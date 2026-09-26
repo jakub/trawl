@@ -272,6 +272,8 @@ struct Ledger {
     pressure: watch::Sender<u64>,
     /// Batches removed by drain, monotonic.
     drained_batches: AtomicU64,
+    /// Batches made resident by insert, monotonic.
+    inserted_batches: AtomicU64,
 }
 
 impl Ledger {
@@ -287,6 +289,7 @@ impl Ledger {
             released: watch::Sender::new(0),
             pressure: watch::Sender::new(0),
             drained_batches: AtomicU64::new(0),
+            inserted_batches: AtomicU64::new(0),
         }
     }
 
@@ -747,6 +750,9 @@ impl HotBuffer {
         drop(reservation);
         if inserted {
             self.generation.fetch_add(1, Ordering::Relaxed);
+            // Counted before the pressure wake below: a compaction loop that
+            // this wake reaches then reads the new count.
+            self.ledger.inserted_batches.fetch_add(1, Ordering::Relaxed);
             // The WAL file now exists, so a pressure pass has work to find.
             if self.ledger.admission() != AdmissionState::Open {
                 advance(&self.ledger.pressure);
@@ -823,6 +829,14 @@ impl HotBuffer {
     /// monotonic. Compaction measures its progress by this delta.
     pub fn drained_batches(&self) -> u64 {
         self.ledger.drained_batches.load(Ordering::Relaxed)
+    }
+
+    /// Batches made resident by [`insert`](Self::insert) since
+    /// construction, monotonic. A refusal, a dropped reservation or a
+    /// duplicate batch id does not count. Compaction reads it to tell an
+    /// insert's pressure wake from a refusal's.
+    pub fn inserted_batches(&self) -> u64 {
+        self.ledger.inserted_batches.load(Ordering::Relaxed)
     }
 
     /// A generation that advances after every release of charge (a dropped
@@ -1760,6 +1774,7 @@ mod tests {
         let small = buf.reserve(Syslog, charge(10, 0)).unwrap();
         buf.insert(small, batch_of("env/small", charge(10, 0)));
         assert!(!pressure.has_changed().unwrap());
+        assert_eq!(buf.inserted_batches(), 1, "every insert counts, Open too");
 
         // A successful reserve that enters pressure does not wake: the WAL
         // file does not exist yet.
@@ -1773,9 +1788,12 @@ mod tests {
         );
         pressure.borrow_and_update();
 
+        assert_eq!(buf.inserted_batches(), 2);
+
         assert_eq!(buf.reserve(Http, charge(40, 0)).unwrap_err(), Refusal::Full);
         assert!(pressure.has_changed().unwrap(), "full refusal wakes");
         pressure.borrow_and_update();
+        assert_eq!(buf.inserted_batches(), 2, "a refusal is not an insert");
 
         buf.drain(&["env/big", "env/small"]);
         assert_eq!(buf.admission_state(), AdmissionState::Open);
@@ -1783,6 +1801,7 @@ mod tests {
             !pressure.has_changed().unwrap(),
             "drain is not a pressure signal"
         );
+        assert_eq!(buf.inserted_batches(), 2, "a drain is not an insert");
     }
 
     #[test]

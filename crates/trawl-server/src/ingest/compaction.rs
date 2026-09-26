@@ -79,23 +79,70 @@ impl PassPlan {
 /// The normal deadline is independent of pressure: only a normal pass moves
 /// it, so continuous pressure can never postpone the rollup.
 ///
-/// A pass that leaves the buffer not `Open` runs again at once only on clean
-/// progress: it drained at least one batch and reported no failure. Any
-/// other such pass starts a cooldown of one interval. That includes a pass
-/// that drained some services' batches while a chunk of another failed.
-/// During the cooldown, pressure is ignored: no refusal, insert or pressure
-/// wake starts a pass. Only the normal deadline or shutdown ends the wait.
+/// Pressure passes follow what the last pass reported ([`PassOutcome`]):
+/// `eligible`, the WAL files its scan selected; `drained`, the batches it
+/// compacted and drained; and `persistent_failures`, its failed chunks,
+/// blocking publication markers and failed WAL scans. The first rule that
+/// matches decides:
 ///
-/// A failed chunk counts against progress because a stall feeds itself.
-/// Its error lines reach self-telemetry, and those inserts give the next
-/// pass a healthy batch to drain. Once a pass fails or frees nothing, the
-/// loop therefore runs at most one pressure pass per interval, plus the
-/// normal passes, however many refusals and inserts the stall produces.
+/// 1. **Cooldown** when `persistent_failures > 0`, or when `eligible > 0`
+///    and `drained == 0`. The WAL is stuck, and a rerun would fail or skip
+///    it the same way. Pressure is ignored until the next normal pass, at
+///    most one interval away: no refusal, insert or pressure wake starts a
+///    pass, and only the normal deadline or shutdown ends the wait. The
+///    admission state after the pass plays no part.
+/// 2. **Rerun** at once when `drained > 0` and the buffer is not `Open`.
+/// 3. **Wait** otherwise, for a pressure wake or the normal deadline. When
+///    the pass took WAL of every age and still found none, only a wake
+///    after a new insert starts a pass (see below). After a pass that took
+///    only WAL older than the interval, any wake does.
+///
+/// The cooldown ignores the admission state and the drained batches because
+/// a stall feeds itself. Its error lines reach self-telemetry, and those
+/// inserts give the next pass a healthy batch to drain, which can take the
+/// buffer back to `Open` while the stuck WAL stays. Quarantines and rollup
+/// failures do not count: a quarantined file leaves the WAL, and a failed
+/// rollup does not stop the WAL from draining.
+///
+/// A pass with no eligible WAL is not a stall. It ran before the charge that
+/// woke it reached the WAL: a producer reserves, writes its WAL file and
+/// then inserts. A pass that takes every file whatever its age and finds
+/// none proves there was no resident batch, so all the charge was
+/// reservations in flight. Each one inserts or releases. An insert while
+/// not `Open` advances the pressure generation, which wakes the loop, and
+/// [`HotBuffer::inserted_batches`] has moved past its value at the empty
+/// pass's start, so that wake starts a pass. A `Full` refusal wakes the
+/// loop too, but with no insert since the empty pass it finds nothing new,
+/// so the loop waits again without a pass. A reservation's release takes
+/// the buffer back toward `Open` and needs no pass.
+///
+/// Bounds between two normal passes: at most one pass that fails or skips
+/// its WAL, since each starts a cooldown. Every other pressure pass follows
+/// a normal pass, a pass that drained at least one batch, or an insert
+/// since the last empty pass. Each batch drains once, so the pass count is
+/// bounded by the batches inserted, never by the refusals. Without a hot
+/// buffer, the loop runs normal passes only.
 #[derive(Debug)]
 struct Cadence {
     interval: Duration,
     next_normal: Instant,
-    cooldown_until: Option<Instant>,
+    next: Next,
+}
+
+/// What starts the next pressure pass ([`Cadence`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Next {
+    /// A pass at once while the buffer is not `Open`, or any pressure wake.
+    /// The state at startup, so a loop that starts under pressure drains
+    /// without waiting for a wake.
+    Rerun,
+    /// Any pressure wake.
+    Wake,
+    /// A pressure wake after [`HotBuffer::inserted_batches`] has moved past
+    /// this value, read when the empty pass started.
+    Insert(u64),
+    /// Nothing: only the normal deadline or shutdown ends the wait.
+    Cooldown,
 }
 
 impl Cadence {
@@ -103,12 +150,8 @@ impl Cadence {
         Self {
             interval,
             next_normal: start + interval,
-            cooldown_until: None,
+            next: Next::Rerun,
         }
-    }
-
-    fn cooling(&self, now: Instant) -> bool {
-        self.cooldown_until.is_some_and(|until| now < until)
     }
 
     /// The pass due at `now` without waiting, if any. The normal deadline
@@ -116,37 +159,53 @@ impl Cadence {
     fn due(&self, now: Instant, admission: AdmissionState) -> Option<PassKind> {
         if now >= self.next_normal {
             Some(PassKind::Normal)
-        } else if admission != AdmissionState::Open && !self.cooling(now) {
+        } else if self.next == Next::Rerun && admission != AdmissionState::Open {
             Some(PassKind::Pressure)
         } else {
             None
         }
     }
 
-    /// Whether a pressure wake may start a pass at `now`.
-    fn accepts_pressure(&self, now: Instant) -> bool {
-        !self.cooling(now)
+    /// Whether the wait listens for pressure wakes at all.
+    fn listens(&self) -> bool {
+        self.next != Next::Cooldown
     }
 
-    /// Record a finished pass. `drained` is whether it removed at least one
-    /// hot batch; `failures` is how many failures it reported, failed chunks
-    /// included; `admission` is the state after it.
+    /// Whether a pressure wake starts a pass, given the hot buffer's
+    /// [`HotBuffer::inserted_batches`] read after the wake.
+    fn wake_starts_pass(&self, inserted: u64) -> bool {
+        match self.next {
+            Next::Rerun | Next::Wake => true,
+            Next::Insert(before) => inserted != before,
+            Next::Cooldown => false,
+        }
+    }
+
+    /// Record a finished pass: its kind and plan, what it reported, the
+    /// admission state after it, and [`HotBuffer::inserted_batches`] as read
+    /// before it scanned the WAL.
     fn finished(
         &mut self,
         kind: PassKind,
+        plan: PassPlan,
         now: Instant,
-        drained: bool,
-        failures: u64,
+        outcome: &PassOutcome,
         admission: AdmissionState,
+        inserted_before: u64,
     ) {
         if kind == PassKind::Normal {
             self.next_normal = now + self.interval;
         }
-        let clean_progress = drained && failures == 0;
-        self.cooldown_until = if !clean_progress && admission != AdmissionState::Open {
-            Some(now + self.interval)
+        let stuck =
+            outcome.persistent_failures > 0 || (outcome.eligible > 0 && outcome.drained == 0);
+        self.next = if stuck {
+            Next::Cooldown
+        } else if outcome.drained > 0 && admission != AdmissionState::Open {
+            Next::Rerun
+        } else if outcome.eligible == 0 && plan.wal_min_age.is_zero() {
+            Next::Insert(inserted_before)
         } else {
-            None
+            Next::Wake
         };
     }
 }
@@ -208,7 +267,7 @@ pub fn spawn_compaction(
                 .as_ref()
                 .map_or(AdmissionState::Open, |buf| buf.admission_state())
         };
-        let drained = || hot_buffer.as_ref().map_or(0, |buf| buf.drained_batches());
+        let inserted = || hot_buffer.as_ref().map_or(0, |buf| buf.inserted_batches());
         let mut pressure = hot_buffer.as_ref().map(|buf| buf.subscribe_pressure());
         let mut cadence = Cadence::new(Instant::now(), interval);
 
@@ -227,7 +286,7 @@ pub fn spawn_compaction(
                 kind
             } else {
                 let next_normal = cadence.next_normal;
-                let accepts_pressure = cadence.accepts_pressure(Instant::now());
+                let listens = cadence.listens();
                 #[cfg(test)]
                 if let Some(stats) = &compaction_stats {
                     stats.waits.fetch_add(1, Ordering::Release);
@@ -239,10 +298,15 @@ pub fn spawn_compaction(
                         break;
                     }
                     () = tokio::time::sleep_until(next_normal.into()) => PassKind::Normal,
-                    changed = pressure_changed(&mut pressure), if accepts_pressure => {
+                    changed = pressure_changed(&mut pressure), if listens => {
                         if changed.is_err() {
                             // The buffer is gone; only the interval remains.
                             pressure = None;
+                            continue;
+                        }
+                        // An insert counts itself before its wake, so this
+                        // read sees the insert behind any wake it sent.
+                        if !cadence.wake_starts_pass(inserted()) {
                             continue;
                         }
                         PassKind::Pressure
@@ -255,6 +319,9 @@ pub fn spawn_compaction(
             if let Some(rx) = pressure.as_mut() {
                 rx.borrow_and_update();
             }
+            // Read before the scan: a batch inserted after this has a WAL
+            // file the scan may miss, and moves the count.
+            let inserted_before = inserted();
             let plan = PassPlan::new(kind, admission(), interval, daily_rollup);
             if kind == PassKind::Pressure {
                 tracing::debug!(
@@ -262,8 +329,7 @@ pub fn spawn_compaction(
                     "hot buffer under pressure; compacting all WAL now"
                 );
             }
-            let drained_before = drained();
-            let failures = match compact_pass(
+            let outcome = match compact_pass(
                 &wal_dir,
                 &data_dir,
                 interval,
@@ -277,10 +343,8 @@ pub fn spawn_compaction(
             )
             .await
             {
-                Ok(PassOutcome {
-                    data_loss,
-                    chunk_failures,
-                }) => {
+                Ok(outcome) => {
+                    let data_loss = outcome.data_loss;
                     if let Some(ref stats) = compaction_stats {
                         stats.total_runs.fetch_add(1, Ordering::Relaxed);
                         // compact_once returns the combined data-loss
@@ -298,20 +362,30 @@ pub fn spawn_compaction(
                             .last_run_epoch_secs
                             .store(epoch_secs, Ordering::Relaxed);
                     }
-                    data_loss + chunk_failures
+                    outcome
                 }
                 Err(e) => {
                     if let Some(ref stats) = compaction_stats {
                         stats.total_errors.fetch_add(1, Ordering::Relaxed);
                     }
                     tracing::error!(event_type = "compaction_error", error = %e, "compaction tick failed");
-                    1
+                    // The whole pass failed before or while scanning the
+                    // WAL: an unreadable WAL root, unlistable markers, or
+                    // rollup recovery paused by a repin.
+                    PassOutcome {
+                        persistent_failures: 1,
+                        ..PassOutcome::default()
+                    }
                 }
             };
-            // Progress is batches drained, not occupancy: producers refill
-            // the buffer while a pass runs.
-            let progressed = drained() != drained_before;
-            cadence.finished(kind, Instant::now(), progressed, failures, admission());
+            cadence.finished(
+                kind,
+                plan,
+                Instant::now(),
+                &outcome,
+                admission(),
+                inserted_before,
+            );
         }
     })
 }
@@ -406,18 +480,30 @@ pub async fn compact_once_coordinated(
 }
 
 /// What one compaction pass reports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PassOutcome {
-    /// The failure tally [`compact_once_coordinated`] returns.
+    /// The failure tally [`compact_once_coordinated`] returns: rollup
+    /// failures, quarantined WAL files, failed env WAL scans and blocking
+    /// publication markers.
     data_loss: u64,
-    /// Chunks that failed, or published without finishing. Their WAL or
-    /// marker stays for a later pass, so they are not in `data_loss`, but
-    /// they deny the pass clean progress ([`Cadence`]).
-    chunk_failures: u64,
+    /// WAL files the scan selected as this pass's input, after the age
+    /// filter, blocked services included.
+    eligible: u64,
+    /// Batches this pass compacted and drained: the WAL files of every chunk
+    /// that published or was quarantined whole, whether or not the hot
+    /// buffer held their batch. The buffer starts empty on boot, so a
+    /// buffer delta would read a healthy first pass over surviving WAL as
+    /// stuck.
+    drained: u64,
+    /// What will stop the next pass the same way: failed chunks (an error,
+    /// or a publish that did not finish), blocking publication markers and
+    /// failed env WAL scans. Quarantines and rollup failures are not here:
+    /// a quarantined file leaves the WAL, and a failed rollup does not
+    /// stop the WAL from draining. See [`Cadence`].
+    persistent_failures: u64,
 }
 
-/// [`compact_once_coordinated`], with the chunk failures the loop's
-/// cadence needs.
+/// [`compact_once_coordinated`], with the counts the loop's cadence needs.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
 async fn compact_pass(
     wal_dir: &Path,
@@ -449,6 +535,10 @@ async fn compact_pass(
 
     // Chunks that failed or left their publish unfinished this cycle.
     let mut chunk_failures: u64 = 0;
+
+    // WAL files selected this cycle, and those compacted and drained.
+    let mut eligible: u64 = 0;
+    let mut drained: u64 = 0;
 
     // Env is the outermost storage dimension (ADR-0009): WAL lives in
     // `wal_dir/{env}/` and parquet in `data_dir/{env}/{date}/{HH}/`.
@@ -495,6 +585,7 @@ async fn compact_pass(
         if files.is_empty() {
             continue;
         }
+        eligible += files.len() as u64;
         // Group WAL files by service prefix.
         let groups = group_by_service(files);
 
@@ -572,12 +663,13 @@ async fn compact_pass(
                 wal_quarantined += outcome.quarantined;
 
                 match outcome.result {
-                    Ok(None) => {}
+                    Ok(None) => drained += chunk.len() as u64,
                     Ok(Some(incomplete)) => {
                         // The output is published and its rows drained; the
                         // marker still names the consumed WAL, so no later
                         // pass can merge it again. Recovery at the start of
                         // a later tick finishes the publish.
+                        drained += chunk.len() as u64;
                         incomplete.operation.record_failure();
                         chunk_failures += 1;
                         tracing::error!(
@@ -663,7 +755,9 @@ async fn compact_pass(
 
     Ok(PassOutcome {
         data_loss: rollup_failures + wal_quarantined + scan_failures + recovery_blocked,
-        chunk_failures,
+        eligible,
+        drained,
+        persistent_failures: chunk_failures + recovery_blocked + scan_failures,
     })
 }
 
@@ -11058,9 +11152,8 @@ mod tests {
     ///
     /// The loop must be waiting before the reservation enters pressure.
     /// Otherwise its startup check can see `Pressure` before the WAL file
-    /// exists, run a pass that drains nothing and cool down for the whole
-    /// interval, and the test would exercise startup detection instead of
-    /// the insert's pressure wake.
+    /// exists and run a pass that finds nothing, and the test would
+    /// exercise startup detection instead of the insert's pressure wake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pressure_wakes_compaction_and_drains_young_wal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11365,6 +11458,318 @@ mod tests {
         );
     }
 
+    /// A stuck env below a quarter of the cap never holds the buffer under
+    /// pressure on its own. A large but legal request cannot fit beside it,
+    /// so each retry is a `Full` refusal that latches `Refusing` and wakes
+    /// the loop, while a healthy trickle gives every pass something to
+    /// drain. The pass fails `prod`, drains the trickle and ends `Open`. The
+    /// failure alone must start the cooldown: with a one-hour interval, the
+    /// retries get one pass, not one each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failing_pass_that_ends_open_still_cools_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        std::fs::write(tmp.path().join("data").join("prod"), b"not a directory").unwrap();
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        let stuck = admitted_env_group(&pipeline, ProducerKind::Http, "prod", "stuck", 10);
+        assert_eq!(write_groups(&pipeline, vec![stuck]).await, 10);
+        assert_eq!(hot.admission_state(), AdmissionState::Open);
+
+        let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
+        let stats = Arc::clone(&compaction.stats);
+        let waiting = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert!(waiting, "the loop reaches its first wait");
+
+        let window = Duration::from_secs(5);
+        let start = Instant::now();
+        let mut refused = 0_u32;
+        while start.elapsed() < window {
+            let trickle = admitted_env_group(&pipeline, ProducerKind::Http, "dev", "small", 1);
+            write_groups(&pipeline, vec![trickle]).await;
+            // 84 events fit under the 93-event external ceiling, but never
+            // beside the 10 stuck events and the trickle.
+            let big = Charge {
+                events: 84,
+                bytes: 84,
+            };
+            if pipeline.reserve(ProducerKind::Http, big).is_err() {
+                refused += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let runs = stats.total_runs.load(Ordering::Relaxed);
+        let drained = hot.drained_batches();
+        compaction.stop().await;
+
+        assert!(refused >= 10, "the large request kept retrying: {refused}");
+        assert!(drained >= 1, "the woken pass drained the trickle");
+        assert!(
+            runs <= 2,
+            "{runs} failing passes in {window:?} with a one-hour interval, \
+             {refused} refusals"
+        );
+    }
+
+    /// A burst on an empty buffer: two groups reserve, and a third does not
+    /// fit, so its refusal wakes the loop before either group's WAL exists.
+    /// That pass finds no WAL at all. The in-flight groups then land, and
+    /// their inserts must start the pass that drains them, well inside the
+    /// one-hour interval.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refusal_before_the_wal_exists_does_not_strand_the_burst() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
+        let stats = Arc::clone(&compaction.stats);
+        let waiting = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert!(waiting, "the loop reaches its first wait");
+
+        let a = admitted_group(&pipeline, ProducerKind::Http, "a", 45);
+        let b = admitted_group(&pipeline, ProducerKind::Http, "b", 45);
+        let refused = pipeline.reserve(
+            ProducerKind::Http,
+            Charge {
+                events: 10,
+                bytes: 10,
+            },
+        );
+        assert!(matches!(refused, Err(crate::hot_buffer::Refusal::Full)));
+        assert_eq!(hot.admission_state(), AdmissionState::Refusing);
+
+        // The refusal's pass runs and the loop waits again, all before
+        // either group has written its WAL.
+        let waiting_again = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 2
+        })
+        .await;
+        assert!(waiting_again, "the refusal woke a pass");
+        assert_eq!(stats.total_runs.load(Ordering::Relaxed), 1);
+        assert_eq!(hot.drained_batches(), 0, "that pass found no WAL");
+
+        assert_eq!(write_groups(&pipeline, vec![a, b]).await, 90);
+        let bound = Duration::from_secs(2);
+        let drained = eventually(bound, || hot.event_count() == 0).await;
+        let runs = stats.total_runs.load(Ordering::Relaxed);
+        compaction.stop().await;
+
+        assert!(
+            drained,
+            "the burst stayed resident for {bound:?}: {} events, {} batches drained, \
+             {runs} passes, {:?}",
+            hot.event_count(),
+            hot.drained_batches(),
+            hot.admission_state()
+        );
+        assert_eq!(hot.drained_batches(), 2);
+        assert_eq!(hot.admission_state(), AdmissionState::Open);
+    }
+
+    /// 30 events are resident and 30 more are reserved. The first pass
+    /// drains the resident batch cleanly, but the reservation keeps the
+    /// buffer under pressure, so the loop reruns at once and finds no WAL:
+    /// the reserved group has not written it yet. When that group lands,
+    /// its insert must start the pass that drains it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_clean_rerun_that_races_in_flight_charge_drains_it_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        let resident = admitted_group(&pipeline, ProducerKind::Syslog, "resident", 30);
+        assert_eq!(write_groups(&pipeline, vec![resident]).await, 30);
+        let in_flight = admitted_group(&pipeline, ProducerKind::Syslog, "in-flight", 30);
+        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
+
+        let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
+        let stats = Arc::clone(&compaction.stats);
+        let waiting = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert!(waiting, "the loop reaches its first wait");
+        assert_eq!(
+            hot.drained_batches(),
+            1,
+            "the first pass drained the resident batch"
+        );
+        assert_eq!(
+            stats.total_runs.load(Ordering::Relaxed),
+            2,
+            "the clean drain reran once, and the rerun found no WAL"
+        );
+        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
+
+        assert_eq!(write_groups(&pipeline, vec![in_flight]).await, 30);
+        let bound = Duration::from_secs(2);
+        let drained = eventually(bound, || hot.event_count() == 0).await;
+        let runs = stats.total_runs.load(Ordering::Relaxed);
+        compaction.stop().await;
+
+        assert!(
+            drained,
+            "the in-flight group stayed resident for {bound:?}: {} events, {runs} passes, {:?}",
+            hot.event_count(),
+            hot.admission_state()
+        );
+        assert_eq!(hot.drained_batches(), 2);
+        assert_eq!(hot.admission_state(), AdmissionState::Open);
+    }
+
+    /// A normal pass is planned while the buffer is `Open`, so it takes only
+    /// WAL older than the interval, and a repin cutover holds it. A burst
+    /// meanwhile puts the buffer under pressure. Once the cutover ends, the
+    /// held pass finds only young WAL and drains nothing. The burst's
+    /// pressure wake must still start a pass at once, not an interval later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_normal_pass_held_across_a_burst_keeps_its_pressure_wake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        let repin = Arc::new(RepinCoordinator::new());
+        let interval = Duration::from_secs(3);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let stats = Arc::new(CompactionStats::default());
+        let handle = spawn_compaction(
+            tmp.path().join("wal"),
+            tmp.path().join("data"),
+            interval,
+            false,
+            DEFAULT_CHUNK_SIZE,
+            "2GB".to_owned(),
+            Some(Arc::clone(&hot)),
+            Some(Arc::clone(&stats)),
+            None,
+            Some(Arc::clone(&repin)),
+            shutdown_rx,
+        );
+        let waiting = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert!(waiting, "the loop reaches its first wait");
+        let cutover = repin.cutover_guard().await;
+        // The normal deadline fires about now and blocks in recovery.
+        tokio::time::sleep(interval + Duration::from_millis(300)).await;
+        assert_eq!(stats.total_runs.load(Ordering::Relaxed), 0);
+
+        let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 60);
+        assert_eq!(write_groups(&pipeline, vec![group]).await, 60);
+        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
+        tokio::time::sleep(Duration::from_millis(2000)).await;
+        drop(cutover);
+        let released = Instant::now();
+
+        let bound = Duration::from_millis(1500);
+        let drained = eventually(bound, || hot.event_count() == 0).await;
+        let waited = released.elapsed();
+        let runs = stats.total_runs.load(Ordering::Relaxed);
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), handle)
+            .await
+            .expect("compaction stops on shutdown")
+            .unwrap();
+
+        assert!(
+            drained,
+            "the burst stayed resident {waited:?} after the cutover ended \
+             (interval {interval:?}, {runs} passes)"
+        );
+    }
+
+    /// A reservation holds 90 of 100 events and has not written its WAL, so
+    /// a pass can find nothing to drain. `Full` refusals every 5 ms wake the
+    /// loop; after the first pass finds nothing, they must not start a pass
+    /// each. The reservation's insert does start one, and it drains the
+    /// batch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refusals_against_in_flight_charge_wait_for_an_insert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
+        let stats = Arc::clone(&compaction.stats);
+        let waiting = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert!(waiting, "the loop reaches its first wait");
+
+        let held = admitted_group(&pipeline, ProducerKind::Http, "held", 90);
+        let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let refusals = {
+            let pipeline = Arc::clone(&pipeline);
+            let refusing = Arc::clone(&refusing);
+            std::thread::spawn(move || {
+                let mut count = 0_u64;
+                let small = Charge {
+                    events: 10,
+                    bytes: 10,
+                };
+                while refusing.load(Ordering::Relaxed) {
+                    assert!(matches!(
+                        pipeline.reserve(ProducerKind::Http, small),
+                        Err(crate::hot_buffer::Refusal::Full)
+                    ));
+                    count += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                count
+            })
+        };
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        refusing.store(false, Ordering::Relaxed);
+        let refused = refusals.join().unwrap();
+        let runs = stats.total_runs.load(Ordering::Relaxed);
+        assert!(refused > 100, "refusals kept coming: {refused}");
+        assert_eq!(
+            runs, 1,
+            "{refused} refusals with nothing on disk started {runs} passes"
+        );
+
+        assert_eq!(write_groups(&pipeline, vec![held]).await, 90);
+        let drained = eventually(Duration::from_secs(2), || hot.event_count() == 0).await;
+        // The pass counts itself after its drain.
+        let counted = eventually(Duration::from_secs(30), || {
+            stats.total_runs.load(Ordering::Relaxed) >= 2
+        })
+        .await;
+        let runs = stats.total_runs.load(Ordering::Relaxed);
+        compaction.stop().await;
+        assert!(
+            drained && counted,
+            "the insert started a pass: {runs} passes, {:?}",
+            hot.admission_state()
+        );
+        assert_eq!(runs, 2, "one pass for the insert");
+    }
+
     #[test]
     fn zero_age_scan_takes_future_mtime_wal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11422,9 +11827,8 @@ mod tests {
             .unwrap();
         assert_eq!(hot.admission_state(), AdmissionState::Pressure);
 
-        // Written before the loop starts: a loop that starts under pressure
-        // runs a pressure pass at once, and one that found nothing would
-        // cool down past the normal deadline.
+        // Written before the loop starts, so the pressure pass a loop runs
+        // at once when it starts under pressure has a batch to drain.
         let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 5);
         assert_eq!(write_groups(&pipeline, vec![group]).await, 5);
         let interval = Duration::from_secs(5);
@@ -11458,100 +11862,261 @@ mod tests {
         drop(hold);
     }
 
-    /// The cadence alone, on a synthetic clock: a stalled drain under a
-    /// pressure wake at every step runs about one pass per interval, and
-    /// the normal deadline moves only with normal passes.
+    /// A [`PassOutcome`] with the three counts the cadence reads, plus a
+    /// data-loss tally it must ignore.
+    fn outcome(
+        eligible: u64,
+        drained: u64,
+        persistent_failures: u64,
+        data_loss: u64,
+    ) -> PassOutcome {
+        PassOutcome {
+            data_loss,
+            eligible,
+            drained,
+            persistent_failures,
+        }
+    }
+
+    /// The plan a pass of `kind` gets under `admission`.
+    fn plan_for(kind: PassKind, admission: AdmissionState, interval: Duration) -> PassPlan {
+        PassPlan::new(kind, admission, interval, true)
+    }
+
+    /// The cadence alone, on a synthetic clock, with a pressure wake at
+    /// every 100 ms step: a stalled drain, and refusals against charge that
+    /// is only in flight, each run about one pass per interval, and the
+    /// normal deadline moves only with normal passes. Inserts, not wakes,
+    /// bound the passes that find nothing.
     #[test]
     fn cadence_bounds_stalled_pressure_and_keeps_the_normal_deadline() {
         let interval = Duration::from_secs(10);
         let t0 = Instant::now();
-        let mut cadence = Cadence::new(t0, interval);
-        let mut passes = 0_u32;
-        let mut normals = 0_u32;
-        for ms in (0..100_000).step_by(100) {
-            let now = t0 + Duration::from_millis(ms);
-            let kind = cadence
-                .due(now, AdmissionState::Refusing)
-                .or_else(|| cadence.accepts_pressure(now).then_some(PassKind::Pressure));
-            if let Some(kind) = kind {
-                passes += 1;
-                normals += u32::from(kind == PassKind::Normal);
-                cadence.finished(kind, now, false, 1, AdmissionState::Refusing);
+        let simulate = |report: PassOutcome, inserts_per_step: u64| {
+            let mut cadence = Cadence::new(t0, interval);
+            let (mut passes, mut normals, mut inserted) = (0_u32, 0_u32, 0_u64);
+            for ms in (0..100_000).step_by(100) {
+                let now = t0 + Duration::from_millis(ms);
+                inserted += inserts_per_step;
+                let kind = cadence.due(now, AdmissionState::Refusing).or_else(|| {
+                    (cadence.listens() && cadence.wake_starts_pass(inserted))
+                        .then_some(PassKind::Pressure)
+                });
+                if let Some(kind) = kind {
+                    passes += 1;
+                    normals += u32::from(kind == PassKind::Normal);
+                    let plan = plan_for(kind, AdmissionState::Refusing, interval);
+                    cadence.finished(kind, plan, now, &report, AdmissionState::Refusing, inserted);
+                }
             }
-        }
-        assert!(passes <= 100 / 10 + 2, "{passes} passes in 100 s");
+            (passes, normals)
+        };
+
+        let (passes, normals) = simulate(outcome(3, 0, 1, 0), 0);
+        assert!(passes <= 100 / 10 + 2, "stalled: {passes} passes in 100 s");
         assert!(normals >= 9, "the normal deadline kept firing: {normals}");
 
-        // Progress under pressure reruns at once, without moving the deadline.
+        let (passes, normals) = simulate(outcome(0, 0, 0, 0), 0);
+        assert!(
+            passes <= 100 / 10 + 2,
+            "refusals with nothing on disk: {passes} passes in 100 s"
+        );
+        assert!(normals >= 9, "the normal deadline kept firing: {normals}");
+
+        let (passes, _) = simulate(outcome(0, 0, 0, 0), 1);
+        assert_eq!(
+            passes, 1000,
+            "an insert at every step starts a pass at every step"
+        );
+
+        // A clean drain under pressure reruns at once, without moving the
+        // deadline.
         let mut cadence = Cadence::new(t0, interval);
         let now = t0 + Duration::from_secs(1);
-        cadence.finished(PassKind::Pressure, now, true, 0, AdmissionState::Pressure);
+        let plan = plan_for(PassKind::Pressure, AdmissionState::Pressure, interval);
+        cadence.finished(
+            PassKind::Pressure,
+            plan,
+            now,
+            &outcome(1, 1, 0, 0),
+            AdmissionState::Pressure,
+            0,
+        );
         assert_eq!(
             cadence.due(now, AdmissionState::Pressure),
             Some(PassKind::Pressure)
         );
         assert_eq!(cadence.next_normal, t0 + interval);
-        // No progress: cooldown, and the normal deadline still fires.
-        cadence.finished(PassKind::Pressure, now, false, 0, AdmissionState::Pressure);
-        assert_eq!(cadence.due(now, AdmissionState::Pressure), None);
-        assert!(!cadence.accepts_pressure(now));
-        assert_eq!(
-            cadence.due(t0 + interval, AdmissionState::Pressure),
-            Some(PassKind::Normal)
-        );
     }
 
-    /// Only clean progress reruns at once. A pass that drained batches but
-    /// also failed a chunk cools down like one that drained nothing, and
-    /// pressure cannot end that cooldown: only the normal deadline can.
+    /// Every branch of [`Cadence::finished`], and what each one lets start
+    /// the next pass: at once, on a wake, only on a wake after an insert,
+    /// or only at the normal deadline.
     #[test]
-    fn cadence_reruns_only_on_clean_progress() {
+    #[allow(clippy::too_many_lines)] // one flat table, one row per branch
+    fn cadence_follows_failures_eligible_and_drained_batches() {
+        use AdmissionState::{Open, Pressure, Refusing};
         let interval = Duration::from_secs(3600);
         let t0 = Instant::now();
         let now = t0 + Duration::from_secs(1);
-
-        let mut cadence = Cadence::new(t0, interval);
-        cadence.finished(PassKind::Pressure, now, true, 0, AdmissionState::Pressure);
-        assert_eq!(
-            cadence.due(now, AdmissionState::Pressure),
-            Some(PassKind::Pressure),
-            "a clean drain reruns at once"
-        );
-        assert!(cadence.accepts_pressure(now));
-
-        let mut cadence = Cadence::new(t0, interval);
-        cadence.finished(PassKind::Pressure, now, true, 1, AdmissionState::Pressure);
-        assert_eq!(
-            cadence.due(now, AdmissionState::Pressure),
-            None,
-            "a drain with a failed chunk cools down"
-        );
         let later = now + Duration::from_secs(60);
-        assert!(!cadence.accepts_pressure(later), "pressure stays muted");
-        assert_eq!(cadence.due(later, AdmissionState::Refusing), None);
-        assert_eq!(
-            cadence.due(t0 + interval, AdmissionState::Refusing),
-            Some(PassKind::Normal),
-            "the normal deadline still fires"
-        );
+        let before = 7;
 
-        // A normal pass follows the same rule, and still moves its deadline.
-        let mut cadence = Cadence::new(t0, interval);
-        let deadline = t0 + interval;
-        cadence.finished(
-            PassKind::Normal,
-            deadline,
-            true,
-            2,
-            AdmissionState::Pressure,
-        );
-        assert_eq!(cadence.due(deadline, AdmissionState::Pressure), None);
-        assert_eq!(cadence.next_normal, deadline + interval);
+        let cases = [
+            // (name, kind, admission when planned, report, admission after, next)
+            (
+                "failure + drain + Open",
+                PassKind::Pressure,
+                Pressure,
+                outcome(4, 3, 1, 0),
+                Open,
+                Next::Cooldown,
+            ),
+            (
+                "failure + drain + Pressure",
+                PassKind::Pressure,
+                Pressure,
+                outcome(4, 3, 1, 0),
+                Pressure,
+                Next::Cooldown,
+            ),
+            (
+                "failure + drain + Refusing, normal",
+                PassKind::Normal,
+                Refusing,
+                outcome(4, 3, 2, 0),
+                Refusing,
+                Next::Cooldown,
+            ),
+            (
+                "whole pass failed",
+                PassKind::Pressure,
+                Refusing,
+                outcome(0, 0, 1, 0),
+                Refusing,
+                Next::Cooldown,
+            ),
+            (
+                "eligible + no drain, Pressure",
+                PassKind::Pressure,
+                Pressure,
+                outcome(2, 0, 0, 0),
+                Pressure,
+                Next::Cooldown,
+            ),
+            (
+                "eligible + no drain, Open",
+                PassKind::Pressure,
+                Pressure,
+                outcome(2, 0, 0, 0),
+                Open,
+                Next::Cooldown,
+            ),
+            (
+                "no eligible + no drain, every age",
+                PassKind::Pressure,
+                Refusing,
+                outcome(0, 0, 0, 0),
+                Refusing,
+                Next::Insert(before),
+            ),
+            (
+                "no eligible + no drain, every age, Open",
+                PassKind::Normal,
+                Pressure,
+                outcome(0, 0, 0, 0),
+                Open,
+                Next::Insert(before),
+            ),
+            (
+                "no eligible + no drain, aged WAL only",
+                PassKind::Normal,
+                Open,
+                outcome(0, 0, 0, 0),
+                Pressure,
+                Next::Wake,
+            ),
+            (
+                "clean drain, Pressure",
+                PassKind::Pressure,
+                Pressure,
+                outcome(3, 3, 0, 0),
+                Pressure,
+                Next::Rerun,
+            ),
+            (
+                "clean drain, Refusing",
+                PassKind::Pressure,
+                Refusing,
+                outcome(3, 3, 0, 0),
+                Refusing,
+                Next::Rerun,
+            ),
+            (
+                "clean drain, Open",
+                PassKind::Pressure,
+                Pressure,
+                outcome(3, 3, 0, 0),
+                Open,
+                Next::Wake,
+            ),
+            (
+                "quarantine only",
+                PassKind::Pressure,
+                Pressure,
+                outcome(2, 2, 0, 2),
+                Pressure,
+                Next::Rerun,
+            ),
+            (
+                "rollup failure only",
+                PassKind::Normal,
+                Refusing,
+                outcome(0, 0, 0, 1),
+                Refusing,
+                Next::Insert(before),
+            ),
+            (
+                "rollup failure only, aged WAL",
+                PassKind::Normal,
+                Open,
+                outcome(1, 1, 0, 1),
+                Open,
+                Next::Wake,
+            ),
+        ];
+        for (name, kind, planned, report, after, next) in cases {
+            let mut cadence = Cadence::new(t0, interval);
+            let plan = plan_for(kind, planned, interval);
+            cadence.finished(kind, plan, now, &report, after, before);
+            assert_eq!(cadence.next, next, "{name}");
 
-        // With the buffer back to Open there is nothing to cool down from.
-        let mut cadence = Cadence::new(t0, interval);
-        cadence.finished(PassKind::Pressure, now, true, 1, AdmissionState::Open);
-        assert!(cadence.accepts_pressure(now));
+            let deadline = match kind {
+                PassKind::Normal => now + interval,
+                PassKind::Pressure => t0 + interval,
+            };
+            assert_eq!(
+                cadence.next_normal, deadline,
+                "{name}: only a normal pass moves the deadline"
+            );
+            assert_eq!(
+                cadence.due(deadline, after),
+                Some(PassKind::Normal),
+                "{name}: the normal deadline always fires"
+            );
+
+            let at_once = cadence.due(later, after);
+            let on_wake = cadence.listens() && cadence.wake_starts_pass(before);
+            let on_insert = cadence.listens() && cadence.wake_starts_pass(before + 1);
+            let expect = match next {
+                Next::Cooldown => (None, false, false),
+                Next::Insert(_) => (None, false, true),
+                Next::Wake => (None, true, true),
+                Next::Rerun if after == Open => (None, true, true),
+                Next::Rerun => (Some(PassKind::Pressure), true, true),
+            };
+            assert_eq!((at_once, on_wake, on_insert), expect, "{name}");
+        }
     }
 
     #[test]
