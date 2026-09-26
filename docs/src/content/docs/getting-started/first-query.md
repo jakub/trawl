@@ -34,7 +34,9 @@ them. Every other process on this machine can reach both ports. Root on this
 machine, and every user who may use the Docker socket, can read every secret
 the trial holds: the two API keys, the database passwords, and the private key
 of the certificate. Do not forward the trial's ports to another machine, and
-do not send it logs you would not show those users.
+do not send it logs you would not show those users. Open the trial in the
+browser only while it runs: when it is stopped, another program can take its
+port and show a fake sign-in page.
 
 ## Start the trial
 
@@ -187,7 +189,8 @@ certificate fingerprint, the sample range as absolute timestamps, the setup
 phases, and the containers. It warns when a `TRAWL_*` connection variable is
 set. `stop` stops the containers and keeps the databases, the keys, the
 samples, and the state. `up` resumes the same trial: the keys and the samples
-stay as they were, and no new events are loaded.
+stay as they were, and no new events are loaded. Every `up` gives `trawl-web`
+a new session key, so sign in to the browser again after it.
 
 ## Delete the trial
 
