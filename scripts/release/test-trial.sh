@@ -441,7 +441,7 @@ note "killed after the key step: services_verified=false, both keys recorded"
 step "trial A: the rerun recovers, and prints the summary"
 ok up-a t trial up
 says up-a "The trial is up."
-says up-a "http://localhost:18090"
+says up-a "http://127.0.0.1:18090"
 says up-a "https://127.0.0.1:15514"
 says up-a "$STATE_DIR/operator.token"
 says up-a "$STATE_DIR/ingest.token"
@@ -468,6 +468,7 @@ indent <<<"$before_samples"
 
 step "trial A: status"
 ok status t trial status
+says status "http://127.0.0.1:18090"
 
 step "trial A: trawl trial key prints operator.token and nothing else"
 t trial key >"$WORK/key.out" 2>"$WORK/key.err" </dev/null || fail "trawl trial key exited non-zero"
@@ -628,9 +629,13 @@ step "trial A: real Chromium signs in with the operator key"
 if [[ "${TRIAL_BROWSER:-}" == skip ]]; then
   note "SKIPPED: TRIAL_BROWSER=skip (local image without the SPA)"
 else
+  # The sign-in runs at localhost, the tutorial's other allowed origin; the
+  # page must also load at the address `up` printed.
+  printed=$(grep -ohE 'http://127\.0\.0\.1:[0-9]+' "$WORK/up-a.out" "$WORK/up-a.err" | sort -u)
+  [[ "$printed" == "http://127.0.0.1:18090" ]] || fail "up printed the browser address '$printed'"
   mkdir -p "$EVIDENCE/browser"
   TRIAL_E2E_DIR="$E2E_DIR" node "$here/trial-browser.mjs" "http://localhost:18090" "$STATE_DIR/operator.token" \
-    "$EVIDENCE/browser" "$DOCUMENTED_QUERY" "$DOCUMENTED_ROW" || fail "the browser step failed"
+    "$EVIDENCE/browser" "$DOCUMENTED_QUERY" "$DOCUMENTED_ROW" "$printed" || fail "the browser step failed"
 fi
 
 step "trial A: a lost token file is revoked by prefix and minted again"
@@ -769,7 +774,7 @@ note "config.toml is byte-identical across up and down"
 
 step "trial B: --api-port 25514 --web-port 28090 --no-sample-data"
 ok up-b t trial up --api-port 25514 --web-port 28090 --no-sample-data "${IMAGE_ARGS[@]}"
-says up-b "http://localhost:28090"
+says up-b "http://127.0.0.1:28090"
 says up-b "https://127.0.0.1:25514"
 collect_secrets
 scan --classes password,cookie,key "$STATE_HOME" "$TRIAL_HOME"
