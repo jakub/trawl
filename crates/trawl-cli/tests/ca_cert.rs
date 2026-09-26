@@ -249,3 +249,86 @@ async fn pinned_ca_refuses_plain_http() {
         _ = listener.accept() => panic!("a pinned client opened a plain connection"),
     }
 }
+
+/// A pin replaces the platform roots; it does not add to them.
+///
+/// Every other test here uses a CA no platform store trusts, so a pin that
+/// merged its roots into the platform store would pass them all. This one
+/// makes the server's issuer a platform root. Under the workspace's reqwest
+/// features the platform store is `rustls-platform-verifier`, which on Linux
+/// loads `rustls-native-certs`, and that reads only `SSL_CERT_FILE` when the
+/// variable is set. The process environment must not be mutated, so the
+/// clients run in a re-executed copy of this test with the variable set on
+/// its `Command`, and the server stays here to see both handshakes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pinned_ca_excludes_the_platform_roots() {
+    const CHILD_URL: &str = "TRAWL_TEST_PLATFORM_ROOTS_URL";
+    const CHILD_PIN: &str = "TRAWL_TEST_PLATFORM_ROOTS_PIN";
+    if let Some(url) = std::env::var_os(CHILD_URL) {
+        let url = url.into_string().expect("UTF-8 URL");
+        let pin = std::fs::read_to_string(std::env::var_os(CHILD_PIN).expect("pin path"))
+            .expect("read the pin");
+        // The platform path trusts the server: the variable took effect.
+        let system = ConnectionParams {
+            url: url.clone(),
+            token: "flt_test_not_real".into(),
+            trust: TlsTrust::System,
+        };
+        let health = system
+            .client()
+            .expect("build client")
+            .health()
+            .await
+            .expect("the platform roots must trust the server");
+        assert_eq!(health.status, HealthStatus::Ok);
+        // A pin to another CA refuses the same server.
+        let err = pinned(url, &pin)
+            .client()
+            .expect("build client")
+            .health()
+            .await
+            .expect_err("a pin must not fall back to the platform roots");
+        assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let platform = ca("trawl test platform CA");
+    let other = ca("trawl test CA B");
+    let platform_file = dir.path().join("platform-roots.pem");
+    let pin_file = dir.path().join("pin.pem");
+    std::fs::write(&platform_file, platform.pem()).expect("write platform roots");
+    std::fs::write(&pin_file, other.pem()).expect("write pin");
+    let mut server = Server::start(leaf(&platform, &["127.0.0.1"])).await;
+
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args([
+            "--exact",
+            "pinned_ca_excludes_the_platform_roots",
+            "--nocapture",
+        ])
+        .env(CHILD_URL, format!("https://127.0.0.1:{}", server.port))
+        .env(CHILD_PIN, &pin_file)
+        .env("SSL_CERT_FILE", &platform_file)
+        .env_remove("SSL_CERT_DIR");
+    let output = tokio::task::spawn_blocking(move || child.output())
+        .await
+        .expect("join the child")
+        .expect("re-execute the test binary");
+    assert!(
+        output.status.success(),
+        "child failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server
+        .handshake()
+        .await
+        .expect("the server saw the platform client's handshake");
+    assert!(
+        server.handshake().await.is_err(),
+        "the server completed a handshake the pinned client should have refused"
+    );
+}
