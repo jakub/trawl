@@ -31,6 +31,7 @@ use serde::Deserialize;
 
 use super::compose::VOLUMES;
 use super::docker::{Args, Docker, PROBE_TIMEOUT, Sensitivity, failure};
+use super::state::ImageRecord;
 use super::{CLAIM_NAME, LABEL_ID, PROJECT};
 
 /// Compose's project label.
@@ -321,12 +322,13 @@ pub fn unfinished_oneoffs<'a>(inventory: &'a Inventory, our_id: &str) -> Vec<&'a
 }
 
 /// `docker container create` of the claim: never started, no ports, no
-/// restart policy, and no Compose label.
-pub fn claim_create_args(trial_id: &str, image_id: &str) -> Args {
+/// restart policy, and no Compose label. It names the recorded image id,
+/// never the reference, as the Compose file does.
+pub fn claim_create_args(trial_id: &str, image: &ImageRecord) -> Args {
     Args::new()
         .args(["container", "create", "--name", CLAIM_NAME, "--label"])
         .arg(format!("{LABEL_ID}={trial_id}"))
-        .args([image_id, "true"])
+        .args([image.id.as_str(), "true"])
 }
 
 /// `docker container inspect` of the claim's labels.
@@ -378,9 +380,9 @@ pub enum Claimed {
 pub async fn claim(
     docker: &Docker,
     trial_id: &str,
-    image_id: &str,
+    image: &ImageRecord,
 ) -> Result<Claimed, super::TrialError> {
-    let create = claim_create_args(trial_id, image_id);
+    let create = claim_create_args(trial_id, image);
     let created = docker
         .output(&create, None, Sensitivity::Diagnose, PROBE_TIMEOUT)
         .await?;
@@ -680,9 +682,18 @@ mod tests {
         );
     }
 
+    /// The trawl image as `up` records it: the claim must name the id.
+    fn image() -> ImageRecord {
+        ImageRecord {
+            reference: "ghcr.io/jakub/trawl:0.9.0".into(),
+            id: "sha256:aaaa".into(),
+            repo_digest: None,
+        }
+    }
+
     #[test]
     fn the_claim_is_created_with_our_label_and_no_compose_label() {
-        let args = claim_create_args(OURS, "sha256:aaaa");
+        let args = claim_create_args(OURS, &image());
         assert_eq!(
             args.display(),
             format!(
@@ -690,6 +701,7 @@ mod tests {
                  sha256:aaaa true"
             )
         );
+        assert!(!args.display().contains(&image().reference));
         assert!(!args.display().contains(PROJECT_LABEL));
         assert!(!args.display().contains("restart"));
         assert!(!args.display().contains("-p"));
@@ -723,7 +735,7 @@ mod tests {
     async fn claim_creates_proceeds_on_ours_and_refuses_theirs() {
         let (_tmp, docker) = stub("case \"$1 $2\" in \"container create\") exit 0 ;; esac; exit 9");
         assert_eq!(
-            claim(&docker, OURS, "sha256:aaaa").await.unwrap(),
+            claim(&docker, OURS, &image()).await.unwrap(),
             Claimed::Created
         );
 
@@ -737,12 +749,12 @@ esac"#
         };
         let (_tmp, docker) = stub(&conflict(OURS));
         assert_eq!(
-            claim(&docker, OURS, "sha256:aaaa").await.unwrap(),
+            claim(&docker, OURS, &image()).await.unwrap(),
             Claimed::Existing
         );
 
         let (_tmp, docker) = stub(&conflict(THEIRS));
-        let err = claim(&docker, OURS, "sha256:aaaa").await.unwrap_err();
+        let err = claim(&docker, OURS, &image()).await.unwrap_err();
         assert!(
             err.to_string().contains(&format!("trial id {THEIRS}")),
             "{err}"
@@ -755,7 +767,7 @@ esac"#
   "container inspect") echo 'No such container' >&2; exit 1 ;;
 esac"#,
         );
-        let err = claim(&docker, OURS, "sha256:aaaa").await.unwrap_err();
+        let err = claim(&docker, OURS, &image()).await.unwrap_err();
         assert!(err.to_string().contains("No such image"), "{err}");
     }
 

@@ -20,7 +20,7 @@ expression: text
         "DATABASE_URL": "postgres://fleet@postgres:5432/fleet",
         "PGPASSFILE": "/var/lib/trawl/trial/secrets/pgpass"
       },
-      "image": "ghcr.io/jakub/trawl:0.9.0",
+      "image": "sha256:aaaa",
       "labels": {
         "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
       },
@@ -61,7 +61,7 @@ expression: text
         ],
         "timeout": "5s"
       },
-      "image": "postgres:18",
+      "image": "sha256:cccc",
       "labels": {
         "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
       },
@@ -80,7 +80,7 @@ expression: text
         "-c",
         "set -eu\numask 077\nd=/var/lib/trawl/trial/tls\nif [ -e \"$$d/cert.pem\" ]; then exit 0; fi\nt=\"$$d.new\"\nrm -rf -- \"$$t\"\ntrawl-admin tls generate --output-dir \"$$t\" --san trawld --san localhost --san 127.0.0.1\nchmod 0400 \"$$t/key.pem\"\nmv -T -- \"$$t\" \"$$d\""
       ],
-      "image": "ghcr.io/jakub/trawl:0.9.0",
+      "image": "sha256:aaaa",
       "labels": {
         "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
       },
@@ -121,7 +121,7 @@ expression: text
         ],
         "timeout": "5s"
       },
-      "image": "ghcr.io/jakub/trawl:0.9.0",
+      "image": "sha256:aaaa",
       "labels": {
         "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
       },
@@ -167,7 +167,7 @@ expression: text
         ],
         "timeout": "5s"
       },
-      "image": "ghcr.io/jakub/trawl:0.9.0",
+      "image": "sha256:aaaa",
       "labels": {
         "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
       },

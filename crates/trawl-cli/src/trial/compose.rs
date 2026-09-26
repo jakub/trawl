@@ -30,6 +30,12 @@
 //! Every published port binds 127.0.0.1. No service has a restart policy,
 //! and no image is pulled by Compose: `up` pulls and records images itself.
 //!
+//! Every `image:` is the recorded image id (`sha256:…`), never the
+//! reference it was resolved from. A tag can move after `up` checked it,
+//! through a concurrent `docker pull` or a rebuilt `--image`, and a later
+//! Compose run would then mount the trial's volumes into another image.
+//! An id cannot move.
+//!
 //! Compose interpolates `$` in every string of the file, so the renderer
 //! writes each `$` as `$$` ([`escape_interpolation`]). Nothing in the
 //! trial's file is meant to be interpolated.
@@ -150,7 +156,7 @@ mv -T -- "$t" "$d""#;
 /// Render the Compose project for `state`.
 pub fn render_compose(state: &TrialState) -> Value {
     let labels = json!({ LABEL_ID: state.trial_id });
-    let trawl = state.images.trawl.reference.as_str();
+    let trawl = state.images.trawl.id.as_str();
     let service = |image: &str, settings: Value| {
         let mut service = json!({
             "image": image,
@@ -163,7 +169,7 @@ pub fn render_compose(state: &TrialState) -> Value {
     };
 
     let services = json!({
-        Service::Postgres.name(): service(&state.images.postgres.reference, json!({
+        Service::Postgres.name(): service(&state.images.postgres.id, json!({
             "environment": { "POSTGRES_PASSWORD_FILE": PG_SUPERUSER_PASSWORD },
             "volumes": [volume("postgres", PG_VOLUME_ROOT, false)],
             // Over TCP, so the init-time server, which listens on the
@@ -555,6 +561,27 @@ mod tests {
         }
     }
 
+    /// Every service, the `init` profile's included, runs the recorded
+    /// image id, so a tag that moves after `up` checked it changes nothing.
+    #[test]
+    fn every_service_runs_its_recorded_image_id() {
+        let state = state();
+        let project = render_compose(&state);
+        let services = project["services"].as_object().unwrap();
+        assert_eq!(services.len(), Service::ALL.len());
+        for service in Service::ALL {
+            let recorded = match service {
+                Service::Postgres => &state.images.postgres,
+                Service::Trawld | Service::Web | Service::FleetAdmin | Service::TlsInit => {
+                    &state.images.trawl
+                }
+            };
+            let image = &services[service.name()]["image"];
+            assert_eq!(image, recorded.id.as_str(), "{}", service.name());
+            assert_ne!(image, recorded.reference.as_str(), "{}", service.name());
+        }
+    }
+
     /// The only environment entries are paths and passwordless URLs.
     #[test]
     fn no_environment_entry_holds_a_secret() {
@@ -623,12 +650,9 @@ mod tests {
     #[test]
     fn dollars_are_escaped_everywhere() {
         let mut state = state();
-        state.images.trawl.reference = "registry.example/trawl:${HOME}".into();
+        state.images.trawl.id = "sha256:${HOME}".into();
         let project = render_compose(&state);
-        assert_eq!(
-            project["services"]["trawld"]["image"],
-            "registry.example/trawl:$${HOME}"
-        );
+        assert_eq!(project["services"]["trawld"]["image"], "sha256:$${HOME}");
         let script = project["services"]["tls-init"]["entrypoint"][2]
             .as_str()
             .unwrap();
