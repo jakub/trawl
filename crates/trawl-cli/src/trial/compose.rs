@@ -27,6 +27,8 @@
 //!   prints a token.
 //!
 //! Every service, the network, and every volume carry the trial id label.
+//! No service inherits the host's DNS search domains, so a trial service
+//! name never resolves outside the trial network.
 //! Every published port binds 127.0.0.1. No service has a restart policy,
 //! and no image is pulled by Compose: `up` pulls and records images itself.
 //!
@@ -164,6 +166,12 @@ pub fn render_compose(state: &TrialState) -> Value {
             "image": image,
             "pull_policy": "never",
             "labels": labels,
+            // No search domains. Docker's DNS forwards a name it does not
+            // know to the host's resolvers, which append the host's search
+            // domains, so while the trial's PostgreSQL is stopped the name
+            // `postgres` can resolve to a machine on the LAN, and pgpass
+            // then offers it the role's password.
+            "dns_search": ["."],
         });
         let map = service.as_object_mut().expect("an object");
         map.extend(settings.as_object().expect("an object").clone());
@@ -560,6 +568,17 @@ mod tests {
         for (name, service) in project["services"].as_object().unwrap() {
             assert_eq!(service["pull_policy"], "never", "{name}");
             assert!(service.get("privileged").is_none(), "{name}");
+        }
+    }
+
+    /// A stopped trial's service names must not resolve through the
+    /// host's search domains: on a real host, `postgres` did, to a LAN
+    /// PostgreSQL that `fleet-admin` then tried the fleet role against.
+    #[test]
+    fn no_service_uses_the_host_search_domains() {
+        let project = render_compose(&state());
+        for (name, service) in project["services"].as_object().unwrap() {
+            assert_eq!(service["dns_search"], json!(["."]), "{name}");
         }
     }
 
