@@ -9,13 +9,47 @@
 //! that directory ([`lock`]), records what it has done in `state.json`
 //! ([`state`]), and serves the reserved `-p trial` profile ([`profile`]).
 //!
+//! The Docker side is pure decisions around one driver: [`preflight`]
+//! checks the engine, [`docker`] is the only place that spawns `docker`,
+//! [`compose`] renders the project and the containers' configs,
+//! [`secrets`] generates secrets and writes them into volumes,
+//! [`keys`] drives `fleet-admin`, and [`ownership`] decides which
+//! resources are the trial's.
+//!
 //! The verbs dispatch before `config.toml` is read, so a broken or absent
 //! client config never blocks `up` or `down`.
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "trawl trial up renders the project")
+)]
+mod compose;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the trial verbs drive docker through it")
+)]
+mod docker;
 mod error;
+#[cfg_attr(not(test), expect(dead_code, reason = "trawl trial up mints the keys"))]
+mod keys;
 mod lock;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "up, stop, and down check ownership first")
+)]
+mod ownership;
 pub mod paths;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "trawl trial up checks the engine first")
+)]
+mod preflight;
 pub mod profile;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "trawl trial up writes the secrets")
+)]
+mod secrets;
 mod state;
 
 pub use error::TrialError;
@@ -26,7 +60,10 @@ pub const PROJECT: &str = "trawl-trial";
 
 /// Label every trial container, network, and volume carries, valued with
 /// the trial id.
-#[expect(dead_code, reason = "the Compose renderer and ownership scan use it")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the Compose renderer and ownership scan use it")
+)]
 pub const LABEL_ID: &str = "sh.trawl.trial.id";
 
 /// The reserved profile name that reads the trial directory.
@@ -48,7 +85,10 @@ pub const DEFAULT_WEB_PORT: u16 = 18090;
 
 /// Name of the never-started container that claims the engine for one
 /// trial. A second trial's create fails on the name conflict.
-#[expect(dead_code, reason = "up creates the claim and down removes it last")]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "up creates the claim and down removes it last")
+)]
 pub const CLAIM_NAME: &str = "trawl-trial-claim";
 
 /// `trawl trial <verb>`.
