@@ -439,7 +439,7 @@ variables log a line when they displace a configured value.
 | `FLEET_SESSION_COOKIE_SECURE` | `true` or `false`. `false` clears `Secure` on the session cookie |
 | `FLEET_SESSION_COOKIE_PATH` | Cookie `Path=`. The only accepted value is `/`. There is no `[web]` counterpart |
 | `TRAWL_WEB_BIND_ADDR` | Overrides `[web] bind_addr` |
-| `TRAWL_WEB_INSECURE_UPSTREAM` | Any non-empty value skips TLS verification of the upstream trawld certificate. The proxy honours it only when the upstream host is an address in `127.0.0.0/8`, `::1`, or `localhost`. Any other host, an upstream URL that does not parse, or a set `upstream_ca_path` is a startup error that names the variable. There is no `[web]` counterpart |
+| `TRAWL_WEB_INSECURE_UPSTREAM` | Any non-empty value skips TLS verification of the upstream trawld certificate. It does not turn TLS off. The proxy honours it only when the upstream URL is `https` and its host is an address in `127.0.0.0/8`, `::1`, or `localhost`. Any other host, an `http` upstream, an upstream URL that does not parse, or a set `upstream_ca_path` is a startup error that names the variable. There is no `[web]` counterpart |
 
 The Helm chart passes `FLEET_SESSION_PUBLIC_ORIGINS` to the sidecar as well as
 rendering `public_origins` into the generated TOML, so a `config.raw` that

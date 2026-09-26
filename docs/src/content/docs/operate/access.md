@@ -144,8 +144,9 @@ issued your certificate. That certificate must also name the host in
 `[server] http_addr`. Restart `trawl-web` after you change either file.
 
 The other way is `TRAWL_WEB_INSECURE_UPSTREAM=1`, which turns verification off.
-The Helm chart sets it. `trawl-web` accepts it only when the upstream host is
-loopback and `upstream_ca_path` is not set, and refuses to start otherwise. On
+The Helm chart sets it. `trawl-web` accepts it only when the upstream URL is
+`https`, its host is loopback, and `upstream_ca_path` is not set. Otherwise
+`trawl-web` refuses to start. On
 a Debian install, remove `upstream_ca_path` from `trawld.toml` before you set
 the variable in `/etc/default/trawl-web`.
 

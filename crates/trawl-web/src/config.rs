@@ -178,6 +178,17 @@ pub enum ConfigError {
     )]
     InsecureUpstreamNotLoopback { host: String },
 
+    /// [`ENV_INSECURE_UPSTREAM`] is set but the upstream is loopback over
+    /// a scheme other than `https`. The variable skips certificate
+    /// verification; it never drops TLS, which would send bearer tokens
+    /// in cleartext.
+    #[error(
+        "{ENV_INSECURE_UPSTREAM} is set, but the upstream URL scheme is `{scheme}`. \
+         The variable skips certificate verification of an https upstream; \
+         it does not turn TLS off. Use an https:// upstream URL"
+    )]
+    InsecureUpstreamNotHttps { scheme: String },
+
     /// [`ENV_INSECURE_UPSTREAM`] is set and the upstream URL has no host
     /// that can be judged loopback. The URL itself is not echoed.
     #[error(
@@ -453,6 +464,9 @@ fn resolve_bind_addr(env_value: Option<&str>, configured: Option<&str>) -> Strin
 ///   `localhost` in any case. The decision is made on the parsed URL, by the
 ///   same parser the client dials with, and never by resolving a name, so a
 ///   DNS answer cannot widen it. A URL that does not parse refuses.
+/// - The variable also needs an `https` upstream: it skips certificate
+///   verification, and a plain `http` upstream would send every bearer
+///   token in cleartext instead.
 /// - `ca_path` is read now, so a missing, empty or unparseable file stops
 ///   startup instead of failing every request later. The upstream must be
 ///   `https`, since a plain `http` upstream would never consult the pin.
@@ -478,6 +492,11 @@ pub fn resolve_upstream_tls(
         if !is_loopback_host(host) {
             return Err(ConfigError::InsecureUpstreamNotLoopback {
                 host: host.to_owned(),
+            });
+        }
+        if url.scheme() != "https" {
+            return Err(ConfigError::InsecureUpstreamNotHttps {
+                scheme: url.scheme().to_owned(),
             });
         }
         return Ok(UpstreamTls::InsecureLoopback);
@@ -1424,6 +1443,29 @@ session_ttl_secs = 3600
             let message = error.to_string();
             assert!(message.contains(ENV_INSECURE_UPSTREAM), "got: {message}");
             assert!(message.contains(&format!("`{host}`")), "got: {message}");
+        }
+    }
+
+    #[test]
+    fn insecure_upstream_refuses_a_loopback_upstream_without_tls_and_names_the_scheme() {
+        // The variable skips certificate checks; it does not drop TLS, which
+        // would put every bearer token on the wire in cleartext.
+        for (upstream, scheme) in [
+            ("http://127.0.0.1:5514", "http"),
+            ("http://[::1]:5514", "http"),
+            ("http://localhost:5514", "http"),
+            ("ws://127.0.0.1:5514", "ws"),
+        ] {
+            let error = resolve_upstream_tls(Some("1"), upstream, None)
+                .expect_err("a cleartext upstream must refuse");
+            assert!(
+                matches!(&error, ConfigError::InsecureUpstreamNotHttps { scheme: s } if s == scheme),
+                "{upstream} gave {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(ENV_INSECURE_UPSTREAM), "got: {message}");
+            assert!(message.contains(&format!("`{scheme}`")), "got: {message}");
+            assert!(message.contains("https"), "got: {message}");
         }
     }
 
