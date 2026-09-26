@@ -14,7 +14,7 @@
 //!   `routes::stream`, which streams bytes rather than buffering.
 //! - Hop-by-hop headers are stripped (connection, upgrade, te, etc.).
 //! - An upstream 3xx becomes the proxy's own 502, and `Location` never
-//!   reaches the browser; see [`refuse_redirect`].
+//!   reaches the browser; see `refuse_redirect`.
 
 use axum::body::Body;
 use axum::extract::{Request, State};
