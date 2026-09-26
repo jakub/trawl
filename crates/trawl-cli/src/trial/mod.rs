@@ -30,10 +30,6 @@ pub mod paths;
 mod preflight;
 pub mod profile;
 mod render;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "trawl trial up seeds the samples")
-)]
 mod sample;
 mod secrets;
 mod state;

@@ -204,6 +204,27 @@ pub enum TrialError {
     #[error("not deleted: the answer was not yes")]
     Declined,
 
+    #[error(
+        "the sample post's result is unknown: after {secs}s the sample services hold \
+         {counts}{detail}. trawl never posts the samples twice. Start over with \
+         `trawl trial down --yes` and then `trawl trial up`, or keep this trial without \
+         samples with `trawl trial up --no-sample-data`"
+    )]
+    SamplesUnverified {
+        secs: u64,
+        counts: String,
+        detail: String,
+    },
+
+    #[error(
+        "the sample services already hold events this trial cannot account for \
+         ({counts}), and posting the samples could duplicate them; trawl never posts the \
+         samples twice. Start over with `trawl trial down --yes` and then \
+         `trawl trial up`, or keep this trial without samples with \
+         `trawl trial up --no-sample-data`"
+    )]
+    SamplesUnaccounted { counts: String },
+
     #[error(transparent)]
     Preflight(#[from] super::preflight::PreflightError),
 

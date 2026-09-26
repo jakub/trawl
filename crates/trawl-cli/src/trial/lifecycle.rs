@@ -29,6 +29,10 @@
 //!    else every active key of that name is revoked and a new one minted.
 //! 8. `compose up --wait trawld trawl-web`, then `whoami` for both keys
 //!    through the pinned certificate, and one authenticated query.
+//! 9. samples, unless `--no-sample-data`: the intent is recorded before
+//!    the one POST, and completion only after the counts are verified.
+//!    [`sample::decide_samples`] rules every branch, and a result `up`
+//!    cannot verify is never posted again.
 //!
 //! `status`, `key`, and `-p trial` take no lock: they read files that are
 //! only ever replaced by an atomic rename.
@@ -48,6 +52,7 @@ use super::ownership::{self, Foreign, Inventory, Kind, Ownership, Resource};
 use super::paths::{TrialPaths, read_private, read_public, write_private};
 use super::preflight::{self, Engine};
 use super::render::{self, Containers};
+use super::sample::{self, SampleAction};
 use super::secrets::{self, CookieKey, DbPasswords, HexSecret, Target, put_file};
 use super::state::{
     DownView, ImageRecord, Images, KeyRecord, Phases, Ports, SCHEMA, Samples, TlsRecord, TrialState,
@@ -238,9 +243,9 @@ pub async fn up(paths: &TrialPaths, args: &UpArgs) -> Result<(), TrialError> {
     setup(docker, paths, &mut state).await?;
     start_services(docker, &state).await?;
     let clients = verify(paths, &state).await?;
-    drop(clients);
     state.phases.services_verified = true;
     state.save(&paths.state_file())?;
+    seed(paths, &mut state, &clients, !args.no_sample_data).await?;
 
     let mut stdout = io::stdout().lock();
     render::render_summary(&mut stdout, &state, paths)
@@ -1038,6 +1043,191 @@ pub fn check_identity(key: TrialKey, who: &trawl_api::WhoAmIResponse) -> Result<
     Ok(())
 }
 
+// -- samples ----------------------------------------------------------------
+
+/// How long `up` waits for posted samples to become queryable.
+const SAMPLE_WAIT: Duration = Duration::from_mins(1);
+
+/// Counts events per service. Only the sample services are compared, so
+/// trawld's self-telemetry never enters a decision.
+const COUNT_QUERY: &str = "* | stats count() as events by service";
+
+/// The sample step. [`sample::decide_samples`] decides; this carries it
+/// out. `Intent` is saved before the single POST, and `Complete` only
+/// once the sample services hold exactly the expected counts. Anything
+/// else refuses with recovery text and never posts again.
+async fn seed(
+    paths: &TrialPaths,
+    state: &mut TrialState,
+    clients: &Clients,
+    requested: bool,
+) -> Result<(), TrialError> {
+    let url = render::api_url(state);
+    let observed = count_samples(&clients.operator, &url).await?;
+    match sample::decide_samples(&state.samples, requested, &observed) {
+        SampleAction::Skip => {
+            if !requested && state.samples == Samples::NotRequested {
+                state.samples = Samples::Skipped;
+                state.save(&paths.state_file())?;
+            }
+            Ok(())
+        }
+        SampleAction::MarkComplete => {
+            let Samples::Intent { seed, anchor, .. } = &state.samples else {
+                unreachable!("decide_samples completes only an intent");
+            };
+            let anchor = chrono::DateTime::parse_from_rfc3339(anchor)
+                .map_err(|_| TrialError::StateInvalid {
+                    path: paths.state_file(),
+                    detail: "the samples anchor is not an RFC 3339 time".into(),
+                })?
+                .with_timezone(&chrono::Utc);
+            progress("the earlier sample post landed; recording it");
+            state.samples = complete(*seed, &sample::generate(*seed, anchor));
+            state.save(&paths.state_file())
+        }
+        SampleAction::Refuse { observed } => Err(TrialError::SamplesUnaccounted {
+            counts: describe_counts(&observed, None),
+        }),
+        SampleAction::Post => post_samples(paths, state, clients, &url).await,
+    }
+}
+
+/// Record the intent, post once, and wait for the exact counts.
+async fn post_samples(
+    paths: &TrialPaths,
+    state: &mut TrialState,
+    clients: &Clients,
+    url: &str,
+) -> Result<(), TrialError> {
+    let set = sample::generate(sample::SAMPLE_SEED, chrono::Utc::now());
+    let expected: std::collections::BTreeMap<String, u64> = sample::expected_counts()
+        .into_iter()
+        .map(|(service, count)| (service.to_owned(), count))
+        .collect();
+    state.samples = Samples::Intent {
+        seed: sample::SAMPLE_SEED,
+        anchor: rfc3339(set.last),
+        expected: expected.clone(),
+    };
+    state.save(&paths.state_file())?;
+
+    progress(format_args!(
+        "posting {} sample events with the ingest key",
+        set.events.len()
+    ));
+    let posted = clients.ingest.ingest(&set.events).await;
+    let detail = match &posted {
+        Ok(response) if response.rejected == 0 => None,
+        Ok(response) => Some(format!(
+            "trawld accepted {} and rejected {}",
+            response.accepted, response.rejected
+        )),
+        Err(e) => Some(format!("the post failed: {e}")),
+    };
+
+    let deadline = Instant::now() + SAMPLE_WAIT;
+    let observed = loop {
+        let counts = count_samples(&clients.operator, url).await?;
+        let counts: std::collections::BTreeMap<String, u64> = expected
+            .keys()
+            .map(|service| (service.clone(), counts.get(service).copied().unwrap_or(0)))
+            .collect();
+        if counts == expected {
+            state.samples = complete(sample::SAMPLE_SEED, &set);
+            return state.save(&paths.state_file());
+        }
+        if Instant::now() >= deadline {
+            break counts;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    };
+    Err(TrialError::SamplesUnverified {
+        secs: SAMPLE_WAIT.as_secs(),
+        counts: describe_counts(&observed, Some(&expected)),
+        detail: detail.map(|d| format!(" ({d})")).unwrap_or_default(),
+    })
+}
+
+fn rfc3339(time: chrono::DateTime<chrono::Utc>) -> String {
+    time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn complete(seed: u64, set: &sample::SampleSet) -> Samples {
+    Samples::Complete {
+        seed,
+        first: rfc3339(set.first),
+        last: rfc3339(set.last),
+        total: set.events.len() as u64,
+    }
+}
+
+/// `web 350/700, api 0/500`, or `web 3, api 0` without expectations.
+fn describe_counts(
+    observed: &std::collections::BTreeMap<String, u64>,
+    expected: Option<&std::collections::BTreeMap<String, u64>>,
+) -> String {
+    observed
+        .iter()
+        .map(
+            |(service, count)| match expected.and_then(|e| e.get(service)) {
+                Some(want) => format!("{service} {count}/{want}"),
+                None => format!("{service} {count}"),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Events per service, through the operator key.
+async fn count_samples(
+    operator: &HttpClient,
+    url: &str,
+) -> Result<std::collections::BTreeMap<String, u64>, TrialError> {
+    let response = operator
+        .query_paginated(COUNT_QUERY, None, None)
+        .await
+        .map_err(|source| TrialError::Api {
+            url: url.to_owned(),
+            source,
+        })?;
+    counts_by_service(&response.result).ok_or_else(|| TrialError::Api {
+        url: url.to_owned(),
+        source: trawl_client::ClientError::Parse(format!(
+            "`{COUNT_QUERY}` returned columns trawl cannot read"
+        )),
+    })
+}
+
+/// Read `service` and `events` from a [`COUNT_QUERY`] result. A row with
+/// no service counts toward nothing.
+fn counts_by_service(
+    result: &trawl_api::value::QueryResult,
+) -> Option<std::collections::BTreeMap<String, u64>> {
+    use trawl_api::value::Value;
+    let column = |name: &str| result.columns.iter().position(|c| c.name == name);
+    if result.rows.is_empty() {
+        return Some(std::collections::BTreeMap::new());
+    }
+    let (service, events) = (column("service")?, column("events")?);
+    let mut counts = std::collections::BTreeMap::new();
+    for row in &result.rows {
+        let count = match row.get(events)? {
+            Value::Integer(n) => u64::try_from(*n).ok()?,
+            Value::UInt(n) => *n,
+            _ => return None,
+        };
+        match row.get(service)? {
+            Value::String(name) => {
+                *counts.entry(name.clone()).or_insert(0) += count;
+            }
+            Value::Null => {}
+            _ => return None,
+        }
+    }
+    Some(counts)
+}
+
 // -- status and key ---------------------------------------------------------
 
 /// `trawl trial status`: works without the lock, and without Docker.
@@ -1589,6 +1779,79 @@ mod tests {
             Some(&recorded),
             TrialKey::Operator
         ));
+    }
+
+    #[test]
+    fn counts_are_read_by_column_name() {
+        use trawl_api::value::{Column, QueryResult, Value};
+        let result = QueryResult {
+            columns: vec![
+                Column {
+                    name: "events".into(),
+                },
+                Column {
+                    name: "service".into(),
+                },
+            ],
+            rows: vec![
+                vec![Value::Integer(700), Value::String("web".into())],
+                vec![Value::UInt(3), Value::String("tutorial".into())],
+                vec![Value::Integer(41), Value::Null],
+            ],
+        };
+        let counts = counts_by_service(&result).unwrap();
+        assert_eq!(
+            counts,
+            [("tutorial".to_owned(), 3), ("web".to_owned(), 700)].into()
+        );
+        assert_eq!(
+            counts_by_service(&QueryResult::empty()),
+            Some(std::collections::BTreeMap::new())
+        );
+        let unreadable = QueryResult {
+            columns: vec![Column {
+                name: "count".into(),
+            }],
+            rows: vec![vec![Value::Integer(1)]],
+        };
+        assert_eq!(counts_by_service(&unreadable), None);
+        let negative = QueryResult {
+            rows: vec![vec![Value::Integer(-1), Value::String("web".into())]],
+            ..result
+        };
+        assert_eq!(counts_by_service(&negative), None);
+    }
+
+    #[test]
+    fn unverified_samples_explain_how_to_recover() {
+        let observed = [("api".to_owned(), 0), ("web".to_owned(), 350)].into();
+        let expected = [("api".to_owned(), 500), ("web".to_owned(), 700)].into();
+        assert_eq!(
+            describe_counts(&observed, Some(&expected)),
+            "api 0/500, web 350/700"
+        );
+        assert_eq!(describe_counts(&observed, None), "api 0, web 350");
+        for err in [
+            TrialError::SamplesUnverified {
+                secs: 60,
+                counts: describe_counts(&observed, Some(&expected)),
+                detail: String::new(),
+            },
+            TrialError::SamplesUnaccounted {
+                counts: describe_counts(&observed, None),
+            },
+        ] {
+            let message = err.to_string();
+            assert!(message.contains("trawl trial down --yes"), "{message}");
+            assert!(
+                message.contains("trawl trial up --no-sample-data"),
+                "{message}"
+            );
+            assert!(
+                message.contains("never posts the samples twice"),
+                "{message}"
+            );
+        }
     }
 
     #[test]
