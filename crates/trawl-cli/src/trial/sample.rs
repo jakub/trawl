@@ -244,6 +244,10 @@ const TUTORIAL_EVENTS: [(&str, &str, u64); 3] = [
 ];
 
 /// The four examples of the browser's Search quick start, verbatim.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "tests hold the recent slice against them")
+)]
 pub const QUICK_START_QUERIES: [&str; 4] = [
     "* | head 20",
     "* | stats count() by service",
