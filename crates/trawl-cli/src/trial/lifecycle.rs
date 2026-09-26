@@ -641,8 +641,10 @@ async fn resolve_image(docker: &Docker, reference: &str) -> Result<ImageRecord, 
 
 /// A new trial: its images, its state, and its engine claim. The state is
 /// written before the claim, so an interrupted first `up` leaves a trial
-/// the rerun resumes, never a claim without state. A claim that is refused
-/// removes the directory this call created.
+/// the rerun resumes, never a claim without state. A claim that was
+/// refused for certain ([`claim_refused`]) removes the directory this
+/// call created; any other failure keeps it, because the claim may exist
+/// with this trial's id, and a rerun must find the state that owns it.
 async fn create(
     paths: &TrialPaths,
     docker: &Docker,
@@ -678,12 +680,38 @@ async fn create(
     paths.ensure_dir()?;
     state.save(&paths.state_file())?;
     if let Err(e) = ownership::claim(docker, &state.trial_id, &state.images.trawl).await {
-        if let Ok(true) = paths.check_dir() {
+        if claim_refused(&e)
+            && let Ok(true) = paths.check_dir()
+        {
             let _ = std::fs::remove_dir_all(&paths.dir);
         }
         return Err(e);
     }
     Ok(state)
+}
+
+/// How the Docker CLI prefixes an error the engine answered a request
+/// with (docker/cli v29.7.2, `vendor/github.com/moby/moby/client/request.go`,
+/// line 306).
+const ENGINE_ERROR: &str = "Error response from daemon:";
+
+/// Whether an error from [`ownership::claim`] proves that no claim with
+/// our id exists: another trial's claim holds the name, or the engine
+/// answered the create with an error, and it creates nothing then. A
+/// timeout, a lost connection, or a pipe error can follow a create the
+/// engine carried out, and any error of the inspect that follows a
+/// failed create leaves the create's outcome open, so they prove nothing.
+pub fn claim_refused(error: &TrialError) -> bool {
+    use super::docker::DockerError;
+    use super::ownership::OwnershipError;
+    match error {
+        TrialError::Ownership(OwnershipError::Foreign { .. }) => true,
+        TrialError::Docker(DockerError::Failed {
+            detail: Some(detail),
+            ..
+        }) => detail.contains(ENGINE_ERROR),
+        _ => false,
+    }
 }
 
 /// Render `compose.json` for the state, at 0600. It holds no secret.
@@ -1571,6 +1599,91 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("ENGINE:A"), "{message}");
         assert!(message.contains("ENGINE:B"), "{message}");
+    }
+
+    /// `create` deletes the new state only when the claim was refused for
+    /// certain; every outcome that could hide a created claim keeps it.
+    #[test]
+    fn only_a_certain_refusal_drops_the_new_state() {
+        use crate::trial::docker::DockerError;
+        use crate::trial::ownership::{Foreign, OwnershipError};
+
+        let create = "docker container create --name trawl-trial-claim --label \
+                      sh.trawl.trial.id=0123 sha256:aaaa true";
+        let failed = |detail: Option<&str>| {
+            TrialError::Docker(DockerError::Failed {
+                command: create.into(),
+                status: "exit status 1".into(),
+                detail: detail.map(Into::into),
+            })
+        };
+        let foreign = |holder: Option<&str>| {
+            TrialError::Ownership(OwnershipError::Foreign {
+                resources: vec![Foreign {
+                    kind: Kind::Container,
+                    name: CLAIM_NAME.into(),
+                    trial_id: holder.map(Into::into),
+                }],
+            })
+        };
+        let table = [
+            (foreign(Some("fedcba9876543210fedcba9876543210")), true),
+            (foreign(None), true),
+            (
+                failed(Some(
+                    "Error response from daemon: Conflict. The container name \
+                     \"/trawl-trial-claim\" is already in use by container \"c0ffee\"",
+                )),
+                true,
+            ),
+            (
+                failed(Some(
+                    "Error response from daemon: No such image: sha256:aaaa",
+                )),
+                true,
+            ),
+            // From the inspect, after a create whose outcome is unknown.
+            (TrialError::Docker(DockerError::NotInstalled), false),
+            (
+                failed(Some(
+                    "error during connect: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.52/\
+                     containers/create?name=trawl-trial-claim\": EOF",
+                )),
+                false,
+            ),
+            (
+                failed(Some(
+                    "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. \
+                     Is the docker daemon running?",
+                )),
+                false,
+            ),
+            (failed(None), false),
+            (
+                TrialError::Docker(DockerError::TimedOut {
+                    command: create.into(),
+                    secs: 30,
+                }),
+                false,
+            ),
+            (
+                TrialError::Docker(DockerError::Spawn {
+                    command: create.into(),
+                    source: io::Error::from(io::ErrorKind::BrokenPipe),
+                }),
+                false,
+            ),
+            (
+                TrialError::Docker(DockerError::OutputTooLarge {
+                    command: create.into(),
+                    limit: 1,
+                }),
+                false,
+            ),
+        ];
+        for (error, refused) in &table {
+            assert_eq!(claim_refused(error), *refused, "{error}");
+        }
     }
 
     fn record(reference: &str, id: &str, digest: Option<&str>) -> ImageRecord {
