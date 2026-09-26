@@ -2,14 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The proxy never follows an upstream redirect.
+//! The proxy never follows an upstream redirect, and never hands one to
+//! the browser.
 //!
 //! With `TRAWL_WEB_INSECURE_UPSTREAM` on, whatever holds the loopback port
 //! could answer 3xx and send the proxy, with certificate checks off, to a
 //! second host. That would defeat the loopback-only rule, so the upstream
-//! client follows no redirect in any trust mode. Each test runs two real
-//! listeners: the upstream answers 307 to the other, and the other must see
-//! no request at all.
+//! client follows no redirect in any trust mode. Passing the 3xx through is
+//! no better: the browser would follow it, and a `Location` naming another
+//! port on the browser's host carries the host-scoped session cookie to
+//! whatever listens there. So every browser-facing route answers an
+//! upstream 3xx with the proxy's own 502 and no `Location`.
+//!
+//! Each test runs two real listeners: the upstream answers 307 to the
+//! other, and the other must see no request at all.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -117,18 +123,64 @@ async fn login_does_not_follow_an_upstream_redirect() {
     }
 }
 
+/// Log in against an upstream whose `/whoami` answers once, and return
+/// the session cookie pair. Mount the route's redirect after this, so the
+/// redirect is what the route sees and not the login.
+async fn session_cookie(state: AppState, upstream: &MockServer, mode: &str) -> String {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/whoami"))
+        .respond_with(whoami_ok())
+        .up_to_n_times(1)
+        .mount(upstream)
+        .await;
+    let response = login(state).await;
+    assert_eq!(response.status(), StatusCode::OK, "{mode}");
+    response
+        .headers()
+        .get(header::SET_COOKIE)
+        .expect("a session cookie")
+        .to_str()
+        .expect("ASCII cookie")
+        .split(';')
+        .next()
+        .expect("cookie pair")
+        .to_owned()
+}
+
+/// Send `uri` with the session cookie and check the browser gets the
+/// proxy's upstream error: a 502, no redirect status, no `Location`.
+async fn assert_redirect_refused(state: AppState, cookie: &str, uri: &str, mode: &str) {
+    let request = Request::builder()
+        .uri(uri)
+        .header(header::COOKIE, cookie)
+        .body(Body::empty())
+        .expect("request");
+    let response = routes::build(state)
+        .oneshot(request)
+        .await
+        .expect("router answers");
+    assert!(
+        !response.status().is_redirection(),
+        "{mode} {uri}: the browser was handed a {} to follow",
+        response.status()
+    );
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{mode} {uri}");
+    assert!(
+        response.headers().get(header::LOCATION).is_none(),
+        "{mode} {uri}: the upstream Location reached the browser: {:?}",
+        response.headers().get(header::LOCATION)
+    );
+}
+
 /// The generic `/api/v1/*` forwarder.
 #[tokio::test]
-async fn forwarding_does_not_follow_an_upstream_redirect() {
+async fn forwarding_does_not_follow_or_pass_on_an_upstream_redirect() {
     for tls in modes() {
         let mode = format!("{tls:?}");
         let upstream = MockServer::start().await;
         let elsewhere = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/whoami"))
-            .respond_with(whoami_ok())
-            .mount(&upstream)
-            .await;
+        let state = state(&upstream, tls);
+        let cookie = session_cookie(state.clone(), &upstream, &mode).await;
         redirect(
             &upstream,
             &elsewhere,
@@ -137,34 +189,52 @@ async fn forwarding_does_not_follow_an_upstream_redirect() {
         )
         .await;
 
-        let state = state(&upstream, tls);
-        let response = login(state.clone()).await;
-        assert_eq!(response.status(), StatusCode::OK, "{mode}");
-        let cookie = response
-            .headers()
-            .get(header::SET_COOKIE)
-            .expect("a session cookie")
-            .to_str()
-            .expect("ASCII cookie")
-            .split(';')
-            .next()
-            .expect("cookie pair")
-            .to_owned();
-
-        let request = Request::builder()
-            .uri("/api/v1/schema")
-            .header(header::COOKIE, cookie)
-            .body(Body::empty())
-            .expect("request");
-        let response = routes::build(state)
-            .oneshot(request)
-            .await
-            .expect("router answers");
-        assert_ne!(
-            response.status(),
-            StatusCode::OK,
-            "{mode}: the proxy answered with the second listener's body"
-        );
+        assert_redirect_refused(state, &cookie, "/api/v1/schema", &mode).await;
         assert_untouched(&elsewhere, &mode).await;
+    }
+}
+
+/// `/api/auth/me` asks the upstream `/whoami` on every call.
+#[tokio::test]
+async fn me_does_not_follow_or_pass_on_an_upstream_redirect() {
+    for tls in modes() {
+        let mode = format!("{tls:?}");
+        let upstream = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        let state = state(&upstream, tls);
+        let cookie = session_cookie(state.clone(), &upstream, &mode).await;
+        redirect(&upstream, &elsewhere, "/api/v1/whoami", whoami_ok()).await;
+
+        assert_redirect_refused(state, &cookie, "/api/auth/me", &mode).await;
+        assert_untouched(&elsewhere, &mode).await;
+    }
+}
+
+/// Both SSE forwarders, which stream rather than buffer.
+#[tokio::test]
+async fn streams_do_not_follow_or_pass_on_an_upstream_redirect() {
+    for (route, uri) in [
+        ("/api/v1/stream", "/api/v1/stream?query=_severity%3Derror"),
+        ("/api/v1/dashboard/stream", "/api/v1/dashboard/stream"),
+    ] {
+        for tls in modes() {
+            let mode = format!("{tls:?}");
+            let upstream = MockServer::start().await;
+            let elsewhere = MockServer::start().await;
+            let state = state(&upstream, tls);
+            let cookie = session_cookie(state.clone(), &upstream, &mode).await;
+            redirect(
+                &upstream,
+                &elsewhere,
+                route,
+                ResponseTemplate::new(200)
+                    .insert_header(header::CONTENT_TYPE.as_str(), "text/event-stream")
+                    .set_body_string("event: data\ndata: {}\n\n"),
+            )
+            .await;
+
+            assert_redirect_refused(state, &cookie, uri, &mode).await;
+            assert_untouched(&elsewhere, &mode).await;
+        }
     }
 }
