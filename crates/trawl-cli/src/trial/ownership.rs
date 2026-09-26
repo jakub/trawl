@@ -172,6 +172,12 @@ pub enum OwnershipError {
         list(.resources)
     )]
     Foreign { resources: Vec<Foreign> },
+
+    #[error(
+        "`docker container inspect {}` printed labels trawl cannot read",
+        CLAIM_NAME
+    )]
+    ClaimUnreadable,
 }
 
 fn list(resources: &[Foreign]) -> String {
@@ -352,31 +358,63 @@ pub enum ClaimDecision {
 }
 
 /// Decide from the existing claim's labels (`docker container inspect`
-/// `.Config.Labels` JSON; `null` when it has none).
-pub fn decide_claim(labels_json: &[u8], our_id: &str) -> ClaimDecision {
+/// `.Config.Labels` JSON; `null` when it has none). Output that is not
+/// such JSON shows nothing about the claim, so it is an error, never a
+/// refusal.
+pub fn decide_claim(labels_json: &[u8], our_id: &str) -> Result<ClaimDecision, OwnershipError> {
     let labels: Option<BTreeMap<String, String>> =
-        serde_json::from_slice(labels_json).unwrap_or_default();
+        serde_json::from_slice(labels_json).map_err(|_| OwnershipError::ClaimUnreadable)?;
     let holder = labels
         .and_then(|mut labels| labels.remove(LABEL_ID))
         .filter(|id| !id.is_empty());
-    if holder.as_deref() == Some(our_id) {
+    Ok(if holder.as_deref() == Some(our_id) {
         ClaimDecision::Proceed
     } else {
         ClaimDecision::Refuse { holder }
-    }
+    })
 }
 
-/// How [`claim`] went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What [`claim`] observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Claimed {
     /// This call created the claim.
     Created,
-    /// Our claim was already there.
+    /// Our inspect found the claim carrying our id.
     Existing,
+    /// Our inspect found the claim carrying another id, or none: another
+    /// trial, or something else, holds the engine, and nothing of ours
+    /// was created. Every create carries our id, so this is the one
+    /// outcome that proves no claim of ours exists.
+    Foreign { holder: Option<String> },
+}
+
+impl Claimed {
+    /// Go on only when the claim is ours; refuse a foreign one, naming
+    /// its holder.
+    pub fn require_ours(self) -> Result<Self, OwnershipError> {
+        match self {
+            Self::Foreign { holder } => Err(OwnershipError::Foreign {
+                resources: vec![Foreign {
+                    kind: Kind::Container,
+                    name: CLAIM_NAME.to_owned(),
+                    trial_id: holder,
+                }],
+            }),
+            ours => Ok(ours),
+        }
+    }
 }
 
 /// Take the engine for `trial_id`, atomically: create the claim, and if
-/// the name is taken, proceed only when the existing claim is ours.
+/// the create fails, inspect the claim to learn whose it is.
+///
+/// A failed create proves nothing about the claim: an engine can carry
+/// out a create and then fail the response, for example when an
+/// authorization plugin denies it, and a timeout or a lost connection can
+/// follow a create the engine made. So every failure returns an error
+/// except what the inspect shows: [`Claimed::Existing`] for our id, and
+/// [`Claimed::Foreign`] for any other. A claim the inspect cannot find or
+/// read returns the create's error, or the inspect's own.
 pub async fn claim(
     docker: &Docker,
     trial_id: &str,
@@ -389,8 +427,9 @@ pub async fn claim(
     if created.status.success() {
         return Ok(Claimed::Created);
     }
-    // The create failed. If a claim exists, that is why; if none does, the
-    // create's own error is the one to report.
+    // The create failed. If a claim exists, the inspect says whose it is;
+    // if the inspect finds none, the create's own error is the one to
+    // report.
     let existing = docker
         .output(
             &claim_inspect_args(),
@@ -408,17 +447,10 @@ pub async fn claim(
         )
         .into());
     }
-    match decide_claim(&existing.stdout, trial_id) {
-        ClaimDecision::Proceed => Ok(Claimed::Existing),
-        ClaimDecision::Refuse { holder } => Err(OwnershipError::Foreign {
-            resources: vec![Foreign {
-                kind: Kind::Container,
-                name: CLAIM_NAME.to_owned(),
-                trial_id: holder,
-            }],
-        }
-        .into()),
-    }
+    Ok(match decide_claim(&existing.stdout, trial_id)? {
+        ClaimDecision::Proceed => Claimed::Existing,
+        ClaimDecision::Refuse { holder } => Claimed::Foreign { holder },
+    })
 }
 
 #[cfg(test)]
@@ -711,64 +743,123 @@ mod tests {
     fn an_existing_claim_is_ours_or_refused() {
         let ours = format!(r#"{{"{LABEL_ID}":"{OURS}"}}"#);
         let theirs = format!(r#"{{"{LABEL_ID}":"{THEIRS}","other":"x"}}"#);
-        assert_eq!(decide_claim(ours.as_bytes(), OURS), ClaimDecision::Proceed);
+        assert_eq!(
+            decide_claim(ours.as_bytes(), OURS),
+            Ok(ClaimDecision::Proceed)
+        );
         assert_eq!(
             decide_claim(theirs.as_bytes(), OURS),
-            ClaimDecision::Refuse {
+            Ok(ClaimDecision::Refuse {
                 holder: Some(THEIRS.into())
-            }
+            })
         );
-        for unlabelled in [
-            &b"null"[..],
-            b"{}",
-            br#"{"sh.trawl.trial.id":""}"#,
-            b"garbage",
-        ] {
+        for unlabelled in [&b"null"[..], b"{}", br#"{"sh.trawl.trial.id":""}"#] {
             assert_eq!(
                 decide_claim(unlabelled, OURS),
-                ClaimDecision::Refuse { holder: None }
+                Ok(ClaimDecision::Refuse { holder: None })
+            );
+        }
+        for unreadable in [&b"garbage"[..], b"", br#"{"sh.trawl.trial.id":"#] {
+            assert_eq!(
+                decide_claim(unreadable, OURS),
+                Err(OwnershipError::ClaimUnreadable)
             );
         }
     }
 
+    /// The claim decision table. `lifecycle::create` deletes the state a
+    /// first `up` wrote only on a `Foreign` row: our inspect saw the claim
+    /// carrying another id, or none, so no claim of ours exists. Every
+    /// `Err` row keeps the state, because the claim may exist with our id;
+    /// the error names the create's failure, or the inspect's.
     #[tokio::test]
-    async fn claim_creates_proceeds_on_ours_and_refuses_theirs() {
-        let (_tmp, docker) = stub("case \"$1 $2\" in \"container create\") exit 0 ;; esac; exit 9");
-        assert_eq!(
-            claim(&docker, OURS, &image()).await.unwrap(),
-            Claimed::Created
+    async fn claim_decision_table() {
+        let fail = |stderr: &str| format!("echo '{stderr}' >&2; exit 1");
+        let conflict = fail(
+            "Error response from daemon: Conflict. The container name \
+             \"/trawl-trial-claim\" is already in use by container \"c0ffee\"",
         );
+        // The engine made the claim, then its authorization plugin denied
+        // the response.
+        let denied = fail("Error response from daemon: authorization denied by plugin authz");
+        let labels = |id: &str| format!("printf '{{\"{LABEL_ID}\":\"{id}\"}}'");
+        let absent = fail("Error: No such container: trawl-trial-claim");
+        let flood = "head -c 9000000 /dev/zero".to_owned();
+        let table: [(String, String, Result<Claimed, &str>); 12] = [
+            ("exit 0".into(), "exit 9".into(), Ok(Claimed::Created)),
+            (conflict.clone(), labels(OURS), Ok(Claimed::Existing)),
+            (denied.clone(), labels(OURS), Ok(Claimed::Existing)),
+            (
+                conflict.clone(),
+                labels(THEIRS),
+                Ok(Claimed::Foreign {
+                    holder: Some(THEIRS.into()),
+                }),
+            ),
+            (
+                conflict.clone(),
+                "echo null".into(),
+                Ok(Claimed::Foreign { holder: None }),
+            ),
+            (
+                denied.clone(),
+                fail("Error response from daemon: authorization denied by plugin authz"),
+                Err("denied by plugin"),
+            ),
+            (
+                fail("Error response from daemon: No such image: sha256:aaaa"),
+                absent.clone(),
+                Err("No such image"),
+            ),
+            (
+                fail(
+                    "error during connect: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.52/\
+                     containers/create?name=trawl-trial-claim\": EOF",
+                ),
+                fail("Cannot connect to the Docker daemon at unix:///var/run/docker.sock"),
+                Err("error during connect"),
+            ),
+            (
+                "kill -9 $$".into(),
+                absent.clone(),
+                Err("killed by signal 9"),
+            ),
+            (
+                conflict.clone(),
+                "echo garbage".into(),
+                Err("printed labels trawl cannot read"),
+            ),
+            (flood.clone(), labels(OURS), Err("wrote more than")),
+            (conflict, flood, Err("wrote more than")),
+        ];
+        for (create, inspect, want) in table {
+            let (_tmp, docker) = stub(&format!(
+                "case \"$1 $2\" in\n  \"container create\") {create} ;;\n  \
+                 \"container inspect\") {inspect} ;;\nesac"
+            ));
+            let row = format!("create: {create}; inspect: {inspect}");
+            match (claim(&docker, OURS, &image()).await, want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{row}"),
+                (Err(err), Err(want)) => assert!(err.to_string().contains(want), "{row}: {err}"),
+                (got, want) => panic!("{row}: got {got:?}, want {want:?}"),
+            }
+        }
+    }
 
-        let conflict = |holder: &str| {
-            format!(
-                r#"case "$1 $2" in
-  "container create") echo 'Conflict. The container name "/trawl-trial-claim" is already in use' >&2; exit 1 ;;
-  "container inspect") printf '{{"{LABEL_ID}":"{holder}"}}' ;;
-esac"#
-            )
-        };
-        let (_tmp, docker) = stub(&conflict(OURS));
-        assert_eq!(
-            claim(&docker, OURS, &image()).await.unwrap(),
-            Claimed::Existing
-        );
-
-        let (_tmp, docker) = stub(&conflict(THEIRS));
-        let err = claim(&docker, OURS, &image()).await.unwrap_err();
+    #[test]
+    fn only_a_foreign_claim_is_refused() {
+        assert_eq!(Claimed::Created.require_ours(), Ok(Claimed::Created));
+        assert_eq!(Claimed::Existing.require_ours(), Ok(Claimed::Existing));
+        let err = Claimed::Foreign {
+            holder: Some(THEIRS.into()),
+        }
+        .require_ours()
+        .unwrap_err();
         assert!(
-            err.to_string().contains(&format!("trial id {THEIRS}")),
+            err.to_string()
+                .contains(&format!("{CLAIM_NAME} (trial id {THEIRS})")),
             "{err}"
         );
-
-        // No claim exists, so the create's own failure is reported.
-        let (_tmp, docker) = stub(
-            r#"case "$1 $2" in
-  "container create") echo 'No such image: sha256:aaaa' >&2; exit 1 ;;
-  "container inspect") echo 'No such container' >&2; exit 1 ;;
-esac"#,
-        );
-        let err = claim(&docker, OURS, &image()).await.unwrap_err();
-        assert!(err.to_string().contains("No such image"), "{err}");
     }
 
     #[tokio::test]
