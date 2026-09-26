@@ -151,7 +151,7 @@ jobs:
 
   release:
     name: github release
-    needs: [resolve-source, docker, publish-helm]
+    needs: [resolve-source, docker, publish-helm, anonymous-pull]
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
@@ -413,3 +413,13 @@ jobs:
 
       - name: Publish the exact prebuilt chart
         run: helm push chart-artifact/trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
+
+  # An evaluator pulls with no GitHub account (ADR-0045). Check both channels
+  # the way they do before the release is announced.
+  anonymous-pull:
+    needs: [resolve-source, docker, publish-helm]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/anonymous-pull.yml
+    with:
+      tag: ${{ needs.resolve-source.outputs.tag }}

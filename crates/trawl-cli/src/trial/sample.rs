@@ -717,13 +717,31 @@ mod tests {
         );
     }
 
+    /// The browser's examples, and the copies the CI trial proof runs
+    /// (`scripts/release/test-trial.sh`) together with the documented query
+    /// and row it asserts.
     #[test]
     fn quick_start_queries_are_the_browsers_literals() {
         let source = include_str!("../../../trawl-web-ui/src/components/search_quick_start.rs");
+        let proof = include_str!("../../../../scripts/release/test-trial.sh");
         for query in QUICK_START_QUERIES {
             assert!(source.contains(&format!("\"{query}\"")), "{query}");
+            assert!(proof.contains(&format!("\n  \"{query}\"\n")), "{query}");
             trawl_core::parser::parse(query).expect("the example parses");
         }
+        assert!(
+            proof.contains(&format!("\nDOCUMENTED_QUERY='{DOCUMENTED_QUERY}'\n")),
+            "test-trial.sh runs another documented query"
+        );
+        let row = proof
+            .lines()
+            .find_map(|line| line.strip_prefix("DOCUMENTED_ROW='"))
+            .and_then(|rest| rest.strip_suffix('\''))
+            .expect("test-trial.sh sets DOCUMENTED_ROW");
+        assert_eq!(
+            serde_json::from_str::<Value>(row).expect("DOCUMENTED_ROW is JSON"),
+            documented_row()
+        );
     }
 
     /// The documented query has no time clause, so its row does not age,

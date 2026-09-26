@@ -8,9 +8,15 @@ on:
       - '.github/workflows/macos-cli.yml'
       - '.github/workflows/distribution-preflight.yml'
       - 'scripts/release/**'
+      - 'Dockerfile'
       - 'Cargo.lock'
       - 'Cargo.toml'
-      - 'crates/trawl-cli/Cargo.toml'
+      # The trial job runs the CLI, the browser proxy, and the Debian units
+      # from these crates, and follows the trial tutorial.
+      - 'crates/trawl-cli/**'
+      - 'crates/trawl-web/**'
+      - 'crates/trawl-server/debian/**'
+      - 'docs/src/content/docs/getting-started/first-query.md'
       - 'crates/trawl-core/Cargo.toml'
       - 'crates/trawl-core/build.rs'
       - 'crates/trawl-core/build_support/**'
