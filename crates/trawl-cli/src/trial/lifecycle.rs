@@ -1121,7 +1121,12 @@ async fn seed(
             state.samples = complete(*seed, &sample::generate(*seed, anchor));
             state.save(&paths.state_file())
         }
-        SampleAction::Refuse { observed } => Err(TrialError::SamplesUnaccounted {
+        SampleAction::RefuseUnknownPost { observed, expected } => {
+            Err(TrialError::SamplesPostUnknown {
+                counts: describe_counts(&observed, Some(&expected)),
+            })
+        }
+        SampleAction::RefuseUnaccounted { observed } => Err(TrialError::SamplesUnaccounted {
             counts: describe_counts(&observed, None),
         }),
         SampleAction::Post => post_samples(paths, state, clients, &url).await,
@@ -1902,6 +1907,9 @@ mod tests {
                 counts: describe_counts(&observed, Some(&expected)),
                 detail: String::new(),
             },
+            TrialError::SamplesPostUnknown {
+                counts: describe_counts(&observed, Some(&expected)),
+            },
             TrialError::SamplesUnaccounted {
                 counts: describe_counts(&observed, None),
             },
@@ -1917,6 +1925,43 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    /// An `up` killed between recording the intent and posting leaves every
+    /// sample service empty. The rerun refuses, and says the earlier post's
+    /// result is unknown rather than that the services hold events.
+    #[test]
+    fn an_all_zero_intent_names_the_unknown_post() {
+        let expected: std::collections::BTreeMap<String, u64> = sample::expected_counts()
+            .into_iter()
+            .map(|(service, count)| (service.to_owned(), count))
+            .collect();
+        let intent = Samples::Intent {
+            seed: sample::SAMPLE_SEED,
+            anchor: "2026-09-25T12:00:00.123Z".into(),
+            expected,
+        };
+        let SampleAction::RefuseUnknownPost { observed, expected } =
+            sample::decide_samples(&intent, true, &std::collections::BTreeMap::new())
+        else {
+            panic!("an intent with no events refuses as an unknown post");
+        };
+        let message = TrialError::SamplesPostUnknown {
+            counts: describe_counts(&observed, Some(&expected)),
+        }
+        .to_string();
+        assert!(
+            message.contains("an earlier `trawl trial up` recorded that it was posting"),
+            "{message}"
+        );
+        assert!(message.contains("result is unknown"), "{message}");
+        assert!(message.contains("api 0/"), "{message}");
+        assert!(!message.contains("already hold"), "{message}");
+        assert!(message.contains("trawl trial down --yes"), "{message}");
+        assert!(
+            message.contains("trawl trial up --no-sample-data"),
+            "{message}"
+        );
     }
 
     #[test]

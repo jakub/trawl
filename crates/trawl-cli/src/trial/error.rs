@@ -217,7 +217,16 @@ pub enum TrialError {
     },
 
     #[error(
-        "the sample services already hold events this trial cannot account for \
+        "an earlier `trawl trial up` recorded that it was posting the samples, and that \
+         post's result is unknown: the sample services hold {counts} (found/expected). \
+         trawl never posts the samples twice. Start over with `trawl trial down --yes` \
+         and then `trawl trial up`, or keep this trial without samples with \
+         `trawl trial up --no-sample-data`"
+    )]
+    SamplesPostUnknown { counts: String },
+
+    #[error(
+        "the sample services already hold events this trial did not record posting \
          ({counts}), and posting the samples could duplicate them; trawl never posts the \
          samples twice. Start over with `trawl trial down --yes` and then \
          `trawl trial up`, or keep this trial without samples with \
