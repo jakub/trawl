@@ -296,7 +296,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `serviceMonitor.interval` | string | `30s` | Scrape interval |
 | `serviceMonitor.scrapeTimeout` | string | `10s` | Scrape timeout |
 | `serviceMonitor.namespace` | string | `""` | ServiceMonitor namespace. Empty uses the release namespace |
-| `prometheusRule.enabled` | bool | `false` | Create the ten operational warning rules; independent of ServiceMonitor creation |
+| `prometheusRule.enabled` | bool | `false` | Create the thirteen operational alert rules: `TrawlHotBufferDrainStalled` at `critical`, the others at `warning`; independent of ServiceMonitor creation |
 | `prometheusRule.namespace` | string | `""` | Rule object namespace. Empty uses the release namespace; never changes workload selectors |
 | `prometheusRule.additionalLabels` | map of strings | `{}` | Rule-resource discovery labels. Invalid Kubernetes label keys or values and conflicting chart label overrides are rejected |
 | `prometheusRule.alerts.<alert>.enabled` | bool | `true` | Enable one of the thirteen alert keys listed above |

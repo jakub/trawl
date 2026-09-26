@@ -2129,8 +2129,8 @@ const BOOKKEEPING_BACKOFF: Duration = Duration::from_millis(100);
 /// walks envs → services → chunks sequentially with no per-tick deadline —
 /// so that cost multiplies by the number of pending batches, against a
 /// 10s compaction interval. A stalled compactor is the one failure this
-/// file will not take: WAL stops draining and the hot buffer grows until
-/// it evicts, which is invisible events.
+/// file will not take: WAL stops draining, the hot buffer fills, and
+/// admission refuses new events (ADR-0043).
 ///
 /// So the retry gets a budget instead of a promise. The blips it exists
 /// for (a full pool, a failover mid-query) fail in milliseconds and still
@@ -10327,8 +10327,9 @@ mod tests {
 
     /// An unreadable WAL *root* is not an empty WAL root: it must surface as
     /// an error, never as a clean cycle. Swallowing it iterates no envs, so
-    /// the WAL never drains, the hot buffer evicts un-compacted events, and
-    /// the error counter stays at zero — silent loss (ADR-0008).
+    /// the WAL never drains, the hot buffer fills until admission refuses
+    /// new events, and the error counter stays at zero: a stall no counter
+    /// explains (ADR-0008).
     #[cfg(unix)]
     #[tokio::test]
     async fn compact_once_errors_on_unreadable_wal_root() {
