@@ -8,21 +8,26 @@ secret that exists is in SECRETS, and masked, before the scan that decides
 whether the output may be printed.
 
 It reads the token files and the key prefixes in STATE_DIR, and the
-PostgreSQL superuser password, the role passwords in the pgpass file, and
-the cookie key from the trial's Compose volumes. The volumes are read
+PostgreSQL superuser password, the role passwords in the pgpass file, the
+TLS private key, and the cookie key from the trial's Compose volumes. The
+TLS key is recorded as its DER bytes, class `key`: if it leaks, a process
+that takes the API port while the trial is stopped passes the clients'
+certificate pin. The volumes are read
 through one throwaway container of IMAGE: the volumes mounted read-only, no
 network, no log driver, and removed on exit. It reads only what exists, so
 it can run at any point of a trial's life, including after a kill.
 
 A value not yet in SECRETS is appended to it. Under GitHub Actions, each new
 value's forms that scan-trial-secrets.py searches for, where they are
-printable, go to stdout as `::add-mask::` lines. Nothing else goes to
+printable, go to stdout as `::add-mask::` lines, and for the TLS key also
+each line of its PEM body, since a mask cannot span lines. Nothing else goes to
 stdout, and no value goes to stderr.
 
 With --require, it fails unless it read every secret of the trial that
 STATE_DIR records: after an `up` that exits 0, all of them exist.
 """
 
+import base64
 import importlib.util
 import io
 import json
@@ -37,7 +42,7 @@ LABEL = "sh.trawl.trial.id"
 # Each Compose volume's secret files, relative to the volume root.
 FILES = {
     "postgres": ["trial/superuser.password"],
-    "trawld": ["trial/secrets/pgpass"],
+    "trawld": ["trial/secrets/pgpass", "trial/tls/key.pem"],
     "web": ["trial/web.cookie"],
 }
 REQUIRED = [
@@ -49,7 +54,9 @@ REQUIRED = [
     "fleet role password",
     "trawl role password",
     "cookie key",
+    "TLS key",
 ]
+PEM_BLOCK = ("-----BEGIN ", "-----END ")
 
 spec = importlib.util.spec_from_file_location("scanner", Path(__file__).with_name("scan-trial-secrets.py"))
 scanner = importlib.util.module_from_spec(spec)
@@ -125,15 +132,27 @@ def read(state_dir, image):
                 fields = line.split(":")
                 if len(fields) == 5 and fields[2] == fields[3] and fields[2] in ("fleet", "trawl"):
                     found.append((f"{fields[2]} role password", owner, "password", "text", fields[4]))
+        elif path == "trial/tls/key.pem":
+            found.append(("TLS key", owner, "key", "hex-bytes", pem_body(data).hex()))
         elif path == "trial/web.cookie":
             found.append(("cookie key", owner, "cookie", "hex-bytes", data.hex()))
     return trial, [entry for entry in found if entry[4]]
 
 
-def masks(kind, value):
-    forms = scanner.variants(kind, value)
-    return sorted(form.decode() for form in forms if form.isascii() and form.decode().isprintable()
-                  and not any(c.isspace() for c in form.decode()))
+def pem_body(data):
+    """The DER bytes of a file that holds one PEM block."""
+    lines = data.decode().splitlines()
+    if len([line for line in lines if line.startswith(PEM_BLOCK)]) != 2:
+        raise SystemExit("key.pem does not hold exactly one PEM block")
+    return base64.b64decode("".join(line for line in lines if not line.startswith(PEM_BLOCK)))
+
+
+def masks(klass, kind, value):
+    forms = {form.decode() for form in scanner.variants(kind, value) if form.isascii()}
+    if klass == "key":
+        encoded = base64.b64encode(bytes.fromhex(value)).decode()
+        forms |= {encoded[i:i + 64] for i in range(0, len(encoded), 64)}
+    return sorted(form for form in forms if form.isprintable() and not any(c.isspace() for c in form))
 
 
 def main(argv):
@@ -159,7 +178,7 @@ def main(argv):
             out.write(f"{name} (trial {owner[:8]})\t{klass}\t{kind}\t{value}\n")
             out.flush()
             if os.environ.get("GITHUB_ACTIONS") == "true":
-                for form in masks(kind, value):
+                for form in masks(klass, kind, value):
                     print(f"::add-mask::{form}", flush=True)
     if fresh:
         print(f"  recorded {fresh} new secret value(s) in the private list (values not shown)", file=sys.stderr)

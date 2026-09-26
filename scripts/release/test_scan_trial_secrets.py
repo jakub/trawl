@@ -16,6 +16,14 @@ SCANNER = Path(__file__).resolve().parent / "scan-trial-secrets.py"
 TOKEN = "flt_Zm9vYmFyYmF6cXV4LXRyaWFsLXRva2VuLXZhbHVl"
 PASSWORD = "5f0c3a9e7b1d24c6a8e0f2b4d6c8e0a1"
 COOKIE = bytes(range(7, 39))
+# A throwaway P-256 key in PKCS #8, as `trawl-admin tls generate` writes it.
+KEY_PEM = """-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgA5uE5d3a9I3tv+eC
+3fMBIjAxuugGpX1CQM0gd4tiq02hRANCAASpTrCkJRcBlhop/T4SKG0FL1tVWFeq
+0V7zRptGugBaL4PeEp1pt0aYz7pyWwa9gdRAJ7o5MEUXM2YAuFwhchof
+-----END PRIVATE KEY-----
+"""
+KEY_DER = base64.b64decode("".join(KEY_PEM.splitlines()[1:-1]))
 
 
 class Scan(unittest.TestCase):
@@ -27,6 +35,7 @@ class Scan(unittest.TestCase):
             f"operator token\ttoken\ttext\t{TOKEN}\n"
             f"trawl role password\tpassword\ttext\t{PASSWORD}\n"
             f"cookie key\tcookie\thex-bytes\t{COOKIE.hex()}\n"
+            f"TLS key\tkey\thex-bytes\t{KEY_DER.hex()}\n"
         )
         self.evidence = self.dir / "evidence"
         self.evidence.mkdir()
@@ -120,6 +129,30 @@ class Scan(unittest.TestCase):
                 path = self.plant("cookie.bin", b"x" + encoded + b"y")
                 self.assert_found(self.scan(), "FOUND cookie key")
                 path.unlink()
+
+
+    def test_the_tls_key_fails_however_it_is_wrapped(self):
+        for name, text in [
+            ("pem", KEY_PEM),
+            ("crlf", KEY_PEM.replace("\n", "\r\n")),
+            ("json-escaped", '{"key": "' + KEY_PEM.replace("\n", "\\n") + '"}'),
+            ("rewrapped", "\n".join(base64.b64encode(KEY_DER).decode()[i:i + 76] for i in range(0, 184, 76))),
+            ("hex", KEY_DER.hex()),
+        ]:
+            with self.subTest(name):
+                path = self.plant("key.txt", text)
+                self.assert_found(self.scan(), "FOUND TLS key")
+                path.unlink()
+
+    def test_the_certificate_of_the_key_passes(self):
+        # The certificate carries the key's public half; only the private
+        # key may fail the scan.
+        cert = subprocess.run(
+            ["openssl", "req", "-x509", "-new", "-key", "/dev/stdin", "-subj", "/CN=trawld", "-days", "1"],
+            input=KEY_PEM, capture_output=True, text=True, check=True).stdout
+        self.plant("ca.pem", cert)
+        result = self.scan()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

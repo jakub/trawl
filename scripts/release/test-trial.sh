@@ -493,8 +493,10 @@ for file in operator.token ingest.token; do
   [[ "$(stat -c '%a %U' "$STATE_DIR/$file")" == "600 $(id -un)" ]] || fail "$file is not 0600 and mine"
 done
 note "the lock file lives outside the trial directory: $(stat -c '%a %n' "$STATE_HOME/trawl/trial.lock")"
-scan --classes password,cookie "$STATE_DIR" "$TRIAL_HOME"
-note "no database password, superuser password, or cookie key is on the host"
+# The TLS private key stays in the trawld volume: whoever holds it can
+# serve the pinned certificate on the API port while the trial is stopped.
+scan --classes password,cookie,key "$STATE_HOME" "$TRIAL_HOME"
+note "no database password, superuser password, cookie key, or TLS private key is on the host"
 scan --classes token,password,cookie "$STATE_DIR/state.json"
 scan "$STATE_DIR/compose.json" "$STATE_DIR/ca.pem"
 
@@ -770,6 +772,8 @@ ok up-b t trial up --api-port 25514 --web-port 28090 --no-sample-data "${IMAGE_A
 says up-b "http://localhost:28090"
 says up-b "https://127.0.0.1:25514"
 collect_secrets
+scan --classes password,cookie,key "$STATE_HOME" "$TRIAL_HOME"
+note "no database password, superuser password, cookie key, or TLS private key is on the host"
 docker exec "$(cid trawl-web)" cat /var/lib/trawl/trial/web.toml >"$EVIDENCE/web-b.toml"
 grep -F 'public_origins' "$EVIDENCE/web-b.toml" | sed 's/^/   /'
 grep -qxF 'public_origins = ["http://localhost:28090", "http://127.0.0.1:28090"]' "$EVIDENCE/web-b.toml" ||
