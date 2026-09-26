@@ -46,6 +46,13 @@ installs the `trawld` and `trawl-web` units disabled and stopped. Set the
 sudo systemctl enable --now trawld trawl-web
 ```
 
+`trawl-web` verifies `trawld` against the self-signed certificate that
+`trawld` writes to `/var/lib/trawl/tls/cert.pem` on its first start. The
+packaged `[web] upstream_ca_path` names that file. Until the file exists,
+`trawl-web` exits and systemd restarts it every 5 seconds, so it can take a few
+seconds to reach `active (running)`. To use your own certificate, see
+[Configure TLS](/operate/access/#configure-tls).
+
 `trawl-web` listens on `127.0.0.1:8090` by default, so browser access from
 other machines needs a TLS-terminating reverse proxy and a public origin.
 

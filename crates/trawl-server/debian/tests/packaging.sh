@@ -7,6 +7,8 @@ postinst="$repo_root/crates/trawl-server/debian/postinst"
 service="$repo_root/crates/trawl-server/debian/trawld.service"
 web_service="$repo_root/crates/trawl-server/debian/trawl-web.service"
 default_env="$repo_root/crates/trawl-server/debian/trawld.default"
+web_default_env="$repo_root/crates/trawl-server/debian/trawl-web.default"
+packaged_config="$repo_root/crates/trawl-server/debian/trawld.toml"
 crashdump_conf="$repo_root/crates/trawl-server/debian/crashdump.conf"
 tmpfiles_conf="$repo_root/crates/trawl-server/debian/trawl.tmpfiles"
 sysusers_conf="$repo_root/crates/trawl-server/debian/trawl.sysusers"
@@ -352,6 +354,25 @@ for unit in trawld trawl-web; do
 done
 if ! grep -Fq 'systemctl enable --now trawld trawl-web' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not tell the operator to run 'systemctl enable --now trawld trawl-web' after setting the database URLs"
+fi
+
+# -- 11. trawl-web verifies trawld by pinning its generated certificate ---
+#
+# Without a pin, trawl-web checks trawld's self-signed certificate against the
+# platform roots and every sign-in fails. The package pins the file trawld
+# generates, never TRAWL_WEB_INSECURE_UPSTREAM, and trawl-web refuses to start
+# with both set. trawl-web's config tests check that the pin resolves;
+# trawl-server's tls.rs tests check that the path is the file trawld writes.
+
+web_section=$(awk '/^\[web\][[:space:]]*$/{flag=1; next} flag && /^\[/{flag=0} flag' "$packaged_config")
+if [[ -z "$web_section" ]]; then
+  fail "crates/trawl-server/debian/trawld.toml has no [web] section"
+fi
+if ! grep -Eq '^upstream_ca_path[[:space:]]*=[[:space:]]*"[^"]+"' <<<"$web_section"; then
+  fail "crates/trawl-server/debian/trawld.toml does not set [web] upstream_ca_path uncommented: trawl-web would check trawld's self-signed certificate against the platform roots and every sign-in would fail"
+fi
+if grep -vE '^[[:space:]]*#' "$web_default_env" | grep -Eq 'TRAWL_WEB_INSECURE_UPSTREAM[[:space:]]*='; then
+  fail "crates/trawl-server/debian/trawl-web.default sets TRAWL_WEB_INSECURE_UPSTREAM uncommented: with the packaged upstream_ca_path, trawl-web refuses to start"
 fi
 
 echo "debian packaging assertions passed"

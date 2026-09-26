@@ -1575,10 +1575,11 @@ session_ttl_secs = 3600
         ));
     }
 
+    /// The Debian package pins the certificate trawld generates for itself.
+    /// The path itself is guarded beside trawld's generator, in
+    /// `trawl-server`'s `tls.rs`, where the file name is defined.
     #[test]
-    fn the_debian_default_config_keeps_the_insecure_variable() {
-        // `/etc/default/trawl-web` offers the variable; the packaged
-        // `trawld.toml` must derive an upstream it is honoured for.
+    fn the_debian_default_config_pins_trawld_generated_certificate() {
         let config = Config::parse_toml(include_str!("../../trawl-server/debian/trawld.toml"))
             .expect("the packaged trawld.toml parses");
         let upstream = config
@@ -1586,13 +1587,47 @@ session_ttl_secs = 3600
             .upstream_url
             .clone()
             .unwrap_or_else(|| default_upstream_from_server(Some(&config.server)));
+        let packaged_pin = config
+            .web
+            .upstream_ca_path
+            .as_deref()
+            .expect("the packaged trawld.toml sets [web] upstream_ca_path");
+
+        // With trawld's certificate at the pinned path, the pin resolves. The
+        // certificate here is the shape trawld generates: self-signed, with
+        // the loopback names as SANs.
+        let dir = tempfile::tempdir().unwrap();
+        let generated = dir.path().join("cert.pem");
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+            "::1".to_owned(),
+        ])
+        .unwrap()
+        .cert;
+        std::fs::write(&generated, cert.pem()).unwrap();
         assert!(
             matches!(
-                resolve_upstream_tls(Some("1"), &upstream, config.web.upstream_ca_path.as_deref()),
-                Ok(UpstreamTls::InsecureLoopback)
+                resolve_upstream_tls(None, &upstream, Some(&generated)),
+                Ok(UpstreamTls::PinnedCa(roots)) if roots.len() == 1
             ),
-            "the Debian upstream {upstream} must be loopback"
+            "the Debian upstream {upstream} must accept a pin"
         );
+
+        // Before trawld's first start writes it, trawl-web refuses to start
+        // and names the file.
+        let missing = dir.path().join("tls").join("cert.pem");
+        let error = resolve_upstream_tls(None, &upstream, Some(&missing)).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::UpstreamCa { path, .. } if *path == missing),
+            "{error:?}"
+        );
+
+        // The insecure variable beside the packaged pin refuses.
+        assert!(matches!(
+            resolve_upstream_tls(Some("1"), &upstream, Some(packaged_pin)),
+            Err(ConfigError::InsecureUpstreamWithCa)
+        ));
     }
 
     /// A self-signed CA certificate in PEM.
