@@ -11,7 +11,8 @@
 //! passes. `stop` and `down` then refuse an engine other than the one the
 //! state records. Then the ownership scan refuses anything on the engine
 //! that carries the trial's names or labels without this trial's id, and
-//! one-off containers a killed command left running are waited for.
+//! one-off containers a killed command left unfinished are waited for;
+//! one that stays `created` past the wait never started, and is removed.
 //!
 //! `up` then creates or resumes, one recorded phase at a time, so a rerun
 //! after an interruption skips what is done:
@@ -73,7 +74,7 @@ const PULL_TIMEOUT: Duration = Duration::from_mins(15);
 /// `compose stop`.
 const STOP_TIMEOUT: Duration = Duration::from_mins(2);
 /// How long `up`, `stop`, and `down` wait for a one-off container that an
-/// interrupted command left running.
+/// interrupted command left unfinished.
 const ONEOFF_WAIT: Duration = Duration::from_mins(1);
 /// How long the API may refuse connections after `compose up --wait`.
 const API_WAIT: Duration = Duration::from_secs(30);
@@ -157,28 +158,54 @@ fn require_owned(
     }
 }
 
-/// Wait for one-off containers an interrupted command left running, then
-/// return a fresh inventory. Refuses, naming them, when they outlast
-/// [`ONEOFF_WAIT`], and refuses anything foreign that appeared meanwhile.
+/// Wait for one-off containers an interrupted command left unfinished,
+/// then return a fresh inventory. Refuses anything foreign that appeared
+/// meanwhile. When the one-offs outlast `wait`, removes those still
+/// `created`, once and by id: their client died before starting them, so
+/// they would never finish. Refuses, naming them, when any other is left.
 async fn settle_oneoffs(
     docker: &Docker,
     paths: &TrialPaths,
     mut inventory: Inventory,
     our_id: &str,
+    wait: Duration,
 ) -> Result<Inventory, TrialError> {
-    let deadline = Instant::now() + ONEOFF_WAIT;
+    let deadline = Instant::now() + wait;
     let mut told = false;
+    let mut removed = false;
     loop {
-        let pending: Vec<String> = ownership::unfinished_oneoffs(&inventory, our_id)
-            .iter()
-            .map(|r| r.name.clone())
-            .collect();
+        let pending = ownership::unfinished_oneoffs(&inventory, our_id);
         if pending.is_empty() {
             return Ok(inventory);
         }
-        let names = pending.join(", ");
+        let names = pending
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         if Instant::now() >= deadline {
-            return Err(TrialError::OneoffsRunning { names });
+            if removed || pending.iter().any(|r| r.state != "created") {
+                return Err(TrialError::OneoffsRunning { names });
+            }
+            progress(format_args!(
+                "removing one-off containers an interrupted command created and never started: {names}"
+            ));
+            // `unfinished_oneoffs` names only containers carrying our id,
+            // and an id's labels never change.
+            for oneoff in pending {
+                docker
+                    .capture(
+                        &ownership::oneoff_remove_args(&oneoff.id),
+                        None,
+                        Sensitivity::Diagnose,
+                        RUN_TIMEOUT,
+                    )
+                    .await?;
+            }
+            removed = true;
+            inventory = Inventory::scan(docker).await?;
+            require_owned(paths, &inventory, Some(our_id))?;
+            continue;
         }
         if !told {
             progress(format_args!(
@@ -270,7 +297,7 @@ async fn admit(
     let mut inventory = Inventory::scan(docker).await?;
     require_owned(paths, &inventory, our_id.as_deref())?;
     if let Some(id) = &our_id {
-        inventory = settle_oneoffs(docker, paths, inventory, id).await?;
+        inventory = settle_oneoffs(docker, paths, inventory, id, ONEOFF_WAIT).await?;
     }
 
     let ports = match &existing {
@@ -1360,7 +1387,7 @@ pub async fn stop(paths: &TrialPaths) -> Result<(), TrialError> {
             dir: paths.dir.clone(),
         });
     };
-    settle_oneoffs(docker, paths, inventory, &view.trial_id).await?;
+    settle_oneoffs(docker, paths, inventory, &view.trial_id, ONEOFF_WAIT).await?;
     if !docker.compose_file().is_file() {
         return Err(TrialError::StateInvalid {
             path: docker.compose_file(),
@@ -1431,7 +1458,7 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
         }
         return Ok(());
     };
-    let inventory = settle_oneoffs(docker, paths, inventory, &view.trial_id).await?;
+    let inventory = settle_oneoffs(docker, paths, inventory, &view.trial_id, ONEOFF_WAIT).await?;
 
     let mut stdout = io::stdout().lock();
     render::render_inventory(&mut stdout, &inventory, &paths.dir)
@@ -1684,6 +1711,110 @@ mod tests {
             oneoff,
             state: state.into(),
         }
+    }
+
+    const OURS: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A stub engine for [`settle_oneoffs`]: `ps` prints the listing in
+    /// `c<N>` for the Nth call, or the last one written, and
+    /// `container rm` logs its argv to `calls` and empties the listing,
+    /// unless `sticky`: then the container stays listed.
+    fn settle_engine(listings: &[&str], sticky: bool) -> ([tempfile::TempDir; 2], Docker) {
+        let dir = tempfile::tempdir().unwrap();
+        for (n, listing) in listings.iter().enumerate() {
+            std::fs::write(dir.path().join(format!("c{}", n + 1)), listing).unwrap();
+        }
+        if sticky {
+            std::fs::write(dir.path().join("sticky"), "").unwrap();
+        }
+        let (keep, docker) = crate::trial::docker::tests::stub(&format!(
+            r#"d="{dir}"
+case "$*" in
+  ps*)
+    n=$(( $(cat "$d/n" 2>/dev/null || echo 0) + 1 )); echo $n > "$d/n"
+    while [ ! -e "$d/c$n" ]; do n=$((n - 1)); done
+    if [ -e "$d/removed" ]; then : ; else cat "$d/c$n"; fi ;;
+  "volume ls"*|"network ls"*) ;;
+  "container rm"*) echo "$*" >> "$d/calls"; [ -e "$d/sticky" ] || touch "$d/removed" ;;
+  *) exit 9 ;;
+esac"#,
+            dir = dir.path().display()
+        ));
+        ([dir, keep], docker)
+    }
+
+    fn oneoff(state: &str) -> String {
+        serde_json::json!({
+            "id": "0ne0ff",
+            "name": "trawl-trial-fleet-admin-run-1",
+            "state": state,
+            "project": PROJECT,
+            "trial": OURS,
+            "oneoff": "True",
+        })
+        .to_string()
+    }
+
+    async fn settle(
+        listings: &[&str],
+        wait: Duration,
+        sticky: bool,
+    ) -> (Result<Inventory, TrialError>, String) {
+        let ([dir, _script], docker) = settle_engine(listings, sticky);
+        let paths = TrialPaths::resolve(Some(std::path::Path::new("/state")), None).unwrap();
+        let inventory = Inventory::scan(&docker).await.unwrap();
+        let result = settle_oneoffs(&docker, &paths, inventory, OURS, wait).await;
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        (result, calls)
+    }
+
+    /// A `created` one-off that starts and finishes within the bound is
+    /// waited for, never removed.
+    #[tokio::test]
+    async fn a_created_oneoff_that_starts_is_waited_for() {
+        let (result, calls) = settle(
+            &[&oneoff("created"), &oneoff("running"), &oneoff("exited")],
+            Duration::from_secs(30),
+            false,
+        )
+        .await;
+        let inventory = result.unwrap();
+        assert_eq!(inventory.resources[0].state, "exited");
+        assert_eq!(calls, "");
+    }
+
+    /// A `created` one-off still `created` after the bound never starts:
+    /// its client died. It is removed by id, without `--force`, so the
+    /// engine refuses the removal if it started after all.
+    #[tokio::test]
+    async fn a_created_oneoff_that_never_starts_is_removed_by_id() {
+        let (result, calls) = settle(&[&oneoff("created")], Duration::ZERO, false).await;
+        assert_eq!(result.unwrap(), Inventory::default());
+        assert_eq!(calls, "container rm -- 0ne0ff\n");
+    }
+
+    /// The removal happens once: a one-off still listed after it is
+    /// refused.
+    #[tokio::test]
+    async fn a_oneoff_that_outlives_its_removal_is_refused() {
+        let (result, calls) = settle(&[&oneoff("created")], Duration::ZERO, true).await;
+        assert!(
+            matches!(result, Err(TrialError::OneoffsRunning { .. })),
+            "{result:?}"
+        );
+        assert_eq!(calls, "container rm -- 0ne0ff\n");
+    }
+
+    /// A one-off still running after the bound is refused, not removed.
+    #[tokio::test]
+    async fn a_running_oneoff_after_the_bound_is_refused() {
+        let (result, calls) = settle(&[&oneoff("running")], Duration::ZERO, false).await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, TrialError::OneoffsRunning { names } if names == "trawl-trial-fleet-admin-run-1"),
+            "{err:?}"
+        );
+        assert_eq!(calls, "");
     }
 
     /// A trial's own running container holds its port; anything else,
