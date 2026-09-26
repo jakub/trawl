@@ -6274,6 +6274,7 @@ dependencies = [
  "crossterm 0.29.0",
  "futures",
  "insta",
+ "nix",
  "nucleo-matcher",
  "ratatui",
  "rcgen",

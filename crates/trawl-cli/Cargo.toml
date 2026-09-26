@@ -24,6 +24,7 @@ clap = { workspace = true }
 comfy-table = { workspace = true }
 crossterm = { workspace = true }
 futures = { workspace = true }
+nix = { workspace = true }
 nucleo-matcher = { workspace = true }
 ratatui = { workspace = true }
 serde = { workspace = true }
