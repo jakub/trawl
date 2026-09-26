@@ -332,6 +332,7 @@ one thing the suite is supposed to catch:
 | `24-palette-overlay-gate.patch` | removes both closed-state overlay admission checks, in Shell's open callback and global chord listener | `command-palette.spec.ts`, export-modal chord inertness |
 | `25-palette-toggle.patch` | replaces the open palette's chord close callback with a no-op | `command-palette.spec.ts`, chord while open toggles closed |
 | `26-save-editor-snapshot.patch` | captures the executed query with URL filters and range instead of the editor buffer | `settings-disposition.spec.ts`, exact preview and POST assertions for the console's Save as Net |
+| `32-rail-choice-from-toggle.patch` | the filter rail's `toggle` handler records the wide hand choice, so the rail's first automatic open becomes a choice that holds it open | `filter-rail.spec.ts`, an automatic open is not a hand choice |
 
 Run the mechanism:
 
