@@ -88,6 +88,22 @@ fn the_tutorial_quotes_the_summary_verbatim() {
     }
 }
 
+/// The trial publishes the browser UI on 127.0.0.1 only. `localhost` can
+/// reach `::1` first, where another local program may listen, so the docs
+/// send the browser to the published address.
+#[test]
+fn the_docs_send_the_browser_to_the_published_address() {
+    assert!(SUMMARY_SNAPSHOT.contains("  Browser   http://127.0.0.1:18090\n"));
+    assert!(FIRST_QUERY.contains("Open `http://127.0.0.1:18090`"));
+    assert!(CLI_REFERENCE.contains("`http://127.0.0.1:<web-port>`"));
+    for (page, text) in [("first-query", FIRST_QUERY), ("cli", CLI_REFERENCE)] {
+        assert!(
+            !text.contains("http://localhost:18090") && !text.contains("http://localhost:<"),
+            "{page} sends the browser to localhost"
+        );
+    }
+}
+
 #[test]
 fn the_tutorial_is_the_trial_tutorial() {
     assert!(FIRST_QUERY.contains("## From trial to installation"));

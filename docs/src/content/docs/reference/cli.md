@@ -343,6 +343,10 @@ trawl trial up [--api-port PORT] [--web-port PORT] [--image REFERENCE] [--no-sam
 | `--image` | `<REFERENCE>` | `ghcr.io/jakub/trawl:<CLI version>` | Run this trawl image instead of the published one. `up` and `status` print the override |
 | `--no-sample-data` | *(flag)* | `false` | Skip the sample events |
 
+The browser address `up` and `status` print is `http://127.0.0.1:<web-port>`.
+A browser tries `localhost` on the IPv6 address `::1` first, where the trial
+does not listen and another local program could.
+
 Ports and the image are fixed when the trial is created. On a resume an
 omitted flag means the recorded value, and a different value is refused with
 a message that points to `down`. The samples are loaded once, and a resume

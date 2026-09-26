@@ -4,7 +4,7 @@ expression: "text(|out| render_summary(out, &state, &paths()))"
 ---
 The trial is up.
 
-  Browser   http://localhost:18090
+  Browser   http://127.0.0.1:18090
   API       https://127.0.0.1:15514
 
 Sign in to the browser with the operator key; `trawl trial key` prints it.

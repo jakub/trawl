@@ -51,7 +51,7 @@ loads 2000 sample events. Progress goes to stderr. Then it prints:
 ```text
 The trial is up.
 
-  Browser   http://localhost:18090
+  Browser   http://127.0.0.1:18090
   API       https://127.0.0.1:15514
 
 Sign in to the browser with the operator key; `trawl trial key` prints it.
@@ -90,8 +90,9 @@ after `up`.
 
 ## Sign in to the browser
 
-1. Open `http://localhost:18090`. Use `localhost` as written: `127.0.0.1` is
-   a different browser origin.
+1. Open `http://127.0.0.1:18090`. Use this address, not `localhost`: a
+   browser tries `localhost` on the IPv6 address `::1` first, where the trial
+   does not listen and another program on this machine could.
 2. Print the operator key and copy it:
 
    ```bash
@@ -213,7 +214,7 @@ you onto the step you do yourself.
 | Created the `fleet` and `trawl` databases with owner roles and ran `fleet-admin migrate` | [Provision the databases](/operate/deployment/#provision-the-databases) |
 | Generated a certificate for loopback and pinned it in `-p trial` and `trawl-web` | [Configure TLS](/operate/access/#configure-tls) with a certificate your clients trust, and set `ca_cert` in their profiles when it is private |
 | Minted the `trial-operator` and `trial-ingest` keys | [Create roles and keys](/operate/access/#create-roles-and-keys): personal keys for people, service keys for senders |
-| Served the browser at `http://localhost:18090` with insecure cookies | [Set the browser origin](/operate/access/#set-the-browser-origin) behind an HTTPS reverse proxy |
+| Served the browser at `http://127.0.0.1:18090` with insecure cookies | [Set the browser origin](/operate/access/#set-the-browser-origin) behind an HTTPS reverse proxy |
 | Resolved `-p trial` from its directory | Save the server as a [profile](/start/connect/#keep-more-than-one-server-in-profiles) in `~/.config/trawl/config.toml` |
 | Loaded 2000 sample events | [Connect your log sources](/operate/ingestion/) |
 | Started nothing at boot | `sudo systemctl enable --now trawld trawl-web` after the databases are set |

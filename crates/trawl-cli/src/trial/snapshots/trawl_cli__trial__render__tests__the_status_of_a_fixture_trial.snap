@@ -8,7 +8,7 @@ Trial 0123456789abcdef0123456789abcdef
   engine       ENGINE:ID
 
 Addresses
-  browser      http://localhost:18090
+  browser      http://127.0.0.1:18090
   API          https://127.0.0.1:15514 (trawl -p trial)
 
 Images
