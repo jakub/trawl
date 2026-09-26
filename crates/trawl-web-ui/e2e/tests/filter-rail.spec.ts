@@ -19,14 +19,11 @@
 
 import fs from 'node:fs';
 import { test, expect, resetScenario } from '../fixtures';
+import { expectRail, watchToggles } from '../filter-rail';
 import { COPY, SEL } from '../selectors';
 import type { Page } from '@playwright/test';
 
 const WIDE = { width: 1440, height: 900 };
-/** fleet-ui's `--facets-w`, the open rail. */
-const OPEN_WIDTH = 224;
-/** trawl-web-ui's `--facet-strip-w`, the closed rail. */
-const STRIP_WIDTH = 32;
 
 /** A plain search: `corpus` answers it with 8 countable rows. */
 const COUNTABLE = 'service=nginx';
@@ -53,48 +50,6 @@ const uncountable = (() => {
     rows: presentation.rows.map((row: unknown[]) => keep.map((i: number) => row[i])),
   };
 })();
-
-/** The rail's state, read the way a reader sees it: open or not, and
- * how wide it is drawn. Width within a pixel, per the acceptance test. */
-async function expectRail(page: Page, open: boolean) {
-  const rail = page.locator(SEL.filterRail);
-  if (open) {
-    await expect(rail).toHaveAttribute('open', '');
-  } else {
-    await expect(rail).not.toHaveAttribute('open');
-  }
-  const want = open ? OPEN_WIDTH : STRIP_WIDTH;
-  await expect
-    .poll(async () => Math.abs((await rail.boundingBox())!.width - want), {
-      message: `the rail should be ${want}px wide`,
-    })
-    .toBeLessThanOrEqual(1);
-}
-
-/** Count every `toggle` the rail's <details> fires from here on, and
- * return a reader. The reader waits two frames and a task first: the
- * event is queued after the attribute changes, so a count read in the
- * same task as the change would miss it. */
-async function watchToggles(page: Page): Promise<() => Promise<number>> {
-  await page.locator(SEL.filterRail).evaluate((el) => {
-    const w = window as unknown as { __railToggles: number };
-    w.__railToggles = 0;
-    el.addEventListener('toggle', () => {
-      w.__railToggles += 1;
-    });
-  });
-  return () =>
-    page.evaluate(
-      () =>
-        new Promise<number>((resolve) =>
-          requestAnimationFrame(() =>
-            requestAnimationFrame(() =>
-              setTimeout(() => resolve((window as unknown as { __railToggles: number }).__railToggles)),
-            ),
-          ),
-        ),
-    );
-}
 
 /** Run `query` from the console, as a reader would. */
 async function haul(page: Page, query: string) {
