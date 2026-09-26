@@ -127,19 +127,27 @@ trawld re-reads both files every `tls_reload_interval_secs` seconds, so a
 renewed certificate needs no restart. `trawl --insecure` skips certificate
 verification. Use it only for a check on the same host.
 
-`trawl-web` checks trawld's certificate against the system trust store. When
-trawld uses a self-signed or private-CA certificate, point the proxy at the CA:
+`trawl-web` checks trawld's certificate against the system trust store, unless
+`[web] upstream_ca_path` names a CA file. The proxy then trusts only the CAs in
+that file and still checks the hostname in `upstream_url`. The Debian package
+ships this setting, which pins the certificate that trawld generates:
 
 ```toml
 [web]
-upstream_ca_path = "/etc/trawl/cert.pem"
+upstream_ca_path = "/var/lib/trawl/tls/cert.pem"
 ```
 
-The proxy then trusts only that CA and still checks the hostname in
-`upstream_url`. The other way is `TRAWL_WEB_INSECURE_UPSTREAM=1`, which turns
-verification off. The Helm chart sets it, and the Debian package offers it,
-commented out, in `/etc/default/trawl-web`. `trawl-web` accepts it only when
-the upstream host is loopback, and refuses to start otherwise.
+`trawl-web` reads the file at startup and refuses to start while it is
+missing. If you set `tls_cert_path`, change `upstream_ca_path` to the CA that
+issued your certificate. That certificate must also name the host in
+`upstream_url`. By default the host is `127.0.0.1`, derived from
+`[server] http_addr`. Restart `trawl-web` after you change either file.
+
+The other way is `TRAWL_WEB_INSECURE_UPSTREAM=1`, which turns verification off.
+The Helm chart sets it. `trawl-web` accepts it only when the upstream host is
+loopback and `upstream_ca_path` is not set, and refuses to start otherwise. On
+a Debian install, remove `upstream_ca_path` from `trawld.toml` before you set
+the variable in `/etc/default/trawl-web`.
 
 ## Set the browser origin
 

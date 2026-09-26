@@ -195,11 +195,18 @@ public_origins = ["http://127.0.0.1:8090", "http://localhost:8090"]
 # (wildcard binds are rewritten to loopback for same-host reach).
 # upstream_url = "https://127.0.0.1:5514"
 
-# PEM file of the CA certificates to trust for trawld. When set, the proxy
-# trusts only these CAs and still checks the hostname in upstream_url, which
-# must be https. Cannot be combined with TRAWL_WEB_INSECURE_UPSTREAM in
-# /etc/default/trawl-web.
-# upstream_ca_path = "/etc/trawl/cert.pem"
+# PEM file of the CA certificates to trust for trawld. The proxy trusts only
+# these CAs and still checks the hostname in upstream_url, which must be
+# https. The package pins the self-signed certificate that trawld generates
+# on its first start, when [server] tls_cert_path is not set. trawl-web
+# refuses to start until that file exists, and systemd restarts it every 5s
+# until trawld has written it.
+# If you set your own tls_cert_path, point upstream_ca_path at the CA that
+# issued that certificate. The certificate must name the host in
+# upstream_url (127.0.0.1 by default).
+# This setting and TRAWL_WEB_INSECURE_UPSTREAM in /etc/default/trawl-web
+# cannot both be set: trawl-web refuses to start.
+upstream_ca_path = "/var/lib/trawl/tls/cert.pem"
 
 # Path to the 32-byte AEAD cookie-encryption key. The Debian postinst
 # script generates one from /dev/urandom on first install.
