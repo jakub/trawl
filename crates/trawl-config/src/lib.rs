@@ -1296,6 +1296,12 @@ pub struct WebConfig {
     /// How the proxy reaches trawld. If unset, derived from `[server]`.
     pub upstream_url: Option<String>,
 
+    /// Path to a PEM file holding the CA certificate(s) that trawld's
+    /// certificate must chain to. When set, only these roots are trusted
+    /// for the upstream connection, and the hostname is still verified.
+    /// Unset: the platform trust store.
+    pub upstream_ca_path: Option<PathBuf>,
+
     /// Path to a file containing the 32-byte AEAD key for cookie encryption.
     /// Either this or `cookie_secret_env` must be set in production.
     pub cookie_secret_path: Option<PathBuf>,
@@ -2638,6 +2644,7 @@ path = "/data"
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.web.bind_addr.is_none());
         assert!(config.web.upstream_url.is_none());
+        assert!(config.web.upstream_ca_path.is_none());
         assert!(config.web.cookie_secret_path.is_none());
         assert!(config.web.cookie_secret_env.is_none());
         assert!(config.web.session_ttl_secs.is_none());
@@ -2898,6 +2905,7 @@ path = "/data"
 [web]
 bind_addr = "0.0.0.0:8090"
 upstream_url = "https://localhost:5514"
+upstream_ca_path = "/etc/trawl/upstream-ca.pem"
 cookie_secret_path = "/etc/trawl/web.key"
 session_ttl_secs = 3600
 allow_insecure_cookies = true
@@ -2907,6 +2915,10 @@ allow_insecure_cookies = true
         assert_eq!(
             config.web.upstream_url.as_deref(),
             Some("https://localhost:5514")
+        );
+        assert_eq!(
+            config.web.upstream_ca_path.as_deref(),
+            Some(std::path::Path::new("/etc/trawl/upstream-ca.pem"))
         );
         assert_eq!(
             config.web.cookie_secret_path.as_deref(),
