@@ -272,8 +272,6 @@ struct Ledger {
     pressure: watch::Sender<u64>,
     /// Batches removed by drain, monotonic.
     drained_batches: AtomicU64,
-    /// Batches made resident by insert, monotonic. The value is the count.
-    inserted: watch::Sender<u64>,
 }
 
 impl Ledger {
@@ -289,7 +287,6 @@ impl Ledger {
             released: watch::Sender::new(0),
             pressure: watch::Sender::new(0),
             drained_batches: AtomicU64::new(0),
-            inserted: watch::Sender::new(0),
         }
     }
 
@@ -750,7 +747,6 @@ impl HotBuffer {
         drop(reservation);
         if inserted {
             self.generation.fetch_add(1, Ordering::Relaxed);
-            advance(&self.ledger.inserted);
             // The WAL file now exists, so a pressure pass has work to find.
             if self.ledger.admission() != AdmissionState::Open {
                 advance(&self.ledger.pressure);
@@ -827,20 +823,6 @@ impl HotBuffer {
     /// monotonic. Compaction measures its progress by this delta.
     pub fn drained_batches(&self) -> u64 {
         self.ledger.drained_batches.load(Ordering::Relaxed)
-    }
-
-    /// Batches made resident by [`insert`](Self::insert) since
-    /// construction, monotonic. A refusal or a dropped reservation does not
-    /// count.
-    pub fn inserted_batches(&self) -> u64 {
-        *self.ledger.inserted.borrow()
-    }
-
-    /// Advances with [`inserted_batches`](Self::inserted_batches) on every
-    /// insert, whatever the admission state. Drop the borrow before calling
-    /// back into the buffer.
-    pub fn subscribe_inserted(&self) -> watch::Receiver<u64> {
-        self.ledger.inserted.subscribe()
     }
 
     /// A generation that advances after every release of charge (a dropped
@@ -1791,15 +1773,9 @@ mod tests {
         );
         pressure.borrow_and_update();
 
-        let inserted = buf.inserted_batches();
         assert_eq!(buf.reserve(Http, charge(40, 0)).unwrap_err(), Refusal::Full);
         assert!(pressure.has_changed().unwrap(), "full refusal wakes");
         pressure.borrow_and_update();
-        assert_eq!(
-            buf.inserted_batches(),
-            inserted,
-            "a refusal is not an insert"
-        );
 
         buf.drain(&["env/big", "env/small"]);
         assert_eq!(buf.admission_state(), AdmissionState::Open);
@@ -1866,9 +1842,7 @@ mod tests {
         let mut released = buf.subscribe_released();
         let reservation = buf.reserve(Syslog, charge(4, 40)).unwrap();
         assert_eq!(buf.charged(), charge(4, 40));
-        assert_eq!(buf.inserted_batches(), 0, "a reservation is not an insert");
         buf.insert(reservation, batch_of("prod/a", charge(4, 40)));
-        assert_eq!(buf.inserted_batches(), 1);
         assert_eq!(
             buf.charged(),
             charge(4, 40),

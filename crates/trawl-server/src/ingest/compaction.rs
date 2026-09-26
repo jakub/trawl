@@ -84,25 +84,11 @@ impl PassPlan {
 /// pressure is ignored. Under continuous refusals and a stalled drain, the
 /// loop therefore runs at most about one pass per interval, not one per
 /// refusal.
-///
-/// An insert after the pass started ends the cooldown early: its WAL file
-/// is work the pass could not see, such as the WAL of a reservation that
-/// was still in flight. Inserts need admitted space and a stalled drain
-/// frees none, so a stall can end at most one cooldown per batch that fits
-/// the buffer. A `Full` refusal inserts nothing and never ends one.
 #[derive(Debug)]
 struct Cadence {
     interval: Duration,
     next_normal: Instant,
-    cooldown: Option<Cooldown>,
-}
-
-/// A cooldown after a pass that drained nothing under pressure.
-#[derive(Debug, Clone, Copy)]
-struct Cooldown {
-    until: Instant,
-    /// [`HotBuffer::inserted_batches`] when the pass started.
-    inserted: u64,
+    cooldown_until: Option<Instant>,
 }
 
 impl Cadence {
@@ -110,22 +96,20 @@ impl Cadence {
         Self {
             interval,
             next_normal: start + interval,
-            cooldown: None,
+            cooldown_until: None,
         }
     }
 
-    /// `inserted` is the current [`HotBuffer::inserted_batches`].
-    fn cooling(&self, now: Instant, inserted: u64) -> bool {
-        self.cooldown
-            .is_some_and(|cooldown| now < cooldown.until && inserted <= cooldown.inserted)
+    fn cooling(&self, now: Instant) -> bool {
+        self.cooldown_until.is_some_and(|until| now < until)
     }
 
     /// The pass due at `now` without waiting, if any. The normal deadline
     /// comes first, so back-to-back pressure passes cannot starve it.
-    fn due(&self, now: Instant, admission: AdmissionState, inserted: u64) -> Option<PassKind> {
+    fn due(&self, now: Instant, admission: AdmissionState) -> Option<PassKind> {
         if now >= self.next_normal {
             Some(PassKind::Normal)
-        } else if admission != AdmissionState::Open && !self.cooling(now, inserted) {
+        } else if admission != AdmissionState::Open && !self.cooling(now) {
             Some(PassKind::Pressure)
         } else {
             None
@@ -133,34 +117,27 @@ impl Cadence {
     }
 
     /// Whether a pressure wake may start a pass at `now`.
-    fn accepts_pressure(&self, now: Instant, inserted: u64) -> bool {
-        !self.cooling(now, inserted)
+    fn accepts_pressure(&self, now: Instant) -> bool {
+        !self.cooling(now)
     }
 
     /// Record a finished pass. `drained` is whether it removed at least one
-    /// hot batch; `admission` is the state after it; `inserted` is
-    /// [`HotBuffer::inserted_batches`] read before the pass scanned the WAL.
-    fn finished(
-        &mut self,
-        kind: PassKind,
-        now: Instant,
-        drained: bool,
-        admission: AdmissionState,
-        inserted: u64,
-    ) {
+    /// hot batch; `admission` is the state after it.
+    fn finished(&mut self, kind: PassKind, now: Instant, drained: bool, admission: AdmissionState) {
         if kind == PassKind::Normal {
             self.next_normal = now + self.interval;
         }
-        self.cooldown = (!drained && admission != AdmissionState::Open).then_some(Cooldown {
-            until: now + self.interval,
-            inserted,
-        });
+        self.cooldown_until = if !drained && admission != AdmissionState::Open {
+            Some(now + self.interval)
+        } else {
+            None
+        };
     }
 }
 
-/// Wait for the next generation of a hot-buffer signal, or forever when
-/// there is no hot buffer to watch.
-async fn signal_changed(
+/// Wait for the next pressure generation, or forever when there is no hot
+/// buffer to watch.
+async fn pressure_changed(
     rx: &mut Option<watch::Receiver<u64>>,
 ) -> Result<(), watch::error::RecvError> {
     match rx {
@@ -216,9 +193,7 @@ pub fn spawn_compaction(
                 .map_or(AdmissionState::Open, |buf| buf.admission_state())
         };
         let drained = || hot_buffer.as_ref().map_or(0, |buf| buf.drained_batches());
-        let inserted = || hot_buffer.as_ref().map_or(0, |buf| buf.inserted_batches());
         let mut pressure = hot_buffer.as_ref().map(|buf| buf.subscribe_pressure());
-        let mut inserts = hot_buffer.as_ref().map(|buf| buf.subscribe_inserted());
         let mut cadence = Cadence::new(Instant::now(), interval);
 
         loop {
@@ -232,11 +207,11 @@ pub fn spawn_compaction(
                 );
                 break;
             }
-            let kind = if let Some(kind) = cadence.due(Instant::now(), admission(), inserted()) {
+            let kind = if let Some(kind) = cadence.due(Instant::now(), admission()) {
                 kind
             } else {
                 let next_normal = cadence.next_normal;
-                let accepts_pressure = cadence.accepts_pressure(Instant::now(), inserted());
+                let accepts_pressure = cadence.accepts_pressure(Instant::now());
                 #[cfg(test)]
                 if let Some(stats) = &compaction_stats {
                     stats.waits.fetch_add(1, Ordering::Release);
@@ -248,7 +223,7 @@ pub fn spawn_compaction(
                         break;
                     }
                     () = tokio::time::sleep_until(next_normal.into()) => PassKind::Normal,
-                    changed = signal_changed(&mut pressure), if accepts_pressure => {
+                    changed = pressure_changed(&mut pressure), if accepts_pressure => {
                         if changed.is_err() {
                             // The buffer is gone; only the interval remains.
                             pressure = None;
@@ -256,28 +231,14 @@ pub fn spawn_compaction(
                         }
                         PassKind::Pressure
                     }
-                    // Cooling: refusals stay muted, but an insert may end
-                    // the cooldown. The top of the loop decides.
-                    changed = signal_changed(&mut inserts), if !accepts_pressure => {
-                        if changed.is_err() {
-                            inserts = None;
-                        }
-                        continue;
-                    }
                 }
             };
 
             // Generations up to here are answered by this pass; one that
-            // advances during it wakes the loop again. The insert count is
-            // read before the scan, so an insert the scan may miss ends a
-            // cooldown this pass starts.
+            // advances during it wakes the loop again.
             if let Some(rx) = pressure.as_mut() {
                 rx.borrow_and_update();
             }
-            if let Some(rx) = inserts.as_mut() {
-                rx.borrow_and_update();
-            }
-            let inserted_before = inserted();
             let plan = PassPlan::new(kind, admission(), interval, daily_rollup);
             if kind == PassKind::Pressure {
                 tracing::debug!(
@@ -329,13 +290,7 @@ pub fn spawn_compaction(
             // Progress is batches drained, not occupancy: producers refill
             // the buffer while a pass runs.
             let progressed = drained() != drained_before;
-            cadence.finished(
-                kind,
-                Instant::now(),
-                progressed,
-                admission(),
-                inserted_before,
-            );
+            cadence.finished(kind, Instant::now(), progressed, admission());
         }
     })
 }
@@ -11100,55 +11055,6 @@ mod tests {
         compaction.stop().await;
     }
 
-    /// A reservation above one half starts the loop under pressure, so its
-    /// first pass runs before the WAL file exists, drains nothing and cools
-    /// down. The insert that follows ends the cooldown: with a one-hour
-    /// interval, only that can publish the young WAL within the test.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn insert_after_an_empty_pressure_pass_ends_the_cooldown() {
-        let tmp = tempfile::tempdir().unwrap();
-        let hot = pressure_buffer();
-        let pipeline = Arc::new(PipelineWriter::new(
-            Arc::new(WalWriter::new(tmp.path().join("wal"))),
-            Some(Arc::clone(&hot)),
-            None,
-        ));
-        let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 60);
-        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
-
-        let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
-        let stats = Arc::clone(&compaction.stats);
-        let cooling = eventually(Duration::from_secs(30), || {
-            stats.waits.load(Ordering::Acquire) == 1
-        })
-        .await;
-        assert!(cooling, "the loop waits after its first pass");
-        assert_eq!(
-            stats.total_runs.load(Ordering::Relaxed),
-            1,
-            "a start under pressure runs one pass before it waits"
-        );
-        assert_eq!(hot.drained_batches(), 0, "that pass found no WAL");
-
-        assert_eq!(write_groups(&pipeline, vec![group]).await, 60);
-        let wal_env = tmp.path().join("wal").join("prod");
-        let drained = eventually(Duration::from_secs(30), || {
-            hot.event_count() == 0 && find_files_by_ext(&wal_env, "ndjson").is_empty()
-        })
-        .await;
-        assert!(
-            drained,
-            "the insert must end the cooldown and a pass drain the young WAL; \
-             {} events still resident, {} runs",
-            hot.event_count(),
-            stats.total_runs.load(Ordering::Relaxed),
-        );
-        assert_eq!(hot.drained_batches(), 1);
-        assert_eq!(hot.admission_state(), AdmissionState::Open);
-
-        compaction.stop().await;
-    }
-
     /// Every pass fails to publish (the env data path is a file), so
     /// none drains anything, while `Full` refusals advance the pressure
     /// generation every few milliseconds. The cooldown keeps the loop to
@@ -11319,15 +11225,13 @@ mod tests {
         let mut normals = 0_u32;
         for ms in (0..100_000).step_by(100) {
             let now = t0 + Duration::from_millis(ms);
-            let kind = cadence.due(now, AdmissionState::Refusing, 0).or_else(|| {
-                cadence
-                    .accepts_pressure(now, 0)
-                    .then_some(PassKind::Pressure)
-            });
+            let kind = cadence
+                .due(now, AdmissionState::Refusing)
+                .or_else(|| cadence.accepts_pressure(now).then_some(PassKind::Pressure));
             if let Some(kind) = kind {
                 passes += 1;
                 normals += u32::from(kind == PassKind::Normal);
-                cadence.finished(kind, now, false, AdmissionState::Refusing, 0);
+                cadence.finished(kind, now, false, AdmissionState::Refusing);
             }
         }
         assert!(passes <= 100 / 10 + 2, "{passes} passes in 100 s");
@@ -11336,67 +11240,19 @@ mod tests {
         // Progress under pressure reruns at once, without moving the deadline.
         let mut cadence = Cadence::new(t0, interval);
         let now = t0 + Duration::from_secs(1);
-        cadence.finished(PassKind::Pressure, now, true, AdmissionState::Pressure, 0);
+        cadence.finished(PassKind::Pressure, now, true, AdmissionState::Pressure);
         assert_eq!(
-            cadence.due(now, AdmissionState::Pressure, 0),
+            cadence.due(now, AdmissionState::Pressure),
             Some(PassKind::Pressure)
         );
         assert_eq!(cadence.next_normal, t0 + interval);
         // No progress: cooldown, and the normal deadline still fires.
-        cadence.finished(PassKind::Pressure, now, false, AdmissionState::Pressure, 0);
-        assert_eq!(cadence.due(now, AdmissionState::Pressure, 0), None);
-        assert!(!cadence.accepts_pressure(now, 0));
+        cadence.finished(PassKind::Pressure, now, false, AdmissionState::Pressure);
+        assert_eq!(cadence.due(now, AdmissionState::Pressure), None);
+        assert!(!cadence.accepts_pressure(now));
         assert_eq!(
-            cadence.due(t0 + interval, AdmissionState::Pressure, 0),
+            cadence.due(t0 + interval, AdmissionState::Pressure),
             Some(PassKind::Normal)
-        );
-    }
-
-    /// A pass that drains nothing cools down, but an insert after the pass
-    /// started brings WAL a new pass can drain: the cooldown ends at once.
-    /// Refusals do not move the insert count, so they stay muted.
-    #[test]
-    fn cadence_cooldown_ends_on_a_fresh_insert() {
-        let interval = Duration::from_secs(3600);
-        let t0 = Instant::now();
-        let mut cadence = Cadence::new(t0, interval);
-        let now = t0 + Duration::from_secs(1);
-        // The pass started with 7 inserts and drained nothing.
-        cadence.finished(PassKind::Pressure, now, false, AdmissionState::Pressure, 7);
-        assert_eq!(cadence.due(now, AdmissionState::Pressure, 7), None);
-        assert!(
-            !cadence.accepts_pressure(now, 7),
-            "no insert: still cooling"
-        );
-
-        let later = now + Duration::from_millis(10);
-        assert_eq!(
-            cadence.due(later, AdmissionState::Pressure, 8),
-            Some(PassKind::Pressure),
-            "an insert after the pass started ends the cooldown"
-        );
-        assert!(cadence.accepts_pressure(later, 8));
-        assert_eq!(
-            cadence.due(later, AdmissionState::Open, 8),
-            None,
-            "an Open buffer needs no pressure pass"
-        );
-        assert_eq!(cadence.next_normal, t0 + interval);
-
-        // A normal pass that finds only young WAL cools down the same way.
-        let mut cadence = Cadence::new(t0, interval);
-        let deadline = t0 + interval;
-        cadence.finished(
-            PassKind::Normal,
-            deadline,
-            false,
-            AdmissionState::Pressure,
-            3,
-        );
-        assert_eq!(cadence.due(deadline, AdmissionState::Pressure, 3), None);
-        assert_eq!(
-            cadence.due(deadline, AdmissionState::Pressure, 4),
-            Some(PassKind::Pressure)
         );
     }
 
