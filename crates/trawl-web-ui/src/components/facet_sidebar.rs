@@ -184,16 +184,20 @@ pub fn FacetSidebar(
         if was_open == Some(true)
             && !is_open
             && !compact.get_untracked()
-            && focus_inside.get_value()
             && let Some(panel) = panel.get_untracked()
             && let Some(summary) = summary.get_untracked()
         {
             let document = document();
-            let stranded = document.active_element().is_none_or(|active| {
+            // Focus still in the rail is stranded whatever the flag says.
+            // The flag only decides whether an idle `body` holds focus
+            // that dropped there from the rail.
+            let dropped = focus_inside.get_value();
+            let stranded = document.active_element().map_or(dropped, |active| {
                 panel.contains(Some(&active))
-                    || document
-                        .body()
-                        .is_some_and(|body| body.is_same_node(Some(&active)))
+                    || (dropped
+                        && document
+                            .body()
+                            .is_some_and(|body| body.is_same_node(Some(&active))))
             });
             if stranded {
                 let _ = summary.focus();
