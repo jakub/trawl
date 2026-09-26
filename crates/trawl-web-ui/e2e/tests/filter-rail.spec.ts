@@ -343,6 +343,48 @@ test('filter rail: a malformed link leaves the strip, and an open rail shows its
   await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
 });
 
+// Clear all is placed over the right end of the header row, and the
+// active count grows to the right from "Filters". Twelve filters give the
+// count two digits, as wide as it gets under the link's cap of 32.
+test('filter rail: Clear all stands apart from a two-digit active count, inside the rail', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  const filters = Array.from({ length: 12 }, (_, i) => ({
+    op: '+',
+    field: 'host',
+    value: `web-${String(i + 1).padStart(2, '0')}`,
+  }));
+  const f = 'v1.' + Buffer.from(JSON.stringify(filters)).toString('base64url');
+  await page.goto(`${COUNTABLE_URL}&f=${f}`);
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
+  await expectRail(page, true);
+  await expectTextShown(page.locator(SEL.facetCount), '12 active');
+  await expect(page.locator(SEL.facetClear)).toBeVisible();
+
+  const box = async (selector: string) => (await page.locator(selector).boundingBox())!;
+  type Box = { x: number; y: number; width: number; height: number };
+  const inside = (inner: Box, outer: Box) =>
+    inner.x >= outer.x &&
+    inner.y >= outer.y &&
+    inner.x + inner.width <= outer.x + outer.width &&
+    inner.y + inner.height <= outer.y + outer.height;
+  const overlap = (a: Box, b: Box) =>
+    a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+  await expect
+    .poll(async () => {
+      const [rail, count, clear] = await Promise.all([
+        box(SEL.filterRail),
+        box(SEL.facetCount),
+        box(SEL.facetClear),
+      ]);
+      return {
+        countInside: inside(count, rail),
+        clearInside: inside(clear, rail),
+        overlap: overlap(count, clear),
+      };
+    })
+    .toEqual({ countInside: true, clearInside: true, overlap: false });
+});
+
 // A closed wide rail's content is inert, so the browser cannot open the
 // rail by itself (below). The narrow disclosure's content never is: it
 // stays searchable, as it was before ADR-0044.
