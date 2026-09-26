@@ -12,7 +12,7 @@ pub mod client;
 pub mod error;
 pub mod types;
 
-pub use client::{HttpClient, RepinCancel, RepinCeilings, RepinStart};
+pub use client::{HttpClient, RepinCancel, RepinCeilings, RepinStart, TlsTrust};
 pub use error::ClientError;
 pub use types::{
     ActiveQuerySnapshot, CancelResponse, CatalogConflictRow, CatalogConflictsResponse,

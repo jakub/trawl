@@ -408,6 +408,8 @@ async fn run(args: Cli) -> Result<(), CliError> {
         cfg.apply_profile(profile)?;
     }
     cfg.apply_overrides(args.url, args.insecure);
+    // Before any output, and before the TUI takes the terminal.
+    warn_if_insecure(&cfg, &mut io::stderr().lock())?;
 
     match args.command {
         None => {
@@ -446,12 +448,7 @@ async fn run(args: Cli) -> Result<(), CliError> {
             let conn = if data.is_some() {
                 None
             } else {
-                let token = cfg.load_token(args.token.as_deref())?;
-                Some(cli::ConnectionParams {
-                    url: cfg.server.url.clone(),
-                    token,
-                    insecure: cfg.server.insecure,
-                })
+                Some(connection(&cfg, args.token.as_deref())?)
             };
 
             cli::run_query(
@@ -465,15 +462,12 @@ async fn run(args: Cli) -> Result<(), CliError> {
             .await?;
         }
         Some(Command::Validate { query }) => {
-            // Validate supports both daemon and local-only mode.
-            let conn = if let Ok(token) = cfg.load_token(args.token.as_deref()) {
-                Some(cli::ConnectionParams {
-                    url: cfg.server.url.clone(),
-                    token,
-                    insecure: cfg.server.insecure,
-                })
-            } else {
-                None
+            // Validate supports both daemon and local-only mode: no token
+            // means local. Any other resolution failure is still an error.
+            let conn = match connection(&cfg, args.token.as_deref()) {
+                Ok(conn) => Some(conn),
+                Err(CliError::Config(config::ConfigError::TokenNotFound)) => None,
+                Err(e) => return Err(e),
             };
 
             cli::run_validate(&query, conn).await?;
@@ -491,6 +485,32 @@ async fn run(args: Cli) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Resolve the connection every server-bound command and the TUI use:
+/// the token first, then the certificate trust.
+pub(crate) fn connection(
+    cfg: &config::Config,
+    direct_token: Option<&str>,
+) -> Result<cli::ConnectionParams, CliError> {
+    let token = cfg.load_token(direct_token)?;
+    Ok(cli::ConnectionParams {
+        url: cfg.server.url.clone(),
+        token,
+        trust: cfg.tls_trust()?,
+    })
+}
+
+/// The one line `trawl` writes when certificate verification is off,
+/// whichever of `--insecure`, `TRAWL_INSECURE`, `[server]`, or the profile
+/// turned it on. It goes to stderr so stdout stays byte-identical.
+const INSECURE_WARNING: &str = "trawl: warning: insecure is on, so the server's TLS certificate is not verified; pin it with ca_cert instead";
+
+fn warn_if_insecure(cfg: &config::Config, stderr: &mut impl Write) -> io::Result<()> {
+    if cfg.server.insecure {
+        writeln!(stderr, "{INSECURE_WARNING}")?;
+    }
+    Ok(())
+}
+
 /// Dispatch `trawl schema <cmd>`. Connection resolution mirrors `query`,
 /// not `validate`: only `fields --data` has a serverless fallback, so
 /// everywhere else a token-resolution failure must surface as itself.
@@ -505,14 +525,7 @@ async fn run_schema(
     cfg: &config::Config,
     token: Option<&str>,
 ) -> Result<(), CliError> {
-    let conn = |token: Option<&str>| -> Result<cli::ConnectionParams, CliError> {
-        let token = cfg.load_token(token)?;
-        Ok(cli::ConnectionParams {
-            url: cfg.server.url.clone(),
-            token,
-            insecure: cfg.server.insecure,
-        })
-    };
+    let conn = |token: Option<&str>| connection(cfg, token);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match cmd {

@@ -198,15 +198,6 @@ pub fn describe_data_to_rows(glob: &str) -> Result<(Vec<String>, Vec<Vec<Json>>)
     Ok((columns, rows))
 }
 
-fn make_client(conn: &ConnectionParams) -> Result<trawl_client::HttpClient, CliError> {
-    let client = if conn.insecure {
-        trawl_client::HttpClient::new_insecure(&conn.url, &conn.token)?
-    } else {
-        trawl_client::HttpClient::new(&conn.url, &conn.token)?
-    };
-    Ok(client)
-}
-
 /// Write a human preamble/section line for `run_field`. The labels exist
 /// for the table view; on a machine format (auto-selected on a pipe) they
 /// would interleave with the ndjson/CSV stream, so they go to stderr —
@@ -257,7 +248,7 @@ pub async fn run_fields<W: Write>(
         CliError::Usage("provide --url (daemon mode) or --data (embedded mode)".into())
     })?;
     let since_secs = last.map(parse_last).transpose()?;
-    let client = make_client(&conn)?;
+    let client = conn.client()?;
     let resp = client.catalog_fields(service, since_secs, limit).await?;
 
     let (columns, rows) = fields_to_rows(&resp);
@@ -292,7 +283,7 @@ pub async fn run_field<W: Write>(
 ) -> Result<(), CliError> {
     let format = resolve_format(format)?;
     let conn = conn.ok_or_else(|| CliError::Usage("schema field requires a server".into()))?;
-    let client = make_client(&conn)?;
+    let client = conn.client()?;
     let resp = client.catalog_field(name, limit, after).await?;
 
     let human = format == OutputFormat::Table;
@@ -454,7 +445,7 @@ pub async fn run_conflicts<W: Write>(
     let format = resolve_format(format)?;
     let conn = conn.ok_or_else(|| CliError::Usage("schema conflicts requires a server".into()))?;
     let since_secs = last.map(parse_last).transpose()?;
-    let client = make_client(&conn)?;
+    let client = conn.client()?;
     let resp = client
         .catalog_conflicts(field, service, since_secs, limit)
         .await?;
@@ -1251,7 +1242,7 @@ pub async fn run_repin(
         }
     }
 
-    let client = make_client(&conn)?;
+    let client = conn.client()?;
     let dialect = flags.dialect.map(crate::cli::SeverityDialect::token);
     let human = format == OutputFormat::Table;
 
@@ -1481,7 +1472,7 @@ pub async fn run_repin_status(
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
     let format = resolve_format(format)?;
-    let client = make_client(&conn)?;
+    let client = conn.client()?;
     let status = client.schema_repin_status().await?;
     match status.job {
         Some(job) => {
@@ -1510,7 +1501,7 @@ pub async fn run_repin_cancel(
     format: Option<OutputFormat>,
 ) -> Result<(), CliError> {
     let format = resolve_format(format)?;
-    let client = make_client(&conn)?;
+    let client = conn.client()?;
     let (accepted, receipt) = match client.schema_repin_cancel().await? {
         trawl_client::RepinCancel::Cancelling(r) => (true, r),
         trawl_client::RepinCancel::PastPointOfNoReturn(r)
@@ -1628,7 +1619,7 @@ pub async fn run_ack<W: Write>(
 ) -> Result<(), CliError> {
     let format = resolve_format(format)?;
     let human = format == OutputFormat::Table;
-    let client = make_client(&conn)?;
+    let client = conn.client()?;
 
     if clear {
         client.schema_field_ack_clear(field).await?;
@@ -2211,7 +2202,7 @@ mod repin_tests {
         let conn = ConnectionParams {
             url: "https://127.0.0.1:1".into(),
             token: "unused".into(),
-            insecure: true,
+            trust: trawl_client::TlsTrust::AcceptInvalid,
         };
         let mut out = Vec::new();
         let err = run_repin(
@@ -2249,7 +2240,7 @@ mod repin_tests {
         let conn = ConnectionParams {
             url: "https://127.0.0.1:1".into(),
             token: "unused".into(),
-            insecure: true,
+            trust: trawl_client::TlsTrust::AcceptInvalid,
         };
         let flags = RepinFlags {
             dialect: Some(crate::cli::SeverityDialect::Syslog),
@@ -2605,7 +2596,7 @@ pub async fn run_gc_pins<W: Write>(
     let older_than_secs = older_than
         .map(|s| parse_window(s, "--older-than"))
         .transpose()?;
-    let client = make_client(&conn)?;
+    let client = conn.client()?;
     // A refusal (409 for a repin owning the data root or an unreadable
     // corpus) arrives as a client error carrying the server's own message,
     // and `main` prints it and exits non-zero.

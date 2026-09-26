@@ -77,7 +77,10 @@ different file. Name the server every time you change something.
 | Permission denied | The permission the action needs, such as `query` or `schema_read` |
 | A query returns no rows | Time range, service spelling, whether logs have arrived |
 
-For a self-signed test server, `insecure = true` under `[server]` or in the
-profile turns off certificate verification for that connection only. Anything
-permanent needs a trusted certificate. Continue with
+For a self-signed or private-CA server, copy its CA certificate to your
+machine and set `ca_cert = "~/.config/trawl/lab-ca.pem"` under `[server]` or in
+the profile. `trawl` then trusts only that CA for the connection and still
+checks the hostname. `insecure = true` turns verification off completely, and
+`trawl` prints a warning on every run. Use it only for a short test. Continue
+with
 [Build a query](/use/query-tutorial/) or [CLI and TUI workflows](/use/cli-tui/).

@@ -43,7 +43,10 @@ clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 insta = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
 tempfile = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [package.metadata.deb]
 maintainer = "Jakub Burgis <mail@jakub.me>"

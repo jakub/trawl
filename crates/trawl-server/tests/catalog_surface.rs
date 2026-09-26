@@ -1028,7 +1028,7 @@ async fn read_commands_render_populated_output() {
     let conn = ConnectionParams {
         url: h.server.url.clone(),
         token: h.server.analyst_token.clone(),
-        insecure: true,
+        trust: trawl_client::TlsTrust::AcceptInvalid,
     };
 
     // `trawl schema fields --service svc-a --last 1h --limit 50`: every flag

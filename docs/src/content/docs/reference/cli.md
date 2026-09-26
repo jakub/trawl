@@ -25,6 +25,12 @@ A flag beats an environment variable, which beats the config file. Profiles and
 the `[ui]` and `[tail]` settings live in
 [client configuration](/reference/configuration/#client-configuration).
 
+When `insecure` is on from the flag, `TRAWL_INSECURE`, `[server]`, or a profile,
+`trawl` writes one warning line to stderr before any other output. Stdout does
+not change. To trust a self-signed or private certificate with verification
+left on, set `ca_cert` in the config file. It has no flag or environment
+variable.
+
 ## Environment variables
 
 | Variable | Equivalent flag | Description |
