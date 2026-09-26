@@ -25,7 +25,7 @@ use fleet_auth::{
 };
 use reqwest::Client;
 
-use crate::config::ResolvedConfig;
+use crate::config::{ResolvedConfig, UpstreamTls};
 
 /// Handler-visible runtime state.
 #[derive(Clone)]
@@ -49,14 +49,23 @@ impl AppState {
     /// rustls `ring` crypto provider on first call (idempotent — ignored
     /// if another provider is already installed).
     ///
+    /// The client's certificate trust comes from
+    /// [`ResolvedConfig::upstream_tls`], already validated at resolution.
+    ///
     /// # Errors
     /// Propagates `reqwest::Error` if the client can't be built.
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let http = Client::builder()
-            .danger_accept_invalid_certs(cfg.insecure_upstream_tls)
-            .build()?;
+        let builder = Client::builder();
+        let builder = match cfg.upstream_tls {
+            UpstreamTls::System => builder,
+            // Only the pinned roots, hostname verification left on. A
+            // plain-http hop would skip the pin, so the client refuses one.
+            UpstreamTls::PinnedCa(roots) => builder.tls_certs_only(roots).https_only(true),
+            UpstreamTls::InsecureLoopback => builder.danger_accept_invalid_certs(true),
+        };
+        let http = builder.build()?;
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -186,7 +195,7 @@ mod tests {
             upstream_url: "http://127.0.0.1:5514".into(),
             session_ttl_secs: 3_600,
             allow_insecure_cookies: !cookie_secure,
-            insecure_upstream_tls: false,
+            upstream_tls: UpstreamTls::System,
             cookie_key: SessionKey::from_bytes([0x42; fleet_auth::KEY_LEN]),
             shared_domain: None,
             public_origins: PublicOrigins::parse(["http://127.0.0.1:8090"])

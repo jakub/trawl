@@ -9,6 +9,8 @@
 # RUST_LOG=trawl_web=info,fleet_auth=info
 
 # Skip TLS verification of the upstream trawld self-signed cert.
-# Safe ONLY when trawl-web and trawld live on the same host talking loopback.
-# Do NOT set this in deployments where upstream traffic leaves the box.
+# trawl-web honours it only for a loopback upstream (127.0.0.0/8, ::1 or
+# localhost) and refuses to start for any other upstream host, or when
+# [web] upstream_ca_path is also set. To verify a remote trawld, set
+# upstream_ca_path in trawld.toml instead.
 # TRAWL_WEB_INSECURE_UPSTREAM=1
