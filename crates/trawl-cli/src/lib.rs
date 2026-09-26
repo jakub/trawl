@@ -417,7 +417,7 @@ async fn run(mut args: Cli) -> Result<(), CliError> {
     // Trial verbs run before config.toml is read: a broken client config
     // must not block `trawl trial up` or `down`.
     let command = match args.command.take() {
-        Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd)?),
+        Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await?),
         command => command,
     };
     // The driver sends to whatever TUI holds the socket and never uses the

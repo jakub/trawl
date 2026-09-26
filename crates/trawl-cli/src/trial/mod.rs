@@ -19,67 +19,41 @@
 //! The verbs dispatch before `config.toml` is read, so a broken or absent
 //! client config never blocks `up` or `down`.
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "trawl trial up renders the project")
-)]
 mod compose;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the trial verbs drive docker through it")
-)]
 mod docker;
 mod error;
-#[cfg_attr(not(test), expect(dead_code, reason = "trawl trial up mints the keys"))]
 mod keys;
+mod lifecycle;
 mod lock;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "up, stop, and down check ownership first")
-)]
 mod ownership;
 pub mod paths;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "trawl trial up checks the engine first")
-)]
 mod preflight;
 pub mod profile;
+mod render;
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "trawl trial up seeds the samples")
 )]
 mod sample;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "trawl trial up writes the secrets")
-)]
 mod secrets;
 mod state;
 
 pub use error::TrialError;
 
 /// Compose project name. One trial per Docker engine.
-#[cfg_attr(not(test), expect(dead_code, reason = "the Compose renderer uses it"))]
 pub const PROJECT: &str = "trawl-trial";
 
 /// Label every trial container, network, and volume carries, valued with
 /// the trial id.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the Compose renderer and ownership scan use it")
-)]
 pub const LABEL_ID: &str = "sh.trawl.trial.id";
 
 /// The reserved profile name that reads the trial directory.
 pub const PROFILE: &str = "trial";
 
 /// Repository of the trawl image; the tag is the CLI version.
-#[expect(dead_code, reason = "up resolves the image from it")]
 pub const IMAGE_REPO: &str = "ghcr.io/jakub/trawl";
 
 /// PostgreSQL image the trial runs.
-#[cfg_attr(not(test), expect(dead_code, reason = "the Compose renderer uses it"))]
 pub const POSTGRES_IMAGE: &str = "postgres:18";
 
 /// Loopback port for the HTTPS API when `--api-port` is omitted.
@@ -90,10 +64,6 @@ pub const DEFAULT_WEB_PORT: u16 = 18090;
 
 /// Name of the never-started container that claims the engine for one
 /// trial. A second trial's create fails on the name conflict.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "up creates the claim and down removes it last")
-)]
 pub const CLAIM_NAME: &str = "trawl-trial-claim";
 
 /// `trawl trial <verb>`.
@@ -152,22 +122,14 @@ pub struct UpArgs {
     pub no_sample_data: bool,
 }
 
-impl TrialCommand {
-    fn verb(&self) -> &'static str {
-        match self {
-            Self::Up(_) => "up",
-            Self::Status => "status",
-            Self::Key => "key",
-            Self::Stop => "stop",
-            Self::Down { .. } => "down",
-        }
-    }
-}
-
 /// Run one trial verb.
-///
-/// The lifecycle behind the verbs lands in a later commit; until then every
-/// verb refuses with a plain error instead of doing part of its job.
-pub fn run(cmd: &TrialCommand) -> Result<(), TrialError> {
-    Err(TrialError::NotImplemented { verb: cmd.verb() })
+pub async fn run(cmd: &TrialCommand) -> Result<(), TrialError> {
+    let paths = paths::TrialPaths::from_env()?;
+    match cmd {
+        TrialCommand::Up(args) => lifecycle::up(&paths, args).await,
+        TrialCommand::Status => lifecycle::status(&paths).await,
+        TrialCommand::Key => lifecycle::key(&paths),
+        TrialCommand::Stop => lifecycle::stop(&paths).await,
+        TrialCommand::Down { yes } => lifecycle::down(&paths, *yes).await,
+    }
 }

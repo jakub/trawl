@@ -24,18 +24,10 @@ use super::TrialError;
 
 /// Held for the life of the value; dropping it releases the lock.
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "up, stop, and down take the lock")
-)]
 pub struct TrialLock {
     _file: File,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "up, stop, and down take the lock")
-)]
 impl TrialLock {
     /// Take the lock, waiting for it if another invocation holds it.
     /// `on_wait` runs once, before blocking, only when the lock is busy,

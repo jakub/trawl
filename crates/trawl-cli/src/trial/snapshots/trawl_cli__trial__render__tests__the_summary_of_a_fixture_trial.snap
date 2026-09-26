@@ -1,0 +1,30 @@
+---
+source: crates/trawl-cli/src/trial/render.rs
+expression: "text(|out| render_summary(out, &state, &paths()))"
+---
+The trial is up.
+
+  Browser   http://localhost:18090
+  API       https://127.0.0.1:15514
+
+Sign in to the browser with the operator key; `trawl trial key` prints it.
+The key files are readable by your user only:
+
+  operator  /state/trawl/trial/operator.token
+  ingest    /state/trawl/trial/ingest.token
+
+Sample data: 2000 events from 2026-09-24T12:00:00Z to 2026-09-25T12:00:00Z.
+
+Run the documented query:
+
+  trawl -p trial query 'service=checkout _severity>=error | stats count() as errors by service'
+
+It returns one row: service checkout, errors 20.
+
+Next:
+
+  trawl trial key     print the operator token for the browser sign-in
+  trawl -p trial      open the terminal UI on the trial
+  trawl trial status  show the trial's state
+  trawl trial stop    stop the containers; `trawl trial up` resumes
+  trawl trial down    delete the trial and everything it made

@@ -396,8 +396,9 @@ async fn trial_profile_without_a_trial_names_trial_up() {
 }
 
 /// Trial verbs dispatch before the config file is read, so a broken
-/// config cannot block them. The verbs themselves are not implemented
-/// in this build and say so.
+/// config cannot block them. A remote `DOCKER_HOST` stops the verbs that
+/// need Docker at preflight, before any subprocess, so no engine is asked;
+/// `status` and `key` work from the trial directory alone.
 #[tokio::test]
 async fn trial_verbs_do_not_read_the_config_file() {
     let trial = Trial::new(1, "unused");
@@ -411,22 +412,36 @@ async fn trial_verbs_do_not_read_the_config_file() {
         stderr_of(&output)
     );
 
-    for verb in [
-        &["up"][..],
-        &["status"],
-        &["key"],
-        &["stop"],
-        &["down", "--yes"],
-    ] {
+    let remote = [("DOCKER_HOST", "tcp://example.invalid:2375")];
+    for verb in [&["up"][..], &["stop"], &["down", "--yes"]] {
         let mut args = vec!["-c", broken, "trial"];
         args.extend(verb);
-        let output = trial.trawl(&args, &[]).await;
+        let output = trial.trawl(&args, &remote).await;
         let stderr = stderr_of(&output);
         assert!(!output.status.success(), "{verb:?}");
         assert!(
-            stderr.contains(&format!("`trawl trial {}` is not implemented", verb[0])),
+            stderr.contains("DOCKER_HOST points at a tcp:// address"),
             "{verb:?}: {stderr}"
         );
         assert!(!stderr.contains("failed to parse"), "{verb:?}: {stderr}");
     }
+
+    let output = trial
+        .trawl(&["-c", broken, "trial", "status"], &remote)
+        .await;
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("Trial 0123456789abcdef0123456789abcdef\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("unknown: DOCKER_HOST points at"),
+        "{stdout}"
+    );
+
+    let output = trial.trawl(&["-c", broken, "trial", "key"], &remote).await;
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(output.stdout, format!("{TOKEN}\n").as_bytes());
+    assert!(output.stderr.is_empty(), "{}", stderr_of(&output));
 }
