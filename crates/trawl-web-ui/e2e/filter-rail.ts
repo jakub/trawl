@@ -2,9 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Readings of the filter rail at wide widths (issue #231, ADR-0044),
-// shared by every spec that asserts where the rail stands. A spec file
-// cannot import another spec file, so they live here.
+// Readings of the filter rail at wide widths (issue #231, ADR-0044), and
+// the held query that keeps an answer pending, shared by every spec that
+// asserts where the rail stands. A spec file cannot import another spec
+// file, so they live here.
 
 import { expect } from './fixtures';
 import { SEL } from './selectors';
@@ -64,6 +65,29 @@ export async function watchToggles(page: Page): Promise<() => Promise<number>> {
           ),
         ),
     );
+}
+
+/** Hold the next `/api/v1/query` until `release` is called. `arrived`
+ * settles once the request is parked, so the page is provably pending. */
+export async function holdNextQuery(page: Page) {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let arrive!: () => void;
+  const arrived = new Promise<void>((resolve) => {
+    arrive = resolve;
+  });
+  await page.route(
+    '**/api/v1/query',
+    async (route) => {
+      arrive();
+      await gate;
+      await route.continue();
+    },
+    { times: 1 },
+  );
+  return { arrived, release };
 }
 
 /** `text` is drawn where a reader can see it: one run of it inside

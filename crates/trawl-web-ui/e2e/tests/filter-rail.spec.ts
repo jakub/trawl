@@ -19,7 +19,7 @@
 
 import fs from 'node:fs';
 import { test, expect, resetScenario } from '../fixtures';
-import { expectRail, expectTextShown, watchToggles } from '../filter-rail';
+import { expectRail, expectTextShown, holdNextQuery, watchToggles } from '../filter-rail';
 import { COPY, SEL } from '../selectors';
 import type { Page } from '@playwright/test';
 
@@ -55,29 +55,6 @@ const uncountable = (() => {
 async function haul(page: Page, query: string) {
   await page.locator(SEL.dslEditor).getByRole('textbox').fill(query);
   await page.locator(SEL.runButton).click();
-}
-
-/** Hold the next `/api/v1/query` until `release` is called. `arrived`
- * settles once the request is parked, so the page is provably pending. */
-async function holdNextQuery(page: Page) {
-  let release!: () => void;
-  const gate = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  let arrive!: () => void;
-  const arrived = new Promise<void>((resolve) => {
-    arrive = resolve;
-  });
-  await page.route(
-    '**/api/v1/query',
-    async (route) => {
-      arrive();
-      await gate;
-      await route.continue();
-    },
-    { times: 1 },
-  );
-  return { arrived, release };
 }
 
 /** A settled snapshot answer: the scope strip shows execution facts

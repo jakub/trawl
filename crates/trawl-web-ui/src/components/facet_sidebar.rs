@@ -42,8 +42,10 @@ use std::collections::HashMap;
 
 use fleet_ui::{Icon, IconView, LoadState, Loaded, SearchInput};
 use leptos::prelude::*;
-use leptos::web_sys;
-use leptos_use::use_media_query;
+use leptos::{ev, web_sys};
+use leptos_use::{
+    UseEventListenerOptions, use_event_listener_with_options, use_media_query, use_window,
+};
 use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 
@@ -144,11 +146,36 @@ pub fn FacetSidebar(
         move || !suppressed.get() && !rows_suppressed.get() && countable.get() == Some(true);
 
     // Whether keyboard focus is somewhere in the rail. Set on the way in,
-    // cleared only when focus moves to an element outside it: a query
-    // unmounts the groups the moment it is sent, which drops a focused
-    // group header to `body` with no destination, and the rail is still
+    // cleared when focus moves to an element outside it or a pointer
+    // presses outside it. Focus that drops to `body` with no destination
+    // clears nothing: a query unmounts the groups the moment it is sent,
+    // which drops a focused group header to `body`, and the rail is still
     // the reader's place until the answer settles.
     let focus_inside = StoredValue::new(false);
+    let outside_rail = move |target: Option<web_sys::EventTarget>| {
+        target
+            .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+            .is_some_and(|target| {
+                panel
+                    .get_untracked()
+                    .is_some_and(|panel| !panel.contains(Some(&target)))
+            })
+    };
+    // A press on content that takes no focus, such as the top bar's
+    // title, also leaves `body` active, so the focus events alone cannot
+    // tell it from the unmount above. The press itself says the reader
+    // went elsewhere. Captured at the window, so no handler that stops
+    // the press can hide it; the hook removes the listener with the rail.
+    let _ = use_event_listener_with_options(
+        use_window(),
+        ev::pointerdown,
+        move |event: web_sys::PointerEvent| {
+            if outside_rail(event.target()) {
+                focus_inside.set_value(false);
+            }
+        },
+        UseEventListenerOptions::default().capture(true),
+    );
     // If the wide rail closes while the reader's focus is in it, move
     // focus to the `<summary>`, the one control a closed rail keeps. On
     // the close edge only; the narrow disclosure has its own rule above.
@@ -202,13 +229,7 @@ pub fn FacetSidebar(
             }
             on:focusin=move |_| focus_inside.set_value(true)
             on:focusout=move |event: web_sys::FocusEvent| {
-                let leaving = event
-                    .related_target()
-                    .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
-                    .is_some_and(|target| {
-                        panel.get_untracked().is_some_and(|panel| !panel.contains(Some(&target)))
-                    });
-                if leaving {
+                if outside_rail(event.related_target()) {
                     focus_inside.set_value(false);
                 }
             }

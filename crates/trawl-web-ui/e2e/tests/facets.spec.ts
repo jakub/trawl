@@ -23,7 +23,7 @@
 
 import fs from 'node:fs';
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
-import { expectRail, watchToggles } from '../filter-rail';
+import { expectRail, holdNextQuery, watchToggles } from '../filter-rail';
 import { SEL, COPY, nameFrom } from '../selectors';
 import { expectFocusRing } from '../a11y';
 
@@ -333,6 +333,39 @@ test('an aggregation that closes the rail moves focus from Clear all to the summ
   await expectRail(page, false);
   await expect(page.locator(SEL.filterRailContent)).toHaveAttribute('inert', '');
   await expect(page.locator(SEL.filterRailSummary)).toBeFocused();
+});
+
+// Focus the query drops to `body` stays the rail's until the reader goes
+// elsewhere, and a press elsewhere counts even where it focuses nothing.
+// The top bar's page title is such a place: it takes no focus and sits
+// outside `<main>`, so the press leaves `body` active, exactly as the
+// unmount did. A press in the results focuses the results region or
+// `<main>`, and a rail that closes then leaves that focus alone anyway.
+test('an aggregation that closes the rail leaves focus alone after a press outside the rail', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await page.locator(SEL.cmContent).fill(`service=${CORPUS.service}`);
+  await page.locator(SEL.runButton).click();
+  await expect(page.locator(SEL.facetGroup).first()).toBeVisible();
+  await expectRail(page, true);
+
+  const bodyActive = () => page.evaluate(() => document.activeElement === document.body);
+  await page.locator(SEL.facetGroup).first().locator(SEL.facetGroupHeader).focus();
+  const held = await holdNextQuery(page);
+  await page.goBack();
+  await held.arrived;
+  await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
+  expect(await bodyActive()).toBe(true);
+  await page.locator(SEL.topbarCrumb).click();
+  expect(await bodyActive()).toBe(true);
+
+  held.release();
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await expect(page.locator(SEL.filterRailSummary)).not.toBeFocused();
+  expect(await bodyActive()).toBe(true);
 });
 
 // A closed rail's own controls are out of the tab order, whatever it
