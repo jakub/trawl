@@ -1,16 +1,16 @@
 {
   "evidence": "Stub fixtures only; no daemon, database, or real ingest",
-  "head": "ba34d8650ee05a36357f969eae0e9993b0531c36",
-  "head_before": "ba34d8650ee05a36357f969eae0e9993b0531c36",
+  "head": "8fb924ef18a7b66fc25fd04b653c9f4ba808d212",
+  "head_before": "8fb924ef18a7b66fc25fd04b653c9f4ba808d212",
   "git_status": " M visual-evidence/issue-231/03-aggregate-filters-strip.png",
   "git_status_before": "",
   "script_sha256": "c1d830c4d68438734c1b4eae40240e303c7df2db1d7a954fa9ec4d0b599efff8",
-  "captured_at": "2026-09-26T07:17:52.083Z",
+  "captured_at": "2026-09-26T07:24:39.225Z",
   "port": 8731,
   "reduced_motion": "reduce",
   "color_scheme": "light",
   "dist": {
-    "sha256": "1f0fc9d13ff5c327eb61d6edab5bbd4c9c55edda648835dccc587023a637c034",
+    "sha256": "81a09fa036f6fc1afcdde860bcfd07c32300cf0ccff9b896daeb3cf7392c5bf4",
     "files": [
       "fleet-ui-a30215ee41c73bb7.css",
       "fonts/AlbertSans-Variable.ttf",
@@ -20,13 +20,13 @@
       "fonts/README.md",
       "fonts/SHA256SUMS",
       "index.html",
-      "main-be342eaf6b2dd1cd.css",
+      "main-7ba41a871e5b6d7b.css",
       "snippets/fleet-ui-2165a24593f0a7f1/vendor/paper-shaders.js",
       "snippets/trawl-web-ui-f99d61b89517acef/vendor/codemirror.js",
       "snippets/trawl-web-ui-f99d61b89517acef/vendor/uplot.js",
       "theme-bootstrap-e7acc838d5582fa1.js",
-      "trawl-web-ui-2e50c18d213b7f09.js",
-      "trawl-web-ui-2e50c18d213b7f09_bg.wasm",
+      "trawl-web-ui-faaf1198ca714fde.js",
+      "trawl-web-ui-faaf1198ca714fde_bg.wasm",
       "uplot-5e0d12c918aed906.css",
       "vendor/codemirror.js",
       "vendor/uplot.js"
@@ -85,7 +85,7 @@
         "open": false,
         "width": 32
       },
-      "sha256": "f1d565b71a961946f0d0051bd09d1617b15cddc03bb227ced7f45d13722eff9d",
+      "sha256": "18779a2ba8977bba9a8eb178e7fcfe9af488bfae73a05a47778998ea52cc2502",
       "bytes": 60789
     },
     {
