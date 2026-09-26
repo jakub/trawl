@@ -13,6 +13,9 @@ expression: text
   },
   "services": {
     "fleet-admin": {
+      "dns_opt": [
+        "ndots:1"
+      ],
       "dns_search": [
         "."
       ],
@@ -44,6 +47,9 @@ expression: text
       ]
     },
     "postgres": {
+      "dns_opt": [
+        "ndots:1"
+      ],
       "dns_search": [
         "."
       ],
@@ -81,6 +87,9 @@ expression: text
       ]
     },
     "tls-init": {
+      "dns_opt": [
+        "ndots:1"
+      ],
       "dns_search": [
         "."
       ],
@@ -116,6 +125,9 @@ expression: text
           "condition": "service_healthy"
         }
       },
+      "dns_opt": [
+        "ndots:1"
+      ],
       "dns_search": [
         "."
       ],
@@ -165,6 +177,9 @@ expression: text
           "condition": "service_healthy"
         }
       },
+      "dns_opt": [
+        "ndots:1"
+      ],
       "dns_search": [
         "."
       ],

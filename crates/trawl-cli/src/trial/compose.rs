@@ -27,8 +27,9 @@
 //!   prints a token.
 //!
 //! Every service, the network, and every volume carry the trial id label.
-//! No service inherits the host's DNS search domains, so a trial service
-//! name never resolves outside the trial network.
+//! No service inherits the host's DNS search domains, and Docker's
+//! embedded DNS never forwards a bare service name upstream, so a trial
+//! service name never resolves outside the trial network.
 //! Every published port binds 127.0.0.1. No service has a restart policy,
 //! and no image is pulled by Compose: `up` pulls and records images itself.
 //!
@@ -166,12 +167,27 @@ pub fn render_compose(state: &TrialState) -> Value {
             "image": image,
             "pull_policy": "never",
             "labels": labels,
-            // No search domains. Docker's DNS forwards a name it does not
-            // know to the host's resolvers, which append the host's search
-            // domains, so while the trial's PostgreSQL is stopped the name
-            // `postgres` can resolve to a machine on the LAN, and pgpass
-            // then offers it the role's password.
+            // A service name must never resolve outside the trial network.
+            // While a service is stopped, Docker's embedded DNS does not
+            // know its name, and without these two settings the name
+            // `postgres` can resolve to a machine on the LAN, which pgpass
+            // then offers the role's password:
+            //
+            // - `dns_search: ["."]` drops the host's search domains, so
+            //   the name is not tried as `postgres.<lan domain>`.
+            // - `ndots:1` stops the embedded DNS from forwarding the bare
+            //   name upstream, where a LAN resolver that answers bare
+            //   host names (dnsmasq `expand-hosts`, DHCP-registered
+            //   names) would resolve it. The embedded DNS answers a
+            //   single-label A or AAAA query it cannot resolve itself
+            //   with no records, instead of forwarding it, only when the
+            //   container's resolv.conf sets `ndots` explicitly (moby
+            //   `daemon/libnetwork/resolver.go` at docker-v29.7.2, lines
+            //   462-471; `sandbox_dns_unix.go` lines 320-321). With no
+            //   search domains, `ndots:1` changes nothing else: every
+            //   name is still looked up as it is.
             "dns_search": ["."],
+            "dns_opt": ["ndots:1"],
         });
         let map = service.as_object_mut().expect("an object");
         map.extend(settings.as_object().expect("an object").clone());
@@ -571,14 +587,26 @@ mod tests {
         }
     }
 
-    /// A stopped trial's service names must not resolve through the
-    /// host's search domains: on a real host, `postgres` did, to a LAN
-    /// PostgreSQL that `fleet-admin` then tried the fleet role against.
+    /// A stopped trial's service names must not resolve outside the
+    /// trial network: on a real host, `postgres` resolved through the
+    /// host's search domains to a LAN PostgreSQL that `fleet-admin` then
+    /// tried the fleet role against. Every service, the ones on no
+    /// network included, carries both settings, so a service added later
+    /// cannot skip them.
     #[test]
-    fn no_service_uses_the_host_search_domains() {
+    fn no_service_name_leaves_the_trial_network() {
         let project = render_compose(&state());
-        for (name, service) in project["services"].as_object().unwrap() {
-            assert_eq!(service["dns_search"], json!(["."]), "{name}");
+        let services = project["services"].as_object().unwrap();
+        assert_eq!(services.len(), Service::ALL.len());
+        for service in Service::ALL {
+            let rendered = &services[service.name()];
+            assert_eq!(rendered["dns_search"], json!(["."]), "{}", service.name());
+            assert_eq!(
+                rendered["dns_opt"],
+                json!(["ndots:1"]),
+                "{}",
+                service.name()
+            );
         }
     }
 
