@@ -11,6 +11,19 @@
 //! `COMPOSE_PROJECT_NAME` cannot redirect the project), and are bounded by
 //! a timeout and by capture limits.
 //!
+//! Every engine call is pinned to one endpoint. Without a pin, each
+//! `docker` child would resolve the current context again, so a
+//! `docker context use` in another terminal between two calls would send
+//! the later ones to an engine preflight never checked. [`DockerCli`] is
+//! the program before an endpoint is known, and all it can run is
+//! `docker context inspect`. [`DockerCli::pin`] consumes it and returns
+//! the [`Docker`] driver, which runs every child with `DOCKER_HOST` set to
+//! its [`LocalEndpoint`] and `DOCKER_CONTEXT` removed. The docker CLI
+//! reads an endpoint in this order: the `--context` flag, `DOCKER_HOST`,
+//! `DOCKER_CONTEXT`, then `currentContext` in its config. The driver never
+//! passes `--context`, so `DOCKER_HOST` decides, and the Compose plugin
+//! inherits it through the environment like any child.
+//!
 //! Two ways to run a command:
 //!
 //! - [`Docker::stream`] hands the child our stderr for both of its output
@@ -185,26 +198,86 @@ pub enum DockerError {
     OutputTooLarge { command: String, limit: usize },
 }
 
-/// Runs `docker`, and `docker compose` for the trial project.
+/// A Docker endpoint on this machine: a `unix://` socket address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEndpoint(String);
+
+impl LocalEndpoint {
+    /// `None` unless `address` is a `unix://` address.
+    pub fn parse(address: &str) -> Option<Self> {
+        address
+            .starts_with("unix://")
+            .then(|| Self(address.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The `docker` program before an endpoint is pinned. It runs one
+/// command, `docker context inspect`, which reads the CLI's own
+/// configuration and contacts no engine.
 #[derive(Debug, Clone)]
-pub struct Docker {
+pub struct DockerCli {
     program: OsString,
     /// Arguments before every argv: empty for `docker`; tests run a stub
     /// script through `/bin/sh` with the script path here.
     lead: Vec<OsString>,
+}
+
+impl DockerCli {
+    pub fn new() -> Self {
+        Self {
+            program: DOCKER.into(),
+            lead: Vec::new(),
+        }
+    }
+
+    /// `docker context inspect` of the current context, buffered and
+    /// diagnosable, whatever its exit status.
+    pub async fn context_inspect(&self) -> Result<Output, DockerError> {
+        let args = Args::new().args(["context", "inspect"]);
+        let command = base_command(&self.program, &self.lead, &args);
+        run_buffered(command, &args, None, Sensitivity::Diagnose, PROBE_TIMEOUT).await
+    }
+
+    /// The driver for the trial whose host directory is `dir`, with every
+    /// call pinned to `endpoint`.
+    pub fn pin(self, endpoint: LocalEndpoint, dir: impl Into<PathBuf>) -> Docker {
+        Docker {
+            program: self.program,
+            lead: self.lead,
+            endpoint,
+            dir: dir.into(),
+        }
+    }
+}
+
+impl Default for DockerCli {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Runs `docker`, and `docker compose` for the trial project, against one
+/// pinned endpoint. Only [`DockerCli::pin`] makes one.
+#[derive(Debug, Clone)]
+pub struct Docker {
+    program: OsString,
+    /// As [`DockerCli`]'s.
+    lead: Vec<OsString>,
+    /// Every child's `DOCKER_HOST`.
+    endpoint: LocalEndpoint,
     /// The trial directory: Compose's project directory, holding
     /// `compose.json`.
     dir: PathBuf,
 }
 
 impl Docker {
-    /// The driver for the trial whose host directory is `dir`.
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            program: DOCKER.into(),
-            lead: Vec::new(),
-            dir: dir.into(),
-        }
+    /// The endpoint every call is pinned to.
+    pub fn endpoint(&self) -> &LocalEndpoint {
+        &self.endpoint
     }
 
     /// The rendered Compose file.
@@ -234,64 +307,7 @@ impl Docker {
         sensitivity: Sensitivity,
         timeout: Duration,
     ) -> Result<Output, DockerError> {
-        let mut command = self.command(args);
-        command
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = spawn(&mut command, args)?;
-        let child_stdin = child.stdin.take();
-        let child_stdout = child.stdout.take().expect("stdout is piped");
-        let child_stderr = child.stderr.take().expect("stderr is piped");
-
-        let work = async {
-            let feed = async {
-                if let (Some(mut pipe), Some(bytes)) = (child_stdin, stdin) {
-                    // A child that exits without reading closes the pipe;
-                    // its exit status reports that, not this write.
-                    let _ = pipe.write_all(bytes).await;
-                    let _ = pipe.shutdown().await;
-                }
-            };
-            let ((), stdout, stderr) = tokio::join!(
-                feed,
-                read_stdout(child_stdout),
-                read_stderr(child_stderr, sensitivity),
-            );
-            let status = child.wait().await;
-            (status, stdout, stderr)
-        };
-        let finished = tokio::time::timeout(timeout, work).await;
-        let Ok((status, stdout, stderr)) = finished else {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(DockerError::TimedOut {
-                command: args.display(),
-                secs: timeout.as_secs(),
-            });
-        };
-
-        let pipe_error = |source| DockerError::Spawn {
-            command: args.display(),
-            source,
-        };
-        let status = status.map_err(pipe_error)?;
-        let stdout = stdout
-            .map_err(pipe_error)?
-            .ok_or(DockerError::OutputTooLarge {
-                command: args.display(),
-                limit: MAX_STDOUT,
-            })?;
-        let stderr = stderr.map_err(pipe_error)?;
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
+        run_buffered(self.command(args), args, stdin, sensitivity, timeout).await
     }
 
     /// [`Self::output`], refusing a non-zero exit status.
@@ -352,29 +368,104 @@ impl Docker {
         })
     }
 
+    /// Every child, `docker compose` included, is built here, pinned.
     fn command(&self, args: &Args) -> Command {
-        let mut command = Command::new(&self.program);
+        let mut command = base_command(&self.program, &self.lead, args);
         command
-            .args(&self.lead)
-            .args(args.argv())
-            .kill_on_drop(true);
-        for name in compose_variables(std::env::vars_os().map(|(name, _)| name)) {
-            command.env_remove(name);
-        }
+            .env("DOCKER_HOST", self.endpoint.as_str())
+            .env_remove("DOCKER_CONTEXT");
         command
     }
 }
 
 #[cfg(test)]
-impl Docker {
-    /// A driver that runs `script` through `/bin/sh` in place of docker.
-    pub(crate) fn stub(script: &std::path::Path, dir: impl Into<PathBuf>) -> Self {
+impl DockerCli {
+    /// A program that runs `script` through `/bin/sh` in place of docker.
+    pub(crate) fn stub(script: &std::path::Path) -> Self {
         Self {
             program: "/bin/sh".into(),
             lead: vec![script.as_os_str().to_owned()],
-            dir: dir.into(),
         }
     }
+}
+
+/// A `docker` child with no pin: the argv, kill on drop, and every
+/// inherited `COMPOSE_*` variable removed.
+fn base_command(program: &OsStr, lead: &[OsString], args: &Args) -> Command {
+    let mut command = Command::new(program);
+    command.args(lead).args(args.argv()).kill_on_drop(true);
+    for name in compose_variables(std::env::vars_os().map(|(name, _)| name)) {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// Run `command` with both output streams buffered, whatever its exit
+/// status. `stdin`, when given, is written and then closed.
+async fn run_buffered(
+    mut command: Command,
+    args: &Args,
+    stdin: Option<&[u8]>,
+    sensitivity: Sensitivity,
+    timeout: Duration,
+) -> Result<Output, DockerError> {
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = spawn(&mut command, args)?;
+    let child_stdin = child.stdin.take();
+    let child_stdout = child.stdout.take().expect("stdout is piped");
+    let child_stderr = child.stderr.take().expect("stderr is piped");
+
+    let work = async {
+        let feed = async {
+            if let (Some(mut pipe), Some(bytes)) = (child_stdin, stdin) {
+                // A child that exits without reading closes the pipe;
+                // its exit status reports that, not this write.
+                let _ = pipe.write_all(bytes).await;
+                let _ = pipe.shutdown().await;
+            }
+        };
+        let ((), stdout, stderr) = tokio::join!(
+            feed,
+            read_stdout(child_stdout),
+            read_stderr(child_stderr, sensitivity),
+        );
+        let status = child.wait().await;
+        (status, stdout, stderr)
+    };
+    let finished = tokio::time::timeout(timeout, work).await;
+    let Ok((status, stdout, stderr)) = finished else {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(DockerError::TimedOut {
+            command: args.display(),
+            secs: timeout.as_secs(),
+        });
+    };
+
+    let pipe_error = |source| DockerError::Spawn {
+        command: args.display(),
+        source,
+    };
+    let status = status.map_err(pipe_error)?;
+    let stdout = stdout
+        .map_err(pipe_error)?
+        .ok_or(DockerError::OutputTooLarge {
+            command: args.display(),
+            limit: MAX_STDOUT,
+        })?;
+    let stderr = stderr.map_err(pipe_error)?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// The inherited variables to remove from a docker child: every
@@ -502,12 +593,22 @@ pub(crate) mod tests {
     /// Write a stub docker script; the driver runs it through `/bin/sh`,
     /// so it needs no exec bit and cannot race a concurrent fork into
     /// "text file busy".
-    pub(crate) fn stub(body: &str) -> (tempfile::TempDir, Docker) {
+    pub(crate) fn stub_cli(body: &str) -> (tempfile::TempDir, DockerCli) {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("docker.sh");
         std::fs::write(&script, format!("set -u\n{body}\n")).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let docker = Docker::stub(&script, tmp.path().join("trial"));
+        (tmp, DockerCli::stub(&script))
+    }
+
+    /// The endpoint [`stub`] pins.
+    pub(crate) const STUB_ENDPOINT: &str = "unix:///stub/docker.sock";
+
+    /// A stub driver pinned to [`STUB_ENDPOINT`].
+    pub(crate) fn stub(body: &str) -> (tempfile::TempDir, Docker) {
+        let (tmp, cli) = stub_cli(body);
+        let endpoint = LocalEndpoint::parse(STUB_ENDPOINT).unwrap();
+        let docker = cli.pin(endpoint, tmp.path().join("trial"));
         (tmp, docker)
     }
 
@@ -660,11 +761,11 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_missing_program_is_named_as_missing_docker() {
-        let docker = Docker {
+        let docker = DockerCli {
             program: "/nonexistent/docker".into(),
             lead: Vec::new(),
-            dir: PathBuf::from("/nonexistent"),
-        };
+        }
+        .pin(LocalEndpoint::parse(STUB_ENDPOINT).unwrap(), "/nonexistent");
         let err = docker
             .output(
                 &args(&["version"]),
@@ -680,7 +781,10 @@ pub(crate) mod tests {
 
     #[test]
     fn compose_arguments_pin_the_project_file_and_directory() {
-        let docker = Docker::new("/state/trawl/trial");
+        let docker = DockerCli::new().pin(
+            LocalEndpoint::parse(STUB_ENDPOINT).unwrap(),
+            "/state/trawl/trial",
+        );
         let call = docker.compose(Args::new().args(["up", "-d"]));
         assert_eq!(
             call.display(),
@@ -712,6 +816,90 @@ pub(crate) mod tests {
             ]
             .map(OsString::from)
         );
+    }
+
+    /// The environment `command` gives a child: `(name, Some(value))` for
+    /// a set variable, `(name, None)` for a removed one.
+    fn child_env(command: &Command) -> Vec<(OsString, Option<OsString>)> {
+        command
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.map(OsStr::to_owned)))
+            .collect()
+    }
+
+    #[test]
+    fn every_child_is_pinned_to_the_endpoint_without_a_context() {
+        let docker = DockerCli::new().pin(
+            LocalEndpoint::parse("unix:///run/user/1000/docker.sock").unwrap(),
+            "/state/trawl/trial",
+        );
+        let calls = [
+            Args::new().args(["version", "--format", "json"]),
+            Args::new().args(["compose", "version", "--short"]),
+            docker.compose(Args::new().args(["up", "--wait"])),
+            docker.compose(Args::new().args(["run", "--rm", "fleet-admin", "keys", "list"])),
+            Args::new().args(["container", "create", "--name", "x", "sha256:aa", "true"]),
+        ];
+        for call in &calls {
+            let command = docker.command(call);
+            let env = child_env(&command);
+            assert!(
+                env.contains(&(
+                    "DOCKER_HOST".into(),
+                    Some("unix:///run/user/1000/docker.sock".into())
+                )),
+                "{}: {env:?}",
+                call.display()
+            );
+            assert!(
+                env.contains(&("DOCKER_CONTEXT".into(), None)),
+                "{}: {env:?}",
+                call.display()
+            );
+            assert_eq!(
+                command.as_std().get_args().collect::<Vec<_>>(),
+                call.argv()
+                    .iter()
+                    .map(OsString::as_os_str)
+                    .collect::<Vec<_>>(),
+            );
+            assert!(
+                !call.argv().iter().any(|a| a == "--context" || a == "-c"),
+                "{}",
+                call.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_child_sees_the_pinned_endpoint_and_no_context() {
+        let (_tmp, docker) =
+            stub(r#"printf '%s|%s' "${DOCKER_HOST-unset}" "${DOCKER_CONTEXT-unset}""#);
+        for call in [
+            Args::new().arg("version"),
+            docker.compose(Args::new().arg("ps")),
+        ] {
+            let out = docker
+                .capture(&call, None, Sensitivity::Diagnose, PROBE_TIMEOUT)
+                .await
+                .unwrap();
+            assert_eq!(&out.stdout[..], format!("{STUB_ENDPOINT}|unset").as_bytes());
+        }
+    }
+
+    #[test]
+    fn only_a_unix_address_is_a_local_endpoint() {
+        assert!(LocalEndpoint::parse("unix:///var/run/docker.sock").is_some());
+        for remote in [
+            "tcp://10.0.0.5:2376",
+            "ssh://me@host",
+            "npipe:////./pipe/docker_engine",
+            "/var/run/docker.sock",
+            "",
+        ] {
+            assert!(LocalEndpoint::parse(remote).is_none(), "{remote}");
+        }
     }
 
     #[test]

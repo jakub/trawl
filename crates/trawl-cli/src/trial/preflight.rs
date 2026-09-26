@@ -14,6 +14,11 @@
 //!   contacted.
 //! - The active context's endpoint must be `unix://` too; a remote
 //!   context is refused before the engine is asked anything.
+//! - The endpoint is resolved once: `DOCKER_HOST` when it is set, else the
+//!   current context's, read with `docker context inspect`. Every later
+//!   probe, and every call the trial makes after preflight, runs through
+//!   the [`Docker`] driver pinned to it, so a context switch in another
+//!   terminal cannot move the trial to an engine this check never saw.
 //! - The Compose floor is a comparison, so any later major version passes.
 //!   The legacy `docker-compose` v1 executable is never run.
 //!
@@ -23,8 +28,11 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::path::PathBuf;
 
-use super::docker::{Args, Docker, DockerError, PROBE_TIMEOUT, Sensitivity};
+use super::docker::{
+    Args, Docker, DockerCli, DockerError, LocalEndpoint, PROBE_TIMEOUT, Sensitivity,
+};
 
 /// The oldest Compose plugin the trial accepts, as (major, minor).
 /// 2.20 is the release that introduced `up --wait-timeout`.
@@ -82,8 +90,8 @@ pub struct EngineFacts {
     pub docker_host: Option<OsString>,
     /// Whether the `docker` command could be run at all.
     pub docker_installed: bool,
-    /// The active context's endpoint (`docker context inspect`), when it
-    /// could be read.
+    /// The endpoint the trial pins: a set `DOCKER_HOST`, else the active
+    /// context's (`docker context inspect`), when it could be read.
     pub context_endpoint: Option<String>,
     /// Whether `docker version` reached the engine.
     pub server_reachable: bool,
@@ -228,60 +236,90 @@ fn scheme(address: &str) -> String {
 /// `DOCKER_HOST`; it is checked before any subprocess runs, and gathering
 /// stops at the first unmet requirement, so a remote endpoint is never
 /// contacted.
+///
+/// On success, the driver for the trial directory `dir`, pinned to the
+/// endpoint this check accepted. It is the only way the trial gets one.
 pub async fn preflight(
-    docker: &Docker,
+    cli: DockerCli,
+    dir: impl Into<PathBuf>,
     docker_host: Option<OsString>,
-) -> Result<Engine, super::TrialError> {
+) -> Result<(Engine, Docker), super::TrialError> {
     check_docker_host(docker_host.as_deref())?;
-    let facts = gather(docker, docker_host).await?;
-    Ok(check(&facts)?)
+    let (facts, docker) = gather(cli, dir.into(), docker_host).await?;
+    let engine = check(&facts)?;
+    // `check` accepts only a local endpoint, and gather pins to every
+    // local endpoint it reads.
+    let docker = docker.ok_or(PreflightError::ContextUnknown)?;
+    Ok((engine, docker))
 }
 
+/// The facts, and the driver pinned to the endpoint when it is local.
 async fn gather(
-    docker: &Docker,
+    cli: DockerCli,
+    dir: PathBuf,
     docker_host: Option<OsString>,
-) -> Result<EngineFacts, DockerError> {
+) -> Result<(EngineFacts, Option<Docker>), DockerError> {
+    let docker_host = docker_host.filter(|v| !v.is_empty());
     let mut facts = EngineFacts {
         docker_host,
         ..EngineFacts::default()
     };
-    let probe = |argv: &'static [&'static str]| {
-        let args = Args::new().args(argv);
-        async move {
-            docker
-                .output(&args, None, Sensitivity::Diagnose, PROBE_TIMEOUT)
-                .await
-        }
-    };
 
-    let context = match probe(&["context", "inspect"]).await {
-        Err(DockerError::NotInstalled) => return Ok(facts),
+    // `DOCKER_HOST` outranks every context in the docker CLI, so when it
+    // is set it is the endpoint, and no context is read.
+    if let Some(host) = &facts.docker_host {
+        facts.context_endpoint = host.to_str().map(str::to_owned);
+    } else {
+        let context = match cli.context_inspect().await {
+            Err(DockerError::NotInstalled) => return Ok((facts, None)),
+            other => other?,
+        };
+        facts.docker_installed = true;
+        if context.status.success() {
+            facts.context_endpoint = context_endpoint(&context.stdout);
+        }
+    }
+    let Some(endpoint) = facts
+        .context_endpoint
+        .as_deref()
+        .and_then(LocalEndpoint::parse)
+    else {
+        return Ok((facts, None));
+    };
+    let docker = cli.pin(endpoint, dir);
+
+    let version = match probe(&docker, &["version", "--format", "json"]).await {
+        Err(DockerError::NotInstalled) => return Ok((facts, Some(docker))),
         other => other?,
     };
     facts.docker_installed = true;
-    if context.status.success() {
-        facts.context_endpoint = context_endpoint(&context.stdout);
-    }
-    if local_endpoint(facts.context_endpoint.as_deref()).is_err() {
-        return Ok(facts);
-    }
-
-    let version = probe(&["version", "--format", "json"]).await?;
     facts.server_reachable = version.status.success() && server_present(&version.stdout);
     if !facts.server_reachable {
-        return Ok(facts);
+        return Ok((facts, Some(docker)));
     }
 
-    let compose = probe(&["compose", "version", "--short"]).await?;
+    let compose = probe(&docker, &["compose", "version", "--short"]).await?;
     if compose.status.success() {
         facts.compose_version = Some(String::from_utf8_lossy(&compose.stdout).trim().to_owned());
     }
 
-    let info = probe(&["info", "--format", "{{.ID}}"]).await?;
+    let info = probe(&docker, &["info", "--format", "{{.ID}}"]).await?;
     if info.status.success() {
         facts.engine_id = Some(String::from_utf8_lossy(&info.stdout).trim().to_owned());
     }
-    Ok(facts)
+    Ok((facts, Some(docker)))
+}
+
+/// One read-only query through the pinned driver.
+async fn probe(docker: &Docker, argv: &[&str]) -> Result<super::docker::Output, DockerError> {
+    docker
+        .output(
+            &Args::new().args(argv),
+            None,
+            Sensitivity::Diagnose,
+            PROBE_TIMEOUT,
+        )
+        .await
 }
 
 /// The Docker endpoint of the first context in `docker context inspect`
@@ -306,7 +344,7 @@ fn server_present(json: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trial::docker::tests::stub;
+    use crate::trial::docker::tests::stub_cli;
 
     fn usable() -> EngineFacts {
         EngineFacts {
@@ -534,27 +572,40 @@ esac"#;
 
     #[tokio::test]
     async fn a_remote_docker_host_is_refused_before_any_subprocess() {
-        let (tmp, docker) = stub(r#"touch "$(dirname "$0")/ran""#);
-        let err = preflight(&docker, Some("tcp://example.invalid:2375".into()))
-            .await
-            .unwrap_err();
+        let (tmp, cli) = stub_cli(r#"touch "$(dirname "$0")/ran""#);
+        let err = preflight(
+            cli,
+            tmp.path().join("trial"),
+            Some("tcp://example.invalid:2375".into()),
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.to_string().contains("DOCKER_HOST points at a tcp://"),
             "{err}"
         );
         assert!(!tmp.path().join("ran").exists(), "docker was run");
 
-        let (_tmp, docker) = stub(HEALTHY);
-        let engine = preflight(&docker, Some("unix:///var/run/docker.sock".into()))
-            .await
-            .unwrap();
+        let (tmp, cli) = stub_cli(HEALTHY);
+        let (engine, docker) = preflight(
+            cli,
+            tmp.path().join("trial"),
+            Some("unix:///var/run/docker.sock".into()),
+        )
+        .await
+        .unwrap();
         assert_eq!(engine.compose.to_string(), "5.5.1");
+        assert_eq!(docker.endpoint().as_str(), "unix:///var/run/docker.sock");
     }
 
     #[tokio::test]
     async fn gather_reads_the_four_probes() {
-        let (_tmp, docker) = stub(HEALTHY);
-        let facts = gather(&docker, None).await.unwrap();
+        let (tmp, cli) = stub_cli(HEALTHY);
+        let (facts, docker) = gather(cli, tmp.path().join("trial"), None).await.unwrap();
+        assert_eq!(
+            docker.unwrap().endpoint().as_str(),
+            "unix:///var/run/docker.sock"
+        );
         assert_eq!(
             facts,
             EngineFacts {
@@ -571,7 +622,7 @@ esac"#;
 
     #[tokio::test]
     async fn gather_never_contacts_a_remote_context() {
-        let (tmp, docker) = stub(&format!(
+        let (tmp, cli) = stub_cli(&format!(
             r#"echo "$*" >> {log}
 case "$*" in
   "context inspect") printf '[{{"Endpoints":{{"docker":{{"Host":"tcp://10.0.0.5:2376"}}}}}}]' ;;
@@ -579,7 +630,8 @@ case "$*" in
 esac"#,
             log = "\"$(dirname \"$0\")/calls\""
         ));
-        let facts = gather(&docker, None).await.unwrap();
+        let (facts, docker) = gather(cli, tmp.path().join("trial"), None).await.unwrap();
+        assert!(docker.is_none());
         assert_eq!(
             check(&facts),
             Err(PreflightError::ContextNotLocal {
@@ -592,14 +644,14 @@ esac"#,
 
     #[tokio::test]
     async fn gather_reports_an_unreachable_server_and_missing_compose() {
-        let (_tmp, docker) = stub(
+        let (tmp, cli) = stub_cli(
             r#"case "$*" in
   "context inspect") printf '[{"Endpoints":{"docker":{"Host":"unix:///nope.sock"}}}]' ;;
   "version --format json") printf '{"Client":{},"Server":null}'; exit 1 ;;
   *) exit 99 ;;
 esac"#,
         );
-        let facts = gather(&docker, None).await.unwrap();
+        let (facts, _) = gather(cli, tmp.path().join("trial"), None).await.unwrap();
         assert_eq!(
             check(&facts),
             Err(PreflightError::ServerUnreachable {
@@ -607,7 +659,7 @@ esac"#,
             })
         );
 
-        let (_tmp, docker) = stub(
+        let (tmp, cli) = stub_cli(
             r#"case "$*" in
   "context inspect") printf '[{"Endpoints":{"docker":{"Host":"unix:///s.sock"}}}]' ;;
   "version --format json") printf '{"Server":{"Version":"29"}}' ;;
@@ -615,7 +667,158 @@ esac"#,
   "info --format {{.ID}}") echo ID ;;
 esac"#,
         );
-        let facts = gather(&docker, None).await.unwrap();
+        let (facts, _) = gather(cli, tmp.path().join("trial"), None).await.unwrap();
         assert_eq!(check(&facts), Err(PreflightError::ComposeMissing));
+    }
+
+    /// A stub that logs each call with the endpoint variables it saw, then
+    /// answers as [`HEALTHY`] does, with the context at `context`.
+    fn logged(context: &str) -> String {
+        format!(
+            r#"echo "$* host=${{DOCKER_HOST-unset}} ctx=${{DOCKER_CONTEXT-unset}}" >> "$(dirname "$0")/calls"
+case "$*" in
+  "context inspect") printf '[{{"Name":"x","Endpoints":{{"docker":{{"Host":"{context}"}}}}}}]'; exit 0 ;;
+esac
+{HEALTHY}"#
+        )
+    }
+
+    fn calls(tmp: &tempfile::TempDir) -> Vec<String> {
+        std::fs::read_to_string(tmp.path().join("calls"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_probe_after_the_context_runs_pinned_to_it() {
+        let (tmp, cli) = stub_cli(&logged("unix:///from/context.sock"));
+        let (_, docker) = preflight(cli, tmp.path().join("trial"), None)
+            .await
+            .unwrap();
+        assert_eq!(docker.endpoint().as_str(), "unix:///from/context.sock");
+        let calls = calls(&tmp);
+        assert!(calls[0].starts_with("context inspect "), "{calls:?}");
+        assert_eq!(
+            calls[1..],
+            [
+                "version --format json host=unix:///from/context.sock ctx=unset",
+                "compose version --short host=unix:///from/context.sock ctx=unset",
+                "info --format {{.ID}} host=unix:///from/context.sock ctx=unset",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_set_docker_host_is_the_endpoint_and_no_context_is_read() {
+        let (tmp, cli) = stub_cli(&logged("unix:///from/context.sock"));
+        let (_, docker) = preflight(
+            cli,
+            tmp.path().join("trial"),
+            Some("unix:///run/user/1000/docker.sock".into()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            docker.endpoint().as_str(),
+            "unix:///run/user/1000/docker.sock"
+        );
+        assert_eq!(
+            calls(&tmp),
+            [
+                "version --format json host=unix:///run/user/1000/docker.sock ctx=unset",
+                "compose version --short host=unix:///run/user/1000/docker.sock ctx=unset",
+                "info --format {{.ID}} host=unix:///run/user/1000/docker.sock ctx=unset",
+            ]
+        );
+    }
+
+    /// Hands [`pinned_driver_under_a_bogus_context`] the endpoint to pin.
+    const CHILD_ENDPOINT: &str = "TRAWL_TEST_PINNED_DOCKER_ENDPOINT";
+    const BOGUS_CONTEXT: &str = "trawl-test-bogus-context";
+
+    /// On this host's Docker: preflight resolves the real endpoint, then
+    /// this test binary runs [`pinned_driver_under_a_bogus_context`] again
+    /// with `DOCKER_CONTEXT` naming a context that does not exist and no
+    /// `DOCKER_HOST`. The test's own process environment cannot be
+    /// changed (`set_var` is unsafe, and the crate forbids unsafe code),
+    /// hence the child process.
+    #[tokio::test]
+    async fn a_bogus_parent_context_does_not_move_the_pinned_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = match preflight(
+            DockerCli::new(),
+            dir.path().join("trial"),
+            std::env::var_os("DOCKER_HOST"),
+        )
+        .await
+        {
+            Ok((_, docker)) => docker,
+            Err(err) => {
+                eprintln!("SKIP: no usable local Docker Engine here: {err}");
+                return;
+            }
+        };
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "trial::preflight::tests::pinned_driver_under_a_bogus_context",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENDPOINT, docker.endpoint().as_str())
+            .env("DOCKER_CONTEXT", BOGUS_CONTEXT)
+            .env_remove("DOCKER_HOST")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child failed:\n{stdout}\n{stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "run by a_bogus_parent_context_does_not_move_the_pinned_driver"]
+    async fn pinned_driver_under_a_bogus_context() {
+        let Some(endpoint) = std::env::var_os(CHILD_ENDPOINT) else {
+            eprintln!("SKIP: runs only as a child of its parent test");
+            return;
+        };
+        assert_eq!(
+            std::env::var_os("DOCKER_CONTEXT").as_deref(),
+            Some(OsStr::new(BOGUS_CONTEXT))
+        );
+        assert!(std::env::var_os("DOCKER_HOST").is_none());
+        let version = Args::new().args(["version", "--format", "json"]);
+
+        // The control: unpinned, the docker CLI follows the bogus context
+        // and fails before it reaches any engine.
+        let unpinned = std::process::Command::new("docker")
+            .args(version.argv())
+            .output()
+            .unwrap();
+        assert!(!unpinned.status.success());
+        assert!(
+            String::from_utf8_lossy(&unpinned.stderr).contains(BOGUS_CONTEXT),
+            "{}",
+            String::from_utf8_lossy(&unpinned.stderr)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let endpoint = LocalEndpoint::parse(endpoint.to_str().unwrap()).unwrap();
+        let docker = DockerCli::new().pin(endpoint, dir.path().join("trial"));
+        let out = docker
+            .capture(&version, None, Sensitivity::Diagnose, PROBE_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(server_present(&out.stdout));
+        eprintln!(
+            "pinned to {} under DOCKER_CONTEXT={BOGUS_CONTEXT}: server reached",
+            docker.endpoint().as_str()
+        );
     }
 }
