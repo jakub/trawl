@@ -5,23 +5,25 @@
 // Follow the browser steps of getting-started/first-query.md in real
 // Chromium against a running `trawl trial`: sign in with the operator key,
 // select the 7d range, run the documented query with Haul, and open the
-// Health page. test-trial.sh runs it.
+// Health page. Then load the sign-in page at PRINTED, the address `trawl
+// trial up` printed. test-trial.sh runs it.
 //
-// Usage: node trial-browser.mjs ORIGIN TOKEN-FILE OUTPUT QUERY ROW
+// Usage: node trial-browser.mjs ORIGIN TOKEN-FILE OUTPUT QUERY ROW PRINTED
 //
 // The token is read from TOKEN-FILE and typed into the sign-in form; it is
 // never logged. The browser records no trace, HAR, or video, and no storage
 // state is saved: the only files written to OUTPUT are screenshots taken
-// after sign-in and a JSON report of the phases that passed.
+// after sign-in, one of the empty sign-in form at PRINTED, and a JSON
+// report of the phases that passed.
 // TRIAL_E2E_DIR names the directory whose node_modules holds @playwright/test.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
-const [origin, tokenFile, output, query, row] = process.argv.slice(2);
-if (!row || !process.env.TRIAL_E2E_DIR) {
-  console.error('usage: TRIAL_E2E_DIR=DIR node trial-browser.mjs ORIGIN TOKEN-FILE OUTPUT QUERY ROW');
+const [origin, tokenFile, output, query, row, printed] = process.argv.slice(2);
+if (!printed || !process.env.TRIAL_E2E_DIR) {
+  console.error('usage: TRIAL_E2E_DIR=DIR node trial-browser.mjs ORIGIN TOKEN-FILE OUTPUT QUERY ROW PRINTED');
   process.exit(2);
 }
 const require = createRequire(path.join(process.env.TRIAL_E2E_DIR, 'package.json'));
@@ -80,6 +82,20 @@ try {
   await expect(page.locator('.health-check').first()).toBeVisible();
   phases.push('health-page-with-server-manage');
   await page.screenshot({ animations: 'disabled', path: path.join(output, 'health.png') });
+
+  // A fresh context: no session, so the address serves the sign-in page.
+  const other = await browser.newContext({ viewport: { width: 1440, height: 900 }, reducedMotion: 'reduce' });
+  try {
+    const signIn = await other.newPage();
+    signIn.on('pageerror', e => errors.push(e.message));
+    await signIn.goto(`${printed}/login`);
+    await expect(signIn.getByLabel('API key', { exact: true })).toBeVisible();
+    await expect(signIn.getByRole('button', { name: 'Sign in', exact: true })).toBeVisible();
+    phases.push('sign-in-page-at-the-printed-address');
+    await signIn.screenshot({ animations: 'disabled', path: path.join(output, 'printed-address.png') });
+  } finally {
+    await other.close();
+  }
 
   assert.deepEqual(errors, []);
   await fs.writeFile(path.join(output, 'browser-report.json'), JSON.stringify({ status: 'passed', phases, errors }, null, 2));
