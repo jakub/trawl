@@ -273,3 +273,90 @@ async fn pinned_self_signed_upstream_certificate() {
     );
     expect_refused(&mut upstream, state).await;
 }
+
+/// A pin replaces the platform roots; it does not add to them.
+///
+/// Every other test here uses a CA no platform store trusts, so a pin that
+/// merged its roots into the platform store would pass them all. This one
+/// makes the upstream's issuer a platform root. Under the workspace's
+/// reqwest features the platform store is `rustls-platform-verifier`, which
+/// on Linux loads `rustls-native-certs`, and that reads only `SSL_CERT_FILE`
+/// when the variable is set. The process environment must not be mutated,
+/// so the proxy runs in a re-executed copy of this test with the variable
+/// set on its `Command`, and the upstream stays here to see both handshakes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pinned_ca_excludes_the_platform_roots() {
+    const CHILD_URL: &str = "TRAWL_TEST_PLATFORM_ROOTS_URL";
+    const CHILD_PIN: &str = "TRAWL_TEST_PLATFORM_ROOTS_PIN";
+    if let Some(url) = std::env::var_os(CHILD_URL) {
+        let url = url.into_string().expect("UTF-8 URL");
+        let pin = std::fs::read_to_string(std::env::var_os(CHILD_PIN).expect("pin path"))
+            .expect("read the pin");
+        // The platform path trusts the upstream: the variable took effect.
+        let web = WebConfig {
+            upstream_url: Some(url.clone()),
+            public_origins: vec!["https://trawl.example.com".to_owned()],
+            ..WebConfig::default()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, None).expect("resolve config");
+        assert!(
+            matches!(resolved.upstream_tls, UpstreamTls::System),
+            "{:?}",
+            resolved.upstream_tls
+        );
+        let system = AppState::from_config(resolved).expect("build state");
+        assert_eq!(
+            login(system).await,
+            StatusCode::OK,
+            "the platform roots must trust the upstream"
+        );
+        // A pin to another CA refuses the same upstream.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = login(pinned_state(&dir, url, &pin)).await;
+        assert!(
+            status.is_server_error(),
+            "a pin must not fall back to the platform roots, got {status}"
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let platform = ca("trawl test platform CA");
+    let other = ca("trawl test CA B");
+    let platform_file = dir.path().join("platform-roots.pem");
+    let pin_file = dir.path().join("pin.pem");
+    std::fs::write(&platform_file, platform.pem()).expect("write platform roots");
+    std::fs::write(&pin_file, other.pem()).expect("write pin");
+    let mut upstream = Upstream::start(leaf(&platform, &["127.0.0.1"])).await;
+
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args([
+            "--exact",
+            "pinned_ca_excludes_the_platform_roots",
+            "--nocapture",
+        ])
+        .env(CHILD_URL, format!("https://127.0.0.1:{}", upstream.port))
+        .env(CHILD_PIN, &pin_file)
+        .env("SSL_CERT_FILE", &platform_file)
+        .env_remove("SSL_CERT_DIR");
+    let output = tokio::task::spawn_blocking(move || child.output())
+        .await
+        .expect("join the child")
+        .expect("re-execute the test binary");
+    assert!(
+        output.status.success(),
+        "child failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    upstream
+        .handshake()
+        .await
+        .expect("the upstream saw the platform client's handshake");
+    assert!(
+        upstream.handshake().await.is_err(),
+        "the upstream completed a handshake the pinned proxy should have refused"
+    );
+}
