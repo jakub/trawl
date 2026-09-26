@@ -420,6 +420,14 @@ async fn run(mut args: Cli) -> Result<(), CliError> {
         Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd)?),
         command => command,
     };
+    // The driver sends to whatever TUI holds the socket and never uses the
+    // resolved connection, so under -p trial it could drive a TUI that is
+    // connected elsewhere. Refused before the socket is touched.
+    if matches!(command, Some(Command::Driver { .. }))
+        && args.profile.as_deref() == Some(trial::PROFILE)
+    {
+        return Err(CliError::Usage(DRIVER_UNDER_TRIAL.to_owned()));
+    }
 
     // Load config file and apply overrides.
     let mut cfg = config::Config::load(args.config.as_deref())?;
@@ -521,6 +529,12 @@ async fn run(mut args: Cli) -> Result<(), CliError> {
 
     Ok(())
 }
+
+/// The refusal for `trawl -p trial driver ...` (or `TRAWL_PROFILE=trial`).
+const DRIVER_UNDER_TRIAL: &str = "-p trial cannot select the trial for `trawl driver`: the driver \
+     controls a TUI that is already running, whichever server that TUI is connected to. \
+     Start the TUI with `trawl -p trial --driver`, then run `trawl driver` without -p trial \
+     or TRAWL_PROFILE=trial";
 
 /// Resolve the connection every server-bound command and the TUI use:
 /// the token first, then the certificate trust.
