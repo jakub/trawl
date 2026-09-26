@@ -502,7 +502,8 @@ The default connection, used when no `--profile` is selected.
 |-----|------|---------|-------------|
 | `url` | string | `"https://localhost:5514"` | Server URL |
 | `token` | string | *(none)* | API token |
-| `insecure` | bool | `false` | Accept self-signed TLS certificates |
+| `insecure` | bool | `false` | Accept self-signed TLS certificates. `trawl` then prints a warning to stderr |
+| `ca_cert` | path | *(none)* | PEM file of the CA certificates to trust for this server. `trawl` trusts only these CAs and still checks the hostname. The path must be absolute or start with `~`. Setting it together with `insecure` is an error |
 
 ### `[profiles.<name>]`
 
@@ -514,6 +515,7 @@ Select a profile with `-p dev`, `--profile dev`, or `TRAWL_PROFILE=dev`.
 | `url` | string | *(inherits `[server]`)* | Server URL |
 | `token` | string | *(inherits `[server]`)* | API token |
 | `insecure` | bool | *(inherits `[server]`)* | Accept self-signed TLS certificates |
+| `ca_cert` | path | *(inherits `[server]`)* | PEM file of the CA certificates to trust. `""` clears an inherited `ca_cert` |
 
 ```toml
 [server]
@@ -523,7 +525,7 @@ token = "flt_prod_token"
 [profiles.dev]
 url = "https://localhost:5514"
 token = "flt_dev_token"
-insecure = true
+ca_cert = "~/.config/trawl/dev-ca.pem"
 ```
 
 ### `[ui]`

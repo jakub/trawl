@@ -25,6 +25,11 @@ pub enum ClientError {
     /// Failed to parse the server's response.
     #[error("response parse error: {0}")]
     Parse(String),
+
+    /// A pinned CA bundle holds no usable certificate. The reason never
+    /// quotes the bundle's bytes.
+    #[error("invalid CA certificate: {0}")]
+    InvalidCa(String),
 }
 
 impl ClientError {

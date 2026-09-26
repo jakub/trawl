@@ -7,7 +7,7 @@
 //! Shared configuration for both CLI and TUI modes.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,20 @@ pub enum ConfigError {
     TokenNotFound,
     #[error("unknown profile '{name}' (available: {available})")]
     UnknownProfile { name: String, available: String },
+    #[error(
+        "ca_cert and insecure are both on; insecure turns off the verification that ca_cert pins. \
+         Remove one (insecure comes from --insecure, TRAWL_INSECURE, [server], or the profile)"
+    )]
+    CaCertWithInsecure,
+    #[error("ca_cert must be an absolute path or start with ~: {path}")]
+    CaCertNotAbsolute { path: String },
+    #[error("failed to read ca_cert {path}: {source}")]
+    CaCertRead {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("ca_cert {path} is empty")]
+    CaCertEmpty { path: String },
 }
 
 /// Trawl configuration loaded from TOML file.
@@ -70,6 +84,11 @@ pub struct ServerConfig {
     /// Accept self-signed TLS certificates.
     #[serde(default)]
     pub insecure: bool,
+
+    /// PEM file of the only CA roots to trust for this server. Absolute or
+    /// `~`-prefixed; never combined with `insecure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -78,6 +97,7 @@ impl Default for ServerConfig {
             url: default_url(),
             token: None,
             insecure: false,
+            ca_cert: None,
         }
     }
 }
@@ -96,6 +116,10 @@ pub struct ProfileConfig {
     /// TLS insecure override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub insecure: Option<bool>,
+
+    /// CA bundle override. `""` clears an inherited `[server] ca_cert`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<PathBuf>,
 }
 
 /// UI preferences.
@@ -202,6 +226,13 @@ impl Config {
         if let Some(insecure) = profile.insecure {
             self.server.insecure = insecure;
         }
+        if let Some(ref ca_cert) = profile.ca_cert {
+            self.server.ca_cert = if ca_cert.as_os_str().is_empty() {
+                None
+            } else {
+                Some(ca_cert.clone())
+            };
+        }
 
         Ok(())
     }
@@ -214,6 +245,36 @@ impl Config {
         if insecure {
             self.server.insecure = true;
         }
+    }
+
+    /// Resolve how the client trusts the server's certificate
+    /// (post-profile, post-override).
+    ///
+    /// A `ca_cert` is read here, so a missing, unreadable, or empty file
+    /// fails before any request. `ca_cert` beside an effective `insecure`
+    /// is refused rather than letting either one silently win.
+    pub fn tls_trust(&self) -> Result<trawl_client::TlsTrust, ConfigError> {
+        let Some(ref ca_cert) = self.server.ca_cert else {
+            return Ok(if self.server.insecure {
+                trawl_client::TlsTrust::AcceptInvalid
+            } else {
+                trawl_client::TlsTrust::System
+            });
+        };
+        if self.server.insecure {
+            return Err(ConfigError::CaCertWithInsecure);
+        }
+        let path = expand_ca_cert(ca_cert)?;
+        let pem = std::fs::read(&path).map_err(|source| ConfigError::CaCertRead {
+            path: path.display().to_string(),
+            source,
+        })?;
+        if pem.iter().all(u8::is_ascii_whitespace) {
+            return Err(ConfigError::CaCertEmpty {
+                path: path.display().to_string(),
+            });
+        }
+        Ok(trawl_client::TlsTrust::PinnedCa(pem))
     }
 
     /// Load the API token.
@@ -231,6 +292,22 @@ impl Config {
         }
 
         Err(ConfigError::TokenNotFound)
+    }
+}
+
+/// Expand a leading `~` and require an absolute result. A relative path
+/// would resolve against whatever directory `trawl` happens to run in.
+fn expand_ca_cert(path: &Path) -> Result<PathBuf, ConfigError> {
+    let expanded = match path.to_str() {
+        Some(text) if text.starts_with('~') => PathBuf::from(shellexpand::tilde(text).as_ref()),
+        _ => path.to_path_buf(),
+    };
+    if expanded.is_absolute() {
+        Ok(expanded)
+    } else {
+        Err(ConfigError::CaCertNotAbsolute {
+            path: path.display().to_string(),
+        })
     }
 }
 
@@ -462,5 +539,181 @@ insecure = true
         assert_eq!(dev.url.as_deref(), Some("https://localhost:5514"));
         assert_eq!(dev.token.as_deref(), Some("dev-token"));
         assert_eq!(dev.insecure, Some(true));
+    }
+
+    // -- ca_cert -------------------------------------------------------------
+
+    use trawl_client::TlsTrust;
+
+    /// A config whose `[server] ca_cert` points at a real temp file.
+    fn with_ca_file(extra: &str) -> (tempfile::TempDir, std::path::PathBuf, Config) {
+        let dir = tempfile::tempdir().unwrap();
+        let pem = dir.path().join("ca.pem");
+        std::fs::write(
+            &pem,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let toml_str = format!(
+            "[server]\nca_cert = {:?}\n{extra}",
+            pem.display().to_string()
+        );
+        let config: Config = toml::from_str(&toml_str).unwrap();
+        (dir, pem, config)
+    }
+
+    #[test]
+    fn ca_cert_parses_on_server_and_profile() {
+        let toml_str = r#"
+[server]
+ca_cert = "/etc/trawl/ca.pem"
+
+[profiles.lab]
+ca_cert = "~/lab-ca.pem"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.server.ca_cert.as_deref(),
+            Some(Path::new("/etc/trawl/ca.pem"))
+        );
+        assert_eq!(
+            config.profiles["lab"].ca_cert.as_deref(),
+            Some(Path::new("~/lab-ca.pem"))
+        );
+        let reparsed: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.server.ca_cert, config.server.ca_cert);
+        assert_eq!(
+            reparsed.profiles["lab"].ca_cert,
+            config.profiles["lab"].ca_cert
+        );
+    }
+
+    #[test]
+    fn profile_ca_cert_overlays_server() {
+        let toml_str = r#"
+[server]
+ca_cert = "/etc/trawl/ca.pem"
+
+[profiles.lab]
+ca_cert = "/etc/trawl/lab-ca.pem"
+"#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        config.apply_profile("lab").unwrap();
+        assert_eq!(
+            config.server.ca_cert.as_deref(),
+            Some(Path::new("/etc/trawl/lab-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn profile_inherits_server_ca_cert() {
+        let toml_str = r#"
+[server]
+ca_cert = "/etc/trawl/ca.pem"
+
+[profiles.lab]
+url = "https://lab:5514"
+"#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        config.apply_profile("lab").unwrap();
+        assert_eq!(
+            config.server.ca_cert.as_deref(),
+            Some(Path::new("/etc/trawl/ca.pem"))
+        );
+    }
+
+    #[test]
+    fn empty_profile_ca_cert_clears_the_inherited_one() {
+        let toml_str = r#"
+[server]
+ca_cert = "/etc/trawl/ca.pem"
+
+[profiles.public]
+ca_cert = ""
+"#;
+        let mut config: Config = toml::from_str(toml_str).unwrap();
+        config.apply_profile("public").unwrap();
+        assert_eq!(config.server.ca_cert, None);
+        assert_eq!(config.tls_trust().unwrap(), TlsTrust::System);
+    }
+
+    #[test]
+    fn relative_ca_cert_is_refused() {
+        for path in ["ca.pem", "./certs/ca.pem", "~other/ca.pem", ""] {
+            let mut config = Config::default();
+            config.server.ca_cert = Some(path.into());
+            let err = config.tls_trust().unwrap_err();
+            assert!(
+                matches!(err, ConfigError::CaCertNotAbsolute { .. }),
+                "{path:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tilde_ca_cert_expands_to_home() {
+        let expanded = expand_ca_cert(Path::new("~/trawl/ca.pem")).unwrap();
+        assert!(expanded.is_absolute());
+        assert!(expanded.ends_with("trawl/ca.pem"));
+        assert!(!expanded.to_string_lossy().contains('~'));
+    }
+
+    #[test]
+    fn ca_cert_with_insecure_is_refused() {
+        // [server] insecure
+        let (_dir, _, config) = with_ca_file("insecure = true\n");
+        assert!(matches!(
+            config.tls_trust(),
+            Err(ConfigError::CaCertWithInsecure)
+        ));
+
+        // --insecure / TRAWL_INSECURE
+        let (_dir, _, mut config) = with_ca_file("");
+        config.apply_overrides(None, true);
+        assert!(matches!(
+            config.tls_trust(),
+            Err(ConfigError::CaCertWithInsecure)
+        ));
+
+        // A profile's insecure beside an inherited ca_cert.
+        let (_dir, _, mut config) = with_ca_file("[profiles.dev]\ninsecure = true\n");
+        config.apply_profile("dev").unwrap();
+        assert!(matches!(
+            config.tls_trust(),
+            Err(ConfigError::CaCertWithInsecure)
+        ));
+    }
+
+    #[test]
+    fn ca_cert_reads_the_bundle() {
+        let (_dir, pem, config) = with_ca_file("");
+        assert_eq!(
+            config.tls_trust().unwrap(),
+            TlsTrust::PinnedCa(std::fs::read(pem).unwrap())
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_ca_cert_fails_before_any_request() {
+        let (dir, pem, mut config) = with_ca_file("");
+        std::fs::write(&pem, " \n").unwrap();
+        assert!(matches!(
+            config.tls_trust(),
+            Err(ConfigError::CaCertEmpty { .. })
+        ));
+
+        config.server.ca_cert = Some(dir.path().join("absent.pem"));
+        assert!(matches!(
+            config.tls_trust(),
+            Err(ConfigError::CaCertRead { .. })
+        ));
+    }
+
+    #[test]
+    fn without_ca_cert_insecure_picks_the_trust() {
+        let mut config = Config::default();
+        assert_eq!(config.tls_trust().unwrap(), TlsTrust::System);
+        config.apply_overrides(None, true);
+        assert_eq!(config.tls_trust().unwrap(), TlsTrust::AcceptInvalid);
     }
 }
