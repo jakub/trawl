@@ -13,8 +13,9 @@
 //!
 //! - [`TrialState::load`] reads schema 1 exactly and refuses anything else,
 //!   because `up` must not resume a trial it does not understand.
-//! - [`DownView::load`] reads only `trial_id` and ignores every other
-//!   field, so `down` deletes a trial written by any CLI version.
+//! - [`DownView::load`] reads only `trial_id` and `engine_id` and ignores
+//!   every other field, so `stop` and `down` act on a trial written by any
+//!   CLI version, and only on the engine it was created on.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -196,15 +197,21 @@ impl TrialState {
     }
 }
 
-/// The one field `down` needs from a state file of any schema.
+/// The fields `stop` and `down` need from a state file of any schema.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DownView {
     pub trial_id: String,
+    /// The engine the trial was created on. `stop` and `down` refuse
+    /// another engine: there, the trial's resources are absent, and
+    /// `down` would delete the state while they stay on their engine. A
+    /// state that records none is acted on wherever it is run.
+    #[serde(default)]
+    pub engine_id: Option<String>,
 }
 
 impl DownView {
-    /// Read `trial_id` from `path`, ignoring every other field:
-    /// `Ok(None)` when there is no state file.
+    /// Read `trial_id` and `engine_id` from `path`, ignoring every other
+    /// field: `Ok(None)` when there is no state file.
     ///
     /// The id must be usable as a Docker label filter value, so it is
     /// limited to ASCII letters, digits, `-`, and `_`.
@@ -401,10 +408,32 @@ pub(crate) mod tests {
 
         let view = DownView::load(&path).unwrap().expect("present");
         assert_eq!(view.trial_id, "0123456789abcdef0123456789abcdef");
+        assert_eq!(view.engine_id, None, "a state may record no engine");
         assert!(matches!(
             TrialState::load(&path),
             Err(TrialError::StateSchema { found: 7, .. })
         ));
+
+        let mut future = future;
+        future["engine_id"] = "ENGINE:FUTURE".into();
+        write_private(&path, future.to_string().as_bytes(), 0o600).unwrap();
+        let view = DownView::load(&path).unwrap().expect("present");
+        assert_eq!(view.engine_id.as_deref(), Some("ENGINE:FUTURE"));
+    }
+
+    /// `stop` and `down` see the engine this CLI records.
+    #[test]
+    fn down_reads_the_recorded_engine() {
+        let (_tmp, path) = state_path();
+        fixture(1).save(&path).unwrap();
+        let view = DownView::load(&path).unwrap().expect("present");
+        assert_eq!(
+            view,
+            DownView {
+                trial_id: "0123456789abcdef0123456789abcdef".into(),
+                engine_id: Some("ENGINE:ID".into()),
+            }
+        );
     }
 
     #[test]

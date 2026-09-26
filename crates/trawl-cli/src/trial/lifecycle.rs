@@ -8,9 +8,10 @@
 //! the Docker driver to the local engine, then the state root is created
 //! and the lifecycle lock taken. Preflight runs first because it only
 //! reads, and nothing, not even the state root, may be created before it
-//! passes. Then the ownership scan refuses anything on the engine that
-//! carries the trial's names or labels without this trial's id, and one-off
-//! containers a killed command left running are waited for.
+//! passes. `stop` and `down` then refuse an engine other than the one the
+//! state records. Then the ownership scan refuses anything on the engine
+//! that carries the trial's names or labels without this trial's id, and
+//! one-off containers a killed command left running are waited for.
 //!
 //! `up` then creates or resumes, one recorded phase at a time, so a rerun
 //! after an interruption skips what is done:
@@ -390,6 +391,34 @@ pub fn check_resume(state: &TrialState, engine_id: &str, args: &UpArgs) -> Resul
         return Err(fixed("--image", state.images.trawl.reference.clone()));
     }
     Ok(())
+}
+
+/// `stop` and `down` act only on the engine the trial was created on. On
+/// another engine the trial's resources are absent, so `down` would
+/// delete the state and report success while they stay on their own
+/// engine. A state that records no engine is acted on wherever it is run.
+pub fn check_engine(recorded: Option<&str>, found: &str) -> Result<(), TrialError> {
+    match recorded {
+        Some(recorded) if recorded != found => Err(TrialError::EngineChanged {
+            recorded: recorded.to_owned(),
+            found: found.to_owned(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// [`check_engine`] for `stop` and `down`. A refusal first says which
+/// endpoint this command reached and how another engine is selected.
+fn require_its_engine(session: &Session, view: &DownView) -> Result<(), TrialError> {
+    let checked = check_engine(view.engine_id.as_deref(), &session.engine.engine_id);
+    if checked.is_err() {
+        progress(format_args!(
+            "this command reached the Docker Engine at {}; DOCKER_HOST or \
+             `docker context use` selects the engine",
+            session.docker.endpoint().as_str()
+        ));
+    }
+    checked
 }
 
 /// A resume runs only the images the trial recorded: the same id, and the
@@ -1242,6 +1271,13 @@ pub async fn status(paths: &TrialPaths) -> Result<(), TrialError> {
     )
     .await
     {
+        // Another engine has none of the trial's containers; listing it
+        // would show a running trial as having none.
+        Ok((engine, _)) if engine.engine_id != state.engine_id => Containers::Unknown(format!(
+            "this command reached Docker engine {}, not the trial's; DOCKER_HOST or \
+             `docker context use` selects the engine",
+            engine.engine_id
+        )),
         Ok((_, docker)) => match Inventory::scan(&docker).await {
             Ok(inventory) => Containers::Listed(our_containers(&inventory, &state.trial_id)),
             Err(e) => Containers::Unknown(e.to_string()),
@@ -1299,6 +1335,9 @@ pub async fn stop(paths: &TrialPaths) -> Result<(), TrialError> {
     let session = begin(paths).await?;
     let docker = &session.docker;
     let view = load_down_view(paths)?;
+    if let Some(view) = &view {
+        require_its_engine(&session, view)?;
+    }
     let inventory = Inventory::scan(docker).await?;
     require_owned(
         paths,
@@ -1362,6 +1401,9 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
     let session = begin(paths).await?;
     let docker = &session.docker;
     let view = load_down_view(paths)?;
+    if let Some(view) = &view {
+        require_its_engine(&session, view)?;
+    }
     let inventory = Inventory::scan(docker).await?;
     require_owned(
         paths,
@@ -1512,6 +1554,23 @@ mod tests {
                 "{flag}: {err:?}"
             );
         }
+    }
+
+    /// `stop` and `down` refuse an engine other than the recorded one,
+    /// naming both; a state that records no engine is acted on anywhere.
+    #[test]
+    fn stop_and_down_act_only_on_the_recorded_engine() {
+        check_engine(Some("ENGINE:A"), "ENGINE:A").expect("the recorded engine");
+        check_engine(None, "ENGINE:B").expect("no engine recorded");
+        let err = check_engine(Some("ENGINE:A"), "ENGINE:B").unwrap_err();
+        assert!(
+            matches!(&err, TrialError::EngineChanged { recorded, found }
+                if recorded == "ENGINE:A" && found == "ENGINE:B"),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("ENGINE:A"), "{message}");
+        assert!(message.contains("ENGINE:B"), "{message}");
     }
 
     fn record(reference: &str, id: &str, digest: Option<&str>) -> ImageRecord {
