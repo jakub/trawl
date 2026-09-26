@@ -21,6 +21,15 @@ async function insideViewport(locator: Locator) {
 async function noPageOverflow(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(page.viewportSize()!.width);
 }
+/** Run a narrow press, then let its `toggle` fire. The narrow disclosure
+ * records its state from that event, which the browser dispatches a frame
+ * or so after the press (two quick presses may coalesce into none), so a
+ * resize across the breakpoint before it fires would read the press as
+ * the other layout's. */
+async function narrowPress(page: Page, press: () => Promise<void>) {
+  await press();
+  await settle(page);
+}
 /** Two frames and a task: a media query change the viewport caused has
  * reached the app, and whatever it set off has run, so an assertion
  * that something did NOT happen is not read too early. */
@@ -106,11 +115,13 @@ test('responsive filters preserve field search, expanded groups and URL filters 
   await expect(summary).toContainText('1 active');
   await summary.click();
   await expect(needle).not.toBeVisible();
-  await summary.press('Enter');
+  await narrowPress(page, () => summary.press('Enter'));
   await expect(needle).toHaveValue('0');
   await expect(page.getByRole('button', { name: 'Include host = cache-01', exact: true })).toBeVisible();
   await page.setViewportSize({ width: 1440, height: 900 });
-  await expect(summary).not.toBeVisible();
+  // Wide, the summary is the open rail's header row (ADR-0044).
+  await expect(summary).toBeVisible();
+  await expectRail(page, true);
   await expect(needle).toHaveValue('0');
   await expect(panel.locator('.v.selected .n')).toHaveText('web-01');
   // Clear the compact disclosure state before testing focus-driven reopening.
@@ -128,6 +139,60 @@ test('responsive filters preserve field search, expanded groups and URL filters 
   await expect(panel).toHaveAttribute('open', '');
   await expect(needle).toBeFocused();
   await expect(needle).toBeVisible();
+  await noPageOverflow(page);
+});
+
+// Below 900px the rail is what it was before ADR-0044: a disclosure a
+// countable page leaves closed, whose own open state is not the wide
+// rail's hand choice.
+test('responsive filters: a countable page leaves the narrow disclosure closed, and a narrow close leaves the wide rail automatic', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.setViewportSize({ width: 720, height: 900 });
+  await page.goto('/search?q=service%3Dnginx');
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
+  const panel = page.locator(SEL.filterRail), summary = page.locator(SEL.filterRailSummary);
+  await settle(page);
+  await expect(panel).not.toHaveAttribute('open');
+  await narrowPress(page, () => summary.click());
+  await expect(panel).toHaveAttribute('open', '');
+  await narrowPress(page, () => summary.click());
+  await expect(panel).not.toHaveAttribute('open');
+  // Wide, on the same countable page, the rail opens by itself.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await expectRail(page, true);
+});
+
+test('responsive filters keep the value search and group state across 720, 1440 and 320', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.setViewportSize({ width: 720, height: 900 });
+  await page.goto('/search?q=service%3Dnginx');
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
+  const panel = page.locator(SEL.filterRail), summary = page.locator(SEL.filterRailSummary);
+  await narrowPress(page, () => summary.click());
+  await expect(panel).toHaveAttribute('open', '');
+  const needle = page.locator(SEL.facetFilterInput);
+  await needle.fill('0');
+  // One group collapsed, and one expanded past its first five values.
+  const status = panel.getByRole('button', { name: /^status, \d+ values?$/ });
+  await status.click();
+  await expect(status).toHaveAttribute('aria-expanded', 'false');
+  await panel.getByRole('button', { name: 'Show 1 more values for host' }).click();
+  const hosts = panel.locator(SEL.facetGroup)
+    .filter({ has: page.getByRole('button', { name: 'host, 6 values', exact: true }) })
+    .locator(SEL.facetValue);
+  await expect(hosts).toHaveCount(6);
+  for (const width of [1440, 320]) {
+    await page.setViewportSize({ width, height: 900 });
+    if (width >= 900) {
+      await expectRail(page, true);
+    } else {
+      await expect(panel).toHaveAttribute('open', '');
+    }
+    await expect(needle).toBeVisible();
+    await expect(needle).toHaveValue('0');
+    await expect(status).toHaveAttribute('aria-expanded', 'false');
+    await expect(hosts).toHaveCount(6);
+  }
   await noPageOverflow(page);
 });
 
