@@ -157,7 +157,7 @@ impl Cadence {
     fn new(start: Instant, interval: Duration) -> Self {
         Self {
             interval,
-            next_normal: start + interval,
+            next_normal: deadline_after(start, interval),
             next: Next::Rerun,
         }
     }
@@ -202,7 +202,7 @@ impl Cadence {
         inserted_before: u64,
     ) {
         if kind == PassKind::Normal {
-            self.next_normal = now + self.interval;
+            self.next_normal = deadline_after(now, self.interval);
         }
         let stuck =
             outcome.persistent_failures > 0 || (outcome.eligible > 0 && outcome.drained == 0);
@@ -216,6 +216,16 @@ impl Cadence {
             Next::Wake
         };
     }
+}
+
+/// `now + interval`, or about 30 years out when that overflows `Instant`.
+/// The configured interval has no upper bound, and `Instant + Duration`
+/// panics on overflow, which would end the compaction task.
+fn deadline_after(now: Instant, interval: Duration) -> Instant {
+    const FAR_FUTURE: Duration = Duration::from_hours(24 * 365 * 30);
+    now.checked_add(interval)
+        .or_else(|| now.checked_add(FAR_FUTURE))
+        .unwrap_or(now)
 }
 
 /// Wait for the next pressure generation, or forever when there is no hot
@@ -587,7 +597,7 @@ async fn compact_pass(
     // except any a pending marker still claims: recovery needs that tmp to
     // roll its publish back.
     for (env, env_data_dir) in list_env_dirs(data_dir) {
-        cleanup_stale_tmp_files(&env, &env_data_dir, min_age * 2, &claims);
+        cleanup_stale_tmp_files(&env, &env_data_dir, min_age.saturating_mul(2), &claims);
     }
 
     for (env, env_wal_dir) in env_wal_dirs {
@@ -12020,6 +12030,59 @@ mod tests {
             Some(PassKind::Pressure)
         );
         assert_eq!(cadence.next_normal, t0 + interval);
+    }
+
+    /// An interval past what `Instant` can hold saturates the normal
+    /// deadline instead of panicking, so the compaction task survives it,
+    /// and the deadline still lies in the future.
+    #[test]
+    fn cadence_saturates_the_normal_deadline_on_a_huge_interval() {
+        let interval = Duration::from_secs(u64::MAX);
+        let t0 = Instant::now();
+        let mut cadence = Cadence::new(t0, interval);
+        assert!(cadence.next_normal > t0, "new: deadline is in the future");
+        assert_eq!(cadence.due(t0, AdmissionState::Open), None);
+
+        let now = t0 + Duration::from_secs(1);
+        let plan = plan_for(PassKind::Normal, AdmissionState::Open, interval);
+        cadence.finished(
+            PassKind::Normal,
+            plan,
+            now,
+            &outcome(0, 0, 0, 0),
+            AdmissionState::Open,
+            0,
+        );
+        assert!(
+            cadence.next_normal > now,
+            "finished: deadline is in the future"
+        );
+        assert_eq!(cadence.due(now, AdmissionState::Open), None);
+    }
+
+    /// A pressure pass under the same huge interval cleans stale tmp files
+    /// against a saturated age instead of overflowing `min_age * 2`.
+    #[tokio::test]
+    async fn pressure_pass_survives_a_huge_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("prod")).unwrap();
+        let data_loss = compact_once_coordinated(
+            &wal,
+            &data,
+            Duration::from_secs(u64::MAX),
+            Duration::ZERO,
+            false,
+            None,
+            1,
+            "2GB",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(data_loss, 0);
     }
 
     /// Every branch of [`Cadence::finished`], and what each one lets start
