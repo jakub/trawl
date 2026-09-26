@@ -99,9 +99,14 @@ section = "net"
 priority = "optional"
 conf-files = ["/etc/trawl/trawld.toml", "/etc/default/trawld", "/etc/default/trawl-web"]
 maintainer-scripts = "debian/"
+# Installed disabled and stopped: the shipped trawld.toml holds CHANGE_ME
+# database URLs, so a started unit could only fail and restart. postinst tells
+# the operator to set the URLs and run `systemctl enable --now trawld trawl-web`.
+# With these flags cargo-deb still restarts, on upgrade, a unit the operator
+# has already started (see debian/tests/packaging.sh).
 systemd-units = [
-    { unit-name = "trawld", enable = true, start = true },
-    { unit-name = "trawl-web", enable = true, start = true },
+    { unit-name = "trawld", enable = false, start = false },
+    { unit-name = "trawl-web", enable = false, start = false },
 ]
 assets = [
     ["target/release/trawld", "usr/bin/", "755"],

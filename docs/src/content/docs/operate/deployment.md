@@ -52,9 +52,10 @@ APT repository from [Installation](/getting-started/).
    sudo apt install trawl-server trawl-cli
    ```
 
-   The package creates the users, directories, and units in the table below,
-   then enables and starts both services. They fail and retry every 5 seconds
-   until the configuration names real databases.
+   The package creates the users, directories, and units in the table below.
+   It does not enable or start either service, because the packaged
+   configuration names no real databases yet. An upgrade keeps the units you
+   enabled and restarts the ones that are running.
 
 2. Put the two DSNs in `/etc/default/trawld`. They take precedence over
    `[auth] database_url` and `[storage] database_url` in the TOML file, and
@@ -93,10 +94,10 @@ APT repository from [Installation](/getting-started/).
    `/var/lib/trawl/tls/`. Remote clients need a certificate they trust. See
    [Configure TLS](/operate/access/#configure-tls).
 
-5. Restart both services and check their state:
+5. Enable and start both services, then check their state:
 
    ```bash
-   sudo systemctl restart trawld trawl-web
+   sudo systemctl enable --now trawld trawl-web
    sudo systemctl status trawld trawl-web
    ```
 

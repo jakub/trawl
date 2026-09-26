@@ -38,8 +38,14 @@ trawl --version
 
 Expect `trawl`, the version, and the build details. A client-only machine
 needs `trawl-cli` alone. The package writes `/etc/trawl/trawld.toml` and
-enables both units. `trawld` refuses to start until `[auth]` and `[storage]`
-have database URLs, so the [deployment guide](/operate/deployment/) is next.
+installs the `trawld` and `trawl-web` units disabled and stopped. Set the
+`[auth]` and `[storage]` database URLs as the
+[deployment guide](/operate/deployment/) shows, then start both services:
+
+```bash
+sudo systemctl enable --now trawld trawl-web
+```
+
 `trawl-web` listens on `127.0.0.1:8090` by default, so browser access from
 other machines needs a TLS-terminating reverse proxy and a public origin.
 
