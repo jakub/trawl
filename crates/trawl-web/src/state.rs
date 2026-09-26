@@ -51,13 +51,16 @@ impl AppState {
     ///
     /// The client's certificate trust comes from
     /// [`ResolvedConfig::upstream_tls`], already validated at resolution.
+    /// It follows no redirect in any mode: trawld never sends one, and a
+    /// followed 3xx would carry the proxy past the loopback-only rule of
+    /// the insecure mode to a second host with verification off.
     ///
     /// # Errors
     /// Propagates `reqwest::Error` if the client can't be built.
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let builder = Client::builder();
+        let builder = Client::builder().redirect(reqwest::redirect::Policy::none());
         let builder = match cfg.upstream_tls {
             UpstreamTls::System => builder,
             // Only the pinned roots, hostname verification left on. A
