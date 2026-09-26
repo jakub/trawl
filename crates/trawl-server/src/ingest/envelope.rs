@@ -139,6 +139,12 @@ pub enum RejectReason {
     NotObject,
     InvalidJson,
     WalFailure,
+    /// A valid event in an HTTP request the hot buffer refused for lack of
+    /// free space (503 `hot_buffer_full`, ADR-0043). Nothing was written.
+    HotBufferFull,
+    /// A valid event in an HTTP request larger than the hot buffer admits
+    /// for one request (413 `ingest_batch_too_large`, ADR-0043).
+    IngestBatchTooLarge,
 }
 
 impl RejectReason {
@@ -156,6 +162,8 @@ impl RejectReason {
             Self::NotObject => "not_object",
             Self::InvalidJson => "invalid_json",
             Self::WalFailure => "wal_failure",
+            Self::HotBufferFull => "hot_buffer_full",
+            Self::IngestBatchTooLarge => "ingest_batch_too_large",
         }
     }
 
@@ -172,6 +180,8 @@ impl RejectReason {
         Self::NotObject,
         Self::InvalidJson,
         Self::WalFailure,
+        Self::HotBufferFull,
+        Self::IngestBatchTooLarge,
     ];
 }
 

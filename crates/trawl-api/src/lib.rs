@@ -125,6 +125,14 @@ pub enum ErrorCode {
     InternalError,
     /// Service temporarily unavailable (503).
     ServiceUnavailable,
+    /// The hot buffer has no room for this ingest request (503, with
+    /// `Retry-After`). Nothing from the request was written, so a retry
+    /// cannot duplicate an event (ADR-0043).
+    HotBufferFull,
+    /// The ingest request is larger than the hot buffer admits for any one
+    /// request (413, no `Retry-After`): it can never fit, so the sender
+    /// must split it (ADR-0043).
+    IngestBatchTooLarge,
 }
 
 /// Source location within a query string.
@@ -258,7 +266,10 @@ pub struct ExportRequest {
 pub struct HealthResponse {
     /// Daemon health status.
     pub status: HealthStatus,
-    /// Per-subsystem check results (`"ok"` or `"error"`).
+    /// Per-subsystem check results: `"ok"` or `"error"` for `duckdb`,
+    /// `auth_db`, `storage_db` and `data_path`; `"ok"` or `"refusing"` for
+    /// `ingest_capacity`, which reads `"refusing"` while hot-buffer
+    /// admission is refusing ingest (non-critical, so `Degraded`).
     ///
     /// The daemon always fills this; optional so a body that omits it parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2245,6 +2256,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::TooManyStreams).unwrap(),
             "\"too_many_streams\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::HotBufferFull).unwrap(),
+            "\"hot_buffer_full\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::IngestBatchTooLarge).unwrap(),
+            "\"ingest_batch_too_large\""
         );
     }
 

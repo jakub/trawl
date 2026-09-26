@@ -263,13 +263,26 @@ pub struct IngestConfig {
     #[serde(default = "default_event_bus_capacity")]
     pub event_bus_capacity: usize,
 
-    /// Maximum number of events held in the hot buffer.
-    /// Oldest batches are evicted when this limit is exceeded.
-    /// Default: 100,000.
+    /// Maximum number of events the hot buffer holds: events not yet
+    /// compacted to parquet, plus the space producers have reserved for
+    /// events they are writing. Default: 100,000.
+    ///
+    /// Ingest is admitted against this cap before it is written
+    /// (ADR-0043). HTTP and syslog may fill at most 15/16 of it
+    /// (rounded down); the server's own telemetry may fill all of it, so
+    /// its self-logs keep landing while external ingest is refused. A
+    /// batch that does not fit is refused: HTTP answers `503` with
+    /// `Retry-After` (or `413` for a batch larger than the whole external
+    /// share); syslog holds TCP senders and drops UDP datagrams until
+    /// compaction drains space.
+    /// Nothing already accepted is ever dropped to make room.
     #[serde(default = "default_hot_buffer_max_events")]
     pub hot_buffer_max_events: usize,
 
-    /// Maximum estimated memory usage for the hot buffer in bytes.
+    /// Maximum serialized bytes the hot buffer holds, counted the same way
+    /// as `hot_buffer_max_events` (resident plus reserved) and admitted
+    /// against the same way: 15/16 for HTTP and syslog, the full cap for
+    /// the server's own telemetry, and refusal when it is full.
     /// Default: 100 MB. Accepts human-readable sizes like `"100M"`, `"1G"`.
     #[serde(
         default = "default_hot_buffer_max_bytes",
@@ -293,8 +306,9 @@ pub struct IngestConfig {
     /// One cap on all the memory internal telemetry holds while the WAL is
     /// unhealthy: the active buffer, the retry queue, and the batch in
     /// flight through a write. Default: 16 MiB. Accepts human-readable
-    /// sizes like `"16M"`. Like `hot_buffer_max_bytes`, the charge is an
-    /// estimate: serialized ndjson bytes plus the retained event maps
+    /// sizes like `"16M"`. Unlike `hot_buffer_max_bytes`, which counts
+    /// serialized bytes only, the charge is an estimate: serialized ndjson
+    /// bytes plus the retained event maps
     /// (which hold roughly the same payload again) plus a fixed per-event
     /// overhead. Enforced as events arrive: over budget the oldest queued
     /// batches are shed first and then the incoming event itself, counted
@@ -821,11 +835,6 @@ pub struct SyslogConfig {
     #[serde(default = "default_syslog_max_events_per_connection")]
     pub max_events_per_connection: usize,
 
-    /// Close a TCP connection after this many consecutive failed sends
-    /// to the batcher (indicates sustained backpressure). Default: 100.
-    #[serde(default = "default_syslog_consecutive_send_failures_limit")]
-    pub consecutive_send_failures_limit: usize,
-
     /// Source IP allowlist in CIDR notation (e.g. `["192.168.0.0/16"]`).
     /// Bare IPs without a prefix are treated as /32 (IPv4) or /128 (IPv6).
     /// Empty list means all source IPs are accepted.
@@ -853,7 +862,6 @@ const DEFAULT_SYSLOG_BATCH_INTERVAL_MS: u64 = 500;
 const DEFAULT_SYSLOG_BATCH_MAX_EVENTS: usize = 1000;
 const DEFAULT_SYSLOG_TCP_IDLE_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SYSLOG_MAX_EVENTS_PER_CONNECTION: usize = 100_000;
-const DEFAULT_SYSLOG_CONSECUTIVE_SEND_FAILURES_LIMIT: usize = 100;
 const DEFAULT_SYSLOG_CHANNEL_CAPACITY: usize = 10_000;
 
 fn default_syslog_addr() -> String {
@@ -888,10 +896,6 @@ fn default_syslog_max_events_per_connection() -> usize {
     DEFAULT_SYSLOG_MAX_EVENTS_PER_CONNECTION
 }
 
-fn default_syslog_consecutive_send_failures_limit() -> usize {
-    DEFAULT_SYSLOG_CONSECUTIVE_SEND_FAILURES_LIMIT
-}
-
 fn default_syslog_channel_capacity() -> usize {
     DEFAULT_SYSLOG_CHANNEL_CAPACITY
 }
@@ -909,7 +913,6 @@ impl Default for SyslogConfig {
             batch_max_events: DEFAULT_SYSLOG_BATCH_MAX_EVENTS,
             tcp_idle_timeout_secs: DEFAULT_SYSLOG_TCP_IDLE_TIMEOUT_SECS,
             max_events_per_connection: DEFAULT_SYSLOG_MAX_EVENTS_PER_CONNECTION,
-            consecutive_send_failures_limit: DEFAULT_SYSLOG_CONSECUTIVE_SEND_FAILURES_LIMIT,
             default_service: "syslog".to_owned(),
             allow_cidrs: Vec::new(),
             source_service_map: std::collections::HashMap::new(),
@@ -1676,6 +1679,14 @@ impl Config {
         self.validate_ingest_env_names()?;
         self.validate_retention_env_keys()?;
 
+        // A zero interval would run normal compaction passes back to back
+        // and turn the pressure cooldown (ADR-0043) into no wait at all.
+        if self.ingest.enabled && self.ingest.compaction_interval_secs == 0 {
+            return Err(ConfigError::Validation(
+                "ingest.compaction_interval_secs must be > 0".into(),
+            ));
+        }
+
         if self.syslog.enabled {
             if self.syslog.batch_interval_ms == 0 {
                 return Err(ConfigError::Validation(
@@ -1978,6 +1989,27 @@ path = "/data"
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("max_concurrent_queries"));
+    }
+
+    #[test]
+    fn validation_rejects_zero_compaction_interval() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[ingest]
+compaction_interval_secs = 0
+"#;
+        let err = Config::from_toml(toml).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "config validation error: ingest.compaction_interval_secs must be > 0"
+        );
+
+        // A query-only node runs no compaction, so the interval is unused.
+        let config = Config::from_toml(&format!("{toml}enabled = false\n")).unwrap();
+        assert_eq!(config.ingest.compaction_interval_secs, 0);
     }
 
     #[test]
@@ -3340,6 +3372,28 @@ default_service = "syslog"
 "#,
         )
         .expect("valid syslog service names must load");
+    }
+
+    /// A TCP sender under backpressure waits for hot-buffer space instead
+    /// of being disconnected (ADR-0043), so the disconnect threshold is
+    /// gone, and a config still naming it is refused rather than ignored.
+    #[test]
+    fn syslog_consecutive_send_failures_limit_is_refused() {
+        let err = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[syslog]
+consecutive_send_failures_limit = 100
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("consecutive_send_failures_limit"),
+            "got: {err}"
+        );
     }
 
     // -- [ingest] derivation sources (ADR-0013) ---------------------------

@@ -7,7 +7,7 @@ groups:
           severity: warning
         annotations:
           summary: "Syslog queue discarded events on {{ $labels.instance }}"
-          description: "Target {{ $labels.job }}/{{ $labels.instance }}: The receive queue abandoned events. This does not measure packets lost before receipt. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: The receive queue abandoned events for reason {{ $labels.reason }}. This does not measure packets lost before receipt. An increase was observed in the last 10 minutes; resolution does not establish recovery."
           runbook_url: "https://trawl.sh/operate/operational-alerts/#syslog-queue-discard"
       - alert: TrawlSyslogWalDiscard
         expr: increase(trawl_syslog_wal_events_discarded_total{job="trawl"}[10m]) > 0
@@ -89,3 +89,21 @@ groups:
           summary: "Publication recovery left a service blocked on {{ $labels.instance }}"
           description: "Target {{ $labels.job }}/{{ $labels.instance }}: Recovery reported outcome {{ $labels.outcome }} for a publication marker. The marker keeps its service out of compaction, and a contradictory marker stays until an operator resolves it. An increase was observed in the last 10 minutes; resolution does not establish recovery."
           runbook_url: "https://trawl.sh/operate/operational-alerts/#publication-recovery-blocked"
+      - alert: TrawlIngestAdmissionRefusing
+        expr: sum without (producer) (increase(trawl_hot_buffer_admission_refusals_total{job="trawl",kind="full"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingest is refused for lack of hot-buffer space on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: The hot buffer refused reservations because it was full, in every 5-minute window for at least 10 minutes. HTTP senders receive 503 hot_buffer_full, syslog TCP stalls, and syslog UDP drops. Admitted events stay searchable. Oversized requests do not count. Resolution does not establish that the backlog drained."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#ingest-admission-refusing"
+      - alert: TrawlHotBufferDrainStalled
+        expr: trawl_hot_buffer_oldest_batch_age_seconds{job="trawl"} > clamp_min(10 * trawl_compaction_interval_seconds{job="trawl"}, 60)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Hot buffer is not draining on {{ $labels.instance }}"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }}: The oldest batch in the hot buffer is older than 10 compaction intervals (at least 60 seconds) for at least 2 minutes. Compaction is not draining the hot buffer, and ingest is refused once the buffer fills. Admitted events stay searchable."
+          runbook_url: "https://trawl.sh/operate/operational-alerts/#hot-buffer-drain-stalled"

@@ -732,7 +732,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
     if (p === '/api/v1/health' && req.method === 'GET') {
       healthHits.health = (healthHits.health ?? 0) + 1;
       sendJson(res, scenario === 'health-degraded' ? 503 : 200,
-        healthScenario() ? wire(scenario === 'health-degraded' ? 'health-unavailable' : 'health-ok') : healthResponse());
+        !healthScenario() ? healthResponse()
+          : scenario === 'health-degraded' ? wire('health-unavailable')
+          : scenario === 'health-ingest-refusing' ? wire('health-ingest-refusing')
+          : wire('health-ok'));
       return;
     }
 

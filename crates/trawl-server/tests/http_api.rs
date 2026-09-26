@@ -31,6 +31,7 @@ async fn health_returns_ok() {
             ("auth_db".to_owned(), "ok".to_owned()),
             ("storage_db".to_owned(), "ok".to_owned()),
             ("data_path".to_owned(), "ok".to_owned()),
+            ("ingest_capacity".to_owned(), "ok".to_owned()),
         ]))
     );
 }
@@ -1129,7 +1130,7 @@ async fn producer_is_stamped_stored_and_queryable_per_door() {
             .expect("ingest is enabled in the test config"),
     );
     assert_eq!(
-        tokio::task::spawn_blocking(move || pipeline.write(batches))
+        tokio::task::spawn_blocking(move || pipeline.write(pipeline.admit_for_test(batches)))
             .await
             .unwrap(),
         1

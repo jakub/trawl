@@ -1,22 +1,30 @@
 ---
 title: Respond to operational alerts
-description: Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, and quarantined files.
+description: Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, quarantined files, and ingest refusals.
 ---
 
-Use this pack to receive warnings when Trawl reports a discard, persistence
-failure, compaction failure, or successful quarantine. It adds no monitoring
+Use this pack to receive alerts when Trawl reports a discard, persistence
+failure, compaction failure, or successful quarantine, when ingest is refused
+for lack of hot-buffer space, or when the hot buffer stops draining. It adds no monitoring
 server, receiver, notification route, or automatic repair. Use your existing
 monitoring system to detect failed scrapes and stopped targets.
 
 ## Read the observation window
 
-Every rule evaluates `increase(counter[10m]) > 0` separately for each source
-series. There is no `for` delay. One observed increment fires at the next
+Eleven rules evaluate `increase(counter[10m]) > 0` separately for each source
+series. They have no `for` delay. One observed increment fires at the next
 evaluation once enough samples exist. Repeated increments can keep it firing.
 Use **30-second scrape and evaluation intervals**, no greater than **two
 minutes**, for this pack.
 
-All rules default to `severity: warning`. Alert labels retain `job`,
+Two rules work differently.
+[Ingest admission refusing](#ingest-admission-refusing) sums a counter over
+producers in a five-minute window and waits ten minutes with `for`.
+[Hot buffer drain stalled](#hot-buffer-drain-stalled) compares two gauges and
+waits two minutes. Their sections describe their windows.
+
+`TrawlHotBufferDrainStalled` defaults to `severity: critical`. Every other rule
+defaults to `severity: warning`. Alert labels retain `job`,
 `instance`, and any target `namespace`, `service`, `pod`, or `cluster` labels.
 Metric labels such as `reason`, `operation`, and `kind` identify the evidence.
 The target `service` label names the scraped Kubernetes Service, not an
@@ -42,10 +50,10 @@ that startup had no drops. Missing or stale series and stopped scrapes also
 do not establish health. A range can retain a recent observed increment after
 the current series becomes stale.
 
-The rules have no current-value or ingest-enable gate. Stopping a producer
-does not erase observations still in the window. This pack introduces no
-current-enabled measurement and makes no claim to detect silent stalls,
-backlog eligibility, every network loss, or every disk failure.
+The counter rules have no current-value or ingest-enable gate. Stopping a producer
+does not erase observations still in the window. Apart from the hot-buffer
+drain, this pack makes no claim to detect silent stalls, backlog eligibility,
+every network loss, or every disk failure.
 
 ## Load rules into plain Prometheus
 
@@ -81,7 +89,7 @@ backlog eligibility, every network loss, or every disk failure.
 3. Check the rule file with `promtool check rules /etc/prometheus/rules/trawl.rules.yml`.
 4. Reload Prometheus through your existing configuration process.
 5. Check that its Targets page shows the `trawl` job as up and its Rules page
-   lists all eleven Trawl alerts without evaluation errors.
+   lists all thirteen Trawl alerts without evaluation errors.
 
 The plain expressions select `job="trawl"`. If you choose another job name,
 replace that matcher in every rule. Edit ordinary rule fields to change
@@ -113,7 +121,8 @@ prometheusRule:
       enabled: false
 ```
 
-All eleven alerts are enabled with severity `warning` when the pack is enabled.
+All thirteen alerts are enabled when the pack is enabled.
+`TrawlHotBufferDrainStalled` has severity `critical`, and the others have `warning`.
 Use the exact alert names in the [metric mapping](/reference/api/#operational-alert-counters)
 as keys under `prometheusRule.alerts`. Each entry accepts only `enabled` and
 `severity`. Severity is a nonblank static string, with no severity enum;
@@ -241,13 +250,28 @@ recursion. [Check health](/operate/health/) covers the serving checks.
 
 ## Syslog queue discard
 
-`TrawlSyslogQueueDiscard` observes `trawl_syslog_events_dropped_total`, in
-events, when the shared TCP/UDP receive queue is full or closed. It does not
-distinguish transport and cannot observe packets lost before receipt.
+`TrawlSyslogQueueDiscard` observes `trawl_syslog_events_dropped_total{reason}`,
+in events, when the syslog receive path abandons events. It cannot observe
+packets lost before receipt. The reason follows the syslog batcher's own
+blocked state, not `trawl_hot_buffer_admission_state`. The alert fires
+separately for each reason:
+
+- `queue_full`: the listener queue was full while the batcher was not
+  blocked, or the batcher was gone. A UDP datagram found the queue full
+  because the batcher was slow, or found it closed because the daemon was
+  stopping. TCP waits on a full queue instead of dropping. It counts here
+  when the batcher was gone, or when shutdown abandoned a waiting frame while
+  the batcher was not blocked.
+- `backpressure`: the batcher was holding a group that hot-buffer admission
+  refused. A UDP datagram found the queue full, or shutdown abandoned a
+  waiting TCP frame, while the batcher was blocked. Events the batcher still
+  held at shutdown count here too.
+  See [syslog delivery under load](/operate/ingestion/#syslog-delivery-under-load).
 
 1. Inspect this counter alongside `trawl_syslog_events_total{transport}` and
    the daemon's queue and shutdown messages.
-2. Check sender bursts and whether the daemon was stopping.
+2. For `backpressure`, follow [ingest admission refusing](#ingest-admission-refusing)
+   first. For `queue_full`, check sender bursts and whether the daemon was stopping.
 3. Reduce sender pressure or correct the receiver's capacity problem before
    increasing traffic. Keep any sender copies for reconciliation.
 
@@ -502,6 +526,86 @@ refused. [Crash recovery](/architecture/recovery/) describes the protocol.
    file. Removing it makes compaction merge those WAL files again, which
    duplicates their rows if they were published.
 
+While a marker keeps blocking, every compaction pass counts it as a failure.
+After a failed pass, compaction starts no early pass under hot-buffer
+pressure and waits for its next regular pass, at most one
+`[ingest] compaction_interval_secs` away. This applies to every service, not
+only the blocked one, so all ingest drains at the regular cadence until the
+marker is resolved. A WAL file that fails on every pass and a WAL root entry
+that compaction cannot inspect have the same effect. Resolving the fault
+restores early draining.
+
 Resolution means that no recovery outcome of either kind was observed in the
 window. A contradictory marker repeats on every tick, so the alert keeps
 firing while that marker stays.
+
+## Ingest admission refusing
+
+`TrawlIngestAdmissionRefusing` observes
+`trawl_hot_buffer_admission_refusals_total{kind="full"}`, in refused
+reservations, summed over `producer`. The hot buffer refuses a write that
+does not fit its free space instead of removing events that it already holds.
+The rule fires when a refusal was observed in every five-minute window for ten
+minutes. A short burst that compaction clears does not fire it.
+`oversized` refusals never fire it: they come from one request or event that
+is larger than its producer's share, and they do not mean the buffer is full.
+
+While ingest is refused:
+
+- HTTP senders receive 503 `hot_buffer_full` and retry.
+- Syslog TCP senders stall, and UDP datagrams are dropped with
+  `reason="backpressure"`.
+- Internal telemetry keeps its batch queued.
+- Every admitted event stays searchable, and `/api/v1/health` reports
+  `ingest_capacity: refusing` at HTTP 200.
+
+1. Read `trawl_hot_buffer_admission_state` and
+   `trawl_hot_buffer_oldest_batch_age_seconds`. If the age keeps growing,
+   compaction is not draining; follow [hot buffer drain stalled](#hot-buffer-drain-stalled).
+2. If the age stays near the compaction interval, compaction drains but
+   senders write faster than it. Compare `trawl_hot_buffer_events` and
+   `trawl_hot_buffer_bytes` with `trawl_hot_buffer_max_events` and
+   `trawl_hot_buffer_max_bytes` to see which cap is full. Check
+   `TrawlCompactionOperationFailure` and `TrawlPublicationRecoveryBlocked`
+   too. While a failure repeats on every pass, compaction runs no early
+   passes under pressure, for any service, and drains only on its interval.
+   See [publication recovery blocked](#publication-recovery-blocked).
+3. Read the `producer` label on the raw counter to find the sender that is
+   refused, and the `http_failure` WARN events with `cause_kind=hot_buffer_full`
+   for the HTTP requests.
+4. Reduce the sender's rate, or raise `[ingest] hot_buffer_max_events` or
+   `hot_buffer_max_bytes` if the host has the memory. See
+   [the `[ingest]` reference](/reference/configuration/#ingest).
+
+Resolution means no refusal was observed in the last five minutes. It does
+not establish that refused HTTP requests were retried or that dropped UDP
+datagrams were recovered.
+
+## Hot buffer drain stalled
+
+`TrawlHotBufferDrainStalled` compares two gauges:
+`trawl_hot_buffer_oldest_batch_age_seconds`, the seconds since the oldest
+resident batch was inserted, and `trawl_compaction_interval_seconds`. It fires
+when the age stays above ten compaction intervals, with a floor of 60 seconds,
+for two minutes. With the default interval of 10 seconds, that is an age over
+100 seconds. A long interval raises the threshold with it, so a slow schedule
+alone does not fire the alert.
+
+Compaction is the only thing that removes a batch from the hot buffer. A batch
+that stays this long means compaction is not draining, and ingest is refused
+once the buffer fills. Admitted events stay searchable. Common causes are an
+unreachable catalog database, a repin cutover, and a
+[publication marker](#publication-recovery-blocked) that blocks a service.
+
+1. Read `compaction_error` and `publication_recovery_failed` events and the
+   daemon journal for the affected target. Compare
+   `TrawlCompactionOperationFailure` and `TrawlPublicationRecoveryBlocked`.
+2. Check `storage_db` in `/api/v1/health` and the app-state database, which
+   holds the catalog.
+3. Check whether a repin job is running. See [repin a field](/operate/catalog/#repin-a-field).
+4. Correct the cause. Compaction then drains the buffer, and the age falls on
+   the next scrape.
+
+Resolution means the oldest batch is younger than the threshold. It does not
+establish that ingest refusals stopped; check
+[ingest admission refusing](#ingest-admission-refusing).

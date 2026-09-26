@@ -256,6 +256,11 @@ pub struct IngestState {
     /// a query-only node runs no compaction and refuses repin requests
     /// outright.
     pub repin_coordinator: Option<Arc<crate::repin::RepinCoordinator>>,
+    /// The `Retry-After` a `hot_buffer_full` refusal answers with, in
+    /// seconds: `ingest.compaction_interval_secs` (ADR-0043). Space frees
+    /// only when compaction drains, so a shorter hint only adds refused
+    /// work.
+    pub retry_after_secs: u64,
 }
 
 /// Parse `[ingest] trusted_relays` CIDRs, boot-fatally.
@@ -342,6 +347,11 @@ pub struct CompactionStats {
     /// counts. It can exceed `total_runs`, being a failure/data-loss tally
     /// rather than a cycle count.
     pub total_errors: AtomicU64,
+    /// Times the loop decided to wait for its next pass: the admission
+    /// state it read before waiting is settled. Tests use it as a startup
+    /// handshake.
+    #[cfg(test)]
+    pub(crate) waits: AtomicU64,
 }
 
 impl Default for CompactionStats {
@@ -350,20 +360,25 @@ impl Default for CompactionStats {
             last_run_epoch_secs: AtomicU64::new(0),
             total_runs: AtomicU64::new(0),
             total_errors: AtomicU64::new(0),
+            #[cfg(test)]
+            waits: AtomicU64::new(0),
         }
     }
 }
 
 impl std::fmt::Debug for CompactionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompactionStats")
+        let mut debug = f.debug_struct("CompactionStats");
+        debug
             .field(
                 "last_run_epoch_secs",
                 &self.last_run_epoch_secs.load(Ordering::Relaxed),
             )
             .field("total_runs", &self.total_runs.load(Ordering::Relaxed))
-            .field("total_errors", &self.total_errors.load(Ordering::Relaxed))
-            .finish()
+            .field("total_errors", &self.total_errors.load(Ordering::Relaxed));
+        #[cfg(test)]
+        debug.field("waits", &self.waits.load(Ordering::Relaxed));
+        debug.finish()
     }
 }
 
@@ -720,6 +735,7 @@ impl AppState {
                 trusted_relays: parse_trusted_relays(&config.ingest.trusted_relays)?,
                 derivation,
                 repin_coordinator: repin_coordinator.clone(),
+                retry_after_secs: config.ingest.compaction_interval_secs,
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),

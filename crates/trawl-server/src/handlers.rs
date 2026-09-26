@@ -566,17 +566,22 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         crate::transport::failure::record_error(err);
     }
 
-    let mut checks = HashMap::with_capacity(4);
+    let mut checks = HashMap::with_capacity(5);
     let duckdb_healthy = duckdb_result.is_ok();
     let auth_healthy = auth_result.is_ok();
     let storage_healthy = storage_result.is_ok();
     let data_healthy = data_result.is_ok();
+    let ingest_admitting = ingest_capacity_admitting(state.query.hot_buffer.as_deref());
     let check_value = |healthy| String::from(if healthy { "ok" } else { "error" });
 
     checks.insert("duckdb".into(), check_value(duckdb_healthy));
     checks.insert("auth_db".into(), check_value(auth_healthy));
     checks.insert("storage_db".into(), check_value(storage_healthy));
     checks.insert("data_path".into(), check_value(data_healthy));
+    checks.insert(
+        "ingest_capacity".into(),
+        String::from(ingest_capacity_check(ingest_admitting)),
+    );
 
     metrics::gauge!("trawl_health_check", "subsystem" => "duckdb").set(if duckdb_healthy {
         1.0
@@ -598,8 +603,16 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     } else {
         0.0
     });
+    metrics::gauge!("trawl_health_check", "subsystem" => "ingest_capacity")
+        .set(if ingest_admitting { 1.0 } else { 0.0 });
 
-    let status = derive_health_status(duckdb_healthy, auth_healthy, storage_healthy, data_healthy);
+    let status = derive_health_status(
+        duckdb_healthy,
+        auth_healthy,
+        storage_healthy,
+        data_healthy,
+        ingest_admitting,
+    );
     let http_status = match status {
         HealthStatus::Ok | HealthStatus::Degraded => StatusCode::OK,
         HealthStatus::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
@@ -615,11 +628,29 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     )
 }
 
+/// Whether hot-buffer admission is accepting ingest (ADR-0043).
+///
+/// `false` only while the ledger has latched
+/// [`AdmissionState::Refusing`](crate::hot_buffer::AdmissionState::Refusing).
+/// `Pressure` still admits, so it reads as healthy. With ingest disabled
+/// there is no buffer to refuse into, and the check reads healthy.
+fn ingest_capacity_admitting(hot_buffer: Option<&crate::hot_buffer::HotBuffer>) -> bool {
+    hot_buffer
+        .is_none_or(|buf| buf.admission_state() != crate::hot_buffer::AdmissionState::Refusing)
+}
+
+/// The `ingest_capacity` check's wire value: `"ok"` or `"refusing"`, never
+/// `"error"`. A refusal is back-pressure on senders, not a failed subsystem.
+const fn ingest_capacity_check(admitting: bool) -> &'static str {
+    if admitting { "ok" } else { "refusing" }
+}
+
 /// Derive overall health status from individual subsystem results.
 ///
 /// - All green → `Ok`
-/// - Any non-critical (`auth_db`, `storage_db`, `data_path`) fails →
-///   `Degraded` (HTTP 200 — the query path can still serve)
+/// - Any non-critical (`auth_db`, `storage_db`, `data_path`,
+///   `ingest_capacity`) fails → `Degraded` (HTTP 200 — the query path can
+///   still serve)
 /// - Any critical (duckdb) fails → `Unavailable`
 #[allow(clippy::fn_params_excessive_bools)] // subsystem flags, call sites are named
 fn derive_health_status(
@@ -627,11 +658,12 @@ fn derive_health_status(
     auth_ok: bool,
     storage_ok: bool,
     data_ok: bool,
+    ingest_admitting: bool,
 ) -> HealthStatus {
     if !duckdb_ok {
         return HealthStatus::Unavailable;
     }
-    if !auth_ok || !storage_ok || !data_ok {
+    if !auth_ok || !storage_ok || !data_ok || !ingest_admitting {
         return HealthStatus::Degraded;
     }
     HealthStatus::Ok
@@ -3950,7 +3982,7 @@ mod tests {
     #[test]
     fn health_all_ok() {
         assert_eq!(
-            derive_health_status(true, true, true, true),
+            derive_health_status(true, true, true, true, true),
             HealthStatus::Ok
         );
     }
@@ -3958,7 +3990,7 @@ mod tests {
     #[test]
     fn health_auth_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, false, true, true),
+            derive_health_status(true, false, true, true, true),
             HealthStatus::Degraded
         );
     }
@@ -3968,7 +4000,7 @@ mod tests {
         // App-state store loss is non-critical: queries still serve, so the
         // wire contract is Degraded + HTTP 200 (never a liveness failure).
         assert_eq!(
-            derive_health_status(true, true, false, true),
+            derive_health_status(true, true, false, true, true),
             HealthStatus::Degraded
         );
     }
@@ -3976,7 +4008,7 @@ mod tests {
     #[test]
     fn health_data_path_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, true, true, false),
+            derive_health_status(true, true, true, false, true),
             HealthStatus::Degraded
         );
     }
@@ -3984,15 +4016,94 @@ mod tests {
     #[test]
     fn health_all_noncritical_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, false, false, false),
+            derive_health_status(true, false, false, false, true),
             HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn health_ingest_refusing_alone_is_degraded() {
+        // A refusing ledger is back-pressure: queries still serve, so the
+        // wire contract is Degraded + HTTP 200.
+        assert_eq!(
+            derive_health_status(true, true, true, true, false),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn health_duckdb_down_while_ingest_refusing_is_unavailable() {
+        assert_eq!(
+            derive_health_status(false, true, true, true, false),
+            HealthStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn ingest_capacity_reads_refusing_only_while_the_buffer_refuses() {
+        use crate::hot_buffer::{AdmissionState, Charge, HotBuffer, HotBufferConfig, Refusal};
+        use crate::ingest::producer::ProducerKind;
+
+        // Ingest disabled: no buffer, nothing to refuse into.
+        assert!(ingest_capacity_admitting(None));
+        assert_eq!(ingest_capacity_check(ingest_capacity_admitting(None)), "ok");
+
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 16,
+            max_bytes: 1_600,
+        });
+        assert_eq!(
+            ingest_capacity_check(ingest_capacity_admitting(Some(&buf))),
+            "ok"
+        );
+
+        // Past half of a cap: Pressure still admits, so the check stays ok.
+        let held = buf
+            .reserve(
+                ProducerKind::Http,
+                Charge {
+                    events: 15,
+                    bytes: 15,
+                },
+            )
+            .expect("the external ceiling admits 15 of 16");
+        assert_eq!(buf.admission_state(), AdmissionState::Pressure);
+        assert_eq!(
+            ingest_capacity_check(ingest_capacity_admitting(Some(&buf))),
+            "ok"
+        );
+
+        // One more external event is a Full refusal, which latches Refusing.
+        assert_eq!(
+            buf.reserve(
+                ProducerKind::Http,
+                Charge {
+                    events: 1,
+                    bytes: 1
+                }
+            )
+            .map(|_| ()),
+            Err(Refusal::Full)
+        );
+        assert_eq!(buf.admission_state(), AdmissionState::Refusing);
+        assert_eq!(
+            ingest_capacity_check(ingest_capacity_admitting(Some(&buf))),
+            "refusing"
+        );
+
+        // Releasing below a quarter of both caps clears the latch.
+        drop(held);
+        assert_eq!(buf.admission_state(), AdmissionState::Open);
+        assert_eq!(
+            ingest_capacity_check(ingest_capacity_admitting(Some(&buf))),
+            "ok"
         );
     }
 
     #[test]
     fn health_duckdb_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, true, true, true),
+            derive_health_status(false, true, true, true, true),
             HealthStatus::Unavailable
         );
     }
@@ -4000,7 +4111,7 @@ mod tests {
     #[test]
     fn health_all_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, false, false, false),
+            derive_health_status(false, false, false, false, true),
             HealthStatus::Unavailable
         );
     }
@@ -4008,7 +4119,7 @@ mod tests {
     #[test]
     fn health_duckdb_and_noncritical_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, false, true, true),
+            derive_health_status(false, false, true, true, true),
             HealthStatus::Unavailable
         );
     }

@@ -31,6 +31,8 @@ With internal telemetry enabled, a tracing layer turns daemon events into ordina
 
 A flush writes its batch through the ingest WAL on Tokio's blocking pool, and only a successful write reaches the hot buffer and SSE. A failed write keeps its batch in a FIFO retry queue that drains oldest first, in coalesced writes of at most 4 MiB each. A cancelled write has already consumed its batch, so Trawl counts those events as lost.
 
+A flush reserves hot-buffer space before it writes. Telemetry may fill the whole hot buffer, while HTTP and syslog stop at 15/16 of each cap, so trawld's records of an ingest stall can still land during it. If even that space is taken, the flush keeps its batch at the front of the queue and ends the cycle. It records no write failure and loses nothing. The next flush tries again after compaction drains. The batch waits under the same `telemetry_buffer_max_bytes` budget, and recording an event never blocks. A single event larger than a full hot-buffer cap can never be admitted, so Trawl drops it as a `buffer_cap` loss. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission).
+
 `telemetry_buffer_max_bytes` bounds one memory charge across the active buffer, the queued batches, and any in-flight write. At capacity Trawl sheds the oldest queued batches first, then new events. `trawl_telemetry_events_dropped_total` separates `buffer_cap`, `preinit_cap`, `write_crashed`, and `unmetered_cap`. `trawl_telemetry_bytes_dropped_total` covers only the first three, because an `unmetered_cap` drop counts events and no bytes. Missing internal events therefore never prove the daemon was idle.
 
 ### What telemetry does not cover

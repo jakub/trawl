@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -41,6 +42,22 @@ pub const INGEST_PROFILE_REJECT_TOTAL: &str = "trawl_ingest_profile_reject_total
 pub const SEVERITY_UNMAPPED_TOTAL: &str = "trawl_severity_unmapped_total";
 pub const HOT_BUFFER_EVENTS: &str = "trawl_hot_buffer_events";
 pub const HOT_BUFFER_BYTES: &str = "trawl_hot_buffer_bytes";
+/// The full event cap (`ingest.hot_buffer_max_events`).
+pub const HOT_BUFFER_MAX_EVENTS: &str = "trawl_hot_buffer_max_events";
+/// The full byte cap (`ingest.hot_buffer_max_bytes`).
+pub const HOT_BUFFER_MAX_BYTES: &str = "trawl_hot_buffer_max_bytes";
+/// Seconds since the oldest resident batch was inserted; 0 when empty.
+pub const HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS: &str = "trawl_hot_buffer_oldest_batch_age_seconds";
+/// [`crate::hot_buffer::AdmissionState`] as 0 (open), 1 (pressure) or
+/// 2 (refusing).
+pub const HOT_BUFFER_ADMISSION_STATE: &str = "trawl_hot_buffer_admission_state";
+/// Reservations refused, by `{producer, kind}`
+/// ([`crate::ingest::producer::ProducerKind`] ×
+/// [`crate::hot_buffer::Refusal`]); the full matrix is zero-initialized.
+pub const HOT_BUFFER_ADMISSION_REFUSALS_TOTAL: &str = "trawl_hot_buffer_admission_refusals_total";
+/// The configured compaction interval, so an alert can scale the drain
+/// stall threshold to it.
+pub const COMPACTION_INTERVAL_SECONDS: &str = "trawl_compaction_interval_seconds";
 pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";
 /// Pool permits held by work whose request already answered (ADR-0024).
 ///
@@ -190,6 +207,28 @@ impl QuarantineKind {
     }
 }
 
+/// Why the syslog receive queue abandoned an event: the `reason` label on
+/// [`SYSLOG_EVENTS_DROPPED_TOTAL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyslogDropReason {
+    /// The queue was full because the batcher stopped taking from it while
+    /// hot-buffer admission refused its pending groups.
+    Backpressure,
+    /// The queue was full or closed for any other reason.
+    QueueFull,
+}
+
+impl SyslogDropReason {
+    pub const ALL: [Self; 2] = [Self::Backpressure, Self::QueueFull];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Backpressure => "backpressure",
+            Self::QueueFull => "queue_full",
+        }
+    }
+}
+
 /// Existing telemetry reasons. A consumed crashed batch may be durable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetryDropReason {
@@ -232,19 +271,33 @@ pub fn prometheus_builder() -> metrics_exporter_prometheus::PrometheusBuilder {
 /// This cannot reconstruct increments made before recorder installation.
 pub fn init_operational_alert_metrics() {
     for name in [
-        SYSLOG_EVENTS_DROPPED_TOTAL,
         SYSLOG_WAL_EVENTS_DISCARDED_TOTAL,
         SYSLOG_WRITE_TASKS_FAILED_TOTAL,
         TELEMETRY_WAL_WRITE_FAILURES_TOTAL,
     ] {
         metrics::counter!(name).increment(0);
     }
+    for reason in SyslogDropReason::ALL {
+        metrics::counter!(SYSLOG_EVENTS_DROPPED_TOTAL, "reason" => reason.label()).increment(0);
+    }
+    for producer in crate::ingest::producer::ProducerKind::ALL {
+        for kind in crate::hot_buffer::Refusal::ALL {
+            metrics::counter!(HOT_BUFFER_ADMISSION_REFUSALS_TOTAL,
+                "producer" => producer.as_str(),
+                "kind" => kind.label())
+            .increment(0);
+        }
+    }
     for reason in TelemetryDropReason::ALL {
         metrics::counter!(TELEMETRY_EVENTS_DROPPED_TOTAL, "reason" => reason.label()).increment(0);
     }
-    metrics::counter!(INGEST_EVENTS_REJECTED_TOTAL,
-        "reason" => crate::ingest::envelope::RejectReason::WalFailure.as_str())
-    .increment(0);
+    for reason in [
+        crate::ingest::envelope::RejectReason::WalFailure,
+        crate::ingest::envelope::RejectReason::HotBufferFull,
+        crate::ingest::envelope::RejectReason::IngestBatchTooLarge,
+    ] {
+        metrics::counter!(INGEST_EVENTS_REJECTED_TOTAL, "reason" => reason.as_str()).increment(0);
+    }
     for operation in WalDurabilityOperation::ALL {
         metrics::counter!(WAL_DURABILITY_FAILURES_TOTAL, "operation" => operation.label())
             .increment(0);
@@ -340,6 +393,40 @@ pub fn describe_metrics() {
         "Current number of events in the hot buffer"
     );
     describe_gauge!(HOT_BUFFER_BYTES, "Current byte size of the hot buffer");
+    describe_gauge!(
+        HOT_BUFFER_MAX_EVENTS,
+        "Hot-buffer event cap (ingest.hot_buffer_max_events); external \
+         producers may fill 15/16 of it, self-telemetry all of it"
+    );
+    describe_gauge!(
+        HOT_BUFFER_MAX_BYTES,
+        "Hot-buffer serialized-byte cap (ingest.hot_buffer_max_bytes); \
+         external producers may fill 15/16 of it, self-telemetry all of it"
+    );
+    describe_gauge!(
+        HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS,
+        "Seconds since the oldest resident hot-buffer batch was inserted, \
+         0 when the buffer is empty; rising past a few compaction intervals \
+         means compaction is not draining"
+    );
+    describe_gauge!(
+        HOT_BUFFER_ADMISSION_STATE,
+        "Hot-buffer admission state: 0 = open, 1 = pressure (at or above \
+         half of either cap, compaction drains early), 2 = refusing (a \
+         reservation was refused for lack of space; clears below a quarter \
+         of both caps)"
+    );
+    describe_counter!(
+        HOT_BUFFER_ADMISSION_REFUSALS_TOTAL,
+        "Hot-buffer reservations refused, labelled by producer (http, \
+         syslog, trawld) and kind (full = no free space, retry after \
+         compaction drains; oversized = larger than the producer's ceiling, \
+         can never fit)"
+    );
+    describe_gauge!(
+        COMPACTION_INTERVAL_SECONDS,
+        "Configured compaction interval (ingest.compaction_interval_secs)"
+    );
     describe_gauge!(ACTIVE_CONNECTIONS, "Number of in-flight HTTP requests");
     describe_gauge!(
         QUERY_PERMITS_RETAINED,
@@ -368,7 +455,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         SYSLOG_EVENTS_DROPPED_TOTAL,
-        "Syslog events abandoned because the batch queue was full or closed; TCP and UDP combined"
+        "Syslog events abandoned because the batch queue was full or closed, \
+         labelled by reason (backpressure = the queue was full while hot-buffer \
+         admission was refusing, queue_full = any other full or closed queue); \
+         TCP and UDP combined"
     );
     describe_counter!(
         SYSLOG_WAL_EVENTS_DISCARDED_TOTAL,
@@ -649,6 +739,22 @@ fn bounded_label(admitted: &mut HashSet<String>, service: &str, cap: usize) -> S
 
 // -- gauge collection --------------------------------------------------------
 
+/// The configured compaction interval in seconds; `u64::MAX` until
+/// [`set_compaction_interval_secs`] runs.
+static COMPACTION_INTERVAL_SECS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Record the configured compaction interval for
+/// [`COMPACTION_INTERVAL_SECONDS`]. Call once at startup, before serving;
+/// [`collect_gauges`] publishes it from then on.
+pub fn set_compaction_interval_secs(secs: u64) {
+    COMPACTION_INTERVAL_SECS.store(secs, Ordering::Relaxed);
+}
+
+fn compaction_interval_secs() -> Option<u64> {
+    let secs = COMPACTION_INTERVAL_SECS.load(Ordering::Relaxed);
+    (secs != u64::MAX).then_some(secs)
+}
+
 /// Preserve the existing storage collection cadence, including failed attempts.
 const STORAGE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -780,6 +886,14 @@ pub fn collect_gauges(
     if let Some(buf) = hot_buffer {
         metrics::gauge!(HOT_BUFFER_EVENTS).set(buf.event_count() as f64);
         metrics::gauge!(HOT_BUFFER_BYTES).set(buf.byte_count() as f64);
+        metrics::gauge!(HOT_BUFFER_MAX_EVENTS).set(buf.config().max_events as f64);
+        metrics::gauge!(HOT_BUFFER_MAX_BYTES).set(buf.config().max_bytes as f64);
+        metrics::gauge!(HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS)
+            .set(buf.oldest_batch_age().map_or(0.0, |age| age.as_secs_f64()));
+        metrics::gauge!(HOT_BUFFER_ADMISSION_STATE).set(f64::from(buf.admission_state().as_u8()));
+    }
+    if let Some(secs) = compaction_interval_secs() {
+        metrics::gauge!(COMPACTION_INTERVAL_SECONDS).set(secs as f64);
     }
 
     // Parquet file gauges — walk the glob pattern's parent directory.
@@ -1574,7 +1688,14 @@ mod tests {
             describe_metrics();
             init_operational_alert_metrics();
             let selected = [
-                "trawl_syslog_events_dropped_total",
+                "trawl_syslog_events_dropped_total{reason=\"backpressure\"}",
+                "trawl_syslog_events_dropped_total{reason=\"queue_full\"}",
+                "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"full\"}",
+                "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"oversized\"}",
+                "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"full\"}",
+                "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"oversized\"}",
+                "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"full\"}",
+                "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"oversized\"}",
                 "trawl_syslog_wal_events_discarded_total",
                 "trawl_syslog_write_tasks_failed_total",
                 "trawl_telemetry_wal_write_failures_total",
@@ -1583,6 +1704,8 @@ mod tests {
                 "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}",
                 "trawl_telemetry_events_dropped_total{reason=\"unmetered_cap\"}",
                 "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}",
+                "trawl_ingest_events_rejected_total{reason=\"hot_buffer_full\"}",
+                "trawl_ingest_events_rejected_total{reason=\"ingest_batch_too_large\"}",
                 "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}",
                 "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}",
                 "trawl_compaction_operation_failures_total{operation=\"wal_environment_scan\"}",
@@ -1712,5 +1835,147 @@ mod tests {
     fn collect_gauges_no_hot_buffer_no_panic() {
         // With no recorder installed and no hot buffer, should be a no-op.
         collect_gauges(None, "/nonexistent/path/**/*.parquet", None, 0);
+    }
+
+    /// One rendered sample value, verbatim (gauges need not be integers).
+    fn gauge_value<'a>(rendered: &'a str, series: &str) -> &'a str {
+        rendered
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.rsplit_once(' ')?;
+                (name == series).then_some(value)
+            })
+            .unwrap_or_else(|| panic!("missing series {series} in {rendered}"))
+    }
+
+    #[test]
+    fn admission_gauges_follow_the_hot_buffer() {
+        use crate::hot_buffer::{AdmissionState, HotBufferConfig};
+        use crate::ingest::producer::ProducerKind;
+
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            init_operational_alert_metrics();
+            set_compaction_interval_secs(10);
+            let buf = Arc::new(HotBuffer::new(HotBufferConfig {
+                max_events: 100,
+                max_bytes: 1_000,
+            }));
+            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            let rendered = handle.render();
+            assert_eq!(gauge_value(&rendered, HOT_BUFFER_MAX_EVENTS), "100");
+            assert_eq!(gauge_value(&rendered, HOT_BUFFER_MAX_BYTES), "1000");
+            assert_eq!(
+                gauge_value(&rendered, HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS),
+                "0"
+            );
+            assert_eq!(gauge_value(&rendered, HOT_BUFFER_ADMISSION_STATE), "0");
+            assert_eq!(gauge_value(&rendered, COMPACTION_INTERVAL_SECONDS), "10");
+
+            buf.insert_for_test(Arc::new(crate::bus::IngestBatch {
+                batch_id: "prod/a".into(),
+                service: "svc".into(),
+                byte_size: 600,
+                events: vec![serde_json::Map::new(); 10],
+            }));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            let rendered = handle.render();
+            assert_eq!(
+                gauge_value(&rendered, HOT_BUFFER_ADMISSION_STATE),
+                AdmissionState::Pressure.as_u8().to_string()
+            );
+            let age: f64 = gauge_value(&rendered, HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS)
+                .parse()
+                .unwrap();
+            assert!(age >= 0.005, "{age}");
+
+            assert!(
+                buf.reserve(
+                    ProducerKind::Http,
+                    crate::hot_buffer::Charge {
+                        events: 1,
+                        bytes: 400,
+                    }
+                )
+                .is_err()
+            );
+            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            let rendered = handle.render();
+            assert_eq!(gauge_value(&rendered, HOT_BUFFER_ADMISSION_STATE), "2");
+            assert_eq!(
+                test_support::sample(
+                    &handle,
+                    "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"full\"}"
+                ),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn syslog_drop_reasons_are_the_frozen_label_set() {
+        let labels: Vec<&str> = SyslogDropReason::ALL.iter().map(|r| r.label()).collect();
+        assert_eq!(labels, ["backpressure", "queue_full"]);
+    }
+
+    /// Every `trawl_*` metric name the alert pack selects.
+    fn alert_pack_metric_names(rules: &str) -> std::collections::BTreeSet<&str> {
+        let bytes = rules.as_bytes();
+        let mut names = std::collections::BTreeSet::new();
+        let mut i = 0;
+        while let Some(offset) = rules[i..].find("trawl_") {
+            let start = i + offset;
+            let preceded =
+                start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_');
+            let end = start
+                + rules[start..]
+                    .find(|c: char| !(c.is_ascii_lowercase() || c == '_'))
+                    .unwrap_or(rules.len() - start);
+            if !preceded {
+                names.insert(&rules[start..end]);
+            }
+            i = end;
+        }
+        names
+    }
+
+    #[test]
+    fn every_metric_the_alert_pack_selects_renders_after_init_and_collection() {
+        // The packaged alert rules only fire on series that exist: a rule
+        // over a name nothing publishes at boot silently never fires. Init
+        // plus one gauge collection must publish every name they select.
+        const RULES: &str = include_str!("../../../monitoring/prometheus/trawl.rules.yml");
+        let names = alert_pack_metric_names(RULES);
+        assert!(
+            names.contains("trawl_syslog_events_dropped_total"),
+            "extraction found {names:?}"
+        );
+
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            init_operational_alert_metrics();
+            set_compaction_interval_secs(10);
+            let buf = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+                max_events: trawl_config::DEFAULT_HOT_BUFFER_MAX_EVENTS,
+                max_bytes: trawl_config::DEFAULT_HOT_BUFFER_MAX_BYTES,
+            }));
+            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            let rendered = handle.render();
+            for name in names {
+                let series_prefix = [format!("{name} "), format!("{name}{{")];
+                assert!(
+                    rendered.lines().any(|line| {
+                        !line.starts_with('#')
+                            && series_prefix.iter().any(|p| line.starts_with(p.as_str()))
+                    }),
+                    "the alert pack selects {name}, which init and collection never publish:\n{rendered}"
+                );
+            }
+        });
     }
 }

@@ -31,13 +31,31 @@ A batch writes one file per environment and service group under `wal/{env}/`. Th
 
 ## Hot buffer and the publication guard
 
-The hot buffer holds shared batches until compaction drains them or capacity forces eviction. Queries share one temporary NDJSON snapshot per hot generation, and that snapshot carries the catalog pins for its own keys.
+The hot buffer holds shared batches until compaction drains them. Nothing else removes a batch. Queries share one temporary NDJSON snapshot per hot generation, and that snapshot carries the catalog pins for its own keys.
 
 A publication lock keeps a query from seeing one event twice. A query takes the read guard before it selects files and holds it through its last physical read. Compaction takes the write guard for Parquet publication and hot drain together, so no query sees the moment between them. Producers hold the ingest read guard from the WAL write through hot insertion, so a slow producer cannot reinsert a drained batch.
 
 Daily rollup holds the same exclusion through hourly-file retirement. These guarantees cover one daemon. They do not deduplicate client retries or coordinate independent readers of the same files.
 
 A bounded Tokio broadcast channel shares each batch with live subscribers. A slow consumer lags and gets a loss notification rather than blocking the producer. The bus is not a durable replay queue.
+
+### Hot-buffer admission
+
+What happens when events arrive faster than compaction drains them? The hot buffer refuses new writes and keeps every event it already holds. A refused sender can retry. An acknowledged event that no query could see would be silent loss, so the buffer never removes one to make room.
+
+The buffer keeps one ledger of events and serialized ndjson bytes, capped by `[ingest] hot_buffer_max_events` and `hot_buffer_max_bytes`. A producer reserves space for its whole batch before it writes the WAL. The order is parse, reserve, take the ingest read guard, write the WAL, and insert. A refused batch writes nothing and never touches the publication lock. Compaction needs that lock's write side to drain, and it is the only thing that frees space, so nothing waits for capacity while it holds the guard. A reservation that is not used, because a WAL write failed or a request was cancelled, returns its space at once.
+
+HTTP and syslog may fill 15/16 of each cap. Internal telemetry may fill the whole cap, so trawld's own records of a stall stay searchable during it. The producer is known from the code path that wrote the batch, never from an event field, so a client that sends `service=trawld` gets the external share.
+
+Each producer handles a refusal its own way:
+
+- **HTTP** answers 503 `hot_buffer_full` with `Retry-After` set to the compaction interval when the request fits the external share but not the free space. It answers 413 `ingest_batch_too_large` when the request is larger than the external share and can never fit. When the buffer has no free space at all, the request is refused before its body is decompressed. See [ingest events](/reference/api/#ingest-events).
+- **Syslog** keeps a refused group pending, in arrival order, and stops taking frames from its queue until space frees. TCP listeners then stop reading, so the kernel's flow control slows the sender, and the connection stays open. UDP has no flow control: a datagram that finds the queue full is dropped and counted. See [syslog delivery under load](/operate/ingestion/#syslog-delivery-under-load).
+- **Internal telemetry** keeps a refused batch at the front of its queue and tries again on the next flush. See [internal telemetry](/architecture/reports-telemetry/#internal-telemetry).
+
+At half of either cap, or after any refusal, compaction starts a pressure pass at once instead of waiting for its interval. A pressure pass reads WAL files of any age and skips daily rollup. Publication still checks under the write guard that every consumed file exists, so a withdrawn write is never published. A pass that failed stops pressure passes until the next regular pass, even when it drained other batches and the buffer is no longer under pressure. A stall makes its own inserts: its error lines reach internal telemetry, which lands in a healthy environment that the next pass could drain. A pass that found WAL files and drained none of them stops pressure passes the same way. A failure that stays until an operator fixes it, such as a blocking publication marker, a WAL file that always fails, or a WAL root entry that compaction cannot inspect, holds every service to the regular interval until the fault is fixed. A pass that drained something with no failure runs again at once while the buffer is under pressure or refusing. A pass that read WAL files of any age and found none ran before the admitted writes reached disk. It waits for their inserts, which wake compaction, and refusals alone do not start another pass. The regular interval runs throughout. The buffer reports that it is refusing until occupancy falls below a quarter of both caps.
+
+When compaction cannot drain at all, for example while the catalog is down, ingest stays refused and reads stay complete. `/api/v1/health` reports `degraded` with `ingest_capacity` set to `refusing`, at HTTP 200. The [operational alerts](/operate/operational-alerts/#hot-buffer-drain-stalled) watch the oldest resident batch's age and sustained refusals.
 
 ## Compaction
 

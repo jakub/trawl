@@ -554,6 +554,37 @@ fn assert_dashboard_measurement_metadata_is_required(dashboard: &trawl_api::Dash
     }
 }
 
+/// The ingest-refusal chip and Warn badge (ADR-0043) are built on refusal
+/// ALONE degrading the report; any other failed check would make the
+/// spec test a different case. The daemon ships `ingest_capacity` in
+/// every report, so the healthy fixtures carry it too.
+#[test]
+fn ingest_refusing_fixture_degrades_on_ingest_capacity_alone() {
+    let ok: trawl_api::HealthResponse = decode(
+        "health-ok.json",
+        include_str!("../e2e/harness/wire/health-ok.json"),
+    );
+    let failed: trawl_api::HealthResponse = decode(
+        "health-unavailable.json",
+        include_str!("../e2e/harness/wire/health-unavailable.json"),
+    );
+    let refusing: trawl_api::HealthResponse = decode(
+        "health-ingest-refusing.json",
+        include_str!("../e2e/harness/wire/health-ingest-refusing.json"),
+    );
+    assert_eq!(ok.checks.as_ref().unwrap()["ingest_capacity"], "ok");
+    assert_eq!(failed.checks.as_ref().unwrap()["ingest_capacity"], "ok");
+    assert_eq!(refusing.status, trawl_api::HealthStatus::Degraded);
+    let refusing_checks = refusing.checks.as_ref().unwrap();
+    assert_eq!(refusing_checks["ingest_capacity"], "refusing");
+    for (key, value) in refusing_checks {
+        if key != "ingest_capacity" {
+            assert_eq!(value, "ok", "health-ingest-refusing.json fails `{key}` too");
+        }
+    }
+    assert_eq!(ok.version, refusing.version);
+}
+
 #[test]
 fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
     let ok: trawl_api::HealthResponse = decode(

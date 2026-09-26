@@ -170,6 +170,10 @@ config:
     internalTelemetry: true
     dailyRollup: true
     eventBusCapacity: 4096
+    # Hot-buffer caps. A write that does not fit is refused (HTTP 503
+    # hot_buffer_full, syslog stalls); admitted events stay until drained.
+    # HTTP and syslog may fill 15/16 of each cap; trawld's own telemetry
+    # may fill all of it. A request over 15/16 answers 413.
     hotBufferMaxEvents: 100000
     hotBufferMaxBytes: "100M"
     statsIntervalSecs: 60
@@ -218,7 +222,6 @@ config:
     defaultService: "syslog"
     tcpIdleTimeoutSecs: 60
     maxEventsPerConnection: 100000
-    consecutiveSendFailuresLimit: 100
     allowCidrs: []
     # allowCidrs:
     #   - "192.168.0.0/16"
@@ -400,7 +403,7 @@ web:
 # invisible. The trawl-web sidecar has its own filter (see web.logLevel).
 logLevel: "trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info"
 
-# -- Operational warnings (requires Prometheus Operator CRDs only when enabled).
+# -- Operational alerts (requires Prometheus Operator CRDs only when enabled).
 # Independent of serviceMonitor. Targets always use the release namespace and Service name.
 prometheusRule:
   enabled: false
@@ -443,6 +446,12 @@ prometheusRule:
     TrawlPublicationRecoveryBlocked:
       enabled: true
       severity: warning
+    TrawlIngestAdmissionRefusing:
+      enabled: true
+      severity: warning
+    TrawlHotBufferDrainStalled:
+      enabled: true
+      severity: critical
 
 # -- Prometheus ServiceMonitor (requires prometheus-operator CRDs)
 serviceMonitor:

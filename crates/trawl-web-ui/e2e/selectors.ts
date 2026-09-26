@@ -429,6 +429,9 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/status_bar.rs — the footer's
   /// status text (Connected / Hauling / Live / Error).
   statusLabel: '.statusbar .status-label',
+  /// crates/trawl-web-ui/src/components/status_bar.rs — the amber chip
+  /// shown while health reports `ingest_capacity: refusing` (ADR-0043).
+  statusIngestRefusing: '.statusbar .grp.ingest-refusing',
   /// crates/trawl-web-ui/src/components/status_bar.rs — the footer's
   /// count group, whose label names the source it counted.
   footerCount: '.statusbar .grp.count',

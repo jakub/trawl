@@ -3,6 +3,9 @@
 
 Only Python's standard library, Helm, and the pinned CI promtool are required.
 The committed expected inventory is an independent oracle, not a rule generator.
+Each expected rule names a family. The "increase" family shares one counter
+expression shape and one set of timelines; every other family carries its own
+expression, `for` delay and severity, and its own timelines.
 """
 
 import copy
@@ -82,6 +85,29 @@ def series(metric, labels):
     return metric + "{" + ",".join(f"{key}={json.dumps(value)}" for key, value in sorted(labels.items())) + "}"
 
 
+PLAIN_SELECTOR = 'job="trawl"'
+HELM_SELECTOR = 'namespace="example",service="launch-trawl"'
+FAMILIES = sorted({rule["family"] for rule in EXPECTED})
+
+
+def expected_rule(expected, selector):
+    if "expr" in expected:
+        expr = expected["expr"].replace("$SELECTOR", selector)
+    else:
+        matchers = selector + ("," + expected["matcher"] if expected["matcher"] else "")
+        expr = f'increase({expected["metric"]}{{{matchers}}}[10m]) > 0'
+    rule = {"alert": expected["alert"], "expr": expr}
+    if "for" in expected:
+        rule["for"] = expected["for"]
+    rule["labels"] = {"severity": severity_of(expected)}
+    rule["annotations"] = expected["annotations"]
+    return rule
+
+
+def severity_of(expected):
+    return expected.get("severity", "warning")
+
+
 def expanded_annotations(annotations, labels):
     return {key: re.sub(r"\{\{ \$labels\.(\w+) \}\}", lambda m: labels.get(m[1], ""), value)
             for key, value in annotations.items()}
@@ -94,22 +120,16 @@ class OperationalAlerts(unittest.TestCase):
         cls.helm = rule_object()
 
     def test_inventory_annotations_and_exact_selector_parity(self):
-        for pack, selector in [(self.plain, 'job="trawl"'),
-                               (self.helm["spec"], 'namespace="example",service="launch-trawl"')]:
+        for pack, selector in [(self.plain, PLAIN_SELECTOR), (self.helm["spec"], HELM_SELECTOR)]:
             self.assertEqual(len(pack["groups"]), 1)
             self.assertEqual(pack["groups"][0]["name"], "trawl.operational")
             rules = pack["groups"][0]["rules"]
-            self.assertEqual(len(rules), 11)
+            self.assertEqual(len(rules), 13)
             for actual, expected in zip(rules, EXPECTED, strict=True):
-                matchers = selector + ("," + expected["matcher"] if expected["matcher"] else "")
-                self.assertEqual(actual, {
-                    "alert": expected["alert"],
-                    "expr": f'increase({expected["metric"]}{{{matchers}}}[10m]) > 0',
-                    "labels": {"severity": "warning"}, "annotations": expected["annotations"],
-                })
+                self.assertEqual(actual, expected_rule(expected, selector))
         normalized = copy.deepcopy(self.helm["spec"])
         for rule in normalized["groups"][0]["rules"]:
-            rule["expr"] = rule["expr"].replace('namespace="example",service="launch-trawl"', 'job="trawl"', 1)
+            rule["expr"] = rule["expr"].replace(HELM_SELECTOR, PLAIN_SELECTOR)
         self.assertEqual(normalized, self.plain)
 
     def test_independent_monitor_and_pack_enablement(self):
@@ -133,8 +153,9 @@ class OperationalAlerts(unittest.TestCase):
                 self.assertEqual([r["alert"] for r in result["spec"]["groups"][0]["rules"]],
                                  [r["alert"] for r in EXPECTED if r["alert"] != name])
                 result = rule_object(enabled(alerts={name: {"severity": "page"}}))
+                defaults = {r["alert"]: severity_of(r) for r in EXPECTED}
                 for rule in result["spec"]["groups"][0]["rules"]:
-                    self.assertEqual(rule["labels"], {"severity": "page" if rule["alert"] == name else "warning"})
+                    self.assertEqual(rule["labels"], {"severity": "page" if rule["alert"] == name else defaults[rule["alert"]]})
         result = rule_object(enabled(alerts={r["alert"]: {"enabled": False} for r in EXPECTED}))
         self.assertEqual(result["spec"]["groups"][0]["rules"], [])
 
@@ -224,22 +245,51 @@ class OperationalAlerts(unittest.TestCase):
                 result = command(args)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def timeline(self, case, target):
+    def timeline(self, case, target, family="increase"):
+        """One promtool test for a family's case, checking every expected alert.
+
+        An increase case feeds its `values` to every variant of every rule in the
+        family. Any other case lists its own `series`, each defaulting to the
+        rule's metric. Alerts outside the family must stay silent at each check.
+        """
         labels = {"job": "trawl", "instance": "10.0.0.1:5514", "namespace": "example",
                   "service": "launch-trawl", "pod": "launch-trawl-0", "cluster": "home", **target}
+        members = [expected for expected in EXPECTED if expected["family"] == family]
         inputs = []
-        for expected in EXPECTED:
-            for variant in expected["variants"]:
-                inputs.append({"series": series(expected["metric"], {**labels, **variant}),
-                               "values": case["values"]})
+        if family == "increase":
+            for expected in members:
+                for variant in expected["variants"]:
+                    inputs.append({"series": series(expected["metric"], {**labels, **variant}),
+                                   "values": case["values"]})
+        else:
+            (metric,) = {expected["metric"] for expected in members}
+            for entry in case["series"]:
+                inputs.append({"series": series(entry.get("metric", metric), {**labels, **entry["labels"]}),
+                               "values": entry["values"]})
         checks = []
         for time, firing in case["checks"]:
             for expected in EXPECTED:
-                alerts = [{"exp_labels": {**labels, **variant, "severity": "warning"},
+                alerts = [{"exp_labels": {**labels, **variant, "severity": severity_of(expected)},
                            "exp_annotations": expanded_annotations(expected["annotations"], {**labels, **variant})}
-                          for variant in expected["variants"]] if firing else []
+                          for variant in expected["variants"]] if firing and expected in members else []
                 checks.append({"eval_time": time, "alertname": expected["alert"], "exp_alerts": alerts})
-        return {"name": case["name"], "interval": "30s", "input_series": inputs, "alert_rule_test": checks}
+        return {"name": f'{family}: {case["name"]}', "interval": "30s", "input_series": inputs,
+                "alert_rule_test": checks}
+
+    def firing_probe(self, family):
+        """The family's first firing case, cut to its first firing check."""
+        for case in TIMELINES[family]:
+            for time, firing in case["checks"]:
+                if firing:
+                    return {**case, "checks": [[time, True]]}
+        raise AssertionError(f"family {family} has no firing timeline")
+
+    def test_every_family_has_timelines(self):
+        self.assertEqual(sorted(TIMELINES), FAMILIES)
+        for family in FAMILIES:
+            with self.subTest(family=family):
+                outcomes = {firing for case in TIMELINES[family] for _, firing in case["checks"]}
+                self.assertEqual(outcomes, {False, True})
 
     def test_promtool_timelines_for_both_packs(self):
         # Counter plateaus model no further observations, not an application setting.
@@ -249,7 +299,8 @@ class OperationalAlerts(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for name, pack in [("plain", self.plain), ("helm", self.helm["spec"])]:
             with self.subTest(pack=name):
-                self.run_promtool(pack, [self.timeline(case, {}) for case in TIMELINES])
+                self.run_promtool(pack, [self.timeline(case, {}, family)
+                                         for family in FAMILIES for case in TIMELINES[family]])
 
     def test_promtool_static_severity_override(self):
         severity = 'page "ops"\nteam: logs #triage'
@@ -257,13 +308,16 @@ class OperationalAlerts(unittest.TestCase):
         plain = copy.deepcopy(self.plain)
         for rule in plain["groups"][0]["rules"]:
             rule["labels"]["severity"] = severity
-        case = self.timeline({"name": "escaped static severity", "values": "0 1+0x30",
-                              "checks": [["0m", False], ["30s", True], ["9m", True], ["10m", False]]}, {})
-        for check in case["alert_rule_test"]:
-            for alert in check["exp_alerts"]:
-                alert["exp_labels"]["severity"] = severity
+        cases = [self.timeline({"name": "escaped static severity", "values": "0 1+0x30",
+                                "checks": [["0m", False], ["30s", True], ["9m", True], ["10m", False]]}, {})]
+        cases += [self.timeline(self.firing_probe(family), {}, family)
+                  for family in FAMILIES if family != "increase"]
+        for case in cases:
+            for check in case["alert_rule_test"]:
+                for alert in check["exp_alerts"]:
+                    alert["exp_labels"]["severity"] = severity
         for pack in [plain, helm["spec"]]:
-            self.run_promtool(pack, [case])
+            self.run_promtool(pack, cases)
 
     def test_promtool_target_isolation_and_rendered_service_identity(self):
         cases = [("launch", "example", None), ("second", "example", None),
@@ -279,16 +333,24 @@ class OperationalAlerts(unittest.TestCase):
                 service_name = decode_yaml(service.stdout)["metadata"]["name"]
                 self.assertEqual(result["metadata"]["namespace"], "rule-objects")
                 target = {"namespace": namespace, "service": service_name}
-                case = self.timeline({"name": "isolation", "values": "0 1", "checks": [["30s", True]]}, target)
-                # Both decoys increment. Only the selected namespace AND Service may fire.
-                for key in ["namespace", "service"]:
-                    decoy = self.timeline({"name": "decoy", "values": "0 1", "checks": []}, {**target, key: "unrelated"})
-                    case["input_series"].extend(decoy["input_series"])
-                self.run_promtool(result["spec"], [case])
-        case = self.timeline({"name": "plain job isolation", "values": "0 1", "checks": [["30s", True]]}, {})
-        decoy = self.timeline({"name": "other job", "values": "0 1", "checks": []}, {"job": "unrelated"})
-        case["input_series"].extend(decoy["input_series"])
-        self.run_promtool(self.plain, [case])
+                tests = []
+                for family in FAMILIES:
+                    probe = self.firing_probe(family)
+                    case = self.timeline(probe, target, family)
+                    # Both decoys match. Only the selected namespace AND Service may fire.
+                    for key in ["namespace", "service"]:
+                        decoy = self.timeline({**probe, "checks": []}, {**target, key: "unrelated"}, family)
+                        case["input_series"].extend(decoy["input_series"])
+                    tests.append(case)
+                self.run_promtool(result["spec"], tests)
+        tests = []
+        for family in FAMILIES:
+            probe = self.firing_probe(family)
+            case = self.timeline(probe, {}, family)
+            decoy = self.timeline({**probe, "checks": []}, {"job": "unrelated"}, family)
+            case["input_series"].extend(decoy["input_series"])
+            tests.append(case)
+        self.run_promtool(self.plain, tests)
 
     def test_promtool_telemetry_disjoint_reasons_and_attempt_overlap(self):
         for pack in [self.plain, self.helm["spec"]]:

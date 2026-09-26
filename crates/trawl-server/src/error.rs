@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use trawl_engine::error::EngineError;
 
+use crate::hot_buffer::Charge;
 use crate::report_window::{MaterializeError, PlanError, WindowPolicyError};
 use crate::store::StoreError;
 
@@ -20,6 +21,24 @@ use crate::store::StoreError;
 /// the scheduler's run rows and the client response unchanged. A refusal
 /// here is 503, never the 504 an execution timeout earns — nothing ran.
 pub const CAPACITY_NOT_STARTED: &str = "server at capacity: the query was not started";
+
+/// The 413 sentence: what the request charged, if it was parsed, against
+/// what one request may charge. Both are counts the sender can act on
+/// (split the batch), and neither quotes the request's content.
+fn ingest_batch_too_large_message(requested: Option<Charge>, ceiling: Charge) -> String {
+    let limit = format!(
+        "{} events or {} serialized bytes per request",
+        ceiling.events, ceiling.bytes
+    );
+    match requested {
+        Some(requested) => format!(
+            "ingest batch too large: {} events and {} serialized bytes exceed the limit of \
+             {limit}; split the batch",
+            requested.events, requested.bytes
+        ),
+        None => format!("ingest batch too large: the hot buffer admits at most {limit}"),
+    }
+}
 
 /// Server errors, mapped to HTTP responses via [`IntoResponse`].
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +125,27 @@ pub enum ServerError {
     /// never reaches the wire.
     #[error("service unavailable: auth backend unavailable")]
     AuthBackend(CauseKind),
+
+    /// The hot buffer has no free space for an ingest request (503 with
+    /// `Retry-After`, ADR-0043). Nothing from the request was written, so
+    /// the sender can retry it whole once compaction drains.
+    #[error("hot buffer full")]
+    HotBufferFull {
+        /// The `Retry-After` value: the compaction interval.
+        retry_after_secs: u64,
+    },
+
+    /// An ingest request larger than the hot buffer admits for any one
+    /// request (413, ADR-0043). It can never fit, so a retry of the same
+    /// request cannot succeed; the sender must split it.
+    #[error("{}", ingest_batch_too_large_message(*.requested, *.ceiling))]
+    IngestBatchTooLarge {
+        /// The request's parsed charge, or `None` when it was refused
+        /// before parsing because the ceiling admits no request at all.
+        requested: Option<Charge>,
+        /// The most one request may charge.
+        ceiling: Charge,
+    },
 
     /// Internal server error (unexpected failures).
     #[error("internal error: {0}")]
@@ -195,11 +235,14 @@ pub enum CauseKind {
     PgOther,
     /// The auth keystore's hashing or token-generation worker failed.
     AuthWorker,
+    /// The hot buffer refused an ingest request for lack of free space
+    /// (ADR-0043): compaction has not drained what is already admitted.
+    HotBufferFull,
 }
 
 impl CauseKind {
     /// Every kind, for closed-set checks and for consumers that enumerate.
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::None,
         Self::Unknown,
         Self::IoNotFound,
@@ -228,6 +271,7 @@ impl CauseKind {
         Self::PgSchema,
         Self::PgOther,
         Self::AuthWorker,
+        Self::HotBufferFull,
     ];
 
     /// The fixed `snake_case` literal this kind is recorded as.
@@ -262,6 +306,7 @@ impl CauseKind {
             Self::PgSchema => "pg_schema",
             Self::PgOther => "pg_other",
             Self::AuthWorker => "auth_worker",
+            Self::HotBufferFull => "hot_buffer_full",
         }
     }
 
@@ -377,6 +422,8 @@ impl ServerError {
             // unable to tell a capacity refusal from any other 503.
             Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
+            // `HotBufferFull` and `IngestBatchTooLarge` render fixed text
+            // and counts, with nothing to redact.
             other => other.to_string(),
         }
     }
@@ -416,7 +463,12 @@ impl ServerError {
             Self::TooManyStreams => "too_many_streams",
             // An auth backend outage is the same 503 it was before the
             // driver's kind rode along; `cause_kind` tells it apart.
-            Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service_unavailable",
+            // A full hot buffer is a 503 like any other refusal to serve;
+            // `cause_kind` names it, as it does an auth backend outage.
+            Self::ServiceUnavailable(_) | Self::AuthBackend(_) | Self::HotBufferFull { .. } => {
+                "service_unavailable"
+            }
+            Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::Internal(_) => "internal",
             Self::Panicked(_) => "panic",
         }
@@ -434,6 +486,7 @@ impl ServerError {
             Self::Store(StoreError::Unavailable(e)) => CauseKind::of_sqlx(e),
             Self::Store(StoreError::Migration(e)) => CauseKind::of_store_schema(e),
             Self::AuthBackend(kind) => *kind,
+            Self::HotBufferFull { .. } => CauseKind::HotBufferFull,
             // A pre-start capacity refusal is a pressure outcome the class
             // names in full. Every other 503 was built from a string and
             // kept no typed source.
@@ -453,6 +506,7 @@ impl ServerError {
             | Self::Ingest(_)
             | Self::RateLimited
             | Self::TooManyStreams
+            | Self::IngestBatchTooLarge { .. }
             | Self::Panicked(_) => CauseKind::None,
         }
     }
@@ -781,6 +835,21 @@ impl IntoResponse for ServerError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "auth backend unavailable"),
             ),
+            // `Retry-After` is added below, from the variant.
+            Self::HotBufferFull { .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(
+                    ErrorCode::HotBufferFull,
+                    "hot buffer full: nothing from this request was written; retry it after \
+                     compaction drains",
+                ),
+            ),
+            // A client error with no `Retry-After`: the same request can
+            // never fit.
+            Self::IngestBatchTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorEnvelope::simple(ErrorCode::IngestBatchTooLarge, self.to_string()),
+            ),
             // `self` renders as the fixed label only: a panic's payload
             // never made it into the variant.
             Self::Internal(_) | Self::Panicked(_) => {
@@ -798,7 +867,14 @@ impl IntoResponse for ServerError {
         };
 
         let body = trawl_api::ErrorResponse { error: envelope };
-        (status, axum::Json(body)).into_response()
+        let mut response = (status, axum::Json(body)).into_response();
+        if let Self::HotBufferFull { retry_after_secs } = self {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(retry_after_secs),
+            );
+        }
+        response
     }
 }
 
@@ -993,10 +1069,11 @@ mod tests {
                 | CauseKind::PgMigrate
                 | CauseKind::PgSchema
                 | CauseKind::PgOther
-                | CauseKind::AuthWorker => true,
+                | CauseKind::AuthWorker
+                | CauseKind::HotBufferFull => true,
             })
             .count();
-        assert_eq!(variants, 28, "ALL lists every variant");
+        assert_eq!(variants, 29, "ALL lists every variant");
 
         let mut seen = std::collections::HashSet::new();
         for kind in CauseKind::ALL {
@@ -1071,6 +1148,19 @@ mod tests {
             (
                 ServerError::Internal("zz_detail".into()),
                 CauseKind::Unknown,
+            ),
+            (
+                ServerError::HotBufferFull {
+                    retry_after_secs: 10,
+                },
+                CauseKind::HotBufferFull,
+            ),
+            (
+                ServerError::IngestBatchTooLarge {
+                    requested: None,
+                    ceiling: Charge::ZERO,
+                },
+                CauseKind::None,
             ),
         ];
         for (err, expected) in cases {
@@ -1195,6 +1285,64 @@ mod tests {
         let err = ServerError::ServiceUnavailable("not ready".into());
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A full hot buffer is a 503 whose `Retry-After` is the variant's
+    /// interval, classed as a refusal to serve and named by its cause.
+    #[tokio::test]
+    async fn hot_buffer_full_is_a_503_with_retry_after() {
+        let err = ServerError::HotBufferFull {
+            retry_after_secs: 37,
+        };
+        assert_eq!(err.error_class(), "service_unavailable");
+        assert_eq!(err.cause_kind(), CauseKind::HotBufferFull);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(axum::http::header::RETRY_AFTER),
+            Some(&axum::http::HeaderValue::from_static("37"))
+        );
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "hot_buffer_full");
+    }
+
+    /// An oversized ingest request is a 413 with no `Retry-After`, and its
+    /// message gives the sender the numbers to split by.
+    #[tokio::test]
+    async fn ingest_batch_too_large_is_a_413_without_retry_after() {
+        let ceiling = Charge {
+            events: 60,
+            bytes: 960,
+        };
+        let err = ServerError::IngestBatchTooLarge {
+            requested: Some(Charge {
+                events: 61,
+                bytes: 700,
+            }),
+            ceiling,
+        };
+        assert_eq!(err.cause_kind(), CauseKind::None);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "ingest_batch_too_large");
+        let message = body["error"]["message"].as_str().unwrap();
+        for number in ["61", "700", "60", "960"] {
+            assert!(message.contains(number), "{number} missing: {message}");
+        }
+
+        let unparsed = ServerError::IngestBatchTooLarge {
+            requested: None,
+            ceiling: Charge::ZERO,
+        }
+        .into_response();
+        assert_eq!(unparsed.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     /// An engine refusal is the caller's mistake, not the server's: 400,

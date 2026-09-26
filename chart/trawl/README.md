@@ -101,7 +101,8 @@ prometheusRule:
       enabled: false
 ```
 
-All eleven alerts default to enabled and `severity: warning`. Each entry accepts
+All thirteen alerts default to enabled. `TrawlHotBufferDrainStalled` defaults to
+`severity: critical`, and the others to `severity: warning`. Each entry accepts
 only `enabled` and `severity`. Severity is a nonblank static routing string,
 not an enum; `{{` and `}}` template delimiters are rejected. Unknown alert
 names, unknown fields, invalid types, invalid Kubernetes label keys or values, and
@@ -124,8 +125,13 @@ Accepted alert keys are:
 - `TrawlCompactionOperationFailure`
 - `TrawlFileQuarantine`
 - `TrawlPublicationRecoveryBlocked`
+- `TrawlIngestAdmissionRefusing`
+- `TrawlHotBufferDrainStalled`
 
-Rules use a fixed `increase(counter[10m]) > 0`, without a `for` delay. Use
+Eleven rules use a fixed `increase(counter[10m]) > 0`, without a `for` delay.
+`TrawlIngestAdmissionRefusing` sums hot-buffer refusals over producers and waits
+ten minutes. `TrawlHotBufferDrainStalled` compares the oldest hot-buffer batch's
+age with ten compaction intervals and waits two minutes. Use
 30-second scrapes and evaluations, no greater than two minutes. Each rule
 retains source-series target labels; none sums failures across targets.
 Resolution does not establish recovery. First-baseline, unseen-process, and
@@ -251,7 +257,6 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.syslog.defaultService` | string | `syslog` | `[syslog] default_service` |
 | `config.syslog.tcpIdleTimeoutSecs` | int | `60` | `[syslog] tcp_idle_timeout_secs` |
 | `config.syslog.maxEventsPerConnection` | int | `100000` | `[syslog] max_events_per_connection` |
-| `config.syslog.consecutiveSendFailuresLimit` | int | `100` | `[syslog] consecutive_send_failures_limit` |
 | `config.syslog.allowCidrs` | list | `[]` | `[syslog] allow_cidrs` |
 | `config.syslog.sourceServiceMap` | map | `{}` | `[syslog] source_service_map`, source IP to service name |
 | `config.syslog.channelCapacity` | int | `10000` | `[syslog] channel_capacity` |
@@ -291,11 +296,11 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `serviceMonitor.interval` | string | `30s` | Scrape interval |
 | `serviceMonitor.scrapeTimeout` | string | `10s` | Scrape timeout |
 | `serviceMonitor.namespace` | string | `""` | ServiceMonitor namespace. Empty uses the release namespace |
-| `prometheusRule.enabled` | bool | `false` | Create the ten operational warning rules; independent of ServiceMonitor creation |
+| `prometheusRule.enabled` | bool | `false` | Create the thirteen operational alert rules: `TrawlHotBufferDrainStalled` at `critical`, the others at `warning`; independent of ServiceMonitor creation |
 | `prometheusRule.namespace` | string | `""` | Rule object namespace. Empty uses the release namespace; never changes workload selectors |
 | `prometheusRule.additionalLabels` | map of strings | `{}` | Rule-resource discovery labels. Invalid Kubernetes label keys or values and conflicting chart label overrides are rejected |
-| `prometheusRule.alerts.<alert>.enabled` | bool | `true` | Enable one of the eleven alert keys listed above |
-| `prometheusRule.alerts.<alert>.severity` | string | `warning` | Nonblank static routing value; template delimiters are rejected |
+| `prometheusRule.alerts.<alert>.enabled` | bool | `true` | Enable one of the thirteen alert keys listed above |
+| `prometheusRule.alerts.<alert>.severity` | string | `warning`; `critical` for `TrawlHotBufferDrainStalled` | Nonblank static routing value; template delimiters are rejected |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount |
 | `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations |
 | `serviceAccount.name` | string | `""` | ServiceAccount name. Empty derives it from the release |

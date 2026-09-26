@@ -1,11 +1,11 @@
 {
-  "status": "unavailable",
+  "status": "degraded",
   "version": "health-fixture-163",
   "checks": {
-    "duckdb": "error",
+    "duckdb": "ok",
     "auth_db": "ok",
     "storage_db": "ok",
     "data_path": "ok",
-    "ingest_capacity": "ok"
+    "ingest_capacity": "refusing"
   }
 }

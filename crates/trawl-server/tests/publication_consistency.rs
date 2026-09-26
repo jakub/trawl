@@ -43,7 +43,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
     let writer = WalWriter::new(wal.clone());
     writer.ensure_dir().unwrap();
     let path = writer.write("prod", "nginx", &ndjson).unwrap();
-    hot.insert(Arc::new(IngestBatch {
+    hot.insert_for_test(Arc::new(IngestBatch {
         batch_id: format!("prod/{}", path.file_stem().unwrap().to_str().unwrap()).into(),
         service: "nginx".into(),
         byte_size: ndjson.len(),

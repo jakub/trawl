@@ -94,8 +94,10 @@ pub async fn run_udp_listener(
                     continue;
                 };
 
-                // Non-blocking send — drop if batcher is overwhelmed
-                if !super::batch::try_enqueue(&sender, event, stats.as_ref()) {
+                // Non-blocking send: drop if the queue is full. The drop is
+                // labelled `backpressure` while the batcher is blocked on
+                // hot-buffer admission, `queue_full` otherwise.
+                if !sender.try_enqueue(event, stats.as_ref()) {
                     tracing::debug!(
                         event_type = "syslog_event_dropped",
                         source = %source_ip,

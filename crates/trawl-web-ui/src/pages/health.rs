@@ -27,6 +27,7 @@ const CHECK_NAMES: &[(&str, &str)] = &[
     ("auth_db", "Authentication database"),
     ("data_path", "Data path"),
     ("duckdb", "Query engine"),
+    ("ingest_capacity", "Ingest capacity"),
     ("storage_db", "Catalog database"),
 ];
 
@@ -36,6 +37,17 @@ fn check_name(key: &str) -> Option<&'static str> {
         .iter()
         .find(|(known, _)| *known == key)
         .map(|(_, name)| *name)
+}
+
+/// The badge for one check result: `ok` is healthy, `ingest_capacity`'s
+/// `refusing` is a warning (ingest is pushed back while queries still
+/// serve, ADR-0043), and any other value is a failure shown verbatim.
+fn check_badge(key: &str, result: &str) -> (Tone, String) {
+    match (key, result) {
+        (_, "ok") => (Tone::Success, "Healthy".to_owned()),
+        ("ingest_capacity", "refusing") => (Tone::Warn, "Refusing".to_owned()),
+        _ => (Tone::Danger, result.to_owned()),
+    }
 }
 
 /// The checks card's title.
@@ -132,7 +144,8 @@ pub fn HealthPage() -> impl IntoView {
                                 // check the daemon has not shipped would
                                 // be a guess dressed as a fact.
                                 let friendly = check_name(&key);
-                                let ok = result == "ok";
+                                let (tone, label) = check_badge(&key, &result);
+                                let failed = tone == Tone::Danger;
                                 view! {
                                     <div class="health-check">
                                         <dt>
@@ -143,10 +156,8 @@ pub fn HealthPage() -> impl IntoView {
                                                 <span class="mono health-check-key">{key.clone()}</span>
                                             })}
                                         </dt>
-                                        <dd class:health-check-error=!ok>
-                                            <Badge tone={if ok { Tone::Success } else { Tone::Danger }}>
-                                                {if ok { "Healthy".to_owned() } else { result.clone() }}
-                                            </Badge>
+                                        <dd class:health-check-error=failed>
+                                            <Badge tone=tone>{label}</Badge>
                                         </dd>
                                     </div>
                                 }

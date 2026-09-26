@@ -158,14 +158,21 @@ path = "~/.trawl/data"
 # event_bus_capacity = 4096
 
 # Maximum number of events held in the hot buffer across all batches.
-# Oldest batches are evicted when exceeded. Increase for longer hot
-# buffer retention; decrease to reduce memory usage.
+# Each write reserves space before it reaches the WAL, and a write that
+# does not fit is refused: HTTP answers 503 hot_buffer_full, syslog
+# holds its batch and stalls TCP senders. Admitted events stay until
+# compaction drains them. HTTP and syslog may fill 15/16 of this cap;
+# the rest is kept for trawld's own telemetry. One HTTP request larger
+# than 15/16 of the cap answers 413 ingest_batch_too_large. Increase
+# for bursty workloads or a long compaction interval; decrease to
+# reduce memory usage.
 # hot_buffer_max_events = 100000
 
 # Maximum estimated memory usage for the hot buffer (default: 100M).
 # This is the serialized ndjson byte count; actual in-memory usage is
-# ~3-5x larger due to Map<String, Value> overhead. Increase for bursty
-# workloads; decrease on memory-constrained hosts.
+# ~3-5x larger due to Map<String, Value> overhead. Admission counts it
+# the same way as hot_buffer_max_events: a write must fit both caps,
+# and HTTP and syslog may fill 15/16 of each.
 # hot_buffer_max_bytes = "100M"
 
 # How often server stats (pool utilization, SSE connections, hot buffer

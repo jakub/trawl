@@ -1500,6 +1500,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"strong status-label\"",
     },
     Contract {
+        assignment: "statusIngestRefusing: '.statusbar .grp.ingest-refusing',",
+        source_path: "src/components/status_bar.rs",
+        source: STATUS_BAR_RS,
+        hook: "class=\"grp ingest-refusing\"",
+    },
+    Contract {
         assignment: "footerCount: '.statusbar .grp.count',",
         source_path: "src/components/status_bar.rs",
         source: STATUS_BAR_RS,
@@ -2313,6 +2319,10 @@ fn every_fixture_check_key_has_a_friendly_name() {
         (
             "health-unavailable.json",
             include_str!("../e2e/harness/wire/health-unavailable.json"),
+        ),
+        (
+            "health-ingest-refusing.json",
+            include_str!("../e2e/harness/wire/health-ingest-refusing.json"),
         ),
     ] {
         let report: trawl_api::HealthResponse = serde_json::from_str(json)

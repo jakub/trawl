@@ -227,6 +227,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     metrics_process::Collector::default().describe();
     trawl_server::metrics::describe_metrics();
     trawl_server::metrics::init_operational_alert_metrics();
+    trawl_server::metrics::set_compaction_interval_secs(config.ingest.compaction_interval_secs);
     // Publish the salvage profiles' rejection matrix at zero. "Telemetry
     // is rejection-free by construction" is evidenced by an absent
     // increment on a present series; an absent series would leave a scrape
@@ -416,6 +417,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             &config.syslog,
             door,
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
+            std::time::Duration::from_secs(config.ingest.compaction_interval_secs),
             state.ingest.syslog_stats.clone(),
             shutdown_rx,
         )

@@ -851,3 +851,91 @@ test('the connected label keeps the host alone when health fails', async ({ page
   await expect(label).toHaveAttribute('data-health', 'error');
   await expect(label).toHaveText(`Connected (${host})`);
 });
+
+test('ingest refusal shows an amber chip and keeps the session connected', async ({ page, request }) => {
+  await setup(request, 'health-ingest-refusing');
+  await page.goto('/search');
+  const host = new URL(page.url()).host;
+  const chip = page.locator(SEL.statusIngestRefusing);
+  await expect(chip).toBeVisible();
+  await expect(chip).toHaveText('Ingest refusing');
+  // Back-pressure is not an outage: the label keeps its connected
+  // semantics, and nothing signs the session out or reports it broken.
+  const label = page.locator(SEL.statusLabel);
+  await expect(label).toHaveText(`Connected (${host} vhealth-fixture-163)`);
+  await expect(label).toHaveAttribute('data-health', 'ok');
+  await expect(page.locator('.auth-notice')).toHaveCount(0);
+  await expect(page).toHaveURL(/\/search/);
+
+  await page.goto('/settings/health');
+  const health = page.locator(SEL.healthSection);
+  await expect(health.getByRole('heading')).toHaveText('Server is degraded');
+  const capacity = health.locator(SEL.healthCheck).filter({ hasText: 'Ingest capacity' });
+  await expect(capacity.locator('.health-check-key')).toHaveText('ingest_capacity');
+  const badge = capacity.locator('dd .bdg');
+  await expect(badge).toHaveText('Refusing');
+  await expect(badge).toHaveClass(/\bwarn\b/);
+  // A warning, not a failure: the row is not painted as an error.
+  await expect(capacity.locator('dd')).not.toHaveClass(/health-check-error/);
+  await expect(
+    health.getByText('Overall state', { exact: true }).locator('xpath=ancestor::div[1]').locator('dd'),
+  ).toHaveText('Degraded');
+  await expect(chip).toBeVisible();
+  await expect(page.locator(SEL.statusLabel)).toHaveText(`Connected (${host} vhealth-fixture-163)`);
+});
+
+test('the footer re-reads health every 30 s, one read at a time, and the chip clears', async ({ page, request }) => {
+  await setup(request, 'health-ingest-refusing');
+  await page.clock.install();
+  let reads = 0;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let release!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/api/v1/health', async route => {
+    const read = ++reads;
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    try {
+      const response = await route.fetch();
+      if (read === 1) {
+        await route.fulfill({ response });
+        return;
+      }
+      // Later reads: compaction freed space, so admission reopened.
+      if (read === 2) await held;
+      const body = await response.json();
+      body.status = 'ok';
+      body.checks.ingest_capacity = 'ok';
+      await route.fulfill({ response, json: body });
+    } finally {
+      inFlight -= 1;
+    }
+  });
+  try {
+    await page.goto('/search');
+    const chip = page.locator(SEL.statusIngestRefusing);
+    await expect(chip).toBeVisible();
+    expect(reads).toBe(1);
+
+    // The next read starts 30 s after the first settled, and is held.
+    await page.clock.fastForward(30_000);
+    await expect.poll(() => reads).toBe(2);
+    // While it is held, no timer may start a second request beside it.
+    await page.clock.fastForward(90_000);
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(reads).toBe(2);
+    await expect(chip).toBeVisible();
+
+    release();
+    await expect(chip).toHaveCount(0);
+    await expect(page.locator(SEL.statusLabel)).toHaveAttribute('data-health', 'ok');
+
+    await page.clock.fastForward(30_000);
+    await expect.poll(() => reads).toBe(3);
+    await expect(chip).toHaveCount(0);
+    expect(maxInFlight).toBe(1);
+  } finally {
+    release();
+  }
+});
