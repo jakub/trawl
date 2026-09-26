@@ -11,12 +11,22 @@ Whatever emits events into ingest: vector, a syslog device, trawld observing its
 _Avoid_: user, client, producer (that names the entry point, not the emitter)
 
 **Operator**:
-The human administering the install — the only actor who can repin, force a lossy change, or grant permissions.
+The human administering the installation — the only actor who can repin, force a lossy change, or grant permissions.
 _Avoid_: admin, user
 
 **Client**:
 Software consuming the API with a key: the CLI, TUI, web UI, or trawl-client. Rate limits and permissions attach to the client's key.
 _Avoid_: user, consumer
+
+### Installations
+
+**Installation**:
+One running trawl: its app-state database, its data directory, and the Fleet keystore it trusts. Nets, tables, and the automation key belong to it, and an operator administers it.
+_Avoid_: instance, deployment, server (when the whole is meant)
+
+**Trial**:
+A disposable installation that one person's CLI creates, owns, and deletes on one machine, reachable only through loopback. A trial is never promoted. A durable installation always starts fresh.
+_Avoid_: demo, sandbox, quickstart, dev stack (that is fleet-dev's)
 
 ### Ingest
 
@@ -33,7 +43,7 @@ The entry point an event arrived through: http, syslog, or trawld (self-telemetr
 _Avoid_: source, door, listener
 
 **Profile**:
-The fixed canonicalization behavior of one producer: what identity it asserts and which sources it reads first. One profile per producer.
+The fixed canonicalization behavior of one producer: what identity it asserts and which sources it reads first. One profile per producer. Unrelated to the CLI's `--profile` connection settings.
 _Avoid_: mode, pipeline config
 
 **Canonicalization**:
