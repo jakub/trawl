@@ -418,9 +418,18 @@ pub enum SampleAction {
     /// Nothing to post. When the state was `NotRequested` and samples were
     /// not requested, `up` records `Skipped`.
     Skip,
-    /// The sample services hold events `up` cannot account for. Posting
-    /// could duplicate them, so `up` stops with recovery text.
-    Refuse {
+    /// An earlier `up` recorded `Intent`, and the sample services do not
+    /// hold exactly the expected counts, so that post's result is unknown.
+    /// Posting again could duplicate it, so `up` stops with recovery text.
+    RefuseUnknownPost {
+        /// Observed events per sample service, zeros included.
+        observed: BTreeMap<String, u64>,
+        /// The counts the recorded intent expects.
+        expected: BTreeMap<String, u64>,
+    },
+    /// No post is recorded, and the sample services already hold events.
+    /// Posting could duplicate them, so `up` stops with recovery text.
+    RefuseUnaccounted {
         /// Observed events per sample service, zeros included.
         observed: BTreeMap<String, u64>,
     },
@@ -458,7 +467,10 @@ pub fn decide_samples(
             if exact {
                 SampleAction::MarkComplete
             } else if requested {
-                SampleAction::Refuse { observed }
+                SampleAction::RefuseUnknownPost {
+                    observed,
+                    expected: expected.clone(),
+                }
             } else {
                 SampleAction::Skip
             }
@@ -469,7 +481,7 @@ pub fn decide_samples(
             } else if observed.values().all(|count| *count == 0) {
                 SampleAction::Post
             } else {
-                SampleAction::Refuse { observed }
+                SampleAction::RefuseUnaccounted { observed }
             }
         }
     }
@@ -807,8 +819,15 @@ mod tests {
     }
 
     fn refuse(observed: &Counts) -> SampleAction {
-        SampleAction::Refuse {
+        SampleAction::RefuseUnaccounted {
             observed: sample_counts(observed),
+        }
+    }
+
+    fn unknown_post(observed: &Counts) -> SampleAction {
+        SampleAction::RefuseUnknownPost {
+            observed: sample_counts(observed),
+            expected: expected_owned(),
         }
     }
 
@@ -871,10 +890,34 @@ mod tests {
                 expected,
                 MarkComplete,
             ),
-            ("nothing landed", intent, true, none.clone(), refuse(&none)),
-            ("telemetry only", intent, true, telemetry(), refuse(&none)),
-            ("partial", intent, true, partial.clone(), refuse(&partial)),
-            ("doubled", intent, true, doubled.clone(), refuse(&doubled)),
+            (
+                "nothing landed",
+                intent,
+                true,
+                none.clone(),
+                unknown_post(&none),
+            ),
+            (
+                "telemetry only",
+                intent,
+                true,
+                telemetry(),
+                unknown_post(&none),
+            ),
+            (
+                "partial",
+                intent,
+                true,
+                partial.clone(),
+                unknown_post(&partial),
+            ),
+            (
+                "doubled",
+                intent,
+                true,
+                doubled.clone(),
+                unknown_post(&doubled),
+            ),
             ("partial, not requested", intent, false, partial, Skip),
             ("nothing, not requested", intent, false, none, Skip),
         ]);
@@ -913,7 +956,7 @@ mod tests {
     #[test]
     fn a_refusal_reports_only_sample_services() {
         let observed = BTreeMap::from([("web".to_owned(), 3), ("trawld".to_owned(), 9)]);
-        let SampleAction::Refuse { observed } =
+        let SampleAction::RefuseUnaccounted { observed } =
             decide_samples(&Samples::NotRequested, true, &observed)
         else {
             panic!("a non-empty sample service refuses");
