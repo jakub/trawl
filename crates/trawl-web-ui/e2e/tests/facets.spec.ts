@@ -15,9 +15,15 @@
 // with an opaque background, which is what keeps a long value from
 // reading through the two glyphs. The last test is that geometry, since
 // nothing else in the suite would notice it going.
+//
+// The rail's own <summary> is a keyboard control too (issue #231,
+// ADR-0044): Enter and Space open and close the wide rail, a rail that
+// closes under the reader's focus hands it to the summary, and a closed
+// rail is that one tab stop between the skip links and the console.
 
 import fs from 'node:fs';
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
+import { expectRail, holdNextQuery, watchToggles } from '../filter-rail';
 import { SEL, COPY, nameFrom } from '../selectors';
 import { expectFocusRing } from '../a11y';
 
@@ -29,6 +35,13 @@ const presentation = JSON.parse(
   fs.readFileSync('harness/wire/query-field-presentation.json', 'utf8'),
 );
 const PRESENTATION_URL = '/search?q=service%3Dapi&page=0';
+
+// `| stats count() by status`: `corpus` answers it with
+// `wire/query-stats-by.json`, five groups.
+const AGG_URL = '/search?q=' + encodeURIComponent(`service=${CORPUS.service} | stats count() by status`);
+const AGG_GROUPS = 5;
+/** `host="web-01"`, one filter in the link's versioned payload. */
+const FILTER = 'v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0';
 
 type Loc = import('@playwright/test').Locator;
 type Pg = import('@playwright/test').Page;
@@ -226,11 +239,16 @@ test('clear all removes every filter', async ({ page, request }) => {
   const clear = page.locator(SEL.facetClear);
   await expect(clear).toHaveJSProperty('tagName', 'BUTTON');
   await expect(clear).toHaveAttribute('type', 'button');
-  // Reached BACKWARDS from the rail's filter box. The control is the
-  // first focusable in the rail, so its predecessor is page chrome; the
-  // filter box is the neighbour that names something.
+  // Reached BACKWARDS from the rail's filter box. The rail's tab order
+  // is its <summary>, then this control, then the filter box, so one
+  // step back from the box is Clear all and one more is the summary,
+  // whose predecessor is page chrome.
   await page.locator(SEL.facetFilterInput).focus();
   await page.keyboard.press('Shift+Tab');
+  await expectFocusRing(clear);
+  await page.keyboard.press('Shift+Tab');
+  await expectFocusRing(page.locator(SEL.filterRailSummary));
+  await page.keyboard.press('Tab');
   await expectFocusRing(clear);
 
   await page.keyboard.press('Enter');
@@ -253,6 +271,133 @@ test('clear all removes every filter', async ({ page, request }) => {
   await expect(page.locator(SEL.filterChip)).toHaveCount(0);
   await expect(page).not.toHaveURL(/[?&]f=/);
 });
+
+test('Enter and Space on the rail summary open and close the rail', async ({ page, request }) => {
+  await openCorpusSearch(page, request);
+  await expectRail(page, true);
+  const toggles = await watchToggles(page);
+  const summary = page.locator(SEL.filterRailSummary);
+  await summary.focus();
+
+  // Each key, each way. One toggle per press: the press cancels the
+  // native toggle and records the choice, so a key the browser turns
+  // into a click must not move the rail twice.
+  let pressed = 0;
+  for (const key of ['Enter', ' ']) {
+    await page.keyboard.press(key);
+    await expectRail(page, false);
+    await page.keyboard.press(key);
+    await expectRail(page, true);
+    pressed += 2;
+    expect(await toggles()).toBe(pressed);
+  }
+  await expectFocusRing(summary);
+});
+
+test('an aggregation that closes the rail moves focus from a group header to the summary', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  // The aggregation first, so Back can run it again from the countable
+  // search without anything taking focus from the rail.
+  await page.goto(AGG_URL);
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await page.locator(SEL.cmContent).fill(`service=${CORPUS.service}`);
+  await page.locator(SEL.runButton).click();
+  await expect(page.locator(SEL.facetGroup).first()).toBeVisible();
+  await expectRail(page, true);
+
+  const header = page.locator(SEL.facetGroup).first().locator(SEL.facetGroupHeader);
+  await header.focus();
+  await page.goBack();
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  // The header went with the groups; the rail's one control is left.
+  await expect(page.locator(SEL.filterRailSummary)).toBeFocused();
+});
+
+// Clear all outlives the groups while a filter is set, so here it is the
+// closed rail's inert content, not an unmount, that takes focus away.
+test('an aggregation that closes the rail moves focus from Clear all to the summary', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(`${AGG_URL}&f=${FILTER}`);
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await page.locator(SEL.cmContent).fill(`service=${CORPUS.service}`);
+  await page.locator(SEL.runButton).click();
+  await expect(page.locator(SEL.facetGroup).first()).toBeVisible();
+  await expectRail(page, true);
+
+  await page.locator(SEL.facetClear).focus();
+  await page.goBack();
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await expect(page.locator(SEL.filterRailContent)).toHaveAttribute('inert', '');
+  await expect(page.locator(SEL.filterRailSummary)).toBeFocused();
+});
+
+// Focus the query drops to `body` stays the rail's until the reader goes
+// elsewhere, and a press elsewhere counts even where it focuses nothing.
+// The top bar's page title is such a place: it takes no focus and sits
+// outside `<main>`, so the press leaves `body` active, exactly as the
+// unmount did. A press in the results focuses the results region or
+// `<main>`, and a rail that closes then leaves that focus alone anyway.
+test('an aggregation that closes the rail leaves focus alone after a press outside the rail', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(AGG_URL);
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await page.locator(SEL.cmContent).fill(`service=${CORPUS.service}`);
+  await page.locator(SEL.runButton).click();
+  await expect(page.locator(SEL.facetGroup).first()).toBeVisible();
+  await expectRail(page, true);
+
+  const bodyActive = () => page.evaluate(() => document.activeElement === document.body);
+  await page.locator(SEL.facetGroup).first().locator(SEL.facetGroupHeader).focus();
+  const held = await holdNextQuery(page);
+  await page.goBack();
+  await held.arrived;
+  await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
+  expect(await bodyActive()).toBe(true);
+  await page.locator(SEL.topbarCrumb).click();
+  expect(await bodyActive()).toBe(true);
+
+  held.release();
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await expect(page.locator(SEL.filterRailSummary)).not.toBeFocused();
+  expect(await bodyActive()).toBe(true);
+});
+
+// A closed rail's own controls are out of the tab order, whatever it
+// holds: on an idle page it holds nothing, and on an aggregation carrying
+// a filter it holds a Clear all.
+for (const [name, url] of [
+  ['idle', '/search'],
+  ['an aggregation carrying a filter', `${AGG_URL}&f=${FILTER}`],
+] as const) {
+  test(`a collapsed rail is one tab stop between the skip links and the console: ${name}`, async ({ page, request }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await resetScenario(request, 'corpus');
+    await page.goto(url);
+    await expect(page.locator(SEL.cmContent)).toBeVisible();
+    await expectRail(page, false);
+    // By keyboard from the top of the page, as a reader arrives: the
+    // shell's skip link into the main content, then the page's two.
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('link', { name: 'Skip to main content', exact: true })).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#fleet-main-content')).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('link', { name: 'Skip to query editor', exact: true })).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(page.getByRole('link', { name: 'Skip to results', exact: true })).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expectFocusRing(page.locator(SEL.filterRailSummary));
+    // The console's first control is the query editor.
+    await page.keyboard.press('Tab');
+    await expect(page.locator(SEL.cmContent)).toBeFocused();
+  });
+}
 
 /** The fields the rail has a group for, read from each header's name. */
 async function railFields(page: Pg): Promise<string[]> {

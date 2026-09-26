@@ -2307,11 +2307,58 @@
   .agg-split .cat-chart { order: 0; border-top: 0; }
 }
 
-/* The sidebar remains one mounted disclosure so field search and group
- * expansion survive viewport changes. Match the media query in FacetSidebar. */
-.facet-panel { width: var(--facets-w); flex-shrink: 0; min-height: 0; }
-.facet-panel > summary { display: none; }
-.facet-panel > .facets { width: 100%; height: 100%; }
+/* The filter rail remains one mounted disclosure so field search and group
+ * expansion survive viewport changes. Match the media query in FacetSidebar.
+ *
+ * Wide, the rail opens for a countable page and closes to a strip at full
+ * sheet height (ADR-0044). The width changes in the same frame as the
+ * results table and is never animated. The strip width is this app's
+ * value; fleet-ui owns only the open width, --facets-w.
+ *
+ * A grid, so the aside can fill the rows under the header: the content
+ * slot is a stretched grid item, which gives its child a definite height
+ * to resolve `height: 100%` against. The slot itself (::details-content)
+ * keeps its native styles, which are what take a closed rail's controls
+ * out of the tab order. FacetSidebar also marks a closed wide rail's
+ * content `inert`, so find-in-page cannot open the rail to show a match. */
+.facet-panel {
+  --facet-strip-w: 32px;
+  --facet-head-h: 36px;
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: var(--facet-head-h) minmax(0, 1fr);
+  width: var(--facets-w);
+  flex-shrink: 0;
+  min-height: 0;
+  background: var(--bg);
+  border-right: 1px solid var(--line);
+}
+.facet-panel:not([open]) { width: var(--facet-strip-w); grid-template-rows: minmax(0, 1fr); }
+/* Open, the summary is the rail's header row; closed, it is the strip. */
+.facet-panel > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0 12px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  font-weight: 600;
+  color: var(--ink-2);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.facet-panel > summary:hover { background: var(--panel-2); }
+.facet-panel:not([open]) > summary { writing-mode: vertical-rl; padding: 12px 0; }
+.facet-panel .facet-chev { display: inline-flex; color: var(--ink-3); transform: rotate(90deg); }
+.facet-panel:not([open]) .facet-chev { transform: rotate(-90deg); }
+.facet-panel .facet-count { color: var(--ink-3); font-weight: 400; }
+.facet-panel .facet-count:not(:empty)::before { content: "· "; }
+.facet-panel > .facets { width: 100%; height: 100%; border-right: 0; }
+/* Clear all sits beside the header row. Positioned against the panel, so
+ * it stays put while the aside under it scrolls. */
+.facet-panel .facets .phead { position: absolute; top: 0; right: 12px; height: var(--facet-head-h); padding: 0; }
 .page, .health-page { min-width: 0; }
 .page-hd, .page-hd .actions, .health-heading { flex-wrap: wrap; }
 .page-hd > *, .health-heading > * { min-width: 0; max-width: 100%; }
@@ -2323,10 +2370,20 @@
  * never disagree by a pixel. */
 @media (max-width: 899.98px) {
   .search-layout { flex-direction: column; overflow-y: auto; }
-  .facet-panel { width: auto; border-bottom: 1px solid var(--line); background: var(--panel); }
-  .facet-panel > summary { display: list-item; padding: 10px 12px; font-size: var(--fs-ui); font-weight: 500; color: var(--ink-2); cursor: pointer; }
+  /* The disclosure above the results. The `:not([open])` resets match the
+   * strip's own specificity, or the strip would win here. */
+  .facet-panel, .facet-panel:not([open]) { display: block; width: auto; border-right: 0; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .facet-panel > summary, .facet-panel:not([open]) > summary { display: list-item; writing-mode: horizontal-tb; padding: 10px 12px; font-size: var(--fs-ui); font-weight: 500; color: var(--ink-2); white-space: normal; cursor: pointer; }
+  .facet-panel > summary:hover { background: none; }
+  .facet-panel .facet-chev { display: none; }
   .facet-panel .facet-count { color: var(--ink-3); font-weight: 400; margin-inline-start: 6px; }
+  .facet-panel .facet-count:not(:empty)::before { content: none; }
   .facet-panel > .facets { height: auto; max-height: min(45dvh, 360px); border-right: 0; }
+  /* Clear all keeps its narrow place, under the summary at the right.
+   * The summary already names the rail, so a header with no filters to
+   * clear holds nothing and takes no row. */
+  .facet-panel .facets .phead { position: static; height: auto; padding: 10px 12px 6px; justify-content: flex-end; }
+  .facet-panel .facets .phead:empty { display: none; }
   .search-col { flex-shrink: 0; min-height: 480px; }
   .statusbar { height: auto; min-height: var(--statusbar-h); flex-wrap: wrap; gap: 4px 10px; padding-block: 4px; }
   .statusbar > .grp + .grp { border-inline-start: 0; padding-inline-start: 4px; }

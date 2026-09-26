@@ -22,6 +22,9 @@
 //!
 //! The snapshot page and the live ring both reach this module through
 //! [`compute_facets`], so the two lanes cannot disagree about eligibility.
+//! [`rail_page`] wraps it with the capability gate: its answer is both
+//! the groups the rail renders and whether the page is countable, which
+//! opens or closes the wide rail (ADR-0044).
 //!
 //! Only the wasm32 build consumes these helpers — on native they exist
 //! purely so their tests run under plain `cargo test`. Matches the
@@ -75,6 +78,78 @@ pub fn is_aggregation_shape(query: &str) -> bool {
         return false;
     }
     trawl_core::parser::parse(query).is_ok_and(|ast| ast.has_aggregation())
+}
+
+/// What the filter rail has to show for one settled answer (ADR-0044).
+///
+/// A countable page opens the wide rail and every other answer closes
+/// it, until the reader opens or closes the rail by hand. An open rail
+/// on a page that is not countable shows [`RailPage::hint`] in place of
+/// the value search and the groups.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RailPage {
+    /// At least one field the rail may count; the groups, before the value search.
+    Countable(Vec<FieldFacet>),
+    /// Rows the rail may not count, or none at all: an empty page, a
+    /// page of reserved or one-off time columns, a source whose fields
+    /// the pipeline may have rewritten. The page's caller also settles a
+    /// failed query and a malformed link here.
+    NothingToCount,
+    /// An aggregation-shaped result (see [`is_aggregation_shape`]).
+    Aggregate,
+}
+
+impl RailPage {
+    /// Whether this page opens the wide rail in automatic mode.
+    #[must_use]
+    pub fn is_countable(&self) -> bool {
+        matches!(self, Self::Countable(_))
+    }
+
+    /// The line an open rail shows when it has nothing to count, verbatim
+    /// from ADR-0044; `None` for a countable page, which shows its groups.
+    #[must_use]
+    pub fn hint(&self) -> Option<&'static str> {
+        match self {
+            Self::Countable(_) => None,
+            Self::NothingToCount => Some("No field values to count."),
+            Self::Aggregate => Some("Field values are not counted for an aggregate result."),
+        }
+    }
+}
+
+/// Decide what the filter rail shows for one answer.
+///
+/// `query` is the query that PRODUCED `result` — the response's own
+/// effective query for a snapshot, the stream's effective query in
+/// live — never the editor's draft.
+///
+/// The aggregation shape is read first, because `top`, `rare` and
+/// `pivot` reach [`Capabilities`] as sources it cannot vouch for, and
+/// the reader should hear that the result is an aggregate, not that it
+/// has nothing to count. Otherwise the groups are [`compute_facets`]'s,
+/// less every field the pipeline may have rewritten; that list is what
+/// the rail renders, so one answer is counted once.
+///
+/// [`Capabilities`]: crate::result_actions::Capabilities
+#[must_use]
+pub fn rail_page(query: &str, result: &QueryResult) -> RailPage {
+    if is_aggregation_shape(query) {
+        return RailPage::Aggregate;
+    }
+    let provenance = crate::result_actions::Capabilities::for_query(query);
+    if !provenance.raw_facets() {
+        return RailPage::NothingToCount;
+    }
+    let groups: Vec<FieldFacet> = compute_facets(result)
+        .into_iter()
+        .filter(|(field, _)| provenance.input_field(field))
+        .collect();
+    if groups.is_empty() {
+        RailPage::NothingToCount
+    } else {
+        RailPage::Countable(groups)
+    }
 }
 
 /// Whether every non-null cell of the column is a distinct timestamp
@@ -493,6 +568,149 @@ mod tests {
         assert_eq!(fields(&facets), vec!["timestamp"]);
         assert_eq!(facets[0].1.len(), FACET_TOP_N);
         assert_eq!(facets[0].1[0], ("2026-01-01T00:00:10Z".into(), 2));
+    }
+
+    /// Every settled answer the rail can be shown, and what it makes of
+    /// each: the one decision behind the wide rail's automatic open and
+    /// close (ADR-0044). `Countable` rows name the groups the rail
+    /// renders, in order.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one table, one row per case
+    fn rail_page_classifies_each_answer() {
+        enum Want {
+            Countable(&'static [&'static str]),
+            NothingToCount,
+            Aggregate,
+        }
+        let t = |i: usize| s(&format!("2026-01-01T00:00:{i:02}Z"));
+        let cases: Vec<(&str, &str, QueryResult, Want)> = vec![
+            (
+                "empty result",
+                "*",
+                QueryResult::empty(),
+                Want::NothingToCount,
+            ),
+            (
+                "eligible groups",
+                "*",
+                QueryResult {
+                    columns: vec![col("_time"), col("host"), col("level")],
+                    rows: vec![
+                        vec![t(0), s("web-1"), s("info")],
+                        vec![t(1), s("web-2"), s("info")],
+                    ],
+                },
+                Want::Countable(&["host", "level"]),
+            ),
+            (
+                "reserved-only columns",
+                "*",
+                QueryResult {
+                    columns: vec![col("_time"), col("_ingested"), col("_raw")],
+                    rows: vec![vec![t(0), t(1), s("a")], vec![t(0), t(1), s("a")]],
+                },
+                Want::NothingToCount,
+            ),
+            (
+                "one-off-time column",
+                "*",
+                QueryResult {
+                    columns: vec![col("_time"), col("timestamp")],
+                    rows: vec![vec![t(0), t(1)], vec![t(2), t(3)]],
+                },
+                Want::NothingToCount,
+            ),
+            (
+                "field excluded by input_field",
+                "* | let host = lower(host)",
+                QueryResult {
+                    columns: vec![col("host")],
+                    rows: vec![vec![s("web-1")], vec![s("web-1")]],
+                },
+                Want::NothingToCount,
+            ),
+            (
+                "input_field keeps the unchanged fields",
+                "* | let host = lower(host)",
+                QueryResult {
+                    columns: vec![col("host"), col("level")],
+                    rows: vec![vec![s("web-1"), s("info")], vec![s("web-1"), s("warn")]],
+                },
+                Want::Countable(&["level"]),
+            ),
+            (
+                "aggregation",
+                "* | stats count() by service",
+                QueryResult {
+                    columns: vec![col("service"), col("count")],
+                    rows: vec![
+                        vec![s("nginx"), Value::Integer(2)],
+                        vec![s("api"), Value::Integer(2)],
+                    ],
+                },
+                Want::Aggregate,
+            ),
+            (
+                "aggregation with no rows",
+                "* | stats count() by service",
+                QueryResult::empty(),
+                Want::Aggregate,
+            ),
+            (
+                "top is an aggregation",
+                "* | top 10 host",
+                QueryResult {
+                    columns: vec![col("host"), col("count")],
+                    rows: vec![vec![s("web-1"), Value::Integer(3)]],
+                },
+                Want::Aggregate,
+            ),
+            (
+                "unknown stage",
+                "* | extract kv",
+                QueryResult {
+                    columns: vec![col("host")],
+                    rows: vec![vec![s("web-1")], vec![s("web-2")]],
+                },
+                Want::NothingToCount,
+            ),
+        ];
+        for (name, query, result, want) in cases {
+            assert!(trawl_core::parser::parse(query).is_ok(), "{name}: {query}");
+            let page = rail_page(query, &result);
+            match want {
+                Want::Countable(names) => {
+                    let RailPage::Countable(groups) = &page else {
+                        panic!("{name}: {page:?}");
+                    };
+                    assert_eq!(fields(groups), names, "{name}");
+                    assert!(page.is_countable(), "{name}");
+                }
+                Want::NothingToCount => {
+                    assert_eq!(page, RailPage::NothingToCount, "{name}");
+                    assert!(!page.is_countable(), "{name}");
+                }
+                Want::Aggregate => {
+                    assert_eq!(page, RailPage::Aggregate, "{name}");
+                    assert!(!page.is_countable(), "{name}");
+                }
+            }
+        }
+    }
+
+    /// The two hints are the ADR's copy, verbatim; a countable page
+    /// shows its groups instead.
+    #[test]
+    fn rail_page_hint_copy() {
+        assert_eq!(RailPage::Countable(Vec::new()).hint(), None);
+        assert_eq!(
+            RailPage::NothingToCount.hint(),
+            Some("No field values to count.")
+        );
+        assert_eq!(
+            RailPage::Aggregate.hint(),
+            Some("Field values are not counted for an aggregate result.")
+        );
     }
 
     /// The live ring and the snapshot page decide the rail with one

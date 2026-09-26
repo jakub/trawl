@@ -335,8 +335,24 @@ export const SEL = {
   serviceTopField: '.topfields .tf button.fn',
 
   // -- facet rail -----------------------------------------------------
-  /// crates/trawl-web-ui/src/components/facet_sidebar.rs — one facet
-  /// group (a field and its values).
+  /// crates/trawl-web-ui/src/components/facet_sidebar.rs — the filter
+  /// rail itself, one `<details>` for both layouts. At 900px and wider
+  /// its `open` attribute follows the countable page until a hand
+  /// choice (ADR-0044); closed, it is the 32px strip.
+  filterRail: '.facet-panel',
+  /// Its `<summary>`: the closed strip and the open header row, and the
+  /// one control whose press is a hand choice.
+  filterRailSummary: '.facet-panel > summary',
+  /// Everything under the summary. `inert` while the wide rail is
+  /// closed, so the browser cannot open it to reveal a match; never
+  /// inert below 900px.
+  filterRailContent: '.facet-panel > .facets',
+  /// The summary's active count, `N active`; empty with no filters.
+  facetCount: '.facet-count',
+  /// The line an open rail shows in place of the value search and the
+  /// groups when the page has nothing to count.
+  facetHint: '.facets .facets-hint',
+  /// One facet group (a field and its values).
   facetGroup: '.facets .g',
   /// Its header, which collapses the group and carries aria-expanded.
   /// Group-relative, like every entry below it: a spec scopes these to
@@ -553,6 +569,11 @@ export const COPY = {
   /// tail comes from the server's own error envelope and is not pinned
   /// here).
   loadHintErrorPrefix: "Couldn't load results:",
+  /// crates/trawl-web-ui/src/facets.rs RailPage::hint — what an open
+  /// filter rail says in place of its groups: for a page with nothing
+  /// to count, and for an aggregate. ADR-0044's copy, verbatim.
+  railHintNothingToCount: 'No field values to count.',
+  railHintAggregate: 'Field values are not counted for an aggregate result.',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — app-supplied
   /// Real-time tab's "Live Tail" button text.
   liveTailButtonText: 'Live Tail',
