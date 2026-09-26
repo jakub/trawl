@@ -112,7 +112,6 @@ impl TrialPaths {
     }
 
     /// The ingest token: the token and one newline.
-    #[cfg_attr(not(test), expect(dead_code, reason = "up writes it"))]
     pub fn ingest_token_file(&self) -> PathBuf {
         self.dir.join("ingest.token")
     }
@@ -122,7 +121,6 @@ impl TrialPaths {
     /// Missing ancestors are created 0700 too, and only after the existing
     /// ones pass the ancestry rule, so nothing is created under a
     /// directory another user controls.
-    #[cfg_attr(not(test), expect(dead_code, reason = "up takes the lock under it"))]
     pub fn ensure_root(&self) -> Result<(), TrialError> {
         if !check_ancestry(&self.base)? {
             DirBuilder::new()
@@ -142,7 +140,6 @@ impl TrialPaths {
     }
 
     /// [`Self::ensure_root`], then the same for the trial directory.
-    #[cfg_attr(not(test), expect(dead_code, reason = "up writes the trial directory"))]
     pub fn ensure_dir(&self) -> Result<(), TrialError> {
         self.ensure_root()?;
         secure_dir(&self.dir)
@@ -327,7 +324,6 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// renamed over `path`, and the directory is fsynced. A reader sees the old
 /// file or the new one, never a partial write. A symlink at `path` is
 /// replaced, not followed. The caller verifies the directory first.
-#[cfg_attr(not(test), expect(dead_code, reason = "up writes state and tokens"))]
 pub fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), TrialError> {
     let dir = path
         .parent()

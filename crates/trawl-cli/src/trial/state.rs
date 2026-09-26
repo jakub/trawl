@@ -158,10 +158,6 @@ pub enum Samples {
     },
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "up writes the state; -p trial only reads it")
-)]
 impl TrialState {
     /// Replace `path` with this state, atomically, at 0600.
     pub fn save(&self, path: &Path) -> Result<(), TrialError> {
@@ -202,12 +198,10 @@ impl TrialState {
 
 /// The one field `down` needs from a state file of any schema.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[cfg_attr(not(test), expect(dead_code, reason = "down reads it"))]
 pub struct DownView {
     pub trial_id: String,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "down reads it"))]
 impl DownView {
     /// Read `trial_id` from `path`, ignoring every other field:
     /// `Ok(None)` when there is no state file.

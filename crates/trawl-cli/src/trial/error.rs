@@ -13,9 +13,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrialError {
-    #[error("`trawl trial {verb}` is not implemented in this build yet")]
-    NotImplemented { verb: &'static str },
-
     #[error(
         "cannot place the trial state: XDG_STATE_HOME is unset, empty, or relative, \
          and HOME is not an absolute path"
@@ -83,6 +80,129 @@ pub enum TrialError {
         dir.display()
     )]
     TrialNotReady { dir: PathBuf, missing: &'static str },
+
+    #[error("no trial in {}. Start one with `trawl trial up`", dir.display())]
+    NotCreated { dir: PathBuf },
+
+    #[error(
+        "the trial in {} has no operator token yet. Finish it with `trawl trial up`",
+        dir.display()
+    )]
+    NoOperatorToken { dir: PathBuf },
+
+    #[error(
+        "Docker resources carry the trial's names or labels, but {} holds no trial \
+         state:\n{listing}\nAnother user or state directory made them, or this trial's \
+         state was deleted. trawl acts only on a trial it has state for: if they are \
+         leftovers, remove them yourself (docker rm, docker volume rm, docker network rm)",
+        dir.display()
+    )]
+    Orphaned { dir: PathBuf, listing: String },
+
+    #[error(
+        "port {port} on 127.0.0.1 is not free ({reason}). Stop what holds it, or \
+         choose another port with {flag}"
+    )]
+    PortTaken {
+        port: u16,
+        flag: &'static str,
+        reason: String,
+    },
+
+    #[error("--api-port and --web-port are both {port}; give them different ports")]
+    SamePort { port: u16 },
+
+    #[error(
+        "the trial was created with {flag} {recorded}, and {flag} is fixed when the trial \
+         is created. Omit {flag} to resume, or delete the trial with `trawl trial down` \
+         and create it again"
+    )]
+    FixedAtCreation {
+        flag: &'static str,
+        recorded: String,
+    },
+
+    #[error(
+        "the trial was created on Docker engine {recorded}, and this is engine {found}. \
+         A trial resumes only on its own engine: switch back to it, or delete the trial \
+         with `trawl trial down` on that engine"
+    )]
+    EngineChanged { recorded: String, found: String },
+
+    #[error(
+        "{reference} is now image {found}, but the trial recorded {recorded}. The trial \
+         resumes only on the images it was created with: restore that image, or delete \
+         the trial with `trawl trial down` and create it again"
+    )]
+    ImageChanged {
+        reference: String,
+        recorded: String,
+        found: String,
+    },
+
+    #[error(
+        "the trial's container {container} runs image {found}, not the recorded {recorded}. \
+         Delete the trial with `trawl trial down` and create it again"
+    )]
+    ContainerImageChanged {
+        container: String,
+        recorded: String,
+        found: String,
+    },
+
+    #[error(
+        "the image {reference} the trial recorded is no longer on this engine. Restore it, \
+         or delete the trial with `trawl trial down` and create it again"
+    )]
+    ImageGone { reference: String },
+
+    #[error("`docker image inspect {reference}` printed output trawl cannot read")]
+    ImageUnreadable { reference: String },
+
+    #[error(
+        "trial one-off containers are still running: {names}. They belong to an \
+         interrupted `trawl trial` command. Wait for them to finish, or stop them with \
+         `docker stop`, then run the command again"
+    )]
+    OneoffsRunning { names: String },
+
+    #[error("fleet-admin: {what}")]
+    Fleet { what: String },
+
+    #[error(transparent)]
+    KeysTable(#[from] super::keys::KeysTableError),
+
+    #[error("the trial certificate is not usable: {reason}")]
+    Certificate { reason: &'static str },
+
+    #[error("the trial API at {url} did not answer: {source}")]
+    Api {
+        url: String,
+        source: trawl_client::ClientError,
+    },
+
+    #[error("the {key} key is not what the trial minted: {problem}")]
+    Identity { key: &'static str, problem: String },
+
+    #[error(
+        "{source}. If Docker reported a port in use, another program holds 127.0.0.1:{api} \
+         or 127.0.0.1:{web}: stop it, or delete the trial with `trawl trial down` and \
+         create it again with --api-port or --web-port"
+    )]
+    ServicesFailed {
+        source: super::docker::DockerError,
+        api: u16,
+        web: u16,
+    },
+
+    #[error(
+        "`trawl trial down` deletes only after confirmation, and stdin is not a terminal. \
+         Run `trawl trial down --yes` to delete without asking; nothing was deleted"
+    )]
+    ConfirmationRequired,
+
+    #[error("not deleted: the answer was not yes")]
+    Declined,
 
     #[error(transparent)]
     Preflight(#[from] super::preflight::PreflightError),

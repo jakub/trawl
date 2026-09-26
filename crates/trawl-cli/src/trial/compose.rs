@@ -78,6 +78,7 @@ pub const TRAWLD_TOML: &str = "/var/lib/trawl/trial/trawld.toml";
 /// Both database roles' passwords, 0400, owned by `trawl`.
 pub const PGPASS: &str = "/var/lib/trawl/trial/secrets/pgpass";
 /// Where `tls-init` publishes the certificate and key.
+#[cfg(test)]
 pub const TLS_DIR: &str = "/var/lib/trawl/trial/tls";
 pub const TLS_CERT: &str = "/var/lib/trawl/trial/tls/cert.pem";
 pub const TLS_KEY: &str = "/var/lib/trawl/trial/tls/key.pem";
@@ -103,6 +104,7 @@ pub enum Service {
 }
 
 impl Service {
+    #[cfg(test)]
     pub const ALL: [Self; 5] = [
         Self::Postgres,
         Self::Trawld,
