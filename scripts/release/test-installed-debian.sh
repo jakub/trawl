@@ -9,6 +9,12 @@ tooling="$(cd "$(dirname "$0")" && pwd)"
 printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
 chmod 755 /usr/sbin/policy-rc.d
 dpkg -i "$packages"/*.deb
+# No service manager runs here, but systemctl reads enablement offline. Both
+# units must install disabled; test-host-debian.sh checks the running state.
+for unit in trawld trawl-web; do
+  state="$(systemctl is-enabled "$unit" 2>&1 || true)"
+  [[ "$state" == disabled ]] || { echo "$unit.service is '$state' after install, expected 'disabled'" >&2; exit 1; }
+done
 python3 - "$packages" <<'PY'
 from pathlib import Path
 import subprocess, sys

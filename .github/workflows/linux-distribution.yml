@@ -329,3 +329,8 @@ jobs:
         run: |
           docker run --rm --network none --cap-add SYS_PTRACE -v "$PWD:/verify:ro" -w /verify \
             trawl-artifact-check bash scripts/release/test-installed-debian.sh debs
+      # The container above refuses every service start and runs no systemd,
+      # so it cannot show a unit is inactive. Hosted runners boot systemd:
+      # install on the runner itself and read the real unit states.
+      - name: Install the server package on a host running systemd
+        run: bash scripts/release/test-host-debian.sh debs

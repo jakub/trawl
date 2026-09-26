@@ -78,13 +78,20 @@ ownership and exact dependencies, exercises the CLI and daemon check mode,
 and tests file-capability loading with `AT_SECURE=1`. It removes the CLI and
 server independently before removing the runtime. It starts no database.
 
+Run `test-host-debian.sh PACKAGE_DIRECTORY` only on a disposable GitHub-hosted
+runner, where systemd is PID 1. It installs `trawl-runtime` and `trawl-server`
+on the host and asserts that `trawld` and `trawl-web` are `disabled` and
+`inactive`, and that the install prints the enable instruction. It then
+enables both units, reinstalls the server package through the upgrade path,
+asserts that both stay enabled and inactive, and purges the package.
+
 Fast helper tests:
 
 ```sh
 python3 scripts/release/test_distribution.py
 python3 scripts/release/test_cargo_runtime.py
 python3 scripts/release/test_release_source.py
-bash -n scripts/release/build-distribution.sh scripts/release/build-arm64.sh scripts/release/test-installed-debian.sh
+bash -n scripts/release/build-distribution.sh scripts/release/build-arm64.sh scripts/release/test-installed-debian.sh scripts/release/test-host-debian.sh
 ```
 
 These source-level tests do not replace the native Linux and macOS artifact

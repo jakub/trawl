@@ -320,4 +320,38 @@ if ! grep -Fq -- "$asset_dest" "$docs_page"; then
   fail "docs/src/content/docs/reference/crash-dumps.md does not mention '$asset_dest'"
 fi
 
-echo "debian crash-dump packaging assertions passed"
+# -- 10. both units install disabled and stopped ---------------------------
+#
+# The shipped trawld.toml holds CHANGE_ME database URLs, so a unit started at
+# install time can only fail and restart every RestartSec. cargo-deb turns
+# `enable = false, start = false` into a postinst that neither enables nor
+# starts on a fresh install, re-enables a unit the operator already enabled,
+# and try-restarts a running unit on upgrade. The verify job in
+# .github/workflows/linux-distribution.yml checks the installed result on a
+# host running systemd.
+
+units_block=$(awk '/^[[:space:]]*systemd-units[[:space:]]*=[[:space:]]*\[/{flag=1} flag{print} flag && /^[[:space:]]*\][[:space:]]*$/{exit}' "$cargo_toml")
+if [[ -z "$units_block" ]]; then
+  fail "crates/trawl-server/Cargo.toml has no [package.metadata.deb] systemd-units array"
+fi
+unit_entries=$(grep -c 'unit-name' <<<"$units_block" || true)
+if [[ "$unit_entries" -ne 2 ]]; then
+  fail "crates/trawl-server/Cargo.toml systemd-units declares $unit_entries units, expected exactly trawld and trawl-web"
+fi
+for unit in trawld trawl-web; do
+  entry=$(grep -E "unit-name[[:space:]]*=[[:space:]]*\"${unit}\"" <<<"$units_block" || true)
+  if [[ -z "$entry" ]]; then
+    fail "crates/trawl-server/Cargo.toml systemd-units does not declare '$unit'"
+  fi
+  if ! grep -Eq 'enable[[:space:]]*=[[:space:]]*false' <<<"$entry" || grep -Eq 'enable[[:space:]]*=[[:space:]]*true' <<<"$entry"; then
+    fail "crates/trawl-server/Cargo.toml systemd-units entry for '$unit' must say enable = false: a fresh install would enable a unit whose config still holds CHANGE_ME database URLs"
+  fi
+  if ! grep -Eq 'start[[:space:]]*=[[:space:]]*false' <<<"$entry" || grep -Eq 'start[[:space:]]*=[[:space:]]*true' <<<"$entry"; then
+    fail "crates/trawl-server/Cargo.toml systemd-units entry for '$unit' must say start = false: a fresh install would start a unit whose config still holds CHANGE_ME database URLs"
+  fi
+done
+if ! grep -Fq 'systemctl enable --now trawld trawl-web' "$postinst"; then
+  fail "crates/trawl-server/debian/postinst does not tell the operator to run 'systemctl enable --now trawld trawl-web' after setting the database URLs"
+fi
+
+echo "debian packaging assertions passed"
