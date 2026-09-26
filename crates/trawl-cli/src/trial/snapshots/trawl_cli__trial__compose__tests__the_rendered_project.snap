@@ -13,6 +13,9 @@ expression: text
   },
   "services": {
     "fleet-admin": {
+      "dns_search": [
+        "."
+      ],
       "entrypoint": [
         "fleet-admin"
       ],
@@ -41,6 +44,9 @@ expression: text
       ]
     },
     "postgres": {
+      "dns_search": [
+        "."
+      ],
       "environment": {
         "POSTGRES_PASSWORD_FILE": "/var/lib/postgresql/trial/superuser.password"
       },
@@ -75,6 +81,9 @@ expression: text
       ]
     },
     "tls-init": {
+      "dns_search": [
+        "."
+      ],
       "entrypoint": [
         "/bin/sh",
         "-c",
@@ -107,6 +116,9 @@ expression: text
           "condition": "service_healthy"
         }
       },
+      "dns_search": [
+        "."
+      ],
       "entrypoint": [
         "trawl-web"
       ],
@@ -153,6 +165,9 @@ expression: text
           "condition": "service_healthy"
         }
       },
+      "dns_search": [
+        "."
+      ],
       "environment": {
         "PGPASSFILE": "/var/lib/trawl/trial/secrets/pgpass"
       },
