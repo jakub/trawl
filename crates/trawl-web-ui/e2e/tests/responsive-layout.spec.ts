@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { test, expect, resetScenario } from '../fixtures';
+import { expectRail } from '../filter-rail';
 import { COPY, SEL } from '../selectors';
 import type { Locator, Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
@@ -19,6 +20,13 @@ async function insideViewport(locator: Locator) {
 }
 async function noPageOverflow(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(page.viewportSize()!.width);
+}
+/** Two frames and a task: a media query change the viewport caused has
+ * reached the app, and whatever it set off has run, so an assertion
+ * that something did NOT happen is not read too early. */
+async function settle(page: Page) {
+  await page.evaluate(() => new Promise<void>((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve)))));
 }
 
 for (const width of [320, 720, 900, 1024, 1440]) {
@@ -121,6 +129,28 @@ test('responsive filters preserve field search, expanded groups and URL filters 
   await expect(needle).toBeFocused();
   await expect(needle).toBeVisible();
   await noPageOverflow(page);
+});
+
+// Narrowing reopens the disclosure for focus in its content, above, so
+// the focused control is never hidden. The <summary> is the one part a
+// closed disclosure still shows, so focus there reopens nothing.
+test('responsive filters leave the narrow disclosure closed for focus on its summary', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto('/search?q=service%3Dnginx');
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
+  await expectRail(page, true);
+  const panel = page.locator(SEL.filterRail), summary = page.locator(SEL.filterRailSummary);
+  // A wide press closes the rail and leaves focus where it was.
+  await summary.press('Enter');
+  await expectRail(page, false);
+  await expect(summary).toBeFocused();
+  await page.setViewportSize({ width: 720, height: 900 });
+  // Narrow now: the summary is the disclosure's full-width row again.
+  await expect.poll(async () => (await summary.boundingBox())!.width).toBeGreaterThan(600);
+  await settle(page);
+  await expect(panel).not.toHaveAttribute('open');
+  await expect(summary).toBeFocused();
 });
 
 test('responsive page headers and labelled list scrolling keep controls and columns reachable', async ({ page, request }) => {

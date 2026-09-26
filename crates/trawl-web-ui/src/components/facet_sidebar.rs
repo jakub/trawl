@@ -99,11 +99,18 @@ pub fn FacetSidebar(
     let open = RwSignal::new(false);
     let panel = NodeRef::<leptos::html::Details>::new();
     let summary = NodeRef::<leptos::html::Summary>::new();
+    // Narrowing with focus in the rail's content opens the disclosure,
+    // so the focused control is not hidden inside a closed one. The
+    // `<summary>` is the part a closed disclosure still shows, so focus
+    // on it leaves the disclosure as it is.
     Effect::new(move |_| {
         if compact.get()
             && let Some(panel) = panel.get()
             && let Some(active) = document().active_element()
             && panel.contains(Some(&active))
+            && !summary
+                .get()
+                .is_some_and(|summary| summary.is_same_node(Some(&active)))
         {
             open.set(true);
         }
