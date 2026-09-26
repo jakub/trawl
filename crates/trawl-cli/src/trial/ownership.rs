@@ -313,7 +313,9 @@ pub fn classify(inventory: &Inventory, our_id: Option<&str>) -> Ownership {
 
 /// Our `compose run` containers that have not finished: a killed `up` can
 /// leave one running (a `keys create` that commits after the rerun lists
-/// keys), so `up`, `stop`, and `down` wait for these, then refuse.
+/// keys), so `up`, `stop`, and `down` wait for these, then refuse. A
+/// `created` one-off counts too: a Compose client killed after the engine
+/// accepted its create and start can leave one that starts late.
 pub fn unfinished_oneoffs<'a>(inventory: &'a Inventory, our_id: &str) -> Vec<&'a Resource> {
     inventory
         .resources
@@ -322,9 +324,15 @@ pub fn unfinished_oneoffs<'a>(inventory: &'a Inventory, our_id: &str) -> Vec<&'a
             r.kind == Kind::Container
                 && r.oneoff
                 && r.trial_id.as_deref() == Some(our_id)
-                && !matches!(r.state.as_str(), "created" | "exited" | "dead")
+                && !matches!(r.state.as_str(), "exited" | "dead")
         })
         .collect()
+}
+
+/// `docker container rm` of one container by id, without `--force`: the
+/// engine refuses a container that is running.
+pub fn oneoff_remove_args(id: &str) -> Args {
+    Args::new().args(["container", "rm", "--", id])
 }
 
 /// `docker container create` of the claim: never started, no ports, no
@@ -683,16 +691,44 @@ mod tests {
             ),
         ]
         .join("\n");
+        let containers = [
+            containers,
+            container(
+                "trawl-trial-fleet-admin-run-5",
+                PROJECT,
+                OURS,
+                "True",
+                "created",
+            ),
+            container(
+                "trawl-trial-fleet-admin-run-6",
+                PROJECT,
+                OURS,
+                "True",
+                "dead",
+            ),
+            container(
+                "trawl-trial-fleet-admin-run-7",
+                PROJECT,
+                THEIRS,
+                "True",
+                "created",
+            ),
+        ]
+        .join("\n");
         let inv = Inventory::from_listings(&containers, "", "").unwrap();
         let names: Vec<_> = unfinished_oneoffs(&inv, OURS)
             .iter()
             .map(|r| r.name.as_str())
             .collect();
+        // A `created` one-off may still start: a killed Compose client can
+        // leave the engine between its create and its start.
         assert_eq!(
             names,
             [
                 "trawl-trial-fleet-admin-run-1",
-                "trawl-trial-fleet-admin-run-3"
+                "trawl-trial-fleet-admin-run-3",
+                "trawl-trial-fleet-admin-run-5",
             ]
         );
     }
