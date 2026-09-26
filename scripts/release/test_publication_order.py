@@ -13,7 +13,7 @@ import unittest
 
 WORKFLOW = Path(__file__).resolve().parents[2] / '.github/workflows/release.yml'
 ANNOUNCEMENTS = ('release', 'publish-docs', 'publish-apt')
-FAILURES = ('build-chart', 'build-linux', 'build-macos', 'build-docs', 'docker', 'publish-helm')
+FAILURES = ('build-chart', 'build-linux', 'build-macos', 'build-docs', 'docker', 'publish-helm', 'anonymous-pull')
 
 
 def parse_workflow(path=WORKFLOW):
@@ -102,11 +102,12 @@ class PublicationOrder(unittest.TestCase):
         self.assertEqual(jobs['build-linux']['uses'], './.github/workflows/linux-distribution.yml')
         linux = parse_workflow(WORKFLOW.with_name('linux-distribution.yml'))
         self.assertEqual(linux['permissions'], {'contents': 'read'})
-        self.assertEqual(set(linux['jobs']), {'build', 'verify'})
+        self.assertEqual(set(linux['jobs']), {'build', 'verify', 'trial'})
         self.assertEqual(dependencies(linux['jobs']['verify']), ['build'])
+        self.assertEqual(dependencies(linux['jobs']['trial']), ['build'])
         source_check = next(s for s in linux['jobs']['build']['steps'] if s.get('name') == 'Verify committed release source and version')
         self.assertIn('test "$(git -C .release-tooling rev-parse HEAD)" = "$TOOLING_SHA"', source_check['run'])
-        for failed in ('build', 'verify'):
+        for failed in ('build', 'verify', 'trial'):
             with self.subTest(failed=failed):
                 native_status = simulate(linux['jobs'], failed)
                 self.assertEqual(native_status[failed], 'failure')
@@ -116,6 +117,28 @@ class PublicationOrder(unittest.TestCase):
                 for announcement in ANNOUNCEMENTS:
                     self.assertEqual(release_status[announcement], 'skipped')
         self.assertTrue(all(s == 'success' for s in simulate(linux['jobs']).values()))
+
+    def test_anonymous_pull_follows_both_registry_writes(self):
+        jobs = self.workflow['jobs']
+        pull = jobs['anonymous-pull']
+        self.assertEqual(pull['uses'], './.github/workflows/anonymous-pull.yml')
+        self.assertEqual(pull['with'], {'tag': '${{ needs.resolve-source.outputs.tag }}'})
+        self.assertLessEqual({'docker', 'publish-helm'}, set(dependencies(pull)))
+        self.assertIn('anonymous-pull', dependencies(jobs['release']))
+        workflow = parse_workflow(WORKFLOW.with_name('anonymous-pull.yml'))
+        triggers = workflow.get('on') or workflow.get('true')
+        self.assertEqual(set(triggers), {'workflow_call', 'workflow_dispatch', 'pull_request'})
+        self.assertEqual(triggers['workflow_dispatch']['inputs']['tag']['default'], 'v0.9.0')
+        self.assertEqual(workflow['permissions'], {'contents': 'read'})
+        steps = workflow['jobs']['pull']['steps']
+        self.assertFalse(any('login' in s.get('uses', '') or 'login' in s.get('run', '') for s in steps))
+        self.assertFalse(any('secrets.' in json.dumps(s) or 'github.token' in json.dumps(s) for s in steps))
+
+    def test_a_release_without_the_anonymous_pull_is_detected(self):
+        jobs = copy.deepcopy(self.workflow['jobs'])
+        jobs['release']['needs'].remove('anonymous-pull')
+        with self.assertRaisesRegex(AssertionError, 'release can start after anonymous-pull fails'):
+            assert_publication_order(jobs)
 
     def test_both_native_preflights_accept_identical_required_inputs(self):
         for filename in ('linux-distribution.yml', 'macos-cli.yml'):
@@ -136,8 +159,9 @@ class PublicationOrder(unittest.TestCase):
         self.assertEqual(set(triggers['pull_request']['paths']), {
             '.github/workflows/release.yml', '.github/workflows/linux-distribution.yml',
             '.github/workflows/macos-cli.yml', '.github/workflows/distribution-preflight.yml',
-            'scripts/release/**', 'Cargo.lock', 'Cargo.toml',
-            'crates/trawl-cli/Cargo.toml', 'crates/trawl-core/build.rs',
+            'scripts/release/**', 'Dockerfile', 'Cargo.lock', 'Cargo.toml',
+            'crates/trawl-cli/**', 'crates/trawl-web/**', 'crates/trawl-server/debian/**',
+            'docs/src/content/docs/getting-started/first-query.md', 'crates/trawl-core/build.rs',
             'crates/trawl-core/build_support/**',
             'crates/trawl-core/Cargo.toml', 'crates/trawl-engine/Cargo.toml',
             'crates/trawl-server/Cargo.toml',

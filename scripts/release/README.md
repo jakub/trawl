@@ -85,6 +85,31 @@ on the host and asserts that `trawld` and `trawl-web` are `disabled` and
 enables both units, reinstalls the server package through the upgrade path,
 asserts that both stay enabled and inactive, and purges the package.
 
+Run `test-trial.sh TRAWL EVIDENCE PRIVATE` only on a disposable Docker engine.
+It proves `trawl trial` (ADR-0045) end to end with the given CLI. It creates
+two trials, one after the other, and deletes both. Along the way it injects
+the faults that ADR-0045 names: a refused preflight, taken ports, a foreign
+trial id, a kill after the key step, a lost token file, a substituted
+certificate, a kill during seeding, and a sample result the trial cannot
+account for. It refuses to start while the engine holds any trial resource or
+a trial port is taken. `EVIDENCE` receives the log, the rendered configs, and
+the browser screenshots. `PRIVATE` holds the trial's `HOME`, its state, and
+`secrets.tsv`, the list of generated secret values. `scan-trial-secrets.py`
+reads that list and fails when a value appears in the evidence. The script
+never prints a secret. Under GitHub Actions it also passes each value to
+`::add-mask::`. `trial-browser.mjs` follows the tutorial's browser steps in
+Chromium, with Playwright from `crates/trawl-web-ui/e2e`. For a local run,
+set `TRIAL_IMAGE` to a locally built image, and set `TRIAL_BROWSER=skip` when
+that image has no SPA. CI refuses both. The `trial` job in
+`linux-distribution.yml` builds the image from the release tarball and tags
+it with the CLI's default reference. `trawl trial up` therefore runs without
+`--image`. The tag exists only on the disposable runner.
+
+`check-anonymous-pulls.sh TAG IMAGE_REPOSITORY CHART_REPOSITORY` pulls the
+release image and chart with empty Docker and Helm registry configs, so no
+stored login applies. `anonymous-pull.yml` runs it after a release push, on
+manual dispatch for any tag, and on pull requests that change it.
+
 Fast helper tests:
 
 ```sh
@@ -101,7 +126,8 @@ it is not Apple Developer ID signing or notarization.
 Release publication prepares and validates the chart before any registry write.
 The image push consumes the same normalized Docker metadata as that chart.
 Helm then publishes the exact prebuilt, checksum-checked chart artifact; only
-successful image and chart publication permit GitHub release creation. Docs
+successful image and chart publication, followed by an anonymous pull of
+both, permit GitHub release creation. Docs
 and APT publication follow the GitHub release. This ordering prevents an
 announcement before its registry channels exist. It is not a transaction
 across services: a later GitHub or Pages failure still requires a rerun.

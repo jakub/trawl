@@ -1,0 +1,51 @@
+name: Anonymous pull
+
+# Pull a release's image and Helm chart from ghcr.io with no credentials
+# (ADR-0045): an evaluator needs no GitHub account. release.yml calls this
+# after it pushes both. A manual run checks any published release; a pull
+# request that changes this check runs it against v0.9.0.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag whose image and chart to pull, for example v0.9.0
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag whose image and chart to pull, for example v0.9.0
+        required: true
+        default: v0.9.0
+        type: string
+  pull_request:
+    paths:
+      - '.github/workflows/anonymous-pull.yml'
+      - 'scripts/release/check-anonymous-pulls.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  pull:
+    name: anonymous pull (${{ inputs.tag || 'v0.9.0' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TAG: ${{ inputs.tag || 'v0.9.0' }}
+      IMAGE_REPOSITORY: ghcr.io/${{ github.repository }}
+      CHART_REPOSITORY: oci://ghcr.io/${{ github.repository_owner }}/charts
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/release
+
+      - name: Install Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+
+      # No login step, no token in the environment, and fresh empty Docker
+      # and Helm registry configs inside the script.
+      - name: Pull the image and the chart with no credentials
+        run: bash scripts/release/check-anonymous-pulls.sh "$TAG" "$IMAGE_REPOSITORY" "$CHART_REPOSITORY"
