@@ -158,6 +158,16 @@ async fn expect_refused(server: &mut Server, conn: &ConnectionParams) {
         .await
         .expect_err("the certificate must be refused");
     assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+    let message = err.to_string();
+    assert_eq!(
+        message,
+        format!(
+            "network error: TLS: the server certificate of API https://127.0.0.1:{} \
+             is not trusted (check ca_cert or the trial's CA)",
+            server.port
+        )
+    );
+    assert!(!message.contains("connection failed"), "{message}");
     let seen = server.handshake().await;
     assert!(
         seen.is_err(),
@@ -230,6 +240,25 @@ async fn pinned_self_signed_server_certificate() {
     let other = ca("trawl test CA B");
     let conn = pinned(format!("https://127.0.0.1:{}", server.port), &other.pem());
     expect_refused(&mut server, &conn).await;
+}
+
+/// Nothing listening is a connection failure, not a certificate one.
+#[tokio::test]
+async fn a_refused_connection_still_says_connection_failed() {
+    let ca_a = ca("trawl test CA A");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    let err = pinned(format!("https://127.0.0.1:{port}"), &ca_a.pem())
+        .client()
+        .expect("build client")
+        .health()
+        .await
+        .expect_err("nothing listens on the port");
+    assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+    let message = err.to_string();
+    assert!(message.contains("connection failed"), "{message}");
+    assert!(!message.contains("certificate"), "{message}");
 }
 
 /// A plain `http://` URL would skip the pin, so a pinned client refuses it

@@ -1013,10 +1013,18 @@ fn normalize_base_url(url: String) -> String {
 
 /// Categorize a reqwest error without exposing raw details or URL secrets.
 /// Connection diagnostics identify only the API origin, never URL userinfo,
-/// paths, query parameters, or fragments.
+/// paths, query parameters, or fragments. A certificate rustls refused is
+/// named as such, without the certificate or the verifier's reason.
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_reqwest_error)`
 fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
-    if e.is_timeout() || e.is_connect() {
+    if e.is_connect() && rejected_certificate(&e) {
+        let origin = e.url().map_or_else(String::new, |url| {
+            format!(" of API {}", url.origin().ascii_serialization())
+        });
+        ClientError::Network(format!(
+            "TLS: the server certificate{origin} is not trusted (check ca_cert or the trial's CA)"
+        ))
+    } else if e.is_timeout() || e.is_connect() {
         let reason = if e.is_timeout() {
             "request timed out"
         } else {
@@ -1038,6 +1046,31 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
     } else {
         ClientError::Network("request failed".into())
     }
+}
+
+/// Whether `e` failed because rustls did not accept the server's
+/// certificate: an unknown issuer, a name it does not cover, an expired
+/// certificate, and the like.
+///
+/// A typed check over the source chain, never the Display text. The TLS
+/// connector reports a handshake failure as a [`rustls::Error`] inside one
+/// or more [`std::io::Error`]s, and `io::Error::source` skips the error it
+/// wraps, so an `io::Error` is stepped into with `get_ref` instead.
+fn rejected_certificate(e: &reqwest::Error) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = next {
+        if matches!(
+            err.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(_))
+        ) {
+            return true;
+        }
+        next = match err.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as _),
+            None => err.source(),
+        };
+    }
+    false
 }
 
 /// Decode a successful repin trigger response: the status code plus the
