@@ -34,7 +34,8 @@ struct Cli {
     url: Option<String>,
 
     /// API token (direct value).
-    #[arg(long, env = "TRAWL_TOKEN", global = true)]
+    // Help names the variable but never prints its value.
+    #[arg(long, env = "TRAWL_TOKEN", hide_env_values = true, global = true)]
     token: Option<String>,
 
     /// Accept self-signed TLS certificates.
