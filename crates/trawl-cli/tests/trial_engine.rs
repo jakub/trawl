@@ -18,7 +18,8 @@
 //! list the wrong engine's containers as the trial's.
 //!
 //! A first `up` writes its state before it creates the engine claim, and
-//! deletes that state again only when the claim was refused for certain.
+//! deletes that state again only when its own inspect finds another
+//! trial's claim.
 
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
@@ -40,10 +41,17 @@ impl Engine {
     /// A `docker` that answers preflight as Docker 29 with Compose 5.5.1
     /// on engine `id`, lists no resources, and logs every other call.
     ///
-    /// For `up`, it has every image, as `sha256:aaaa`. `container create`
-    /// fails with the stderr in `create.err`, and `container inspect`
-    /// prints `claim.labels`, or reports no such container when that file
-    /// does not exist.
+    /// For `up`, it has every image, as `sha256:aaaa`, and runs no
+    /// services: every `compose` call fails. The engine's claim is the
+    /// file `claim.id`, holding the id it carries: `ps` lists it,
+    /// `container inspect` prints its labels, and `container create`
+    /// refuses the name while it exists. Otherwise the create makes it,
+    /// unless `create.err` exists: then the create fails with that stderr,
+    /// after making the claim when `create.lands` exists too, as an
+    /// engine whose authorization plugin denies the response does.
+    /// `race.id` becomes the claim when the create runs, as another trial
+    /// winning the race after `up` listed the engine. `inspect.err` makes
+    /// `container inspect` of the claim fail with that stderr.
     fn new(id: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("stub");
@@ -54,12 +62,29 @@ d="{dir}"
 case "$*" in
   version*) printf '{{"Client":{{}},"Server":{{"Version":"29.7.2"}}}}' ;;
   "compose version --short") echo 5.5.1 ;;
+  compose*) echo "$*" >> "$d/calls"; echo "the stub engine runs no services" >&2; exit 1 ;;
   info*) echo {id} ;;
-  ps*|"volume ls"*|"network ls"*) ;;
+  ps*)
+    if [ -e "$d/claim.id" ]; then
+      printf '{{"id":"c1a1m","name":"trawl-trial-claim","state":"created","project":"","trial":"%s","oneoff":""}}\n' "$(cat "$d/claim.id")"
+    fi ;;
+  "volume ls"*|"network ls"*) ;;
   "image inspect"*) printf '{{"id":"sha256:aaaa","digests":[]}}' ;;
-  "container create"*) echo "$*" >> "$d/calls"; cat "$d/create.err" >&2; exit 1 ;;
+  "container create"*)
+    echo "$*" >> "$d/calls"
+    if [ -e "$d/race.id" ]; then mv "$d/race.id" "$d/claim.id"; fi
+    if [ -e "$d/claim.id" ]; then
+      echo 'Error response from daemon: Conflict. The container name "/trawl-trial-claim" is already in use by container "c1a1m".' >&2
+      exit 1
+    fi
+    if [ -e "$d/create.err" ] && [ ! -e "$d/create.lands" ]; then cat "$d/create.err" >&2; exit 1; fi
+    echo "$*" | sed 's/.*sh[.]trawl[.]trial[.]id=\([0-9a-f]*\).*/\1/' > "$d/claim.id"
+    if [ -e "$d/create.err" ]; then cat "$d/create.err" >&2; exit 1; fi
+    echo c1a1m ;;
+  "container inspect"*.Image*) echo '"sha256:aaaa"' ;;
   "container inspect"*)
-    if [ -e "$d/claim.labels" ]; then cat "$d/claim.labels"
+    if [ -e "$d/inspect.err" ]; then cat "$d/inspect.err" >&2; exit 1; fi
+    if [ -e "$d/claim.id" ]; then printf '{{"sh.trawl.trial.id":"%s"}}' "$(cat "$d/claim.id")"
     else echo "Error: No such container: trawl-trial-claim" >&2; exit 1; fi ;;
   *) echo "$*" >> "$d/calls" ;;
 esac
@@ -236,76 +261,189 @@ fn free_port() -> String {
     listener.local_addr().unwrap().port().to_string()
 }
 
-/// A first `up` whose claim create fails with `create_err`, while the
-/// claim inspect finds `claim` (its labels JSON) or nothing. Returns the
-/// trial directory and `up`'s stderr.
-fn first_up_with_claim(create_err: &str, claim: Option<&str>) -> (Engine, PathBuf, String) {
-    let engine = Engine::new("engine-a");
-    std::fs::write(engine.stub.join("create.err"), create_err).unwrap();
-    if let Some(labels) = claim {
-        std::fs::write(engine.stub.join("claim.labels"), labels).unwrap();
+/// Another trial's id.
+const THEIRS: &str = "fedcba9876543210fedcba9876543210";
+
+/// How the Docker CLI reports a request the engine carried out and an
+/// authorization plugin then denied the response to.
+const RESPONSE_DENIED: &str =
+    "Error response from daemon: authorization denied by plugin authz: response denied";
+
+/// The first step `up` takes once it holds the claim. The stub runs no
+/// services, so `up` fails there.
+const PAST_THE_CLAIM: &str = "writing the PostgreSQL superuser password";
+
+impl Engine {
+    fn put(&self, name: &str, body: &str) {
+        std::fs::write(self.stub.join(name), body).unwrap();
     }
-    let (api, web) = (free_port(), free_port());
-    let out = engine.trawl(&[
-        "up",
-        "--api-port",
-        &api,
-        "--web-port",
-        &web,
-        "--no-sample-data",
-    ]);
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    assert!(!out.status.success(), "{stderr}");
-    let calls = engine.calls();
-    assert!(
-        calls.starts_with("container create --name trawl-trial-claim --label sh.trawl.trial.id="),
-        "up stops at the claim: {calls:?}"
-    );
-    let dir = engine.state_home.join("trawl/trial");
-    (engine, dir, stderr)
+
+    fn remove(&self, name: &str) {
+        std::fs::remove_file(self.stub.join(name)).unwrap();
+    }
+
+    /// The trial id the engine's claim carries.
+    fn claim(&self) -> Option<String> {
+        std::fs::read_to_string(self.stub.join("claim.id"))
+            .ok()
+            .map(|id| id.trim().to_owned())
+    }
+
+    fn dir(&self) -> PathBuf {
+        self.state_home.join("trawl/trial")
+    }
+
+    /// The trial id the state records, when there is a state.
+    fn state(&self) -> Option<String> {
+        let bytes = std::fs::read(self.dir().join("state.json")).ok()?;
+        let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(state["engine_id"], "engine-a");
+        Some(state["trial_id"].as_str().unwrap().to_owned())
+    }
+
+    /// How many claim creates `up` ran.
+    fn creates(&self) -> usize {
+        self.calls()
+            .lines()
+            .filter(|call| {
+                call.starts_with(
+                    "container create --name trawl-trial-claim --label sh.trawl.trial.id=",
+                )
+            })
+            .count()
+    }
+
+    /// `up`, which the stub always fails; returns its stderr. The first
+    /// `up` picks free ports, and a rerun resumes on the recorded ones.
+    fn up(&self) -> String {
+        let out = if self.state().is_some() {
+            self.trawl(&["up", "--no-sample-data"])
+        } else {
+            let (api, web) = (free_port(), free_port());
+            self.trawl(&[
+                "up",
+                "--api-port",
+                &api,
+                "--web-port",
+                &web,
+                "--no-sample-data",
+            ])
+        };
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(!out.status.success(), "{stderr}");
+        stderr
+    }
 }
 
-/// The create may have reached the engine and made the claim before the
-/// connection dropped. The state stays, so a rerun finds that claim
-/// carrying its own id instead of refusing it as an orphan.
+/// (a) The engine made the claim and the response to the create was
+/// denied. Our inspect finds the claim with our id, so `up` goes on,
+/// and so does a rerun.
 #[test]
-fn an_unknown_claim_outcome_keeps_the_state() {
-    let (_engine, dir, stderr) = first_up_with_claim(
-        "error during connect: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.52/containers/create?name=trawl-trial-claim\": EOF",
-        None,
-    );
-    assert!(stderr.contains("error during connect"), "{stderr}");
-    let state: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
-    assert_eq!(state["engine_id"], "engine-a");
-    assert_eq!(state["trial_id"].as_str().unwrap().len(), 32);
+fn a_denied_create_response_goes_on_when_the_claim_is_ours() {
+    let engine = Engine::new("engine-a");
+    engine.put("create.err", RESPONSE_DENIED);
+    engine.put("create.lands", "");
+    let stderr = engine.up();
+    assert!(stderr.contains(PAST_THE_CLAIM), "{stderr}");
+    let id = engine.state().expect("the state stays");
+    assert_eq!(engine.claim().as_deref(), Some(id.as_str()));
+
+    let stderr = engine.up();
+    assert!(stderr.contains(PAST_THE_CLAIM), "{stderr}");
+    assert_eq!(engine.state().as_deref(), Some(id.as_str()));
+    assert_eq!(engine.claim().as_deref(), Some(id.as_str()));
 }
 
-/// Another trial holds the engine: nothing of ours was created, and the
-/// state this `up` wrote goes.
+/// (b) The engine made the claim, the response to the create was denied,
+/// and the inspect failed too. Nothing proves the claim is not ours, so
+/// the state stays, and a rerun finds the claim with its own id instead
+/// of refusing it as an orphan.
+#[test]
+fn a_denied_create_response_and_a_failed_inspect_keep_the_state() {
+    let engine = Engine::new("engine-a");
+    engine.put("create.err", RESPONSE_DENIED);
+    engine.put("create.lands", "");
+    engine.put(
+        "inspect.err",
+        "Error response from daemon: authorization denied by plugin authz: request denied",
+    );
+    let stderr = engine.up();
+    assert!(stderr.contains("response denied"), "{stderr}");
+    let id = engine.state().expect("the state stays");
+    assert_eq!(engine.claim().as_deref(), Some(id.as_str()));
+
+    engine.remove("inspect.err");
+    let stderr = engine.up();
+    assert!(stderr.contains(PAST_THE_CLAIM), "{stderr}");
+    assert_eq!(engine.state().as_deref(), Some(id.as_str()));
+}
+
+/// (c) Another trial took the claim after `up` listed the engine. Our
+/// inspect shows its id, so nothing of ours was created: `up` refuses,
+/// and the state it wrote goes.
 #[test]
 fn a_foreign_claim_removes_the_new_state() {
-    let (_engine, dir, stderr) = first_up_with_claim(
-        "Error response from daemon: Conflict. The container name \"/trawl-trial-claim\" is \
-         already in use by container \"c0ffee\". You have to remove (or rename) that container \
-         to be able to reuse that name.",
-        Some(r#"{"sh.trawl.trial.id":"fedcba9876543210fedcba9876543210"}"#),
-    );
+    let engine = Engine::new("engine-a");
+    engine.put("race.id", THEIRS);
+    let stderr = engine.up();
     assert!(
-        stderr.contains("trawl-trial-claim (trial id fedcba9876543210fedcba9876543210)"),
+        stderr.contains(&format!("trawl-trial-claim (trial id {THEIRS})")),
         "{stderr}"
     );
-    assert!(!dir.exists(), "{stderr}");
+    assert!(!engine.dir().exists(), "{stderr}");
+    assert_eq!(engine.claim().as_deref(), Some(THEIRS));
 }
 
-/// The engine answered the create with an error, so it created nothing,
-/// and the state this `up` wrote goes.
+/// (d) The engine refused the create and holds no claim. The state stays,
+/// and a rerun creates the claim with the recorded id.
 #[test]
-fn an_engine_refusal_removes_the_new_state() {
-    let (_engine, dir, stderr) = first_up_with_claim(
+fn a_refused_create_keeps_the_state_and_a_rerun_creates_the_claim() {
+    let engine = Engine::new("engine-a");
+    engine.put(
+        "create.err",
         "Error response from daemon: No such image: sha256:aaaa",
-        None,
     );
+    let stderr = engine.up();
     assert!(stderr.contains("No such image"), "{stderr}");
-    assert!(!dir.exists(), "{stderr}");
+    let id = engine.state().expect("the state stays");
+    assert_eq!(engine.claim(), None);
+
+    engine.remove("create.err");
+    let stderr = engine.up();
+    assert!(stderr.contains(PAST_THE_CLAIM), "{stderr}");
+    assert_eq!(engine.claim().as_deref(), Some(id.as_str()));
+    assert_eq!(engine.creates(), 2);
+}
+
+/// The create may have reached the engine before the connection dropped;
+/// the state stays for the same reason.
+#[test]
+fn a_dropped_create_keeps_the_state() {
+    let engine = Engine::new("engine-a");
+    engine.put(
+        "create.err",
+        "error during connect: Post \"http://%2Fvar%2Frun%2Fdocker.sock/v1.52/containers/create?name=trawl-trial-claim\": EOF",
+    );
+    let stderr = engine.up();
+    assert!(stderr.contains("error during connect"), "{stderr}");
+    assert!(engine.state().is_some(), "{stderr}");
+}
+
+/// (e) `down` deletes a kept state that owns nothing on the engine.
+#[test]
+fn down_removes_a_kept_state_that_owns_nothing() {
+    let engine = Engine::new("engine-a");
+    engine.put(
+        "create.err",
+        "Error response from daemon: No such image: sha256:aaaa",
+    );
+    engine.up();
+    assert!(engine.state().is_some());
+
+    let out = engine.trawl(&["down", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!engine.dir().exists(), "{stderr}");
+    assert_eq!(engine.creates(), 1);
+    assert_eq!(engine.calls().lines().count(), 1, "down removed nothing");
 }
