@@ -99,7 +99,8 @@ reads that list and fails when a value appears in the evidence. The script
 never prints a secret. Everything it and its commands print goes first to
 `PRIVATE/capture.log`. Before any of it is printed,
 `harvest-trial-secrets.py` records every secret that exists at that moment,
-and under GitHub Actions passes each one to `::add-mask::`. Then the scanner
+the TLS private key included, and under GitHub Actions passes each one to
+`::add-mask::`. Then the scanner
 checks the whole capture. When a value is found, the job log gets the scan
 result, and no later output. The exit trap follows the same order.
 `trial-browser.mjs` follows the tutorial's browser steps in

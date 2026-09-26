@@ -5,12 +5,14 @@ Usage: scan-trial-secrets.py SECRETS [--classes CLASS,...] PATH...
 
 SECRETS is the private list `test-trial.sh` writes: one secret per line,
 `label<TAB>class<TAB>kind<TAB>value`. The class is `token`, `prefix`,
-`password`, or `cookie`. The kind is `text`, a value whose bytes are its
+`password`, `cookie`, or `key` (the trial's TLS private key, as DER). The kind is `text`, a value whose bytes are its
 UTF-8 encoding (also searched in lower and upper case when it is
 hexadecimal), or `hex-bytes`, a binary value given as hex. Either way the
 bytes are searched raw, as lower- and upper-case hex, and as standard and
 URL-safe base64, padded or not, at each of the three byte alignments the
-value can take inside a longer base64 string.
+value can take inside a longer base64 string. Each file is also searched
+with its line breaks removed, raw and JSON-escaped, so a PEM copy of the
+key is found however it is wrapped.
 
 Every PATH is a file or a directory searched recursively. A symlink, or
 anything else that is not a regular file or a directory, fails the scan
@@ -25,12 +27,14 @@ is refused, and 2 on a usage error.
 
 import base64
 import binascii
+import re
 import stat
 import string
 import sys
 from pathlib import Path
 
-CLASSES = {"token", "prefix", "password", "cookie"}
+CLASSES = {"token", "prefix", "password", "cookie", "key"}
+BREAKS = re.compile(rb"\\[rn]|[\r\n]")
 HEX = set(string.hexdigits)
 # The shortest value searched. Below it the base64 forms get short enough
 # to match by chance.
@@ -131,8 +135,9 @@ def main(argv):
         data = path.read_bytes()
         scanned += 1
         total += len(data)
+        joined = BREAKS.sub(b"", data)
         for label, forms in secrets:
-            if any(form in data for form in forms):
+            if any(form in data or form in joined for form in forms):
                 findings.append((label, path))
     if scanned == 0 and not refused:
         print("refusing to report a clean scan: no file was scanned", file=sys.stderr)
