@@ -83,6 +83,15 @@ pub enum TrialError {
         dir.display()
     )]
     TrialNotReady { dir: PathBuf, missing: &'static str },
+
+    #[error(transparent)]
+    Preflight(#[from] super::preflight::PreflightError),
+
+    #[error(transparent)]
+    Docker(#[from] super::docker::DockerError),
+
+    #[error(transparent)]
+    Ownership(#[from] super::ownership::OwnershipError),
 }
 
 impl TrialError {

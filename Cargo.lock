@@ -6276,6 +6276,7 @@ dependencies = [
  "insta",
  "nix",
  "nucleo-matcher",
+ "rand 0.8.7",
  "ratatui",
  "rcgen",
  "rustls",
@@ -6297,6 +6298,7 @@ dependencies = [
  "trawl-dashboard",
  "trawl-engine",
  "unicode-width",
+ "zeroize",
 ]
 
 [[package]]
