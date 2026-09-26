@@ -25,11 +25,23 @@
 //! because trawl did not create it that way. The pattern follows fleet-dev's
 //! `state_root` and `secure_directory`; fleet-dev is a development
 //! controller, so it is copied rather than depended on.
+//!
+//! Those two checks read metadata and keep no handle, so the files below
+//! are reached by path again later. That is sound only if no other user can
+//! swap a directory on the way there. Every directory above the root, from
+//! `/` down, must therefore be owned by root or the current user, and must
+//! not be group- or other-writable unless it has the sticky bit (as `/tmp`
+//! does). The walk follows a symlinked ancestor, such as a dotfile manager's
+//! `~/.local`, and checks the directories it resolves to. The link itself
+//! must be owned by root or the current user too, because in a sticky
+//! directory the link's owner can re-point it.
 
+use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, Metadata};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::TrialError;
@@ -37,9 +49,16 @@ use super::TrialError;
 /// Directory mode for the state root and the trial directory.
 const DIR_MODE: u32 = 0o700;
 
+/// Symlinks the ancestry walk follows before giving up, as the kernel's
+/// own `ELOOP` limit.
+const MAX_SYMLINK_HOPS: usize = 40;
+
 /// The trial's host paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrialPaths {
+    /// `$XDG_STATE_HOME`: every directory from `/` down to it must be
+    /// trusted.
+    base: PathBuf,
     /// `$XDG_STATE_HOME/trawl`.
     pub root: PathBuf,
     /// `root/trial`: everything `down` deletes.
@@ -66,6 +85,7 @@ impl TrialPaths {
             dir: root.join("trial"),
             lock: root.join("trial.lock"),
             root,
+            base,
         })
     }
 
@@ -99,15 +119,24 @@ impl TrialPaths {
 
     /// Create the state root (0700) if absent and verify it: a real
     /// directory, owned by this user, with no group or other access.
-    /// Missing ancestors are created 0700 too.
+    /// Missing ancestors are created 0700 too, and only after the existing
+    /// ones pass the ancestry rule, so nothing is created under a
+    /// directory another user controls.
     #[cfg_attr(not(test), expect(dead_code, reason = "up takes the lock under it"))]
     pub fn ensure_root(&self) -> Result<(), TrialError> {
-        if let Some(parent) = self.root.parent() {
+        if !check_ancestry(&self.base)? {
             DirBuilder::new()
                 .recursive(true)
                 .mode(DIR_MODE)
-                .create(parent)
-                .map_err(|e| TrialError::io("create", parent, e))?;
+                .create(&self.base)
+                .map_err(|e| TrialError::io("create", &self.base, e))?;
+            if !check_ancestry(&self.base)? {
+                return Err(TrialError::io(
+                    "create",
+                    &self.base,
+                    std::io::ErrorKind::NotFound.into(),
+                ));
+            }
         }
         secure_dir(&self.root)
     }
@@ -119,9 +148,12 @@ impl TrialPaths {
         secure_dir(&self.dir)
     }
 
-    /// Verify the root and the trial directory without creating either.
-    /// `Ok(false)` when there is no trial directory.
+    /// Verify the ancestry, the root, and the trial directory without
+    /// creating anything. `Ok(false)` when there is no trial directory.
     pub fn check_dir(&self) -> Result<bool, TrialError> {
+        if !check_ancestry(&self.base)? {
+            return Ok(false);
+        }
         for path in [&self.root, &self.dir] {
             match fs::symlink_metadata(path) {
                 Ok(meta) => verify_dir(path, &meta, euid())?,
@@ -168,6 +200,119 @@ fn verify_dir(path: &Path, meta: &Metadata, me: u32) -> Result<(), TrialError> {
     let mode = meta.mode() & 0o7777;
     if mode & 0o077 != 0 {
         return Err(TrialError::LooseMode { path, mode });
+    }
+    Ok(())
+}
+
+/// One step of the ancestry walk.
+enum Step {
+    Root,
+    Parent,
+    Name(OsString),
+}
+
+/// The steps of `path`, as the kernel would take them.
+fn steps(path: &Path) -> impl DoubleEndedIterator<Item = Step> + '_ {
+    path.components().filter_map(|component| match component {
+        Component::RootDir => Some(Step::Root),
+        Component::ParentDir => Some(Step::Parent),
+        Component::Normal(name) => Some(Step::Name(name.to_owned())),
+        // Unix paths have no prefix; `.` changes nothing.
+        Component::Prefix(_) | Component::CurDir => None,
+    })
+}
+
+/// [`walk_ancestry`] for this process's user.
+fn check_ancestry(path: &Path) -> Result<bool, TrialError> {
+    walk_ancestry(path, euid())
+}
+
+/// Resolve absolute `path` one component at a time, from `/`, and verify
+/// every directory and symlink on the way with [`verify_ancestor`].
+/// `Ok(false)` when some component does not exist yet; everything above
+/// it has passed.
+///
+/// A walk rather than `fs::canonicalize`: canonicalizing returns only the
+/// final directory and hides the links it followed, and each link's owner
+/// matters as much as its target's.
+fn walk_ancestry(path: &Path, me: u32) -> Result<bool, TrialError> {
+    let mut pending: VecDeque<Step> = steps(path).collect();
+    if !matches!(pending.front(), Some(Step::Root)) {
+        return Err(TrialError::NotPrivateFile {
+            path: path.to_owned(),
+            reason: "trial state needs an absolute path",
+        });
+    }
+    // Always a real directory, reached without a symlink, so `pop` is `..`.
+    let mut resolved = PathBuf::new();
+    let mut hops = 0;
+    while let Some(step) = pending.pop_front() {
+        let name = match step {
+            Step::Root => {
+                resolved = PathBuf::from("/");
+                let meta = fs::symlink_metadata(&resolved)
+                    .map_err(|e| TrialError::io("inspect", &resolved, e))?;
+                verify_ancestor(&resolved, &meta, me)?;
+                continue;
+            }
+            Step::Parent => {
+                resolved.pop();
+                continue;
+            }
+            Step::Name(name) => name,
+        };
+        let next = resolved.join(name);
+        let meta = match fs::symlink_metadata(&next) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(TrialError::io("inspect", next, e)),
+        };
+        verify_ancestor(&next, &meta, me)?;
+        if meta.file_type().is_symlink() {
+            hops += 1;
+            if hops > MAX_SYMLINK_HOPS {
+                return Err(TrialError::io(
+                    "resolve",
+                    next,
+                    std::io::Error::from_raw_os_error(nix::libc::ELOOP),
+                ));
+            }
+            let target = fs::read_link(&next).map_err(|e| TrialError::io("resolve", &next, e))?;
+            // A relative target resolves from the link's own directory,
+            // which is `resolved` as it stands.
+            for step in steps(&target).rev() {
+                pending.push_front(step);
+            }
+        } else {
+            resolved = next;
+        }
+    }
+    Ok(true)
+}
+
+/// The ancestry rule for one directory or symlink above the state root:
+/// owned by root or `me`, and for a directory, no group or other write
+/// unless the sticky bit is set. Anything else is refused by name.
+fn verify_ancestor(path: &Path, meta: &Metadata, me: u32) -> Result<(), TrialError> {
+    let path = path.to_owned();
+    let file_type = meta.file_type();
+    if !file_type.is_dir() && !file_type.is_symlink() {
+        return Err(TrialError::NotADirectory { path });
+    }
+    if meta.uid() != 0 && meta.uid() != me {
+        return Err(TrialError::ForeignOwner {
+            path,
+            owner: meta.uid(),
+            me,
+        });
+    }
+    let mode = meta.mode();
+    if file_type.is_dir() && mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(TrialError::NotPrivateFile {
+            path,
+            reason: "group or other can write to it and it has no sticky bit, \
+                     so another user could replace the trial state below it",
+        });
     }
     Ok(())
 }
@@ -238,6 +383,23 @@ pub fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), TrialEr
 /// file, owned by this user, with no group or other access, and at most
 /// `limit` bytes.
 pub fn read_private(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, TrialError> {
+    read_owned(path, limit, 0o077, "group or other can access it")
+}
+
+/// Read a public file the trial wrote, such as `ca.pem` (0644):
+/// [`read_private`], except that group and other may read it. They still
+/// may not write it.
+pub fn read_public(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, TrialError> {
+    read_owned(path, limit, 0o022, "group or other can write to it")
+}
+
+/// The shared read: refuse the file when any `forbidden` mode bit is set.
+fn read_owned(
+    path: &Path,
+    limit: u64,
+    forbidden: u32,
+    loose: &'static str,
+) -> Result<Option<Vec<u8>>, TrialError> {
     // Not `open_with_mode`: that re-modes the file after opening it, and a
     // read must leave the mode as it found it.
     let file = match fs::OpenOptions::new()
@@ -262,8 +424,8 @@ pub fn read_private(path: &Path, limit: u64) -> Result<Option<Vec<u8>>, TrialErr
     if meta.uid() != euid() {
         return Err(refuse("it is owned by another user"));
     }
-    if meta.mode() & 0o077 != 0 {
-        return Err(refuse("group or other can access it"));
+    if meta.mode() & forbidden != 0 {
+        return Err(refuse(loose));
     }
     let mut bytes = Vec::new();
     file.take(limit + 1)
@@ -453,6 +615,174 @@ mod tests {
         ));
     }
 
+    /// A directory at `path` with exactly `mode`.
+    fn dir_at(path: &Path, mode: u32) {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// The finding this rule closes: another user who can rename entries
+    /// in an ancestor can swap the trial directory between two reads.
+    #[test]
+    fn an_ancestor_writable_without_the_sticky_bit_is_refused() {
+        for mode in [0o770, 0o777, 0o757] {
+            let tmp = tempfile::tempdir().unwrap();
+            let shared = tmp.path().join("shared");
+            dir_at(&shared, mode);
+            let paths = paths_in(&shared.join("state"));
+
+            let err = paths.ensure_dir().expect_err("a loose ancestor");
+            assert!(
+                matches!(&err, TrialError::NotPrivateFile { path, .. } if *path == shared),
+                "{mode:o}: {err:?}"
+            );
+            assert!(err.to_string().contains("no sticky bit"), "{err}");
+            assert!(
+                err.to_string().contains(&shared.display().to_string()),
+                "the refusal names the directory: {err}"
+            );
+            assert!(
+                !shared.join("state").exists(),
+                "{mode:o}: nothing is created below a loose ancestor"
+            );
+            assert!(
+                matches!(paths.check_dir(), Err(TrialError::NotPrivateFile { .. })),
+                "{mode:o}: the -p trial read path refuses too"
+            );
+        }
+    }
+
+    /// A loose directory further up than the immediate parent counts too,
+    /// and so does a trial that already exists below it.
+    #[test]
+    fn a_loose_ancestor_is_refused_even_over_an_existing_trial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        dir_at(&shared, 0o700);
+        let paths = paths_in(&shared.join("a/b/state"));
+        paths.ensure_dir().unwrap();
+        assert!(paths.check_dir().unwrap());
+
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+        for result in [
+            paths.ensure_root(),
+            paths.ensure_dir(),
+            paths.check_dir().map(|_| ()),
+        ] {
+            assert!(
+                matches!(&result, Err(TrialError::NotPrivateFile { path, .. }) if *path == shared),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// `/tmp`: world-writable, but the sticky bit stops other users from
+    /// renaming entries they do not own.
+    #[test]
+    fn a_sticky_world_writable_ancestor_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let public = tmp.path().join("public");
+        dir_at(&public, 0o1777);
+        let paths = paths_in(&public.join("state"));
+        paths.ensure_dir().expect("a sticky ancestor is trusted");
+        assert!(paths.check_dir().unwrap());
+    }
+
+    /// A dotfile manager's symlinked `~/.local`: the link is followed and
+    /// its target's directories are what the rule checks.
+    #[test]
+    fn a_symlinked_ancestor_with_a_trusted_target_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dotfiles = tmp.path().join("dotfiles");
+        dir_at(&dotfiles, 0o755);
+        let home = tmp.path().join("home");
+        dir_at(&home, 0o700);
+        // One absolute link and one relative link with `..`.
+        std::os::unix::fs::symlink(&dotfiles, home.join("abs")).unwrap();
+        std::os::unix::fs::symlink("../dotfiles", home.join("rel")).unwrap();
+
+        for link in ["abs", "rel"] {
+            let paths = paths_in(&home.join(link).join(format!("{link}-state")));
+            paths.ensure_dir().expect(link);
+            assert!(paths.check_dir().unwrap(), "{link}");
+            assert!(
+                dotfiles.join(format!("{link}-state/trawl/trial")).is_dir(),
+                "{link}: the state lands in the link's target"
+            );
+        }
+    }
+
+    /// The link is followed, so a loose target is refused by its own name.
+    #[test]
+    fn a_symlinked_ancestor_is_judged_by_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loose = tmp.path().join("loose");
+        dir_at(&loose, 0o777);
+        let home = tmp.path().join("home");
+        dir_at(&home, 0o700);
+        std::os::unix::fs::symlink(&loose, home.join("link")).unwrap();
+
+        let paths = paths_in(&home.join("link/state"));
+        let err = paths.ensure_dir().expect_err("a loose target");
+        assert!(
+            matches!(&err, TrialError::NotPrivateFile { path, .. } if *path == loose),
+            "{err:?}"
+        );
+        assert!(!loose.join("state").exists());
+    }
+
+    /// Tests run as one user, so the owner rule is walked against a
+    /// different expected uid: root-owned `/` and `/tmp` pass, and the
+    /// first directory the test user owns is refused by name.
+    #[test]
+    fn an_ancestor_owned_by_another_user_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("state");
+        dir_at(&base, 0o700);
+        let owner = fs::symlink_metadata(tmp.path()).unwrap().uid();
+        assert_ne!(owner, 0, "the suite does not run as root");
+        assert!(walk_ancestry(&base, owner).unwrap());
+
+        let err = walk_ancestry(&base, owner.wrapping_add(1)).unwrap_err();
+        assert!(
+            matches!(&err, TrialError::ForeignOwner { path, owner: o, .. }
+                if o == &owner && tmp.path().starts_with(path)),
+            "{err:?}"
+        );
+    }
+
+    /// A link another user owns can be re-pointed in a sticky directory,
+    /// so its owner is checked like a directory's.
+    #[test]
+    fn a_symlink_owned_by_another_user_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        dir_at(&target, 0o700);
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let meta = fs::symlink_metadata(&link).unwrap();
+        verify_ancestor(&link, &meta, meta.uid()).expect("own link passes");
+        assert!(matches!(
+            verify_ancestor(&link, &meta, meta.uid().wrapping_add(1)),
+            Err(TrialError::ForeignOwner { .. })
+        ));
+    }
+
+    #[test]
+    fn a_symlink_loop_in_the_ancestry_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("b"), tmp.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("a"), tmp.path().join("b")).unwrap();
+        let paths = paths_in(&tmp.path().join("a/state"));
+        assert!(matches!(
+            paths.ensure_dir(),
+            Err(TrialError::Io {
+                action: "resolve",
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn check_dir_reports_absence_without_creating() {
         let tmp = tempfile::tempdir().unwrap();
@@ -538,5 +868,45 @@ mod tests {
             read_private(&link, 64).is_err(),
             "a symlink is not followed"
         );
+    }
+
+    #[test]
+    fn read_public_lets_others_read_but_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(&tmp.path().join("state"));
+        paths.ensure_dir().unwrap();
+        let path = paths.ca_file();
+        assert_eq!(read_public(&path, 64).unwrap(), None);
+
+        write_private(&path, b"pem", 0o644).unwrap();
+        assert_eq!(
+            read_public(&path, 64).unwrap().as_deref(),
+            Some(&b"pem"[..])
+        );
+        assert!(
+            matches!(
+                read_private(&path, 64),
+                Err(TrialError::NotPrivateFile { .. })
+            ),
+            "control: the private read refuses the same file"
+        );
+
+        for mode in [0o664, 0o646] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert!(
+                matches!(
+                    read_public(&path, 64),
+                    Err(TrialError::NotPrivateFile { .. })
+                ),
+                "{mode:o}"
+            );
+        }
+
+        let link = paths.dir.join("link.pem");
+        let target = tmp.path().join("target.pem");
+        fs::write(&target, "pem").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_public(&link, 64).is_err(), "a symlink is not followed");
     }
 }

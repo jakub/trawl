@@ -149,6 +149,8 @@ impl Trial {
         private("state.json", state.to_string().as_bytes());
         private("operator.token", format!("{TOKEN}\n").as_bytes());
         std::fs::write(dir.join("ca.pem"), ca_pem).unwrap();
+        std::fs::set_permissions(dir.join("ca.pem"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
 
         Self {
             _tmp: tmp,
@@ -357,6 +359,27 @@ async fn trial_profile_refuses_overrides_before_connecting() {
         0,
         "a refused invocation must not connect"
     );
+}
+
+/// A directory above the trial that another user could rename entries in
+/// is refused by name, before any connection.
+#[tokio::test]
+async fn trial_profile_refuses_a_loose_ancestor_before_connecting() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (pem, chain, key) = self_signed();
+    let (port, seen) = serve(chain, key).await;
+    let trial = Trial::new(port, &pem);
+    std::fs::set_permissions(&trial.state_home, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let output = trial.trawl(&["-p", "trial", "validate", QUERY], &[]).await;
+    assert_refused(&output, "no sticky bit", "loose ancestor");
+    assert!(
+        stderr_of(&output).contains(&trial.state_home.display().to_string()),
+        "the refusal names the directory: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(seen.lock().unwrap().connections, 0);
 }
 
 #[tokio::test]
