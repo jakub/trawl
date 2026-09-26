@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 pub mod cli;
 mod config;
 pub mod schema;
+mod trial;
 mod tui;
 
 /// trawl — search your logs with a pipeline DSL.
@@ -41,6 +42,7 @@ struct Cli {
     insecure: bool,
 
     /// Named profile from config file (overrides [server] settings).
+    /// `trial` is reserved: it connects to the `trawl trial` installation.
     #[arg(long, short = 'p', env = "TRAWL_PROFILE", global = true)]
     profile: Option<String>,
 
@@ -97,6 +99,13 @@ enum Command {
 
         #[command(subcommand)]
         cmd: DriverSubcommand,
+    },
+
+    /// Run a disposable trial installation in Docker on this machine:
+    /// loopback only, with sample data. `-p trial` connects to it.
+    Trial {
+        #[command(subcommand)]
+        cmd: trial::TrialCommand,
     },
 }
 
@@ -382,6 +391,8 @@ pub enum CliError {
     Config(#[from] config::ConfigError),
     #[error("{0}")]
     Usage(String),
+    #[error("{0}")]
+    Trial(#[from] trial::TrialError),
 }
 
 /// The binary's entry point: parse argv, run, and map errors to an exit code.
@@ -401,17 +412,40 @@ pub async fn main() {
     }
 }
 
-async fn run(args: Cli) -> Result<(), CliError> {
+async fn run(mut args: Cli) -> Result<(), CliError> {
+    // Trial verbs run before config.toml is read: a broken client config
+    // must not block `trawl trial up` or `down`.
+    let command = match args.command.take() {
+        Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd)?),
+        command => command,
+    };
+
     // Load config file and apply overrides.
     let mut cfg = config::Config::load(args.config.as_deref())?;
-    if let Some(ref profile) = args.profile {
+    let trial_profile = args.profile.as_deref() == Some(trial::PROFILE);
+    if trial_profile {
+        let overrides =
+            trial::profile::Overrides::observe(args.url.is_some(), args.token.is_some());
+        let config_path = args
+            .config
+            .as_deref()
+            .unwrap_or(config::DEFAULT_CONFIG_PATH);
+        let paths = trial::paths::TrialPaths::from_env()?;
+        trial::profile::apply(&mut cfg, overrides, config_path, &paths)?;
+    } else if let Some(ref profile) = args.profile {
         cfg.apply_profile(profile)?;
     }
     cfg.apply_overrides(args.url, args.insecure);
+    if trial_profile {
+        // The trial is only ever reached through its pinned certificate:
+        // --insecure or TRAWL_INSECURE fails here, through the
+        // ca_cert-with-insecure rule, before any command runs.
+        cfg.tls_trust()?;
+    }
     // Before any output, and before the TUI takes the terminal.
     warn_if_insecure(&cfg, &mut io::stderr().lock())?;
 
-    match args.command {
+    match command {
         None => {
             // TUI mode — tracing goes to a log file, not stderr (which corrupts the UI).
             let log_dir = shellexpand::tilde("~/.config/trawl");
@@ -480,6 +514,8 @@ async fn run(args: Cli) -> Result<(), CliError> {
         Some(Command::Driver { socket, cmd }) => {
             run_driver(&socket, cmd).await?;
         }
+
+        Some(Command::Trial { .. }) => unreachable!("trial verbs return before the config loads"),
     }
 
     Ok(())
