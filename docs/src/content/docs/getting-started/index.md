@@ -5,7 +5,10 @@ description: Install the Trawl client and server packages from APT, a release ta
 
 If someone already runs Trawl for you, [connect to it](/start/connect/). To
 inspect Parquet files only, [Query local Parquet](/start/local-parquet/) needs
-the `trawl` CLI alone. A server installation has these parts:
+the `trawl` CLI alone. To try Trawl before you install a server, install the
+CLI alone on a Linux machine with Docker and run `trawl trial up`:
+[Your first query](/getting-started/first-query/) walks through the trial and
+its trust boundary. A server installation has these parts:
 
 | Component | Responsibility |
 | --- | --- |
@@ -166,5 +169,6 @@ executable: the `lib/trawl` directory is part of the installed product.
 
 ## What's next
 
-[Your first query](/getting-started/first-query/) starts a private server with
-two databases, TLS, keys, and three sample events, and checks an exact result.
+[Your first query](/getting-started/first-query/) starts a disposable trial in
+Docker with `trawl trial up`, checks one exact result in the browser and the
+CLI, and maps each trial step onto the [deployment guide](/operate/deployment/).

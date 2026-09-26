@@ -9,7 +9,8 @@ Pick a starting point from the data you have.
 | --- | --- | --- |
 | A running Trawl server | [Connect to a server](/start/connect/) | Its URL, an API key, and trust in its TLS certificate |
 | Parquet files on disk | [Query local Parquet](/start/local-parquet/) | The `trawl` CLI and read access to the files |
-| Logs to collect from now on | [Install Trawl](/getting-started/), then [your first query](/getting-started/first-query/) | Linux, persistent storage, PostgreSQL, and the server packages |
+| A Linux machine with Docker, and five minutes | [Your first query](/getting-started/first-query/) in a disposable trial | Docker Engine with Compose v2 2.20 or later, and the `trawl` CLI |
+| Logs to collect from now on | [Install Trawl](/getting-started/), then [deploy it](/operate/deployment/) | Linux, persistent storage, PostgreSQL, and the server packages |
 | A change to make to Trawl | [Local development](/getting-started/development/) | Rust, the build tools, and disposable test infrastructure |
 
 ## What a server installation runs
