@@ -492,7 +492,7 @@ async fn full_buffer_refuses_before_decompression() {
 
 /// A refusal never waits on the publication gate: with the gate's write
 /// side held, as compaction holds it to drain, both refusal points answer
-/// within two seconds.
+/// within two seconds, while an admissible request provably waits on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusal_does_not_wait_on_the_publication_gate() {
     stdout();
@@ -504,7 +504,45 @@ async fn refusal_does_not_wait_on_the_publication_gate() {
     let publication = hot(&server).publication();
     let held = publication.write().await;
 
-    // Refused at the reservation (56 + 7 > 60).
+    // Control: an admissible request reserves, then waits on the held gate,
+    // so this is the gate the HTTP path takes. Its charge stays reserved.
+    let (body, _) = events("adm-ac7", "control", 1);
+    let control = tokio::spawn({
+        let server_url = server.url.clone();
+        let token = server.ingest_token.clone();
+        async move {
+            common::harness_client_builder()
+                .build()
+                .unwrap()
+                .post(format!("{server_url}/api/v1/ingest"))
+                .bearer_auth(token)
+                .header("content-type", "application/x-ndjson")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    // Wait until it has reserved, then watch it stay parked on the gate.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while hot(&server).charged().events < 57 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the control reserves its event");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !control.is_finished(),
+        "an admissible request waits for the held gate"
+    );
+    assert_eq!(
+        hot(&server).charged().events,
+        57,
+        "its reservation is held while it waits"
+    );
+
+    // Refused at the reservation (57 + 7 > 60).
     let (body, _) = events("adm-ac7", "reserve", 7);
     let response = tokio::time::timeout(Duration::from_secs(2), post(&server, body, false))
         .await
@@ -512,8 +550,15 @@ async fn refusal_does_not_wait_on_the_publication_gate() {
     assert_eq!(refusal(response).await.0, 503);
 
     drop(held);
-    let (body, _) = events("adm-ac7", "fill", 4);
-    acknowledge(&server, body, 4).await;
+    let response = control.await.unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "the control lands once the gate is released"
+    );
+    let (body, _) = events("adm-ac7", "fill", 3);
+    acknowledge(&server, body, 3).await;
+    assert_eq!(hot(&server).charged().events, 60);
     let held = publication.write().await;
 
     // Refused early, before parsing (60 of 60).
