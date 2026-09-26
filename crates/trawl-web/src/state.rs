@@ -15,6 +15,7 @@
 //! set, because browsers ignore a clear directive whose
 //! `Domain`/`Path`/`SameSite` don't match issuance.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::http::HeaderValue;
@@ -23,7 +24,7 @@ use fleet_auth::{
     DEFAULT_COOKIE_NAME, PublicOrigins, SameSite, SessionKey, build_clear_cookie_header,
     build_session_cookie_header,
 };
-use reqwest::Client;
+use reqwest::{Client, ClientBuilder};
 
 use crate::config::{ResolvedConfig, UpstreamTls};
 
@@ -50,25 +51,15 @@ impl AppState {
     /// if another provider is already installed).
     ///
     /// The client's certificate trust comes from
-    /// [`ResolvedConfig::upstream_tls`], already validated at resolution.
-    /// It follows no redirect in any mode: trawld never sends one, and a
-    /// followed 3xx would carry the proxy past the loopback-only rule of
-    /// the insecure mode to a second host with verification off.
+    /// [`ResolvedConfig::upstream_tls`], already validated at resolution;
+    /// see `upstream_client` for what each mode sets.
     ///
     /// # Errors
     /// Propagates `reqwest::Error` if the client can't be built.
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let builder = Client::builder().redirect(reqwest::redirect::Policy::none());
-        let builder = match cfg.upstream_tls {
-            UpstreamTls::System => builder,
-            // Only the pinned roots, hostname verification left on. A
-            // plain-http hop would skip the pin, so the client refuses one.
-            UpstreamTls::PinnedCa(roots) => builder.tls_certs_only(roots).https_only(true),
-            UpstreamTls::InsecureLoopback => builder.danger_accept_invalid_certs(true),
-        };
-        let http = builder.build()?;
+        let http = upstream_client(Client::builder(), cfg.upstream_tls).build()?;
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -175,6 +166,47 @@ impl AppState {
     }
 }
 
+/// Where the insecure-loopback client dials the name `localhost`. Port 0
+/// defers to the upstream URL's port, which reqwest always prefers.
+const LOCALHOST_ADDRS: [SocketAddr; 2] = [
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+];
+
+/// Set the upstream trust mode on `builder`.
+///
+/// The client follows no redirect in any mode: trawld never sends one, and
+/// a followed 3xx would carry the proxy past the loopback-only rule of the
+/// insecure mode to a second host with verification off.
+///
+/// The insecure-loopback mode also fixes where it dials. Resolution
+/// accepts the name `localhost`, and the host resolver would otherwise
+/// answer for it later, from `/etc/hosts`, NSS or DNS, any of which can
+/// name another machine. So the client maps `localhost` to `127.0.0.1` and
+/// `::1` itself and never asks the resolver. The alternative, a resolver
+/// that drops non-loopback answers, still depends on the system resolver
+/// answering loopback at all; the fixed map has no such dependency, and it
+/// covers every name the mode admits, since the other spellings are IP
+/// literals that are never resolved. The mode also ignores proxy settings,
+/// such as `HTTPS_PROXY`: a proxy resolves the name on its own side, so
+/// requests with verification off would leave the machine.
+///
+/// Split from [`AppState::from_config`] so a test can pass a builder with
+/// its own resolver or proxy and see what the mode overrides.
+fn upstream_client(builder: ClientBuilder, tls: UpstreamTls) -> ClientBuilder {
+    let builder = builder.redirect(reqwest::redirect::Policy::none());
+    match tls {
+        UpstreamTls::System => builder,
+        // Only the pinned roots, hostname verification left on. A
+        // plain-http hop would skip the pin, so the client refuses one.
+        UpstreamTls::PinnedCa(roots) => builder.tls_certs_only(roots).https_only(true),
+        UpstreamTls::InsecureLoopback => builder
+            .danger_accept_invalid_certs(true)
+            .resolve_to_addrs("localhost", &LOCALHOST_ADDRS)
+            .no_proxy(),
+    }
+}
+
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
@@ -189,8 +221,99 @@ impl std::fmt::Debug for AppState {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use reqwest::dns::{Name, Resolve, Resolving};
+    use tokio::net::TcpListener;
 
     use super::*;
+
+    /// A host resolver that answers nothing and counts how often it is
+    /// asked, standing in for one that would name another machine.
+    struct RefusingResolver(Arc<AtomicUsize>);
+
+    impl Resolve for RefusingResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(
+                Err("the host resolver was asked".into()),
+            ))
+        }
+    }
+
+    /// Send one request to `url` with `client` and report whether
+    /// `listener` saw a connection. The TLS handshake then fails, since
+    /// the listener speaks no TLS; only the dial matters here.
+    async fn dials(client: &Client, url: String, listener: &TcpListener) -> bool {
+        let request = tokio::spawn(client.get(url).send());
+        let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .is_ok_and(|accept| accept.is_ok());
+        request.abort();
+        accepted
+    }
+
+    #[tokio::test]
+    async fn insecure_loopback_dials_localhost_without_asking_the_resolver() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "https://localhost:{}/api/v1/whoami",
+            listener.local_addr().unwrap().port()
+        );
+
+        // Control: in the verifying mode the name goes to the resolver,
+        // which refuses, so the injected resolver is the one in use.
+        let asked = Arc::new(AtomicUsize::new(0));
+        let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
+        let client = upstream_client(base, UpstreamTls::System).build().unwrap();
+        let err = client.get(&url).send().await.expect_err("nothing resolves");
+        assert!(err.is_connect(), "got: {err:?}");
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        let asked = Arc::new(AtomicUsize::new(0));
+        let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
+        let client = upstream_client(base, UpstreamTls::InsecureLoopback)
+            .build()
+            .unwrap();
+        assert!(
+            dials(&client, url, &listener).await,
+            "the insecure client did not dial localhost on 127.0.0.1"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "the insecure client asked the host resolver for localhost"
+        );
+    }
+
+    #[tokio::test]
+    async fn insecure_loopback_ignores_a_configured_proxy() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap());
+        let client = upstream_client(base, UpstreamTls::InsecureLoopback)
+            .build()
+            .unwrap();
+
+        let url = format!(
+            "https://localhost:{}/api/v1/whoami",
+            upstream.local_addr().unwrap().port()
+        );
+        assert!(
+            dials(&client, url, &upstream).await,
+            "the insecure client did not dial the upstream directly"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), proxy.accept())
+                .await
+                .is_err(),
+            "the insecure client went through the proxy"
+        );
+    }
 
     fn state(cookie_secure: bool) -> AppState {
         AppState::from_config(ResolvedConfig {
