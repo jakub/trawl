@@ -128,14 +128,18 @@ pub fn keys_list_args() -> Args {
     fleet_admin(Args::new().args(["keys", "list"]))
 }
 
-/// `fleet-admin keys revoke <prefix> --yes`. The prefix is withheld from
-/// every error, and `fleet-admin` echoes it on stderr, so run it sealed.
+/// `fleet-admin keys revoke --yes -- <prefix>`. The prefix is withheld
+/// from every error, and `fleet-admin` echoes it on stderr, so run it
+/// sealed.
+///
+/// A base64url prefix can start with `-`, which clap would read as an
+/// option, so the options come first and `--` ends them before the
+/// prefix.
 pub fn key_revoke_args(prefix: &KeyPrefix) -> Args {
     fleet_admin(
         Args::new()
-            .args(["keys", "revoke"])
-            .withheld(&prefix.0)
-            .arg("--yes"),
+            .args(["keys", "revoke", "--yes", "--"])
+            .withheld(&prefix.0),
     )
 }
 
@@ -559,6 +563,19 @@ mod tests {
         assert!(!args.display().contains("pfx12345"), "{}", args.display());
         assert!(!format!("{args:?}").contains("pfx12345"));
         assert!(args.argv().iter().any(|a| a == "pfx12345"));
+    }
+
+    #[test]
+    fn a_prefix_that_starts_with_a_dash_follows_the_end_of_options() {
+        let prefix = KeyPrefix::parse("-bcdefgh").unwrap();
+        let call = key_revoke_args(&prefix);
+        assert_eq!(
+            call.display(),
+            "docker run --rm --no-deps -T fleet-admin keys revoke --yes -- <withheld>"
+        );
+        let argv = call.argv();
+        assert_eq!(argv.last().unwrap(), "-bcdefgh");
+        assert_eq!(argv[argv.len() - 2], "--");
     }
 
     #[test]
