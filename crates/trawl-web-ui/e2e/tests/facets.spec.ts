@@ -315,6 +315,26 @@ test('an aggregation that closes the rail moves focus from a group header to the
   await expect(page.locator(SEL.filterRailSummary)).toBeFocused();
 });
 
+// Clear all outlives the groups while a filter is set, so here it is the
+// closed rail's inert content, not an unmount, that takes focus away.
+test('an aggregation that closes the rail moves focus from Clear all to the summary', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(`${AGG_URL}&f=${FILTER}`);
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await page.locator(SEL.cmContent).fill(`service=${CORPUS.service}`);
+  await page.locator(SEL.runButton).click();
+  await expect(page.locator(SEL.facetGroup).first()).toBeVisible();
+  await expectRail(page, true);
+
+  await page.locator(SEL.facetClear).focus();
+  await page.goBack();
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
+  await expectRail(page, false);
+  await expect(page.locator(SEL.filterRailContent)).toHaveAttribute('inert', '');
+  await expect(page.locator(SEL.filterRailSummary)).toBeFocused();
+});
+
 // A closed rail's own controls are out of the tab order, whatever it
 // holds: on an idle page it holds nothing, and on an aggregation carrying
 // a filter it holds a Clear all.

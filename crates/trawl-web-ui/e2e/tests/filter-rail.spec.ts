@@ -362,3 +362,64 @@ test('filter rail: a malformed link leaves the strip, and an open rail shows its
   await expect(page.locator(SEL.facetClear)).toHaveCount(0);
   await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
 });
+
+// A closed wide rail's content is inert, so the browser cannot open the
+// rail by itself (below). The narrow disclosure's content never is: it
+// stays searchable, as it was before ADR-0044.
+test('filter rail: a closed wide rail is inert, an open one and the narrow disclosure are not', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto('/search');
+  await expectRail(page, false);
+  const content = page.locator(SEL.filterRailContent);
+  await expect(content).toHaveAttribute('inert', '');
+  await haul(page, COUNTABLE);
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
+  await expectRail(page, true);
+  await expect(content).not.toHaveAttribute('inert');
+  await page.locator(SEL.filterRailSummary).click();
+  await expectRail(page, false);
+  await expect(content).toHaveAttribute('inert', '');
+  await page.setViewportSize({ width: 720, height: 900 });
+  await expect(content).not.toHaveAttribute('inert');
+  await expect(page.locator(SEL.filterRail)).not.toHaveAttribute('open');
+});
+
+// The browser opens a closed <details> by itself to show a match inside
+// it: find-in-page does, and so does a link's text fragment, which is
+// the one a test can drive. That open never reaches the rail's state,
+// so a hand-closed wide rail would show open while its state says
+// closed, and the next press would "close" it into the open it already
+// shows. The narrow leg is the control: there the same link does open
+// the disclosure, and the disclosure's state follows it.
+test('filter rail: a link cannot open a closed wide rail, and the narrow disclosure follows one it opens', async ({ page, request }) => {
+  await resetScenario(request, 'corpus');
+  await page.goto(COUNTABLE_URL);
+  await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
+  await expectRail(page, true);
+  const rail = page.locator(SEL.filterRail);
+  const summary = page.locator(SEL.filterRailSummary);
+  await summary.click();
+  await expectRail(page, false);
+
+  // "+ 1 more" is the host group's control; nothing outside the rail
+  // says it. Chromium drops the directive from the URL once it has read
+  // it, so the same link can be followed twice.
+  const followLink = () => page.goto(page.url() + '#:~:text=' + encodeURIComponent('+ 1 more'));
+  const toggles = await watchToggles(page);
+  await followLink();
+  expect(await toggles()).toBe(0);
+  await expectRail(page, false);
+  // And the rail still answers its one control.
+  await summary.click();
+  await expectRail(page, true);
+
+  await page.setViewportSize({ width: 720, height: 900 });
+  await expect(rail).not.toHaveAttribute('open');
+  const closed = await toggles();
+  await followLink();
+  await expect.poll(toggles).toBe(closed + 1);
+  await expect(rail).toHaveAttribute('open', '');
+  // One press closes it: the state took the browser's open.
+  await summary.click();
+  await expect(rail).not.toHaveAttribute('open');
+});

@@ -13,10 +13,18 @@
 //! answer: idle, zero rows, rows with nothing to count, an aggregation, a
 //! failed query or a malformed link. A press on the `<summary>` is a
 //! hand choice, which holds for the browser session through
-//! [`FilterRailChoice`]. The press is read from the summary's `click`,
-//! never from `toggle`, which also fires for the automatic changes.
-//! Below 900px the rail is a disclosure above the results that starts
-//! closed and opens only by hand, with its own component-local state.
+//! [`FilterRailChoice`]. Below 900px the rail is a disclosure above the
+//! results that starts closed and opens only by hand, with its own
+//! component-local state.
+//!
+//! One writer each. The summary's `click` writes the state, at both
+//! widths: it cancels the native toggle and flips the narrow state or
+//! the wide choice. The `open` binding writes the DOM. `toggle` records
+//! nothing, because it also fires for the automatic changes and arrives
+//! a frame late. Below 900px it only takes up an open the browser made
+//! by itself, as find-in-page does for a match. A closed wide rail's
+//! content is `inert`, which find-in-page and text fragments skip, so
+//! the browser cannot open the wide rail that way.
 //!
 //! The `<summary>` is the rail's one control: a vertical strip when the
 //! rail is closed, and the header row (chevron, "Filters", the active
@@ -94,8 +102,9 @@ pub fn FacetSidebar(
     // both stylesheets query it), so the disclosure and the layout it
     // presents can never disagree by a pixel.
     let compact = use_media_query("(max-width: 899.98px)");
-    // The narrow disclosure's own state, written only by its native
-    // toggle and the focus reopen below. The wide rail never reads it.
+    // The narrow disclosure's own state, written by a narrow press on the
+    // `<summary>`, the focus reopen below, and the `toggle` reconcile for
+    // an open the browser made by itself. The wide rail never reads it.
     let open = RwSignal::new(false);
     let panel = NodeRef::<leptos::html::Details>::new();
     let summary = NodeRef::<leptos::html::Summary>::new();
@@ -171,9 +180,24 @@ pub fn FacetSidebar(
             class="facet-panel"
             node_ref=panel
             open=move || rail_open.get()
+            // Not a record of presses: the `<summary>` click records
+            // those at both widths. `toggle` is dispatched a frame after
+            // the change it reports, when the width may have crossed the
+            // breakpoint, and it fires for the binding's own writes too.
+            // Its one job is narrow. When the DOM disagrees with what the
+            // binding last rendered, the browser opened or closed the
+            // disclosure by itself (find-in-page opens one to show a
+            // match), and the narrow state takes that up, or the next
+            // press would look dead. It never writes the wide choice: the
+            // first automatic open would become a hand choice.
             on:toggle=move |_| {
-                if compact.get() && let Some(panel) = panel.get() {
-                    open.set(panel.has_attribute("open"));
+                if compact.get_untracked()
+                    && let Some(panel) = panel.get_untracked()
+                {
+                    let shown = panel.has_attribute("open");
+                    if shown != rail_open.get_untracked() {
+                        open.set(shown);
+                    }
                 }
             }
             on:focusin=move |_| focus_inside.set_value(true)
@@ -191,16 +215,18 @@ pub fn FacetSidebar(
         >
         <summary
             node_ref=summary
-            // The wide rail's one writer of the hand choice. The press
-            // cancels the native toggle and sets the choice, and the
-            // `open` binding above renders it. Narrow presses keep the
-            // native toggle, which `on:toggle` records.
+            // The one writer of the rail's state at both widths. The
+            // press cancels the native toggle and flips the state its
+            // width owns: the narrow disclosure's own, or the wide hand
+            // choice. The `open` binding above is the only writer of the
+            // DOM, so it renders either.
             on:click=move |event: web_sys::MouseEvent| {
-                if compact.get_untracked() {
-                    return;
-                }
                 event.prevent_default();
-                choice.choose(!wide_open.get_untracked());
+                if compact.get_untracked() {
+                    open.update(|open| *open = !*open);
+                } else {
+                    choice.choose(!wide_open.get_untracked());
+                }
             }
         >
             <span class="facet-chev" aria-hidden="true">
@@ -213,7 +239,19 @@ pub fn FacetSidebar(
                 else { format!("{count} active") }
             }}</span>
         </summary>
-        <aside class="facets" aria-label="Search filters">
+        // A closed wide rail's content is inert, so the browser cannot
+        // open the rail by itself. Find-in-page and a link's text
+        // fragment show a match inside a closed `<details>` by opening
+        // it, and that open would bypass the hand choice: the rail would
+        // show open while its state says closed, and the next press
+        // would look dead. Inert content is not searched. The narrow
+        // disclosure stays searchable, and `on:toggle` follows what the
+        // browser opens there.
+        <aside
+            class="facets"
+            aria-label="Search filters"
+            inert=move || !compact.get() && !rail_open.get()
+        >
             <div class="phead">
                 <Show when=move || !filters.get().is_empty() && !suppressed.get()>
                     <button

@@ -21,15 +21,6 @@ async function insideViewport(locator: Locator) {
 async function noPageOverflow(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(page.viewportSize()!.width);
 }
-/** Run a narrow press, then let its `toggle` fire. The narrow disclosure
- * records its state from that event, which the browser dispatches a frame
- * or so after the press (two quick presses may coalesce into none), so a
- * resize across the breakpoint before it fires would read the press as
- * the other layout's. */
-async function narrowPress(page: Page, press: () => Promise<void>) {
-  await press();
-  await settle(page);
-}
 /** Two frames and a task: a media query change the viewport caused has
  * reached the app, and whatever it set off has run, so an assertion
  * that something did NOT happen is not read too early. */
@@ -115,7 +106,7 @@ test('responsive filters preserve field search, expanded groups and URL filters 
   await expect(summary).toContainText('1 active');
   await summary.click();
   await expect(needle).not.toBeVisible();
-  await narrowPress(page, () => summary.press('Enter'));
+  await summary.press('Enter');
   await expect(needle).toHaveValue('0');
   await expect(page.getByRole('button', { name: 'Include host = cache-01', exact: true })).toBeVisible();
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -153,9 +144,9 @@ test('responsive filters: a countable page leaves the narrow disclosure closed, 
   const panel = page.locator(SEL.filterRail), summary = page.locator(SEL.filterRailSummary);
   await settle(page);
   await expect(panel).not.toHaveAttribute('open');
-  await narrowPress(page, () => summary.click());
+  await summary.click();
   await expect(panel).toHaveAttribute('open', '');
-  await narrowPress(page, () => summary.click());
+  await summary.click();
   await expect(panel).not.toHaveAttribute('open');
   // Wide, on the same countable page, the rail opens by itself.
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -168,7 +159,7 @@ test('responsive filters keep the value search and group state across 720, 1440 
   await page.goto('/search?q=service%3Dnginx');
   await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
   const panel = page.locator(SEL.filterRail), summary = page.locator(SEL.filterRailSummary);
-  await narrowPress(page, () => summary.click());
+  await summary.click();
   await expect(panel).toHaveAttribute('open', '');
   const needle = page.locator(SEL.facetFilterInput);
   await needle.fill('0');

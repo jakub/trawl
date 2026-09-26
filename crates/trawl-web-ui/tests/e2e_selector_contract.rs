@@ -1325,6 +1325,18 @@ const CONTRACTS: &[Contract] = &[
         hook: "<summary",
     },
     Contract {
+        assignment: "filterRailContent: '.facet-panel > .facets',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facet-panel\"",
+    },
+    Contract {
+        assignment: "filterRailContent: '.facet-panel > .facets',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facets\"",
+    },
+    Contract {
         assignment: "facetCount: '.facet-count',",
         source_path: "src/components/facet_sidebar.rs",
         source: FACET_SIDEBAR_RS,

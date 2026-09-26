@@ -343,6 +343,10 @@ export const SEL = {
   /// Its `<summary>`: the closed strip and the open header row, and the
   /// one control whose press is a hand choice.
   filterRailSummary: '.facet-panel > summary',
+  /// Everything under the summary. `inert` while the wide rail is
+  /// closed, so the browser cannot open it to reveal a match; never
+  /// inert below 900px.
+  filterRailContent: '.facet-panel > .facets',
   /// The summary's active count, `N active`; empty with no filters.
   facetCount: '.facet-count',
   /// The line an open rail shows in place of the value search and the
