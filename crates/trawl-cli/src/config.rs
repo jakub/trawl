@@ -89,6 +89,13 @@ pub struct ServerConfig {
     /// `~`-prefixed; never combined with `insecure`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<PathBuf>,
+
+    /// CA roots already read into memory, pinned in place of `ca_cert`.
+    /// `-p trial` sets it from the bytes it read and checked once, so no
+    /// later step re-opens a path that could have changed. Never read from
+    /// or written to the config file.
+    #[serde(skip)]
+    pub pinned_ca: Option<Vec<u8>>,
 }
 
 impl Default for ServerConfig {
@@ -98,6 +105,7 @@ impl Default for ServerConfig {
             token: None,
             insecure: false,
             ca_cert: None,
+            pinned_ca: None,
         }
     }
 }
@@ -252,8 +260,16 @@ impl Config {
     ///
     /// A `ca_cert` is read here, so a missing, unreadable, or empty file
     /// fails before any request. `ca_cert` beside an effective `insecure`
-    /// is refused rather than letting either one silently win.
+    /// is refused rather than letting either one silently win. In-memory
+    /// `pinned_ca` bytes take the place of `ca_cert` and follow the same
+    /// `insecure` rule.
     pub fn tls_trust(&self) -> Result<trawl_client::TlsTrust, ConfigError> {
+        if let Some(ref pem) = self.server.pinned_ca {
+            if self.server.insecure {
+                return Err(ConfigError::CaCertWithInsecure);
+            }
+            return Ok(trawl_client::TlsTrust::PinnedCa(pem.clone()));
+        }
         let Some(ref ca_cert) = self.server.ca_cert else {
             return Ok(if self.server.insecure {
                 trawl_client::TlsTrust::AcceptInvalid
@@ -706,6 +722,26 @@ ca_cert = ""
         assert!(matches!(
             config.tls_trust(),
             Err(ConfigError::CaCertRead { .. })
+        ));
+    }
+
+    /// In-memory roots are pinned as they are, with no file behind them,
+    /// and refuse `insecure` exactly as `ca_cert` does.
+    #[test]
+    fn pinned_ca_bytes_pin_without_a_file() {
+        let mut config = Config::default();
+        config.server.pinned_ca = Some(b"pem bytes".to_vec());
+        assert_eq!(
+            config.tls_trust().unwrap(),
+            TlsTrust::PinnedCa(b"pem bytes".to_vec())
+        );
+        let toml = toml::to_string(&config).unwrap();
+        assert!(!toml.contains("pinned_ca"), "never serialized: {toml}");
+
+        config.apply_overrides(None, true);
+        assert!(matches!(
+            config.tls_trust(),
+            Err(ConfigError::CaCertWithInsecure)
         ));
     }
 

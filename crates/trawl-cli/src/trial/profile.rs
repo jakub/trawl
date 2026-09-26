@@ -15,11 +15,15 @@
 //! `[profiles.trial]` of the user's own. The overlay turns `insecure` off
 //! and pins the trial's `ca.pem`, so `--insecure` or `TRAWL_INSECURE` then
 //! fails through the `ca_cert`-with-`insecure` rule.
+//!
+//! The certificate is read once, here, through the same checked read as
+//! the token, and the connection pins those bytes. No pathname is handed
+//! on for a later step to open again.
 
 use crate::config::Config;
 
 use super::TrialError;
-use super::paths::{TrialPaths, read_private};
+use super::paths::{TrialPaths, read_private, read_public};
 use super::state::TrialState;
 
 /// The environment variable clap binds to `--url`.
@@ -29,6 +33,9 @@ pub const TOKEN_ENV: &str = "TRAWL_TOKEN";
 
 /// A token file holds the token and one newline.
 const MAX_TOKEN_BYTES: u64 = 4096;
+
+/// `ca.pem` holds one self-signed certificate: a few kilobytes.
+const MAX_CA_BYTES: u64 = 64 * 1024;
 
 /// Connection settings the invocation supplied besides the profile.
 ///
@@ -103,18 +110,9 @@ pub fn apply(
         dir: paths.dir.clone(),
         missing,
     };
-    let ca = paths.ca_file();
-    match std::fs::symlink_metadata(&ca) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => {
-            return Err(TrialError::NotPrivateFile {
-                path: ca,
-                reason: "the trial certificate must be a regular file",
-            });
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_ready("certificate")),
-        Err(e) => return Err(TrialError::io("inspect", ca, e)),
-    }
+    let ca = read_public(&paths.ca_file(), MAX_CA_BYTES)?
+        .filter(|pem| !pem.iter().all(u8::is_ascii_whitespace))
+        .ok_or_else(|| not_ready("certificate"))?;
     let token_path = paths.operator_token_file();
     let token = read_private(&token_path, MAX_TOKEN_BYTES)?
         .and_then(|bytes| String::from_utf8(bytes).ok())
@@ -127,7 +125,8 @@ pub fn apply(
     cfg.server.url = format!("https://127.0.0.1:{}", state.ports.api);
     cfg.server.token = Some(token);
     cfg.server.insecure = false;
-    cfg.server.ca_cert = Some(ca);
+    cfg.server.ca_cert = None;
+    cfg.server.pinned_ca = Some(ca);
     Ok(())
 }
 
@@ -184,15 +183,88 @@ url = "https://lab.example:5514"
 
         assert_eq!(cfg.server.url, "https://127.0.0.1:15999");
         assert!(!cfg.server.insecure, "the overlay turns insecure off");
-        assert_eq!(
-            cfg.server.ca_cert.as_deref(),
-            Some(paths.ca_file().as_path())
-        );
+        assert_eq!(cfg.server.pinned_ca.as_deref(), Some(PEM));
 
         let conn = crate::connection(&cfg, None).unwrap();
         assert_eq!(conn.url, "https://127.0.0.1:15999");
         assert_eq!(conn.token, TOKEN);
         assert_eq!(conn.trust, TlsTrust::PinnedCa(PEM.to_vec()));
+    }
+
+    /// The certificate is read once, at resolution. Whatever happens to
+    /// `ca.pem` afterwards, the connection pins the bytes read then, and no
+    /// pathname is left for a later step to open.
+    #[test]
+    fn the_connection_pins_the_bytes_read_at_resolution() {
+        let (_tmp, paths) = ready_trial(15999);
+        let mut cfg: Config =
+            toml::from_str("[server]\nca_cert = \"/etc/trawl/prod-ca.pem\"\n").unwrap();
+        apply_default(&mut cfg, &paths).unwrap();
+        assert_eq!(
+            cfg.server.ca_cert, None,
+            "no pathname survives the overlay, not even an inherited one"
+        );
+
+        let substitute = b"-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----\n";
+        write_private(&paths.ca_file(), substitute, 0o644).unwrap();
+        let conn = crate::connection(&cfg, None).unwrap();
+        assert_eq!(conn.trust, TlsTrust::PinnedCa(PEM.to_vec()));
+
+        std::fs::remove_dir_all(&paths.dir).unwrap();
+        let conn = crate::connection(&cfg, None).unwrap();
+        assert_eq!(
+            conn.trust,
+            TlsTrust::PinnedCa(PEM.to_vec()),
+            "the trial directory is not read again"
+        );
+    }
+
+    /// `ca.pem` goes through the checked read: a link or a file others can
+    /// write is refused, and an empty one is an unfinished trial.
+    #[test]
+    fn an_untrusted_or_empty_certificate_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (tmp, paths) = ready_trial(15999);
+        std::fs::set_permissions(paths.ca_file(), std::fs::Permissions::from_mode(0o666)).unwrap();
+        let err = apply_default(&mut Config::default(), &paths).unwrap_err();
+        assert!(matches!(err, TrialError::NotPrivateFile { .. }), "{err:?}");
+
+        let elsewhere = tmp.path().join("elsewhere.pem");
+        std::fs::write(&elsewhere, PEM).unwrap();
+        std::fs::remove_file(paths.ca_file()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, paths.ca_file()).unwrap();
+        assert!(apply_default(&mut Config::default(), &paths).is_err());
+
+        std::fs::remove_file(paths.ca_file()).unwrap();
+        write_private(&paths.ca_file(), b" \n", 0o644).unwrap();
+        let err = apply_default(&mut Config::default(), &paths).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TrialError::TrialNotReady {
+                    missing: "certificate",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// The ancestry rule reaches the `-p trial` read path.
+    #[test]
+    fn a_loose_ancestor_refuses_the_profile() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (tmp, paths) = ready_trial(15999);
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut cfg = Config::default();
+        let err = apply_default(&mut cfg, &paths).unwrap_err();
+        assert!(
+            matches!(&err, TrialError::NotPrivateFile { path, .. } if path == tmp.path()),
+            "{err:?}"
+        );
+        assert_eq!(cfg.server.token, None, "nothing applied");
     }
 
     /// `--insecure` / `TRAWL_INSECURE` land after the overlay and must not
