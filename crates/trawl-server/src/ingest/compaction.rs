@@ -6226,10 +6226,11 @@ mod tests {
     /// How [`quarantined_batches_drain_whether_or_not_their_chunk_publishes`]
     /// ends its first compaction pass.
     #[derive(Debug, Clone, Copy)]
-    enum ChunkEnd {
+    pub(super) enum ChunkEnd {
         Publishes,
         /// Phase 2: the catalog is unreachable, so the pins never become
-        /// durable.
+        /// durable. The dead catalog is a pool, so this case runs from
+        /// `pg_tests`, inside the postgres test group.
         CatalogUnreachable,
         /// Phase 3: the env data path is a file, so the write fails.
         WriteFails,
@@ -6244,122 +6245,117 @@ mod tests {
     /// chunk whose preparation panics after the quarantine. The chunk's
     /// other batches stay resident until a retry publishes them.
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // one fixture, every way the chunk can end
     async fn quarantined_batches_drain_whether_or_not_their_chunk_publishes() {
         for end in [
             ChunkEnd::Publishes,
-            ChunkEnd::CatalogUnreachable,
             ChunkEnd::WriteFails,
             ChunkEnd::PrepPanics,
         ] {
-            let tmp = tempfile::tempdir().unwrap();
-            let wal = tmp.path().join("wal");
-            let data = tmp.path().join("data");
-            let env_wal = wal.join("prod");
-            std::fs::create_dir_all(&env_wal).unwrap();
-            let hot = hot_buffer();
+            quarantined_chunk_ends(end, None).await;
+        }
+    }
 
-            // The corrupt batch goes in first, so it is the oldest resident.
-            let corrupt = env_wal.join("svc_1729999999999_dead.ndjson");
-            std::fs::write(&corrupt, [0; 32]).unwrap();
-            hot.insert_for_test(Arc::new(crate::bus::IngestBatch {
-                batch_id: "prod/svc_1729999999999_dead".into(),
-                service: "svc".into(),
-                events: vec![serde_json::Map::new(); 3],
-                byte_size: 32,
-            }));
-            let corrupt_charge = hot.charged();
-            assert!(!corrupt_charge.is_zero());
+    /// One pass of [`quarantined_batches_drain_whether_or_not_their_chunk_publishes`].
+    /// `catalog` is the dead catalog for [`ChunkEnd::CatalogUnreachable`],
+    /// and `None` for every other end.
+    #[allow(clippy::too_many_lines)] // one fixture, every way the chunk can end
+    pub(super) async fn quarantined_chunk_ends(end: ChunkEnd, catalog: Option<&CatalogContext>) {
+        assert_eq!(
+            catalog.is_some(),
+            matches!(end, ChunkEnd::CatalogUnreachable),
+            "{end:?}"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let hot = hot_buffer();
 
-            // A field no pin covers, so phase 2 needs the catalog.
-            let good: Vec<PathBuf> = ["q-good-0", "q-good-1"]
-                .iter()
-                .enumerate()
-                .map(|(n, tag)| {
-                    let path = env_wal.join(format!("svc_173000000000{n}_{n:04x}.ndjson"));
-                    std::fs::write(
-                        &path,
-                        format!(
-                            r#"{{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"svc","message":"{tag}","quarantine_probe":{n}}}"#
-                        ),
-                    )
-                    .unwrap();
-                    insert_hot(&hot, "prod", &path, "svc");
-                    path
-                })
-                .collect();
-            let all_charged = hot.charged();
-            assert_eq!(hot.batch_count(), 3);
+        // The corrupt batch goes in first, so it is the oldest resident.
+        let corrupt = env_wal.join("svc_1729999999999_dead.ndjson");
+        std::fs::write(&corrupt, [0; 32]).unwrap();
+        hot.insert_for_test(Arc::new(crate::bus::IngestBatch {
+            batch_id: "prod/svc_1729999999999_dead".into(),
+            service: "svc".into(),
+            events: vec![serde_json::Map::new(); 3],
+            byte_size: 32,
+        }));
+        let corrupt_charge = hot.charged();
+        assert!(!corrupt_charge.is_zero());
 
-            // Deliberately unreachable: this pool simulates a dead catalog
-            // store, not a fixture database (ADR-0021 ruling 3).
-            #[allow(clippy::disallowed_methods)]
-            let dead_catalog = CatalogContext {
-                store: crate::store::CatalogStore::new(
-                    sqlx::postgres::PgPoolOptions::new()
-                        .acquire_timeout(Duration::from_millis(200))
-                        .connect_lazy("postgres://nobody@127.0.0.1:1/nowhere")
-                        .unwrap(),
-                ),
-                cache: Arc::new(crate::catalog::FieldCatalog::new()),
-            };
-            let catalog = match end {
-                ChunkEnd::CatalogUnreachable => Some(&dead_catalog),
-                ChunkEnd::Publishes | ChunkEnd::WriteFails | ChunkEnd::PrepPanics => None,
-            };
-            let panic = matches!(end, ChunkEnd::PrepPanics).then(|| phase1_panic::arm(&data));
-            let env_data = data.join("prod");
-            if matches!(end, ChunkEnd::WriteFails) {
-                std::fs::create_dir_all(&data).unwrap();
-                std::fs::write(&env_data, b"not a directory").unwrap();
-            }
-            let quarantines = compact_once(
-                &wal,
-                &data,
-                Duration::ZERO,
-                false,
-                Some(&hot),
-                DEFAULT_CHUNK_SIZE,
-                "2GB",
-                catalog,
-            )
-            .await
-            .unwrap();
-            assert_eq!(quarantines, 1, "{end:?}");
-            assert!(
-                corrupt.with_extension("ndjson.corrupt").is_file(),
-                "{end:?}"
-            );
+        // A field no pin covers, so phase 2 needs the catalog.
+        let good: Vec<PathBuf> = ["q-good-0", "q-good-1"]
+            .iter()
+            .enumerate()
+            .map(|(n, tag)| {
+                let path = env_wal.join(format!("svc_173000000000{n}_{n:04x}.ndjson"));
+                std::fs::write(
+                    &path,
+                    format!(
+                        r#"{{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"svc","message":"{tag}","quarantine_probe":{n}}}"#
+                    ),
+                )
+                .unwrap();
+                insert_hot(&hot, "prod", &path, "svc");
+                path
+            })
+            .collect();
+        let all_charged = hot.charged();
+        assert_eq!(hot.batch_count(), 3);
 
-            if matches!(end, ChunkEnd::Publishes) {
-                assert_eq!(hot.charged(), Charge::ZERO, "{end:?}");
-                assert_eq!(hot.oldest_batch_age(), None, "{end:?}");
-                assert_eq!(hot.drained_batches(), 3, "{end:?}");
-                assert_eq!(published_messages(&data), ["q-good-0", "q-good-1"]);
-                continue;
-            }
+        let panic = matches!(end, ChunkEnd::PrepPanics).then(|| phase1_panic::arm(&data));
+        let env_data = data.join("prod");
+        if matches!(end, ChunkEnd::WriteFails) {
+            std::fs::create_dir_all(&data).unwrap();
+            std::fs::write(&env_data, b"not a directory").unwrap();
+        }
+        let quarantines = compact_once(
+            &wal,
+            &data,
+            Duration::ZERO,
+            false,
+            Some(&hot),
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            catalog,
+        )
+        .await
+        .unwrap();
+        assert_eq!(quarantines, 1, "{end:?}");
+        assert!(
+            corrupt.with_extension("ndjson.corrupt").is_file(),
+            "{end:?}"
+        );
 
-            assert!(good.iter().all(|path| path.is_file()), "{end:?}: WAL kept");
-            assert_eq!(
-                hot.charged(),
-                all_charged.checked_sub(corrupt_charge).unwrap(),
-                "{end:?}: exactly the quarantined batch's charge is released"
-            );
-            assert_eq!(hot.drained_batches(), 1, "{end:?}");
-            assert_eq!(hot.batch_count(), 2, "{end:?}: the failed chunk stays");
-            assert!(published_messages(&data).is_empty(), "{end:?}");
-
-            // Clear the fault: the retry publishes the rest, and nothing
-            // stays behind to age.
-            if matches!(end, ChunkEnd::WriteFails) {
-                std::fs::remove_file(&env_data).unwrap();
-            }
-            drop(panic);
-            assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0, "{end:?}");
+        if matches!(end, ChunkEnd::Publishes) {
             assert_eq!(hot.charged(), Charge::ZERO, "{end:?}");
             assert_eq!(hot.oldest_batch_age(), None, "{end:?}");
+            assert_eq!(hot.drained_batches(), 3, "{end:?}");
             assert_eq!(published_messages(&data), ["q-good-0", "q-good-1"]);
+            return;
         }
+
+        assert!(good.iter().all(|path| path.is_file()), "{end:?}: WAL kept");
+        assert_eq!(
+            hot.charged(),
+            all_charged.checked_sub(corrupt_charge).unwrap(),
+            "{end:?}: exactly the quarantined batch's charge is released"
+        );
+        assert_eq!(hot.drained_batches(), 1, "{end:?}");
+        assert_eq!(hot.batch_count(), 2, "{end:?}: the failed chunk stays");
+        assert!(published_messages(&data).is_empty(), "{end:?}");
+
+        // Clear the fault: the retry publishes the rest, and nothing
+        // stays behind to age.
+        if matches!(end, ChunkEnd::WriteFails) {
+            std::fs::remove_file(&env_data).unwrap();
+        }
+        drop(panic);
+        assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0, "{end:?}");
+        assert_eq!(hot.charged(), Charge::ZERO, "{end:?}");
+        assert_eq!(hot.oldest_batch_age(), None, "{end:?}");
+        assert_eq!(published_messages(&data), ["q-good-0", "q-good-1"]);
     }
 
     #[test]
@@ -12288,5 +12284,36 @@ mod tests {
                 }
             );
         }
+    }
+}
+
+/// The compaction case that needs a catalog pool. It dials nothing that
+/// answers, but the pool is still a pool, so it lives outside `tests` and
+/// runs in the postgres test group (`.config/nextest.toml`).
+#[cfg(test)]
+mod pg_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::CatalogContext;
+    use super::tests::{ChunkEnd, quarantined_chunk_ends};
+
+    /// [`ChunkEnd::CatalogUnreachable`]: phase 2 cannot make the pins
+    /// durable, and the quarantined batch still drains.
+    #[tokio::test]
+    async fn quarantined_batches_drain_when_the_catalog_is_unreachable() {
+        // Deliberately unreachable: this pool simulates a dead catalog
+        // store, not a fixture database (ADR-0021 ruling 3).
+        #[allow(clippy::disallowed_methods)]
+        let dead_catalog = CatalogContext {
+            store: crate::store::CatalogStore::new(
+                sqlx::postgres::PgPoolOptions::new()
+                    .acquire_timeout(Duration::from_millis(200))
+                    .connect_lazy("postgres://nobody@127.0.0.1:1/nowhere")
+                    .unwrap(),
+            ),
+            cache: Arc::new(crate::catalog::FieldCatalog::new()),
+        };
+        quarantined_chunk_ends(ChunkEnd::CatalogUnreachable, Some(&dead_catalog)).await;
     }
 }
