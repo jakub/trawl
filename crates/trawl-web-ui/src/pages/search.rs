@@ -61,7 +61,7 @@ use crate::components::query_error_notice::QueryErrorNotice;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
-use crate::facets::is_aggregation_shape;
+use crate::facets::{self, RailPage, is_aggregation_shape};
 use crate::fetch_plan::FetchPlan;
 use crate::pages::layout::ShellStatus;
 use crate::query_error::{NoticeModel, live_syntax_notice, refusal_notice};
@@ -891,17 +891,22 @@ pub fn Search() -> impl IntoView {
 
     let filters_sig = Signal::derive(move || filters.get());
     let range_sig = Signal::derive(move || range.get());
-    // Field provenance follows the active result source, never the editor.
-    let facet_capabilities = Signal::derive(move || {
-        let query = if live.get() {
+    // The query that produced the rows on screen: the snapshot response's
+    // own effective query, or the stream's in live. Field provenance and
+    // the rail's page both read it, never the editor.
+    let facet_query = Memo::new(move |_| {
+        if live.get() {
             effective_q.get()
         } else {
-            rows.get()
-                .and_then(Result::ok)
-                .map_or_else(String::new, |r| r.query.effective)
-        };
-        crate::result_actions::Capabilities::for_query(&query)
+            rows.with(|result| match result {
+                Some(Ok(response)) => response.query.effective.clone(),
+                _ => String::new(),
+            })
+        }
     });
+    // Field provenance follows the active result source, never the editor.
+    let facet_capabilities =
+        Signal::derive(move || crate::result_actions::Capabilities::for_query(&facet_query.get()));
     // A pending URL can hide stale row-derived groups, but its filter count
     // and Clear all are URL-owned and remain safe to use.
     let facet_rows_suppressed = Signal::derive(move || {
@@ -912,6 +917,39 @@ pub fn Search() -> impl IntoView {
                     .and_then(Result::ok)
                     .is_some_and(|r| r.query.effective != effective_q.get()))
     });
+    // What the filter rail shows, and whether the page is countable,
+    // decided once per settled answer (ADR-0044). The rail renders its
+    // groups from this and never counts the same answer again.
+    //
+    // Only a settled answer moves it. While a snapshot request is
+    // pending, `active_rows` is `Loading` and the memo holds its last
+    // value, so a page turn, a same-query Haul or a tab switch leaves
+    // the rail where it was. `loading` compares the response's query,
+    // plan, generation and intent with the current request's, so
+    // `Ready` here is always the answer to the request on screen.
+    //
+    // Idle is decided before the rows are read: with no snapshot query
+    // `loading` is false, and `rows` still holds the previous response
+    // until the synthetic empty one lands (or nothing at all on a first
+    // mount), so reading it would count a page that is no longer asked for.
+    let rail_page = Memo::new(move |held: Option<&Option<RailPage>>| {
+        if unreadable.get() {
+            return Some(RailPage::NothingToCount);
+        }
+        if !live.get() && snapshot_q.with(|q| q.trim().is_empty()) {
+            return Some(RailPage::NothingToCount);
+        }
+        active_rows.with(|state| match state {
+            LoadState::Loading => held.cloned().flatten(),
+            LoadState::Ready(result) => Some(facets::rail_page(&facet_query.get(), result)),
+            // A failed or refused query has nothing on screen to count.
+            LoadState::Error(_) | LoadState::Missing => Some(RailPage::NothingToCount),
+        })
+    });
+    // The open binding's one input, apart so it reruns when the verdict
+    // changes rather than on every live frame that recounts the groups.
+    let rail_countable =
+        Memo::new(move |_| rail_page.with(|page| page.as_ref().map(RailPage::is_countable)));
 
     // --- reading modes ------------------------------------------------
     // Both default off (ADR-0032): with the defaults in force the
@@ -1007,7 +1045,8 @@ pub fn Search() -> impl IntoView {
                 filters=filters_sig
                 suppressed=unreadable
                 rows_suppressed=facet_rows_suppressed
-                capabilities=facet_capabilities
+                page=rail_page
+                countable=rail_countable
                 on_add=on_add_filter
                 on_clear=on_clear_filters
             />

@@ -86,10 +86,6 @@ pub fn is_aggregation_shape(query: &str) -> bool {
 /// it, until the reader opens or closes the rail by hand. An open rail
 /// on a page that is not countable shows [`RailPage::hint`] in place of
 /// the value search and the groups.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "the Search page wires the rail to it next")
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RailPage {
     /// At least one field the rail may count; the groups, before the value search.
@@ -103,10 +99,6 @@ pub enum RailPage {
     Aggregate,
 }
 
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "the Search page wires the rail to it next")
-)]
 impl RailPage {
     /// Whether this page opens the wide rail in automatic mode.
     #[must_use]
@@ -140,10 +132,6 @@ impl RailPage {
 /// the rail renders, so one answer is counted once.
 ///
 /// [`Capabilities`]: crate::result_actions::Capabilities
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "the Search page wires the rail to it next")
-)]
 #[must_use]
 pub fn rail_page(query: &str, result: &QueryResult) -> RailPage {
     if is_aggregation_shape(query) {

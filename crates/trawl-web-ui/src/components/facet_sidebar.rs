@@ -2,33 +2,53 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<FacetSidebar/>` — 224px Splunk-style filter rail.
+//! `<FacetSidebar/>` — the filter rail (the glossary's term; the code
+//! keeps its old name).
 //!
-//! Header (title, plus "Clear all" once a filter is set), a filter
-//! input, plus per-field collapsible groups with proportional value
-//! bars and include/exclude actions the row reveals on hover or focus
-//! (opacity, never `display: none`, so the buttons keep their place in
-//! the tab order — ADR-0029). Pressing `+` / `⊘` on a value adds an
-//! include / exclude `Filter` to the shared filters signal; the parent
-//! owns state and re-runs the query via URL navigation.
+//! One `<details class="facet-panel">` serves both layouts, so the value
+//! search text and the group state survive a breakpoint crossing.
+//!
+//! At 900px and wider the rail follows the page (ADR-0044). It opens for
+//! a countable page and closes, to a 32px strip, for any other settled
+//! answer: idle, zero rows, rows with nothing to count, an aggregation, a
+//! failed query or a malformed link. A press on the `<summary>` is a
+//! hand choice, which holds for the browser session through
+//! [`FilterRailChoice`]. The press is read from the summary's `click`,
+//! never from `toggle`, which also fires for the automatic changes.
+//! Below 900px the rail is a disclosure above the results that starts
+//! closed and opens only by hand, with its own component-local state.
+//!
+//! The `<summary>` is the rail's one control: a vertical strip when the
+//! rail is closed, and the header row (chevron, "Filters", the active
+//! count) when it is open, with "Clear all" beside it once a filter is
+//! set. Below the header sit a filter input and the per-field
+//! collapsible groups, with proportional value bars and include/exclude
+//! actions the row reveals on hover or focus (opacity, never
+//! `display: none`, so the buttons keep their place in the tab order —
+//! ADR-0029). Pressing `+` / `⊘` on a value adds an include / exclude
+//! `Filter` to the shared filters signal; the parent owns state and
+//! re-runs the query via URL navigation. An open rail with nothing to
+//! count shows one hint in place of the input and the groups.
 
 use std::collections::HashMap;
 
 use fleet_ui::{Icon, IconView, LoadState, Loaded, SearchInput};
 use leptos::prelude::*;
+use leptos::web_sys;
 use leptos_use::use_media_query;
 use trawl_api::value::QueryResult;
+use wasm_bindgen::JsCast;
 
-use crate::facets::compute_facets;
-use crate::result_actions::Capabilities;
+use crate::facets::RailPage;
+use crate::state::filter_rail::FilterRailChoice;
 use crate::state::query::{Filter, FilterOp};
 
 #[component]
 #[allow(clippy::too_many_lines)] // facet markup tree is one cohesive view
 pub fn FacetSidebar(
     /// The rows on screen, from whichever source the page's mode makes
-    /// active: the snapshot page, or the live ring. The rail counts what
-    /// is shown, never the corpus.
+    /// active: the snapshot page, or the live ring. Read here for its
+    /// loading and error states only; the groups come from `page`.
     #[prop(into)]
     state: Signal<LoadState<QueryResult>>,
     /// Current filters — read to paint selected/excluded value rows.
@@ -46,10 +66,15 @@ pub fn FacetSidebar(
     /// or an unknown source. URL filter count and Clear all remain usable.
     #[prop(into)]
     rows_suppressed: Signal<bool>,
-    /// Provenance of the query that produced the displayed rows. A let or
-    /// rename can change one field while leaving other facets usable.
+    /// The last settled answer's page: the groups to render, or the hint
+    /// for a page with nothing to count. `None` before any answer.
     #[prop(into)]
-    capabilities: Signal<Capabilities>,
+    page: Signal<Option<RailPage>>,
+    /// Whether that page is countable, which opens the wide rail in
+    /// automatic mode. Separate from `page` so the open state is not
+    /// recomputed on every live frame.
+    #[prop(into)]
+    countable: Signal<Option<bool>>,
     /// Called when the user clicks `+` or `⊘` on a facet value.
     on_add: Callback<Filter>,
     /// Called when the user clicks "clear all" in the header.
@@ -69,8 +94,11 @@ pub fn FacetSidebar(
     // both stylesheets query it), so the disclosure and the layout it
     // presents can never disagree by a pixel.
     let compact = use_media_query("(max-width: 899.98px)");
+    // The narrow disclosure's own state, written only by its native
+    // toggle and the focus reopen below. The wide rail never reads it.
     let open = RwSignal::new(false);
     let panel = NodeRef::<leptos::html::Details>::new();
+    let summary = NodeRef::<leptos::html::Summary>::new();
     Effect::new(move |_| {
         if compact.get()
             && let Some(panel) = panel.get()
@@ -81,18 +109,96 @@ pub fn FacetSidebar(
         }
     });
 
+    // The wide rail: a hand choice for the session, else the page.
+    let choice = expect_context::<FilterRailChoice>();
+    let wide_open = Memo::new(move |_| {
+        choice
+            .held()
+            .unwrap_or_else(|| countable.get() == Some(true))
+    });
+    let rail_open = Memo::new(move |_| {
+        if compact.get() {
+            open.get()
+        } else {
+            wide_open.get()
+        }
+    });
+    let hint = Memo::new(move |_| page.with(|page| page.as_ref().and_then(RailPage::hint)));
+    let body_shown =
+        move || !suppressed.get() && !rows_suppressed.get() && countable.get() == Some(true);
+
+    // Whether keyboard focus is somewhere in the rail. Set on the way in,
+    // cleared only when focus moves to an element outside it: a query
+    // unmounts the groups the moment it is sent, which drops a focused
+    // group header to `body` with no destination, and the rail is still
+    // the reader's place until the answer settles.
+    let focus_inside = StoredValue::new(false);
+    // If the wide rail closes while the reader's focus is in it, move
+    // focus to the `<summary>`, the one control a closed rail keeps. On
+    // the close edge only; the narrow disclosure has its own rule above.
+    Effect::new(move |was_open: Option<bool>| {
+        let is_open = rail_open.get();
+        if was_open == Some(true)
+            && !is_open
+            && !compact.get_untracked()
+            && focus_inside.get_value()
+            && let Some(panel) = panel.get_untracked()
+            && let Some(summary) = summary.get_untracked()
+        {
+            let document = document();
+            let stranded = document.active_element().is_none_or(|active| {
+                panel.contains(Some(&active))
+                    || document
+                        .body()
+                        .is_some_and(|body| body.is_same_node(Some(&active)))
+            });
+            if stranded {
+                let _ = summary.focus();
+            }
+        }
+        is_open
+    });
+
     view! {
         <details
             class="facet-panel"
             node_ref=panel
-            open=move || !compact.get() || open.get()
+            open=move || rail_open.get()
             on:toggle=move |_| {
                 if compact.get() && let Some(panel) = panel.get() {
                     open.set(panel.has_attribute("open"));
                 }
             }
+            on:focusin=move |_| focus_inside.set_value(true)
+            on:focusout=move |event: web_sys::FocusEvent| {
+                let leaving = event
+                    .related_target()
+                    .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+                    .is_some_and(|target| {
+                        panel.get_untracked().is_some_and(|panel| !panel.contains(Some(&target)))
+                    });
+                if leaving {
+                    focus_inside.set_value(false);
+                }
+            }
         >
-        <summary>
+        <summary
+            node_ref=summary
+            // The wide rail's one writer of the hand choice. The press
+            // cancels the native toggle and sets the choice, and the
+            // `open` binding above renders it. Narrow presses keep the
+            // native toggle, which `on:toggle` records.
+            on:click=move |event: web_sys::MouseEvent| {
+                if compact.get_untracked() {
+                    return;
+                }
+                event.prevent_default();
+                choice.choose(!wide_open.get_untracked());
+            }
+        >
+            <span class="facet-chev" aria-hidden="true">
+                <IconView icon=Icon::Chevron size=12 stroke_width=1.5/>
+            </span>
             "Filters"
             <span class="facet-count">{move || {
                 let count = filters.get().len();
@@ -102,9 +208,6 @@ pub fn FacetSidebar(
         </summary>
         <aside class="facets" aria-label="Search filters">
             <div class="phead">
-                <div class="ttl">
-                    "Filters"
-                </div>
                 <Show when=move || !filters.get().is_empty() && !suppressed.get()>
                     <button
                         type="button"
@@ -113,29 +216,36 @@ pub fn FacetSidebar(
                     >"Clear all"</button>
                 </Show>
             </div>
-            // Both gates hide the value search with the groups: it
-            // filters names that are not being computed.
-            <Show when=move || !suppressed.get() && !rows_suppressed.get()>
+            // A settled page with nothing to count says so. A malformed
+            // link shows the header only: suppression outranks the hint.
+            {move || {
+                (!suppressed.get())
+                    .then(|| hint.get())
+                    .flatten()
+                    .map(|hint| view! { <p class="facets-hint">{hint}</p> })
+            }}
+            // Every gate hides the value search with the groups: it
+            // filters names that are not being shown.
+            <Show when=body_shown>
                 <SearchInput value=needle placeholder="Filter field values"/>
             </Show>
             // Suppression is total: an unreadable link has no active
             // source, so the rail shows its header and nothing else —
             // not even the loading hint the state would otherwise
             // render (ADR-0027).
-            <Show when=move || !suppressed.get() && !rows_suppressed.get()>
+            <Show when=body_shown>
             <Loaded
                 state=state
                 // Deliberate quiet-error override: the results table
                 // already reports the query failure, and repeating it in
                 // the facet rail is noise.
                 error=Box::new(|_| view! { <p class="facets-hint">"—"</p> }.into_any())
-                render=Box::new(move |result: QueryResult| {
-                    let provenance = capabilities.get();
-                    let facets: Vec<_> = compute_facets(&result).into_iter()
-                        .filter(|(field, _)| provenance.input_field(field)).collect();
-                    if facets.is_empty() {
+                // The groups were counted once, with the page's verdict;
+                // this only applies the value search to them.
+                render=Box::new(move |_: QueryResult| {
+                    let Some(RailPage::Countable(facets)) = page.get() else {
                         return ().into_any();
-                    }
+                    };
                     let q = needle.get().to_lowercase();
                     let active = filters.get();
                     facets.into_iter().map(|(field, values)| {
