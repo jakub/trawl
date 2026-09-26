@@ -1679,6 +1679,14 @@ impl Config {
         self.validate_ingest_env_names()?;
         self.validate_retention_env_keys()?;
 
+        // A zero interval would run normal compaction passes back to back
+        // and turn the pressure cooldown (ADR-0043) into no wait at all.
+        if self.ingest.enabled && self.ingest.compaction_interval_secs == 0 {
+            return Err(ConfigError::Validation(
+                "ingest.compaction_interval_secs must be > 0".into(),
+            ));
+        }
+
         if self.syslog.enabled {
             if self.syslog.batch_interval_ms == 0 {
                 return Err(ConfigError::Validation(
@@ -1981,6 +1989,27 @@ path = "/data"
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("max_concurrent_queries"));
+    }
+
+    #[test]
+    fn validation_rejects_zero_compaction_interval() {
+        let toml = r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[ingest]
+compaction_interval_secs = 0
+"#;
+        let err = Config::from_toml(toml).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "config validation error: ingest.compaction_interval_secs must be > 0"
+        );
+
+        // A query-only node runs no compaction, so the interval is unused.
+        let config = Config::from_toml(&format!("{toml}enabled = false\n")).unwrap();
+        assert_eq!(config.ingest.compaction_interval_secs, 0);
     }
 
     #[test]
