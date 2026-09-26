@@ -5,7 +5,10 @@ description: Install the Trawl client and server packages from APT, a release ta
 
 If someone already runs Trawl for you, [connect to it](/start/connect/). To
 inspect Parquet files only, [Query local Parquet](/start/local-parquet/) needs
-the `trawl` CLI alone. A server installation has these parts:
+the `trawl` CLI alone. To try Trawl before you install a server, install the
+CLI alone on a Linux machine with Docker and run `trawl trial up`:
+[Your first query](/getting-started/first-query/) walks through the trial and
+its trust boundary. A server installation has these parts:
 
 | Component | Responsibility |
 | --- | --- |
@@ -38,8 +41,21 @@ trawl --version
 
 Expect `trawl`, the version, and the build details. A client-only machine
 needs `trawl-cli` alone. The package writes `/etc/trawl/trawld.toml` and
-enables both units. `trawld` refuses to start until `[auth]` and `[storage]`
-have database URLs, so the [deployment guide](/operate/deployment/) is next.
+installs the `trawld` and `trawl-web` units disabled and stopped. Set the
+`[auth]` and `[storage]` database URLs as the
+[deployment guide](/operate/deployment/) shows, then start both services:
+
+```bash
+sudo systemctl enable --now trawld trawl-web
+```
+
+`trawl-web` verifies `trawld` against the self-signed certificate that
+`trawld` writes to `/var/lib/trawl/tls/cert.pem` on its first start. The
+packaged `[web] upstream_ca_path` names that file. Until the file exists,
+`trawl-web` exits and systemd restarts it every 5 seconds, so it can take a few
+seconds to reach `active (running)`. To use your own certificate, see
+[Configure TLS](/operate/access/#configure-tls).
+
 `trawl-web` listens on `127.0.0.1:8090` by default, so browser access from
 other machines needs a TLS-terminating reverse proxy and a public origin.
 
@@ -153,5 +169,6 @@ executable: the `lib/trawl` directory is part of the installed product.
 
 ## What's next
 
-[Your first query](/getting-started/first-query/) starts a private server with
-two databases, TLS, keys, and three sample events, and checks an exact result.
+[Your first query](/getting-started/first-query/) starts a disposable trial in
+Docker with `trawl trial up`, checks one exact result in the browser and the
+CLI, and maps each trial step onto the [deployment guide](/operate/deployment/).

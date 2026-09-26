@@ -141,7 +141,8 @@ fn the_debian_config_states_origins_that_load() {
     assert!(
         !config.web.public_origins.is_empty(),
         "the .deb must ship an active public_origins: trawl-web does not start without one, \
-         and the package enables trawl-web.service on install"
+         and the package tells the operator to set only the database URLs before \
+         `systemctl enable --now trawld trawl-web`"
     );
     let origins = PublicOrigins::parse(&config.web.public_origins)
         .expect("the packaged origins must load through the real parser");

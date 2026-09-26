@@ -1,0 +1,23 @@
+---
+source: crates/trawl-cli/src/trial/compose.rs
+expression: trawld_toml()
+---
+# Rendered by `trawl trial up`. Holds no secret: the database passwords
+# are in the pgpass file that PGPASSFILE names.
+
+[server]
+http_addr = "0.0.0.0:5514"
+tls_cert_path = "/var/lib/trawl/trial/tls/cert.pem"
+tls_key_path = "/var/lib/trawl/trial/tls/key.pem"
+
+[data]
+path = "/var/lib/trawl/data"
+
+[auth]
+database_url = "postgres://fleet@postgres:5432/fleet"
+
+[storage]
+database_url = "postgres://trawl@postgres:5432/trawl"
+
+[syslog]
+enabled = false

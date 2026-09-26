@@ -48,7 +48,19 @@ impl SeverityDialect {
 pub struct ConnectionParams {
     pub url: String,
     pub token: String,
-    pub insecure: bool,
+    pub trust: trawl_client::TlsTrust,
+}
+
+impl ConnectionParams {
+    /// Build the `HttpClient` for these params. Every command and the TUI
+    /// connect through here, so the trust rules have one home.
+    pub fn client(&self) -> Result<trawl_client::HttpClient, CliError> {
+        Ok(trawl_client::HttpClient::with_trust(
+            &self.url,
+            &self.token,
+            &self.trust,
+        )?)
+    }
 }
 
 /// Hand-written so the API token never reaches a log line or a panic message.
@@ -57,7 +69,7 @@ impl std::fmt::Debug for ConnectionParams {
         f.debug_struct("ConnectionParams")
             .field("url", &self.url)
             .field("token", &"<redacted>")
-            .field("insecure", &self.insecure)
+            .field("trust", &self.trust)
             .finish()
     }
 }
@@ -234,7 +246,7 @@ fn write_degraded_footer(
 pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result<(), CliError> {
     if let Some(conn) = conn {
         // Server-side validation (richer checks).
-        let client = make_client(&conn)?;
+        let client = conn.client()?;
         let response = client.validate(query).await?;
         if response.valid {
             println!("valid");
@@ -278,7 +290,7 @@ async fn run_parquet_export(
         )?;
     } else if let Some(conn) = conn {
         // Daemon mode: fetch parquet bytes via HTTP export endpoint.
-        let client = make_client(conn)?;
+        let client = conn.client()?;
         let bytes = client
             .export(query, trawl_client::ExportFormat::Parquet, None)
             .await?;
@@ -297,7 +309,7 @@ async fn run_daemon_mode(
     query: &str,
     timezone: &str,
 ) -> Result<(QueryResult, Vec<String>, Vec<String>), CliError> {
-    let client = make_client(conn)?;
+    let client = conn.client()?;
     let response = client
         .query_paginated_tz(query, None, None, Some(timezone.to_owned()))
         .await?;
@@ -332,16 +344,6 @@ fn run_embedded_mode(data: &str, query: &str, timezone: &str) -> Result<QueryRes
         usize::MAX,
         utc_offset_secs,
     )?)
-}
-
-/// Build an `HttpClient` from resolved connection params.
-fn make_client(conn: &ConnectionParams) -> Result<trawl_client::HttpClient, CliError> {
-    let client = if conn.insecure {
-        trawl_client::HttpClient::new_insecure(&conn.url, &conn.token)?
-    } else {
-        trawl_client::HttpClient::new(&conn.url, &conn.token)?
-    };
-    Ok(client)
 }
 
 // -- output formatters -------------------------------------------------------

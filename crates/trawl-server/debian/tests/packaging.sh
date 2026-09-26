@@ -7,6 +7,8 @@ postinst="$repo_root/crates/trawl-server/debian/postinst"
 service="$repo_root/crates/trawl-server/debian/trawld.service"
 web_service="$repo_root/crates/trawl-server/debian/trawl-web.service"
 default_env="$repo_root/crates/trawl-server/debian/trawld.default"
+web_default_env="$repo_root/crates/trawl-server/debian/trawl-web.default"
+packaged_config="$repo_root/crates/trawl-server/debian/trawld.toml"
 crashdump_conf="$repo_root/crates/trawl-server/debian/crashdump.conf"
 tmpfiles_conf="$repo_root/crates/trawl-server/debian/trawl.tmpfiles"
 sysusers_conf="$repo_root/crates/trawl-server/debian/trawl.sysusers"
@@ -320,4 +322,57 @@ if ! grep -Fq -- "$asset_dest" "$docs_page"; then
   fail "docs/src/content/docs/reference/crash-dumps.md does not mention '$asset_dest'"
 fi
 
-echo "debian crash-dump packaging assertions passed"
+# -- 10. both units install disabled and stopped ---------------------------
+#
+# The shipped trawld.toml holds CHANGE_ME database URLs, so a unit started at
+# install time can only fail and restart every RestartSec. cargo-deb turns
+# `enable = false, start = false` into a postinst that neither enables nor
+# starts on a fresh install, re-enables a unit the operator already enabled,
+# and try-restarts a running unit on upgrade. The verify job in
+# .github/workflows/linux-distribution.yml checks the installed result on a
+# host running systemd.
+
+units_block=$(awk '/^[[:space:]]*systemd-units[[:space:]]*=[[:space:]]*\[/{flag=1} flag{print} flag && /^[[:space:]]*\][[:space:]]*$/{exit}' "$cargo_toml")
+if [[ -z "$units_block" ]]; then
+  fail "crates/trawl-server/Cargo.toml has no [package.metadata.deb] systemd-units array"
+fi
+unit_entries=$(grep -c 'unit-name' <<<"$units_block" || true)
+if [[ "$unit_entries" -ne 2 ]]; then
+  fail "crates/trawl-server/Cargo.toml systemd-units declares $unit_entries units, expected exactly trawld and trawl-web"
+fi
+for unit in trawld trawl-web; do
+  entry=$(grep -E "unit-name[[:space:]]*=[[:space:]]*\"${unit}\"" <<<"$units_block" || true)
+  if [[ -z "$entry" ]]; then
+    fail "crates/trawl-server/Cargo.toml systemd-units does not declare '$unit'"
+  fi
+  if ! grep -Eq 'enable[[:space:]]*=[[:space:]]*false' <<<"$entry" || grep -Eq 'enable[[:space:]]*=[[:space:]]*true' <<<"$entry"; then
+    fail "crates/trawl-server/Cargo.toml systemd-units entry for '$unit' must say enable = false: a fresh install would enable a unit whose config still holds CHANGE_ME database URLs"
+  fi
+  if ! grep -Eq 'start[[:space:]]*=[[:space:]]*false' <<<"$entry" || grep -Eq 'start[[:space:]]*=[[:space:]]*true' <<<"$entry"; then
+    fail "crates/trawl-server/Cargo.toml systemd-units entry for '$unit' must say start = false: a fresh install would start a unit whose config still holds CHANGE_ME database URLs"
+  fi
+done
+if ! grep -Fq 'systemctl enable --now trawld trawl-web' "$postinst"; then
+  fail "crates/trawl-server/debian/postinst does not tell the operator to run 'systemctl enable --now trawld trawl-web' after setting the database URLs"
+fi
+
+# -- 11. trawl-web verifies trawld by pinning its generated certificate ---
+#
+# Without a pin, trawl-web checks trawld's self-signed certificate against the
+# platform roots and every sign-in fails. The package pins the file trawld
+# generates, never TRAWL_WEB_INSECURE_UPSTREAM, and trawl-web refuses to start
+# with both set. trawl-web's config tests check that the pin resolves;
+# trawl-server's tls.rs tests check that the path is the file trawld writes.
+
+web_section=$(awk '/^\[web\][[:space:]]*$/{flag=1; next} flag && /^\[/{flag=0} flag' "$packaged_config")
+if [[ -z "$web_section" ]]; then
+  fail "crates/trawl-server/debian/trawld.toml has no [web] section"
+fi
+if ! grep -Eq '^upstream_ca_path[[:space:]]*=[[:space:]]*"[^"]+"' <<<"$web_section"; then
+  fail "crates/trawl-server/debian/trawld.toml does not set [web] upstream_ca_path uncommented: trawl-web would check trawld's self-signed certificate against the platform roots and every sign-in would fail"
+fi
+if grep -vE '^[[:space:]]*#' "$web_default_env" | grep -Eq 'TRAWL_WEB_INSECURE_UPSTREAM[[:space:]]*='; then
+  fail "crates/trawl-server/debian/trawl-web.default sets TRAWL_WEB_INSECURE_UPSTREAM uncommented: with the packaged upstream_ca_path, trawl-web refuses to start"
+fi
+
+echo "debian packaging assertions passed"

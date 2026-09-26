@@ -52,9 +52,10 @@ APT repository from [Installation](/getting-started/).
    sudo apt install trawl-server trawl-cli
    ```
 
-   The package creates the users, directories, and units in the table below,
-   then enables and starts both services. They fail and retry every 5 seconds
-   until the configuration names real databases.
+   The package creates the users, directories, and units in the table below.
+   It does not enable or start either service, because the packaged
+   configuration names no real databases yet. An upgrade keeps the units you
+   enabled and restarts the ones that are running.
 
 2. Put the two DSNs in `/etc/default/trawld`. They take precedence over
    `[auth] database_url` and `[storage] database_url` in the TOML file, and
@@ -90,17 +91,24 @@ APT repository from [Installation](/getting-started/).
 
 4. Decide on TLS. Without `tls_cert_path` and `tls_key_path`, trawld
    generates a self-signed certificate for `localhost` under
-   `/var/lib/trawl/tls/`. Remote clients need a certificate they trust. See
+   `/var/lib/trawl/tls/`. The packaged `[web] upstream_ca_path` pins that
+   `cert.pem`, so `trawl-web` verifies trawld with no further setup. Remote
+   clients need a certificate they trust. If you set `tls_cert_path`, also
+   point `upstream_ca_path` at the CA that issued your certificate. See
    [Configure TLS](/operate/access/#configure-tls).
 
-5. Restart both services and check their state:
+5. Enable and start both services, then check their state:
 
    ```bash
-   sudo systemctl restart trawld trawl-web
+   sudo systemctl enable --now trawld trawl-web
    sudo systemctl status trawld trawl-web
    ```
 
-   Both show `active (running)`. Then [verify the installation](#verify-the-installation).
+   Both show `active (running)`. On the first start, trawld writes its
+   certificate only after it connects to both databases. Until then,
+   `trawl-web` exits and systemd restarts it every 5 seconds, so it can show
+   `activating (auto-restart)` for a few seconds. Then
+   [verify the installation](#verify-the-installation).
 
 The package creates these files and directories:
 
@@ -110,10 +118,10 @@ The package creates these files and directories:
 | `/usr/lib/systemd/system/trawld.service`, `trawl-web.service` | root:root 0644 | Run `trawld --config /etc/trawl/trawld.toml --no-monitor` as `trawl:trawl`, and `trawl-web --config /etc/trawl/trawld.toml` as `trawl-web:trawl` after it. |
 | `/etc/trawl/trawld.toml` | root:trawl 0640 | Configuration for both daemons. |
 | `/etc/default/trawld` | root:trawl 0640 | Environment for `trawld.service`: `FLEET_DATABASE_URL`, `TRAWL_DATABASE_URL`, `RUST_LOG`. |
-| `/etc/default/trawl-web` | root:root 0644 | Environment for `trawl-web.service`: `RUST_LOG`, `TRAWL_WEB_INSECURE_UPSTREAM`. World-readable, so no secrets. |
+| `/etc/default/trawl-web` | root:root 0644 | Environment for `trawl-web.service`: `RUST_LOG`, and `TRAWL_WEB_INSECURE_UPSTREAM`, which works only after you remove `upstream_ca_path` from `trawld.toml`. World-readable, so no secrets. |
 | `/var/lib/trawl` | trawl:trawl 0750 | State directory. `trawld` writes only here and to `/var/log/trawl`. |
 | `/var/lib/trawl/data` | trawl:trawl | Parquet files, `wal/`, `scheduled/`, and the `EPOCH` and `CATALOG` markers. Created on first start. |
-| `/var/lib/trawl/tls` | trawl:trawl | `cert.pem` and `key.pem`, generated when `[server]` names no certificate. |
+| `/var/lib/trawl/tls` | trawl:trawl | `cert.pem` and `key.pem`, generated when `[server]` names no certificate. The packaged `[web] upstream_ca_path` pins `cert.pem`. |
 | `/var/lib/trawl/web.cookie` | trawl:trawl 0640 | 32-byte session cookie key, generated once on first install. The `trawl` group lets `trawl-web` read it. |
 | `/var/lib/trawl/cores` | trawl:trawl 0700 | Crash dumps. Empty unless the [crash-dump drop-in](/reference/crash-dumps/) is enabled. |
 | `/var/log/trawl` | trawl:trawl | Log directory for `[server] log_file`. |

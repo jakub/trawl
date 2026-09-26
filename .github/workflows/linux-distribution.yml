@@ -329,3 +329,88 @@ jobs:
         run: |
           docker run --rm --network none --cap-add SYS_PTRACE -v "$PWD:/verify:ro" -w /verify \
             trawl-artifact-check bash scripts/release/test-installed-debian.sh debs
+      # The container above refuses every service start and runs no systemd,
+      # so it cannot show a unit is inactive. Hosted runners boot systemd:
+      # install on the runner itself and read the real unit states.
+      - name: Install the server package on a host running systemd
+        run: bash scripts/release/test-host-debian.sh debs
+
+  # `trawl trial` (ADR-0045) from the release-built artifacts: the CLI from
+  # the tarball, and an image built from the same tarball the way release.yml's
+  # docker job builds one. The image is tagged with the exact default
+  # reference, so `trawl trial up` runs without --image. The tag exists only
+  # on this disposable runner's engine and is never pushed.
+  trial:
+    name: trawl trial (${{ matrix.target }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      SOURCE_SHA: ${{ inputs.source-sha }}
+      RELEASE_TAG: ${{ inputs.release-tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tooling-sha }}
+          persist-credentials: false
+          # Cone mode keeps the root files, so the Dockerfile comes along.
+          sparse-checkout: |
+            scripts/release
+            crates/trawl-web-ui/e2e
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: incoming
+      - name: Build the image from the tarball as the release docker job does
+        run: |
+          set -euo pipefail
+          (cd incoming && sha256sum -c ./*.sha256)
+          tarball="incoming/trawl-${RELEASE_TAG}-${TARGET}.tar.gz"
+          mkdir -p "docker-ctx/$ARCH" installed
+          tar xzf "$tarball" -C "docker-ctx/$ARCH" --strip-components=1
+          tar xzf "$tarball" -C installed --strip-components=1
+          version="$(installed/bin/trawl --version | awk '{ print $2 }')"
+          test "$version" = "${RELEASE_TAG#v}"
+          # The reference `trawl trial up` resolves when --image is omitted.
+          docker build --platform "linux/$ARCH" \
+            --label "org.opencontainers.image.revision=$SOURCE_SHA" \
+            --tag "ghcr.io/jakub/trawl:$version" .
+          docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "ghcr.io/jakub/trawl:$version"
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
+      - name: Install Playwright's Chromium
+        working-directory: crates/trawl-web-ui/e2e
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+      - name: Prove the trial
+        run: bash scripts/release/test-trial.sh installed/bin/trawl "$RUNNER_TEMP/trial-evidence" "$RUNNER_TEMP/trial-private"
+      # The script scans as it goes; this pass covers the finished log. The
+      # evidence is uploaded only when it passes.
+      - name: Scan every captured log and artifact for secret values
+        id: scan
+        if: always()
+        run: python3 scripts/release/scan-trial-secrets.py "$RUNNER_TEMP/trial-private/secrets.tsv" "$RUNNER_TEMP/trial-evidence"
+      - name: Upload the trial evidence
+        if: always() && steps.scan.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trial-evidence-${{ matrix.target }}
+          retention-days: ${{ github.event_name == 'pull_request' && 7 || 0 }}
+          path: ${{ runner.temp }}/trial-evidence
+          if-no-files-found: error

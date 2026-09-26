@@ -13,7 +13,7 @@ Every subcommand accepts these options.
 
 | Flag | Value | Default | Description |
 |------|-------|---------|-------------|
-| `-p, --profile` | `<NAME>` | *(none)* | Named profile from the config file. Overrides `[server]` |
+| `-p, --profile` | `<NAME>` | *(none)* | Named profile from the config file. Overrides `[server]`. `trial` is reserved for the [trial](#trial-mode) |
 | `--url` | `<URL>` | `https://localhost:5514` | Server URL |
 | `--token` | `<TOKEN>` | *(none)* | API token |
 | `--insecure` | *(flag)* | `false` | Accept self-signed TLS certificates |
@@ -24,6 +24,22 @@ Every subcommand accepts these options.
 A flag beats an environment variable, which beats the config file. Profiles and
 the `[ui]` and `[tail]` settings live in
 [client configuration](/reference/configuration/#client-configuration).
+
+When `insecure` is on from the flag, `TRAWL_INSECURE`, `[server]`, or a profile,
+`trawl` writes one warning line to stderr before any other output. Stdout does
+not change.
+
+### Pin a CA with `ca_cert`
+
+`ca_cert` names a PEM file of CA certificates. It is a config file key on
+`[server]` and on `[profiles.<name>]`, and it has no flag or environment
+variable. With it set, `trawl` trusts only the CAs in that file for the
+connection, not the system trust store, and still checks the hostname in the
+URL. The path must be absolute or start with `~`. A profile inherits the
+`[server]` value, and a profile value of `""` clears it. `trawl` reads the
+file before the first request and fails when it is missing, unreadable, or
+empty. `ca_cert` together with an effective `insecure`, from any source, is an
+error. See [client configuration](/reference/configuration/#client-configuration).
 
 ## Environment variables
 
@@ -292,6 +308,108 @@ conflict episode raises the badge again.
 ```bash
 trawl schema ack duration --note "fix due Friday"
 ```
+
+## Trial mode
+
+```text
+trawl trial <VERB>
+```
+
+`trawl trial` runs a disposable Trawl installation in Docker on this machine,
+on loopback only, with sample data. It is supported on Linux with Docker
+Engine and the Compose v2 plugin, version 2.20 or later, over the local
+`unix://` socket. [Your first query](/getting-started/first-query/) walks
+through it and states the trust boundary. The trial verbs run before the
+config file is read, so a broken client config does not block them.
+
+| Verb | Description |
+|------|-------------|
+| `up` | Create the trial, or resume it. Pulls the images when absent, starts PostgreSQL, creates the databases and roles, applies the Fleet schema, generates a certificate, mints two keys, starts `trawld` and `trawl-web`, checks one authenticated query, and loads the samples. Prints the addresses and the token file paths, never a token |
+| `status` | Print the trial id, addresses, image ids and digests, certificate fingerprint, sample range as absolute timestamps, setup phases, and containers. Warns on stderr for each `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_INSECURE`, or `TRAWL_PROFILE` that is set |
+| `key` | Print the operator token and one newline to stdout, nothing else |
+| `stop` | Stop the containers. The databases, keys, samples, and state stay, and a later `up` resumes |
+| `down` | Print the containers, volumes, and network that carry this trial's id, ask `Delete all of it? [y/N]` on a terminal, delete them and the trial directory |
+
+### Up
+
+```text
+trawl trial up [--api-port PORT] [--web-port PORT] [--image REFERENCE] [--no-sample-data]
+```
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--api-port` | `<PORT>` | `15514` | Loopback port for the HTTPS API |
+| `--web-port` | `<PORT>` | `18090` | Loopback port for the browser UI |
+| `--image` | `<REFERENCE>` | `ghcr.io/jakub/trawl:<CLI version>` | Run this trawl image instead of the published one. `up` and `status` print the override |
+| `--no-sample-data` | *(flag)* | `false` | Skip the sample events |
+
+The browser address `up` and `status` print is `http://127.0.0.1:<web-port>`.
+A browser tries `localhost` on the IPv6 address `::1` first, where the trial
+does not listen and another local program could.
+
+Every `up` stops `trawl-web` and gives it a new session key before it starts
+it, so every browser session from before that `up` ends.
+
+Ports and the image are fixed when the trial is created. On a resume an
+omitted flag means the recorded value, and a different value is refused with
+a message that points to `down`. The samples are loaded once, and a resume
+never posts them again. A trial created with `--no-sample-data` gets them on
+a later `up` without the flag, when the sample services still hold no events.
+
+`up` checks Docker before it creates anything, and the message names the
+missing requirement: the `docker` command, the Compose plugin or a version
+below 2.20, an unreachable engine, or a `DOCKER_HOST` or active Docker context
+that is not a `unix://` address. A taken port is refused with the port and
+the flag that moves it. A `trawl-trial` project or a `trawl-trial-claim`
+container with another trial's id is refused before anything is changed.
+
+### Down
+
+```text
+trawl trial down [--yes]
+```
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--yes` | *(flag)* | `false` | Delete without asking. Required when stdin is not a terminal |
+
+Without a terminal and without `--yes`, `down` exits `1` and deletes nothing.
+It deletes only resources that carry this trial's id, and it accepts state
+written by any CLI version. When no trial exists it prints so and exits `0`.
+
+### State and lock
+
+The trial directory is `$XDG_STATE_HOME/trawl/trial`, or
+`~/.local/state/trawl/trial` when `XDG_STATE_HOME` is unset. It is mode
+`0700` and holds `state.json`, `compose.json`, the public certificate
+`ca.pem`, and the two token files `operator.token` and `ingest.token` at mode
+`0600`. A symbolic link at the directory or its parent is refused. `down`
+deletes the directory.
+
+`up`, `stop`, and `down` hold an exclusive lock on
+`$XDG_STATE_HOME/trawl/trial.lock`, outside the directory `down` deletes. A
+second command waits and prints that it is waiting. `status`, `key`, and
+`-p trial` take no lock.
+
+### The reserved `-p trial` profile
+
+`-p trial`, or `TRAWL_PROFILE=trial`, connects any `trawl` command and the TUI
+to the trial. It reads the URL `https://127.0.0.1:<api-port>`, the operator
+token, and the certificate from the trial directory, and never edits the
+config file. It exits `1` and sends nothing when:
+
+- `TRAWL_URL` or `TRAWL_TOKEN` is set, even to an empty value, or `--url` or
+  `--token` is given.
+- The config file defines `[profiles.trial]`.
+- `--insecure` or `TRAWL_INSECURE` is on, through the `ca_cert` with
+  `insecure` rule.
+- The trial directory is missing or the trial is unfinished. The message
+  names `trawl trial up`.
+- The command is `trawl driver`. Start the TUI with `trawl -p trial --driver`
+  and run `trawl driver` without the profile.
+
+Every trial verb prints its reason to stderr and exits `1` on refusal, and
+nothing is created or deleted before the check that refused.
 
 ## Driver mode
 

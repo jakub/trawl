@@ -79,6 +79,30 @@ pub struct RepinCeilings {
     pub max_ambiguous_rows: Option<u64>,
 }
 
+/// How a client decides whether to trust the server's TLS certificate.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum TlsTrust {
+    /// The platform trust store.
+    #[default]
+    System,
+    /// Only the roots in this PEM bundle. The chain and the hostname are
+    /// still verified; no platform or built-in root is trusted.
+    PinnedCa(Vec<u8>),
+    /// No certificate verification at all.
+    AcceptInvalid,
+}
+
+/// Hand-written so a pinned bundle shows its size, never its bytes.
+impl std::fmt::Debug for TlsTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => f.write_str("System"),
+            Self::PinnedCa(pem) => write!(f, "PinnedCa(<{} bytes>)", pem.len()),
+            Self::AcceptInvalid => f.write_str("AcceptInvalid"),
+        }
+    }
+}
+
 /// HTTP client for the trawl daemon API.
 #[derive(Clone)]
 pub struct HttpClient {
@@ -105,7 +129,7 @@ impl HttpClient {
 
     /// Create a new client targeting the given daemon URL with an API key.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, ClientError> {
-        Self::build(base_url, token, false)
+        Self::build(base_url, token, &TlsTrust::System)
     }
 
     /// Create a client that accepts self-signed / invalid TLS certificates.
@@ -116,7 +140,19 @@ impl HttpClient {
         base_url: impl Into<String>,
         token: impl Into<String>,
     ) -> Result<Self, ClientError> {
-        Self::build(base_url, token, true)
+        Self::build(base_url, token, &TlsTrust::AcceptInvalid)
+    }
+
+    /// Create a client that verifies the server against `trust`.
+    ///
+    /// A [`TlsTrust::PinnedCa`] bundle that holds no parseable certificate
+    /// fails here with [`ClientError::InvalidCa`], before any request.
+    pub fn with_trust(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        trust: &TlsTrust,
+    ) -> Result<Self, ClientError> {
+        Self::build(base_url, token, trust)
     }
 
     /// Create a client with a pre-configured `reqwest::Client`.
@@ -135,7 +171,7 @@ impl HttpClient {
     fn build(
         base_url: impl Into<String>,
         token: impl Into<String>,
-        accept_invalid_certs: bool,
+        trust: &TlsTrust,
     ) -> Result<Self, ClientError> {
         // Ensure ring is available as the rustls crypto provider.
         // Idempotent — returns Err if already installed, which we ignore.
@@ -145,11 +181,34 @@ impl HttpClient {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Self::DEFAULT_TIMEOUT);
 
-        if accept_invalid_certs {
-            builder = builder.danger_accept_invalid_certs(true);
+        match trust {
+            TlsTrust::System => {}
+            TlsTrust::PinnedCa(pem) => {
+                let roots = reqwest::Certificate::from_pem_bundle(pem)
+                    .map_err(|_| ClientError::InvalidCa("the bundle is not valid PEM".into()))?;
+                if roots.is_empty() {
+                    return Err(ClientError::InvalidCa(
+                        "the bundle holds no PEM certificate".into(),
+                    ));
+                }
+                // Only these roots: no platform or built-in store is
+                // consulted, and hostname verification stays on. A plain
+                // `http://` URL would skip the pin entirely, so refuse it.
+                builder = builder.tls_certs_only(roots).https_only(true);
+            }
+            TlsTrust::AcceptInvalid => {
+                builder = builder.danger_accept_invalid_certs(true);
+            }
         }
 
-        let client = builder.build().map_err(sanitize_reqwest_error)?;
+        let client = builder.build().map_err(|e| match trust {
+            // The only input a pinned build adds is the roots, and the root
+            // store rejects a certificate whose DER does not parse.
+            TlsTrust::PinnedCa(_) if e.is_builder() => {
+                ClientError::InvalidCa("a certificate in the bundle does not parse".into())
+            }
+            _ => sanitize_reqwest_error(e),
+        })?;
         Ok(Self {
             base_url: normalize_base_url(base_url.into()),
             token: Zeroizing::new(token.into()),
@@ -954,10 +1013,18 @@ fn normalize_base_url(url: String) -> String {
 
 /// Categorize a reqwest error without exposing raw details or URL secrets.
 /// Connection diagnostics identify only the API origin, never URL userinfo,
-/// paths, query parameters, or fragments.
+/// paths, query parameters, or fragments. A certificate rustls refused is
+/// named as such, without the certificate or the verifier's reason.
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_reqwest_error)`
 fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
-    if e.is_timeout() || e.is_connect() {
+    if e.is_connect() && rejected_certificate(&e) {
+        let origin = e.url().map_or_else(String::new, |url| {
+            format!(" of API {}", url.origin().ascii_serialization())
+        });
+        ClientError::Network(format!(
+            "TLS: the server certificate{origin} is not trusted (check ca_cert or the trial's CA)"
+        ))
+    } else if e.is_timeout() || e.is_connect() {
         let reason = if e.is_timeout() {
             "request timed out"
         } else {
@@ -979,6 +1046,31 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
     } else {
         ClientError::Network("request failed".into())
     }
+}
+
+/// Whether `e` failed because rustls did not accept the server's
+/// certificate: an unknown issuer, a name it does not cover, an expired
+/// certificate, and the like.
+///
+/// A typed check over the source chain, never the Display text. The TLS
+/// connector reports a handshake failure as a [`rustls::Error`] inside one
+/// or more [`std::io::Error`]s, and `io::Error::source` skips the error it
+/// wraps, so an `io::Error` is stepped into with `get_ref` instead.
+fn rejected_certificate(e: &reqwest::Error) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = next {
+        if matches!(
+            err.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(_))
+        ) {
+            return true;
+        }
+        next = match err.downcast_ref::<std::io::Error>() {
+            Some(io) => io.get_ref().map(|inner| inner as _),
+            None => err.source(),
+        };
+    }
+    false
 }
 
 /// Decode a successful repin trigger response: the status code plus the
@@ -1046,6 +1138,37 @@ mod tests {
 
     fn init() {
         let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    /// A pinned bundle that yields no trust anchor must fail at build time,
+    /// never fall back to another store or reach the network.
+    #[test]
+    fn pinned_ca_without_a_usable_certificate_is_refused() {
+        let key_only = b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        let bad_der = b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let bad_pem = b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        for pem in [&b""[..], b"not pem at all\n", key_only, bad_der, bad_pem] {
+            let err = HttpClient::with_trust(
+                "https://127.0.0.1:1",
+                "tok",
+                &TlsTrust::PinnedCa(pem.to_vec()),
+            )
+            .expect_err("an unusable bundle must not build a client");
+            assert!(
+                matches!(err, ClientError::InvalidCa(_)),
+                "{:?} gave {err:?}",
+                String::from_utf8_lossy(pem)
+            );
+        }
+    }
+
+    #[test]
+    fn tls_trust_debug_never_prints_the_bundle() {
+        let trust = TlsTrust::PinnedCa(b"-----BEGIN CERTIFICATE-----secret".to_vec());
+        let shown = format!("{trust:?}");
+        assert_eq!(shown, "PinnedCa(<33 bytes>)");
+        assert_eq!(format!("{:?}", TlsTrust::System), "System");
+        assert_eq!(format!("{:?}", TlsTrust::AcceptInvalid), "AcceptInvalid");
     }
 
     #[tokio::test]

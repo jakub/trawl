@@ -1,0 +1,40 @@
+---
+source: crates/trawl-cli/src/trial/render.rs
+expression: "text(|out| render_status(out, &state, &paths(), &containers()))"
+---
+Trial 0123456789abcdef0123456789abcdef
+  created      2026-09-25T12:00:00Z by trawl 0.9.0
+  directory    /state/trawl/trial
+  engine       ENGINE:ID
+
+Addresses
+  browser      http://127.0.0.1:18090
+  API          https://127.0.0.1:15514 (trawl -p trial)
+
+Images
+  trawl        ghcr.io/jakub/trawl:0.9.0
+               id sha256:aaaa
+               digest ghcr.io/jakub/trawl@sha256:bbbb
+  postgres     postgres:18
+               id sha256:cccc
+               digest none (a locally built image)
+
+Certificate
+  SHA-256      AB:CD
+
+Samples
+  2000 events from 2026-09-24T12:00:00Z to 2026-09-25T12:00:00Z
+
+Setup
+  databases    done
+  Fleet schema done
+  certificate  done
+  operator key minted
+  ingest key   not yet
+  services     not verified yet
+
+Containers
+  trawl-trial-postgres-1   running
+  trawl-trial-trawld-1     running
+  trawl-trial-trawl-web-1  exited
+  trawl-trial-claim        created

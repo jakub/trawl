@@ -1,295 +1,236 @@
 ---
 title: Your first query
-description: Start a private Trawl server and browser UI, send three events, and check an exact query result.
+description: Start a disposable Trawl trial in Docker with one command, check an exact query result in the browser and the CLI, then delete it.
 ---
 
-In this tutorial we start a private Trawl server on your Linux machine, send it
-three events, and check an exact answer in the browser, CLI, TUI, and a local
-Parquet export. Allow about 20 minutes after installation.
+In this tutorial we start a disposable Trawl trial on your Linux machine with
+one command, sign in to the browser, run one query with an exact answer in the
+browser, the CLI, and the TUI, and delete the trial again. Allow about five
+minutes after the CLI is installed, plus the image downloads.
 
 You need:
 
-- Linux with Bash, Docker, Python 3, and `curl`.
-- `trawl`, `trawld`, `trawl-web`, `trawl-admin`, and `fleet-admin` in your `PATH`. See [Installation](/getting-started/).
-- Ports 55439, 15514, and 18090 free, and a browser on this machine.
+- Linux with Docker Engine and the Docker Compose v2 plugin, version 2.20 or
+  later, reached over the local Unix socket. Your user must be allowed to use
+  the socket, for example through the `docker` group.
+- The `trawl` CLI. Install `trawl-cli` from APT, or the CLI from a release
+  tarball, as [Installation](/getting-started/) shows. The trial needs no
+  other Trawl executable: the server side runs from the published container
+  image.
+- Ports 15514 and 18090 free, and a browser on this machine. `--api-port` and
+  `--web-port` on the first `up` move the trial to other ports.
 
-Keep the first terminal open, because later steps reuse its variables. Do not
-reuse an existing database or data directory.
+The trial is supported on Linux only. `trawl trial up` checks the Docker
+requirements before it creates anything, and its error names what is missing:
+the `docker` command, the Compose plugin or its version, an unreachable
+engine, or a `DOCKER_HOST` or Docker context that does not point at a
+local `unix://` socket.
 
-## Start PostgreSQL
+## Know the trust boundary
 
-Trawl needs two databases. Create a private working directory and random
-passwords first. Nothing prints a password or a token.
+The trial is for evaluation on your own machine, not for exposure. The API
+and the browser UI listen on `127.0.0.1` only, so no other machine reaches
+them. Every other process on this machine can reach both ports. Root on this
+machine, and every user who may use the Docker socket, can read every secret
+the trial holds: the two API keys, the database passwords, and the private key
+of the certificate. Do not forward the trial's ports to another machine, and
+do not send it logs you would not show those users. Open the trial in the
+browser only while it runs: when it is stopped, another program can take its
+port and show a fake sign-in page.
+
+## Start the trial
 
 ```bash
-umask 077
-TRAWL_TUTORIAL_DIR=$(mktemp -d /tmp/trawl-tutorial.XXXXXX)
-TRAWL_PG_ADMIN_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
-TRAWL_FLEET_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
-TRAWL_APP_PASSWORD=$(python3 -c 'import secrets; print(secrets.token_hex(24))')
-printf 'POSTGRES_PASSWORD=%s\n' "$TRAWL_PG_ADMIN_PASSWORD" > "$TRAWL_TUTORIAL_DIR/postgres.env"
-docker run --detach --name trawl-docs-postgres \
-  --publish 127.0.0.1:55439:5432 \
-  --env-file "$TRAWL_TUTORIAL_DIR/postgres.env" postgres:18
+trawl trial up
 ```
 
-Now wait for PostgreSQL:
+`up` pulls `ghcr.io/jakub/trawl` at your CLI's version and `postgres:18`,
+starts PostgreSQL, creates the two databases and their owner roles, applies the
+Fleet schema, generates a certificate, mints two API keys, starts `trawld` and
+`trawl-web`, checks one authenticated query through the pinned certificate, and
+loads 2000 sample events. Progress goes to stderr. Then it prints:
 
-```bash
-for attempt in {1..30}; do
-  docker exec trawl-docs-postgres pg_isready -U postgres >/dev/null 2>&1 && break
-  sleep 1
-done
-docker exec trawl-docs-postgres pg_isready -U postgres
+```text
+The trial is up.
+
+  Browser   http://127.0.0.1:18090
+  API       https://127.0.0.1:15514
+
+Sign in to the browser with the operator key; `trawl trial key` prints it.
+The key files are readable by your user only:
+
+  operator  ~/.local/state/trawl/trial/operator.token
+  ingest    ~/.local/state/trawl/trial/ingest.token
+
+Sample data: 2000 events from 2026-09-24T12:00:00Z to 2026-09-25T12:00:00Z.
+
+Run the documented query:
+
+  trawl -p trial query 'service=checkout _severity>=error | stats count() as errors by service'
+
+It returns one row: service checkout, errors 20.
+
+Next:
+
+  trawl trial key     print the operator token for the browser sign-in
+  trawl -p trial      open the terminal UI on the trial
+  trawl trial status  show the trial's state
+  trawl trial stop    stop the containers; `trawl trial up` resumes
+  trawl trial down    delete the trial and everything it made
 ```
 
-The last line must end with `accepting connections`. If not, read
-`docker logs trawl-docs-postgres`.
+The paths and the sample dates follow your machine. The output never contains
+a token. The trial keeps its files in `$XDG_STATE_HOME/trawl/trial`, which is
+`~/.local/state/trawl/trial` by default. Nothing restarts at boot, and
+nothing edits `~/.config/trawl/config.toml`.
 
-## Create the databases
+The samples cover the 24 hours before `up` loaded them. The newest events sit
+in the last 10 minutes before that moment, and the three `service=tutorial`
+events that [Build a query](/use/query-tutorial/) uses sit at the newest
+timestamp. With the default retention of 90 days, the samples age out 90 days
+after `up`.
 
-Create a login and a database for each, then apply the Fleet migrations.
-Hexadecimal passwords are safe inside the SQL quotes.
+## Sign in to the browser
 
-```bash
-docker exec -i trawl-docs-postgres psql -U postgres -v ON_ERROR_STOP=1 <<SQL
-CREATE ROLE fleet LOGIN PASSWORD '$TRAWL_FLEET_PASSWORD';
-CREATE ROLE trawl LOGIN PASSWORD '$TRAWL_APP_PASSWORD';
-CREATE DATABASE fleet OWNER fleet;
-CREATE DATABASE trawl OWNER trawl;
-SQL
-export DATABASE_URL="postgres://fleet:$TRAWL_FLEET_PASSWORD@127.0.0.1:55439/fleet"
-fleet-admin migrate
-```
+1. Open `http://127.0.0.1:18090`. Use this address, not `localhost`: a
+   browser tries `localhost` on the IPv6 address `::1` first, where the trial
+   does not listen and another program on this machine could.
+2. Print the operator key and copy it:
 
-Expect four `CREATE` lines, then `fleet-admin: migrations applied`. `trawld`
-runs its own app-state migrations at startup.
+   ```bash
+   trawl trial key
+   ```
 
-## Create an API key
+   It prints the token and one newline, nothing else. Paste it into
+   **API key** and select **Sign in**. The operator key holds every
+   permission except `ingest`, so the **Health** page is present.
+3. Search opens with **Quick start** and four examples. Each example's **Run**
+   uses the selected **Date range**. The default range is the last 15 minutes,
+   and the newest samples fall inside it right after `up`. Select `7d` in
+   **Date range** to see all 2000 events for the trial's life.
+4. Enter `service=checkout _severity>=error | stats count() as errors by service`
+   and select **Haul**. Expect one row with service `checkout` and errors
+   `20`.
 
-One key reads, another sends. Permissions come from the role's list, not its
-name.
+The [browser guide](/reference/web-ui/) explains the time range, filters,
+live mode, and saved queries.
 
-```bash
-fleet-admin roles create --name tutorial-reader \
-  --perm trawl:query --perm trawl:schema_read --perm trawl:validate \
-  --perm trawl:export --perm trawl:stream --perm trawl:saved_query \
-  --perm trawl:query_cancel
-fleet-admin roles create --name tutorial-ingest --perm trawl:ingest
-fleet-admin keys create --name tutorial-reader --kind human \
-  --role tutorial-reader > "$TRAWL_TUTORIAL_DIR/reader.token"
-fleet-admin keys create --name tutorial-ingest --kind service \
-  --role tutorial-ingest > "$TRAWL_TUTORIAL_DIR/ingest.token"
-unset DATABASE_URL
-```
+## Run the same query in the CLI
 
-`keys create` prints metadata to stderr and the token to stdout once, so the
-redirect keeps it in a private file.
-
-## Start the server
-
-Generate a self-signed certificate and a persistent browser-session key,
-then write the configuration shared by the two daemons. The private working
-directory and `umask 077` protect the session key.
+The reserved profile `-p trial` reads the URL, the operator token, and the
+certificate from the trial directory. It works for every `trawl` command and
+never touches your config file.
 
 ```bash
-trawl-admin tls generate --output-dir "$TRAWL_TUTORIAL_DIR/tls"
-python3 -c 'import secrets, sys; sys.stdout.buffer.write(secrets.token_bytes(32))' \
-  > "$TRAWL_TUTORIAL_DIR/web.cookie"
-cat > "$TRAWL_TUTORIAL_DIR/trawld.toml" <<TOML
-[server]
-http_addr = "127.0.0.1:15514"
-tls_cert_path = "$TRAWL_TUTORIAL_DIR/tls/cert.pem"
-tls_key_path = "$TRAWL_TUTORIAL_DIR/tls/key.pem"
-max_concurrent_queries = 2
-
-[data]
-path = "$TRAWL_TUTORIAL_DIR/data"
-
-[auth]
-database_url = "postgres://fleet:$TRAWL_FLEET_PASSWORD@127.0.0.1:55439/fleet"
-
-[storage]
-database_url = "postgres://trawl:$TRAWL_APP_PASSWORD@127.0.0.1:55439/trawl"
-
-[ingest]
-enabled = true
-internal_telemetry = false
-
-[web]
-bind_addr = "127.0.0.1:18090"
-upstream_url = "https://localhost:15514"
-public_origins = ["http://localhost:18090"]
-cookie_secret_path = "$TRAWL_TUTORIAL_DIR/web.cookie"
-allow_insecure_cookies = true
-TOML
-printf 'env -u FLEET_DATABASE_URL -u TRAWL_DATABASE_URL -u TRAWL_HTTP_ADDR trawld --config %q\n' "$TRAWL_TUTORIAL_DIR/trawld.toml"
-```
-
-`tls generate` prints the `cert:` and `key:` paths. The last command prints a
-`trawld` command line, with `env -u` clearing environment overrides. Run it in
-a second terminal and leave it running. Back in the first terminal:
-
-```bash
-curl --fail --silent --show-error \
-  --cacert "$TRAWL_TUTORIAL_DIR/tls/cert.pem" \
-  https://localhost:15514/api/v1/health
-```
-
-Expect a JSON object whose `status` and every entry in `checks` are `ok`.
-HTTP 200 alone can report degraded dependencies. If not, read the error in the
-second terminal. A connection error points at PostgreSQL, an authentication
-error at a database login or the migrations.
-
-## Start the browser UI
-
-Print the proxy command in the first terminal:
-
-```bash
-printf 'env -u FLEET_SESSION_AEAD_KEY -u FLEET_SESSION_PUBLIC_ORIGINS -u FLEET_SESSION_COOKIE_DOMAIN -u FLEET_SESSION_COOKIE_PATH -u FLEET_SESSION_COOKIE_SECURE -u TRAWL_WEB_BIND_ADDR TRAWL_WEB_INSECURE_UPSTREAM=1 trawl-web --config %q\n' "$TRAWL_TUTORIAL_DIR/trawld.toml"
-```
-
-Run the printed command in a third terminal and leave it running. Expect a
-`trawl-web listening` message for `127.0.0.1:18090`.
-`TRAWL_WEB_INSECURE_UPSTREAM=1` lets this local proxy contact the tutorial's
-self-signed API. `allow_insecure_cookies = true` permits browser sessions
-over local HTTP. Permanent installations need the [TLS and browser-origin setup](/operate/access/).
-
-The two URLs serve different clients:
-
-| URL | Use |
-| --- | --- |
-| `https://localhost:15514` | HTTPS API for the CLI and event senders |
-| `http://localhost:18090` | Browser UI |
-
-## Configure the client
-
-Write a client config for this tutorial only, so your usual
-`~/.config/trawl/config.toml` stays untouched.
-
-```bash
-printf '[server]\nurl = "https://localhost:15514"\ntoken = "%s"\ninsecure = true\n' \
-  "$(cat "$TRAWL_TUTORIAL_DIR/reader.token")" > "$TRAWL_TUTORIAL_DIR/client.toml"
-unset TRAWL_TOKEN TRAWL_URL TRAWL_PROFILE TRAWL_INSECURE
-```
-
-`insecure = true` accepts the self-signed certificate. Use a trusted
-certificate for a permanent installation.
-
-## Send three events
-
-Build three events with the current UTC time, then post them with the ingest
-key.
-
-```bash
-python3 - <<'PYDATA' > "$TRAWL_TUTORIAL_DIR/events.json"
-import datetime, json
-now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-events = [
-    {"level": "info", "message": "server started", "duration": 12},
-    {"level": "error", "message": "connection refused", "duration": 1500},
-    {"level": "warn", "message": "upstream timeout", "duration": 700},
-]
-for event in events:
-    event.update(service="tutorial", host="tutorial-host", timestamp=now)
-print(json.dumps(events))
-PYDATA
-printf 'Authorization: Bearer %s\n' "$(cat "$TRAWL_TUTORIAL_DIR/ingest.token")" \
-  > "$TRAWL_TUTORIAL_DIR/ingest.header"
-curl --fail --silent --show-error \
-  --cacert "$TRAWL_TUTORIAL_DIR/tls/cert.pem" \
-  --header @"$TRAWL_TUTORIAL_DIR/ingest.header" \
-  --header 'Content-Type: application/json' \
-  --data-binary @"$TRAWL_TUTORIAL_DIR/events.json" \
-  https://localhost:15514/api/v1/ingest
-```
-
-Expect `{"accepted":3}`. Send it once, because a second post adds three more
-events. The events are visible at once from the hot buffer.
-
-## Run your first query
-
-```bash
-trawl --config "$TRAWL_TUTORIAL_DIR/client.toml" query --format json \
-  'service=tutorial last=1h | stats count() by service'
+trawl -p trial query --format json \
+  'service=checkout _severity>=error | stats count() as errors by service'
 ```
 
 Expect:
 
 ```json
-{"service":"tutorial","count":3}
+{"errors":20,"service":"checkout"}
 ```
 
-Property order can differ. Now select the error event:
+Property order can differ. The query names no time range, and `trawl query`
+adds none, so this row holds for the trial's whole life. The four quick-start
+examples run the same way:
 
 ```bash
-trawl --config "$TRAWL_TUTORIAL_DIR/client.toml" query --format json \
-  'service=tutorial _severity>=error last=1h | table message, duration'
+trawl -p trial query '* | head 20'
+trawl -p trial query '* | stats count() by service'
+trawl -p trial query '_severity>=error | stats count() as errors by service | sort -errors | head 10'
+trawl -p trial query 'service=web _severity>=warn | timechart span=5m count()'
 ```
 
-Expect one row with `message` equal to `connection refused` and `duration`
-equal to `1500`. Trawl derived `_severity` from `level`. [Build a query](/use/query-tutorial/)
-continues from here.
+Each returns rows: the first 20 events, one count per service, the services
+with the most errors, and one bucket per five minutes of web warnings.
 
-## Run the same query in the browser
+`-p trial` refuses to run when `TRAWL_URL` or `TRAWL_TOKEN` is set, when
+`--url` or `--token` is given, or when your config file defines its own
+`[profiles.trial]`. Each of those would send the command somewhere else
+without you seeing it. It also refuses `--insecure`, because the trial is only
+ever reached through its pinned certificate.
 
-1. Open `http://localhost:18090`. Use `localhost` as written: `127.0.0.1`
-   is a different browser origin.
-2. Open the private file `$TRAWL_TUTORIAL_DIR/reader.token` in a text editor,
-   copy its contents into the API-key field, and sign in. Use the personal
-   reader key; the ingest key only sends events.
-3. In Search, enter `service=tutorial last=1h | stats count() by service`
-   and select **Haul**. Expect one row with service `tutorial` and count `3`.
-4. Run `service=tutorial _severity>=error last=1h | table message, duration`.
-   Expect `connection refused` and `1500`, as in the CLI.
-
-The [browser guide](/reference/web-ui/) explains the time range, filters,
-live mode, and saved queries.
-
-## Open the TUI
+### Open the TUI
 
 ```bash
-trawl --config "$TRAWL_TUTORIAL_DIR/client.toml"
+trawl -p trial
 ```
 
-Press F1 for the shortcut list. Enter the same query and press Shift+Enter or
-F5. Expect the same rows. Press Ctrl+Q to quit before you clean up. See
+Press F1 for the shortcut list. Enter the documented query and press
+Shift+Enter or F5. Expect the same row. Press Ctrl+Q to quit. See
 [CLI and TUI workflows](/use/cli-tui/).
 
-## Query the export without a server
+### Query the export without a server
 
-Export the events to Parquet, then query the file with no server:
+Export the three tutorial events to Parquet, then query the file with no
+server:
 
 ```bash
-trawl --config "$TRAWL_TUTORIAL_DIR/client.toml" query \
-  'service=tutorial last=1h' --format parquet \
-  --output "$TRAWL_TUTORIAL_DIR/tutorial.parquet"
-trawl query --data "$TRAWL_TUTORIAL_DIR/tutorial.parquet" --format json \
-  '* | stats count() by service'
+trawl -p trial query 'service=tutorial' --format parquet --output ~/tutorial.parquet
+trawl query --data ~/tutorial.parquet --format json '* | stats count() by service'
 ```
 
 Expect `{"count":3,"service":"tutorial"}`. Property order can differ. See
-[Query local Parquet](/start/local-parquet/).
+[Query local Parquet](/start/local-parquet/), and remove the file when you
+are done.
 
-## Clean up
-
-Stop `trawl-web` and `trawld` with Ctrl+C in their terminals. Remove the container and its
-anonymous volume:
+## Stop and resume
 
 ```bash
-docker rm --force --volumes trawl-docs-postgres
+trawl trial status
+trawl trial stop
+trawl trial up
 ```
 
-The working directory still holds tokens, passwords, TLS keys, and the export.
-Remove it when you are done:
+`status` shows the trial id, the addresses, the image ids and digests, the
+certificate fingerprint, the sample range as absolute timestamps, the setup
+phases, and the containers. It warns when a `TRAWL_*` connection variable is
+set. `stop` stops the containers and keeps the databases, the keys, the
+samples, and the state. `up` resumes the same trial: the keys and the samples
+stay as they were, and no new events are loaded. Every `up` gives `trawl-web`
+a new session key, so sign in to the browser again after it.
+
+## Delete the trial
 
 ```bash
-rm -r -- "$TRAWL_TUTORIAL_DIR"
-unset TRAWL_PG_ADMIN_PASSWORD TRAWL_FLEET_PASSWORD TRAWL_APP_PASSWORD TRAWL_TUTORIAL_DIR
+trawl trial down
 ```
+
+`down` prints the containers, volumes, and network it will delete and asks
+`Delete all of it? [y/N]`. Without a terminal it exits non-zero and deletes
+nothing. Pass `--yes` to skip the question. It deletes only resources that
+carry this trial's id, then the trial directory, and exits 0. A second `down`
+prints that there is nothing to delete and exits 0.
+
+## From trial to installation
+
+A trial never becomes an installation. When you have seen enough, install
+fresh from a package, the tarball, or the Helm chart, and follow
+[Deploy Trawl](/operate/deployment/). The table maps each step `up` did for
+you onto the step you do yourself.
+
+| The trial did | You do |
+| --- | --- |
+| Ran `trawld`, `trawl-web`, and PostgreSQL from the container image | Install `trawl-server` from [APT or a tarball](/getting-started/), or the [Helm chart](/operate/deployment/#install-with-helm) |
+| Created the `fleet` and `trawl` databases with owner roles and ran `fleet-admin migrate` | [Provision the databases](/operate/deployment/#provision-the-databases) |
+| Generated a certificate for loopback and pinned it in `-p trial` and `trawl-web` | [Configure TLS](/operate/access/#configure-tls) with a certificate your clients trust, and set `ca_cert` in their profiles when it is private |
+| Minted the `trial-operator` and `trial-ingest` keys | [Create roles and keys](/operate/access/#create-roles-and-keys): personal keys for people, service keys for senders |
+| Served the browser at `http://127.0.0.1:18090` with insecure cookies | [Set the browser origin](/operate/access/#set-the-browser-origin) behind an HTTPS reverse proxy |
+| Resolved `-p trial` from its directory | Save the server as a [profile](/start/connect/#keep-more-than-one-server-in-profiles) in `~/.config/trawl/config.toml` |
+| Loaded 2000 sample events | [Connect your log sources](/operate/ingestion/) |
+| Started nothing at boot | `sudo systemctl enable --now trawld trawl-web` after the databases are set |
+
+Nothing carries over. The installation starts with empty databases and an
+empty data directory. The trial's keys are unknown to it, its sample data is
+not imported, its self-signed certificate is not trusted by anyone, and its
+loopback-only addresses give way to the addresses you configure. Run
+`trawl trial down` when the installation is up, or keep the trial as a
+scratch server on your own machine.
 
 ## What's next
 
+- [Build a query](/use/query-tutorial/) adds filters, columns, and summaries on the sample data.
 - [Search in the browser](/reference/web-ui/) explains the other search controls.
-- [Vector integration](/getting-started/vector-integration/) sends logs continuously.
-- [Share searches and export results](/use/sharing-export/) keeps or shares an answer.
+- [Vector integration](/getting-started/vector-integration/) sends logs continuously to an installation.
