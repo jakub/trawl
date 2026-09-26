@@ -24,6 +24,10 @@
 //! passes `--context`, so `DOCKER_HOST` decides, and the Compose plugin
 //! inherits it through the environment like any child.
 //!
+//! A pin holds only while no one can put another socket at its path, so
+//! [`LocalEndpoint::trusted`] refuses a socket that another user owns or
+//! could replace.
+//!
 //! Two ways to run a command:
 //!
 //! - [`Docker::stream`] hands the child our stderr for both of its output
@@ -47,15 +51,21 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs;
 use std::io;
 use std::os::fd::AsFd as _;
-use std::path::PathBuf;
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 use zeroize::Zeroizing;
+
+use super::TrialError;
+use super::paths;
+use super::preflight::PreflightError;
 
 /// The program the driver runs.
 const DOCKER: &str = "docker";
@@ -198,20 +208,132 @@ pub enum DockerError {
     OutputTooLarge { command: String, limit: usize },
 }
 
-/// A Docker endpoint on this machine: a `unix://` socket address.
+/// A Docker endpoint on this machine: a `unix://` socket address whose
+/// socket no other user can replace.
+///
+/// Every docker child connects to the socket by its path again, so pinning
+/// the address fixes the engine only while the same socket stays at that
+/// path. [`LocalEndpoint::trusted`] is the only way to make one, and it
+/// accepts a socket only when:
+///
+/// - it is a socket, owned by root or the current user;
+/// - every directory from `/` down to it, and every symlink on the way,
+///   including one at the socket's own name (`/var/run` to `/run`, say),
+///   passes the trial state's ancestry rule in [`super::paths`]: owned by
+///   root or the current user, and not group- or other-writable unless it
+///   has the sticky bit.
+///
+/// The socket's own mode is not judged. Connecting needs write access to
+/// it, so the standard `root:docker 0660` socket must pass, and only its
+/// directory decides who can put another socket in its place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEndpoint(String);
 
 impl LocalEndpoint {
-    /// `None` unless `address` is a `unix://` address.
-    pub fn parse(address: &str) -> Option<Self> {
-        address
-            .starts_with("unix://")
-            .then(|| Self(address.to_owned()))
+    /// `Ok(None)` unless `address` is a `unix://` address. A socket that
+    /// fails the rule is refused by name; one that does not exist is an
+    /// engine that is not running.
+    pub fn trusted(address: &str) -> Result<Option<Self>, TrialError> {
+        let Some(path) = address.strip_prefix("unix://") else {
+            return Ok(None);
+        };
+        if trust_socket(Path::new(path), nix::unistd::geteuid().as_raw())? {
+            Ok(Some(Self(address.to_owned())))
+        } else {
+            Err(PreflightError::ServerUnreachable {
+                endpoint: address.to_owned(),
+            }
+            .into())
+        }
+    }
+
+    /// An endpoint for a stub program, with no socket behind it.
+    #[cfg(test)]
+    pub(crate) fn unchecked(address: &str) -> Self {
+        assert!(address.starts_with("unix://"), "{address}");
+        Self(address.to_owned())
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// Whether `socket` passes the [`LocalEndpoint`] rule for user `me`.
+/// `Ok(false)` when it, or a directory or link target on the way to it,
+/// does not exist.
+///
+/// The ancestry of each path is the trial state's walk. A symlink at the
+/// socket's own name is checked like any link on the way, then its target
+/// is judged in turn.
+fn trust_socket(socket: &Path, me: u32) -> Result<bool, TrialError> {
+    let refuse = |problem: String| TrialError::UntrustedDockerSocket {
+        path: socket.to_owned(),
+        problem,
+    };
+    if !socket.is_absolute() {
+        return Err(refuse("it is not an absolute path".to_owned()));
+    }
+    // A rule failure names the component that broke it; an I/O error
+    // passes through as it is.
+    let rule = |error: TrialError| match error {
+        TrialError::ForeignOwner { path, owner, me } => refuse(format!(
+            "{} is owned by uid {owner}, and must be owned by root or by uid {me}",
+            path.display()
+        )),
+        TrialError::NotPrivateFile { path, .. } => refuse(format!(
+            "group or other can write to {} and it has no sticky bit",
+            path.display()
+        )),
+        TrialError::NotADirectory { path } => {
+            refuse(format!("{} is not a directory", path.display()))
+        }
+        other => other,
+    };
+    let mut current = socket.to_owned();
+    let mut hops = 0;
+    loop {
+        let not_a_socket = || refuse(format!("{} is not a socket", current.display()));
+        let Some(parent) = current.parent() else {
+            return Err(not_a_socket());
+        };
+        if !paths::walk_ancestry(parent, me).map_err(rule)? {
+            return Ok(false);
+        }
+        let meta = match fs::symlink_metadata(&current) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(TrialError::io("inspect", &current, e)),
+        };
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            paths::verify_ancestor(&current, &meta, me).map_err(rule)?;
+            hops += 1;
+            if hops > paths::MAX_SYMLINK_HOPS {
+                return Err(TrialError::io(
+                    "resolve",
+                    &current,
+                    io::Error::from_raw_os_error(nix::libc::ELOOP),
+                ));
+            }
+            let target =
+                fs::read_link(&current).map_err(|e| TrialError::io("resolve", &current, e))?;
+            // A relative target resolves from the link's directory; an
+            // absolute one replaces the path.
+            current = parent.join(target);
+            continue;
+        }
+        if !file_type.is_socket() {
+            return Err(not_a_socket());
+        }
+        if meta.uid() != 0 && meta.uid() != me {
+            return Err(refuse(format!(
+                "{} is owned by uid {}, and must be owned by root or by uid {me}",
+                current.display(),
+                meta.uid()
+            )));
+        }
+        return Ok(true);
     }
 }
 
@@ -607,7 +729,7 @@ pub(crate) mod tests {
     /// A stub driver pinned to [`STUB_ENDPOINT`].
     pub(crate) fn stub(body: &str) -> (tempfile::TempDir, Docker) {
         let (tmp, cli) = stub_cli(body);
-        let endpoint = LocalEndpoint::parse(STUB_ENDPOINT).unwrap();
+        let endpoint = LocalEndpoint::unchecked(STUB_ENDPOINT);
         let docker = cli.pin(endpoint, tmp.path().join("trial"));
         (tmp, docker)
     }
@@ -765,7 +887,7 @@ pub(crate) mod tests {
             program: "/nonexistent/docker".into(),
             lead: Vec::new(),
         }
-        .pin(LocalEndpoint::parse(STUB_ENDPOINT).unwrap(), "/nonexistent");
+        .pin(LocalEndpoint::unchecked(STUB_ENDPOINT), "/nonexistent");
         let err = docker
             .output(
                 &args(&["version"]),
@@ -782,7 +904,7 @@ pub(crate) mod tests {
     #[test]
     fn compose_arguments_pin_the_project_file_and_directory() {
         let docker = DockerCli::new().pin(
-            LocalEndpoint::parse(STUB_ENDPOINT).unwrap(),
+            LocalEndpoint::unchecked(STUB_ENDPOINT),
             "/state/trawl/trial",
         );
         let call = docker.compose(Args::new().args(["up", "-d"]));
@@ -831,7 +953,7 @@ pub(crate) mod tests {
     #[test]
     fn every_child_is_pinned_to_the_endpoint_without_a_context() {
         let docker = DockerCli::new().pin(
-            LocalEndpoint::parse("unix:///run/user/1000/docker.sock").unwrap(),
+            LocalEndpoint::unchecked("unix:///run/user/1000/docker.sock"),
             "/state/trawl/trial",
         );
         let calls = [
@@ -890,7 +1012,6 @@ pub(crate) mod tests {
 
     #[test]
     fn only_a_unix_address_is_a_local_endpoint() {
-        assert!(LocalEndpoint::parse("unix:///var/run/docker.sock").is_some());
         for remote in [
             "tcp://10.0.0.5:2376",
             "ssh://me@host",
@@ -898,8 +1019,240 @@ pub(crate) mod tests {
             "/var/run/docker.sock",
             "",
         ] {
-            assert!(LocalEndpoint::parse(remote).is_none(), "{remote}");
+            assert!(
+                matches!(LocalEndpoint::trusted(remote), Ok(None)),
+                "{remote}"
+            );
         }
+    }
+
+    fn me() -> u32 {
+        nix::unistd::geteuid().as_raw()
+    }
+
+    /// A directory at `path` with exactly `mode`.
+    fn dir_at(path: &Path, mode: u32) {
+        fs::create_dir(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// A listening socket at `path`, owned by the test user; the socket
+    /// file stays while the listener lives.
+    fn socket_at(path: &Path) -> std::os::unix::net::UnixListener {
+        std::os::unix::net::UnixListener::bind(path).unwrap()
+    }
+
+    fn address(path: &Path) -> String {
+        format!("unix://{}", path.display())
+    }
+
+    /// The refusal's path and problem, or a panic naming what came back.
+    fn refusal(result: Result<Option<LocalEndpoint>, TrialError>) -> (PathBuf, String, String) {
+        match result {
+            Err(err @ TrialError::UntrustedDockerSocket { .. }) => {
+                let text = err.to_string();
+                let TrialError::UntrustedDockerSocket { path, problem } = err else {
+                    unreachable!()
+                };
+                (path, problem, text)
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_user_owned_socket_in_a_trusted_directory_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("docker.sock");
+        let _listener = socket_at(&sock);
+        let endpoint = LocalEndpoint::trusted(&address(&sock)).unwrap().unwrap();
+        assert_eq!(
+            endpoint.as_str(),
+            address(&sock),
+            "the address is pinned as given"
+        );
+    }
+
+    /// The finding: another user who can rename entries in the socket's
+    /// directory can swap the socket after preflight.
+    #[test]
+    fn a_socket_under_a_group_writable_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("shared");
+        dir_at(&shared, 0o770);
+        let sock = shared.join("docker.sock");
+        let _listener = socket_at(&sock);
+
+        let (path, problem, text) = refusal(LocalEndpoint::trusted(&address(&sock)));
+        assert_eq!(path, sock);
+        assert!(problem.contains(&shared.display().to_string()), "{problem}");
+        assert!(problem.contains("no sticky bit"), "{problem}");
+        assert!(
+            text.contains(&sock.display().to_string()),
+            "names the path: {text}"
+        );
+        assert!(
+            text.contains("owned by root or by you"),
+            "names the rule: {text}"
+        );
+
+        // Control: the same directory with the sticky bit is trusted.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1770)).unwrap();
+        assert!(LocalEndpoint::trusted(&address(&sock)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_regular_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("docker.sock");
+        fs::write(&file, "").unwrap();
+        let (path, problem, _) = refusal(LocalEndpoint::trusted(&address(&file)));
+        assert_eq!(path, file);
+        assert!(problem.contains("is not a socket"), "{problem}");
+
+        let (_, problem, _) = refusal(LocalEndpoint::trusted(&address(tmp.path())));
+        assert!(
+            problem.contains("is not a socket"),
+            "a directory: {problem}"
+        );
+    }
+
+    #[test]
+    fn a_relative_socket_path_is_refused() {
+        let (_, problem, _) = refusal(LocalEndpoint::trusted("unix://docker.sock"));
+        assert!(problem.contains("not an absolute path"), "{problem}");
+        let (_, problem, _) = refusal(LocalEndpoint::trusted("unix://"));
+        assert!(problem.contains("not an absolute path"), "{problem}");
+    }
+
+    #[test]
+    fn a_missing_socket_is_an_engine_that_is_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        for missing in [
+            tmp.path().join("docker.sock"),
+            tmp.path().join("absent/docker.sock"),
+        ] {
+            let address = address(&missing);
+            assert!(
+                matches!(
+                    LocalEndpoint::trusted(&address),
+                    Err(TrialError::Preflight(PreflightError::ServerUnreachable { endpoint }))
+                        if endpoint == address
+                ),
+                "{address}"
+            );
+        }
+    }
+
+    /// `/var/run -> ../run` style links resolve, absolute and relative,
+    /// at the socket's own name and above it.
+    #[test]
+    fn a_socket_reached_through_a_link_to_a_trusted_place_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("run");
+        dir_at(&real, 0o755);
+        let sock = real.join("docker.sock");
+        let _listener = socket_at(&sock);
+        std::os::unix::fs::symlink("run", tmp.path().join("var-run")).unwrap();
+        std::os::unix::fs::symlink(&sock, tmp.path().join("abs.sock")).unwrap();
+        std::os::unix::fs::symlink("run/docker.sock", tmp.path().join("rel.sock")).unwrap();
+
+        for via in ["var-run/docker.sock", "abs.sock", "rel.sock"] {
+            let link = tmp.path().join(via);
+            assert!(
+                LocalEndpoint::trusted(&address(&link)).unwrap().is_some(),
+                "{via}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_socket_reached_through_a_link_into_an_untrusted_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loose = tmp.path().join("loose");
+        dir_at(&loose, 0o777);
+        let sock = loose.join("docker.sock");
+        let _listener = socket_at(&sock);
+        std::os::unix::fs::symlink(&sock, tmp.path().join("at-name.sock")).unwrap();
+        std::os::unix::fs::symlink(&loose, tmp.path().join("dir-link")).unwrap();
+
+        for via in ["at-name.sock", "dir-link/docker.sock"] {
+            let link = tmp.path().join(via);
+            let (path, problem, _) = refusal(LocalEndpoint::trusted(&address(&link)));
+            assert_eq!(path, link, "the refusal names the address given");
+            assert!(
+                problem.contains(&loose.display().to_string()) && problem.contains("no sticky bit"),
+                "{via}: {problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_loop_at_the_socket_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("b.sock", tmp.path().join("a.sock")).unwrap();
+        std::os::unix::fs::symlink("a.sock", tmp.path().join("b.sock")).unwrap();
+        assert!(matches!(
+            LocalEndpoint::trusted(&address(&tmp.path().join("a.sock"))),
+            Err(TrialError::Io {
+                action: "resolve",
+                ..
+            })
+        ));
+    }
+
+    /// Tests run as one user, so the owner rules are checked against a
+    /// different expected uid: first a socket in the temp directory, whose
+    /// ancestry is root's, then the temp directory the test user owns.
+    #[test]
+    fn a_socket_or_directory_owned_by_another_user_is_refused() {
+        let other = me().wrapping_add(1);
+        let system_temp = std::env::temp_dir();
+        let sock = system_temp.join(format!("trawl-trial-owner-{}.sock", std::process::id()));
+        let _ = fs::remove_file(&sock);
+        let listener = socket_at(&sock);
+        let result = trust_socket(&sock, other);
+        drop(listener);
+        fs::remove_file(&sock).unwrap();
+        if paths::walk_ancestry(&system_temp, other).is_err() {
+            eprintln!(
+                "SKIP socket-owner leg: {} is not root's all the way up",
+                system_temp.display()
+            );
+        } else {
+            let err = result.unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains(&format!("{} is owned by uid {}", sock.display(), me())),
+                "{text}"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("docker.sock");
+        let _listener = socket_at(&sock);
+        assert!(trust_socket(&sock, me()).unwrap());
+        let err = trust_socket(&sock, other).unwrap_err();
+        assert!(
+            matches!(&err, TrialError::UntrustedDockerSocket { problem, .. }
+                if problem.contains("must be owned by root or by uid")),
+            "{err:?}"
+        );
+    }
+
+    /// The standard `root:docker 0660` socket, usually reached through
+    /// the `/var/run -> /run` link.
+    #[test]
+    fn the_standard_docker_socket_passes_when_present() {
+        const SOCK: &str = "/var/run/docker.sock";
+        if fs::symlink_metadata(SOCK).is_err() {
+            eprintln!("SKIP: {SOCK} does not exist on this host");
+            return;
+        }
+        let endpoint = LocalEndpoint::trusted(&format!("unix://{SOCK}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(endpoint.as_str(), "unix:///var/run/docker.sock");
     }
 
     #[test]
