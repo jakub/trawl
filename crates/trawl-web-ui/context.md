@@ -63,8 +63,12 @@ The newest raw events the stream delivered, up to a fixed size. In live it is wh
 _Avoid_: buffer (unqualified), tail rows, history
 
 **Filter rail**:
-The sidebar counting field values over the rows on screen: the snapshot page or the live ring. Its counts describe what is shown, never the corpus, and it is absent for an aggregation-shaped result because a value filter on an aggregate column names a field no event carries. It never counts an event instant or the raw event (`_time`, `_ingested`, `_raw`), nor a field whose values on screen are all different and all read as times; a field that is merely all different, such as ten hosts on ten rows, stays.
-_Avoid_: facet sidebar (the code name), facets
+The panel counting field values over the rows on screen: the snapshot page or the live ring. Its counts describe what is shown, never the corpus. It counts nothing for an aggregation-shaped result, because a value filter on an aggregate column names a field no event carries, but its header, active count and Clear all remain. It never counts an event instant or the raw event (`_time`, `_ingested`, `_raw`), nor a field whose values on screen are all different and all read as times; a field that is merely all different, such as ten hosts on ten rows, stays. At 900px and wider it opens and closes with the countable page until the reader opens or closes it by hand, which holds for the browser session; below 900px it opens only by hand. Whether it is open is presentation, never search URL state or a reading preference.
+_Avoid_: facet sidebar (the code name), facets, Filters sidebar (the navigation sidebar also collapses)
+
+**Countable page**:
+A settled result on screen, the snapshot page or the live ring, with at least one field the filter rail may count. Active filters alone do not make a page countable, and a pending, refused, malformed or aggregation-shaped result never is.
+_Avoid_: relevant, has data, non-empty page
 
 **Null field**:
 A field whose value in this row is NULL: the event did not carry it, carried an explicit null, or carried a value its pin could not convert. The detail views fold null fields behind one disclosure; an empty string, zero or false is a value, never a null field.
