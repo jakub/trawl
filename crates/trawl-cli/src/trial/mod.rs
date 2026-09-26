@@ -47,6 +47,11 @@ mod preflight;
 pub mod profile;
 #[cfg_attr(
     not(test),
+    expect(dead_code, reason = "trawl trial up seeds the samples")
+)]
+mod sample;
+#[cfg_attr(
+    not(test),
     expect(dead_code, reason = "trawl trial up writes the secrets")
 )]
 mod secrets;
