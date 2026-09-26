@@ -20,9 +20,11 @@ use super::sample::{DOCUMENTED_QUERY, documented_row};
 use super::state::{ImageRecord, Samples, TrialState};
 use super::{CLAIM_NAME, PROFILE};
 
-/// The browser address: `localhost`, the first of the trial's origins.
+/// The browser address: `127.0.0.1`, where the trial publishes the web
+/// port. Both origins are allowed, but a browser tries `localhost` on
+/// `::1` first, where the trial does not listen and any local user may.
 pub fn browser_url(state: &TrialState) -> String {
-    format!("http://localhost:{}", state.ports.web)
+    format!("http://127.0.0.1:{}", state.ports.web)
 }
 
 /// The API address `-p trial` connects to.
@@ -405,7 +407,7 @@ mod tests {
         let mut state = fixture(25514);
         state.ports.web = 28090;
         let summary = text(|out| render_summary(out, &state, &paths()));
-        assert!(summary.contains("http://localhost:28090"), "{summary}");
+        assert!(summary.contains("http://127.0.0.1:28090"), "{summary}");
         assert!(summary.contains("https://127.0.0.1:25514"), "{summary}");
         assert!(
             summary.contains(&format!("query '{DOCUMENTED_QUERY}'")),
@@ -416,6 +418,22 @@ mod tests {
         let summary = text(|out| render_summary(out, &state, &paths()));
         assert!(!summary.contains(DOCUMENTED_QUERY), "{summary}");
         assert!(summary.contains("No sample data"), "{summary}");
+    }
+
+    /// The trial publishes on 127.0.0.1 only. A browser tries `localhost`
+    /// on `::1` first, where any local user may listen, so no output sends
+    /// the browser to `localhost`.
+    #[test]
+    fn the_browser_address_is_the_published_one() {
+        let mut state = fixture(25514);
+        state.ports.web = 28090;
+        assert_eq!(browser_url(&state), "http://127.0.0.1:28090");
+        for output in [
+            text(|out| render_summary(out, &state, &paths())),
+            text(|out| render_status(out, &state, &paths(), &containers())),
+        ] {
+            assert!(!output.contains("localhost"), "{output}");
+        }
     }
 
     #[test]
