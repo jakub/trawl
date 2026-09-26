@@ -496,8 +496,9 @@ struct PassOutcome {
     /// stuck.
     drained: u64,
     /// What will stop the next pass the same way: failed chunks (an error,
-    /// or a publish that did not finish), blocking publication markers and
-    /// failed env WAL scans. Quarantines and rollup failures are not here:
+    /// or a publish that did not finish), blocking publication markers,
+    /// failed env WAL scans and a WAL root scan that skipped an entry it
+    /// could not inspect. Quarantines and rollup failures are not here:
     /// a quarantined file leaves the WAL, and a failed rollup does not
     /// stop the WAL from draining. See [`Cadence`].
     persistent_failures: u64,
@@ -549,11 +550,17 @@ async fn compact_pass(
     // admission refuses ingest (ADR-0043). A *missing* root is a cold start and yields an
     // empty list silently. Unlike a single unreadable env (isolated and
     // counted), a bad root leaves nothing to carry on with.
+    //
+    // A root entry that cannot be inspected still lets the listed envs
+    // drain, but the pass counts it as a persistent failure: the entry may
+    // be an env whose WAL never drains, and the next pass would skip it the
+    // same way.
     let mut skipped_scan_error = false;
     let env_wal_dirs = try_list_env_dirs_observed(wal_dir, || skipped_scan_error = true);
     if skipped_scan_error || env_wal_dirs.is_err() {
         CompactionOperation::WalRootScan.record_failure();
     }
+    let root_scan_incomplete = u64::from(skipped_scan_error);
     let env_wal_dirs = env_wal_dirs.map_err(|e| {
         format!(
             "failed to list WAL env directories in {}: {e}",
@@ -757,7 +764,10 @@ async fn compact_pass(
         data_loss: rollup_failures + wal_quarantined + scan_failures + recovery_blocked,
         eligible,
         drained,
-        persistent_failures: chunk_failures + recovery_blocked + scan_failures,
+        persistent_failures: chunk_failures
+            + recovery_blocked
+            + scan_failures
+            + root_scan_incomplete,
     })
 }
 
@@ -11456,6 +11466,61 @@ mod tests {
             runs, 1,
             "a pass with a failed chunk cools down even though it drained"
         );
+    }
+
+    /// One pass drains env `dev`, but one entry of the WAL root cannot be
+    /// inspected: a symlink loop, which fails with `ELOOP` for any user.
+    /// That entry may be an env whose WAL never drains, so the pass cools
+    /// down as a failed chunk does, after it has drained the healthy env.
+    /// A later insert that puts the buffer under pressure must then wait
+    /// for the normal pass, an hour out.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_wal_root_scan_drains_and_cools_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hot = pressure_buffer();
+        let pipeline = Arc::new(PipelineWriter::new(
+            Arc::new(WalWriter::new(tmp.path().join("wal"))),
+            Some(Arc::clone(&hot)),
+            None,
+        ));
+        let healthy = admitted_env_group(&pipeline, ProducerKind::Trawld, "dev", "svc", 60);
+        assert_eq!(write_groups(&pipeline, vec![healthy]).await, 60);
+        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
+        let cycle = tmp.path().join("wal").join("cycle");
+        std::os::unix::fs::symlink("cycle", &cycle).unwrap();
+        assert_ne!(
+            cycle.metadata().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "the loop must be a skipped scan error, not a vanished entry"
+        );
+
+        // The loop starts under pressure, so its first pass runs at once.
+        let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
+        let stats = Arc::clone(&compaction.stats);
+        let waiting = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        assert!(waiting, "the loop reaches its first wait");
+        assert_eq!(stats.total_runs.load(Ordering::Relaxed), 1);
+        assert_eq!(hot.drained_batches(), 1, "the pass drained the healthy env");
+        assert_eq!(hot.admission_state(), AdmissionState::Open);
+
+        let again = admitted_env_group(&pipeline, ProducerKind::Trawld, "dev", "svc", 60);
+        assert_eq!(write_groups(&pipeline, vec![again]).await, 60);
+        assert_eq!(hot.admission_state(), AdmissionState::Pressure);
+        let rerun = eventually(Duration::from_secs(1), || hot.drained_batches() > 1).await;
+        let runs = stats.total_runs.load(Ordering::Relaxed);
+        compaction.stop().await;
+
+        assert!(
+            !rerun && runs == 1,
+            "an incomplete WAL root scan must start the cooldown: {runs} passes, \
+             {} batches drained",
+            hot.drained_batches()
+        );
+        assert_eq!(hot.event_count(), 60, "the second batch waits");
     }
 
     /// A stuck env below a quarter of the cap never holds the buffer under
