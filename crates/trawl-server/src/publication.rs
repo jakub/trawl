@@ -45,19 +45,94 @@ impl CorpusUnsettled {
     }
 }
 
+/// The [`CorpusUnsettled`] reasons that hold at one instant. Each holds or
+/// not on its own; only [`Self::first`] applies the precedence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnsettledReasons {
+    rollup_pending: bool,
+    restart_backlog: bool,
+}
+
+impl UnsettledReasons {
+    /// Whether `reason` holds.
+    #[must_use]
+    pub const fn contains(self, reason: CorpusUnsettled) -> bool {
+        match reason {
+            CorpusUnsettled::RollupPending => self.rollup_pending,
+            CorpusUnsettled::RestartBacklog => self.restart_backlog,
+        }
+    }
+
+    /// The reason a refusal or the health check names: `RollupPending`
+    /// when both hold, `None` when the corpus is settled.
+    #[must_use]
+    pub const fn first(self) -> Option<CorpusUnsettled> {
+        if self.rollup_pending {
+            Some(CorpusUnsettled::RollupPending)
+        } else if self.restart_backlog {
+            Some(CorpusUnsettled::RestartBacklog)
+        } else {
+            None
+        }
+    }
+}
+
+/// Whether the WAL that survived the last restart is proven covered by the
+/// hot buffer or Parquet (ADR-0041 slice 2). It only moves forward:
+/// `Starting` to `Settled` or `Overhang`, and `Overhang` to `Settled`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Restart {
+    /// Nothing from before the restart is unaccounted for. A gate not born
+    /// [`starting`](PublicationGate::starting) starts here.
+    #[default]
+    Settled,
+    /// Boot hydration has not finished.
+    Starting,
+    /// Hydration left WAL that is neither resident nor proven drained.
+    Overhang,
+}
+
+/// Everything the gate knows about the corpus, under one mutex. Nothing
+/// outside the gate keeps a copy.
 #[derive(Debug, Default)]
-struct PendingRollups {
+struct CorpusState {
+    /// Rollup markers registered and not yet confirmed gone.
     markers: HashSet<PathBuf>,
+    /// The marker scan failed, so an unknown marker may exist. Only a later
+    /// complete scan clears it.
     scan_failed: bool,
     initialized: bool,
+    restart: Restart,
 }
+
+impl CorpusState {
+    /// The one evaluator behind every answer about the corpus: forget
+    /// markers whose files are confirmed gone, then report what holds.
+    fn evaluate(&mut self) -> UnsettledReasons {
+        self.markers.retain(|path| !is_missing(path));
+        UnsettledReasons {
+            rollup_pending: self.scan_failed || !self.markers.is_empty(),
+            restart_backlog: self.restart != Restart::Settled,
+        }
+    }
+}
+
+/// [`PublicationGate::finish_hydration`] on a gate that is not starting:
+/// hydration already finished, or the gate was not born starting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("hydration can finish only once, on a gate born starting")]
+pub struct NotStarting;
 
 /// Readers hold a guard through source selection, hot snapshot, and execution.
 /// Writers hold a guard through publication and hot drain or source retirement.
+///
+/// The gate also holds the corpus state: pending rollups and, on an ingest
+/// node, whether the WAL from before the restart is covered. While either
+/// is unsettled, [`read`](Self::read) refuses (ADR-0026, ADR-0041).
 #[derive(Debug, Default)]
 pub struct PublicationGate {
     lock: Arc<RwLock<()>>,
-    pending: Mutex<PendingRollups>,
+    corpus: Mutex<CorpusState>,
     #[cfg(any(test, feature = "test-support"))]
     pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     #[cfg(test)]
@@ -65,42 +140,161 @@ pub struct PublicationGate {
 }
 
 impl PublicationGate {
+    /// A settled gate: a query-only node's, and any gate outside boot.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Register root/env/date/.rollup-* markers before admitting readers.
-    /// Literal directory traversal keeps glob metacharacters in root names
-    /// literal. A failed scan refuses reads until this gate is replaced.
-    /// Repeated initialization preserves markers already registered by writers.
-    pub fn initialize(&self, root: &Path) {
-        let mut pending = self.pending.lock();
-        if pending.initialized {
-            return;
-        }
-        pending.initialized = true;
-        if let Err(error) = scan_markers(root, &mut pending.markers) {
-            // This scan is attempted once. Later read refusals are its
-            // consequences, not new recovery or scan attempts.
-            crate::metrics::CompactionOperation::PendingRollupScan.record_failure();
-            tracing::error!(event_type = "publication_scan_failed", %error,
-                "cannot establish rollup publication state; corpus reads refused until restart");
-            pending.scan_failed = true;
+    /// An ingest node's gate at boot. Reads refuse `restart_backlog` until
+    /// [`finish_hydration`](Self::finish_hydration) says the surviving WAL
+    /// is resident (ADR-0041 slice 2).
+    #[must_use]
+    pub fn starting() -> Self {
+        Self {
+            corpus: Mutex::new(CorpusState {
+                restart: Restart::Starting,
+                ..CorpusState::default()
+            }),
+            ..Self::default()
         }
     }
 
-    /// Refuse mixed rollup generations, including incomplete recovery at boot.
+    /// Register root/env/date/.rollup-* markers before admitting readers.
+    /// Literal directory traversal keeps glob metacharacters in root names
+    /// literal. A failed scan refuses reads until a later complete scan
+    /// clears it ([`rescan_if_failed`](Self::rescan_if_failed)). Only
+    /// compaction rescans, so on a query-only node that is the next restart.
+    /// Repeated initialization preserves markers already registered by writers.
+    pub fn initialize(&self, root: &Path) {
+        let mut corpus = self.corpus.lock();
+        if corpus.initialized {
+            return;
+        }
+        corpus.initialized = true;
+        if let Err(error) = scan_markers(root, &mut corpus.markers) {
+            // The failure episode is counted here, once. Later read
+            // refusals and failed rescans are its consequences, not new
+            // failures.
+            crate::metrics::CompactionOperation::PendingRollupScan.record_failure();
+            tracing::error!(event_type = "publication_scan_failed", %error,
+                "cannot establish rollup publication state; corpus reads refused until a later scan completes");
+            corpus.scan_failed = true;
+        }
+    }
+
+    /// Retry a failed marker scan. Only a complete scan clears the failure,
+    /// and its markers join those writers registered. A failed retry
+    /// changes nothing and records nothing: the failure was counted when
+    /// the first scan failed. A gate whose scan did not fail returns at
+    /// once. Blocking filesystem I/O.
+    pub fn rescan_if_failed(&self, root: &Path) {
+        if !self.corpus.lock().scan_failed {
+            return;
+        }
+        let mut found = HashSet::new();
+        if scan_markers(root, &mut found).is_err() {
+            return;
+        }
+        {
+            let mut corpus = self.corpus.lock();
+            corpus.markers.extend(found);
+            corpus.scan_failed = false;
+        }
+        tracing::info!(
+            event_type = "publication_scan_recovered",
+            "rollup publication state established; the failed marker scan is cleared"
+        );
+    }
+
+    /// Admit a corpus reader: take the read guard, then refuse with
+    /// [`ServerError::CorpusRecovering`] while the corpus is unsettled. A
+    /// pending rollup (including incomplete recovery at boot) is named
+    /// before a restart backlog.
     pub async fn read(&self) -> Result<OwnedRwLockReadGuard<()>, ServerError> {
         let guard = Arc::clone(&self.lock).read_owned().await;
-        let mut pending = self.pending.lock();
-        pending.markers.retain(|path| !is_missing(path));
-        if pending.scan_failed || !pending.markers.is_empty() {
-            return Err(ServerError::ServiceUnavailable(
-                "query data is temporarily unavailable".to_owned(),
-            ));
+        match self.corpus.lock().evaluate().first() {
+            Some(reason) => Err(ServerError::CorpusRecovering(reason)),
+            None => Ok(guard),
+        }
+    }
+
+    /// Admit compaction's WAL phase: take the read guard, then refuse only
+    /// while a rollup is pending. The restart backlog is compaction's to
+    /// drain, so it must not stop compaction.
+    pub async fn read_rollups_only(&self) -> Result<OwnedRwLockReadGuard<()>, CorpusUnsettled> {
+        let guard = Arc::clone(&self.lock).read_owned().await;
+        if self
+            .corpus
+            .lock()
+            .evaluate()
+            .contains(CorpusUnsettled::RollupPending)
+        {
+            return Err(CorpusUnsettled::RollupPending);
         }
         Ok(guard)
+    }
+
+    /// Why reads would refuse now, by precedence, or `None` when settled.
+    /// Takes no guard, so it never waits behind a publication.
+    #[must_use]
+    pub fn unsettled(&self) -> Option<CorpusUnsettled> {
+        self.unsettled_reasons().first()
+    }
+
+    /// Every reason that holds now, each on its own. Takes no guard.
+    #[must_use]
+    pub fn unsettled_reasons(&self) -> UnsettledReasons {
+        self.corpus.lock().evaluate()
+    }
+
+    /// Whether the WAL from before the restart is not yet proven covered:
+    /// hydration has not finished, or it left overhang.
+    #[must_use]
+    pub fn overhang(&self) -> bool {
+        self.unsettled_reasons()
+            .contains(CorpusUnsettled::RestartBacklog)
+    }
+
+    /// End boot hydration: settled when every surviving WAL file became
+    /// resident, overhang otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`NotStarting`] when the gate was not born
+    /// [`starting`](Self::starting) or hydration already finished; the gate
+    /// is unchanged.
+    pub fn finish_hydration(&self, overhang: bool) -> Result<(), NotStarting> {
+        let mut corpus = self.corpus.lock();
+        if corpus.restart != Restart::Starting {
+            return Err(NotStarting);
+        }
+        corpus.restart = if overhang {
+            Restart::Overhang
+        } else {
+            Restart::Settled
+        };
+        Ok(())
+    }
+
+    /// Clear overhang once a coverage proof holds. The caller must hold the
+    /// publication write guard it proved under. Moves only `Overhang` to
+    /// `Settled`, and logs `corpus_settled` once, on that move.
+    pub fn settle_overhang(&self) {
+        let settled = {
+            let mut corpus = self.corpus.lock();
+            let overhang = corpus.restart == Restart::Overhang;
+            if overhang {
+                corpus.restart = Restart::Settled;
+            }
+            overhang
+        };
+        if settled {
+            tracing::info!(
+                event_type = "corpus_settled",
+                "the WAL from before the restart is covered; corpus reads are no longer refused for it"
+            );
+        }
     }
 
     pub async fn write(&self) -> OwnedRwLockWriteGuard<()> {
@@ -127,23 +321,23 @@ impl PublicationGate {
 
     /// The caller must hold the publication write guard until retirement ends.
     pub fn mark_rollup(&self, marker: &Path) {
-        self.pending.lock().markers.insert(marker.to_path_buf());
+        self.corpus.lock().markers.insert(marker.to_path_buf());
     }
 
     /// The caller must hold the publication write guard. A surviving marker or
     /// metadata error still refuses readers. This method never changes files.
     pub fn finish_rollup(&self, marker: &Path) {
         if is_missing(marker) {
-            self.pending.lock().markers.remove(marker);
+            self.corpus.lock().markers.remove(marker);
         }
     }
 
     /// Recovery must finish these days before WAL compaction changes any
     /// hourly input named by a marker.
     pub fn pending_rollup_markers(&self) -> Vec<PathBuf> {
-        let mut pending = self.pending.lock();
-        pending.markers.retain(|path| !is_missing(path));
-        pending.markers.iter().cloned().collect()
+        let mut corpus = self.corpus.lock();
+        corpus.markers.retain(|path| !is_missing(path));
+        corpus.markers.iter().cloned().collect()
     }
 
     /// Pause the next publication while its caller still holds the write guard.
@@ -266,7 +460,9 @@ mod tests {
         }
         assert!(matches!(
             gate.read().await,
-            Err(ServerError::ServiceUnavailable(_))
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RollupPending
+            ))
         ));
         std::fs::remove_file(marker).unwrap();
         assert!(gate.read().await.is_ok());
@@ -288,13 +484,16 @@ mod tests {
         assert!(gate.read().await.is_ok());
     }
 
+    /// A failed scan refuses reads until a later complete scan clears it
+    /// (ADR-0041 slice 2). Reads and failed rescans in between are the
+    /// same failure episode, counted once.
     #[tokio::test]
     async fn scan_failure_stays_closed() {
         use crate::metrics::test_support::sample;
         let recorder = crate::metrics::prometheus_builder().build_recorder();
         let handle = recorder.handle();
-        // initialize and read perform their checks on this thread; neither
-        // dispatches a worker whose counters this recorder could miss.
+        // initialize, rescan and read perform their checks on this thread;
+        // none dispatches a worker whose counters this recorder could miss.
         let _recorder = metrics::set_default_local_recorder(&recorder);
         crate::metrics::init_operational_alert_metrics();
         let dir = tempfile::tempdir().unwrap();
@@ -311,11 +510,21 @@ mod tests {
         gate.initialize(dir.path());
         assert!(gate.read().await.is_err());
         assert!(gate.read().await.is_err());
+        gate.rescan_if_failed(&root);
+        assert!(
+            gate.read().await.is_err(),
+            "a rescan that fails again changes nothing"
+        );
         assert_eq!(
             sample(&handle, series),
             1,
-            "a latched refusal is not a new scan"
+            "a latched refusal or a failed rescan is not a new failure"
         );
+        std::fs::remove_file(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        gate.rescan_if_failed(&root);
+        assert!(gate.read().await.is_ok(), "a complete rescan clears it");
+        assert_eq!(sample(&handle, series), 1);
         assert_eq!(
             sample(
                 &handle,
@@ -361,7 +570,323 @@ mod tests {
         std::fs::remove_file(&env).unwrap();
         assert!(
             gate.read().await.is_err(),
-            "errors other than confirmed absence remain closed until restart"
+            "errors other than confirmed absence remain closed until a complete rescan"
         );
+    }
+
+    /// `(level, event_type)` of one recorded event.
+    type Recorded = (tracing::Level, Option<String>);
+
+    /// Every event recorded while installed.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<Recorded>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct EventType(Option<String>);
+            impl tracing::field::Visit for EventType {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "event_type" {
+                        self.0 = Some(value.to_owned());
+                    }
+                }
+                fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+            }
+            let mut event_type = EventType(None);
+            event.record(&mut event_type);
+            self.0
+                .lock()
+                .push((*event.metadata().level(), event_type.0));
+        }
+    }
+
+    impl Capture {
+        fn count(&self, event_type: &str) -> usize {
+            self.0
+                .lock()
+                .iter()
+                .filter(|(_, recorded)| recorded.as_deref() == Some(event_type))
+                .count()
+        }
+    }
+
+    /// Run `f` with every event it logs on this thread captured.
+    fn capturing<T>(f: impl FnOnce(&Capture) -> T) -> T {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || f(&capture))
+    }
+
+    fn assert_settled(gate: &PublicationGate) {
+        assert_eq!(gate.unsettled(), None);
+        assert_eq!(gate.unsettled_reasons(), UnsettledReasons::default());
+        assert!(!gate.overhang());
+    }
+
+    fn assert_restart_backlog(gate: &PublicationGate) {
+        assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RestartBacklog));
+        assert!(gate.overhang());
+        let reasons = gate.unsettled_reasons();
+        assert!(reasons.contains(CorpusUnsettled::RestartBacklog));
+        assert!(!reasons.contains(CorpusUnsettled::RollupPending));
+    }
+
+    #[tokio::test]
+    async fn new_and_default_gates_are_born_settled() {
+        for gate in [PublicationGate::new(), PublicationGate::default()] {
+            assert_settled(&gate);
+            assert!(gate.read().await.is_ok());
+            assert!(gate.read_rollups_only().await.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_starting_gate_refuses_restart_backlog_until_hydration_finishes() {
+        let gate = PublicationGate::starting();
+        assert_restart_backlog(&gate);
+        assert!(matches!(
+            gate.read().await,
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RestartBacklog
+            ))
+        ));
+
+        capturing(|capture| {
+            assert_eq!(gate.finish_hydration(false), Ok(()));
+            assert_eq!(
+                capture.count("corpus_settled"),
+                0,
+                "a boot with nothing left over settles without a coverage proof"
+            );
+        });
+        assert_settled(&gate);
+        assert!(gate.read().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn overhang_refuses_until_settled_and_logs_the_settling_once() {
+        let gate = PublicationGate::starting();
+        assert_eq!(gate.finish_hydration(true), Ok(()));
+        assert_restart_backlog(&gate);
+        assert!(matches!(
+            gate.read().await,
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RestartBacklog
+            ))
+        ));
+
+        capturing(|capture| {
+            gate.settle_overhang();
+            assert_settled(&gate);
+            gate.settle_overhang();
+            assert_eq!(
+                capture.count("corpus_settled"),
+                1,
+                "logged on the move from overhang, never again"
+            );
+            assert!(
+                capture
+                    .0
+                    .lock()
+                    .iter()
+                    .all(|(level, _)| *level == tracing::Level::INFO)
+            );
+        });
+        assert!(gate.read().await.is_ok());
+    }
+
+    #[test]
+    fn finish_hydration_is_valid_only_once_from_starting() {
+        let settled = PublicationGate::new();
+        assert_eq!(settled.finish_hydration(true), Err(NotStarting));
+        assert_settled(&settled);
+
+        for overhang in [false, true] {
+            let gate = PublicationGate::starting();
+            gate.finish_hydration(overhang).unwrap();
+            for again in [false, true] {
+                assert_eq!(gate.finish_hydration(again), Err(NotStarting));
+                assert_eq!(
+                    gate.overhang(),
+                    overhang,
+                    "the refused call changed nothing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settle_overhang_moves_only_overhang() {
+        capturing(|capture| {
+            let starting = PublicationGate::starting();
+            starting.settle_overhang();
+            assert_restart_backlog(&starting);
+
+            let settled = PublicationGate::new();
+            settled.settle_overhang();
+            assert_settled(&settled);
+
+            assert_eq!(capture.count("corpus_settled"), 0);
+        });
+    }
+
+    #[tokio::test]
+    async fn rollup_pending_wins_over_restart_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-svc");
+        std::fs::write(&marker, "").unwrap();
+        let gate = PublicationGate::starting();
+        gate.finish_hydration(true).unwrap();
+        {
+            let _writer = gate.write().await;
+            gate.mark_rollup(&marker);
+        }
+
+        let reasons = gate.unsettled_reasons();
+        assert!(reasons.contains(CorpusUnsettled::RollupPending));
+        assert!(
+            reasons.contains(CorpusUnsettled::RestartBacklog),
+            "each reason holds on its own"
+        );
+        assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RollupPending));
+        assert!(gate.overhang());
+        assert!(matches!(
+            gate.read().await,
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RollupPending
+            ))
+        ));
+
+        std::fs::remove_file(&marker).unwrap();
+        assert!(matches!(
+            gate.read().await,
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RestartBacklog
+            ))
+        ));
+        gate.settle_overhang();
+        assert!(gate.read().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_failed_scan_is_rollup_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("file");
+        std::fs::write(&root, "").unwrap();
+        let gate = PublicationGate::starting();
+        gate.initialize(&root);
+        assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RollupPending));
+        assert!(matches!(
+            gate.read_rollups_only().await,
+            Err(CorpusUnsettled::RollupPending)
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_rollups_only_ignores_the_restart_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-svc");
+        let gate = PublicationGate::starting();
+        assert!(gate.read().await.is_err());
+        assert!(gate.read_rollups_only().await.is_ok(), "starting");
+        gate.finish_hydration(true).unwrap();
+        assert!(gate.read_rollups_only().await.is_ok(), "overhang");
+
+        std::fs::write(&marker, "").unwrap();
+        {
+            let _writer = gate.write().await;
+            gate.mark_rollup(&marker);
+        }
+        assert!(matches!(
+            gate.read_rollups_only().await,
+            Err(CorpusUnsettled::RollupPending)
+        ));
+        std::fs::remove_file(&marker).unwrap();
+        assert!(gate.read_rollups_only().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn read_rollups_only_waits_for_a_writer() {
+        let gate = PublicationGate::starting();
+        let writer = gate.write().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                gate.read_rollups_only()
+            )
+            .await
+            .is_err()
+        );
+        drop(writer);
+        assert!(gate.read_rollups_only().await.is_ok());
+    }
+
+    /// A complete rescan clears a failed scan and registers the markers it
+    /// finds; those still refuse until they resolve (ADR-0041 slice 2).
+    #[tokio::test]
+    async fn rollup_boot_recovery_rescan_registers_what_the_complete_scan_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        std::fs::write(&root, "").unwrap();
+        let gate = PublicationGate::new();
+        gate.initialize(&root);
+        assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RollupPending));
+
+        // A marker a writer registered while the scan was failed survives
+        // the rescan that clears the failure.
+        let registered = dir.path().join(".rollup-registered");
+        std::fs::write(&registered, "").unwrap();
+        {
+            let _writer = gate.write().await;
+            gate.mark_rollup(&registered);
+        }
+
+        std::fs::remove_file(&root).unwrap();
+        let day = root.join("prod/2026-01-01");
+        std::fs::create_dir_all(&day).unwrap();
+        let found = day.join(".rollup-svc");
+        std::fs::write(&found, "").unwrap();
+        gate.rescan_if_failed(&root);
+
+        let mut pending = gate.pending_rollup_markers();
+        pending.sort();
+        let mut expected = vec![found.clone(), registered.clone()];
+        expected.sort();
+        assert_eq!(pending, expected);
+        assert!(matches!(
+            gate.read().await,
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RollupPending
+            ))
+        ));
+        std::fs::remove_file(&found).unwrap();
+        std::fs::remove_file(&registered).unwrap();
+        assert!(
+            gate.read().await.is_ok(),
+            "the failed scan no longer refuses"
+        );
+    }
+
+    /// A gate whose scan did not fail never rescans: a marker that appears
+    /// on disk behind its back is a writer's to register.
+    #[tokio::test]
+    async fn rollup_boot_recovery_rescan_leaves_a_healthy_gate_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("prod/2026-01-01");
+        std::fs::create_dir_all(&day).unwrap();
+        let gate = PublicationGate::new();
+        gate.initialize(dir.path());
+        std::fs::write(day.join(".rollup-svc"), "").unwrap();
+        capturing(|capture| {
+            gate.rescan_if_failed(dir.path());
+            assert_eq!(capture.count("publication_scan_recovered"), 0);
+        });
+        assert!(gate.pending_rollup_markers().is_empty());
+        assert!(gate.read().await.is_ok());
     }
 }

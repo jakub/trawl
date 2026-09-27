@@ -542,6 +542,9 @@ async fn compact_pass(
     let publication =
         hot_buffer.map_or_else(|| Arc::new(PublicationGate::new()), |buf| buf.publication());
     publication.initialize(data_dir);
+    // A failed marker scan refuses every read until a complete scan
+    // replaces it, and compaction is what retries it (ADR-0041 slice 2).
+    publication.rescan_if_failed(data_dir);
     recover_pending_rollups(&publication, repin).await?;
 
     // Tally of corrupt WAL files quarantined this cycle. Folded into the
@@ -898,8 +901,10 @@ async fn recover_pending_rollups(
     }
     // An incomplete bootstrap scan must also stop WAL publication, even if
     // the failed scan did not discover a marker before encountering an error.
+    // Only rollups count here: the restart backlog is this pass's to drain,
+    // and waiting for it would stop the drain that clears it.
     let _reader = publication
-        .read()
+        .read_rollups_only()
         .await
         .map_err(|_| "pending rollup recovery is incomplete".to_owned())?;
     Ok(())
@@ -6775,6 +6780,84 @@ mod tests {
         assert!(recover_pending_rollups(&gate, None).await.is_err());
         assert!(gate.read().await.is_err());
         assert!(rollup_marker_path(day, "nginx").exists());
+    }
+
+    /// Rollup recovery admits compaction on rollup state alone: the restart
+    /// backlog is what compaction drains, so it must not stop the pass
+    /// (ADR-0041 slice 2). A failed marker scan still does.
+    #[tokio::test]
+    async fn rollup_boot_recovery_does_not_wait_for_the_restart_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        for overhang in [None, Some(false), Some(true)] {
+            let gate = Arc::new(PublicationGate::starting());
+            if let Some(overhang) = overhang {
+                gate.finish_hydration(overhang).unwrap();
+            }
+            gate.initialize(dir.path());
+            assert!(
+                recover_pending_rollups(&gate, None).await.is_ok(),
+                "hydration finished: {overhang:?}"
+            );
+        }
+
+        let root = dir.path().join("file");
+        std::fs::write(&root, "").unwrap();
+        let gate = Arc::new(PublicationGate::starting());
+        gate.finish_hydration(true).unwrap();
+        gate.initialize(&root);
+        assert_eq!(
+            recover_pending_rollups(&gate, None).await,
+            Err("pending rollup recovery is incomplete".to_owned())
+        );
+    }
+
+    /// Each compaction pass retries a failed marker scan, and a complete
+    /// one lets the pass drain WAL again (ADR-0041 slice 2).
+    #[tokio::test]
+    async fn rollup_boot_recovery_rescan_runs_on_each_compaction_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let record = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"one"}"#;
+        let file = write_wal_file(&wal.join("prod"), "nginx", &[record]);
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        let gate = hot.publication();
+        // The data root cannot be listed, so the boot scan fails.
+        std::fs::write(&data, "").unwrap();
+        gate.initialize(&data);
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+
+        let pass = || {
+            compact_once(
+                &wal,
+                &data,
+                Duration::ZERO,
+                false,
+                Some(&hot),
+                DEFAULT_CHUNK_SIZE,
+                "2GB",
+                None,
+            )
+        };
+        assert!(
+            pass().await.is_err(),
+            "a pass whose rescan fails stays stopped"
+        );
+        assert!(file.exists());
+
+        std::fs::remove_file(&data).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        assert_eq!(pass().await, Ok(0));
+        assert!(!file.exists(), "the pass drained the WAL");
+        assert_eq!(gate.unsettled(), None);
+        assert!(gate.read().await.is_ok());
     }
 
     /// The pass-through shortcut is a claim about the conform, not about

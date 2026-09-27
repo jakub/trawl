@@ -32,6 +32,7 @@ async fn health_returns_ok() {
             ("storage_db".to_owned(), "ok".to_owned()),
             ("data_path".to_owned(), "ok".to_owned()),
             ("ingest_capacity".to_owned(), "ok".to_owned()),
+            ("corpus".to_owned(), "ok".to_owned()),
         ]))
     );
 }

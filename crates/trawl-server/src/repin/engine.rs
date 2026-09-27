@@ -36,6 +36,7 @@ use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
+use crate::publication::CorpusUnsettled;
 use crate::repin::cancel::{
     CancelActor, CancelHandle, CancelRegistry, CancelVerdict, Commit, PassStop, STAGE_BUILD,
     STAGE_FINAL_GATE, STAGE_SCAN, Settlement, audit_cancel_refused, audit_cancel_requested,
@@ -74,6 +75,21 @@ const FLIP_ATTEMPTS: u32 = 3;
 /// in [`RepinEngine::finish`] are exhausted (a real store outage).
 const FINISH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Why repin admission stops while the corpus is unsettled (ADR-0041).
+/// Fixed text per reason: the job row carries it, so it names no path,
+/// marker or count.
+const fn repin_blocked(reason: CorpusUnsettled) -> &'static str {
+    match reason {
+        CorpusUnsettled::RollupPending => {
+            "repin is blocked while rollup publication is incomplete; retry after recovery"
+        }
+        CorpusUnsettled::RestartBacklog => {
+            "repin is blocked while the server finishes loading data from before its restart; \
+             retry once it settles"
+        }
+    }
+}
+
 /// Wait out an active rollup, validate its completed publication, then claim
 /// the pause before another unit can start. The corpus guard comes first,
 /// matching the rollup's lock order. Neither lock survives this admission.
@@ -85,11 +101,11 @@ async fn claim_rollup_pause(
     cancel.check(STAGE_SCAN)?;
     let admission = async {
         let _corpus = coordinator.cutover_guard().await;
-        let _publication = publication.read().await.map_err(|_| {
-            PassStop::Failed(
-                "repin is blocked while rollup publication is incomplete; retry after recovery"
-                    .to_owned(),
-            )
+        let _publication = publication.read().await.map_err(|error| {
+            PassStop::Failed(match error {
+                ServerError::CorpusRecovering(reason) => repin_blocked(reason).to_owned(),
+                other => other.safe_message(),
+            })
         })?;
         cancel.check(STAGE_SCAN)?;
         Ok(coordinator.pause_rollup())
@@ -2445,6 +2461,52 @@ mod tests {
     #[tokio::test]
     async fn repin_admission_observes_rollup_failure_before_pausing() {
         assert_rollup_admission_waits_for_unit(true).await;
+    }
+
+    /// An unsettled corpus refuses repin admission with a fixed message
+    /// that names the reason, the pending rollup first (ADR-0041).
+    #[tokio::test]
+    async fn repin_admission_names_why_the_corpus_is_unsettled() {
+        let admit = |publication: crate::publication::PublicationGate| async move {
+            let coordinator = Arc::new(RepinCoordinator::new());
+            let registry = Arc::new(CancelRegistry::default());
+            let cancel = registry.arm(1);
+            let result = claim_rollup_pause(&coordinator, &publication, &cancel).await;
+            assert!(!coordinator.rollup_paused());
+            match result {
+                Err(PassStop::Failed(message)) => message,
+                Err(other) => panic!("expected a failed admission, got {other:?}"),
+                Ok(_) => panic!("an unsettled corpus admitted a repin"),
+            }
+        };
+        let restart = "repin is blocked while the server finishes loading data from before its \
+                       restart; retry once it settles";
+        let rollup =
+            "repin is blocked while rollup publication is incomplete; retry after recovery";
+
+        assert_eq!(
+            admit(crate::publication::PublicationGate::starting()).await,
+            restart
+        );
+        let overhang = crate::publication::PublicationGate::starting();
+        overhang.finish_hydration(true).unwrap();
+        assert_eq!(admit(overhang).await, restart);
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-api");
+        std::fs::write(&marker, "unfinished").unwrap();
+        for starting in [false, true] {
+            let gate = if starting {
+                crate::publication::PublicationGate::starting()
+            } else {
+                crate::publication::PublicationGate::new()
+            };
+            {
+                let _writer = gate.write().await;
+                gate.mark_rollup(&marker);
+            }
+            assert_eq!(admit(gate).await, rollup, "starting: {starting}");
+        }
     }
 
     #[tokio::test]

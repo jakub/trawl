@@ -13,6 +13,7 @@ use std::time::Instant;
 use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
 
 use crate::hot_buffer::HotBuffer;
+use crate::publication::PublicationGate;
 
 // -- metric name constants ---------------------------------------------------
 
@@ -72,6 +73,11 @@ pub const QUERY_PERMITS_RETAINED: &str = "trawl_query_permits_retained";
 pub const PARQUET_FILES: &str = "trawl_parquet_files_total";
 pub const PARQUET_BYTES: &str = "trawl_parquet_size_bytes";
 pub const HEALTH_CHECK: &str = "trawl_health_check";
+/// 1 while corpus reads refuse for `reason`
+/// ([`crate::publication::CorpusUnsettled`]), else 0. One series per
+/// reason, each set on its own; computed from the publication gate at
+/// every collection.
+pub const CORPUS_UNSETTLED: &str = "trawl_corpus_unsettled";
 pub const SYSLOG_EVENTS_TOTAL: &str = "trawl_syslog_events_total";
 pub const SYSLOG_PARSE_ERRORS_TOTAL: &str = "trawl_syslog_parse_errors_total";
 pub const SYSLOG_EVENTS_DROPPED_TOTAL: &str = "trawl_syslog_events_dropped_total";
@@ -314,6 +320,11 @@ pub fn init_operational_alert_metrics() {
     for kind in QuarantineKind::ALL {
         metrics::counter!(FILES_QUARANTINED_TOTAL, "kind" => kind.label()).increment(0);
     }
+    // A gauge, so this sets rather than adds: collection recomputes it
+    // from the publication gate at every scrape.
+    for reason in crate::publication::CorpusUnsettled::ALL {
+        metrics::gauge!(CORPUS_UNSETTLED, "reason" => reason.label()).set(0.0);
+    }
     init_publication_recovery_metrics();
 }
 
@@ -455,6 +466,13 @@ pub fn describe_metrics() {
     describe_gauge!(
         HEALTH_CHECK,
         "Subsystem health (1 = ok, 0 = failed), labeled by subsystem"
+    );
+    describe_gauge!(
+        CORPUS_UNSETTLED,
+        "1 while corpus reads answer 503 corpus_recovering for this reason \
+         (rollup_pending = a rollup is unresolved or the rollup scan failed; \
+         restart_backlog = WAL from before the restart is not yet proven \
+         loaded or compacted), else 0"
     );
     describe_counter!(
         SYSLOG_EVENTS_TOTAL,
@@ -879,13 +897,15 @@ fn wal_cache() -> &'static StorageCache {
     CACHE.get_or_init(StorageCache::default)
 }
 
-/// Update gauges that require periodic polling (hot buffer + parquet + WAL files).
+/// Update gauges that require periodic polling (hot buffer + corpus state +
+/// parquet + WAL files).
 ///
 /// Called by Prometheus scrapes and the stats emitter. Filesystem scans and
 /// competing attempts may block; dashboard readers only read the short cache.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
 pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
+    publication: &PublicationGate,
     fallback_glob: &str,
     wal_dir: Option<&Path>,
     retained_permits: usize,
@@ -893,6 +913,14 @@ pub fn collect_gauges(
     // Callers snapshot the pool count before collection. No pool registry lock
     // travels with this number through a storage scan or attempt-owner wait.
     metrics::gauge!(QUERY_PERMITS_RETAINED).set(retained_permits as f64);
+
+    // Read from the gate now, never cached: each reason's series is its own
+    // 0/1, so a switch from one reason to the other shows in both.
+    let unsettled = publication.unsettled_reasons();
+    for reason in crate::publication::CorpusUnsettled::ALL {
+        metrics::gauge!(CORPUS_UNSETTLED, "reason" => reason.label())
+            .set(if unsettled.contains(reason) { 1.0 } else { 0.0 });
+    }
 
     if let Some(buf) = hot_buffer {
         metrics::gauge!(HOT_BUFFER_EVENTS).set(buf.event_count() as f64);
@@ -1732,6 +1760,8 @@ mod tests {
                 "trawl_files_quarantined_total{kind=\"rollup_temporary\"}",
                 "trawl_publication_recovery_total{outcome=\"contradictory\"}",
                 "trawl_publication_recovery_total{outcome=\"failed\"}",
+                "trawl_corpus_unsettled{reason=\"rollup_pending\"}",
+                "trawl_corpus_unsettled{reason=\"restart_backlog\"}",
             ];
             for series in selected {
                 assert_eq!(test_support::sample(&handle, series), 0);
@@ -1846,7 +1876,13 @@ mod tests {
     #[test]
     fn collect_gauges_no_hot_buffer_no_panic() {
         // With no recorder installed and no hot buffer, should be a no-op.
-        collect_gauges(None, "/nonexistent/path/**/*.parquet", None, 0);
+        collect_gauges(
+            None,
+            &PublicationGate::new(),
+            "/nonexistent/path/**/*.parquet",
+            None,
+            0,
+        );
     }
 
     /// One rendered sample value, verbatim (gauges need not be integers).
@@ -1875,7 +1911,13 @@ mod tests {
                 max_events: 100,
                 max_bytes: 1_000,
             }));
-            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            collect_gauges(
+                Some(&buf),
+                &buf.publication(),
+                "/nonexistent/path/**/*.parquet",
+                None,
+                0,
+            );
             let rendered = handle.render();
             assert_eq!(gauge_value(&rendered, HOT_BUFFER_MAX_EVENTS), "100");
             assert_eq!(gauge_value(&rendered, HOT_BUFFER_MAX_BYTES), "1000");
@@ -1893,7 +1935,13 @@ mod tests {
                 events: vec![serde_json::Map::new(); 10],
             }));
             std::thread::sleep(std::time::Duration::from_millis(5));
-            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            collect_gauges(
+                Some(&buf),
+                &buf.publication(),
+                "/nonexistent/path/**/*.parquet",
+                None,
+                0,
+            );
             let rendered = handle.render();
             assert_eq!(
                 gauge_value(&rendered, HOT_BUFFER_ADMISSION_STATE),
@@ -1914,7 +1962,13 @@ mod tests {
                 )
                 .is_err()
             );
-            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            collect_gauges(
+                Some(&buf),
+                &buf.publication(),
+                "/nonexistent/path/**/*.parquet",
+                None,
+                0,
+            );
             let rendered = handle.render();
             assert_eq!(gauge_value(&rendered, HOT_BUFFER_ADMISSION_STATE), "2");
             assert_eq!(
@@ -1924,6 +1978,54 @@ mod tests {
                 ),
                 1
             );
+        });
+    }
+
+    /// `trawl_corpus_unsettled` is computed from the gate at collection,
+    /// one 0/1 series per reason, each set on its own: precedence belongs
+    /// to health and refusals, not to the gauge (ADR-0041).
+    #[test]
+    fn corpus_unsettled_gauges_follow_the_gate_one_series_per_reason() {
+        use crate::publication::CorpusUnsettled::{RestartBacklog, RollupPending};
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-svc");
+        std::fs::write(&marker, "").unwrap();
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            init_operational_alert_metrics();
+            let series = |reason: crate::publication::CorpusUnsettled| {
+                test_support::sample(
+                    &handle,
+                    &format!("{CORPUS_UNSETTLED}{{reason=\"{}\"}}", reason.label()),
+                )
+            };
+            let collected = |gate: &PublicationGate| {
+                collect_gauges(None, gate, "/nonexistent/path/**/*.parquet", None, 0);
+                (series(RollupPending), series(RestartBacklog))
+            };
+            assert_eq!(
+                (series(RollupPending), series(RestartBacklog)),
+                (0, 0),
+                "zero-initialized"
+            );
+            assert_eq!(collected(&PublicationGate::new()), (0, 0));
+
+            let gate = PublicationGate::starting();
+            assert_eq!(collected(&gate), (0, 1), "starting");
+            gate.finish_hydration(true).unwrap();
+            assert_eq!(collected(&gate), (0, 1), "overhang");
+            {
+                let _writer = gate.blocking_write();
+                gate.mark_rollup(&marker);
+            }
+            assert_eq!(collected(&gate), (1, 1), "each reason on its own series");
+            gate.settle_overhang();
+            assert_eq!(collected(&gate), (1, 0));
+            std::fs::remove_file(&marker).unwrap();
+            assert_eq!(collected(&gate), (0, 0), "settled");
         });
     }
 
@@ -1976,7 +2078,13 @@ mod tests {
                 max_events: trawl_config::DEFAULT_HOT_BUFFER_MAX_EVENTS,
                 max_bytes: trawl_config::DEFAULT_HOT_BUFFER_MAX_BYTES,
             }));
-            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            collect_gauges(
+                Some(&buf),
+                &buf.publication(),
+                "/nonexistent/path/**/*.parquet",
+                None,
+                0,
+            );
             let rendered = handle.render();
             for name in names {
                 let series_prefix = [format!("{name} "), format!("{name}{{")];

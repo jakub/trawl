@@ -2744,7 +2744,13 @@ mod hydrate {
         let handle = recorder.handle();
         let buf = Arc::new(buf);
         metrics::with_local_recorder(&recorder, || {
-            crate::metrics::collect_gauges(Some(&buf), "/nonexistent/*.parquet", None, 0);
+            crate::metrics::collect_gauges(
+                Some(&buf),
+                &buf.publication(),
+                "/nonexistent/*.parquet",
+                None,
+                0,
+            );
         });
         let rendered = handle.render();
         let gauge: f64 = rendered
