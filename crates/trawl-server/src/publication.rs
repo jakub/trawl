@@ -98,6 +98,13 @@ enum Restart {
 struct CorpusState {
     /// Rollup markers registered and not yet confirmed gone.
     markers: HashSet<PathBuf>,
+    /// Whether any marker survived the last guarded evaluation: its file
+    /// existed, or its metadata could not be read, and either way reads
+    /// refused for it. No writer's marker is in flight under a guard, so
+    /// such a marker is established, not a publication's own. Only
+    /// [`evaluate`](Self::evaluate) sets or clears it; registering a
+    /// marker never does.
+    established_rollup: bool,
     /// The marker scan failed, so an unknown marker may exist. Only a later
     /// complete scan clears it.
     scan_failed: bool,
@@ -114,19 +121,21 @@ impl CorpusState {
     /// could forget a marker that a failed rollup then leaves on disk.
     fn evaluate(&mut self) -> UnsettledReasons {
         self.markers.retain(|path| !is_missing(path));
+        self.established_rollup = !self.markers.is_empty();
         UnsettledReasons {
-            rollup_pending: self.scan_failed || !self.markers.is_empty(),
+            rollup_pending: self.scan_failed || self.established_rollup,
             restart_backlog: self.restart != Restart::Settled,
         }
     }
 
     /// What holds while a writer holds or waits for the publication lock.
     /// Its markers may be in flight, so the registered markers are neither
-    /// pruned nor reported: only a failed marker scan and the restart
-    /// state count.
+    /// pruned nor reported. A marker the last guarded evaluation kept is
+    /// established rather than in flight, so it still counts, as do a
+    /// failed marker scan and the restart state.
     fn beside_a_writer(&self) -> UnsettledReasons {
         UnsettledReasons {
-            rollup_pending: self.scan_failed,
+            rollup_pending: self.scan_failed || self.established_rollup,
             restart_backlog: self.restart != Restart::Settled,
         }
     }
@@ -268,11 +277,13 @@ impl PublicationGate {
     /// publication lock is free, it evaluates under a read guard taken
     /// without waiting. While a writer holds the lock or waits for it, the
     /// writer's rollup marker may be in flight, so no registered marker is
-    /// pruned or reported; a failed marker scan and the restart state
-    /// still are. A normal rollup therefore never moves the answer, and a
-    /// marker that a failed rollup leaves is reported once the writer is
-    /// gone. [`read`](Self::read) always waits for the writer and
-    /// evaluates everything.
+    /// pruned, and only a marker the last guarded evaluation kept is
+    /// reported; a failed marker scan and the restart state still are. A
+    /// normal rollup therefore never moves the answer, a marker that a
+    /// failed rollup leaves is reported from the first evaluation after the
+    /// writer is gone, and a later publication does not hide it again.
+    /// [`read`](Self::read) always waits for the writer and evaluates
+    /// everything.
     #[must_use]
     pub fn unsettled_reasons(&self) -> UnsettledReasons {
         match self.lock.try_read() {
@@ -938,6 +949,50 @@ mod tests {
             drop(writer);
             assert_eq!(gate.unsettled(), expected, "after");
         }
+    }
+
+    /// A marker that a guarded evaluation found on disk is no writer's
+    /// in-flight marker: a lock-free query keeps reporting it while a
+    /// writer holds the lock, so a later publication does not hide a
+    /// stuck rollup from health and `/metrics`. A writer's new marker
+    /// beside it is still not what makes the report, and once the stuck
+    /// marker resolves, the next guarded evaluation clears it.
+    #[test]
+    fn an_established_marker_is_reported_while_a_writer_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let stuck = dir.path().join(".rollup-stuck");
+        let gate = PublicationGate::new();
+        {
+            // An earlier rollup failed and left its marker on disk.
+            let _writer = gate.blocking_write();
+            gate.mark_rollup(&stuck);
+            std::fs::write(&stuck, "hourly inputs").unwrap();
+        }
+        assert_eq!(
+            gate.unsettled(),
+            Some(CorpusUnsettled::RollupPending),
+            "a guarded evaluation establishes it"
+        );
+        {
+            let _writer = gate.blocking_write();
+            assert_eq!(
+                gate.unsettled(),
+                Some(CorpusUnsettled::RollupPending),
+                "beside a later publication"
+            );
+            // Recovery resolves the stuck marker under the write guard.
+            std::fs::remove_file(&stuck).unwrap();
+            gate.finish_rollup(&stuck);
+        }
+        assert_eq!(gate.unsettled(), None, "a guarded evaluation clears it");
+
+        // A normal rollup after that: its in-flight marker is not reported.
+        let normal = dir.path().join(".rollup-normal");
+        let _writer = gate.blocking_write();
+        gate.mark_rollup(&normal);
+        assert_eq!(gate.unsettled(), None, "registered, file not yet written");
+        std::fs::write(&normal, "hourly inputs").unwrap();
+        assert_eq!(gate.unsettled(), None, "file written");
     }
 
     /// A failed marker scan is no writer's marker: a lock-free query
