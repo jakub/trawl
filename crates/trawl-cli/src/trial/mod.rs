@@ -46,8 +46,30 @@ pub const LABEL_ID: &str = "sh.trawl.trial.id";
 /// The reserved profile name that reads the trial directory.
 pub const PROFILE: &str = "trial";
 
-/// Repository of the trawl image; the tag is the CLI version.
+/// Repository of the trawl image; the tag is [`published_image_tag`] of
+/// the CLI version.
 pub const IMAGE_REPO: &str = "ghcr.io/jakub/trawl";
+
+/// The tag the release publishes the trawl image under for `version`: the
+/// version without its `+` build metadata. The release workflow tags the
+/// image with `docker/metadata-action`'s `type=semver,pattern={{version}}`,
+/// which renders node-semver's normalized version, and that omits build
+/// metadata. `+` is not valid in a Docker tag either. What is left of a
+/// Cargo version, a semantic version core and prerelease, is already a
+/// valid tag.
+pub fn published_image_tag(version: &str) -> &str {
+    version
+        .split_once('+')
+        .map_or(version, |(release, _build)| release)
+}
+
+/// The trawl image `up` runs when `--image` is omitted.
+pub fn default_image() -> String {
+    format!(
+        "{IMAGE_REPO}:{}",
+        published_image_tag(env!("CARGO_PKG_VERSION"))
+    )
+}
 
 /// PostgreSQL image the trial runs.
 pub const POSTGRES_IMAGE: &str = "postgres:18";
@@ -131,5 +153,33 @@ pub async fn run(cmd: &TrialCommand) -> Result<(), TrialError> {
         TrialCommand::Key => lifecycle::key(&paths),
         TrialCommand::Stop => lifecycle::stop(&paths).await,
         TrialCommand::Down { yes } => lifecycle::down(&paths, *yes).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `scripts/release/test_release_version.py` holds the release side's
+    /// mapping to the same vectors, so the CLI's default image and the
+    /// published tag cannot drift apart.
+    #[test]
+    fn the_published_tag_drops_build_metadata() {
+        for (version, tag) in [
+            ("1.1.0-rc.1+build.7", "1.1.0-rc.1"),
+            ("0.9.0", "0.9.0"),
+            ("1.0.0+abc", "1.0.0"),
+            ("1.2.3-rc.1", "1.2.3-rc.1"),
+        ] {
+            assert_eq!(published_image_tag(version), tag, "{version}");
+            // Docker's tag grammar: [A-Za-z0-9_][A-Za-z0-9_.-]{0,127}.
+            assert!(
+                tag.len() <= 128
+                    && tag
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
+                "{tag}"
+            );
+        }
     }
 }

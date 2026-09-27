@@ -69,8 +69,8 @@ use super::state::{
     DownView, ImageRecord, Images, KeyRecord, Phases, Ports, SCHEMA, Samples, TlsRecord, TrialState,
 };
 use super::{
-    CLAIM_NAME, DEFAULT_API_PORT, DEFAULT_WEB_PORT, IMAGE_REPO, POSTGRES_IMAGE, PROJECT,
-    TrialError, UpArgs,
+    CLAIM_NAME, DEFAULT_API_PORT, DEFAULT_WEB_PORT, POSTGRES_IMAGE, PROJECT, TrialError, UpArgs,
+    default_image,
 };
 
 /// A one-shot `compose run` step: `fleet-admin`, `tls-init`, a key.
@@ -742,10 +742,7 @@ async fn create(
     args: &UpArgs,
     ports: Ports,
 ) -> Result<TrialState, TrialError> {
-    let reference = args
-        .image
-        .clone()
-        .unwrap_or_else(|| format!("{IMAGE_REPO}:{}", env!("CARGO_PKG_VERSION")));
+    let reference = args.image.clone().unwrap_or_else(default_image);
     let trawl = resolve_image(docker, &reference).await?;
     let postgres = resolve_image(docker, POSTGRES_IMAGE).await?;
     let state = TrialState {

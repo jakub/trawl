@@ -340,7 +340,7 @@ trawl trial up [--api-port PORT] [--web-port PORT] [--image REFERENCE] [--no-sam
 |------|-------|---------|-------------|
 | `--api-port` | `<PORT>` | `15514` | Loopback port for the HTTPS API |
 | `--web-port` | `<PORT>` | `18090` | Loopback port for the browser UI |
-| `--image` | `<REFERENCE>` | `ghcr.io/jakub/trawl:<CLI version>` | Run this trawl image instead of the published one. `up` and `status` print the override |
+| `--image` | `<REFERENCE>` | `ghcr.io/jakub/trawl:<CLI version>` | Run this trawl image instead of the published one. The published tag is the CLI version without its `+` build metadata, so CLI `1.1.0-rc.1+build.7` runs `ghcr.io/jakub/trawl:1.1.0-rc.1`. `up` and `status` print the override |
 | `--no-sample-data` | *(flag)* | `false` | Skip the sample events |
 
 The browser address `up` and `status` print is `http://127.0.0.1:<web-port>`.
