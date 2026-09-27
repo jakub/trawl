@@ -683,24 +683,37 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
   -addext 'subjectAltName=DNS:trawld,DNS:localhost,IP:127.0.0.1' \
   -keyout "$WORK/impostor.key" -out "$WORK/impostor.pem" 2>/dev/null
 cat >"$WORK/impostor.py" <<'PY'
-import http.server, ssl, sys
+import socket, ssl, sys
 cert, key, port, log = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-class Handler(http.server.BaseHTTPRequestHandler):
-    # Log a connection only once a request line arrives over it: a client
-    # that refused the certificate never sends one.
-    def handle(self):
-        try:
-            line = self.rfile.readline(65537)
-        except OSError:
-            return
-        if line:
-            with open(log, "a") as f:
-                f.write("an HTTP request arrived\n")
+def note(line):
+    with open(log, "a") as f:
+        f.write(line + "\n")
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain(cert, key)
-server = http.server.HTTPServer(("127.0.0.1", port), Handler)
-server.socket = context.wrap_socket(server.socket, server_side=True)
-server.serve_forever()
+listener = socket.create_server(("127.0.0.1", port))
+while True:
+    raw, _ = listener.accept()
+    # Every connection is logged before its handshake, so a client that
+    # refuses the certificate still leaves proof that it connected. Only a
+    # client that accepted the certificate can send a request line.
+    note("a TCP connection arrived")
+    # A client that connects and never handshakes must not stall the step.
+    raw.settimeout(10)
+    try:
+        conn = context.wrap_socket(raw, server_side=True)
+    except (ssl.SSLError, OSError):
+        note("the TLS handshake failed")
+        raw.close()
+        continue
+    try:
+        conn.settimeout(10)
+        line = conn.makefile("rb").readline(65537)
+    except OSError:
+        line = b""
+    if line:
+        note("an HTTP request arrived")
+        conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    conn.close()
 PY
 : >"$WORK/impostor.log"
 spawn python3 "$WORK/impostor.py" "$WORK/impostor.pem" "$WORK/impostor.key" 15514 "$WORK/impostor.log"
@@ -709,16 +722,22 @@ wait_listening 15514
 openssl x509 -in "$WORK/impostor.pem" -noout -subject -ext subjectAltName | indent
 # Controls: a client that trusts the impostor reaches it, and curl pinned to
 # the trial certificate names the reason it refuses.
-curl --silent --cacert "$WORK/impostor.pem" https://127.0.0.1:15514/ >/dev/null 2>&1 || true
+curl --silent --max-time 30 --cacert "$WORK/impostor.pem" https://127.0.0.1:15514/ >/dev/null 2>&1 || true
 grep -q 'an HTTP request arrived' "$WORK/impostor.log" || fail "the impostor does not serve TLS on 15514"
 : >"$WORK/impostor.log"
-if curl --silent --show-error --cacert "$STATE_DIR/ca.pem" https://127.0.0.1:15514/ >/dev/null 2>"$WORK/pinned-curl.err"; then
+if curl --silent --show-error --max-time 30 --cacert "$STATE_DIR/ca.pem" https://127.0.0.1:15514/ >/dev/null 2>"$WORK/pinned-curl.err"; then
   fail "curl pinned to the trial certificate accepted the impostor"
 fi
 indent <"$WORK/pinned-curl.err"
+: >"$WORK/impostor.log"
 refused impostor-query t -p trial query '* | head 1'
-[[ ! -s "$WORK/impostor.log" ]] || fail "trawl sent an HTTP request, and so its token, to the impostor"
-note "trawl -p trial refused the impostor during the TLS handshake and sent no request, so no token"
+grep -q 'a TCP connection arrived' "$WORK/impostor.log" ||
+  fail "trawl never connected to the impostor, so its certificate check never ran"
+! grep -q 'an HTTP request arrived' "$WORK/impostor.log" ||
+  fail "trawl sent an HTTP request, and so its token, to the impostor"
+says impostor-query "the server certificate of API https://127.0.0.1:15514 is not trusted"
+indent <"$WORK/impostor.log"
+note "trawl -p trial connected, refused the impostor's certificate during the TLS handshake, and sent no request, so no token"
 stop_spawned "$impostor"
 
 ok up-after-stop t trial up
