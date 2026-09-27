@@ -687,6 +687,10 @@ pub struct HotBuffer {
     /// (embedded mode, unit tests), which yields empty `field_types` on
     /// every snapshot.
     field_catalog: Arc<crate::catalog::FieldCatalog>,
+    /// Set by [`fail_next_snapshot_for_test`](Self::fail_next_snapshot_for_test):
+    /// the next snapshot build refuses its first event's write.
+    #[cfg(any(test, feature = "test-support"))]
+    fail_next_snapshot: AtomicBool,
 }
 
 impl std::fmt::Debug for HotBuffer {
@@ -720,6 +724,8 @@ impl HotBuffer {
             generation: AtomicU64::new(0),
             snapshot_cache: Mutex::new(None),
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            fail_next_snapshot: AtomicBool::new(false),
         }
     }
 
@@ -1035,7 +1041,12 @@ impl HotBuffer {
     /// Get a snapshot of all buffered events as a temporary ndjson file,
     /// paired with the catalog pins that apply to it.
     ///
-    /// Returns `None` if the buffer is empty.
+    /// Returns `Ok(None)` if the buffer holds no event, and an error if the
+    /// file cannot be built: creating it, writing or serializing any one
+    /// event, or flushing it. A failure is never an empty buffer, because
+    /// a reader that took it for one would answer without the newest
+    /// events (ADR-0041).
+    ///
     /// Uses a generation-based cache: concurrent queries against an unchanged
     /// buffer share a single snapshot file (1 disk write instead of N).
     /// The `Arc` ensures the temp file stays alive until all queries using it finish.
@@ -1049,10 +1060,15 @@ impl HotBuffer {
     /// cycle to serialize concurrent misses — one thread builds while
     /// others wait ~40ms and get the cached result, preventing thundering
     /// herd I/O.
-    pub fn snapshot(&self) -> Option<HotSnapshot> {
+    ///
+    /// # Errors
+    ///
+    /// The I/O error that stopped the build. Its text can quote a path;
+    /// callers report its kind, not its text.
+    pub fn snapshot(&self) -> std::io::Result<Option<HotSnapshot>> {
         // Fast path: no events at all → skip locking entirely.
         if self.total_events.load(Ordering::Relaxed) == 0 {
-            return None;
+            return Ok(None);
         }
 
         let current_gen = self.generation.load(Ordering::Relaxed);
@@ -1062,14 +1078,16 @@ impl HotBuffer {
         if let Some(cached) = cache.as_ref()
             && cached.generation == current_gen
         {
-            return Some(HotSnapshot {
+            return Ok(Some(HotSnapshot {
                 field_types: Arc::new(self.pins_for(&cached.keys)),
                 file: Arc::clone(&cached.file),
-            });
+            }));
         }
 
         // Cache miss — build under lock so concurrent queries wait.
-        let (file, keys) = self.build_snapshot()?;
+        let Some((file, keys)) = self.build_snapshot()? else {
+            return Ok(None);
+        };
         let file = Arc::new(file);
         let field_types = Arc::new(self.pins_for(&keys));
         *cache = Some(CachedSnapshot {
@@ -1078,7 +1096,18 @@ impl HotBuffer {
             keys,
         });
 
-        Some(HotSnapshot { file, field_types })
+        Ok(Some(HotSnapshot { file, field_types }))
+    }
+
+    /// Make the next snapshot build fail: the cached file is dropped, and
+    /// the next build's first event write is refused with
+    /// [`StorageFull`](std::io::ErrorKind::StorageFull), as if the temp
+    /// directory had filled up. One shot; nothing latches.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_snapshot_for_test(&self) {
+        let mut cache = self.snapshot_cache.lock();
+        *cache = None;
+        self.fail_next_snapshot.store(true, Ordering::Relaxed);
     }
 
     /// The pins that apply to one snapshot: the catalog intersected with
@@ -1104,67 +1133,42 @@ impl HotBuffer {
     /// the one door that folds field names. Test-only constructors that
     /// insert unfolded keys get the loud behaviour: an unnameable `x_1` twin
     /// column, not a silent merge.
-    fn build_snapshot(&self) -> Option<(tempfile::NamedTempFile, Vec<String>)> {
+    ///
+    /// `Ok(None)` when no batch holds an event. Any failure fails the whole
+    /// build and is returned, not logged: the reader that asked refuses,
+    /// and its failure record names the kind.
+    fn build_snapshot(&self) -> std::io::Result<Option<(tempfile::NamedTempFile, Vec<String>)>> {
         let map = self.batches.read();
-        if map.is_empty() {
-            return None;
-        }
-
-        let events: Vec<(&Arc<str>, &Event)> = map
+        let events: Vec<&Event> = map
             .values()
-            .map(|resident| &resident.batch)
-            .flat_map(|batch| batch.events.iter().map(move |e| (&batch.batch_id, e)))
+            .flat_map(|resident| resident.batch.events.iter())
             .collect();
-        let (pioneer, keys) = survey_schema(events.iter().map(|(_, e)| *e));
-
-        let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile().ok()?;
-        // serde_json emits many small writes per event. Buffer them before
-        // crossing into the filesystem, then flush before publishing the file.
-        let mut writer = BufWriter::new(&mut tmpfile);
-        let mut wrote_any = false;
-
+        if events.is_empty() {
+            return Ok(None);
+        }
+        let (pioneer, keys) = survey_schema(events.iter().copied());
         let order = (0..events.len())
             .filter(|&i| pioneer[i])
-            .chain((0..events.len()).filter(|&i| !pioneer[i]));
-        for (batch_id, event) in order.map(|i| events[i]) {
-            // Events are written verbatim: ingest canonicalization already
-            // stringified top-level object/array values (ADR-0009), so every
-            // value here is a scalar.
-            //
-            // Serialization failure is very unlikely (the event parsed during
-            // ingest), but log and skip rather than poisoning the whole
-            // snapshot.
-            match serde_json::to_writer(&mut writer, event) {
-                Ok(()) => {
-                    if let Err(e) = writer.write_all(b"\n") {
-                        tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot write failed");
-                        return None;
-                    }
-                    wrote_any = true;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        event_type = "hot_buffer_error",
-                        batch_id = %batch_id,
-                        error = %e,
-                        "failed to serialize event in hot buffer snapshot"
-                    );
-                }
-            }
-        }
+            .chain((0..events.len()).filter(|&i| !pioneer[i]))
+            .map(|i| events[i]);
 
-        if !wrote_any {
-            return None;
-        }
-
+        let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile()?;
+        // serde_json emits many small writes per event. Buffer them before
+        // crossing into the filesystem, then flush before publishing the file.
+        let writer = BufWriter::new(&mut tmpfile);
+        // The injected fault sits in front of the buffer, so the first
+        // event's serialization is what fails.
+        #[cfg(any(test, feature = "test-support"))]
+        let writer = test_seam::Tripwire {
+            tripped: self.fail_next_snapshot.swap(false, Ordering::Relaxed),
+            inner: writer,
+        };
+        let mut writer = writer;
+        write_events(&mut writer, order)?;
         // Flush to ensure DuckDB can read the file.
-        if let Err(e) = writer.flush() {
-            tracing::error!(event_type = "hot_buffer_error", error = %e, "hot buffer snapshot flush failed");
-            return None;
-        }
-
+        writer.flush()?;
         drop(writer);
-        Some((tmpfile, keys))
+        Ok(Some((tmpfile, keys)))
     }
 
     /// Total number of events across all batches.
@@ -1229,6 +1233,50 @@ fn survey_schema<'a>(events: impl Iterator<Item = &'a Event>) -> (Vec<bool>, Vec
     (pioneers, keys)
 }
 
+/// Write `events` as ndjson, one line each, in order.
+///
+/// Events are written verbatim: ingest canonicalization already stringified
+/// top-level object/array values (ADR-0009), so every value is a scalar.
+/// The first failure, one event's serialization included, fails the whole
+/// write: a snapshot that skipped an event would answer a read without it.
+/// A serialization error that is not I/O becomes
+/// [`InvalidData`](std::io::ErrorKind::InvalidData).
+fn write_events<'a, W: std::io::Write>(
+    writer: &mut W,
+    events: impl Iterator<Item = &'a Event>,
+) -> std::io::Result<()> {
+    for event in events {
+        serde_json::to_writer(&mut *writer, event)?;
+        writer.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+mod test_seam {
+    //! The fault behind [`HotBuffer::fail_next_snapshot_for_test`].
+
+    /// Passes writes through to `inner` until `tripped`, then refuses
+    /// every one with `StorageFull`.
+    pub(super) struct Tripwire<W> {
+        pub(super) tripped: bool,
+        pub(super) inner: W,
+    }
+
+    impl<W: std::io::Write> std::io::Write for Tripwire<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.tripped {
+                return Err(std::io::ErrorKind::StorageFull.into());
+            }
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1283,7 +1331,7 @@ mod tests {
         assert_eq!(buf.event_count(), 3);
         assert_eq!(buf.batch_count(), 1);
 
-        let tmpfile = buf.snapshot().expect("should have events");
+        let tmpfile = buf.snapshot().unwrap().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         assert_eq!(content.lines().count(), 3);
         assert!(content.contains("event_0"));
@@ -1351,7 +1399,7 @@ mod tests {
             events,
         }));
 
-        let tmpfile = buf.snapshot().expect("should have events");
+        let tmpfile = buf.snapshot().unwrap().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
 
@@ -1399,7 +1447,7 @@ mod tests {
             byte_size: 1000,
             events: events_with_trailing_sparse_key(30_000),
         }));
-        let snapshot = buf.snapshot().expect("should have events");
+        let snapshot = buf.snapshot().unwrap().expect("should have events");
         let hot = snapshot.path().to_str().unwrap();
 
         for with_cold in [false, true] {
@@ -1467,7 +1515,7 @@ mod tests {
             events: vec![ev],
         }));
 
-        let snap = buf.snapshot().expect("should have events");
+        let snap = buf.snapshot().unwrap().expect("should have events");
         assert_eq!(
             snap.field_types.get("duration"),
             Some(CanonicalType::BigInt),
@@ -1508,7 +1556,7 @@ mod tests {
             events: vec![ev],
         }));
 
-        let first = buf.snapshot().expect("should have events");
+        let first = buf.snapshot().unwrap().expect("should have events");
         assert!(
             first.field_types.is_empty(),
             "no pins yet — nothing to conform"
@@ -1517,7 +1565,7 @@ mod tests {
         // Pin lands mid-window: no buffer mutation, same generation.
         catalog.replace([("duration".to_string(), CanonicalType::BigInt)]);
 
-        let second = buf.snapshot().expect("should have events");
+        let second = buf.snapshot().unwrap().expect("should have events");
         assert!(
             Arc::ptr_eq(&first.file, &second.file),
             "same generation must reuse the cached snapshot file"
@@ -1546,7 +1594,7 @@ mod tests {
 
         buf.drain(&["batch_002"]);
         assert_eq!(buf.event_count(), 0);
-        assert!(buf.snapshot().is_none());
+        assert!(buf.snapshot().unwrap().is_none());
     }
 
     #[test]
@@ -1572,7 +1620,7 @@ mod tests {
         buf.insert_for_test(make_batch("batch_001", 2));
         buf.insert_for_test(make_batch("batch_002", 3));
 
-        let tmpfile = buf.snapshot().expect("should have events");
+        let tmpfile = buf.snapshot().unwrap().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         // All 5 events from both batches should be in the snapshot.
         assert_eq!(content.lines().count(), 5);
@@ -1588,7 +1636,7 @@ mod tests {
         buf.insert_for_test(make_batch("batch_002", 3));
 
         // Take a snapshot (Arc-wrapped temp file).
-        let snapshot = buf.snapshot().expect("should have events");
+        let snapshot = buf.snapshot().unwrap().expect("should have events");
         let content_before = std::fs::read_to_string(snapshot.path()).unwrap();
         assert_eq!(content_before.lines().count(), 5);
 
@@ -1606,7 +1654,91 @@ mod tests {
             max_events: 100,
             max_bytes: 10_000_000,
         });
-        assert!(buf.snapshot().is_none());
+        assert!(buf.snapshot().unwrap().is_none());
+    }
+
+    /// Refuses the first write of line `refuse_line` (0-based) once, and
+    /// accepts every other write: one event whose serialization fails while
+    /// its neighbours would succeed.
+    struct RefusesOneLine {
+        refuse_line: usize,
+        refused: bool,
+        /// Whole lines accepted so far. JSON escapes a newline inside a
+        /// value, so a raw `\n` only ever ends a line.
+        line: usize,
+        out: Vec<u8>,
+    }
+
+    impl std::io::Write for RefusesOneLine {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if !self.refused && self.line == self.refuse_line {
+                self.refused = true;
+                return Err(std::io::ErrorKind::StorageFull.into());
+            }
+            if buf.contains(&b'\n') {
+                self.line += 1;
+            }
+            self.out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One event that fails to serialize fails the whole snapshot write
+    /// (ADR-0041). Skipping it would leave a snapshot that answers a read
+    /// without that event.
+    #[test]
+    fn snapshot_failure_of_one_event_fails_the_whole_write() {
+        let batch = make_batch("batch_001", 3);
+        let mut writer = RefusesOneLine {
+            refuse_line: 1,
+            refused: false,
+            line: 0,
+            out: Vec::new(),
+        };
+        let err = write_events(&mut writer, batch.events.iter())
+            .expect_err("the second event's serialization failed");
+        assert!(writer.refused);
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::StorageFull,
+            "an I/O failure keeps its kind"
+        );
+        let written = String::from_utf8(writer.out).unwrap();
+        assert_eq!(
+            written.lines().collect::<Vec<_>>(),
+            [serde_json::to_string(&batch.events[0]).unwrap()],
+            "nothing after the failed event was written: {written}"
+        );
+    }
+
+    /// A snapshot that cannot be built is an error, never `Ok(None)`, which
+    /// means an empty buffer. The failure is not cached: the next build is
+    /// whole.
+    #[test]
+    fn snapshot_failure_is_an_error_never_an_empty_buffer() {
+        let buf = HotBuffer::new(HotBufferConfig {
+            max_events: 1000,
+            max_bytes: 10_000_000,
+        });
+        assert!(buf.snapshot().unwrap().is_none(), "empty is Ok(None)");
+        buf.insert_for_test(make_batch("batch_001", 3));
+        // Built and cached first: the fault must not be answered from the
+        // cache.
+        buf.snapshot().unwrap().expect("should have events");
+
+        buf.fail_next_snapshot_for_test();
+        let err = buf
+            .snapshot()
+            .expect_err("an event that cannot be written fails the snapshot");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+
+        let snapshot = buf.snapshot().unwrap().expect("should have events");
+        let content = std::fs::read_to_string(snapshot.path()).unwrap();
+        assert_eq!(content.lines().count(), 3);
     }
 
     #[test]
@@ -2546,7 +2678,7 @@ mod hydrate {
                 "{why}"
             );
             assert!(!buf.is_resident("prod/a"), "{why}");
-            assert!(buf.snapshot().is_none(), "{why}");
+            assert!(buf.snapshot().unwrap().is_none(), "{why}");
             assert!(!pressure.has_changed().unwrap(), "{why}");
             assert!(!released.has_changed().unwrap(), "{why}");
         }
@@ -2575,7 +2707,7 @@ mod hydrate {
         assert!(buf.is_resident("dev/svc_2_abcd"));
         assert!(!buf.is_resident("prod/svc_3_abcd"));
 
-        let snapshot = buf.snapshot().expect("hydrated rows are readable");
+        let snapshot = buf.snapshot().unwrap().expect("hydrated rows are readable");
         let content = std::fs::read_to_string(snapshot.path()).unwrap();
         assert_eq!(content.lines().count(), 3);
         assert!(content.contains("first") && content.contains("second"));
@@ -2589,7 +2721,7 @@ mod hydrate {
         assert!(!buf.is_resident("prod/svc_1_abcd"));
         assert_eq!(buf.charged(), Charge::ZERO);
         assert_eq!(buf.drained_batches(), 3);
-        assert!(buf.snapshot().is_none());
+        assert!(buf.snapshot().unwrap().is_none());
     }
 
     #[test]
@@ -2739,7 +2871,7 @@ mod duplicate_identity {
                 );
                 assert!(released.has_changed().unwrap());
                 assert_eq!(buf.inserted_batches(), 1, "a duplicate is not an insert");
-                let snapshot = buf.snapshot().unwrap();
+                let snapshot = buf.snapshot().unwrap().unwrap();
                 let content = std::fs::read_to_string(snapshot.path()).unwrap();
                 assert!(content.contains("kept_one") && content.contains("kept_two"));
                 assert!(!content.contains("lost_"), "{content}");
@@ -2790,7 +2922,7 @@ mod duplicate_identity {
             assert_eq!(total, charge(2, 11), "the duplicate is not charged");
             assert_eq!(buf.charged(), total);
             assert_eq!(buf.batch_count(), 2);
-            let content = std::fs::read_to_string(buf.snapshot().unwrap().path()).unwrap();
+            let content = std::fs::read_to_string(buf.snapshot().unwrap().unwrap().path()).unwrap();
             assert!(content.contains("kept") && !content.contains("lost_"));
             assert_eq!(duplicates(&handle), 1);
         });

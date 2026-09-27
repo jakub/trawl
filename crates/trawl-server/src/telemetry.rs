@@ -4180,7 +4180,7 @@ mod tests {
 
     /// Events of `event_type` in the hot buffer's current snapshot.
     fn hot_events_of(hot: &crate::hot_buffer::HotBuffer, event_type: &str) -> usize {
-        let Some(snapshot) = hot.snapshot() else {
+        let Some(snapshot) = hot.snapshot().unwrap() else {
             return 0;
         };
         std::fs::read_to_string(snapshot.path())

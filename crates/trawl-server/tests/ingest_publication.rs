@@ -260,7 +260,7 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
     assert_eq!(durable_ids, [1, 5, 6]);
     assert!(durable.iter().all(|event| event["env"] == "prod"));
     assert_eq!(hot.event_count(), 3);
-    let snapshot = hot.snapshot().unwrap();
+    let snapshot = hot.snapshot().unwrap().unwrap();
     let mut hot_ids: Vec<_> = std::fs::read_to_string(snapshot.path())
         .unwrap()
         .lines()

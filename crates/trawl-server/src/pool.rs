@@ -47,7 +47,7 @@ use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
 use crate::error::{CAPACITY_NOT_STARTED, ServerError};
-use crate::hot_buffer::HotBuffer;
+use crate::hot_buffer::{HotBuffer, HotSnapshot};
 use crate::source::compute_source;
 
 /// Test-only delay injected into the blocking query task so timeout and
@@ -930,19 +930,7 @@ fn run_query_blocking(
     // cached file when the buffer hasn't changed since the last snapshot;
     // the snapshot also carries the catalog pins (∩ observed keys) the
     // executor conforms the hot branch with.
-    let hot_snapshot = hot_buffer.and_then(|hb| hb.snapshot());
-
-    // Filter out hot files whose paths aren't valid UTF-8 (required by
-    // DuckDB's file reader). This is extremely unlikely on any modern OS
-    // but avoids a panic in production.
-    let hot_snapshot = hot_snapshot.and_then(|s| {
-        if s.path().to_str().is_some() {
-            Some(s)
-        } else {
-            tracing::warn!("hot buffer temp file path is not valid UTF-8, skipping hot source");
-            None
-        }
-    });
+    let hot_snapshot = hot_source(hot_buffer.map_or(Ok(None), |hb| hb.snapshot()));
 
     // Capture debug info if requested (query log is active).
     let debug = if capture_debug {
@@ -956,12 +944,16 @@ fn run_query_blocking(
     } else {
         None
     };
+    let hot_snapshot = match hot_snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => return (Err(error), debug),
+    };
 
     // catch_unwind ensures the executor is always returned to the
     // pool even if DuckDB panics (e.g. corrupt parquet file).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(ref hot) = hot_snapshot {
-            // Safety: we verified UTF-8 validity above.
+            // `hot_source` refused a path that is not UTF-8.
             let hot_path = hot.path().to_str().unwrap_or_default();
             executor
                 .cancellable(cancel)
@@ -991,6 +983,28 @@ fn run_query_blocking(
     };
 
     (result, debug)
+}
+
+/// The hot source of one read, from the hot buffer's snapshot: `None` when
+/// there is no buffer or it holds no event.
+///
+/// A snapshot that could not be built, or whose path `DuckDB`'s file reader
+/// cannot take because it is not UTF-8, refuses the read with
+/// [`ServerError::HotSnapshot`] (ADR-0041). Parquet alone would answer
+/// without the newest events, in steady state as after a restart.
+fn hot_source(
+    snapshot: std::io::Result<Option<HotSnapshot>>,
+) -> Result<Option<HotSnapshot>, ServerError> {
+    match snapshot {
+        Ok(Some(snapshot)) if snapshot.path().to_str().is_none() => {
+            Err(ServerError::HotSnapshot(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "hot snapshot path is not valid UTF-8",
+            )))
+        }
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => Err(ServerError::HotSnapshot(error)),
+    }
 }
 
 /// Capture debug info about source selection, hot buffer state, and SQL generation.
@@ -2080,15 +2094,14 @@ impl ExecutorPool {
                     let tmp_path = tmp.path().to_owned();
 
                     // Snapshot hot buffer for fresh events.
-                    let hot_snapshot = hot_buffer
-                        .as_ref()
-                        .and_then(|hb| hb.snapshot())
-                        .filter(|s| s.path().to_str().is_some());
+                    let hot_snapshot =
+                        hot_source(hot_buffer.as_ref().map_or(Ok(None), |hb| hb.snapshot()))?;
 
                     let pins = field_catalog.all();
                     let cancel = slot.cancel_latch();
                     let executor = slot.executor().cancellable(&cancel);
                     let written = if let Some(ref hot) = hot_snapshot {
+                        // `hot_source` refused a path that is not UTF-8.
                         let hot_path = hot.path().to_str().unwrap_or_default();
                         executor.export_parquet_with_hot(
                             &dsl,
@@ -2530,6 +2543,192 @@ mod tests {
             Err(other) => panic!("expected the bucket-type refusal, got {other:?}"),
             Ok(result) => panic!("expected a refusal, got {} rows", result.row_count()),
         }
+    }
+
+    /// A pool over one compacted cold event and one hot event: a read that
+    /// answered from parquet alone would come back one row short.
+    async fn cold_and_hot_pool() -> (tempfile::TempDir, Arc<HotBuffer>, ExecutorPool) {
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+        use crate::ingest::wal::WalWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (wal_dir, data_dir) = (dir.path().join("wal"), dir.path().join("data"));
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let event = |message: &str| {
+            let mut event = serde_json::Map::new();
+            event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+            event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
+            event.insert("service".into(), "svc".into());
+            event.insert("message".into(), message.into());
+            event
+        };
+
+        let wal = WalWriter::new(wal_dir.clone());
+        wal.ensure_dir().unwrap();
+        let mut line = serde_json::to_vec(&event("cold")).unwrap();
+        line.push(b'\n');
+        wal.write("prod", "svc", &line).unwrap();
+        crate::ingest::compaction::compact_once(
+            &wal_dir,
+            &data_dir,
+            Duration::ZERO,
+            false,
+            None,
+            500,
+            "2GB",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+            max_events: 100,
+            max_bytes: 1 << 20,
+        }));
+        hot.insert_for_test(Arc::new(IngestBatch {
+            batch_id: "prod/svc_hot".into(),
+            service: "svc".into(),
+            byte_size: 64,
+            events: vec![event("hot")],
+        }));
+        let pool = ExecutorPool::new(
+            data_dir.to_str().unwrap().to_owned(),
+            1,
+            100_000,
+            Some(Arc::clone(&hot)),
+        );
+        (dir, hot, pool)
+    }
+
+    /// Rows in a Parquet export's bytes.
+    fn parquet_rows(bytes: &[u8]) -> i64 {
+        let file = tempfile::Builder::new()
+            .suffix(".parquet")
+            .tempfile()
+            .unwrap();
+        std::fs::write(file.path(), bytes).unwrap();
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{}')",
+                    file.path().display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A read refused for its hot snapshot: 503 `service_unavailable`, the
+    /// I/O error's kind as its cause.
+    async fn assert_snapshot_refusal(error: ServerError, kind: crate::error::CauseKind) {
+        assert!(matches!(error, ServerError::HotSnapshot(_)), "{error:?}");
+        assert_eq!(error.error_class(), "service_unavailable");
+        assert_eq!(error.cause_kind(), kind);
+        let response = axum::response::IntoResponse::into_response(error);
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "service_unavailable");
+    }
+
+    /// A query whose hot snapshot cannot be built refuses with a 503 rather
+    /// than answer from parquet alone (ADR-0041).
+    #[tokio::test]
+    async fn snapshot_failure_refuses_a_query_instead_of_answering_cold_only() {
+        let (_dir, hot, pool) = cold_and_hot_pool().await;
+        let query = || {
+            pool.execute(
+                pool.allocate_query_id(),
+                "* | head 100",
+                Deadline::after(Duration::from_secs(30)),
+                false,
+                0,
+                TEST_WORK,
+            )
+        };
+        let rows = |outcome: ExecuteOutcome| outcome.result.expect("the read answers").row_count();
+        assert_eq!(rows(query().await), 2, "one cold row and one hot row");
+
+        hot.fail_next_snapshot_for_test();
+        let error = query()
+            .await
+            .result
+            .expect_err("the read refuses instead of answering cold-only");
+        assert_snapshot_refusal(error, crate::error::CauseKind::IoStorageFull).await;
+
+        assert_eq!(rows(query().await), 2, "the fault latched nothing");
+    }
+
+    /// An export whose hot snapshot cannot be built refuses with a 503
+    /// rather than export parquet alone (ADR-0041).
+    #[tokio::test]
+    async fn snapshot_failure_refuses_an_export_instead_of_answering_cold_only() {
+        let (_dir, hot, pool) = cold_and_hot_pool().await;
+        let export = || {
+            pool.export_parquet(
+                pool.allocate_query_id(),
+                "* | head 100",
+                1_000,
+                Deadline::after(Duration::from_secs(30)),
+                TEST_WORK,
+            )
+        };
+        assert_eq!(
+            parquet_rows(&export().await.expect("the export answers")),
+            2,
+            "one cold row and one hot row"
+        );
+
+        hot.fail_next_snapshot_for_test();
+        let error = export()
+            .await
+            .map(|bytes| parquet_rows(&bytes))
+            .expect_err("the export refuses instead of answering cold-only");
+        assert_snapshot_refusal(error, crate::error::CauseKind::IoStorageFull).await;
+
+        assert_eq!(
+            parquet_rows(&export().await.expect("the export answers")),
+            2,
+            "the fault latched nothing"
+        );
+    }
+
+    /// A snapshot whose path is not UTF-8 cannot be opened by `DuckDB`, so
+    /// the read refuses rather than drop the hot source (ADR-0041). Query
+    /// and export both take their hot source from [`hot_source`].
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_failure_on_a_non_utf8_path_refuses_the_read() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(std::ffi::OsStr::from_bytes(b"hot-\xff"));
+        std::fs::create_dir(&dir).unwrap();
+        let snapshot = HotSnapshot {
+            file: Arc::new(
+                tempfile::Builder::new()
+                    .suffix(".ndjson")
+                    .tempfile_in(&dir)
+                    .unwrap(),
+            ),
+            field_types: Arc::default(),
+        };
+        assert!(snapshot.path().to_str().is_none());
+
+        let error = hot_source(Ok(Some(snapshot))).expect_err("the read refuses");
+        assert_snapshot_refusal(error, crate::error::CauseKind::IoInvalidData).await;
+        assert!(
+            hot_source(Ok(None)).unwrap().is_none(),
+            "an empty buffer is no hot source, not a refusal"
+        );
     }
 
     /// A run that produced no rows carries no presentation metadata: an
