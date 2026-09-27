@@ -21,7 +21,7 @@ A publication read guard protects source selection through the last physical rea
 
 ## Hot buffer integration
 
-A cached snapshot file represents the current hot generation. It puts every observed field name inside DuckDB's schema-detection prefix, and carries the current pins intersected with its own keys, so the SQL never names an absent hot column.
+A cached snapshot file represents the current hot generation. If the snapshot cannot be built, the query is refused with 503 rather than answered from Parquet alone. It puts every observed field name inside DuckDB's schema-detection prefix, and carries the current pins intersected with its own keys, so the SQL never names an absent hot column.
 
 The emitter conforms the hot branch and leaves conformant cold files alone. See [hot and cold agreement](/architecture/catalog/#hot-and-cold-agreement).
 

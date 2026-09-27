@@ -157,6 +157,14 @@ its own message and excerpt, in the server's order. A validation error, such
 as an unknown function, names no position and shows no excerpt. The notice
 has no **Retry**: sending the same text again gets the same answer.
 
+When the server refuses a snapshot as `corpus_recovering`, both results tabs
+show a recovering notice instead of the table or chart. Its title reads
+**Search is recovering**, the server's sentence follows, and **Retry** sends
+the same request again. The server is still loading data from before a
+restart, or finishing an interrupted storage rollup, so an empty table would be
+wrong. Live mode reads only the event stream, which this refusal does not
+touch. See [reads while the corpus is unsettled](/architecture/data-flow/#reads-while-the-corpus-is-unsettled).
+
 For every other failure, **Events** shows `Couldn't load results:` with the
 server's message or status, and a **Retry** button. **Visualization** shows
 **Snapshot query failed. Open Events for the error.** with **Retry

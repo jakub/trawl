@@ -1,11 +1,12 @@
 ---
 title: Respond to operational alerts
-description: Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, quarantined files, and ingest refusals.
+description: Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, quarantined files, ingest refusals, and refused searches.
 ---
 
 Use this pack to receive alerts when Trawl reports a discard, persistence
 failure, compaction failure, or successful quarantine, when ingest is refused
-for lack of hot-buffer space, or when the hot buffer stops draining. It adds no monitoring
+for lack of hot-buffer space, when the hot buffer stops draining, or when
+search stays refused because the corpus is unsettled. It adds no monitoring
 server, receiver, notification route, or automatic repair. Use your existing
 monitoring system to detect failed scrapes and stopped targets.
 
@@ -17,11 +18,12 @@ evaluation once enough samples exist. Repeated increments can keep it firing.
 Use **30-second scrape and evaluation intervals**, no greater than **two
 minutes**, for this pack.
 
-Two rules work differently.
+Three rules work differently.
 [Ingest admission refusing](#ingest-admission-refusing) sums a counter over
 producers in a five-minute window and waits ten minutes with `for`.
 [Hot buffer drain stalled](#hot-buffer-drain-stalled) compares two gauges and
-waits two minutes. Their sections describe their windows.
+waits two minutes. [Corpus unsettled](#corpus-unsettled) reads one gauge and
+waits ten minutes. Their sections describe their windows.
 
 `TrawlHotBufferDrainStalled` defaults to `severity: critical`. Every other rule
 defaults to `severity: warning`. Alert labels retain `job`,
@@ -52,7 +54,7 @@ the current series becomes stale.
 
 The counter rules have no current-value or ingest-enable gate. Stopping a producer
 does not erase observations still in the window. Apart from the hot-buffer
-drain, this pack makes no claim to detect silent stalls, backlog eligibility,
+drain and the corpus state, this pack makes no claim to detect silent stalls, backlog eligibility,
 every network loss, or every disk failure.
 
 ## Load rules into plain Prometheus
@@ -89,7 +91,7 @@ every network loss, or every disk failure.
 3. Check the rule file with `promtool check rules /etc/prometheus/rules/trawl.rules.yml`.
 4. Reload Prometheus through your existing configuration process.
 5. Check that its Targets page shows the `trawl` job as up and its Rules page
-   lists all thirteen Trawl alerts without evaluation errors.
+   lists all fourteen Trawl alerts without evaluation errors.
 
 The plain expressions select `job="trawl"`. If you choose another job name,
 replace that matcher in every rule. Edit ordinary rule fields to change
@@ -121,7 +123,7 @@ prometheusRule:
       enabled: false
 ```
 
-All thirteen alerts are enabled when the pack is enabled.
+All fourteen alerts are enabled when the pack is enabled.
 `TrawlHotBufferDrainStalled` has severity `critical`, and the others have `warning`.
 Use the exact alert names in the [metric mapping](/reference/api/#operational-alert-counters)
 as keys under `prometheusRule.alerts`. Each entry accepts only `enabled` and
@@ -390,29 +392,32 @@ failure alerts; never subtract attempt counts from event counts.
 `TrawlWalDurabilityDegraded` observes
 `trawl_wal_durability_failures_total{operation="parent_directory_sync"}`, in
 failed operations. `WalWriter::write` failed to sync a WAL directory: the
-environment directory after a rename, or the WAL root before the first write
-into an environment. A write is acknowledged only after that sync, so the
-write is rejected. Before it returns the error, the writer tries to remove the
-renamed file. A file it cannot remove stays in the WAL, as step 2 describes.
+environment directory after the writer linked a new file into it, or the WAL
+root before the first write into an environment. A write is acknowledged only
+after that sync, so the write is rejected. Before it returns the error, the
+writer removes the new file and syncs the directory again. A file that it
+cannot remove durably stays in the WAL, as steps 2 and 3 describe.
 Each lane then follows its own failure path:
 
 - HTTP ingest answers a redacted 500 and counts the failed group under
   `TrawlHttpPersistenceRejection`. The sender retries.
 - Syslog discards the group and counts it under `TrawlSyslogWalDiscard`.
 - Telemetry counts the attempt under `TrawlTelemetryWalWriteFailure`. It
-  retains the batch for retry, unless the file stayed in the WAL.
+  retains the batch for retry, unless the removal failed or was not durable.
 
 1. Find `wal_dir_fsync_failed` and the filesystem error it carries. The
-   `withdrawn` field says whether the renamed file was removed.
-2. If `withdrawn` is `false`, the file stays in the WAL and compaction merges
-   it, although the write was rejected. A sender that retries that batch
-   duplicates it. Telemetry does not retry such a batch.
+   `withdrawn` field says whether the new file was removed.
+2. If `withdrawn` is `false`, `withdraw_error` carries the removal error. The
+   file stays in the WAL, and compaction merges it, although the write was
+   rejected. A sender that retries that batch duplicates it. Telemetry does
+   not retry such a batch.
 3. If `withdrawn` is `true`, read `withdrawal_durable`. The writer syncs the
    directory again after it removes the file. `true` means that the removal
    is durable. `false` means that the second sync failed too, and
    `withdrawal_sync_error` carries its error. The file is gone now, but a
    power loss before the next successful sync of that directory can restore
-   it, and compaction then merges a batch whose write was rejected. That
+   it. The next boot then hydrates it, and compaction merges a batch whose
+   write was rejected. Telemetry does not retry such a batch either. That
    second failure increments the counter again.
 4. Inspect filesystem and storage health, and address the reported sync
    failure.
@@ -489,6 +494,15 @@ environment and service are out of compaction, stale temporary-file cleanup,
 daily rollup of that day, and retention of that date. A repin cutover is
 refused. [Crash recovery](/architecture/recovery/) describes the protocol.
 
+A marker that recovery cannot resolve at boot also refuses search. Boot
+hydration skips the scope that the marker blocks, so queries, exports, and
+manual runs answer 503 `corpus_recovering` with cause kind `restart_backlog`,
+and [corpus unsettled](#corpus-unsettled) fires after ten minutes. Search stays
+refused until the marker is resolved and compaction drains that scope.
+While search is refused as `restart_backlog`, any pending publication marker
+keeps it refused, because compaction's coverage proof fails while a marker is
+pending.
+
 - `failed`: a filesystem error stopped recovery of one marker, for example a
   WAL directory where the consumed files cannot be removed. Check whether
   the marker still exists: while it does, the service stays blocked and the
@@ -525,6 +539,9 @@ refused. [Crash recovery](/architecture/recovery/) describes the protocol.
    marker until you know whether the listed WAL rows are in the canonical
    file. Removing it makes compaction merge those WAL files again, which
    duplicates their rows if they were published.
+4. After the marker is resolved, the next compaction pass drains the scope.
+   If search was refused as `restart_backlog`, the coverage proof after that
+   pass settles the corpus and logs `corpus_settled`.
 
 While a marker keeps blocking, every compaction pass counts it as a failure.
 After a failed pass, compaction starts no early pass under hot-buffer
@@ -585,7 +602,9 @@ datagrams were recovered.
 
 `TrawlHotBufferDrainStalled` compares two gauges:
 `trawl_hot_buffer_oldest_batch_age_seconds`, the seconds since the oldest
-resident batch was inserted, and `trawl_compaction_interval_seconds`. It fires
+resident batch was inserted, and `trawl_compaction_interval_seconds`. A batch
+that boot hydration loaded counts from the time in its WAL file name, so a
+restart does not reset the age. It fires
 when the age stays above ten compaction intervals, with a floor of 60 seconds,
 for two minutes. With the default interval of 10 seconds, that is an age over
 100 seconds. A long interval raises the threshold with it, so a slow schedule
@@ -609,3 +628,77 @@ unreachable catalog database, a repin cutover, and a
 Resolution means the oldest batch is younger than the threshold. It does not
 establish that ingest refusals stopped; check
 [ingest admission refusing](#ingest-admission-refusing).
+
+## Corpus unsettled
+
+`TrawlCorpusUnsettled` observes the gauge `trawl_corpus_unsettled{reason}`.
+It fires when the corpus has been unsettled for ten minutes. The rule takes
+the maximum over `reason`, so a change from one reason to the other does not
+restart the delay. [Reads while the corpus is unsettled](/architecture/data-flow/#reads-while-the-corpus-is-unsettled)
+explains the state.
+
+While the corpus is unsettled:
+
+- Searches, exports, uncached field values, and manual runs answer 503
+  `corpus_recovering`.
+- Scheduled runs wait. The scheduler claims no window until the corpus
+  settles, and one claim then covers the gap.
+- A repin is refused and ends `blocked`.
+- Live tail, health, and metrics work as usual.
+- `checks.corpus` in `/api/v1/health` names the current reason.
+
+The `reason` label is one of two values:
+
+- `restart_backlog`: WAL from before the last restart is not yet proven
+  covered. Boot hydration left some of it out of the hot buffer, and
+  compaction has not proven that it drained it.
+- `rollup_pending`: a daily rollup marker is unfinished, or the scan for
+  rollup markers failed. When both reasons hold, health and the refusals
+  name `rollup_pending`.
+
+1. Read `checks.corpus` in `/api/v1/health`, and both
+   `trawl_corpus_unsettled` series, to see which reasons hold.
+2. For `restart_backlog`, find `boot_hydration` in the log of the last boot.
+   Its counts say why WAL was left out:
+   - `capacity`, or `examine_bound_hit=true`: the backlog did not fit the
+     caps. Lowering `[ingest] hot_buffer_max_events` or `hot_buffer_max_bytes`
+     across a restart can cause this once. Compaction drains the rest.
+   - `oversized`: a file is larger than a full cap. Compaction merges it.
+   - `undecodable`: a file is not exactly what the WAL writer produces.
+     Compaction's decoder merges it or quarantines it.
+   - `unreadable`: an entry is not a regular file, or could not be read.
+     Check its type and permissions.
+   - `claimed`: a pending publication marker blocks a service. Follow
+     [publication recovery blocked](#publication-recovery-blocked).
+   - `unlisted`: a WAL directory could not be listed. Check its permissions
+     and the storage.
+3. Read the `coverage_proof` events that compaction logs after each pass.
+   Their `outcome` names what still holds the state:
+   - `settled`: the proof cleared the state, and `corpus_settled` follows.
+   - `incomplete`: a WAL directory could not be listed. Check
+     `TrawlCompactionOperationFailure` for `wal_root_scan` or
+     `wal_environment_scan`.
+   - `marker_pending`: a publication marker is pending. Follow
+     [publication recovery blocked](#publication-recovery-blocked).
+   - `too_many_candidates`: more than 1024 WAL files are not resident.
+   - `not_resident`: a WAL file is on disk and not resident.
+4. If the outcome stays `too_many_candidates` or `not_resident` while
+   `trawl_wal_files` does not fall, compaction is not draining the WAL. Read `compaction_error` events, and check
+   `storage_db` in `/api/v1/health`: a catalog outage stops every merge.
+   Follow [hot buffer drain stalled](#hot-buffer-drain-stalled) for the
+   causes.
+5. For `rollup_pending`, find `rollup_boot_recovery` at ERROR and
+   `rollup_error`, and check `TrawlCompactionOperationFailure` for
+   `pending_rollup_scan` and `pending_rollup_recovery`. Correct the reported
+   filesystem problem. The next compaction pass retries, and
+   `publication_scan_recovered` logs a failed scan that it clears. A
+   query-only node clears a failed scan only when you restart it.
+   [Daily rollup](/architecture/recovery/#daily-rollup) describes the
+   recovery.
+
+Do not remove WAL files or markers to clear the state. A removed WAL file
+loses its events, and a removed marker can duplicate rows.
+
+Resolution means the gauge read 0 for both reasons. Searches answer again
+from the moment the state clears, and the next scheduler poll claims the
+windows that waited.
