@@ -15,7 +15,9 @@
 //! For `up` and `stop`, one that stays `created` past the wait never
 //! started, and is removed. `down` removes nothing before it is confirmed:
 //! it waits only for running one-offs, lists what is left with the rest,
-//! and deletes it all after a yes.
+//! and deletes it all after a yes. A trial directory without a state is
+//! listed entry by entry and asked about the same way; only an empty one
+//! is removed without asking.
 //!
 //! `up` then creates or resumes, one recorded phase at a time, so a rerun
 //! after an interruption skips what is done:
@@ -1524,6 +1526,35 @@ pub fn confirm(
     })
 }
 
+/// What `down` shows before it asks.
+#[derive(Debug, Clone, Copy)]
+pub enum Listing<'a> {
+    /// The trial's resources on the engine, then its directory.
+    Trial(&'a Inventory),
+    /// A trial directory that holds no state, and the entries in it. The
+    /// engine then holds nothing of a trial's.
+    Leftover(&'a [Entry]),
+}
+
+impl Listing<'_> {
+    /// Print the listing for the trial directory `dir`.
+    pub fn render(self, out: &mut impl Write, dir: &std::path::Path) -> io::Result<()> {
+        match self {
+            Self::Trial(inventory) => render::render_inventory(out, inventory, dir),
+            Self::Leftover(entries) => render::render_leftover(out, dir, entries),
+        }
+    }
+}
+
+/// One entry of a trial directory that holds no state.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Entry {
+    pub name: std::ffi::OsString,
+    /// A real directory, removed with what it holds. A symlink is never
+    /// one: it is removed, never followed.
+    pub dir: bool,
+}
+
 /// `trawl trial down`: delete every resource that carries this trial's id,
 /// the claim last, then the trial directory. The lock file stays.
 pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
@@ -1537,9 +1568,10 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
         paths,
         view.as_ref(),
         ONEOFF_WAIT,
-        |inventory| {
+        |listing| {
             let mut stdout = io::stdout().lock();
-            render::render_inventory(&mut stdout, inventory, &paths.dir)
+            listing
+                .render(&mut stdout, &paths.dir)
                 .and_then(|()| stdout.flush())
                 .map_err(|e| TrialError::io("write", "stdout", e))?;
             drop(stdout);
@@ -1552,40 +1584,99 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
     .await
 }
 
-/// `down` on its own engine. `approve` shows the inventory and answers;
+/// `down` on its own engine. `approve` shows the listing and answers;
 /// nothing is deleted before it answers [`Confirmation::Proceed`], and
-/// then exactly the inventory it was shown is deleted, by id.
+/// then exactly what it was shown is deleted: the inventory by id, or the
+/// listed entries of a directory without a state.
 async fn remove_trial(
     docker: &Docker,
     paths: &TrialPaths,
     view: Option<&DownView>,
     wait: Duration,
-    approve: impl FnOnce(&Inventory) -> Result<Confirmation, TrialError>,
+    approve: impl FnOnce(Listing<'_>) -> Result<Confirmation, TrialError>,
 ) -> Result<(), TrialError> {
     let inventory = Inventory::scan(docker).await?;
     require_owned(paths, &inventory, view.map(|v| v.trial_id.as_str()))?;
     let Some(view) = view else {
-        // Nothing on the engine, and no state: at most an empty directory.
-        if paths.check_dir()? {
-            remove_dir(paths)?;
-            progress("removed a trial directory that held no trial");
-        } else {
-            progress("there is no trial here; nothing to delete");
-        }
-        return Ok(());
+        // No state, and `require_owned` refused anything of a trial's on
+        // the engine: at most a directory.
+        return remove_leftover(paths, approve);
     };
     let inventory = await_running_oneoffs(docker, paths, inventory, &view.trial_id, wait).await?;
 
-    match approve(&inventory)? {
-        Confirmation::Proceed => {}
-        Confirmation::Declined => return Err(TrialError::Declined),
-        Confirmation::NeedsYes => return Err(TrialError::ConfirmationRequired),
-    }
-
+    approved(approve(Listing::Trial(&inventory))?)?;
     delete(docker, &inventory, &view.trial_id).await?;
     remove_dir(paths)?;
     progress("deleted the trial");
     Ok(())
+}
+
+/// `Ok` only for [`Confirmation::Proceed`].
+fn approved(answer: Confirmation) -> Result<(), TrialError> {
+    match answer {
+        Confirmation::Proceed => Ok(()),
+        Confirmation::Declined => Err(TrialError::Declined),
+        Confirmation::NeedsYes => Err(TrialError::ConfirmationRequired),
+    }
+}
+
+/// `down` over a trial directory that holds no state.
+///
+/// An empty one is removed without asking. `rmdir` removes only an empty
+/// directory, and the kernel checks that when it removes it, so this can
+/// delete no file, not even one written a moment before: it deletes the
+/// name of an empty 0700 directory that `up` creates again. One that holds
+/// anything is listed and asked about like a trial. After a yes, only the
+/// entries it listed are removed, then the directory, which stays with
+/// what appeared since.
+fn remove_leftover(
+    paths: &TrialPaths,
+    approve: impl FnOnce(Listing<'_>) -> Result<Confirmation, TrialError>,
+) -> Result<(), TrialError> {
+    if !paths.check_dir()? {
+        progress("there is no trial here; nothing to delete");
+        return Ok(());
+    }
+    match std::fs::remove_dir(&paths.dir) {
+        Ok(()) => {
+            progress("removed an empty trial directory that held no trial");
+            return Ok(());
+        }
+        Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+        Err(e) => return Err(TrialError::io("remove", &paths.dir, e)),
+    }
+    let entries = list_entries(&paths.dir)?;
+    approved(approve(Listing::Leftover(&entries))?)?;
+    for entry in &entries {
+        let path = paths.dir.join(&entry.name);
+        let removed = if entry.dir {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        removed.map_err(|e| TrialError::io("remove", &path, e))?;
+    }
+    std::fs::remove_dir(&paths.dir).map_err(|e| TrialError::io("remove", &paths.dir, e))?;
+    progress("deleted a trial directory that held no trial");
+    Ok(())
+}
+
+/// The entries of `dir`, sorted by name, each read without following a
+/// symlink.
+fn list_entries(dir: &std::path::Path) -> Result<Vec<Entry>, TrialError> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| TrialError::io("read", dir, e))? {
+        let entry = entry.map_err(|e| TrialError::io("read", dir, e))?;
+        let kind = entry
+            .file_type()
+            .map_err(|e| TrialError::io("inspect", entry.path(), e))?;
+        entries.push(Entry {
+            name: entry.file_name(),
+            dir: kind.is_dir(),
+        });
+    }
+    entries.sort();
+    Ok(entries)
 }
 
 /// Delete the inventory by id: containers, networks, volumes, and the
@@ -1954,8 +2045,8 @@ esac"#,
             engine_id: None,
         };
         let mut shown = Vec::new();
-        let result = remove_trial(&docker, &paths, Some(&view), wait, |inventory| {
-            render::render_inventory(&mut shown, inventory, &paths.dir).unwrap();
+        let result = remove_trial(&docker, &paths, Some(&view), wait, |listing| {
+            listing.render(&mut shown, &paths.dir).unwrap();
             Ok(confirm(yes, tty, &mut typed.as_bytes(), &mut Vec::new()).unwrap())
         })
         .await;
@@ -2054,6 +2145,64 @@ esac"#,
         let approved = remove(&[&running], Duration::ZERO, true, false, "").await;
         approved.result.unwrap();
         assert_eq!(approved.calls, "container rm --force -- 0ne0ff\n");
+    }
+
+    /// [`remove_trial`] without a state, of a trial directory holding
+    /// `files`, on an engine with nothing of a trial's. `approve` gets the
+    /// listing as printed, and the directory.
+    async fn remove_leftover_of(
+        files: &[&str],
+        approve: impl FnOnce(&str, &std::path::Path) -> Confirmation,
+    ) -> (Result<(), TrialError>, tempfile::TempDir, TrialPaths) {
+        let ([_dir, _script], docker) = settle_engine(&[""], false);
+        let home = tempfile::tempdir().unwrap();
+        let paths = TrialPaths::resolve(Some(&home.path().join("state")), None).unwrap();
+        paths.ensure_dir().unwrap();
+        for file in files {
+            std::fs::write(paths.dir.join(file), "x").unwrap();
+        }
+        let result = remove_trial(&docker, &paths, None, Duration::ZERO, |listing| {
+            let mut shown = Vec::new();
+            listing.render(&mut shown, &paths.dir).unwrap();
+            Ok(approve(&String::from_utf8(shown).unwrap(), &paths.dir))
+        })
+        .await;
+        (result, home, paths)
+    }
+
+    /// A directory without a state is listed, and a `n` keeps all of it.
+    #[tokio::test]
+    async fn down_keeps_a_directory_without_state_on_a_no() {
+        let (result, _home, paths) = remove_leftover_of(&["a", "b"], |shown, _| {
+            assert!(shown.ends_with("\n    a\n    b\n"), "{shown}");
+            confirm(false, true, &mut "n\n".as_bytes(), &mut Vec::new()).unwrap()
+        })
+        .await;
+        assert!(matches!(result, Err(TrialError::Declined)), "{result:?}");
+        assert!(paths.dir.join("a").is_file() && paths.dir.join("b").is_file());
+    }
+
+    /// After a yes, only the listed entries go. A file that appeared while
+    /// `down` asked stays, and so does the directory holding it.
+    #[tokio::test]
+    async fn down_removes_only_the_listed_entries_of_a_directory_without_state() {
+        let (result, _home, paths) = remove_leftover_of(&["a"], |_, dir| {
+            std::fs::write(dir.join("late"), "x").unwrap();
+            Confirmation::Proceed
+        })
+        .await;
+        assert!(
+            matches!(
+                &result,
+                Err(TrialError::Io {
+                    action: "remove",
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(!paths.dir.join("a").exists());
+        assert!(paths.dir.join("late").is_file());
     }
 
     /// Every `up`, first or resumed, starts the services through

@@ -546,3 +546,71 @@ fn down_removes_a_kept_state_that_owns_nothing() {
     assert_eq!(engine.creates(), 1);
     assert_eq!(engine.calls().lines().count(), 1, "down removed nothing");
 }
+
+impl Engine {
+    /// A trial directory at 0700 that holds `files` and no `state.json`,
+    /// as a state file removed by hand, or a removal that failed part way,
+    /// leaves it.
+    fn leftover(&self, files: &[(&str, &str)]) -> PathBuf {
+        let dir = self.dir();
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .unwrap();
+        for (name, body) in files {
+            let path = dir.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        dir
+    }
+}
+
+/// A trial directory without a state still holds files, and the engine
+/// holds nothing of a trial's. Without a terminal and without `--yes`,
+/// `down` lists what the directory holds, deletes nothing, and exits
+/// non-zero. With `--yes` it deletes the directory.
+#[test]
+fn down_asks_before_it_deletes_a_directory_without_state() {
+    let engine = Engine::new("engine-a");
+    let dir = engine.leftover(&[("operator.token", "kept\n"), ("notes/todo.txt", "mine\n")]);
+
+    let out = engine.trawl(&["down"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("nothing was deleted"), "{stderr}");
+    for (name, body) in [("operator.token", "kept\n"), ("notes/todo.txt", "mine\n")] {
+        assert_eq!(
+            std::fs::read_to_string(dir.join(name)).ok().as_deref(),
+            Some(body),
+            "down deleted {name} before it was confirmed: {stderr}"
+        );
+    }
+    for row in ["    notes/\n", "    operator.token\n"] {
+        assert!(stdout.contains(row), "{row:?} is not listed: {stdout}");
+    }
+    assert_eq!(engine.calls(), "");
+
+    let out = engine.trawl(&["down", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!dir.exists(), "{stderr}");
+    assert_eq!(engine.calls(), "");
+}
+
+/// An empty trial directory without a state holds nothing to lose, so
+/// `down` removes it without asking.
+#[test]
+fn down_removes_an_empty_directory_without_asking() {
+    let engine = Engine::new("engine-a");
+    let dir = engine.leftover(&[]);
+
+    let out = engine.trawl(&["down"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!dir.exists(), "{stderr}");
+    assert!(dir.parent().unwrap().is_dir(), "{stderr}");
+    assert_eq!(engine.calls(), "");
+}

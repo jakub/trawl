@@ -14,6 +14,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use super::keys::TrialKey;
+use super::lifecycle::Entry;
 use super::ownership::{Inventory, Kind};
 use super::paths::TrialPaths;
 use super::sample::{DOCUMENTED_QUERY, documented_row};
@@ -345,6 +346,22 @@ pub fn render_inventory(out: &mut impl Write, inventory: &Inventory, dir: &Path)
     Ok(())
 }
 
+/// What `down` prints before it asks about a trial directory that holds
+/// no state: the directory and each entry in it, a directory with a `/`.
+pub fn render_leftover(out: &mut impl Write, dir: &Path, entries: &[Entry]) -> io::Result<()> {
+    writeln!(
+        out,
+        "The trial directory holds no trial state. `trawl trial down` deletes it and what it holds:"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "  {}", dir.display())?;
+    for entry in entries {
+        let slash = if entry.dir { "/" } else { "" };
+        writeln!(out, "    {}{slash}", Path::new(&entry.name).display())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,6 +578,25 @@ mod tests {
             out,
             &inventory,
             Path::new("/state/trawl/trial")
+        )));
+    }
+
+    #[test]
+    fn a_directory_without_state_lists_its_entries() {
+        let entries = [
+            Entry {
+                name: "notes".into(),
+                dir: true,
+            },
+            Entry {
+                name: "operator.token".into(),
+                dir: false,
+            },
+        ];
+        insta::assert_snapshot!(text(|out| render_leftover(
+            out,
+            Path::new("/state/trawl/trial"),
+            &entries
         )));
     }
 
