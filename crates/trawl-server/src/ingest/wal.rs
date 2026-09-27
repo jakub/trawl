@@ -1335,15 +1335,11 @@ mod no_clobber {
         writer.write("prod", "svc", b"{\"id\":3}\n").unwrap();
     }
 
-    /// A marker far over the size bound refuses the write from its `lstat`
-    /// alone. Mode `000` makes any open fail, so a refusal for a marker that
-    /// cannot be read would mean the body was opened.
+    /// A marker far over the size bound refuses the write from `fstat` on
+    /// its descriptor, before any read. It is sparse, so it costs no disk.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_oversized_marker_refuses_the_write_without_being_read() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        crate::ingest::hydration::enforce_mode_bits_on_this_thread();
         let tmp = tempfile::tempdir().unwrap();
         let writer = warmed(tmp.path());
         let marker = writer.dir().join("prod").join(".publish-svc.json");
@@ -1351,8 +1347,42 @@ mod no_clobber {
             .unwrap()
             .set_len(1 << 40)
             .unwrap();
-        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(std::fs::File::open(&marker).is_err());
+
+        let refusal = refused_by_marker(&writer);
+        assert!(refusal.contains("is invalid"), "{refusal}");
+    }
+
+    /// A FIFO at the marker path refuses the write at once: the writer
+    /// never waits for a FIFO writer to come.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_marker_refuses_the_write_without_blocking() {
+        use crate::ingest::no_follow::test_support::{make_fifo, returns_promptly};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = warmed(tmp.path());
+        make_fifo(&writer.dir().join("prod").join(".publish-svc.json"));
+
+        let refusal = returns_promptly(move || refused_by_marker(&writer));
+        assert!(refusal.contains("is invalid"), "{refusal}");
+    }
+
+    /// A symlink at the marker path refuses the write, even to a valid
+    /// marker that claims no name the write would take: the writer never
+    /// follows it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlinked_marker_refuses_the_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = warmed(tmp.path());
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("prod")).unwrap();
+        pending_marker(&elsewhere, "svc", &["svc_1000_0001.ndjson"]);
+        std::os::unix::fs::symlink(
+            elsewhere.join("prod").join(".publish-svc.json"),
+            writer.dir().join("prod").join(".publish-svc.json"),
+        )
+        .unwrap();
 
         let refusal = refused_by_marker(&writer);
         assert!(refusal.contains("is invalid"), "{refusal}");

@@ -35,6 +35,8 @@ use std::path::{Path, PathBuf};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+use super::no_follow;
+
 /// Marker file name prefix inside `wal_dir/{env}`.
 const MARKER_PREFIX: &str = ".publish-";
 /// Marker file name suffix. Anything but `.ndjson`, which the WAL scan claims.
@@ -371,9 +373,13 @@ fn io_error(path: &Path, operation: &str, error: &io::Error) -> MarkerError {
 /// Read and confine the marker at `path`. The env is the parent directory's
 /// name and the service comes from the file name.
 ///
-/// A marker over [`MAX_MARKER_BYTES`] is invalid: one its `lstat` reports is
-/// never opened, and one that grows after the `lstat` is read only up to one
-/// byte past the bound.
+/// The marker is opened without following a symlink and without waiting on
+/// a FIFO ([`no_follow::open`]), and its type and size come from `fstat` on
+/// that descriptor, so nothing swapped in at the path after a check is ever
+/// read. Anything but a regular file is invalid. A marker over
+/// [`MAX_MARKER_BYTES`] is invalid: one `fstat` reports is never read, and
+/// one that grows after the `fstat` is read only up to one byte past the
+/// bound. Off Linux no marker is opened, so a present one cannot be read.
 pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     let file_name = path
         .file_name()
@@ -389,11 +395,17 @@ pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     validate_env(env).map_err(MarkerError::Invalid)?;
     validate_service(service).map_err(MarkerError::Invalid)?;
 
-    let metadata = std::fs::symlink_metadata(path).map_err(|e| io_error(path, "inspect", &e))?;
+    let not_regular = || MarkerError::Invalid("marker is not a regular file".to_owned());
+    let file = no_follow::open(path).map_err(|e| {
+        if no_follow::is_symlink_refusal(&e) {
+            not_regular()
+        } else {
+            io_error(path, "open", &e)
+        }
+    })?;
+    let metadata = file.metadata().map_err(|e| io_error(path, "inspect", &e))?;
     if !metadata.file_type().is_file() {
-        return Err(MarkerError::Invalid(
-            "marker is not a regular file".to_owned(),
-        ));
+        return Err(not_regular());
     }
     let over_limit =
         || MarkerError::Invalid(format!("marker is over the {MAX_MARKER_BYTES}-byte limit"));
@@ -401,8 +413,8 @@ pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
         return Err(over_limit());
     }
     let mut body = Vec::new();
-    std::fs::File::open(path)
-        .and_then(|file| file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut body))
+    file.take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut body)
         .map_err(|e| io_error(path, "read", &e))?;
     if body.len() as u64 > MAX_MARKER_BYTES {
         return Err(over_limit());
@@ -1342,15 +1354,75 @@ mod tests {
         assert_invalid(read_marker(&link), "not a regular file");
     }
 
-    /// A marker far over the size bound is refused from its `lstat` alone.
-    /// It is sparse, so it costs no disk, and mode `000` makes any open
-    /// fail: an `Io` error would mean the body was opened.
+    /// The WAL writer reads the marker on every write, so a FIFO at the
+    /// marker path must not block the read waiting for a FIFO writer.
     #[cfg(target_os = "linux")]
     #[test]
-    fn an_oversized_marker_is_invalid_without_being_opened() {
-        use std::os::unix::fs::PermissionsExt as _;
+    fn a_fifo_marker_is_invalid_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(ENV);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(marker_file_name(SERVICE));
+        crate::ingest::no_follow::test_support::make_fifo(&path);
+        let result =
+            crate::ingest::no_follow::test_support::returns_promptly(move || read_marker(&path));
+        assert_invalid(result, "not a regular file");
+    }
 
-        crate::ingest::hydration::enforce_mode_bits_on_this_thread();
+    /// A FIFO or a symlink swapped in for a valid marker between a check
+    /// of the path and the open must neither block the read nor be
+    /// followed. A swapper flips the marker path between a valid marker, a
+    /// FIFO and a symlink to a valid marker while reads run; every read
+    /// returns, and none reads through the symlink.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_marker_swapped_under_the_read_never_blocks_or_is_followed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(ENV);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(marker_file_name(SERVICE));
+        let valid = body("2026-09-23/07", &[WAL_A], &hex());
+        std::fs::write(&path, &valid).unwrap();
+        // The symlink's target names another partition, so a read that
+        // followed it is told apart from one of the valid marker.
+        let elsewhere = tmp.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, body("2026-09-23/08", &[WAL_A], &hex())).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let (stop, dir, path) = (Arc::clone(&stop), dir.clone(), path.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let staged = dir.join(format!("staged-{n}"));
+                    match n % 3 {
+                        0 => crate::ingest::no_follow::test_support::make_fifo(&staged),
+                        1 => std::os::unix::fs::symlink(&elsewhere, &staged).unwrap(),
+                        _ => std::fs::write(&staged, &valid).unwrap(),
+                    }
+                    std::fs::rename(&staged, &path).unwrap();
+                    n += 1;
+                }
+            })
+        };
+        let followed = crate::ingest::no_follow::test_support::returns_promptly(move || {
+            (0..20_000)
+                .filter(|_| read_marker(&path).is_ok_and(|marker| marker.hour() == 8))
+                .count()
+        });
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert_eq!(followed, 0, "a read followed a swapped-in symlink");
+    }
+
+    /// A marker far over the size bound is refused from `fstat` on its
+    /// descriptor, before any read. It is sparse, so it costs no disk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_oversized_marker_is_invalid_without_being_read() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(ENV);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1359,11 +1431,6 @@ mod tests {
             .unwrap()
             .set_len(1 << 40)
             .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        assert!(
-            std::fs::File::open(&path).is_err(),
-            "mode 000 must lock the marker for this thread"
-        );
         assert_invalid(read_marker(&path), "byte limit");
     }
 

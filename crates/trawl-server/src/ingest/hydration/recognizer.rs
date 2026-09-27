@@ -28,6 +28,7 @@ use serde_json::{Map, Value};
 
 use crate::ingest::compaction;
 use crate::ingest::envelope::is_folded_name;
+use crate::ingest::no_follow;
 use crate::ingest::wal::{self, WalName};
 
 /// One WAL line's event.
@@ -186,7 +187,7 @@ impl WalFile {
     /// check with `fstat` on the descriptor that it is a regular file. The
     /// open does not block: a FIFO is refused after it opens, never read.
     fn open(path: &Path) -> std::io::Result<Self> {
-        let file = open_no_follow(path)?;
+        let file = no_follow::open(path)?;
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file() {
             return Err(std::io::Error::new(
@@ -222,32 +223,6 @@ impl WalFile {
         }
         Ok(bytes)
     }
-}
-
-/// `open(2)` with `O_NOFOLLOW`, and `O_NONBLOCK` so that opening a FIFO
-/// returns at once instead of waiting for a writer.
-#[cfg(target_os = "linux")]
-fn open_no_follow(path: &Path) -> std::io::Result<File> {
-    use rustix::fs::{Mode, OFlags};
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    Ok(File::from(fd))
-}
-
-/// Off Linux there is no `rustix` to open with `O_NOFOLLOW | O_NONBLOCK`,
-/// and a check with `lstat` before a plain open leaves a gap in which a
-/// FIFO swapped in blocks the boot and a symlink swapped in is followed.
-/// So no file is opened: every entry is unreadable, hydration loads
-/// nothing, and the WAL stays as overhang for compaction.
-#[cfg(not(target_os = "linux"))]
-fn open_no_follow(_path: &Path) -> std::io::Result<File> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "hydration opens WAL files only on Linux",
-    ))
 }
 
 #[cfg(test)]
