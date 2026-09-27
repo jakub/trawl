@@ -231,7 +231,6 @@ pub async fn query(
                 result: Err(refusal),
                 debug: None,
                 severity_columns: Vec::new(),
-                timing: None,
             },
             Vec::new(),
         ),
@@ -248,7 +247,6 @@ pub async fn query(
                         result: Err(conflict),
                         debug: None,
                         severity_columns: Vec::new(),
-                        timing: None,
                     },
                     Vec::new(),
                 )
@@ -4246,7 +4244,6 @@ mod tests {
             result,
             debug: None,
             severity_columns: vec![],
-            timing: None,
         };
         let one_column = || QueryResult {
             columns: vec![trawl_engine::value::Column {

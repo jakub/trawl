@@ -43,7 +43,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::executor::{Executor, RowCap};
-use trawl_engine::timing::{PhaseClock, PhaseTotals, QueryPhase};
+use trawl_engine::timing::{PhaseClock, QueryPhase};
 use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
@@ -361,24 +361,31 @@ impl WorkSlot {
     }
 
     /// The worker's last word, before this slot drops: record how the
-    /// physical work ended and close the clock, returning its final
-    /// totals as a plain value.
+    /// physical work ended and close the clock, so its final totals are
+    /// on the shared clock before [`Drop`] takes the registry lock. The
+    /// clock is the one accumulator (ADR-0046): the handler's complete
+    /// account and the reclaim both read it, and no copy of it travels.
     ///
     /// Work that never started discards its `startup`: nothing ran, so
     /// the refusal reports no worker phase. The request may have
     /// discarded it already, which is a no-op here.
-    fn finish<T>(&mut self, result: &Result<T, ServerError>) -> Option<PhaseTotals> {
+    fn finish<T>(&mut self, result: &Result<T, ServerError>) {
         let started = self.started.load(Ordering::SeqCst);
         self.physical = if started {
             PhysicalOutcome::of_result(result)
         } else {
             PhysicalOutcome::NotStarted
         };
-        let clock = self.timing.as_ref()?.clock();
+        let Some(timing) = &self.timing else {
+            return;
+        };
+        let clock = timing.clock();
         if !started {
             clock.discard(QueryPhase::Startup);
         }
-        clock.close_at(Instant::now())
+        // Closing books any phase still active; the totals it returns are
+        // read from the clock by whoever writes the account.
+        let _ = clock.close_at(Instant::now());
     }
 
     /// The executor this work runs on. It never leaves the slot, so no
@@ -695,7 +702,6 @@ impl RefusalOnce {
             result: Err(self.refuse(id, kind, refusal)),
             debug: None,
             severity_columns: Vec::new(),
-            timing: None,
         }
     }
 
@@ -972,12 +978,6 @@ pub struct ExecuteOutcome {
     /// `SEVERITY` pin produced. Empty for a failed, timed-out or
     /// never-started run: there are no rows to present.
     pub severity_columns: Vec<String>,
-    /// The worker's final phase totals, closed before its slot dropped,
-    /// crossing `spawn_blocking` as a plain value the way `debug` does
-    /// (ADR-0046). `None` for work with no timing account, and for an
-    /// outcome the request assembled itself — whose account the pool has
-    /// already written.
-    pub timing: Option<PhaseTotals>,
 }
 
 /// The result columns that carry the `SEVERITY` pin at the end of the
@@ -1591,7 +1591,6 @@ impl ExecutorPool {
                     result: Err(ServerError::Internal("executor pool shut down".into())),
                     debug: None,
                     severity_columns: Vec::new(),
-                    timing: None,
                 };
             }
             Err(crate::deadline::Expired) => {
@@ -1612,7 +1611,6 @@ impl ExecutorPool {
                     result: Err(error),
                     debug: None,
                     severity_columns: Vec::new(),
-                    timing: None,
                 };
             }
             Err(crate::deadline::Expired) => {
@@ -1633,7 +1631,6 @@ impl ExecutorPool {
                     result: Err(error),
                     debug: None,
                     severity_columns: Vec::new(),
-                    timing: None,
                 };
             }
         };
@@ -1723,16 +1720,14 @@ impl ExecutorPool {
                         result,
                         debug,
                         severity_columns,
-                        timing: None,
                     }
                 }));
-                let mut outcome = outcome.unwrap_or_else(|_payload| ExecuteOutcome {
+                let outcome = outcome.unwrap_or_else(|_payload| ExecuteOutcome {
                     result: Err(ServerError::Panicked("query worker")),
                     debug: None,
                     severity_columns: Vec::new(),
-                    timing: None,
                 });
-                outcome.timing = slot.finish(&outcome.result);
+                slot.finish(&outcome.result);
                 // Interrupt deregistered, executor re-idled, publication and
                 // permit released — on this thread, before the answer goes
                 // back.
@@ -1762,7 +1757,6 @@ impl ExecutorPool {
                         result: Err(ServerError::from_join("query", e)),
                         debug: None,
                         severity_columns: Vec::new(),
-                        timing: None,
                     },
                 }
             }
@@ -1776,7 +1770,7 @@ impl ExecutorPool {
                 } else {
                     Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
                 };
-                ExecuteOutcome { result, debug: None, severity_columns: Vec::new(), timing: None }
+                ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
             }
         }
     }
@@ -1833,7 +1827,6 @@ impl ExecutorPool {
                     result: Err(ServerError::Internal("executor pool shut down".into())),
                     debug: None,
                     severity_columns: Vec::new(),
-                    timing: None,
                 };
             }
             Err(crate::deadline::Expired) => {
@@ -1850,7 +1843,6 @@ impl ExecutorPool {
                     result: Err(error),
                     debug: None,
                     severity_columns: Vec::new(),
-                    timing: None,
                 };
             }
         };
@@ -1925,16 +1917,14 @@ impl ExecutorPool {
                         result,
                         debug,
                         severity_columns,
-                        timing: None,
                     }
                 }));
-                let mut outcome = outcome.unwrap_or_else(|_payload| ExecuteOutcome {
+                let outcome = outcome.unwrap_or_else(|_payload| ExecuteOutcome {
                     result: Err(ServerError::Panicked("query worker")),
                     debug: None,
                     severity_columns: Vec::new(),
-                    timing: None,
                 });
-                outcome.timing = slot.finish(&outcome.result);
+                slot.finish(&outcome.result);
                 drop(slot);
                 worker_seam!(seams, Released);
                 outcome
@@ -1956,7 +1946,6 @@ impl ExecutorPool {
                         result: Err(ServerError::from_join("query", e)),
                         debug: None,
                         severity_columns: Vec::new(),
-                        timing: None,
                     },
                 }
             }
@@ -1966,7 +1955,7 @@ impl ExecutorPool {
                 } else {
                     Err(refusal_log.refuse(query_id, kind, StartRefusal::Expired))
                 };
-                ExecuteOutcome { result, debug: None, severity_columns: Vec::new(), timing: None }
+                ExecuteOutcome { result, debug: None, severity_columns: Vec::new() }
             }
         }
     }
