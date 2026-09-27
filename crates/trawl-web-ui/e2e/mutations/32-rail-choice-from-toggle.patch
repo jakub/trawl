@@ -1,0 +1,12 @@
+diff --git a/crates/trawl-web-ui/src/components/facet_sidebar.rs b/crates/trawl-web-ui/src/components/facet_sidebar.rs
+--- a/crates/trawl-web-ui/src/components/facet_sidebar.rs
++++ b/crates/trawl-web-ui/src/components/facet_sidebar.rs
+@@ -198,6 +198,8 @@ pub fn FacetSidebar(
+                     if shown != rail_open.get_untracked() {
+                         open.set(shown);
+                     }
++                } else if let Some(panel) = panel.get_untracked() {
++                    choice.choose(panel.has_attribute("open"));
+                 }
+             }
+             on:focusin=move |_| focus_inside.set_value(true)

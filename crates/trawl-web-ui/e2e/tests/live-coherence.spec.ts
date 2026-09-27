@@ -13,8 +13,13 @@
 // Two of them are also the subjects of mutations 27 and 28: Stop live
 // pushes (so Back returns to the stream), and the snapshot resource is
 // gated on the mode (so live posts no query at all).
+//
+// The rail's own tests here read it at the default wide viewport, where
+// it opens for a countable page and is otherwise a closed strip
+// (ADR-0044).
 
 import { test, expect, resetScenario, capturedQueryCount, lastCapturedQuery } from '../fixtures';
+import { expectRail, expectTextShown, watchToggles } from '../filter-rail';
 import { SEL, COPY } from '../selectors';
 
 type Pg = import('@playwright/test').Page;
@@ -23,6 +28,11 @@ type Ctl = import('@playwright/test').APIRequestContext;
 /** `host="web-01"`, the same versioned payload live-raw-recovery uses.
  * Stop live has to carry it through untouched. */
 const FILTERS = 'v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifV0';
+
+/** `host="web-01"` and `status="200"`: two filters, so a count or a
+ * Clear all that handled only one of them shows. */
+const TWO_FILTERS =
+  'v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifSx7Im9wIjoiKyIsImZpZWxkIjoic3RhdHVzIiwidmFsdWUiOiIyMDAifV0';
 
 /** A NON-default range: the URL producer elides `15m`, so a spec that
  * used the default could not tell preservation from omission. */
@@ -270,6 +280,10 @@ test('the filter rail summarizes the ring in live, not the snapshot it replaced'
   await expect(page.locator(SEL.facetValue).filter({ hasText: 'web-01' })).toHaveCount(0);
 });
 
+// Active filters alone do not open the rail: an aggregation counts no
+// field values, whatever the link filters on. The strip still shows the
+// count, and a press opens the rail to say why it is empty and to offer
+// Clear all, which #180 kept usable on an aggregation.
 test('an aggregation-shaped result computes no groups while Clear all still removes URL filters', async ({ page }) => {
   const aggregation = {
     columns: [{ name: 'status' }, { name: 'count' }],
@@ -278,18 +292,90 @@ test('an aggregation-shaped result computes no groups while Clear all still remo
   };
   await page.route('**/api/v1/query', route => route.fulfill({ json: aggregation }));
 
-  // Control: the same rows under a plain search DO get a rail.
-  await page.goto(`/search?q=service%3Dnginx&f=${FILTERS}`);
+  // Control: the same rows under a plain search DO get a rail, and it
+  // opens for them.
+  await page.goto(`/search?q=service%3Dnginx&f=${TWO_FILTERS}`);
   await expect(page.locator(SEL.facetGroup).first()).toBeVisible();
+  await expectRail(page, true);
 
   await page.goto(
-    `/search?q=${encodeURIComponent('service=nginx | stats count() by status')}&f=${FILTERS}`,
+    `/search?q=${encodeURIComponent('service=nginx | stats count() by status')}&f=${TWO_FILTERS}`,
   );
-  await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
+  // Settled: the aggregate's own table, not the pending page.
+  await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(2);
+  await expect(page.locator(SEL.filterChip)).toHaveCount(2);
+  await expectRail(page, false);
+  // Read on the strip itself: the text is drawn, not merely present.
+  const summary = page.locator(SEL.filterRailSummary);
+  await expectTextShown(summary, 'Filters');
+  await expect(page.locator(SEL.facetCount)).toHaveText('2 active');
+  await expectTextShown(summary, '2 active');
+
+  await summary.click();
+  await expectRail(page, true);
+  await expectTextShown(summary, 'Filters');
+  await expect(page.locator(SEL.facetCount)).toHaveText('2 active');
+  await expectTextShown(summary, '2 active');
+  await expect(page.locator(SEL.facetClear)).toBeVisible();
+  await expect(page.locator(SEL.facetHint)).toHaveText(COPY.railHintAggregate);
+  await expectTextShown(page.locator(SEL.facetHint), COPY.railHintAggregate);
   await expect(page.locator(SEL.facetFilterInput)).toHaveCount(0);
-  await expect(page.locator(SEL.filterChip)).toHaveCount(1);
+  await expect(page.locator(SEL.facetGroup)).toHaveCount(0);
+
   await page.locator(SEL.facetClear).click();
   await expect(page.locator(SEL.filterChip)).toHaveCount(0);
+  await expect(page).not.toHaveURL(/[?&]f=/);
+});
+
+// A live stream starts with the rail closed and opens it on the first
+// countable frame. From idle the rail is a strip already, so the whole
+// stream moves it once; from a countable snapshot it would close on the
+// empty ring first. The stream is held in the browser until the rail
+// has been read on an empty ring.
+test('Live Tail from idle opens the filter rail once, on the first countable frame', async ({ page, request }) => {
+  // `corpus` streams a `tick N` event every 150ms and ends each stream
+  // after about a second, and the browser reconnects into the same ring.
+  await resetScenario(request, 'corpus');
+  await page.goto('/search');
+  await expect(page.locator('.search-quick-start')).toBeVisible();
+  await expectRail(page, false);
+  const toggles = await watchToggles(page);
+
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let arrive!: () => void;
+  const arrived = new Promise<void>(resolve => { arrive = resolve; });
+  await page.route('**/api/v1/stream?*', async route => {
+    arrive();
+    await gate;
+    await route.continue();
+  }, { times: 1 });
+
+  // Written, never run: the page is still idle when Live Tail starts.
+  await page.locator(SEL.cmContent).fill('service=nginx');
+  await page.locator(SEL.dateRangeTrigger).click();
+  await page.locator(SEL.realtimeTab).click();
+  await page.locator(SEL.liveTailButton).click();
+  await expect(page).toHaveURL(/mode=live/);
+  await arrived;
+  await expectRail(page, false);
+  expect(await toggles()).toBe(0);
+
+  const opens = (await sseState(request)).opens;
+  release();
+  await expect(page.locator(SEL.facetValue).filter({ hasText: 'tick 1' }).first()).toBeVisible();
+  await expectRail(page, true);
+  expect(await toggles()).toBe(1);
+
+  // Past a reconnect, with frames still arriving: the rail stays open.
+  const received = async () =>
+    Number((await page.locator(SEL.footerCount).textContent())?.match(/Received (\d+)/)?.[1] ?? 0);
+  await expect.poll(async () => (await sseState(request)).opens).toBeGreaterThan(opens + 1);
+  const before = await received();
+  await expect.poll(received).toBeGreaterThan(before);
+  await expectRail(page, true);
+  expect(await toggles()).toBe(1);
+  expect(await capturedQueryCount(request)).toBe(0);
 });
 
 test('the histogram and execution timing are absent in live and return with a snapshot', async ({ page, request }) => {

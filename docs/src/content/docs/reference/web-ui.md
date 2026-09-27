@@ -66,7 +66,7 @@ page URL. These client limits do not guarantee acceptance by every deployment.
 | **Save as Net** | In the console. Opens a dialog to name and save the editor text as a net |
 | **Copy search URL** | Beside the editor. Copies the current URL to the clipboard |
 | **Format** | Reformats the editor text. A query with parse errors is left alone |
-| **Filters** sidebar | Field values counted over the snapshot page or live buffer. Aggregate results hide the field-value groups; the active-filter count and **Clear all** remain. **Include** and **Exclude** add a filter, **Clear all** removes every filter |
+| **Filters** rail | Field values counted over the snapshot page or live buffer. **Include** and **Exclude** add a filter, and **Clear all** removes every filter. At 900px and wider, the rail opens by itself for a page with field values to count. Otherwise it collapses to a 32px strip at the left of the results, which shows the active-filter count. A press on the strip or the rail's header opens or closes the rail, and that choice holds until you reload the page or sign out. An aggregate result has no field values to count. An open rail with nothing to count says so, and keeps the active-filter count and **Clear all**. Below 900px, the rail is a disclosure above the results that opens only by hand |
 | Filter chips | Above the tabs. Selecting a chip removes that filter |
 | **Events** tab | The result table, with the row count in the tab. An aggregation renders the exact table and, where the shape allows it, the categorical chart beside it |
 | **Visualization** tab | The chart for a `timechart` or `stats … by` result, as Line, Column, or Bar. It has no pager: it draws a whole result or states why it cannot |
@@ -103,7 +103,7 @@ the chart of one page is a different picture from the chart of the result. See
 and
 [ADR-0038](https://github.com/jakub/trawl/blob/main/docs/adr/0038-the-visualization-tab-draws-time-and-groups.md).
 
-**Save as Net** omits the range control and sidebar filters. It saves the
+**Save as Net** omits the range control and the active filters. It saves the
 editor text, not the effective query or returned rows.
 
 **Edited** appears when the editor differs from the executed query. The strip

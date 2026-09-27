@@ -1,0 +1,110 @@
+{
+  "evidence": "Stub fixtures only; no daemon, database, or real ingest",
+  "head": "8fb924ef18a7b66fc25fd04b653c9f4ba808d212",
+  "head_before": "8fb924ef18a7b66fc25fd04b653c9f4ba808d212",
+  "git_status": " M visual-evidence/issue-231/03-aggregate-filters-strip.png",
+  "git_status_before": "",
+  "script_sha256": "c1d830c4d68438734c1b4eae40240e303c7df2db1d7a954fa9ec4d0b599efff8",
+  "captured_at": "2026-09-26T07:24:39.225Z",
+  "port": 8731,
+  "reduced_motion": "reduce",
+  "color_scheme": "light",
+  "dist": {
+    "sha256": "81a09fa036f6fc1afcdde860bcfd07c32300cf0ccff9b896daeb3cf7392c5bf4",
+    "files": [
+      "fleet-ui-a30215ee41c73bb7.css",
+      "fonts/AlbertSans-Variable.ttf",
+      "fonts/ChivoMono-Variable.ttf",
+      "fonts/OFL-AlbertSans.txt",
+      "fonts/OFL-ChivoMono.txt",
+      "fonts/README.md",
+      "fonts/SHA256SUMS",
+      "index.html",
+      "main-7ba41a871e5b6d7b.css",
+      "snippets/fleet-ui-2165a24593f0a7f1/vendor/paper-shaders.js",
+      "snippets/trawl-web-ui-f99d61b89517acef/vendor/codemirror.js",
+      "snippets/trawl-web-ui-f99d61b89517acef/vendor/uplot.js",
+      "theme-bootstrap-e7acc838d5582fa1.js",
+      "trawl-web-ui-faaf1198ca714fde.js",
+      "trawl-web-ui-faaf1198ca714fde_bg.wasm",
+      "uplot-5e0d12c918aed906.css",
+      "vendor/codemirror.js",
+      "vendor/uplot.js"
+    ]
+  },
+  "captures": [
+    {
+      "file": "01-idle-strip.png",
+      "claim": "Idle /search: the rail is a closed 32px strip reading \"Filters\"",
+      "scenario": "corpus",
+      "route": "/search",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "theme": "light",
+      "stored_prefs": null,
+      "rail": {
+        "open": false,
+        "width": 32
+      },
+      "sha256": "bdd11946ac698eab2aa927e44c78e8f3006ec7b079d8e0df3f93f301ed50d9c8",
+      "bytes": 88056
+    },
+    {
+      "file": "02-countable-open.png",
+      "claim": "A countable page (8 rows of service=nginx): the rail open at 224px with its field groups and value search",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "theme": "light",
+      "stored_prefs": null,
+      "rail": {
+        "open": true,
+        "width": 224,
+        "groups": 3
+      },
+      "sha256": "12aa5f9a5f3ef071ee5ca43a74b10f8f9962dae625cbe7ec90f4eafd5c86f11f",
+      "bytes": 108027
+    },
+    {
+      "file": "03-aggregate-filters-strip.png",
+      "claim": "An aggregation (service=nginx | stats count() by service) carrying two link filters: the rail a closed 32px strip reading \"Filters\" and \"2 active\"",
+      "scenario": "corpus",
+      "route": "/search?q=service%3Dnginx%20%7C%20stats%20count()%20by%20service&f=v1.W3sib3AiOiIrIiwiZmllbGQiOiJob3N0IiwidmFsdWUiOiJ3ZWItMDEifSx7Im9wIjoiKyIsImZpZWxkIjoic3RhdHVzIiwidmFsdWUiOiIyMDAifV0",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "theme": "light",
+      "stored_prefs": null,
+      "rail": {
+        "open": false,
+        "width": 32
+      },
+      "sha256": "18779a2ba8977bba9a8eb178e7fcfe9af488bfae73a05a47778998ea52cc2502",
+      "bytes": 60789
+    },
+    {
+      "file": "04-hand-open-empty.png",
+      "claim": "A zero-row page with the rail opened by a press on its summary: \"No field values to count.\" and no value search",
+      "scenario": "default",
+      "route": "/search?q=service%3Dnginx",
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "theme": "light",
+      "stored_prefs": null,
+      "rail": {
+        "open": true,
+        "width": 224
+      },
+      "sha256": "8953d015d0622c41e75bd1b30d045128fdc5ba77ed137e73a34dec46034beea2",
+      "bytes": 58791
+    }
+  ]
+}

@@ -3,6 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 import { test, expect, resetScenario, lastCapturedQuery, capturedQueryCount } from '../fixtures';
+import { expectRail } from '../filter-rail';
 import { SEL } from '../selectors';
 import { selectTheme } from '../theme';
 
@@ -40,6 +41,9 @@ for (const theme of ['light', 'dark']) {
     await page.goto('/search?q=service%3Dnginx');
     await selectTheme(page, theme === 'dark' ? 'Dark' : 'Light');
     await expect(page.locator('.results-table thead th').first()).toBeVisible();
+    // The counts are sampled on an open rail, which a countable page opens
+    // (ADR-0044); a closed rail would leave nothing to measure.
+    await expectRail(page, true);
     await expect(page.locator('.facets .v .c').first()).toBeVisible();
     async function contrast(selector: string) {
       return page.locator(selector).evaluateAll(elements => {

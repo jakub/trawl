@@ -20,6 +20,8 @@ pub mod section;
 pub mod stream_session_value;
 
 #[cfg(target_arch = "wasm32")]
+pub mod filter_rail;
+#[cfg(target_arch = "wasm32")]
 pub mod query;
 #[cfg(target_arch = "wasm32")]
 pub mod search_session;

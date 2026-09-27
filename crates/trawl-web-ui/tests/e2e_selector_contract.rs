@@ -59,6 +59,7 @@ const SORT_LABEL_RS: &str = include_str!("../src/sort_label.rs");
 const SERVICE_DRAWER_RS: &str = include_str!("../src/components/service_drawer.rs");
 const NET_DRAWER_RS: &str = include_str!("../src/components/net_drawer.rs");
 const FACET_SIDEBAR_RS: &str = include_str!("../src/components/facet_sidebar.rs");
+const FACETS_RS: &str = include_str!("../src/facets.rs");
 const STATUS_BAR_RS: &str = include_str!("../src/components/status_bar.rs");
 const HISTOGRAM_RS: &str = include_str!("../src/components/histogram.rs");
 const DRAWER_QUERY_RS: &str = include_str!("../src/drawer_query.rs");
@@ -565,6 +566,18 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/results_table.rs",
         source: RESULTS_TABLE_RS,
         hook: "label=\"results\"",
+    },
+    Contract {
+        assignment: "railHintNothingToCount: 'No field values to count.',",
+        source_path: "src/facets.rs",
+        source: FACETS_RS,
+        hook: "Some(\"No field values to count.\")",
+    },
+    Contract {
+        assignment: "railHintAggregate: 'Field values are not counted for an aggregate result.',",
+        source_path: "src/facets.rs",
+        source: FACETS_RS,
+        hook: "Some(\"Field values are not counted for an aggregate result.\")",
     },
     Contract {
         assignment: "absoluteTab: '.dr-pop >> text=Absolute',",
@@ -1293,6 +1306,54 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"fn row-stretch\"",
     },
     // -- facet rail -----------------------------------------------------
+    Contract {
+        assignment: "filterRail: '.facet-panel',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facet-panel\"",
+    },
+    Contract {
+        assignment: "filterRailSummary: '.facet-panel > summary',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facet-panel\"",
+    },
+    Contract {
+        assignment: "filterRailSummary: '.facet-panel > summary',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "<summary",
+    },
+    Contract {
+        assignment: "filterRailContent: '.facet-panel > .facets',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facet-panel\"",
+    },
+    Contract {
+        assignment: "filterRailContent: '.facet-panel > .facets',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facets\"",
+    },
+    Contract {
+        assignment: "facetCount: '.facet-count',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facet-count\"",
+    },
+    Contract {
+        assignment: "facetHint: '.facets .facets-hint',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "class=\"facets\"",
+    },
+    Contract {
+        assignment: "facetHint: '.facets .facets-hint',",
+        source_path: "src/components/facet_sidebar.rs",
+        source: FACET_SIDEBAR_RS,
+        hook: "<p class=\"facets-hint\">{hint}</p>",
+    },
     Contract {
         assignment: "facetGroup: '.facets .g',",
         source_path: "src/components/facet_sidebar.rs",

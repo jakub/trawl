@@ -22,6 +22,7 @@ use crate::api;
 use crate::components::status_bar::StatusBar;
 use crate::search_status::{FooterCount, StatusKind};
 use crate::state::app_mode;
+use crate::state::filter_rail::FilterRailChoice;
 use crate::state::section;
 use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
 
@@ -91,6 +92,10 @@ pub fn AuthShell() -> impl IntoView {
     };
     provide_context(shell_status);
     provide_context(me);
+    // The wide filter rail's hand choice lives here, above the Search
+    // route, so it survives route changes and drops on sign-out: `/login`
+    // is outside this shell (ADR-0044).
+    provide_context(FilterRailChoice::new());
 
     // The Health page and footer share this report. Only server_manage
     // sessions issue the bootstrap GET or open the stream. The footer
