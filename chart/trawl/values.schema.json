@@ -117,7 +117,8 @@
             "TrawlFileQuarantine",
             "TrawlPublicationRecoveryBlocked",
             "TrawlIngestAdmissionRefusing",
-            "TrawlHotBufferDrainStalled"
+            "TrawlHotBufferDrainStalled",
+            "TrawlCorpusUnsettled"
           ],
           "properties": {
             "TrawlSyslogQueueDiscard": {
@@ -157,6 +158,9 @@
               "$ref": "#/definitions/operationalAlert"
             },
             "TrawlHotBufferDrainStalled": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlCorpusUnsettled": {
               "$ref": "#/definitions/operationalAlert"
             }
           }

@@ -664,5 +664,188 @@
         ]
       ]
     }
+  ],
+  "corpus_unsettled": [
+    {
+      "name": "settled corpus",
+      "series": [
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "rollup_pending"
+          },
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "restart_backlog"
+          },
+          "values": "0+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "0m",
+          false
+        ],
+        [
+          "11m",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
+      ]
+    },
+    {
+      "name": "restart backlog fires after the for delay",
+      "series": [
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "rollup_pending"
+          },
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "restart_backlog"
+          },
+          "values": "1+0x40"
+        }
+      ],
+      "checks": [
+        [
+          "30s",
+          false
+        ],
+        [
+          "9m30s",
+          false
+        ],
+        [
+          "10m",
+          true
+        ],
+        [
+          "20m",
+          true
+        ]
+      ]
+    },
+    {
+      "name": "reason switch without a gap keeps the timer",
+      "series": [
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "rollup_pending"
+          },
+          "values": "1+0x11 0+0x28"
+        },
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "restart_backlog"
+          },
+          "values": "0+0x11 1+0x28"
+        }
+      ],
+      "checks": [
+        [
+          "5m30s",
+          false
+        ],
+        [
+          "6m",
+          false
+        ],
+        [
+          "9m30s",
+          false
+        ],
+        [
+          "10m",
+          true
+        ],
+        [
+          "15m",
+          true
+        ]
+      ]
+    },
+    {
+      "name": "a settled scrape restarts the delay",
+      "series": [
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "rollup_pending"
+          },
+          "values": "1+0x11 0+0x28"
+        },
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "restart_backlog"
+          },
+          "values": "0+0x12 1+0x27"
+        }
+      ],
+      "checks": [
+        [
+          "10m",
+          false
+        ],
+        [
+          "16m",
+          false
+        ],
+        [
+          "16m30s",
+          true
+        ]
+      ]
+    },
+    {
+      "name": "settling resolves the alert",
+      "series": [
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "rollup_pending"
+          },
+          "values": "0+0x40"
+        },
+        {
+          "metric": "trawl_corpus_unsettled",
+          "labels": {
+            "reason": "restart_backlog"
+          },
+          "values": "1+0x30 0+0x9"
+        }
+      ],
+      "checks": [
+        [
+          "12m",
+          true
+        ],
+        [
+          "15m",
+          true
+        ],
+        [
+          "15m30s",
+          false
+        ],
+        [
+          "20m",
+          false
+        ]
+      ]
+    }
   ]
 }
