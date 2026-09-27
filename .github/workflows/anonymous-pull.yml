@@ -22,6 +22,7 @@ on:
     paths:
       - '.github/workflows/anonymous-pull.yml'
       - 'scripts/release/check-anonymous-pulls.sh'
+      - 'scripts/release/release_version.py'
 
 permissions:
   contents: read

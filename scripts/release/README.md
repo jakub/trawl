@@ -118,6 +118,14 @@ release image and chart with empty Docker and Helm registry configs, so no
 stored login applies. `anonymous-pull.yml` runs it after a release push, on
 manual dispatch for any tag, and on pull requests that change it.
 
+`release_version.py TAG` holds the release tag grammar that the resolver and
+the anonymous check share. It prints the version and the image tag that a
+release publishes. The image tag drops SemVer build metadata, because Docker
+metadata renders the tag that way: `v1.1.0-rc.1+build.7` publishes
+`ghcr.io/jakub/trawl:1.1.0-rc.1`. The chart keeps the whole version. Helm
+stores its `+` as `_` in the OCI tag and maps it back when it pulls. The
+trial job tags its local image the same way.
+
 Fast helper tests:
 
 ```sh
@@ -126,6 +134,7 @@ python3 scripts/release/test_cargo_runtime.py
 python3 scripts/release/test_release_source.py
 python3 scripts/release/test_scan_trial_secrets.py
 python3 scripts/release/test_trial_capture.py
+python3 scripts/release/test_release_version.py
 bash -n scripts/release/build-distribution.sh scripts/release/build-arm64.sh scripts/release/test-installed-debian.sh scripts/release/test-host-debian.sh
 ```
 

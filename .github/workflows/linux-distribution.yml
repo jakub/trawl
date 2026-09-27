@@ -383,11 +383,14 @@ jobs:
           tar xzf "$tarball" -C installed --strip-components=1
           version="$(installed/bin/trawl --version | awk '{ print $2 }')"
           test "$version" = "${RELEASE_TAG#v}"
-          # The reference `trawl trial up` resolves when --image is omitted.
+          # The reference `trawl trial up` resolves when --image is omitted:
+          # the version without build metadata, the tag release.yml pushes.
+          refs="$(python3 scripts/release/release_version.py "$RELEASE_TAG")"
+          image="ghcr.io/jakub/trawl:${refs#* }"
           docker build --platform "linux/$ARCH" \
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
-            --tag "ghcr.io/jakub/trawl:$version" .
-          docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "ghcr.io/jakub/trawl:$version"
+            --tag "$image" .
+          docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "$image"
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: '22'

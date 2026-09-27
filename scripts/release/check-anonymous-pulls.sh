@@ -8,20 +8,23 @@
 #   CHART_REPOSITORY  for example oci://ghcr.io/jakub/charts
 #
 # Docker and Helm read their registry credentials from their config files.
-# Both get fresh empty ones here, so no stored login can be offered. The image
-# is pulled as IMAGE_REPOSITORY:VERSION, the tag release.yml pushes, and the
-# chart as CHART_REPOSITORY/trawl at VERSION, where VERSION is TAG without
-# its leading v. Each pull is tried three times, because a registry may take
-# a moment to serve a tag it has just accepted.
+# Both get fresh empty ones here, so no stored login can be offered.
+# release_version.py accepts the tags the release resolver accepts and names
+# what the release publishes for one. The image is pulled as
+# IMAGE_REPOSITORY:IMAGE_TAG, the tag release.yml pushes, which drops any
+# build metadata. The chart is pulled as CHART_REPOSITORY/trawl at VERSION,
+# TAG without its leading v: helm push stores a + in VERSION as _ in the OCI
+# tag, and helm pull maps it back. Each pull is tried three times, because a
+# registry may take a moment to serve a tag it has just accepted.
 set -euo pipefail
 
 [[ $# -eq 3 ]] || { echo "usage: check-anonymous-pulls.sh TAG IMAGE_REPOSITORY CHART_REPOSITORY" >&2; exit 2; }
 tag=$1
 image_repository=$2
 chart_repository=$3
-[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || { echo "not a release tag: $tag" >&2; exit 2; }
+refs=$(python3 "$(dirname "${BASH_SOURCE[0]}")/release_version.py" "$tag") || exit 2
+read -r version image_tag <<<"$refs"
 [[ "$chart_repository" == oci://* ]] || { echo "not an OCI chart repository: $chart_repository" >&2; exit 2; }
-version=${tag#v}
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -43,7 +46,7 @@ retry() {
   return 1
 }
 
-image="$image_repository:$version"
+image="$image_repository:$image_tag"
 echo "== anonymous docker pull $image"
 retry docker pull "$image"
 docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}} {{join .RepoDigests " "}}' "$image"

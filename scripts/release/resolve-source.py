@@ -9,15 +9,7 @@ import re
 import subprocess
 import sys
 
-
-# Cargo and Helm use SemVer. Keep the leading v for existing artifact names.
-NUMBER = r"(?:0|[1-9][0-9]*)"
-PRERELEASE = rf"(?:{NUMBER}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-TAG = re.compile(
-    rf"v{NUMBER}\.{NUMBER}\.{NUMBER}"
-    rf"(?:-{PRERELEASE}(?:\.{PRERELEASE})*)?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-)
+from release_version import references
 
 
 def resolve(event, ref, requested_tag):
@@ -27,8 +19,7 @@ def resolve(event, ref, requested_tag):
         tag = ref.removeprefix("refs/tags/")
     else:
         raise ValueError("release requires a tag push or workflow_dispatch")
-    if TAG.fullmatch(tag) is None:
-        raise ValueError("release tag must be v-prefixed SemVer, for example v1.0.0")
+    references(tag)  # refuses anything but a v-prefixed SemVer tag
 
     subprocess.run(
         ["git", "fetch", "--no-tags", "--depth=1", "origin", f"refs/tags/{tag}"],
