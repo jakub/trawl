@@ -352,7 +352,8 @@ trap cleanup EXIT
 
 step "preconditions"
 version=$(t --version | awk '{ print $2 }')
-DEFAULT_IMAGE="ghcr.io/jakub/trawl:$version"
+# The published tag drops semver build metadata (scripts/release/release_version.py).
+DEFAULT_IMAGE="ghcr.io/jakub/trawl:${version%%+*}"
 note "trawl $version at $TRAWL_BIN"
 note "Docker $(docker version --format '{{.Server.Version}}'), $(docker compose version)"
 [[ -z "$(listing)" ]] || { show_listing; fail "the engine already holds trial resources; run this on a disposable engine"; }
