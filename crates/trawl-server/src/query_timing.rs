@@ -395,6 +395,35 @@ impl TimingGuard {
         Self(timing)
     }
 
+    /// Open the account of one HTTP request's DSL work, correlated by
+    /// the request's id, with its window starting at `origin`.
+    #[must_use]
+    pub fn for_request(
+        query_id: u64,
+        request_id: impl Into<String>,
+        kind: TimingKind,
+        origin: Instant,
+    ) -> Self {
+        Self::new(QueryTiming::new(
+            origin,
+            query_id,
+            Correlation::Request(request_id.into()),
+            kind,
+        ))
+    }
+
+    /// Open the account of one scheduled or manual run, correlated by
+    /// the run record's id, with its window starting at `origin`.
+    #[must_use]
+    pub fn for_run(query_id: u64, run_id: i64, origin: Instant) -> Self {
+        Self::new(QueryTiming::new(
+            origin,
+            query_id,
+            Correlation::Run(run_id),
+            TimingKind::Scheduled,
+        ))
+    }
+
     #[must_use]
     pub fn timing(&self) -> &QueryTiming {
         &self.0
