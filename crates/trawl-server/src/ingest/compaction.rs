@@ -1070,13 +1070,24 @@ fn relocate_pending_rollups(
 /// failure does not stop the boot: it logs one `rollup_boot_recovery`
 /// ERROR, naming no path, and leaves the marker pending, so reads refuse
 /// `rollup_pending` until a compaction pass recovers it. A marker scan that
-/// failed at boot stays latched until a compaction pass rescans.
+/// failed at boot stays latched until a compaction pass rescans, and is
+/// logged the same way: recovery of the markers the scan did find is no
+/// finished recovery.
 pub(crate) fn recover_rollups_at_boot(publication: &PublicationGate) {
     let markers = publication.pending_rollup_markers();
     let _publication_guard = publication.blocking_write();
     // The error names hourly paths, so it is not logged; the failure
     // counter has recorded it.
-    if relocate_pending_rollups(publication, &markers).is_ok() {
+    let recovered = relocate_pending_rollups(publication, &markers).is_ok();
+    if publication.marker_scan_failed() {
+        tracing::error!(
+            event_type = "rollup_boot_recovery",
+            markers = markers.len(),
+            pending = publication.pending_rollup_markers().len(),
+            "boot rollup marker scan failed; corpus reads are refused as \
+             rollup_pending until a compaction pass completes a rescan"
+        );
+    } else if recovered {
         tracing::info!(
             event_type = "rollup_boot_recovery",
             markers = markers.len(),
@@ -7115,6 +7126,39 @@ mod tests {
             gate.unsettled(),
             Some(crate::publication::CorpusUnsettled::RestartBacklog),
             "only hydration settles the restart"
+        );
+    }
+
+    /// A boot whose rollup marker scan failed logs that at ERROR, naming no
+    /// path, and never as a finished recovery: reads refuse
+    /// `rollup_pending` until a compaction pass completes a rescan.
+    #[test]
+    fn rollup_boot_recovery_logs_a_failed_marker_scan_at_error() {
+        let logs = captured_logs();
+        let tmp = tempfile::tempdir().unwrap();
+        // The data root cannot be listed, so the gate's boot scan fails.
+        let data = tmp.path().join("data");
+        std::fs::write(&data, "").unwrap();
+        let gate = PublicationGate::starting();
+        gate.initialize(&data);
+
+        recover_rollups_at_boot(&gate);
+
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+        let log = logged(&logs);
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("event_type=\"rollup_boot_recovery\""))
+            .collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains("ERROR"), "{log}");
+        assert!(lines[0].contains("marker scan failed"), "{log}");
+        assert!(
+            !log.contains(&*tmp.path().to_string_lossy()),
+            "no path is logged: {log}"
         );
     }
 

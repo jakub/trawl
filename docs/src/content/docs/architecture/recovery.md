@@ -66,7 +66,7 @@ Rollup writes a durable marker listing its complete input set before replacing h
 
 An ingest boot recovers rollup markers before boot conformance, so a marker that recovery can finish never reaches a client. Recovery renames or retires files and reads Parquet footers. It never merges again. `rollup_boot_recovery` logs the marker count at INFO. A failure does not stop the boot. `rollup_boot_recovery` then logs at ERROR with the count still pending, reads stay refused as `rollup_pending`, and each compaction pass retries. Boot conformance leaves a day directory alone while a rollup marker in it is unresolved, and logs `catalog_conform_skip` with `phase="rollup"` for each file it skips. If conformance cannot read the rollup markers at all, it skips every file and logs `catalog_conform_rollups_unreadable`.
 
-If the gate's scan for rollup markers fails, the gate cannot know which markers exist, so reads refuse as `rollup_pending`. Only a later complete scan clears that. On an ingest node, each compaction pass scans again, and `publication_scan_recovered` logs the scan that clears it. A query-only node has no compaction, so its failed scan stays until you restart it.
+If the gate's scan for rollup markers fails, the gate cannot know which markers exist, so reads refuse as `rollup_pending`. An ingest boot then logs `rollup_boot_recovery` at ERROR to say that the marker scan failed, not the INFO line of a finished recovery. Only a later complete scan clears that. On an ingest node, each compaction pass scans again, and `publication_scan_recovered` logs the scan that clears it. A query-only node has no compaction, so its failed scan stays until you restart it.
 
 ## Publication markers
 

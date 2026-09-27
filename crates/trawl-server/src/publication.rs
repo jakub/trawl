@@ -198,6 +198,12 @@ impl PublicationGate {
         }
     }
 
+    /// Whether the marker scan failed and no complete rescan has cleared
+    /// it, so a marker the gate does not know may exist.
+    pub(crate) fn marker_scan_failed(&self) -> bool {
+        self.corpus.lock().scan_failed
+    }
+
     /// Retry a failed marker scan. Only a complete scan clears the failure,
     /// and its markers join those writers registered. A failed retry
     /// changes nothing and records nothing: the failure was counted when
