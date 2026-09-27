@@ -947,8 +947,6 @@ pub struct PoolDebugInfo {
     pub sql: String,
     /// SQL parameter values (Display form).
     pub params: Vec<String>,
-    /// Time spent waiting for pool permit (ms).
-    pub pool_wait_ms: u64,
 }
 
 /// Exclusive hold over the whole executor pool (see
@@ -1102,7 +1100,6 @@ fn run_query_blocking(
     cap: RowCap,
     utc_offset_secs: i32,
     capture_debug: bool,
-    pool_wait_ms: u64,
 ) -> (Result<QueryResult, ServerError>, Option<PoolDebugInfo>) {
     // Snapshot hot buffer to a temp ndjson file so fresh events
     // are visible to this query via UNION ALL BY NAME. Returns a
@@ -1128,7 +1125,7 @@ fn run_query_blocking(
     // re-parse and re-emit are the preview's own emission, booked as such.
     let debug = if capture_debug {
         Some(clock.time(QueryPhase::Emit, || {
-            capture_pool_debug(dsl, source, hot_buffer, pins, pool_wait_ms)
+            capture_pool_debug(dsl, source, hot_buffer, pins)
         }))
     } else {
         None
@@ -1180,7 +1177,6 @@ fn capture_pool_debug(
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
     pins: &trawl_core::schema::FieldTypes,
-    pool_wait_ms: u64,
 ) -> PoolDebugInfo {
     let glob_count = if source.starts_with('[') {
         source.matches(',').count() + 1
@@ -1256,7 +1252,6 @@ fn capture_pool_debug(
         hot_bytes,
         sql,
         params,
-        pool_wait_ms,
     }
 }
 
@@ -1584,7 +1579,6 @@ impl ExecutorPool {
         // query could sit here for minutes and still be handed a whole
         // fresh timeout to run in. The phase guard books the wait however
         // it ends, the deadline and a dropped caller included.
-        let wait_start = std::time::Instant::now();
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
@@ -1606,9 +1600,6 @@ impl ExecutorPool {
                 return refused;
             }
         };
-
-        #[allow(clippy::cast_possible_truncation)]
-        let pool_wait_ms = wait_start.elapsed().as_millis() as u64;
 
         let published = {
             let _wait = clock.guard(QueryPhase::PublicationWait);
@@ -1718,7 +1709,6 @@ impl ExecutorPool {
                         cap,
                         utc_offset_secs,
                         capture_debug,
-                        pool_wait_ms,
                     );
                     // Inside the permit, on the blocking pool: the walk compiles a
                     // regex per `extract` stage, so it may not run on a reactor
@@ -1831,7 +1821,6 @@ impl ExecutorPool {
         // Same budget rule as the ordinary lane. This one takes no
         // publication guard (ADR-0024 keeps per-lane gate membership as
         // it is), so the queue and execution are the whole of its wait.
-        let wait_start = std::time::Instant::now();
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
@@ -1853,9 +1842,6 @@ impl ExecutorPool {
                 return refused;
             }
         };
-
-        #[allow(clippy::cast_possible_truncation)]
-        let pool_wait_ms = wait_start.elapsed().as_millis() as u64;
 
         let mut slot = match self.begin_slot(query_id, &work, Some(dsl), permit, None) {
             Ok(slot) => slot,
@@ -1921,7 +1907,6 @@ impl ExecutorPool {
                         cap,
                         utc_offset_secs,
                         capture_debug,
-                        pool_wait_ms,
                     );
                     // `dsl` here is what follows `| from saved`, whose `PinScope`
                     // rule clears the scope, so the presentation walk roots in an

@@ -212,6 +212,8 @@ struct Account {
     kind: TimingKind,
     /// Latched by whoever writes the final `query_timing`.
     emitted: bool,
+    /// The totals that `query_timing` carried, once written.
+    written: Option<PhaseTotals>,
     /// The pool has taken over writing the account, so a dropped
     /// handler guard leaves it alone.
     pool_owns_emit: bool,
@@ -244,6 +246,7 @@ impl QueryTiming {
             account: Mutex::new(Account {
                 kind,
                 emitted: false,
+                written: None,
                 pool_owns_emit: false,
                 work_started: false,
             }),
@@ -319,6 +322,19 @@ impl QueryTiming {
         self.account().emitted
     }
 
+    /// The phase totals the final `query_timing` carried — partial ones
+    /// for a partial account — once it has been written: what the query
+    /// debug log reports, so the two never disagree.
+    #[must_use]
+    pub fn written(&self) -> Option<PhaseTotals> {
+        self.account().written.clone()
+    }
+
+    /// Keep what the event just carried, for [`Self::written`].
+    fn keep_written(&self, totals: PhaseTotals) {
+        self.account().written = Some(totals);
+    }
+
     /// Take the write latch. `Some` carries what the event needs from
     /// the account; `None` means someone else already wrote it.
     fn claim(&self) -> Option<(TimingKind, bool)> {
@@ -347,6 +363,7 @@ impl QueryTiming {
             observed_us: micros(end.saturating_duration_since(self.origin())),
             totals: &totals,
         });
+        self.keep_written(totals);
         true
     }
 
@@ -375,6 +392,7 @@ impl QueryTiming {
             observed_us: micros(now.saturating_duration_since(self.origin())),
             totals: &totals,
         });
+        self.keep_written(totals);
         true
     }
 }
