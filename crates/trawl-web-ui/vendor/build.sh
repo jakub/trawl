@@ -31,8 +31,11 @@ npx esbuild src/codemirror.ts \
   --log-level=warning
 
 echo "[vendor] bundling uplot.js"
+# The inject gives uPlot a navigator whose language Intl accepts; see
+# src/uplot-navigator.ts.
 npx esbuild src/uplot.ts \
   --bundle \
+  --inject:src/uplot-navigator.ts \
   --format=esm \
   --minify \
   --target=es2022 \
