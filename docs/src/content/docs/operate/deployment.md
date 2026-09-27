@@ -58,15 +58,34 @@ APT repository from [Installation](/getting-started/).
    enabled and restarts the ones that are running.
 
    The package now pins trawld's generated certificate with
-   `[web] upstream_ca_path` in `trawld.toml`. If you set
-   `TRAWL_WEB_INSECURE_UPSTREAM=1` in `/etc/default/trawl-web` for an earlier
-   package, remove that line before or after you upgrade. An upgrade keeps
-   your edited `/etc/default/trawl-web`, and `trawl-web` refuses to start when
-   both settings are present. systemd then restarts it every 5 seconds, and
-   `systemctl status trawl-web` shows `activating (auto-restart)` with a log
-   line that names `TRAWL_WEB_INSECURE_UPSTREAM` and `upstream_ca_path`. After
-   you remove the line, run `sudo systemctl restart trawl-web` and check that
-   `systemctl status trawl-web` shows `active (running)`.
+   `[web] upstream_ca_path` in `trawld.toml`. An upgrade from an earlier
+   package can leave `trawl-web` without a working upstream.
+   `/etc/trawl/trawld.toml` and `/etc/default/trawl-web` are conffiles. When
+   you edited one, dpkg asks whether to keep your copy. Keeping it is the
+   default answer, and `--force-confold` keeps it without asking. A kept
+   `trawld.toml` does not get the new setting. Without it, and without
+   `TRAWL_WEB_INSECURE_UPSTREAM=1`, `trawl-web` checks trawld's self-signed
+   certificate against the system roots, the check fails, and every sign-in
+   returns 502. After the upgrade:
+
+   1. If the `[web]` section of `/etc/trawl/trawld.toml` has no
+      `upstream_ca_path` line, add this line under `[web]`:
+
+      ```toml
+      upstream_ca_path = "/var/lib/trawl/tls/cert.pem"
+      ```
+
+      trawld writes that certificate when `[server] tls_cert_path` is not
+      set. If you set your own `tls_cert_path`, use the file of the CA that
+      issued it.
+   2. If `/etc/default/trawl-web` sets `TRAWL_WEB_INSECURE_UPSTREAM=1`,
+      remove that line. `trawl-web` refuses to start when both settings are
+      present. systemd then restarts it every 5 seconds, and
+      `systemctl status trawl-web` shows `activating (auto-restart)` with a
+      log line that names `TRAWL_WEB_INSECURE_UPSTREAM` and
+      `upstream_ca_path`.
+   3. Run `sudo systemctl restart trawl-web`. Check that
+      `systemctl status trawl-web` shows `active (running)`, then sign in.
 
 2. Put the two DSNs in `/etc/default/trawld`. They take precedence over
    `[auth] database_url` and `[storage] database_url` in the TOML file, and
