@@ -1205,7 +1205,7 @@ async fn seed(
                 })?
                 .with_timezone(&chrono::Utc);
             progress("the earlier sample post landed; recording it");
-            state.samples = complete(*seed, &sample::generate(*seed, anchor));
+            state.samples = sample::complete(*seed, &sample::generate(*seed, anchor));
             state.save(&paths.state_file())
         }
         SampleAction::Decline => {
@@ -1250,7 +1250,7 @@ async fn post_samples(
         .collect();
     state.samples = Samples::Intent {
         seed: sample::SAMPLE_SEED,
-        anchor: rfc3339(set.last),
+        anchor: sample::rfc3339(set.last),
         expected: expected.clone(),
     };
     state.save(&paths.state_file())?;
@@ -1277,7 +1277,7 @@ async fn post_samples(
             .map(|service| (service.clone(), counts.get(service).copied().unwrap_or(0)))
             .collect();
         if counts == expected {
-            state.samples = complete(sample::SAMPLE_SEED, &set);
+            state.samples = sample::complete(sample::SAMPLE_SEED, &set);
             return state.save(&paths.state_file());
         }
         if Instant::now() >= deadline {
@@ -1290,19 +1290,6 @@ async fn post_samples(
         counts: describe_counts(&observed, Some(&expected)),
         detail: detail.map(|d| format!(" ({d})")).unwrap_or_default(),
     })
-}
-
-fn rfc3339(time: chrono::DateTime<chrono::Utc>) -> String {
-    time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-fn complete(seed: u64, set: &sample::SampleSet) -> Samples {
-    Samples::Complete {
-        seed,
-        first: rfc3339(set.first),
-        last: rfc3339(set.last),
-        total: set.events.len() as u64,
-    }
 }
 
 /// `web 350/700, api 0/500`, or `web 3, api 0` without expectations.

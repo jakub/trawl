@@ -314,12 +314,16 @@ pub(crate) mod tests {
                 }),
                 ingest: None,
             },
-            samples: Samples::Complete {
-                seed: 203,
-                first: "2026-09-24T12:00:00Z".into(),
-                last: "2026-09-25T12:00:00Z".into(),
-                total: 2000,
-            },
+            // Formatted as `up` records a verified sample set.
+            samples: crate::trial::sample::complete(
+                203,
+                &crate::trial::sample::generate(
+                    203,
+                    chrono::DateTime::parse_from_rfc3339("2026-09-25T12:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                ),
+            ),
         }
     }
 

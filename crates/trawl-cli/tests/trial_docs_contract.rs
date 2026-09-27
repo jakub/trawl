@@ -206,6 +206,13 @@ fn the_tutorials_say_when_the_widest_preset_stops_covering_the_samples() {
 /// `status` prints `created <ts>` above the `Samples` section, and most
 /// samples are older than `created`. The tutorials name the timestamp after
 /// `from` on the `Samples` line and show that line as `status` prints it.
+///
+/// The status snapshot's fixture records its samples through
+/// `sample::complete` over a generated set, the call `up` makes, so the
+/// line below has the shape a real trial prints: RFC 3339 in UTC with
+/// milliseconds. The browser's **From** field accepts that shape
+/// (`normalize_instant` in `trawl-web-ui/src/search_url.rs`, tested there
+/// with a fractional second).
 #[test]
 fn the_tutorials_point_at_the_first_sample_timestamp() {
     let mut lines = STATUS_SNAPSHOT.lines();
@@ -215,9 +222,15 @@ fn the_tutorials_point_at_the_first_sample_timestamp() {
         .expect("the status snapshot has a Samples section");
     let samples = lines.next().expect("a line under Samples");
     let words: Vec<&str> = samples.split_whitespace().collect();
-    let [_count, "events", "from", first, "to", _last] = words[..] else {
+    let [_count, "events", "from", first, "to", last] = words[..] else {
         panic!("the status Samples line changed shape: {samples:?}");
     };
+    for time in [first, last] {
+        assert!(
+            is_rfc3339_millis(time),
+            "the status snapshot prints {time:?}, not a UTC time with milliseconds"
+        );
+    }
     let created = STATUS_SNAPSHOT
         .lines()
         .find_map(|line| line.trim().strip_prefix("created"))
@@ -248,7 +261,21 @@ fn the_tutorials_point_at_the_first_sample_timestamp() {
             flat.contains(&format!("`{first}`")),
             "{page} does not name the example value {first}"
         );
+        assert!(
+            flat.contains("**From** accepts the timestamp with its milliseconds"),
+            "{page} does not say that **From** accepts the milliseconds"
+        );
     }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+fn is_rfc3339_millis(time: &str) -> bool {
+    let shape = "dddd-dd-ddTdd:dd:dd.dddZ";
+    time.len() == shape.len()
+        && time.chars().zip(shape.chars()).all(|(c, s)| match s {
+            'd' => c.is_ascii_digit(),
+            _ => c == s,
+        })
 }
 
 #[test]

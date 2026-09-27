@@ -62,7 +62,7 @@ The key files are readable by your user only:
   operator  ~/.local/state/trawl/trial/operator.token
   ingest    ~/.local/state/trawl/trial/ingest.token
 
-Sample data: 2000 events from 2026-09-24T12:00:00Z to 2026-09-25T12:00:00Z.
+Sample data: 2000 events from 2026-09-24T12:01:36.453Z to 2026-09-25T12:00:00.000Z.
 
 Run the documented query:
 
@@ -115,14 +115,16 @@ result on this page holds while the samples are retained (90 days by default).
    **Absolute**. In the `Samples` section that `trawl trial status` prints,
    copy the timestamp after `from` into **From**, not the `created` timestamp
    above it: most samples are older than `created`. The section looks like
-   this, and here the value is `2026-09-24T12:00:00Z`:
+   this, and here the value is `2026-09-24T12:01:36.453Z`:
 
    ```text
    Samples
-     2000 events from 2026-09-24T12:00:00Z to 2026-09-25T12:00:00Z
+     2000 events from 2026-09-24T12:01:36.453Z to 2026-09-25T12:00:00.000Z
    ```
 
-   Leave **To** at `now`, and select **Apply**.
+   **From** accepts the timestamp with its milliseconds and drops them, which
+   moves the start a fraction of a second earlier. Leave **To** at `now`, and
+   select **Apply**.
 4. Enter `service=checkout _severity>=error | stats count() as errors by service`
    and select **Haul**. Expect one row with service `checkout` and errors
    `20`. A range that misses some samples gives a smaller count.

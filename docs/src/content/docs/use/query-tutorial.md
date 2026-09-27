@@ -16,14 +16,16 @@ time, so it covers the events for about seven days. After that, open
 **Date range** and select **Absolute**. In the `Samples` section that
 `trawl trial status` prints, copy the timestamp after `from` into **From**,
 not the `created` timestamp above it. The section looks like this, and here
-the value is `2026-09-24T12:00:00Z`:
+the value is `2026-09-24T12:01:36.453Z`:
 
 ```text
 Samples
-  2000 events from 2026-09-24T12:00:00Z to 2026-09-25T12:00:00Z
+  2000 events from 2026-09-24T12:01:36.453Z to 2026-09-25T12:00:00.000Z
 ```
 
-Leave **To** at `now`, and select **Apply**. With your own logs, replace the
+**From** accepts the timestamp with its milliseconds and drops them, which
+moves the start a fraction of a second earlier. Leave **To** at `now`, and
+select **Apply**. With your own logs, replace the
 service and look at a few rows first.
 
 ## Find your events

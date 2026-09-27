@@ -373,8 +373,25 @@ fn event(
         "level": level,
         "message": message,
         "duration": duration,
-        "timestamp": time.to_rfc3339_opts(SecondsFormat::Millis, true),
+        "timestamp": rfc3339(time),
     })
+}
+
+/// A sample time as the events carry it, `state.json` records it, and
+/// `trawl trial status` prints it: RFC 3339 in UTC with milliseconds, as
+/// `2026-09-24T12:00:00.000Z`.
+pub fn rfc3339(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// The verified state of `set`, generated from `seed`.
+pub fn complete(seed: u64, set: &SampleSet) -> Samples {
+    Samples::Complete {
+        seed,
+        first: rfc3339(set.first),
+        last: rfc3339(set.last),
+        total: set.events.len() as u64,
+    }
 }
 
 fn ms(delta: TimeDelta) -> u64 {
