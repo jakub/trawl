@@ -366,6 +366,15 @@ pub fn spawn_compaction(
                     }
                 }
             };
+            #[cfg(any(test, feature = "test-support"))]
+            if kind == PassKind::Boot && !hold_boot_pass_for_test(&mut shutdown_rx).await {
+                tracing::info!(
+                    event_type = "lifecycle",
+                    action = "compaction_stop",
+                    "compaction task shutting down"
+                );
+                break;
+            }
 
             // Generations up to here are answered by this pass; one that
             // advances during it wakes the loop again.
@@ -446,6 +455,38 @@ pub fn spawn_compaction(
             );
         }
     })
+}
+
+/// Hold the boot pass until a test harness releases it. Only builds with
+/// `test-support` (and unit tests) carry the hold; release builds never
+/// reach it.
+///
+/// `TRAWL_TEST_HOLD_BOOT_PASS` names a release file. When it is set, the
+/// boot pass logs `event_type = "test_hold_point"` before it reads the WAL
+/// or the corpus, then waits until that file exists. A real-process test
+/// uses the hold to read the corpus after a restart while no pass can have
+/// published anything yet (ADR-0041 slice 2). Returns `false` when shutdown
+/// arrives first, so a held daemon still stops.
+#[cfg(any(test, feature = "test-support"))]
+async fn hold_boot_pass_for_test(shutdown_rx: &mut watch::Receiver<bool>) -> bool {
+    let Some(release) = std::env::var_os("TRAWL_TEST_HOLD_BOOT_PASS").map(PathBuf::from) else {
+        return true;
+    };
+    tracing::warn!(
+        event_type = "test_hold_point",
+        point = "compaction:boot_pass",
+        "holding the boot pass until its release file exists"
+    );
+    let released = async {
+        while !tokio::fs::try_exists(&release).await.unwrap_or(false) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => false,
+        () = released => true,
+    }
 }
 
 /// Run one compaction cycle.

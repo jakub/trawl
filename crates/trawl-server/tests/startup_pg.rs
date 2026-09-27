@@ -35,6 +35,10 @@ struct Fixture {
     ingest: bool,
 }
 
+/// The file whose existence releases a boot pass held by
+/// `TRAWL_TEST_HOLD_BOOT_PASS`.
+const BOOT_PASS_RELEASE: &str = "boot-pass.release";
+
 impl Fixture {
     async fn new() -> Self {
         std::env::var("DATABASE_URL").expect("select an owned PostgreSQL cluster explicitly");
@@ -160,6 +164,22 @@ impl Fixture {
     }
 
     fn spawn(&self) -> Daemon {
+        self.spawn_with(false)
+    }
+
+    /// Spawn with the first compaction pass held before it reads the WAL,
+    /// until [`release_boot_pass`](Self::release_boot_pass): the corpus the
+    /// first query sees is what boot recovery and hydration left, and no
+    /// pass has published anything (ADR-0041 slice 2).
+    fn spawn_holding_boot_pass(&self) -> Daemon {
+        self.spawn_with(true)
+    }
+
+    fn release_boot_pass(&self) {
+        std::fs::write(self.root.path().join(BOOT_PASS_RELEASE), b"").unwrap();
+    }
+
+    fn spawn_with(&self, hold_boot_pass: bool) -> Daemon {
         let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
         let (cert, key) = common::ensure_test_cert();
         let config = format!(
@@ -207,6 +227,15 @@ impl Fixture {
         }
         if let Some(point) = self.crash_at {
             command.env("TRAWL_TEST_CRASH_AT", point);
+        }
+        if hold_boot_pass {
+            let release = self.root.path().join(BOOT_PASS_RELEASE);
+            match std::fs::remove_file(&release) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => panic!("clear {}: {e}", release.display()),
+            }
+            command.env("TRAWL_TEST_HOLD_BOOT_PASS", release);
         }
         let child = command
             .args(["--no-monitor", "--config"])
@@ -285,6 +314,12 @@ impl Daemon {
     }
 
     async fn ready(&mut self) -> String {
+        self.serving("ok").await
+    }
+
+    /// Wait until the daemon listens and `/api/v1/health` answers with
+    /// `status`; returns its base URL.
+    async fn serving(&mut self, status: &str) -> String {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let deadline = Instant::now() + Duration::from_secs(30);
         let client = common::harness_client_builder()
@@ -312,12 +347,42 @@ impl Daemon {
                 let url = format!("https://{addr}");
                 if let Ok(response) = client.get(format!("{url}/api/v1/health")).send().await {
                     let body: serde_json::Value = response.json().await.unwrap();
-                    if body["status"] == "ok" {
+                    if body["status"] == status {
                         return url;
                     }
                 }
             }
             assert!(Instant::now() < deadline, "readiness timed out: {log}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Wait until the first compaction pass logs that it is held (see
+    /// [`Fixture::spawn_holding_boot_pass`]). A daemon built without the
+    /// hold never logs it, so the test fails instead of racing the pass.
+    async fn held_at_boot_pass(&mut self) {
+        self.wait_for_log("the boot pass never held", |line| {
+            line.contains("event_type=\"test_hold_point\"")
+                && line.contains("point=\"compaction:boot_pass\"")
+        })
+        .await;
+    }
+
+    /// Wait up to 30 s for a log line matching `matches`, while the daemon
+    /// runs; returns the log.
+    async fn wait_for_log(&mut self, failure: &str, matches: impl Fn(&str) -> bool) -> String {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "daemon exited: {}",
+                self.log()
+            );
+            let log = self.log();
+            if log.lines().any(&matches) {
+                return log;
+            }
+            assert!(Instant::now() < deadline, "{failure}: {log}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -979,6 +1044,18 @@ const CRASH_SERVICE: &str = "crashsvc";
 /// `ingest::publication_marker`.
 const CRASH_EVENTS: usize = 100;
 
+/// What boot publication recovery did with a crashed publish, and so where
+/// the first query after the restart finds the acknowledged rows.
+#[derive(Debug, Clone, Copy)]
+enum Recovered {
+    /// Recovery finished the publish: every row is in parquet, and the
+    /// consumed WAL is retired.
+    Published,
+    /// Recovery rolled the publish back and kept the WAL, which the boot
+    /// hydrated: parquet holds none of the rows.
+    RolledBack,
+}
+
 /// A daemon killed mid-publish, with what it had acknowledged.
 struct CrashedPublish {
     fixture: Fixture,
@@ -1038,29 +1115,56 @@ impl CrashedPublish {
         }
     }
 
-    /// Restart without a crash point and assert every acknowledged event is
-    /// counted exactly once: `after_restart`, by the first query at
-    /// readiness, whether the rows are in the published output or in the
-    /// hot buffer the boot hydrated from the kept WAL (ADR-0041 slice 2);
-    /// and always over the parquet files and the query API after two
-    /// further completed compaction ticks. Boot recovery and the first
-    /// compaction pass, which runs at boot, leave no marker. Ends with no
-    /// marker, no tmp and no WAL.
-    async fn restart_exactly_once(&self, after_restart: bool) {
-        let mut daemon = self.fixture.spawn();
+    /// Restart without a crash point, with the boot pass held, and assert
+    /// the first query at readiness counts every acknowledged event exactly
+    /// once from where boot recovery left it ([`Recovered`]). No pass can
+    /// have published anything yet, so when recovery rolled the publish
+    /// back, parquet holds none of the rows and the query counts them from
+    /// the hot buffer the boot hydrated from the kept WAL (ADR-0041 slice
+    /// 2). Then release the boot pass, which publishes that WAL under a
+    /// marker of its own, and assert the count again over the parquet files
+    /// and the query API after two further completed compaction ticks. Ends
+    /// with no marker, no tmp and no WAL.
+    async fn restart_exactly_once(&self, recovered: Recovered) {
+        let mut daemon = self.fixture.spawn_holding_boot_pass();
         let client = client(&daemon.ready().await, &self.token);
-        if after_restart {
-            assert_eq!(
-                api_count(&client, &self.tag).await,
-                self.acknowledged,
-                "the first query after the restart"
-            );
-        }
-        // The boot pass (ADR-0041 slice 2) may be publishing kept WAL under
-        // a marker of its own at the crashed marker's path.
+        daemon.held_at_boot_pass().await;
+        let (in_parquet, kept_wal, hydrated) = match recovered {
+            Recovered::Published => (self.acknowledged, Vec::new(), "0"),
+            Recovered::RolledBack => (0, vec![self.wal_file.clone()], "1"),
+        };
+        assert_eq!(
+            parquet_count(&self.fixture.data(), &self.tag),
+            in_parquet,
+            "parquet at readiness, before any pass"
+        );
+        assert_eq!(wal_files(&self.fixture), kept_wal, "WAL at readiness");
+        assert!(
+            !marker_path(&self.fixture).exists(),
+            "boot recovery resolved the marker"
+        );
+        let log = daemon.log();
+        let hydration = boot_hydration(&log);
+        assert_eq!(
+            (
+                log_field(hydration, "hydrated"),
+                log_field(hydration, "overhang")
+            ),
+            (hydrated, "false"),
+            "{hydration}"
+        );
+        assert_api_exactly_once(
+            &client,
+            &self.tag,
+            self.acknowledged,
+            "the first query after the restart",
+        )
+        .await;
+
+        self.fixture.release_boot_pass();
         wait_for_drain(
             &self.fixture,
-            "boot recovery and the boot pass left a marker or WAL",
+            "the boot pass left a marker or WAL after its release",
         )
         .await;
         let probes = complete_ticks(&self.fixture, &client, &self.time, 2).await;
@@ -1084,11 +1188,13 @@ impl CrashedPublish {
             self.acknowledged,
             "parquet count {when}"
         );
-        assert_eq!(
-            api_count(client, &self.tag).await,
+        assert_api_exactly_once(
+            client,
+            &self.tag,
             self.acknowledged,
-            "query API count {when}"
-        );
+            &format!("query API {when}"),
+        )
+        .await;
     }
 
     /// The kill after the rename: the canonical output carries the marker's
@@ -1207,7 +1313,8 @@ fn wal_files(fixture: &Fixture) -> Vec<PathBuf> {
     files
 }
 
-/// Exact count of events tagged `tag` over every published parquet file.
+/// Exact count of events tagged `tag` over every published parquet file;
+/// 0 when nothing was ever published.
 fn parquet_count(data: &Path, tag: &str) -> i64 {
     fn walk(path: &Path, files: &mut Vec<String>) {
         for entry in std::fs::read_dir(path).unwrap() {
@@ -1220,7 +1327,10 @@ fn parquet_count(data: &Path, tag: &str) -> i64 {
         }
     }
     let mut files = Vec::new();
-    walk(&data.join("prod"), &mut files);
+    let env = data.join("prod");
+    if env.exists() {
+        walk(&env, &mut files);
+    }
     if files.is_empty() {
         return 0;
     }
@@ -1245,6 +1355,56 @@ async fn api_count(client: &trawl_client::HttpClient, tag: &str) -> i64 {
         trawl_api::value::Value::Integer(n) => *n,
         other => panic!("{dsl}: count must be an integer, got {other:?}"),
     }
+}
+
+/// Assert the query API counts every event tagged `tag` exactly once:
+/// `expected` rows, and as many distinct `seq` values, so no event is
+/// missing while another is doubled.
+async fn assert_api_exactly_once(
+    client: &trawl_client::HttpClient,
+    tag: &str,
+    expected: i64,
+    when: &str,
+) {
+    let dsl = format!("crash_tag=\"{tag}\" last=24h | stats count(), dc(seq)");
+    let result = client.query_paginated(&dsl, None, None).await.unwrap();
+    assert!(result.result.row_count() <= 1, "{dsl}");
+    // A corpus with no source at all answers no row, not a row of zeros.
+    let counts: Vec<i64> = result.result.rows.first().map_or_else(
+        || vec![0, 0],
+        |row| {
+            row.iter()
+                .map(|value| match value {
+                    trawl_api::value::Value::Integer(n) => *n,
+                    other => panic!("{dsl}: counts must be integers, got {other:?}"),
+                })
+                .collect()
+        },
+    );
+    assert_eq!(
+        counts,
+        vec![expected, expected],
+        "{when}: [events, distinct seq] tagged {tag}"
+    );
+}
+
+/// The value of the field `name` on a formatted log line.
+fn log_field<'a>(line: &'a str, name: &str) -> &'a str {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix(name)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("no {name} field: {line}"))
+}
+
+/// The one `boot_hydration` line in a daemon's log.
+fn boot_hydration(log: &str) -> &str {
+    let mut lines = log
+        .lines()
+        .filter(|line| line.contains("event_type=\"boot_hydration\""));
+    let line = lines
+        .next()
+        .unwrap_or_else(|| panic!("no boot_hydration line: {log}"));
+    assert!(lines.next().is_none(), "one boot_hydration line: {log}");
+    line
 }
 
 /// Wait for `ticks` further compaction ticks to complete; returns the number
@@ -1295,7 +1455,7 @@ async fn compaction_crash_after_publish_before_retire_is_exactly_once() {
     let crashed = CrashedPublish::at("publish:after_rename").await;
     assert!(marker_path(&crashed.fixture).exists());
     crashed.assert_published_unretired();
-    crashed.restart_exactly_once(true).await;
+    crashed.restart_exactly_once(Recovered::Published).await;
 }
 
 /// AC3 (#252): a kill after the marker and before the rename leaves the
@@ -1307,7 +1467,7 @@ async fn restart_compaction_crash_after_marker_before_rename_is_exactly_once() {
     let crashed = CrashedPublish::at("publish:after_marker").await;
     assert!(marker_path(&crashed.fixture).exists());
     crashed.assert_staged_unpublished();
-    crashed.restart_exactly_once(true).await;
+    crashed.restart_exactly_once(Recovered::RolledBack).await;
 }
 
 /// AC2 (#252), real-process complement of the in-process `ac2_*` matrix: a
@@ -1325,7 +1485,7 @@ async fn publication_recovery_crash_in_published_branch_reruns_exactly_once() {
     assert!(marker_path(&crashed.fixture).exists(), "the marker stays");
     assert!(!crashed.wal_file.exists(), "the consumed WAL was retired");
     assert_eq!(wal_files(&crashed.fixture), Vec::<PathBuf>::new());
-    crashed.restart_exactly_once(true).await;
+    crashed.restart_exactly_once(Recovered::Published).await;
 }
 
 /// AC2 (#252), real-process complement: a kill during boot recovery of an
@@ -1350,17 +1510,20 @@ async fn restart_publication_recovery_crash_in_unpublished_branch_reruns_exactly
     );
     assert!(!crashed.marker.canonical(&data).exists());
     crashed.assert_wal_kept();
-    crashed.restart_exactly_once(true).await;
+    crashed.restart_exactly_once(Recovered::RolledBack).await;
 }
 
 /// AC1 (#265): events acknowledged before the process stops, and still in
 /// the WAL, are counted exactly once by the first successful query after
-/// the restart. All of them arrive in ONE request, so one WAL file holds
-/// them, and the boot's `boot_hydration` line proves that file became
-/// resident before the listener bound. An hour between compaction ticks
-/// keeps any pass from publishing it before the stop. A pass after the
-/// restart publishes it and drains the hydrated batch under one guard, so
-/// the count is exact whichever the query sees.
+/// the restart, before any compaction pass could have published them. All
+/// of them arrive in ONE request, so one WAL file holds them. An hour
+/// between compaction ticks keeps any pass from publishing it before the
+/// stop. The restart holds its boot pass, the first pass, which would
+/// otherwise publish the file at once: the query then finds no parquet row
+/// for the tag and counts every event from the hot buffer, which the boot
+/// hydrated before the listener bound. Released, the boot pass publishes
+/// the file and drains the hydrated batch under one guard, and the count
+/// stays exact.
 async fn restart_counts_every_acknowledged_event_once(kill: bool) {
     let mut fixture = Fixture::new().await;
     fixture.current_fleet().await;
@@ -1396,24 +1559,43 @@ async fn restart_counts_every_acknowledged_event_once(kill: bool) {
         "nothing was compacted before the stop"
     );
 
-    let mut daemon = fixture.spawn();
+    let mut daemon = fixture.spawn_holding_boot_pass();
     let client = client(&daemon.ready().await, &token);
+    daemon.held_at_boot_pass().await;
     assert_eq!(
-        api_count(&client, &tag).await,
-        acknowledged,
-        "the first query after the restart"
+        parquet_count(&fixture.data(), &tag),
+        0,
+        "no pass has published the acknowledged WAL"
     );
+    assert_eq!(wal_files(&fixture), vec![wal_file.clone()]);
+    assert_api_exactly_once(
+        &client,
+        &tag,
+        acknowledged,
+        "the first query after the restart, from the hot buffer alone",
+    )
+    .await;
     let log = daemon.log();
-    let hydration = log
-        .lines()
-        .find(|line| line.contains("event_type=\"boot_hydration\""))
-        .unwrap_or_else(|| panic!("no boot_hydration line: {log}"));
-    assert!(
-        hydration.contains("hydrated=1")
-            && hydration.contains(&format!("events={CRASH_EVENTS}"))
-            && hydration.contains("overhang=false"),
+    let hydration = boot_hydration(&log);
+    assert_eq!(
+        (
+            log_field(hydration, "hydrated"),
+            log_field(hydration, "events"),
+            log_field(hydration, "overhang"),
+        ),
+        ("1", CRASH_EVENTS.to_string().as_str(), "false"),
         "the acknowledged WAL file became resident: {hydration}"
     );
+
+    fixture.release_boot_pass();
+    wait_for_drain(&fixture, "the released boot pass never published the WAL").await;
+    assert!(!wal_file.exists(), "the boot pass retired the WAL");
+    assert_eq!(
+        parquet_count(&fixture.data(), &tag),
+        acknowledged,
+        "the boot pass published every acknowledged event once"
+    );
+    assert_api_exactly_once(&client, &tag, acknowledged, "after the boot pass").await;
     daemon.stop().await;
     fixture.assert_lock_free().await;
 }
