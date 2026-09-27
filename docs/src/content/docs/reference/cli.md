@@ -387,10 +387,9 @@ containers that are left with the other resources, and deletes nothing
 before the answer.
 It deletes only resources that carry this trial's id, and it accepts state
 written by any CLI version. When no trial exists it prints so and exits `0`.
-When the trial directory has no `state.json` but still holds files, `down`
-lists each entry and asks the same way. It deletes those entries and the
-directory only after a yes or with `--yes`. It removes an empty trial
-directory without asking.
+When the trial directory has no `state.json`, `down` lists the directory and
+each entry in it, and asks the same way, even when the directory is empty.
+It deletes those entries and the directory only after a yes or with `--yes`.
 
 ### State and lock
 

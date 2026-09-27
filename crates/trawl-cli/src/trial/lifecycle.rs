@@ -15,9 +15,8 @@
 //! For `up` and `stop`, one that stays `created` past the wait never
 //! started, and is removed. `down` removes nothing before it is confirmed:
 //! it waits only for running one-offs, lists what is left with the rest,
-//! and deletes it all after a yes. A trial directory without a state is
-//! listed entry by entry and asked about the same way; only an empty one
-//! is removed without asking.
+//! and deletes it all after a yes. A trial directory without a state,
+//! empty or not, is listed entry by entry and asked about the same way.
 //!
 //! `up` then creates or resumes, one recorded phase at a time, so a rerun
 //! after an interruption skips what is done:
@@ -1622,13 +1621,12 @@ fn approved(answer: Confirmation) -> Result<(), TrialError> {
 
 /// `down` over a trial directory that holds no state.
 ///
-/// An empty one is removed without asking. `rmdir` removes only an empty
-/// directory, and the kernel checks that when it removes it, so this can
-/// delete no file, not even one written a moment before: it deletes the
-/// name of an empty 0700 directory that `up` creates again. One that holds
-/// anything is listed and asked about like a trial. After a yes, only the
-/// entries it listed are removed, then the directory, which stays with
-/// what appeared since.
+/// The directory, empty or not, is listed with its top-level entries and
+/// asked about like a trial. After a yes, each listed entry is removed, a
+/// listed subdirectory with everything in it, and then the directory with
+/// `rmdir`. Only the top-level entries are checked against the listing:
+/// a top-level entry that appeared while the prompt waited makes the
+/// `rmdir` fail, and it stays with the directory.
 fn remove_leftover(
     paths: &TrialPaths,
     approve: impl FnOnce(Listing<'_>) -> Result<Confirmation, TrialError>,
@@ -1636,14 +1634,6 @@ fn remove_leftover(
     if !paths.check_dir()? {
         progress("there is no trial here; nothing to delete");
         return Ok(());
-    }
-    match std::fs::remove_dir(&paths.dir) {
-        Ok(()) => {
-            progress("removed an empty trial directory that held no trial");
-            return Ok(());
-        }
-        Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-        Err(e) => return Err(TrialError::io("remove", &paths.dir, e)),
     }
     let entries = list_entries(&paths.dir)?;
     approved(approve(Listing::Leftover(&entries))?)?;

@@ -623,17 +623,34 @@ fn a_foreign_claim_keeps_files_the_new_state_did_not_write() {
     );
 }
 
-/// An empty trial directory without a state holds nothing to lose, so
-/// `down` removes it without asking.
+/// An empty trial directory without a state is a deletion like any
+/// other: `down` lists it, and without a terminal and without `--yes` it
+/// exits non-zero and leaves it. With `--yes` it removes it, and a second
+/// `down`, with no trial directory left, exits 0.
 #[test]
-fn down_removes_an_empty_directory_without_asking() {
+fn down_asks_before_it_removes_an_empty_directory() {
     let engine = Engine::new("engine-a");
     let dir = engine.leftover(&[]);
 
     let out = engine.trawl(&["down"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("nothing was deleted"), "{stderr}");
+    assert!(dir.is_dir(), "down removed the directory unasked: {stderr}");
+    assert!(
+        stdout.contains(&format!("  {}\n", dir.display())),
+        "the directory is not listed: {stdout}"
+    );
+
+    let out = engine.trawl(&["down", "--yes"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     assert!(!dir.exists(), "{stderr}");
     assert!(dir.parent().unwrap().is_dir(), "{stderr}");
+
+    let out = engine.trawl(&["down"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
     assert_eq!(engine.calls(), "");
 }
