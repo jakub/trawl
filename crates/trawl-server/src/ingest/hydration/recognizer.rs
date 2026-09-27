@@ -13,6 +13,11 @@
 //! handles every other file as it always has. Hydration never
 //! canonicalizes an event again, so a hydrated event reads the same hot as
 //! it will cold.
+//!
+//! Only Linux opens a WAL file without following a symlink and without
+//! blocking on a FIFO. Off Linux every entry is [`Rejection::Unreadable`],
+//! so the boot hydrates nothing and compaction clears the WAL as
+//! overhang.
 
 use std::fs::File;
 use std::io::Read as _;
@@ -188,28 +193,17 @@ fn open_no_follow(path: &Path) -> std::io::Result<File> {
     Ok(File::from(fd))
 }
 
-/// Without `rustix` off Linux there is no `O_NOFOLLOW` flag to pass, so
-/// a symlink or other non-regular entry is refused from `lstat` before the
-/// open, and the opened descriptor must be the entry `lstat` saw.
+/// Off Linux there is no `rustix` to open with `O_NOFOLLOW | O_NONBLOCK`,
+/// and a check with `lstat` before a plain open leaves a gap in which a
+/// FIFO swapped in blocks the boot and a symlink swapped in is followed.
+/// So no file is opened: every entry is unreadable, hydration loads
+/// nothing, and the WAL stays as overhang for compaction.
 #[cfg(not(target_os = "linux"))]
-fn open_no_follow(path: &Path) -> std::io::Result<File> {
-    use std::os::unix::fs::MetadataExt as _;
-    let entry = std::fs::symlink_metadata(path)?;
-    if !entry.file_type().is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    let file = File::open(path)?;
-    let opened = file.metadata()?;
-    if (opened.dev(), opened.ino()) != (entry.dev(), entry.ino()) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the entry changed while it was opened",
-        ));
-    }
-    Ok(file)
+fn open_no_follow(_path: &Path) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "hydration opens WAL files only on Linux",
+    ))
 }
 
 #[cfg(test)]
@@ -595,6 +589,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join(writer_name());
         assert_eq!(examine_path(&gone).unwrap_err(), Rejection::Unreadable);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn off_linux_even_writer_output_is_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(writer_name());
+        std::fs::write(&path, written(&awkward_events()).ndjson).unwrap();
+        assert_eq!(examine_path(&path).unwrap_err(), Rejection::Unreadable);
     }
 
     #[test]
