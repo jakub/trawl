@@ -20,6 +20,7 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
+use crate::publication::CorpusUnsettled;
 use crate::report_window::{ReportWindow, format_window_bound, truncate_to_micros};
 use crate::store::{ClaimedRun, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
 
@@ -85,6 +86,8 @@ async fn scheduler_loop(
         "scheduler started"
     );
 
+    let mut corpus = CorpusWatch::default();
+
     loop {
         tokio::select! {
             _ = tick.tick() => {}
@@ -93,6 +96,10 @@ async fn scheduler_loop(
                 return;
             }
         }
+
+        // Only the log reads the gate here; `poll_and_execute` makes its
+        // own decision, so the two never have to agree.
+        corpus.observe(pool.publication().unsettled());
 
         // ONE clock reading per tick, truncated to the microsecond every
         // stored bound shares (postgres TIMESTAMPTZ, DuckDB TIMESTAMP, and
@@ -143,6 +150,39 @@ async fn scheduler_loop(
     }
 }
 
+/// The corpus state the scheduler loop last logged, so it logs each change
+/// once rather than once per poll: a pause naming the reason when the
+/// corpus becomes unsettled (or the reason changes), a resume when it
+/// settles. A loop that starts settled logs nothing.
+#[derive(Debug, Default)]
+struct CorpusWatch {
+    logged: Option<CorpusUnsettled>,
+}
+
+impl CorpusWatch {
+    /// Log `now` if it differs from the state last logged. Returns whether
+    /// it logged.
+    fn observe(&mut self, now: Option<CorpusUnsettled>) -> bool {
+        if now == self.logged {
+            return false;
+        }
+        if let Some(reason) = now {
+            tracing::info!(
+                event_type = "scheduler_paused",
+                reason = reason.label(),
+                "corpus unsettled; the scheduler claims no run until it settles"
+            );
+        } else {
+            tracing::info!(
+                event_type = "scheduler_resumed",
+                "corpus settled; the scheduler claims due runs again"
+            );
+        }
+        self.logged = now;
+        true
+    }
+}
+
 /// One scheduler tick: claim and spawn every schedule due at `now`.
 ///
 /// `now` is a parameter rather than a clock reading, and [`scheduler_loop`]
@@ -153,6 +193,15 @@ async fn scheduler_loop(
 ///
 /// Returns the spawned execution tasks. The loop drops them — each run
 /// records its own outcome through `finish_run` — and tests await them.
+///
+/// While the corpus is unsettled (ADR-0041) the poll claims nothing. A
+/// claim moves the fire cursor in the transaction that plans the window,
+/// so a run the corpus gate refused afterwards would lose that window. The
+/// cursor stays put instead, and the first poll after the corpus settles
+/// covers every boundary that passed in one claim. The check holds no
+/// guard: the run's own read is still the one door to the corpus, and a
+/// rollup that starts between this check and that read still fails the
+/// run, as it could before.
 pub async fn poll_and_execute(
     schedule_store: &ScheduleStore,
     key_store: &KeyStore,
@@ -162,6 +211,10 @@ pub async fn poll_and_execute(
     now: DateTime<Utc>,
 ) -> Vec<JoinHandle<()>> {
     let mut spawned = Vec::new();
+
+    if pool.publication().unsettled().is_some() {
+        return spawned;
+    }
 
     let schedules = match schedule_store.list_enabled_schedules().await {
         Ok(s) => s,
@@ -853,7 +906,29 @@ mod pg_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::remove_result_file;
+    use super::{CorpusWatch, remove_result_file};
+    use crate::publication::CorpusUnsettled::{RestartBacklog, RollupPending};
+
+    /// The loop logs a change of corpus state once, never a poll that
+    /// finds the same state: a settled start is silent, a reason switch is
+    /// a change, and settling is logged once.
+    #[test]
+    fn corpus_watch_logs_each_change_once() {
+        let mut watch = CorpusWatch::default();
+        let logged: Vec<bool> = [
+            None,
+            Some(RestartBacklog),
+            Some(RestartBacklog),
+            Some(RollupPending),
+            Some(RollupPending),
+            None,
+            None,
+        ]
+        .into_iter()
+        .map(|state| watch.observe(state))
+        .collect();
+        assert_eq!(logged, [false, true, false, true, false, true, false]);
+    }
 
     /// An existing file is unlinked and the removal reports `true`.
     #[test]

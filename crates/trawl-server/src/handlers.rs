@@ -2803,7 +2803,9 @@ pub async fn runs_stats(
 ///
 /// No schedule is a 400: there is nothing to record a run under. A run in
 /// progress, a reached `max_runs` and an empty `since_last` window are 409s:
-/// the request is well formed, and the schedule's state refuses it.
+/// the request is well formed, and the schedule's state refuses it. An
+/// unsettled corpus is a 503 `corpus_recovering`, answered before the claim,
+/// so it creates no run.
 pub async fn trigger_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2811,6 +2813,14 @@ pub async fn trigger_run(
 ) -> Result<Json<ReportRunSummary>, ServerError> {
     if !verified.has_permission(Permission::SavedQuery) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
+    }
+
+    // Before the claim, which creates the run and plans its window from
+    // the schedule: a run the corpus gate refused afterwards would record a
+    // failure for a window nothing read (ADR-0041). No guard is held; the
+    // run's own read is still the door.
+    if let Some(reason) = state.query.pool.publication().unsettled() {
+        return Err(ServerError::CorpusRecovering(reason));
     }
 
     let key_id = verified.id;
