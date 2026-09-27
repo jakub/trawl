@@ -490,7 +490,7 @@ impl Drop for WorkSlot {
             let totals = if started {
                 self.timing
                     .as_ref()
-                    .and_then(|timing| timing.clock().snapshot_at(Instant::now()))
+                    .and_then(|timing| timing.clock().close_at(Instant::now()))
             } else {
                 None
             };
@@ -604,7 +604,7 @@ impl<'a> RequestGuard<'a> {
             // and outside the registry lock, so it may not have yet.
             timing.mark_work_started();
             if end.retained {
-                timing.emit_partial(if_started, now);
+                timing.emit_partial(if_started);
             } else {
                 timing.emit_complete(if_started, now);
             }

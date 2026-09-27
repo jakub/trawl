@@ -350,14 +350,21 @@ impl QueryTiming {
         true
     }
 
-    /// Write the partial account at `now` — the completed totals and the
+    /// Write the partial account now — the completed totals and the
     /// phase still running — unless it has been written already. Returns
     /// whether this call wrote it.
-    pub fn emit_partial(&self, outcome: Outcome, now: Instant) -> bool {
+    ///
+    /// The window ends at the instant the clock cut its copy at, under
+    /// its lock, so a worker that finishes a phase while the request is
+    /// deciding cannot book time past the end of the window.
+    pub fn emit_partial(&self, outcome: Outcome) -> bool {
         let Some((kind, work_started)) = self.claim() else {
             return false;
         };
-        let totals = self.clock().snapshot_at(now).unwrap_or_default();
+        let (totals, now) = self
+            .clock()
+            .snapshot()
+            .unwrap_or_else(|| (PhaseTotals::default(), Instant::now()));
         emit_query_timing(&TimingRecord {
             query_id: self.query_id(),
             kind,
@@ -819,12 +826,11 @@ mod tests {
         timing.clock().time(QueryPhase::PoolWait, || ());
         timing.mark_work_started();
         timing.clock().enter(QueryPhase::Bind);
-        let now = Instant::now() + Duration::from_millis(2);
 
         let events = capture(|| {
-            assert!(timing.emit_partial(Outcome::Timeout, now));
+            assert!(timing.emit_partial(Outcome::Timeout));
             assert!(
-                !timing.emit_complete(Outcome::Success, now),
+                !timing.emit_complete(Outcome::Success, Instant::now()),
                 "the account is written once"
             );
         });
@@ -847,8 +853,83 @@ mod tests {
         let Some(Value::U64(observed)) = v("query_observed_us") else {
             panic!("observed present: {event:?}");
         };
-        assert!(active >= 2_000);
         assert_eq!(pool_wait + active + other, observed);
+    }
+
+    /// A worker that finishes a phase after the request decided to write
+    /// its partial account, and before the copy is taken, cannot book
+    /// time past the window's end: the window is cut with the copy,
+    /// under the clock's lock, not at the moment the request decided.
+    #[test]
+    fn a_partial_window_covers_a_phase_finished_while_deciding() {
+        use std::sync::Barrier;
+        use trawl_engine::timing::Transition;
+
+        let timing = QueryTiming::new(
+            Instant::now(),
+            11,
+            Correlation::Request("01HZ".into()),
+            TimingKind::Query,
+        );
+        let parked = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        {
+            let parked = Arc::clone(&parked);
+            let release = Arc::clone(&release);
+            timing.clock().hold_on_enter(QueryPhase::Bind, move || {
+                parked.wait();
+                release.wait();
+            });
+        }
+        let exited = Arc::new(Barrier::new(2));
+        let worker = {
+            let clock = timing.clock().clone();
+            let exited = Arc::clone(&exited);
+            std::thread::spawn(move || {
+                clock.time(QueryPhase::Emit, || ());
+                clock.time(QueryPhase::Bind, || ());
+                exited.wait();
+            })
+        };
+
+        // The worker is inside bind when the request decides to stop
+        // waiting; it finishes bind before the request writes.
+        parked.wait();
+        timing.mark_work_started();
+        release.wait();
+        exited.wait();
+        assert!(
+            timing
+                .clock()
+                .transitions()
+                .contains(&Transition::Exit(QueryPhase::Bind)),
+            "bind finished before the copy"
+        );
+
+        let events = capture(|| {
+            assert!(timing.emit_partial(Outcome::Timeout));
+        });
+        worker.join().expect("the worker finishes");
+
+        let event = only(&events, "query_timing");
+        let u = |name: &str| match event.values.get(name) {
+            Some(Value::U64(v)) => Some(*v),
+            None => None,
+            other => panic!("{name} is an integer: {other:?}"),
+        };
+        let observed = u("query_observed_us").expect("observed");
+        let other = u("query_other_us").expect("other");
+        let completed: u64 = QueryPhase::ALL
+            .into_iter()
+            .filter_map(|phase| u(phase.field()))
+            .sum();
+        let active = u("active_elapsed_us").unwrap_or(0);
+        assert!(u("query_bind_us").is_some(), "bind is booked: {event:?}");
+        assert!(
+            observed >= completed + active,
+            "the window covers the totals: {observed} < {completed} + {active}"
+        );
+        assert_eq!(completed + active + other, observed);
     }
 
     /// A dropped handler guard writes the abandonment, complete, unless

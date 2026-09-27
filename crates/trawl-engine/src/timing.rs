@@ -172,7 +172,7 @@ impl Fallback {
 /// A plain-value copy of a clock's account at one instant.
 ///
 /// Complete when taken by [`PhaseClock::close_at`], partial when taken by
-/// [`PhaseClock::snapshot_at`]. A partial copy reports the phase still
+/// [`PhaseClock::snapshot`]. A partial copy reports the phase still
 /// running in [`Self::active`] and never books it: elapsed time in an
 /// unfinished phase is not a finished phase's total.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -447,17 +447,25 @@ impl PhaseClock {
         }
     }
 
-    /// A partial copy at `now`: the completed totals, plus the active
-    /// phase and its elapsed time, which is reported and not booked.
+    /// A partial copy, and the instant it was cut at: the completed
+    /// totals, plus the active phase and its elapsed time, which is
+    /// reported and not booked.
+    ///
+    /// The cut is read while the account is locked, so no phase can
+    /// finish between the cut and the copy: a caller that measures its
+    /// window to the returned instant has a window that covers every
+    /// total in the copy. A cut taken before the lock could let a worker
+    /// book a phase past it, and the totals outrun the window.
     ///
     /// `None` for a clock that is off.
     #[must_use]
-    pub fn snapshot_at(&self, now: Instant) -> Option<PhaseTotals> {
+    pub fn snapshot(&self) -> Option<(PhaseTotals, Instant)> {
         let state = self.state()?;
+        let cut = Instant::now();
         let active = state
             .active
-            .map(|(phase, start)| (phase, micros(now.saturating_duration_since(start))));
-        Some(state.totals(active))
+            .map(|(phase, start)| (phase, micros(cut.saturating_duration_since(start))));
+        Some((state.totals(active), cut))
     }
 
     /// The complete account at `now`.
@@ -500,7 +508,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
 
-    use super::{Fallback, PhaseClock, QueryPhase, Transition};
+    use super::{Fallback, PhaseClock, QueryPhase, Transition, micros};
 
     #[test]
     fn phase_names_and_fields_agree() {
@@ -523,7 +531,7 @@ mod tests {
         clock.time(QueryPhase::Bind, || ());
         clock.bind_attempt();
         clock.fallback(Fallback::RawRetry);
-        assert!(clock.snapshot_at(Instant::now()).is_none());
+        assert!(clock.snapshot().is_none());
         assert!(clock.close_at(Instant::now()).is_none());
         assert!(clock.transitions().is_empty());
     }
@@ -570,9 +578,9 @@ mod tests {
     fn a_partial_copy_reports_the_active_phase_without_booking_it() {
         let clock = PhaseClock::new();
         clock.time(QueryPhase::Source, || ());
+        let before = Instant::now();
         clock.enter(QueryPhase::Bind);
-        let later = Instant::now() + Duration::from_millis(5);
-        let partial = clock.snapshot_at(later).expect("on");
+        let (partial, cut) = clock.snapshot().expect("on");
         assert!(partial.get(QueryPhase::Source).is_some());
         assert_eq!(
             partial.get(QueryPhase::Bind),
@@ -581,7 +589,10 @@ mod tests {
         );
         let (phase, elapsed) = partial.active.expect("bind is active");
         assert_eq!(phase, QueryPhase::Bind);
-        assert!(elapsed >= 5_000, "elapsed measured to `now`: {elapsed}");
+        assert!(
+            elapsed <= micros(cut.saturating_duration_since(before)),
+            "elapsed measured to the cut: {elapsed}"
+        );
 
         clock.exit(QueryPhase::Bind);
         let complete = clock.close_at(Instant::now()).expect("on");
@@ -697,7 +708,7 @@ mod tests {
             })
         };
         parked.wait();
-        let partial = clock.snapshot_at(Instant::now()).expect("on");
+        let (partial, _) = clock.snapshot().expect("on");
         assert_eq!(partial.active.map(|(p, _)| p), Some(QueryPhase::Bind));
         assert!(partial.get(QueryPhase::Emit).is_some());
         assert_eq!(partial.get(QueryPhase::Bind), None);
