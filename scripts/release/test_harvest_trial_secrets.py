@@ -14,6 +14,7 @@ from test_scan_trial_secrets import KEY_DER, KEY_PEM
 
 HARVEST = Path(__file__).resolve().parent / "harvest-trial-secrets.py"
 PASSWORD = "0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+FLEET_PASSWORD = "f9e8d7c6b5a4938271605f4e3d2c1b0a"
 
 DOCKER = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_CALLS"
@@ -35,7 +36,8 @@ class Harvest(unittest.TestCase):
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode="w") as tar:
             for name, data in (("0/trial/tls/key.pem", KEY_PEM.encode()),
-                               ("0/trial/secrets/pgpass", f"postgres:5432:trawl:trawl:{PASSWORD}\n".encode())):
+                               ("0/trial/secrets/pgpass", (f"postgres:5432:trawl:trawl:{PASSWORD}\n"
+                                                          f"postgres:5432:fleet:fleet:{FLEET_PASSWORD}\n").encode())):
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
                 tar.addfile(info, io.BytesIO(data))
@@ -60,6 +62,16 @@ class Harvest(unittest.TestCase):
             self.assertIn(line, masks)
         for line in KEY_PEM.splitlines()[1:-1]:
             self.assertNotIn(line, result.stderr)
+
+    def test_each_role_password_is_recorded_and_masked(self):
+        result = self.harvest()
+        rows = [line.split("\t") for line in self.secrets.read_text().splitlines()]
+        masks = {line.removeprefix("::add-mask::") for line in result.stdout.splitlines()}
+        for role, password in (("trawl", PASSWORD), ("fleet", FLEET_PASSWORD)):
+            with self.subTest(role=role):
+                self.assertIn([f"{role} role password (trial f00dcafe)", "password", "text", password], rows)
+                self.assertIn(password, masks)
+                self.assertNotIn(password, result.stderr)
 
     def test_the_volume_is_read_without_network_log_or_write_access(self):
         self.harvest()
