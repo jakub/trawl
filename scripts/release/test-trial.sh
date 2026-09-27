@@ -625,17 +625,18 @@ for query in "${QUICK_START_QUERIES[@]}"; do
   cut -c1-160 "$WORK/quick-start.out" | head -n 8 | indent
 done
 
-step "trial A: real Chromium signs in with the operator key"
+step "trial A: real Chromium signs in with the operator key at both addresses"
 if [[ "${TRIAL_BROWSER:-}" == skip ]]; then
   note "SKIPPED: TRIAL_BROWSER=skip (local image without the SPA)"
 else
-  # The sign-in runs at localhost, the tutorial's other allowed origin; the
-  # page must also load at the address `up` printed.
+  # The whole tutorial runs twice, each in a fresh browser context: at
+  # localhost, the acceptance criterion's address, and at the address `up`
+  # printed, where the tutorial sends the reader.
   printed=$(grep -ohE 'http://127\.0\.0\.1:[0-9]+' "$WORK/up-a.out" "$WORK/up-a.err" | sort -u)
   [[ "$printed" == "http://127.0.0.1:18090" ]] || fail "up printed the browser address '$printed'"
   mkdir -p "$EVIDENCE/browser"
-  TRIAL_E2E_DIR="$E2E_DIR" node "$here/trial-browser.mjs" "http://localhost:18090" "$STATE_DIR/operator.token" \
-    "$EVIDENCE/browser" "$DOCUMENTED_QUERY" "$DOCUMENTED_ROW" "$printed" || fail "the browser step failed"
+  TRIAL_E2E_DIR="$E2E_DIR" node "$here/trial-browser.mjs" "$STATE_DIR/operator.token" "$EVIDENCE/browser" \
+    "$DOCUMENTED_QUERY" "$DOCUMENTED_ROW" "http://localhost:18090" "$printed" || fail "the browser step failed"
 fi
 
 step "trial A: a lost token file is revoked by prefix and minted again"

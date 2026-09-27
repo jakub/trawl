@@ -104,7 +104,9 @@ the TLS private key included, and under GitHub Actions passes each one to
 checks the whole capture. When a value is found, the job log gets the scan
 result, and no later output. The exit trap follows the same order.
 `trial-browser.mjs` follows the tutorial's browser steps in
-Chromium, with Playwright from `crates/trawl-web-ui/e2e`. For a local run,
+Chromium, with Playwright from `crates/trawl-web-ui/e2e`. It runs them twice,
+each time in a fresh browser context: at `http://localhost:<web-port>` and at
+`http://127.0.0.1:<web-port>`, the address `trawl trial up` prints. For a local run,
 set `TRIAL_IMAGE` to a locally built image, and set `TRIAL_BROWSER=skip` when
 that image has no SPA. CI refuses both. The `trial` job in
 `linux-distribution.yml` builds the image from the release tarball and tags
