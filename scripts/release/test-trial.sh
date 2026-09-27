@@ -219,7 +219,7 @@ scan() { # scan [--classes C,...] PATH...: nothing in the private list may appea
 # so a failed scan never leaves a secret-bearing file in what CI uploads.
 publish() {
   scan "$1"
-  cp "$1" "$EVIDENCE/$2"
+  cp -R "$1" "$EVIDENCE/$2"
 }
 
 # Counts per sample service, as `service count` lines.
@@ -645,9 +645,14 @@ else
   # printed, where the tutorial sends the reader.
   printed=$(grep -ohE 'http://127\.0\.0\.1:[0-9]+' "$WORK/up-a.out" "$WORK/up-a.err" | sort -u)
   [[ "$printed" == "http://127.0.0.1:18090" ]] || fail "up printed the browser address '$printed'"
-  mkdir -p "$EVIDENCE/browser"
-  TRIAL_E2E_DIR="$E2E_DIR" node "$here/trial-browser.mjs" "$STATE_DIR/operator.token" "$EVIDENCE/browser" \
-    "$DOCUMENTED_QUERY" "$DOCUMENTED_ROW" "http://localhost:18090" "$printed" || fail "the browser step failed"
+  # The screenshots and report are published even when the step fails,
+  # after their scan: the report is what explains a failed run.
+  mkdir -p "$WORK/browser"
+  browser=0
+  TRIAL_E2E_DIR="$E2E_DIR" node "$here/trial-browser.mjs" "$STATE_DIR/operator.token" "$WORK/browser" \
+    "$DOCUMENTED_QUERY" "$DOCUMENTED_ROW" "http://localhost:18090" "$printed" || browser=$?
+  publish "$WORK/browser" browser
+  ((browser == 0)) || fail "the browser step failed"
 fi
 
 step "trial A: a lost token file is revoked by prefix and minted again"
