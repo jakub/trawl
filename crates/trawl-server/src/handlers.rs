@@ -4142,8 +4142,8 @@ mod tests {
 
     /// `checks.corpus` reads `ok`, `restart_backlog` or `rollup_pending`,
     /// the pending rollup first when both hold (ADR-0041).
-    #[tokio::test]
-    async fn corpus_check_reads_ok_restart_backlog_or_rollup_pending() {
+    #[test]
+    fn corpus_check_reads_ok_restart_backlog_or_rollup_pending() {
         use crate::publication::PublicationGate;
 
         assert_eq!(corpus_check(&PublicationGate::new()), "ok");
@@ -4157,17 +4157,17 @@ mod tests {
         let marker = dir.path().join(".rollup-svc");
         std::fs::write(&marker, "").unwrap();
         {
-            let _writer = gate.write().await;
+            let _writer = gate.blocking_write();
             gate.mark_rollup(&marker);
         }
         assert_eq!(corpus_check(&gate), "rollup_pending", "precedence");
-        gate.settle_overhang();
+        gate.settle_overhang(&gate.blocking_write());
         assert_eq!(corpus_check(&gate), "rollup_pending");
         std::fs::remove_file(&marker).unwrap();
         assert_eq!(corpus_check(&gate), "ok");
 
         // The probe takes no publication guard: a held writer cannot stall it.
-        let _writer = gate.write().await;
+        let _writer = gate.blocking_write();
         assert_eq!(corpus_check(&gate), "ok");
     }
 

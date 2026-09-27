@@ -285,10 +285,18 @@ impl PublicationGate {
         Ok(())
     }
 
-    /// Clear overhang once a coverage proof holds. The caller must hold the
-    /// publication write guard it proved under. Moves only `Overhang` to
-    /// `Settled`, and logs `corpus_settled` once, on that move.
-    pub fn settle_overhang(&self) {
+    /// Clear overhang once a coverage proof holds. `_held` is the publication
+    /// write guard the proof ran under, taken from this gate: requiring it
+    /// makes the caller hold the guard across the proof and the move. Moves
+    /// only `Overhang` to `Settled`, and logs `corpus_settled` once, on that
+    /// move.
+    pub fn settle_overhang(&self, _held: &RwLockWriteGuard<'_, ()>) {
+        // The guard type cannot name its lock. A read that is admitted
+        // while `_held` is alive proves it is some other gate's guard.
+        debug_assert!(
+            self.lock.try_read().is_err(),
+            "settle_overhang needs this gate's write guard"
+        );
         let settled = {
             let mut corpus = self.corpus.lock();
             let overhang = corpus.restart == Restart::Overhang;
@@ -691,10 +699,11 @@ mod tests {
             ))
         ));
 
+        let held = gate.lock.write().await;
         capturing(|capture| {
-            gate.settle_overhang();
+            gate.settle_overhang(&held);
             assert_settled(&gate);
-            gate.settle_overhang();
+            gate.settle_overhang(&held);
             assert_eq!(
                 capture.count("corpus_settled"),
                 1,
@@ -708,6 +717,7 @@ mod tests {
                     .all(|(level, _)| *level == tracing::Level::INFO)
             );
         });
+        drop(held);
         assert!(gate.read().await.is_ok());
     }
 
@@ -735,11 +745,11 @@ mod tests {
     fn settle_overhang_moves_only_overhang() {
         capturing(|capture| {
             let starting = PublicationGate::starting();
-            starting.settle_overhang();
+            starting.settle_overhang(&starting.blocking_write());
             assert_restart_backlog(&starting);
 
             let settled = PublicationGate::new();
-            settled.settle_overhang();
+            settled.settle_overhang(&settled.blocking_write());
             assert_settled(&settled);
 
             assert_eq!(capture.count("corpus_settled"), 0);
@@ -758,7 +768,7 @@ mod tests {
             let gate = PublicationGate::starting();
             gate.finish_hydration(overhang).unwrap();
             assert_eq!(gate.awaits_coverage_proof(), overhang);
-            gate.settle_overhang();
+            gate.settle_overhang(&gate.blocking_write());
             assert!(!gate.awaits_coverage_proof());
         }
     }
@@ -797,8 +807,18 @@ mod tests {
                 CorpusUnsettled::RestartBacklog
             ))
         ));
-        gate.settle_overhang();
+        gate.settle_overhang(&gate.lock.write().await);
         assert!(gate.read().await.is_ok());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "settle_overhang needs this gate's write guard")]
+    fn settle_overhang_refuses_another_gates_guard() {
+        let gate = PublicationGate::starting();
+        gate.finish_hydration(true).unwrap();
+        let other = PublicationGate::new();
+        gate.settle_overhang(&other.blocking_write());
     }
 
     #[tokio::test]

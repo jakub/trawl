@@ -135,7 +135,7 @@ fn prove(
     // Every producer that published a listed file inserts it before it
     // releases its read guard, so under the write guard a candidate is
     // resident, gone, or really left over. Only `NotFound` proves it gone.
-    let _publication = gate.blocking_write();
+    let publication = gate.blocking_write();
     for (batch_id, path) in &candidates {
         let resident = batch_id.as_deref().is_some_and(|id| hot.is_resident(id));
         let gone = matches!(
@@ -146,7 +146,7 @@ fn prove(
             return ProofOutcome::NotResident;
         }
     }
-    gate.settle_overhang();
+    gate.settle_overhang(&publication);
     ProofOutcome::Settled
 }
 

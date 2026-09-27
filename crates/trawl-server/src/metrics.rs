@@ -2041,7 +2041,7 @@ mod tests {
                 gate.mark_rollup(&marker);
             }
             assert_eq!(collected(&gate), (1, 1), "each reason on its own series");
-            gate.settle_overhang();
+            gate.settle_overhang(&gate.blocking_write());
             assert_eq!(collected(&gate), (1, 0));
             std::fs::remove_file(&marker).unwrap();
             assert_eq!(collected(&gate), (0, 0), "settled");
