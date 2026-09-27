@@ -12,10 +12,18 @@ does not move them, so the examples name no time range. `trawl query` adds
 none. In the browser, select `7d` in **Date range**, because the default 15
 minutes stops covering the events soon after `up`. `7d` ends at the current
 time, so it covers the events for about seven days. After that, open
-**Date range**, select **Absolute**, paste the first sample timestamp that
-`trawl trial status` prints into **From**, leave **To** at `now`, and select
-**Apply**. With your own logs, replace the service and look at a few rows
-first.
+**Date range** and select **Absolute**. In the `Samples` section that
+`trawl trial status` prints, copy the timestamp after `from` into **From**,
+not the `created` timestamp above it. The section looks like this, and here
+the value is `2026-09-24T12:00:00Z`:
+
+```text
+Samples
+  2000 events from 2026-09-24T12:00:00Z to 2026-09-25T12:00:00Z
+```
+
+Leave **To** at `now`, and select **Apply**. With your own logs, replace the
+service and look at a few rows first.
 
 ## Find your events
 

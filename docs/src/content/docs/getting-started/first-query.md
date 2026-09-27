@@ -110,9 +110,18 @@ after `up`.
    and the newest samples fall inside it right after `up`. Select `7d` in
    **Date range** to see all 2000 events. `7d` is the widest preset, and it
    ends at the current time, so it covers every sample for about six days
-   after the first `up`. After that, open **Date range**, select **Absolute**,
-   paste the first timestamp that `trawl trial status` prints into **From**,
-   leave **To** at `now`, and select **Apply**.
+   after the first `up`. After that, open **Date range** and select
+   **Absolute**. In the `Samples` section that `trawl trial status` prints,
+   copy the timestamp after `from` into **From**, not the `created` timestamp
+   above it: most samples are older than `created`. The section looks like
+   this, and here the value is `2026-09-24T12:00:00Z`:
+
+   ```text
+   Samples
+     2000 events from 2026-09-24T12:00:00Z to 2026-09-25T12:00:00Z
+   ```
+
+   Leave **To** at `now`, and select **Apply**.
 4. Enter `service=checkout _severity>=error | stats count() as errors by service`
    and select **Haul**. Expect one row with service `checkout` and errors
    `20`. A range that misses some samples gives a smaller count.

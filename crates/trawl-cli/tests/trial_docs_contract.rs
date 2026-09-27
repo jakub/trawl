@@ -22,6 +22,9 @@ const RANGE_DIALOG: &str = include_str!("../../fleet-ui/src/range_dialog.rs");
 const SUMMARY_SNAPSHOT: &str = include_str!(
     "../src/trial/snapshots/trawl_cli__trial__render__tests__the_summary_of_a_fixture_trial.snap"
 );
+const STATUS_SNAPSHOT: &str = include_str!(
+    "../src/trial/snapshots/trawl_cli__trial__render__tests__the_status_of_a_fixture_trial.snap"
+);
 
 /// `sample::DOCUMENTED_QUERY`.
 const DOCUMENTED_QUERY: &str =
@@ -197,6 +200,54 @@ fn the_tutorials_say_when_the_widest_preset_stops_covering_the_samples() {
         ] {
             assert!(flat.contains(claim), "{page}: {claim}");
         }
+    }
+}
+
+/// `status` prints `created <ts>` above the `Samples` section, and most
+/// samples are older than `created`. The tutorials name the timestamp after
+/// `from` on the `Samples` line and show that line as `status` prints it.
+#[test]
+fn the_tutorials_point_at_the_first_sample_timestamp() {
+    let mut lines = STATUS_SNAPSHOT.lines();
+    lines
+        .by_ref()
+        .find(|line| *line == "Samples")
+        .expect("the status snapshot has a Samples section");
+    let samples = lines.next().expect("a line under Samples");
+    let words: Vec<&str> = samples.split_whitespace().collect();
+    let [_count, "events", "from", first, "to", _last] = words[..] else {
+        panic!("the status Samples line changed shape: {samples:?}");
+    };
+    let created = STATUS_SNAPSHOT
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("created"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the status snapshot prints created <ts>");
+    assert_ne!(created, first, "the fixture no longer tells the two apart");
+
+    for (page, text) in [
+        ("first-query", FIRST_QUERY),
+        ("query-tutorial", QUERY_TUTORIAL),
+    ] {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let claim = "In the `Samples` section that `trawl trial status` prints, \
+                     copy the timestamp after `from` into **From**";
+        assert!(flat.contains(claim), "{page}: {claim}");
+        assert!(
+            flat.contains("not the `created` timestamp"),
+            "{page} does not rule out the created timestamp"
+        );
+        let shown = text
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == ["Samples", samples.trim()]);
+        assert!(shown, "{page} does not show the status line {samples:?}");
+        assert!(
+            flat.contains(&format!("`{first}`")),
+            "{page} does not name the example value {first}"
+        );
     }
 }
 
