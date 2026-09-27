@@ -190,7 +190,7 @@ Notes:
 | `stats_interval_secs` | integer | `60` | How often server stats are emitted as telemetry. `0` disables |
 | `telemetry_flush_interval_secs` | integer | `1` | How often buffered tracing events are flushed to the WAL |
 | `telemetry_buffer_max_bytes` | byte size | `"16M"` | One estimated memory budget for everything self-telemetry holds while the WAL is unhealthy: active buffer, retry queue, and the batch in flight. Minimum `"64K"` |
-| `compaction_chunk_size` | integer | `500` | Maximum WAL files merged per compaction chunk. A larger backlog is split into chunks |
+| `compaction_chunk_size` | integer | `500` | Maximum WAL files merged per compaction chunk. A larger backlog is split into chunks. At most `4096`, because each chunk's publication marker names every file it merges |
 | `compaction_memory_limit` | string | `"2GB"` | DuckDB memory limit for compaction connections, as a DuckDB memory string |
 | `default_env` | string | `"prod"` | Fills a missing `env`, recorded as the `env.defaulted` repair. Must pass the env charset and belong to `envs` |
 | `envs` | string array | `[default_env]` | Environment allowlist. Entries must match `[a-z0-9_-]{1,32}`. `wal` and `scheduled` are reserved |

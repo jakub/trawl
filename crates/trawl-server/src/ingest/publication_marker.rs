@@ -29,7 +29,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
@@ -39,6 +39,27 @@ use serde::{Deserialize, Serialize};
 const MARKER_PREFIX: &str = ".publish-";
 /// Marker file name suffix. Anything but `.ndjson`, which the WAL scan claims.
 const MARKER_SUFFIX: &str = ".json";
+
+/// Most WAL entries one marker names. A marker names the surviving inputs of
+/// one compaction chunk, and configuration caps a chunk at this many files.
+const MAX_MARKER_WAL_ENTRIES: usize = trawl_config::MAX_COMPACTION_CHUNK_SIZE;
+
+/// Longest WAL entry a marker names. An entry is one file name in a WAL
+/// directory, and Linux caps a file name at 255 bytes (`NAME_MAX`).
+const MAX_WAL_ENTRY_BYTES: usize = 255;
+
+/// Largest marker [`read_marker`] reads, about 1 MiB. The WAL writer calls
+/// [`read_marker`] on every write, so the bound keeps a planted marker from
+/// making each write load a file of any size.
+///
+/// [`ValidatedMarker::encode`] writes compact JSON, and validation bounds
+/// every part of it. The keys and punctuation, the 13-byte partition, a
+/// `u64` size of at most 20 digits and the 64-digit digest take 142 bytes;
+/// 1 KiB covers them. Each WAL entry takes its name, two quotes and a comma.
+/// So every marker compaction can write fits, and one at the configured
+/// default holds about 500 names of 30 to 160 bytes, a few dozen KiB.
+pub const MAX_MARKER_BYTES: u64 =
+    (1024 + MAX_MARKER_WAL_ENTRIES * (MAX_WAL_ENTRY_BYTES + 3)) as u64;
 
 /// The on-disk marker body. Every component is relative; see the module
 /// docs for how paths are rebuilt from it.
@@ -253,13 +274,26 @@ fn validate_service(service: &str) -> Result<(), String> {
 }
 
 /// Each entry is one path component inside `wal_dir/{env}` that the WAL
-/// scan would have picked up for `service`.
+/// scan would have picked up for `service`, and the list is no longer than
+/// one compaction chunk: what [`MAX_MARKER_BYTES`] is derived from.
 fn validate_wal_names(service: &str, wal: &[String]) -> Result<(), String> {
     if wal.is_empty() {
         return Err("WAL list is empty".to_owned());
     }
+    if wal.len() > MAX_MARKER_WAL_ENTRIES {
+        return Err(format!(
+            "WAL list has {} entries, over the {MAX_MARKER_WAL_ENTRIES}-entry limit",
+            wal.len()
+        ));
+    }
     let mut seen = BTreeSet::new();
     for name in wal {
+        if name.len() > MAX_WAL_ENTRY_BYTES {
+            return Err(format!(
+                "WAL entry is {} bytes, over the {MAX_WAL_ENTRY_BYTES}-byte limit",
+                name.len()
+            ));
+        }
         // The service charset excludes `/`, NUL and spaces; a name made of it
         // is a single component. `.` and `..` fail the suffix check.
         let Some(stem) = name.strip_suffix(".ndjson") else {
@@ -324,6 +358,10 @@ impl fmt::Display for MarkerError {
 
 /// Read and confine the marker at `path`. The env is the parent directory's
 /// name and the service comes from the file name.
+///
+/// A marker over [`MAX_MARKER_BYTES`] is invalid: one its `lstat` reports is
+/// never opened, and one that grows after the `lstat` is read only up to one
+/// byte past the bound.
 pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     let file_name = path
         .file_name()
@@ -339,16 +377,25 @@ pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     validate_env(env).map_err(MarkerError::Invalid)?;
     validate_service(service).map_err(MarkerError::Invalid)?;
 
-    let kind = std::fs::symlink_metadata(path)
-        .map_err(|e| MarkerError::Io(format!("failed to inspect {}: {e}", path.display())))?
-        .file_type();
-    if !kind.is_file() {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| MarkerError::Io(format!("failed to inspect {}: {e}", path.display())))?;
+    if !metadata.file_type().is_file() {
         return Err(MarkerError::Invalid(
             "marker is not a regular file".to_owned(),
         ));
     }
-    let body = std::fs::read(path)
+    let over_limit =
+        || MarkerError::Invalid(format!("marker is over the {MAX_MARKER_BYTES}-byte limit"));
+    if metadata.len() > MAX_MARKER_BYTES {
+        return Err(over_limit());
+    }
+    let mut body = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|file| file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut body))
         .map_err(|e| MarkerError::Io(format!("failed to read {}: {e}", path.display())))?;
+    if body.len() as u64 > MAX_MARKER_BYTES {
+        return Err(over_limit());
+    }
     let record: PublicationMarker = serde_json::from_slice(&body)
         .map_err(|e| MarkerError::Invalid(format!("unparseable marker: {e}")))?;
     ValidatedMarker::from_record(env, service, record).map_err(MarkerError::Invalid)
@@ -1282,6 +1329,103 @@ mod tests {
         assert_invalid(read_marker(&link), "not a regular file");
     }
 
+    /// A marker far over the size bound is refused from its `lstat` alone.
+    /// It is sparse, so it costs no disk, and mode `000` makes any open
+    /// fail: an `Io` error would mean the body was opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_oversized_marker_is_invalid_without_being_opened() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        crate::ingest::hydration::enforce_mode_bits_on_this_thread();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(ENV);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(marker_file_name(SERVICE));
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            std::fs::File::open(&path).is_err(),
+            "mode 000 must lock the marker for this thread"
+        );
+        assert_invalid(read_marker(&path), "byte limit");
+    }
+
+    /// A valid marker body padded with trailing whitespace, which JSON
+    /// allows, to exactly `len` bytes.
+    fn padded_body(len: u64) -> String {
+        let mut padded = body("2026-09-23/07", &[WAL_A], &hex());
+        padded.push_str(&" ".repeat(usize::try_from(len).unwrap() - padded.len()));
+        padded
+    }
+
+    #[test]
+    fn a_marker_at_the_size_bound_reads_and_one_byte_more_is_invalid() {
+        let marker = read_body(ENV, SERVICE, &padded_body(MAX_MARKER_BYTES)).unwrap();
+        assert_eq!(marker.wal_names(), [WAL_A]);
+        assert_invalid(
+            read_body(ENV, SERVICE, &padded_body(MAX_MARKER_BYTES + 1)),
+            "byte limit",
+        );
+    }
+
+    /// The largest marker validation admits: the most entries, each the
+    /// longest file name, the largest size and the latest hour.
+    fn largest_marker() -> ValidatedMarker {
+        // `s_{digits}_ab.ndjson` at exactly the longest entry.
+        let digits = MAX_WAL_ENTRY_BYTES - "s__ab.ndjson".len();
+        let wal: Vec<String> = (0..MAX_MARKER_WAL_ENTRIES)
+            .map(|n| format!("s_{n:0digits$}_ab.ndjson"))
+            .collect();
+        assert!(wal.iter().all(|name| name.len() == MAX_WAL_ENTRY_BYTES));
+        ValidatedMarker::new(
+            ENV,
+            "s",
+            date(),
+            23,
+            wal,
+            OutputIdentity {
+                size: u64::MAX,
+                hash: blake3::hash(b""),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_marker_validation_admits_fits_the_size_bound() {
+        let largest = largest_marker();
+        let encoded = largest.encode().len() as u64;
+        assert!(
+            encoded <= MAX_MARKER_BYTES,
+            "{encoded} > {MAX_MARKER_BYTES}"
+        );
+        // The bound is the entries plus a frame of at most 1 KiB.
+        assert!(MAX_MARKER_BYTES - encoded <= 1024, "{encoded}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir_all(largest.wal_env_dir(&wal)).unwrap();
+        write_marker(&wal, &largest).unwrap();
+        assert_eq!(read_marker(&largest.marker_path(&wal)).unwrap(), largest);
+    }
+
+    #[test]
+    fn validation_bounds_the_entries_the_size_bound_is_derived_from() {
+        let mut too_many = largest_marker().wal_names().to_vec();
+        too_many.push("s_1_ab.ndjson".to_owned());
+        let err = ValidatedMarker::new(ENV, "s", date(), 0, too_many, identity(b"")).unwrap_err();
+        assert!(err.contains("entry limit"), "{err}");
+
+        let too_long = format!("s_{}_ab.ndjson", "1".repeat(MAX_WAL_ENTRY_BYTES));
+        let err =
+            ValidatedMarker::new(ENV, "s", date(), 0, vec![too_long], identity(b"")).unwrap_err();
+        assert!(err.contains("byte limit"), "{err}");
+    }
+
     #[test]
     fn marker_files_are_invisible_to_the_wal_scan() {
         // A service named like a WAL file must not turn its marker, the
@@ -1543,6 +1687,28 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(snapshot(f.root.path()), before);
+    }
+
+    #[test]
+    fn row_contradictory_oversized_marker() {
+        let f = published_fixture();
+        std::fs::write(
+            f.marker.marker_path(&f.wal),
+            padded_body(MAX_MARKER_BYTES + 1),
+        )
+        .unwrap();
+        let before = snapshot(f.root.path());
+        for _ in 0..2 {
+            let report = recover_all(&f, &mut Vec::new());
+            match only_result(&report) {
+                Ok(RecoveryOutcome::Contradictory(Contradiction::InvalidMarker(reason))) => {
+                    assert!(reason.contains("byte limit"), "{reason}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(scan_claims(&f.wal).unwrap().blocks_service(ENV, SERVICE));
+        }
+        assert_eq!(snapshot(f.root.path()), before, "nothing touched");
     }
 
     #[cfg(unix)]

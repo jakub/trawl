@@ -323,6 +323,7 @@ pub struct IngestConfig {
 
     /// Maximum WAL files per compaction chunk. Larger backlogs are split
     /// into chunks of this size and merged incrementally. Default: 500.
+    /// At most [`MAX_COMPACTION_CHUNK_SIZE`].
     #[serde(default = "default_compaction_chunk_size")]
     pub compaction_chunk_size: usize,
 
@@ -1066,6 +1067,11 @@ pub const DEFAULT_INTERNAL_TELEMETRY: bool = true;
 pub const DEFAULT_DAILY_ROLLUP: bool = true;
 /// Default compaction chunk size (WAL files per `read_json` call).
 pub const DEFAULT_COMPACTION_CHUNK_SIZE: usize = 500;
+/// Largest compaction chunk size. A chunk's publication marker names every
+/// WAL file the chunk consumed, and the marker reader refuses a marker over
+/// a fixed size derived from this count, so a larger chunk could publish a
+/// marker that recovery then refuses to read. Eight times the default.
+pub const MAX_COMPACTION_CHUNK_SIZE: usize = 4096;
 /// Default `DuckDB` memory limit for compaction connections.
 pub const DEFAULT_COMPACTION_MEMORY_LIMIT: &str = "2GB";
 /// Default retention max age (days).
@@ -1687,6 +1693,13 @@ impl Config {
             ));
         }
 
+        if self.ingest.compaction_chunk_size > MAX_COMPACTION_CHUNK_SIZE {
+            return Err(ConfigError::Validation(format!(
+                "ingest.compaction_chunk_size must be at most {MAX_COMPACTION_CHUNK_SIZE} \
+                 (a chunk's publication marker names every WAL file it merges)"
+            )));
+        }
+
         if self.syslog.enabled {
             if self.syslog.batch_interval_ms == 0 {
                 return Err(ConfigError::Validation(
@@ -2269,6 +2282,35 @@ telemetry_buffer_max_bytes = {}
             err.to_string(),
             "config validation error: ingest.telemetry_buffer_max_bytes must be at least 64K \
              (65536 bytes); set ingest.internal_telemetry = false to disable internal telemetry"
+        );
+    }
+
+    #[test]
+    fn compaction_chunk_size_above_the_marker_bound_is_boot_fatal() {
+        let chunk = |size: usize| {
+            Config::from_toml(&format!(
+                r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[ingest]
+compaction_chunk_size = {size}
+"#
+            ))
+        };
+        let err = chunk(MAX_COMPACTION_CHUNK_SIZE + 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "config validation error: ingest.compaction_chunk_size must be at most 4096 \
+             (a chunk's publication marker names every WAL file it merges)"
+        );
+        assert_eq!(
+            chunk(MAX_COMPACTION_CHUNK_SIZE)
+                .unwrap()
+                .ingest
+                .compaction_chunk_size,
+            MAX_COMPACTION_CHUNK_SIZE
         );
     }
 
