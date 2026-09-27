@@ -1240,19 +1240,105 @@ pub(crate) mod tests {
         );
     }
 
+    /// The first directory above `socket`, on its path as given or as
+    /// resolved, that the ancestry rule would refuse, with the reason.
+    /// Plain std metadata, so the verdict does not lean on the code under
+    /// test.
+    fn untrusted_ancestry(socket: &Path) -> Option<String> {
+        let resolved = fs::canonicalize(socket).ok()?;
+        let given = socket.parent().into_iter().flat_map(Path::ancestors);
+        let real = resolved.parent().into_iter().flat_map(Path::ancestors);
+        for dir in given.chain(real) {
+            let meta = fs::metadata(dir).ok()?;
+            let mode = meta.permissions().mode();
+            if !meta.is_dir() {
+                return Some(format!("{} is not a directory", dir.display()));
+            }
+            if meta.uid() != 0 && meta.uid() != me() {
+                return Some(format!("{} is owned by uid {}", dir.display(), meta.uid()));
+            }
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                return Some(format!(
+                    "{} has mode {:o}: group or other can write and there is no sticky bit",
+                    dir.display(),
+                    mode & 0o7777
+                ));
+            }
+        }
+        None
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Verdict {
+        Absent,
+        Passed,
+        Refused,
+    }
+
+    /// A socket passes when its directories are sane, and is refused when
+    /// one of them is not; `Absent` when there is no socket to judge.
+    fn socket_verdict_matches_its_ancestry(socket: &Path) -> Verdict {
+        if fs::symlink_metadata(socket).is_err() {
+            eprintln!("SKIP: {} does not exist on this host", socket.display());
+            return Verdict::Absent;
+        }
+        let result = LocalEndpoint::trusted(&address(socket));
+        if let Some(reason) = untrusted_ancestry(socket) {
+            eprintln!(
+                "SKIP pass leg for {}: {reason}; asserting the refusal instead",
+                socket.display()
+            );
+            let (path, problem, _) = refusal(result);
+            assert_eq!(path, socket);
+            eprintln!("refused as expected: {problem}");
+            return Verdict::Refused;
+        }
+        let endpoint = result.unwrap().unwrap();
+        assert_eq!(endpoint.as_str(), address(socket));
+        eprintln!("PASS: {} is trusted", socket.display());
+        Verdict::Passed
+    }
+
     /// The standard `root:docker 0660` socket, usually reached through
-    /// the `/var/run -> /run` link.
+    /// the `/var/run -> /run` link. On a host whose own directories break
+    /// the rule (a CI runner with a world-writable `/run`, say), the
+    /// socket must be refused instead.
     #[test]
     fn the_standard_docker_socket_passes_when_present() {
-        const SOCK: &str = "/var/run/docker.sock";
-        if fs::symlink_metadata(SOCK).is_err() {
-            eprintln!("SKIP: {SOCK} does not exist on this host");
-            return;
+        socket_verdict_matches_its_ancestry(Path::new("/var/run/docker.sock"));
+    }
+
+    /// The helper above takes the refusal branch for a socket under a
+    /// world-writable directory without the sticky bit, and the pass
+    /// branch once the sticky bit is set.
+    #[test]
+    fn the_standard_socket_check_refuses_under_an_untrusted_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loose = tmp.path().join("run");
+        dir_at(&loose, 0o777);
+        let sock = loose.join("docker.sock");
+        let _listener = socket_at(&sock);
+        std::os::unix::fs::symlink("run", tmp.path().join("var-run")).unwrap();
+        let via_link = tmp.path().join("var-run/docker.sock");
+
+        for socket in [&sock, &via_link] {
+            assert!(untrusted_ancestry(socket).is_some(), "{}", socket.display());
+            assert_eq!(
+                socket_verdict_matches_its_ancestry(socket),
+                Verdict::Refused
+            );
         }
-        let endpoint = LocalEndpoint::trusted(&format!("unix://{SOCK}"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(endpoint.as_str(), "unix:///var/run/docker.sock");
+
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert_eq!(untrusted_ancestry(&via_link), None);
+        assert_eq!(
+            socket_verdict_matches_its_ancestry(&via_link),
+            Verdict::Passed
+        );
+        assert_eq!(
+            socket_verdict_matches_its_ancestry(&tmp.path().join("absent.sock")),
+            Verdict::Absent
+        );
     }
 
     #[test]
