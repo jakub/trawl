@@ -29,7 +29,7 @@ When the hot buffer reaches its caps, it evicts its oldest batches. Those events
 
 **A write that leaves its file visible.** A WAL write that fails and cannot withdraw its file (`LeftVisible`) releases its reservation. It was never acknowledged, so the invariant does not cover it. Compaction merges the file later, as it does today. The disk it uses is headroom's concern (ADR-0042), not the ledger's.
 
-**Boot hydration charges the same ledger.** Slice 2 of ADR-0041 loads surviving WAL into this ledger. How hydration treats its overhang, and whether the telemetry reserve applies to it, is decided in that slice's own prep.
+**Boot hydration charges the same ledger.** Slice 2 of ADR-0041 loads surviving WAL into this ledger. How hydration treats its overhang, and whether the telemetry reserve applies to it, is decided in that slice's own prep. _Amended 2026-09-27:_ hydration charges the full caps, not the external share. It is not a producer: it never latches `Refusing`, counts no refusal and sends no pressure wake. Overhang, like admission pressure, makes compaction passes take WAL of any age, and the cooldown still comes first. A standing failure therefore also delays clearing overhang by up to one interval per pass.
 
 ## Considered options
 

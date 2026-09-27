@@ -88,6 +88,18 @@ _Avoid_: lockfile, flag file
 The durable record of one compaction publishing its WAL batches into a parquet file: which WAL files it consumes and which output it installs. While it exists, recovery decides from it whether the publish happened, and nothing else may compact, hydrate, retire or delete the files it names.
 _Avoid_: lock, journal entry
 
+**Batch identity**:
+The name of one ingest batch: its environment and its WAL file name without the extension. The WAL, the hot buffer, publication markers and compaction all refer to the batch by it.
+_Avoid_: batch id (in prose), file name
+
+**Hydration**:
+The one-time load at boot of surviving WAL batches into the hot buffer, under their existing batch identities. It is not the field catalog's pin-cache load, which older code comments also call "hydrate".
+_Avoid_: replay, reload, warm-up
+
+**Overhang**:
+WAL that existed at boot and did not become resident in the hot buffer. While any may exist, a corpus read cannot count every acknowledged event exactly once. Overhang ends when compaction proves that none remains.
+_Avoid_: backlog (that is all surviving WAL), spill
+
 **Epoch**:
 A generation of the stored data's format and meaning. Files in one epoch share the same interpretation rules.
 _Avoid_: schema version, migration level
@@ -159,6 +171,10 @@ _Avoid_: snapshot (unqualified)
 **Lane**:
 One of the four evaluators that can answer a query: batch SQL, the live stream (SSE), the kv batch tail, and embedded `--data`. "All four lanes" means literally all four; when embedded is excluded (it has no catalog), say "the three pinned lanes".
 _Avoid_: path, mode
+
+**Corpus read**:
+A read that counts or returns events from the hot buffer and parquet together. Only corpus reads carry the exactly-once guarantee. Parquet footer statistics and the live stream are not corpus reads.
+_Avoid_: query (unqualified), cold read
 
 **Conform**:
 To cast a value to its pin under the lossless round-trip guard — one operation, wherever it runs (compaction, a query's hot branch, the boot pass, a repin rewrite). A cast that would change the value shelves it instead.

@@ -26,6 +26,9 @@ its daily file was written. Query-only processes also scan for unfinished
 markers before admitting reads. Recovery clears a marker before discarding
 an invalid replacement, so a retry cannot mistake the old daily file for
 the unpublished replacement.
+_Amended 2026-09-27:_ boot recovers rollup markers before it serves, and the
+refusal answers 503 `corpus_recovering` with cause kind `rollup_pending`
+(ADR-0041 slice 2).
 
 Producers take a shared guard before writing WAL and keep it through hot
 insertion in the same blocking task. Otherwise a stalled producer could add
