@@ -313,9 +313,10 @@ pub fn classify(inventory: &Inventory, our_id: Option<&str>) -> Ownership {
 
 /// Our `compose run` containers that have not finished: a killed `up` can
 /// leave one running (a `keys create` that commits after the rerun lists
-/// keys), so `up`, `stop`, and `down` wait for these, then refuse. A
-/// `created` one-off counts too: a Compose client killed after the engine
-/// accepted its create and start can leave one that starts late.
+/// keys), so `up` and `stop` wait for these, then refuse, and `down` waits
+/// for the running ones, then lists them all for approval. A `created`
+/// one-off counts too: a Compose client killed after the engine accepted
+/// its create and start can leave one that starts late.
 pub fn unfinished_oneoffs<'a>(inventory: &'a Inventory, our_id: &str) -> Vec<&'a Resource> {
     inventory
         .resources

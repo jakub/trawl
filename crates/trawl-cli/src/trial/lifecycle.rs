@@ -11,8 +11,11 @@
 //! passes. `stop` and `down` then refuse an engine other than the one the
 //! state records. Then the ownership scan refuses anything on the engine
 //! that carries the trial's names or labels without this trial's id, and
-//! one-off containers a killed command left unfinished are waited for;
-//! one that stays `created` past the wait never started, and is removed.
+//! one-off containers a killed command left unfinished are waited for.
+//! For `up` and `stop`, one that stays `created` past the wait never
+//! started, and is removed. `down` removes nothing before it is confirmed:
+//! it waits only for running one-offs, lists what is left with the rest,
+//! and deletes it all after a yes.
 //!
 //! `up` then creates or resumes, one recorded phase at a time, so a rerun
 //! after an interruption skips what is done:
@@ -160,11 +163,12 @@ fn require_owned(
     }
 }
 
-/// Wait for one-off containers an interrupted command left unfinished,
-/// then return a fresh inventory. Refuses anything foreign that appeared
-/// meanwhile. When the one-offs outlast `wait`, removes those still
-/// `created`, once and by id: their client died before starting them, so
-/// they would never finish. Refuses, naming them, when any other is left.
+/// `up` and `stop`'s wait: for one-off containers an interrupted command
+/// left unfinished, then a fresh inventory. Refuses anything foreign that
+/// appeared meanwhile. When the one-offs outlast `wait`, removes those
+/// still `created`, once and by id: their client died before starting
+/// them, so they would never finish. Refuses, naming them, when any other
+/// is left.
 async fn settle_oneoffs(
     docker: &Docker,
     paths: &TrialPaths,
@@ -212,6 +216,45 @@ async fn settle_oneoffs(
         if !told {
             progress(format_args!(
                 "waiting for one-off containers an interrupted command left: {names}"
+            ));
+            told = true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        inventory = Inventory::scan(docker).await?;
+        require_owned(paths, &inventory, Some(our_id))?;
+    }
+}
+
+/// `down`'s wait: for one-off containers an interrupted command left
+/// running, up to `wait`, then a fresh inventory. Refuses anything foreign
+/// that appeared meanwhile. It removes nothing and refuses no one-off:
+/// what is still unfinished, `created` or running, stays in the inventory
+/// that `down` lists before it asks, and is deleted only after a yes.
+async fn await_running_oneoffs(
+    docker: &Docker,
+    paths: &TrialPaths,
+    mut inventory: Inventory,
+    our_id: &str,
+    wait: Duration,
+) -> Result<Inventory, TrialError> {
+    let deadline = Instant::now() + wait;
+    let mut told = false;
+    loop {
+        let running: Vec<&Resource> = ownership::unfinished_oneoffs(&inventory, our_id)
+            .into_iter()
+            .filter(|r| r.state != "created")
+            .collect();
+        if running.is_empty() || Instant::now() >= deadline {
+            return Ok(inventory);
+        }
+        if !told {
+            let names = running
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            progress(format_args!(
+                "waiting for one-off containers an interrupted command left running: {names}"
             ));
             told = true;
         }
@@ -1446,17 +1489,42 @@ pub fn confirm(
 /// the claim last, then the trial directory. The lock file stays.
 pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
     let session = begin(paths).await?;
-    let docker = &session.docker;
     let view = load_down_view(paths)?;
     if let Some(view) = &view {
         require_its_engine(&session, view)?;
     }
-    let inventory = Inventory::scan(docker).await?;
-    require_owned(
+    remove_trial(
+        &session.docker,
         paths,
-        &inventory,
-        view.as_ref().map(|v| v.trial_id.as_str()),
-    )?;
+        view.as_ref(),
+        ONEOFF_WAIT,
+        |inventory| {
+            let mut stdout = io::stdout().lock();
+            render::render_inventory(&mut stdout, inventory, &paths.dir)
+                .and_then(|()| stdout.flush())
+                .map_err(|e| TrialError::io("write", "stdout", e))?;
+            drop(stdout);
+            let stdin = io::stdin();
+            let tty = stdin.is_terminal();
+            confirm(yes, tty, &mut stdin.lock(), &mut io::stderr().lock())
+                .map_err(|e| TrialError::io("read", "stdin", e))
+        },
+    )
+    .await
+}
+
+/// `down` on its own engine. `approve` shows the inventory and answers;
+/// nothing is deleted before it answers [`Confirmation::Proceed`], and
+/// then exactly the inventory it was shown is deleted, by id.
+async fn remove_trial(
+    docker: &Docker,
+    paths: &TrialPaths,
+    view: Option<&DownView>,
+    wait: Duration,
+    approve: impl FnOnce(&Inventory) -> Result<Confirmation, TrialError>,
+) -> Result<(), TrialError> {
+    let inventory = Inventory::scan(docker).await?;
+    require_owned(paths, &inventory, view.map(|v| v.trial_id.as_str()))?;
     let Some(view) = view else {
         // Nothing on the engine, and no state: at most an empty directory.
         if paths.check_dir()? {
@@ -1467,18 +1535,9 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
         }
         return Ok(());
     };
-    let inventory = settle_oneoffs(docker, paths, inventory, &view.trial_id, ONEOFF_WAIT).await?;
+    let inventory = await_running_oneoffs(docker, paths, inventory, &view.trial_id, wait).await?;
 
-    let mut stdout = io::stdout().lock();
-    render::render_inventory(&mut stdout, &inventory, &paths.dir)
-        .and_then(|()| stdout.flush())
-        .map_err(|e| TrialError::io("write", "stdout", e))?;
-    drop(stdout);
-    let stdin = io::stdin();
-    let tty = stdin.is_terminal();
-    let answer = confirm(yes, tty, &mut stdin.lock(), &mut io::stderr().lock())
-        .map_err(|e| TrialError::io("read", "stdin", e))?;
-    match answer {
+    match approve(&inventory)? {
         Confirmation::Proceed => {}
         Confirmation::Declined => return Err(TrialError::Declined),
         Confirmation::NeedsYes => return Err(TrialError::ConfirmationRequired),
@@ -1824,6 +1883,138 @@ esac"#,
             "{err:?}"
         );
         assert_eq!(calls, "");
+    }
+
+    /// What [`remove_trial`] did against [`settle_engine`].
+    struct Removal {
+        result: Result<(), TrialError>,
+        /// The engine calls that change something.
+        calls: String,
+        /// The inventory `approve` was shown.
+        shown: String,
+        /// The trial directory is still there.
+        dir_left: bool,
+    }
+
+    /// [`remove_trial`] of trial [`OURS`] while `ps` lists `listings`,
+    /// with `approve` answering as `down` does for `--yes`, a terminal,
+    /// and the line typed at the prompt.
+    async fn remove(
+        listings: &[&str],
+        wait: Duration,
+        yes: bool,
+        tty: bool,
+        typed: &str,
+    ) -> Removal {
+        let ([dir, _script], docker) = settle_engine(listings, false);
+        let home = tempfile::tempdir().unwrap();
+        let paths = TrialPaths::resolve(Some(&home.path().join("state")), None).unwrap();
+        paths.ensure_dir().unwrap();
+        let view = DownView {
+            trial_id: OURS.into(),
+            engine_id: None,
+        };
+        let mut shown = Vec::new();
+        let result = remove_trial(&docker, &paths, Some(&view), wait, |inventory| {
+            render::render_inventory(&mut shown, inventory, &paths.dir).unwrap();
+            Ok(confirm(yes, tty, &mut typed.as_bytes(), &mut Vec::new()).unwrap())
+        })
+        .await;
+        Removal {
+            result,
+            calls: std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default(),
+            shown: String::from_utf8(shown).unwrap(),
+            dir_left: paths.dir.exists(),
+        }
+    }
+
+    const CREATED_ROW: &str = "  container trawl-trial-fleet-admin-run-1  created\n";
+
+    /// A `created` one-off is listed for approval, and nothing is removed
+    /// until the answer is yes: not without a terminal, and not on `n`.
+    /// It is not waited for, so `down` shows it at once.
+    #[tokio::test]
+    async fn down_removes_nothing_before_a_yes() {
+        let created = oneoff("created");
+        let started = Instant::now();
+        let no_terminal = remove(&[&created], ONEOFF_WAIT, false, false, "y\n").await;
+        assert!(
+            started.elapsed() < ONEOFF_WAIT / 2,
+            "down waited for a created one-off"
+        );
+        assert!(
+            matches!(no_terminal.result, Err(TrialError::ConfirmationRequired)),
+            "{:?}",
+            no_terminal.result
+        );
+        let answered_n = remove(&[&created], ONEOFF_WAIT, false, true, "n\n").await;
+        assert!(
+            matches!(answered_n.result, Err(TrialError::Declined)),
+            "{:?}",
+            answered_n.result
+        );
+        for refused in [no_terminal, answered_n] {
+            assert_eq!(refused.calls, "", "removed before a yes");
+            assert!(refused.dir_left);
+            assert!(refused.shown.contains(CREATED_ROW), "{}", refused.shown);
+        }
+    }
+
+    /// After a yes, the listed one-off goes with everything else, by id.
+    #[tokio::test]
+    async fn down_deletes_the_listed_oneoff_after_a_yes() {
+        let created = oneoff("created");
+        for (yes, tty, typed) in [(true, false, ""), (false, true, "y\n")] {
+            let removal = remove(&[&created], Duration::ZERO, yes, tty, typed).await;
+            removal.result.unwrap();
+            assert!(removal.shown.contains(CREATED_ROW), "{}", removal.shown);
+            assert_eq!(removal.calls, "container rm --force -- 0ne0ff\n");
+            assert!(!removal.dir_left);
+        }
+    }
+
+    /// A running one-off is waited for before anything is shown. One that
+    /// outlasts the wait is listed as running, never removed before a
+    /// yes, and never refused: `down` deletes it with the rest.
+    #[tokio::test]
+    async fn down_waits_for_a_running_oneoff_then_lists_it() {
+        let (running, exited) = (oneoff("running"), oneoff("exited"));
+        let finished = remove(
+            &[&running, &exited],
+            Duration::from_secs(30),
+            false,
+            false,
+            "",
+        )
+        .await;
+        assert!(matches!(
+            finished.result,
+            Err(TrialError::ConfirmationRequired)
+        ));
+        assert!(
+            finished
+                .shown
+                .contains("  container trawl-trial-fleet-admin-run-1  exited\n"),
+            "{}",
+            finished.shown
+        );
+
+        let stuck = remove(&[&running], Duration::ZERO, false, false, "").await;
+        assert!(matches!(
+            stuck.result,
+            Err(TrialError::ConfirmationRequired)
+        ));
+        assert_eq!(stuck.calls, "");
+        assert!(
+            stuck
+                .shown
+                .contains("  container trawl-trial-fleet-admin-run-1  running\n"),
+            "{}",
+            stuck.shown
+        );
+        let approved = remove(&[&running], Duration::ZERO, true, false, "").await;
+        approved.result.unwrap();
+        assert_eq!(approved.calls, "container rm --force -- 0ne0ff\n");
     }
 
     /// Every `up`, first or resumed, starts the services through

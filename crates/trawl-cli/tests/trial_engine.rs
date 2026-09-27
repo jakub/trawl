@@ -52,6 +52,10 @@ impl Engine {
     /// `race.id` becomes the claim when the create runs, as another trial
     /// winning the race after `up` listed the engine. `inspect.err` makes
     /// `container inspect` of the claim fail with that stderr.
+    ///
+    /// `oneoff.state` makes `ps` list a one-off container `0ne0ff` of
+    /// trial [`TRIAL_ID`] in that state, as a `compose run` an interrupted
+    /// command left. `container rm` of it removes it.
     fn new(id: &str) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let stub = tmp.path().join("stub");
@@ -67,6 +71,9 @@ case "$*" in
   ps*)
     if [ -e "$d/claim.id" ]; then
       printf '{{"id":"c1a1m","name":"trawl-trial-claim","state":"created","project":"","trial":"%s","oneoff":""}}\n' "$(cat "$d/claim.id")"
+    fi
+    if [ -e "$d/oneoff.state" ]; then
+      printf '{{"id":"0ne0ff","name":"trawl-trial-fleet-admin-run-1","state":"%s","project":"trawl-trial","trial":"{trial}","oneoff":"True"}}\n' "$(cat "$d/oneoff.state")"
     fi ;;
   "volume ls"*|"network ls"*) ;;
   "image inspect"*) printf '{{"id":"sha256:aaaa","digests":[]}}' ;;
@@ -86,10 +93,14 @@ case "$*" in
     if [ -e "$d/inspect.err" ]; then cat "$d/inspect.err" >&2; exit 1; fi
     if [ -e "$d/claim.id" ]; then printf '{{"sh.trawl.trial.id":"%s"}}' "$(cat "$d/claim.id")"
     else echo "Error: No such container: trawl-trial-claim" >&2; exit 1; fi ;;
+  "container rm"*)
+    echo "$*" >> "$d/calls"
+    case "$*" in *0ne0ff*) rm -f "$d/oneoff.state" ;; esac ;;
   *) echo "$*" >> "$d/calls" ;;
 esac
 "#,
-            dir = stub.display()
+            dir = stub.display(),
+            trial = TRIAL_ID,
         );
         let program = stub.join("docker");
         std::fs::write(&program, script).unwrap();
@@ -227,6 +238,35 @@ fn down_proceeds_on_its_own_engine() {
     assert!(out.status.success(), "{stderr}");
     assert!(!dir.exists(), "{stderr}");
     assert_eq!(engine.calls(), "");
+}
+
+/// An interrupted command left a one-off container that never started.
+/// Without a terminal and without `--yes`, `down` deletes nothing, not
+/// even that one-off: it lists it with the rest, then refuses. With
+/// `--yes` it deletes it with everything else.
+#[test]
+fn down_deletes_nothing_before_it_is_confirmed() {
+    let engine = Engine::new("engine-a");
+    let dir = engine.trial_on("engine-a");
+    engine.put("oneoff.state", "created");
+
+    let out = engine.trawl(&["down"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("nothing was deleted"), "{stderr}");
+    assert_eq!(engine.calls(), "", "down deleted before it was confirmed");
+    assert!(dir.join("state.json").is_file(), "{stderr}");
+    assert!(
+        stdout.contains("  container trawl-trial-fleet-admin-run-1  created\n"),
+        "the one-off is not listed for approval: {stdout}"
+    );
+
+    let out = engine.trawl(&["down", "--yes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert_eq!(engine.calls(), "container rm --force -- 0ne0ff\n");
+    assert!(!dir.exists(), "{stderr}");
 }
 
 /// `status` lists containers only from the trial's own engine.

@@ -374,6 +374,10 @@ trawl trial down [--yes]
 | `--yes` | *(flag)* | `false` | Delete without asking. Required when stdin is not a terminal |
 
 Without a terminal and without `--yes`, `down` exits `1` and deletes nothing.
+Before it asks, `down` waits up to a minute for one-off containers that an
+interrupted `trawl trial` command left running. It lists the one-off
+containers that are left with the other resources, and deletes nothing
+before the answer.
 It deletes only resources that carry this trial's id, and it accepts state
 written by any CLI version. When no trial exists it prints so and exits `0`.
 
