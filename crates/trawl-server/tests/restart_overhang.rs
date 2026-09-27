@@ -819,7 +819,9 @@ async fn runs_owner(server: &TestServer, saved_id: i64) -> i64 {
 
 /// While the corpus is unsettled a manual run answers 503
 /// `corpus_recovering` before it claims: no run row, and the schedule row
-/// is unchanged. After settling the same request starts a run.
+/// is unchanged. After settling the same request starts a run. A saved
+/// query that does not exist, or that another key owns, is a 404 either
+/// way: the lookup comes before the corpus check.
 #[tokio::test(flavor = "multi_thread")]
 async fn nets_manual_run_is_refused_before_it_claims() {
     capture();
@@ -828,6 +830,24 @@ async fn nets_manual_run_is_refused_before_it_claims() {
     let (saved_id, schedule_id) = scheduled_saved_query(&server, "overhang_manual").await;
     let db = app_db(&server).await;
     let run = format!("/api/v1/saved/{saved_id}/run");
+
+    let foreign = trawl_client::HttpClient::new_insecure(&server.url, &server.admin_token)
+        .unwrap()
+        .create_saved("overhang_foreign", "service=nginx | stats count()")
+        .await
+        .unwrap()
+        .id;
+    for (what, id) in [("missing", saved_id + 1_000), ("foreign", foreign)] {
+        let answer = post(
+            &server,
+            &server.analyst_token,
+            &format!("/api/v1/saved/{id}/run"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(answer.status, 404, "{what}: {}", answer.body);
+        assert_eq!(answer.json()["error"]["code"], "not_found", "{what}");
+    }
 
     let before = schedule_row(&db, schedule_id).await;
     let refused = post(&server, &server.analyst_token, &run, serde_json::json!({})).await;

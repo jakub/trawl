@@ -41,7 +41,7 @@ use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
     HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus, SavedQuery, Schedule,
-    ScheduleWithStats, format_interval, parse_duration_secs, parse_interval,
+    ScheduleWithStats, StoreError, format_interval, parse_duration_secs, parse_interval,
 };
 
 // -- handlers ----------------------------------------------------------------
@@ -2803,9 +2803,10 @@ pub async fn runs_stats(
 ///
 /// No schedule is a 400: there is nothing to record a run under. A run in
 /// progress, a reached `max_runs` and an empty `since_last` window are 409s:
-/// the request is well formed, and the schedule's state refuses it. An
-/// unsettled corpus is a 503 `corpus_recovering`, answered before the claim,
-/// so it creates no run.
+/// the request is well formed, and the schedule's state refuses it. A saved
+/// query that does not exist or that another key owns is a 404, whatever
+/// the corpus state. An unsettled corpus is then a 503
+/// `corpus_recovering`, answered before the claim, so it creates no run.
 pub async fn trigger_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2815,6 +2816,19 @@ pub async fn trigger_run(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
+    let key_id = verified.id;
+
+    // A missing or foreign id is a 404 even while the corpus is unsettled.
+    // The lookup locks and claims nothing; the claim below checks
+    // ownership again under its own lock, and that check decides.
+    if state.storage.saved.get(saved_id, key_id).await?.is_none() {
+        return Err(StoreError::NotFound {
+            id: saved_id,
+            resource: "saved query",
+        }
+        .into());
+    }
+
     // Before the claim, which creates the run and plans its window from
     // the schedule: a run the corpus gate refused afterwards would record a
     // failure for a window nothing read (ADR-0041). No guard is held; the
@@ -2822,8 +2836,6 @@ pub async fn trigger_run(
     if let Some(reason) = state.query.pool.publication().unsettled() {
         return Err(ServerError::CorpusRecovering(reason));
     }
-
-    let key_id = verified.id;
 
     // One transaction: lock the saved query and read the DSL from it, lock
     // the schedule, refuse or plan, claim the run. The ownership check
