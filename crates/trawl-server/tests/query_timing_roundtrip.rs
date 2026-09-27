@@ -103,6 +103,16 @@ async fn query(server: &TestServer, dsl: &str) -> (String, Vec<Row>) {
     (request_id, rows)
 }
 
+/// The one value a `stats count()` answers with.
+async fn count(server: &TestServer, dsl: &str) -> i64 {
+    let (_, rows) = query(server, dsl).await;
+    assert_eq!(rows.len(), 1, "{dsl}: {rows:?}");
+    match rows[0].values().next() {
+        Some(Value::Integer(n)) => *n,
+        other => panic!("{dsl}: the count is an integer, got {other:?}"),
+    }
+}
+
 /// A column's value as an integer, only when the row carries it as one.
 fn integer(row: &Row, column: &str) -> Option<u64> {
     match row.get(column)? {
@@ -169,6 +179,20 @@ async fn query_timing_round_trips_through_trawld_telemetry() {
     .await;
     assert_eq!(found.len(), 1, "one account for the probe: {found:?}");
     let query_id = integer(&found[0], "query_id").expect("query_id is an integer");
+
+    // The flushed WAL holds no `pool_acquired`, which the timing account
+    // replaced, while it holds the probe's account: the count of zero is
+    // over a capture that saw the query run.
+    for (filter, expected) in [
+        (
+            format!("event_type=query_timing request_id=\"{request_id}\""),
+            1,
+        ),
+        ("event_type=pool_acquired".to_owned(), 0),
+    ] {
+        let dsl = format!("service=trawld _producer=trawld {filter} | stats count()");
+        assert_eq!(count(&server, &dsl).await, expected, "{dsl}");
+    }
 
     // 2. The issue's recipe returns the phases as numbers, not strings.
     let recipe = format!(
