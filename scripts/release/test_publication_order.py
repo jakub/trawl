@@ -161,6 +161,7 @@ class PublicationOrder(unittest.TestCase):
             '.github/workflows/macos-cli.yml', '.github/workflows/distribution-preflight.yml',
             'scripts/release/**', 'Dockerfile', 'Cargo.lock', 'Cargo.toml',
             'crates/trawl-cli/**', 'crates/trawl-web/**', 'crates/trawl-server/debian/**',
+            'crates/trawl-web-ui/**', 'crates/fleet-admin/**', 'crates/trawl-admin/**',
             'docs/src/content/docs/getting-started/first-query.md', 'crates/trawl-core/build.rs',
             'crates/trawl-core/build_support/**',
             'crates/trawl-core/Cargo.toml', 'crates/trawl-engine/Cargo.toml',

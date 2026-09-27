@@ -12,10 +12,14 @@ on:
       - 'Cargo.lock'
       - 'Cargo.toml'
       # The trial job runs the CLI, the browser proxy, and the Debian units
-      # from these crates, and follows the trial tutorial.
+      # from these crates, and follows the trial tutorial. It also reads the
+      # web UI by selector and the admin tools by their output text.
       - 'crates/trawl-cli/**'
       - 'crates/trawl-web/**'
       - 'crates/trawl-server/debian/**'
+      - 'crates/trawl-web-ui/**'
+      - 'crates/fleet-admin/**'
+      - 'crates/trawl-admin/**'
       - 'docs/src/content/docs/getting-started/first-query.md'
       - 'crates/trawl-core/Cargo.toml'
       - 'crates/trawl-core/build.rs'
