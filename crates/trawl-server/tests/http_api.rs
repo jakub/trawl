@@ -926,8 +926,9 @@ async fn query_timing_export_formats() {
         let inside: u64 = inside_legacy.iter().filter_map(|p| present.get(p)).sum();
         // Excluded: the legacy window lies inside the account's, after
         // the check and (CSV, JSON) before the render. `duration_ms`
-        // floors, so it needs no slack; the one microsecond covers each
-        // field of the account flooring on its own.
+        // floors, and flooring the subtracted phases only loosens the
+        // bound, so the inequality holds exactly; the one microsecond is
+        // defensive slack, not a flooring allowance.
         assert!(
             duration_ms * 1_000 <= observed - outside + 1,
             "{format}: export_complete's {duration_ms}ms excludes {outside_legacy:?} \
