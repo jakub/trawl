@@ -788,6 +788,45 @@ async fn query_timing_books_an_expired_saved_lookup() {
     timing::assert_sums(&event);
 }
 
+/// A `from saved` lookup that fails is booked like one that resolved: the
+/// name was read from postgres before it was found missing, so the error
+/// shows where its time went. The account stays a `query` one, never
+/// resolved, and carries the class without the name.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_books_a_failed_saved_lookup() {
+    use timing::{flag, int, phases, text};
+
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup().await;
+    let (status, request_id, body) = post_query(
+        &server,
+        "| from saved zz_timing_missing_report run=latest | stats count()",
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{body}");
+
+    let event = timing::only(capture, &request_id);
+    assert_eq!(text(&event, "outcome"), Some("error"));
+    assert_eq!(text(&event, "error_class"), Some("not_found"));
+    assert_eq!(text(&event, "kind"), Some("query"), "never resolved");
+    assert_eq!(flag(&event, "work_started"), Some(false));
+    assert_eq!(flag(&event, "timing_complete"), Some(true));
+    assert_eq!(
+        phases(&event).into_keys().collect::<Vec<_>>(),
+        ["dsl_check", "saved_lookup"],
+        "{event:?}"
+    );
+    assert!(int(&event, "query_saved_lookup_us").is_some(), "{event:?}");
+    assert!(!event.contains_key("error"), "{event:?}");
+    assert!(
+        !serde_json::to_string(&event)
+            .unwrap()
+            .contains("zz_timing_missing_report"),
+        "no error text: {event:?}"
+    );
+    timing::assert_sums(&event);
+}
+
 /// A query refused at its admission check reports that check alone, with
 /// its class and without its text.
 #[tokio::test(flavor = "multi_thread")]

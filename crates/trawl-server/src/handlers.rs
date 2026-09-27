@@ -182,11 +182,13 @@ pub async fn query(
     // the pre-start capacity refusal, since no work was ever started and a
     // timeout history row would claim otherwise.
     //
-    // `saved_lookup` is booked for a `from saved` read that resolved, and
-    // only then is the account a `from_saved` one: every query takes the
-    // detection parse, and an ordinary query's is not a lookup. A lookup
-    // the deadline cut is booked too, like any request-side wait a
-    // deadline ends (ADR-0046): the refusal shows where its time went.
+    // `saved_lookup` is booked for every `from saved` read, and only one
+    // that resolved makes the account a `from_saved` one: every query
+    // takes the detection parse, and an ordinary query's is not a lookup.
+    // A lookup that failed (an unknown saved query, a database error) is
+    // booked like one that resolved, and one the deadline cut is booked
+    // like any request-side wait a deadline ends (ADR-0046): the refusal
+    // shows where its time went.
     let checked = timing.clock().time(QueryPhase::DslCheck, || {
         crate::admission::check_dsl(&req.query)
     });
@@ -203,9 +205,13 @@ pub async fn query(
                 timing.set_kind(TimingKind::FromSaved);
                 Ok(Some(resolved))
             }
-            Ok(resolved) => {
+            Ok(Ok(None)) => {
                 timing.clock().discard(QueryPhase::SavedLookup);
-                resolved
+                Ok(None)
+            }
+            Ok(Err(refusal)) => {
+                timing.clock().exit(QueryPhase::SavedLookup);
+                Err(refusal)
             }
             Err(crate::deadline::Expired) => {
                 timing.clock().exit(QueryPhase::SavedLookup);
