@@ -600,6 +600,29 @@ fn down_asks_before_it_deletes_a_directory_without_state() {
     assert_eq!(engine.calls(), "");
 }
 
+/// (c) over a trial directory that already held files but no state: the
+/// foreign claim removes only the state this `up` wrote, and the files
+/// and the directory stay.
+#[test]
+fn a_foreign_claim_keeps_files_the_new_state_did_not_write() {
+    let engine = Engine::new("engine-a");
+    let dir = engine.leftover(&[("notes.txt", "mine\n")]);
+    engine.put("race.id", THEIRS);
+    let stderr = engine.up();
+    assert!(
+        stderr.contains(&format!("trawl-trial-claim (trial id {THEIRS})")),
+        "{stderr}"
+    );
+    assert!(!dir.join("state.json").exists(), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("notes.txt"))
+            .ok()
+            .as_deref(),
+        Some("mine\n"),
+        "up deleted a file it did not write: {stderr}"
+    );
+}
+
 /// An empty trial directory without a state holds nothing to lose, so
 /// `down` removes it without asking.
 #[test]

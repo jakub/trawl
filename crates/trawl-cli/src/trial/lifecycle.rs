@@ -730,9 +730,11 @@ async fn resolve_image(docker: &Docker, reference: &str) -> Result<ImageRecord, 
 /// written before the claim, so an interrupted first `up` leaves a trial
 /// the rerun resumes, never a claim without state. Only a claim our own
 /// inspect shows carrying another id ([`Claimed::Foreign`]) removes the
-/// directory this call created. Every error keeps it, because the claim
-/// may exist with this trial's id, and a rerun must find the state that
-/// owns it; a rerun that finds no claim creates it.
+/// state this call wrote, then the directory if that leaves it empty: a
+/// directory that held files without a state keeps them. Every error keeps
+/// the state, because the claim may exist with this trial's id, and a
+/// rerun must find the state that owns it; a rerun that finds no claim
+/// creates it.
 async fn create(
     paths: &TrialPaths,
     docker: &Docker,
@@ -771,7 +773,8 @@ async fn create(
     if let Claimed::Foreign { .. } = claimed
         && let Ok(true) = paths.check_dir()
     {
-        let _ = std::fs::remove_dir_all(&paths.dir);
+        let _ = std::fs::remove_file(paths.state_file());
+        let _ = std::fs::remove_dir(&paths.dir);
     }
     claimed.require_ours()?;
     Ok(state)
