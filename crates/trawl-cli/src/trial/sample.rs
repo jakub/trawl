@@ -260,8 +260,8 @@ const DOCUMENTED_SERVICE: &str = "checkout";
 
 /// The query the trial tutorial runs. It has no time clause: `trawl query`
 /// sends none of its own, so it counts every stored sample and gives the
-/// same row for the trial's whole life. Naming one sample service keeps
-/// trawld's self-telemetry out of it.
+/// same row while the samples are retained (90 days by default). Naming
+/// one sample service keeps trawld's self-telemetry out of it.
 pub const DOCUMENTED_QUERY: &str =
     "service=checkout _severity>=error | stats count() as errors by service";
 
