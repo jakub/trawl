@@ -300,7 +300,7 @@ async fn http_handler_directory_sync_failure_is_a_redacted_500_after_publishing_
     let hot = state.query.hot_buffer.as_ref().unwrap().clone();
     let wal = state.ingest.wal_writer.as_ref().unwrap().clone();
     // Make `prod` durable first, so the injected failure hits the env
-    // directory sync after the first group's rename, not the root sync.
+    // directory sync after the first group's link, not the root sync.
     std::fs::remove_file(wal.write("prod", "warm", b"{}\n").unwrap()).unwrap();
 
     let metrics = common::test_metrics_handle();

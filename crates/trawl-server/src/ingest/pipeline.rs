@@ -52,7 +52,8 @@ pub struct ServiceBatch {
 }
 
 impl ServiceBatch {
-    /// Add an event to this batch, serializing it to ndjson in the process.
+    /// Add an event to this batch, serializing it to ndjson in the WAL's
+    /// line format ([`encode_line`](crate::ingest::wal::encode_line)).
     ///
     /// The map is kept only if its line was written, so maps and lines stay
     /// one to one. Serializing a `Map<String, Value>` into a `Vec` cannot
@@ -62,12 +63,11 @@ impl ServiceBatch {
     /// the WAL bytes.
     pub fn push(&mut self, map: Map<String, serde_json::Value>) {
         let start = self.ndjson.len();
-        if serde_json::to_writer(&mut self.ndjson, &map).is_err() {
+        if crate::ingest::wal::encode_line(&map, &mut self.ndjson).is_err() {
             self.ndjson.truncate(start);
             debug_assert!(false, "a JSON object failed to serialize");
             return;
         }
-        self.ndjson.push(b'\n');
         self.maps.push(map);
     }
 
@@ -183,7 +183,7 @@ impl PipelineWriter {
         } in groups
         {
             let event_count = batch.maps.len();
-            // Compaction may read the WAL as soon as its rename completes.
+            // Compaction may read the WAL as soon as its link completes.
             // Keep its publication and drain behind this hot insertion.
             let publication = self.hot_buffer.as_ref().map(|buf| buf.publication());
             let _ingest = publication.as_ref().map(|gate| gate.blocking_ingest());
@@ -378,6 +378,30 @@ mod tests {
     }
 
     #[test]
+    fn push_writes_the_wal_line_format() {
+        let maps = [
+            serde_json::json!({"f": 0.1, "big": 1e300, "neg": -0.0, "i": -7, "u": u64::MAX}),
+            serde_json::json!({"s": "quote \" nul \u{0} 🦀", "t": true, "n": null}),
+            serde_json::json!({}),
+        ];
+        let mut batch = ServiceBatch::default();
+        let mut expected = Vec::new();
+        for map in &maps {
+            let map = map.as_object().unwrap();
+            batch.push(map.clone());
+            let mut line = serde_json::to_vec(map).unwrap();
+            line.push(b'\n');
+            expected.extend_from_slice(&line);
+        }
+        assert_eq!(batch.ndjson, expected);
+        let mut encoded = Vec::new();
+        for map in &batch.maps {
+            crate::ingest::wal::encode_line(map, &mut encoded).unwrap();
+        }
+        assert_eq!(batch.ndjson, encoded);
+    }
+
+    #[test]
     fn admitted_failed_group_releases_only_its_reservation() {
         let recorder = crate::metrics::prometheus_builder().build_recorder();
         let handle = recorder.handle();
@@ -439,7 +463,7 @@ mod tests {
             let before = hot.charged();
             let group = admit(&pipeline, "prod", "syslog", 2);
             // Make `prod` durable first, so the injected failure hits the
-            // env directory sync after the rename, not the root sync.
+            // env directory sync after the link, not the root sync.
             std::fs::remove_file(wal.write("prod", "warm", b"{}\n").unwrap()).unwrap();
             wal.fail_next_directory_sync_for_test();
             assert_eq!(pipeline.write(vec![group]), 0);

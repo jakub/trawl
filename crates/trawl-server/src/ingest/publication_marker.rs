@@ -222,7 +222,7 @@ impl ValidatedMarker {
     }
 }
 
-fn marker_file_name(service: &str) -> String {
+pub(crate) fn marker_file_name(service: &str) -> String {
     format!("{MARKER_PREFIX}{service}{MARKER_SUFFIX}")
 }
 

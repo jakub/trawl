@@ -4075,7 +4075,7 @@ fn publish_output(
     {
         let publication = hot_buffer.map(HotBuffer::publication);
         let publication_guard = publication.as_ref().map(|gate| gate.blocking_write());
-        // A WAL writer holds the ingest side of this gate from its rename
+        // A WAL writer holds the ingest side of this gate from its link
         // until it has fsynced or withdrawn the file, so under the write
         // guard a consumed file that is gone was withdrawn: its write was
         // rejected and its sender may retry. Publishing its rows would
