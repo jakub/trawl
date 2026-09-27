@@ -16,6 +16,35 @@ use tokio::sync::{
 
 use crate::error::ServerError;
 
+/// Why the corpus is not settled, so reads refuse with 503
+/// `corpus_recovering` (ADR-0041). When both hold, `RollupPending` is the
+/// one reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CorpusUnsettled {
+    /// A rollup marker is unresolved, or the rollup scan failed: cold data
+    /// may mix rollup generations.
+    RollupPending,
+    /// WAL written before the restart is not yet proven to be in the hot
+    /// buffer or drained to Parquet.
+    RestartBacklog,
+}
+
+impl CorpusUnsettled {
+    /// Every reason, for consumers that enumerate (gauges, zero-init).
+    pub const ALL: [Self; 2] = [Self::RollupPending, Self::RestartBacklog];
+
+    /// The fixed `snake_case` literal this reason is reported as: the
+    /// health check's value, the gauge's `reason` label and the failure
+    /// record's cause kind.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RollupPending => "rollup_pending",
+            Self::RestartBacklog => "restart_backlog",
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct PendingRollups {
     markers: HashSet<PathBuf>,

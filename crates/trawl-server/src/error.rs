@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response};
 use trawl_engine::error::EngineError;
 
 use crate::hot_buffer::Charge;
+use crate::publication::CorpusUnsettled;
 use crate::report_window::{MaterializeError, PlanError, WindowPolicyError};
 use crate::store::StoreError;
 
@@ -21,6 +22,20 @@ use crate::store::StoreError;
 /// the scheduler's run rows and the client response unchanged. A refusal
 /// here is 503, never the 504 an execution timeout earns — nothing ran.
 pub const CAPACITY_NOT_STARTED: &str = "server at capacity: the query was not started";
+
+/// The whole answer to a read refused while the corpus is not settled
+/// (ADR-0041). Fixed per reason: no counts, paths or marker names, so the
+/// wire, the query tracker and a run row can all carry it unredacted.
+const fn corpus_recovering_message(reason: CorpusUnsettled) -> &'static str {
+    match reason {
+        CorpusUnsettled::RestartBacklog => {
+            "Search is unavailable while the server finishes loading data from before its restart."
+        }
+        CorpusUnsettled::RollupPending => {
+            "Search is unavailable while the server finishes an interrupted storage rollup."
+        }
+    }
+}
 
 /// The 413 sentence: what the request charged, if it was parsed, against
 /// what one request may charge. Both are counts the sender can act on
@@ -147,6 +162,21 @@ pub enum ServerError {
         ceiling: Charge,
     },
 
+    /// A corpus read refused because the corpus is not settled: WAL from
+    /// before a restart is not yet proven covered, or a rollup is
+    /// unresolved (503, no `Retry-After`, ADR-0041). The message is fixed
+    /// per reason.
+    #[error("{}", corpus_recovering_message(*.0))]
+    CorpusRecovering(CorpusUnsettled),
+
+    /// The hot buffer's snapshot could not be built, so a read refuses
+    /// rather than answer without the newest events (503, ADR-0041). The
+    /// I/O error's kind rides along for [`ServerError::cause_kind`]; its
+    /// text can quote event values or paths and reaches neither the
+    /// message nor the wire.
+    #[error("hot buffer snapshot failed")]
+    HotSnapshot(#[source] std::io::Error),
+
     /// Internal server error (unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
@@ -238,11 +268,17 @@ pub enum CauseKind {
     /// The hot buffer refused an ingest request for lack of free space
     /// (ADR-0043): compaction has not drained what is already admitted.
     HotBufferFull,
+    /// A read was refused because WAL written before a restart is not yet
+    /// proven covered by the hot buffer or Parquet (ADR-0041).
+    RestartBacklog,
+    /// A read was refused because a rollup is unresolved or the rollup
+    /// scan failed (ADR-0026, ADR-0041).
+    RollupPending,
 }
 
 impl CauseKind {
     /// Every kind, for closed-set checks and for consumers that enumerate.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 31] = [
         Self::None,
         Self::Unknown,
         Self::IoNotFound,
@@ -272,6 +308,8 @@ impl CauseKind {
         Self::PgOther,
         Self::AuthWorker,
         Self::HotBufferFull,
+        Self::RestartBacklog,
+        Self::RollupPending,
     ];
 
     /// The fixed `snake_case` literal this kind is recorded as.
@@ -307,6 +345,8 @@ impl CauseKind {
             Self::PgOther => "pg_other",
             Self::AuthWorker => "auth_worker",
             Self::HotBufferFull => "hot_buffer_full",
+            Self::RestartBacklog => "restart_backlog",
+            Self::RollupPending => "rollup_pending",
         }
     }
 
@@ -422,8 +462,9 @@ impl ServerError {
             // unable to tell a capacity refusal from any other 503.
             Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
-            // `HotBufferFull` and `IngestBatchTooLarge` render fixed text
-            // and counts, with nothing to redact.
+            // `HotBufferFull`, `IngestBatchTooLarge`, `CorpusRecovering`
+            // and `HotSnapshot` render fixed text and counts, with nothing
+            // to redact.
             other => other.to_string(),
         }
     }
@@ -465,9 +506,13 @@ impl ServerError {
             // driver's kind rode along; `cause_kind` tells it apart.
             // A full hot buffer is a 503 like any other refusal to serve;
             // `cause_kind` names it, as it does an auth backend outage.
-            Self::ServiceUnavailable(_) | Self::AuthBackend(_) | Self::HotBufferFull { .. } => {
-                "service_unavailable"
-            }
+            // An unsettled corpus and a failed hot snapshot are too: the
+            // reason and the I/O kind are cause kinds, not classes.
+            Self::ServiceUnavailable(_)
+            | Self::AuthBackend(_)
+            | Self::HotBufferFull { .. }
+            | Self::CorpusRecovering(_)
+            | Self::HotSnapshot(_) => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::Internal(_) => "internal",
             Self::Panicked(_) => "panic",
@@ -482,11 +527,13 @@ impl ServerError {
     pub fn cause_kind(&self) -> CauseKind {
         match self {
             Self::Engine(EngineError::Database(e)) => CauseKind::of_duckdb(e),
-            Self::Engine(EngineError::Io(e)) => CauseKind::of_io(e),
+            Self::Engine(EngineError::Io(e)) | Self::HotSnapshot(e) => CauseKind::of_io(e),
             Self::Store(StoreError::Unavailable(e)) => CauseKind::of_sqlx(e),
             Self::Store(StoreError::Migration(e)) => CauseKind::of_store_schema(e),
             Self::AuthBackend(kind) => *kind,
             Self::HotBufferFull { .. } => CauseKind::HotBufferFull,
+            Self::CorpusRecovering(CorpusUnsettled::RestartBacklog) => CauseKind::RestartBacklog,
+            Self::CorpusRecovering(CorpusUnsettled::RollupPending) => CauseKind::RollupPending,
             // A pre-start capacity refusal is a pressure outcome the class
             // names in full. Every other 503 was built from a string and
             // kept no typed source.
@@ -844,6 +891,25 @@ impl IntoResponse for ServerError {
                      compaction drains",
                 ),
             ),
+            // No `Retry-After`: nothing says when a backlog drains or a
+            // rollup finishes. The reason is the failure record's cause
+            // kind, and the sentence already says it in words.
+            Self::CorpusRecovering(reason) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(
+                    ErrorCode::CorpusRecovering,
+                    corpus_recovering_message(*reason),
+                ),
+            ),
+            // Never a cold-only answer in place of the newest events. The
+            // I/O error's text stays off the wire; its kind is recorded.
+            Self::HotSnapshot(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(
+                    ErrorCode::ServiceUnavailable,
+                    "recent events could not be read for this query",
+                ),
+            ),
             // A client error with no `Retry-After`: the same request can
             // never fit.
             Self::IngestBatchTooLarge { .. } => (
@@ -1070,10 +1136,12 @@ mod tests {
                 | CauseKind::PgSchema
                 | CauseKind::PgOther
                 | CauseKind::AuthWorker
-                | CauseKind::HotBufferFull => true,
+                | CauseKind::HotBufferFull
+                | CauseKind::RestartBacklog
+                | CauseKind::RollupPending => true,
             })
             .count();
-        assert_eq!(variants, 29, "ALL lists every variant");
+        assert_eq!(variants, 31, "ALL lists every variant");
 
         let mut seen = std::collections::HashSet::new();
         for kind in CauseKind::ALL {
@@ -1304,6 +1372,84 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(body["error"]["code"], "hot_buffer_full");
+    }
+
+    /// A corpus that is not settled refuses reads with one 503 per reason
+    /// (ADR-0041): classed like any refusal to serve, the reason as its
+    /// cause kind, and a fixed sentence that names no count, path or
+    /// marker. No `Retry-After`: nothing tells the server when a backlog
+    /// drains or a rollup finishes.
+    #[tokio::test]
+    async fn corpus_recovering_is_a_503_naming_its_reason_without_retry_after() {
+        for reason in CorpusUnsettled::ALL {
+            // Exhaustive on purpose: a new reason needs its own row here.
+            let (kind, message) = match reason {
+                CorpusUnsettled::RestartBacklog => (
+                    CauseKind::RestartBacklog,
+                    "Search is unavailable while the server finishes loading data from before \
+                     its restart.",
+                ),
+                CorpusUnsettled::RollupPending => (
+                    CauseKind::RollupPending,
+                    "Search is unavailable while the server finishes an interrupted storage \
+                     rollup.",
+                ),
+            };
+            let err = ServerError::CorpusRecovering(reason);
+            assert_eq!(err.error_class(), "service_unavailable");
+            assert_eq!(err.cause_kind(), kind);
+            assert_eq!(kind.as_str(), reason.label());
+            // The tracker and a run row get the same sentence the wire does.
+            assert_eq!(err.safe_message(), message);
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none(),
+                "{reason:?} must not send Retry-After"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], "corpus_recovering");
+            assert_eq!(body["error"]["message"], message);
+            assert!(body["error"].get("details").is_none());
+        }
+    }
+
+    /// A hot snapshot that cannot be built refuses the read instead of
+    /// answering without the newest events (ADR-0041): a 503 classed like
+    /// any refusal to serve, its cause kind read off the I/O error, and a
+    /// fixed body that quotes nothing the error carried.
+    #[tokio::test]
+    async fn a_hot_snapshot_failure_is_a_redacted_503_with_its_io_kind() {
+        use std::io::{Error as IoError, ErrorKind};
+        for (io_kind, expected) in [
+            (ErrorKind::InvalidData, CauseKind::IoInvalidData),
+            (ErrorKind::StorageFull, CauseKind::IoStorageFull),
+            (ErrorKind::WouldBlock, CauseKind::IoOther),
+        ] {
+            let err = ServerError::HotSnapshot(IoError::new(
+                io_kind,
+                "zz_secret_value at /var/lib/trawl/zz_path",
+            ));
+            assert_eq!(err.error_class(), "service_unavailable");
+            assert_eq!(err.cause_kind(), expected);
+            assert!(!err.safe_message().contains("zz_"), "{err:?}");
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .is_none()
+            );
+            let body = body_string(response).await;
+            assert!(!body.contains("zz_"), "got: {body}");
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["error"]["code"], "service_unavailable");
+        }
     }
 
     /// An oversized ingest request is a 413 with no `Retry-After`, and its

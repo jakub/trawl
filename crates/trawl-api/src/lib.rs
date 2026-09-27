@@ -133,6 +133,11 @@ pub enum ErrorCode {
     /// request (413, no `Retry-After`): it can never fit, so the sender
     /// must split it (ADR-0043).
     IngestBatchTooLarge,
+    /// The server refuses corpus reads until it can prove the corpus
+    /// complete again (503, no `Retry-After`): it is still loading data
+    /// written before a restart, or an interrupted storage rollup is
+    /// unresolved (ADR-0041). The failure record's cause kind says which.
+    CorpusRecovering,
 }
 
 /// Source location within a query string.
@@ -2264,6 +2269,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::IngestBatchTooLarge).unwrap(),
             "\"ingest_batch_too_large\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::CorpusRecovering).unwrap(),
+            "\"corpus_recovering\""
         );
     }
 

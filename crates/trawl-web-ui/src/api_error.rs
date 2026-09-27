@@ -123,7 +123,8 @@ pub fn is_query_error(code: &ErrorCode) -> bool {
         | ErrorCode::InternalError
         | ErrorCode::ServiceUnavailable
         | ErrorCode::HotBufferFull
-        | ErrorCode::IngestBatchTooLarge => false,
+        | ErrorCode::IngestBatchTooLarge
+        | ErrorCode::CorpusRecovering => false,
     }
 }
 
@@ -154,7 +155,7 @@ mod tests {
     /// Every wire code, spelled out. The match in `is_query_error` has no
     /// wildcard, so a new code already fails to compile there; this list
     /// makes the test say which way each existing code is classified.
-    const EVERY_CODE: [(ErrorCode, bool); 16] = [
+    const EVERY_CODE: [(ErrorCode, bool); 17] = [
         (ErrorCode::ParseError, true),
         (ErrorCode::ValidationError, true),
         (ErrorCode::ExecutionError, false),
@@ -171,6 +172,7 @@ mod tests {
         (ErrorCode::ServiceUnavailable, false),
         (ErrorCode::HotBufferFull, false),
         (ErrorCode::IngestBatchTooLarge, false),
+        (ErrorCode::CorpusRecovering, false),
     ];
 
     #[test]
