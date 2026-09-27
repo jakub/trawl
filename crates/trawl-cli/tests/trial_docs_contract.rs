@@ -272,3 +272,23 @@ fn the_cli_reference_documents_every_trial_flag_and_ca_cert() {
         assert!(CLI_REFERENCE.contains(&format!("| {verb} |")), "{verb}");
     }
 }
+
+/// The samples age out under the default retention, so no page promises an
+/// exact result for longer than they are kept.
+#[test]
+fn the_exact_results_are_bounded_by_retention() {
+    for (page, text) in [
+        ("first-query", FIRST_QUERY),
+        ("query-tutorial", QUERY_TUTORIAL),
+    ] {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !flat.contains("whole life"),
+            "{page} promises a result for the trial's whole life"
+        );
+        assert!(
+            flat.contains("while the samples are retained (90 days by default)"),
+            "{page} does not bound its exact results by retention"
+        );
+    }
+}

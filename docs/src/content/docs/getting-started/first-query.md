@@ -88,8 +88,9 @@ The samples cover the 24 hours before the first `up` loaded them, and a later
 `up` does not move them. `trawl trial status` prints their exact range. The
 newest events sit in the last 10 minutes before that moment, and the three `service=tutorial`
 events that [Build a query](/use/query-tutorial/) uses sit at the newest
-timestamp. With the default retention of 90 days, the samples age out 90 days
-after `up`.
+timestamp. Retention deletes them like any other events: with the default of
+90 days, they start to age out about 90 days after the first `up`. Every exact
+result on this page holds while the samples are retained (90 days by default).
 
 ## Sign in to the browser
 
@@ -147,8 +148,8 @@ Expect:
 ```
 
 Property order can differ. The query names no time range, and `trawl query`
-adds none, so this row holds for the trial's whole life. The four quick-start
-examples run the same way:
+adds none, so this row holds while the samples are retained (90 days by
+default). The four quick-start examples run the same way:
 
 ```bash
 trawl -p trial query '* | head 20'

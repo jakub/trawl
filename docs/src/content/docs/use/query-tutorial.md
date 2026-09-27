@@ -9,7 +9,8 @@ use the three `service=tutorial` events that `trawl trial up` loads with its
 sample data ([Your first query](/getting-started/first-query/)). They carry the
 time at which the first `trawl trial up` loaded the samples, and a later `up`
 does not move them, so the examples name no time range. `trawl query` adds
-none. In the browser, select `7d` in **Date range**, because the default 15
+none. The expected rows hold while the samples are retained (90 days by
+default). In the browser, select `7d` in **Date range**, because the default 15
 minutes stops covering the events soon after `up`. `7d` ends at the current
 time, so it covers the events for about seven days. After that, open
 **Date range** and select **Absolute**. In the `Samples` section that
