@@ -399,7 +399,10 @@ fn directory_exists(path: &Path) -> std::io::Result<bool> {
     }
 }
 
-fn scan_markers(root: &Path, markers: &mut HashSet<PathBuf>) -> std::io::Result<()> {
+/// Collect every `root/{env}/{date}/.rollup-*` marker into `markers`. A
+/// missing root holds none; any other listing error is an `Err`, because an
+/// unknown marker may exist.
+pub(crate) fn scan_markers(root: &Path, markers: &mut HashSet<PathBuf>) -> std::io::Result<()> {
     let envs = match std::fs::read_dir(root) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),

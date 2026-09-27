@@ -323,67 +323,16 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         state.query.query_log = Some(Arc::new(log));
     }
 
-    // ADR-0009 boot conformance pass: make the write-time invariant true
-    // over the standing corpus before anything reads or writes it. Only on
-    // ingest-enabled nodes (a query-only node does not own the data root).
-    // Fatal on failure, like the epoch gate — a data root not proven
-    // conformant must not serve queries. A per-path failure is not that:
-    // an unreadable or foreign parquet file, or a subdirectory the walk
-    // cannot enumerate, is skipped and counted inside the pass, so one bad
-    // path cannot keep the daemon down. So is every file a publication
-    // marker still claims after boot recovery (ADR-0041): the pass leaves it
-    // untouched and withholds completion, so the next boot conforms it once
-    // the marker resolves.
-    if config.ingest.enabled {
-        let summary = trawl_server::catalog::conform::ensure_conformance(
-            &state.storage.catalog,
-            &state.query.field_catalog,
-            &config.data.base_dir(),
-            &config.wal_dir(),
-            &config.ingest.compaction_memory_limit,
-        )
-        .await?;
-        tracing::info!(
-            event_type = "catalog_conform",
-            ran = summary.ran,
-            scanned = summary.scanned,
-            rewritten = summary.rewritten,
-            skipped = summary.skipped,
-            observed = summary.observed,
-            "boot conformance pass finished"
-        );
-    } else {
-        // A query-only node skips the pass, but `/api/v1/schema` still
-        // answers from this catalog's pins — which describe the archive only
-        // if this catalog wrote it. Check the same dual-sided marker as a
-        // gate, and refuse the boot rather than advertise a schema about
-        // someone else's data. Only a marker naming another catalog does
-        // that: an archive with no marker (what an incomplete conformance
-        // pass leaves) warns and serves, exactly as the ingest node does for
-        // the same corpus.
-        let identity = trawl_server::catalog::conform::verify_archive_identity(
-            &state.storage.catalog,
-            &config.data.base_dir(),
-        )
-        .await?;
-        match identity {
-            trawl_server::catalog::conform::ArchiveIdentity::Unproven => tracing::warn!(
-                event_type = "catalog_identity_unproven",
-                "query-only node: the archive carries no conformance marker, so \
-                 the pins /api/v1/schema advertises are not proven to describe \
-                 it — boot once with [ingest] enabled = true to run the \
-                 conformance pass, and check for skipped paths if it has"
-            ),
-            identity => tracing::info!(
-                event_type = "catalog_identity",
-                identity = ?identity,
-                "query-only node: archive belongs to the connected catalog"
-            ),
-        }
-    }
+    // Make the corpus ready to serve before anything reads or writes it: on
+    // an ingest node, rollup-marker recovery, the ADR-0009 boot conformance
+    // pass and WAL hydration, in that order; on a query-only node, the
+    // archive identity gate (ADR-0041 slice 2). The integration fixture
+    // runs the same function, so the tests boot this sequence.
+    trawl_server::boot::prepare_corpus(&state, &config).await?;
 
-    // Recovery and conformance are complete. Telemetry can now write to
-    // the WAL and hot buffer, alongside the other ingest producers.
+    // Recovery, conformance and hydration are complete. Telemetry can now
+    // write to the WAL and hot buffer, alongside the other ingest
+    // producers: a file it writes from here on is inserted, never hydrated.
     // Activate internal telemetry by injecting the WAL writer.
     if let Some((handle, layer)) = &telemetry {
         if let Some(writer) = &state.ingest.wal_writer {
@@ -608,8 +557,9 @@ fn prepare_data_root(
 /// A marker recovery cannot resolve is logged and counted on
 /// `trawl_publication_recovery_total` by outcome, and keeps its service out
 /// of compaction; each tick retries it. The boot conformance pass then
-/// leaves the files it claims alone. Only an unreadable WAL root is
-/// fatal, as it is for the epoch gate's WAL validation.
+/// leaves the files it claims alone, and hydration skips the services it
+/// blocks. Only an unreadable WAL root is fatal, as it is for the epoch
+/// gate's WAL validation.
 fn recover_publications_at_boot(
     wal_dir: &std::path::Path,
     data_root: &std::path::Path,

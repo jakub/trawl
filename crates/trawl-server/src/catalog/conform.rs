@@ -72,10 +72,17 @@
 //! fails closed, and the pass skips every file. Either skip withholds
 //! completion, so the next boot conforms the file once its marker resolves.
 //!
+//! A day directory holding a rollup marker is deferred the same way
+//! (ADR-0041 slice 2). Boot rollup recovery runs just before the pass, so a
+//! marker still present is one recovery could not resolve, and the
+//! compaction pass that later recovers it may retire or replace any file of
+//! that day. Markers that cannot be read fail closed like the publication
+//! claims: the pass skips every file.
+//!
 //! The repin engine reuses this machinery: `layout_path`, `Progress` and
 //! `open_bounded_connection`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb_type};
@@ -103,9 +110,10 @@ pub struct ConformSummary {
     pub scanned: usize,
     /// Files rewritten to conform.
     pub rewritten: usize,
-    /// Files skipped as unreadable, foreign or claimed by a pending
-    /// publication marker (nonzero = the corpus was not proven conformant,
-    /// so completion is withheld and the next boot re-runs).
+    /// Files skipped as unreadable, foreign, claimed by a pending
+    /// publication marker or in a day an unresolved rollup marker holds
+    /// (nonzero = the corpus was not proven conformant, so completion is
+    /// withheld and the next boot re-runs).
     pub skipped: usize,
     /// `(field, service)` observations backfilled from the standing corpus.
     pub observed: usize,
@@ -297,7 +305,8 @@ fn archive_is_empty(data_dir: &Path) -> bool {
 /// already ran for exactly this (catalog, data root) pair.
 ///
 /// `wal_dir` holds the publication markers. Every file a pending marker
-/// claims is left untouched and counts as skipped.
+/// claims, and every file in a day directory that holds a rollup marker, is
+/// left untouched and counts as skipped.
 pub async fn ensure_conformance(
     store: &CatalogStore,
     cache: &FieldCatalog,
@@ -343,8 +352,8 @@ pub async fn ensure_conformance(
         .into_iter()
         .collect();
 
-    // Phase A (blocking): read the publication claims, then enumerate +
-    // describe the corpus.
+    // Phase A (blocking): read the publication claims and the rollup
+    // markers, then enumerate + describe the corpus.
     let (scan, scan_skipped) = {
         let data_dir = data_dir.to_path_buf();
         let wal_dir = wal_dir.to_path_buf();
@@ -352,7 +361,14 @@ pub async fn ensure_conformance(
         let pinned = existing.clone();
         tokio::task::spawn_blocking(move || {
             let claims = scan_claims(&wal_dir);
-            scan_corpus(&data_dir, &memory_limit, &pinned, claims.as_ref())
+            let rollups = pending_rollup_days(&data_dir);
+            scan_corpus(
+                &data_dir,
+                &memory_limit,
+                &pinned,
+                claims.as_ref(),
+                rollups.as_ref(),
+            )
         })
         .await
         .map_err(|e| crate::error::join_failure_text("conformance scan", e))??
@@ -451,8 +467,9 @@ async fn publish_completion(
             scanned,
             rewritten,
             skipped,
-            "boot conformance pass skipped unreadable, foreign or \
-             publication-claimed paths; the corpus is not proven conformant \
+            "boot conformance pass skipped unreadable, foreign, \
+             publication-claimed or rollup-deferred paths; the corpus is not \
+             proven conformant \
              and the pass will re-run on the next boot — inspect the skipped \
              paths (queries touching them error)"
         );
@@ -479,9 +496,9 @@ fn skip_file(path: &Path, phase: &str, error: &str) {
         file = %path.display(),
         phase,
         error,
-        "unreadable, foreign or publication-claimed path skipped by the boot \
-         conformance pass; it is left untouched and remains outside the \
-         catalog invariant"
+        "unreadable, foreign, publication-claimed or rollup-deferred path \
+         skipped by the boot conformance pass; it is left untouched and \
+         remains outside the catalog invariant"
     );
 }
 
@@ -556,17 +573,21 @@ pub(crate) fn open_bounded_connection(
 
 /// Enumerate every parquet file under the data root (hourly + daily
 /// rollups, skipping `scheduled/`) and describe each. Returns the readable
-/// files plus the count of paths skipped as unreadable, foreign or claimed by
-/// a pending publication marker — one bad file, or one unreadable directory,
-/// must never take the daemon's boot down with it.
+/// files plus the count of paths skipped as unreadable, foreign, claimed by
+/// a pending publication marker or deferred behind a rollup marker — one bad
+/// file, or one unreadable directory, must never take the daemon's boot down
+/// with it.
 ///
-/// `claims` is the publication marker scan. An `Err` means the markers could
-/// not be read, so every file may be claimed and none is scanned.
+/// `claims` is the publication marker scan and `rollups` the day
+/// directories holding a rollup marker ([`pending_rollup_days`]). An `Err`
+/// in either means those markers could not be read, so every file may be
+/// claimed and none is scanned.
 fn scan_corpus(
     data_dir: &Path,
     memory_limit: &str,
     pinned: &HashMap<String, CanonicalType>,
     claims: Result<&PublicationClaims, &String>,
+    rollups: Result<&HashSet<PathBuf>, &std::io::Error>,
 ) -> Result<(Vec<FileScan>, usize), String> {
     // A root that was never created is a cold start, not a failure: there is
     // no corpus to prove anything about.
@@ -601,6 +622,24 @@ fn scan_corpus(
                 "cannot read the publication markers, so any standing file may \
                  be a pending publish; the boot conformance pass skips every \
                  file and will re-run on the next boot"
+            );
+            return Ok((Vec::new(), skipped + files.len()));
+        }
+    };
+    let rollup_days = match rollups {
+        Ok(days) => days,
+        Err(e) => {
+            // Fail closed, as for the publication claims: any day may hold
+            // an unresolved rollup.
+            metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL)
+                .increment(files.len() as u64);
+            tracing::warn!(
+                event_type = "catalog_conform_rollups_unreadable",
+                files = files.len(),
+                error = %e,
+                "cannot read the rollup markers, so any standing file may \
+                 belong to an unresolved rollup; the boot conformance pass \
+                 skips every file and will re-run on the next boot"
             );
             return Ok((Vec::new(), skipped + files.len()));
         }
@@ -646,6 +685,19 @@ fn scan_corpus(
             progress.tick();
             continue;
         }
+        // The rollup that recovers this day's marker may retire or replace
+        // any file of the day, so none of them is rewritten under it.
+        if rollup_days.iter().any(|day| path.starts_with(day)) {
+            skipped += 1;
+            skip_file(
+                &path,
+                "rollup",
+                "in a day directory an unresolved rollup marker holds — the \
+                 boot pass conforms it after the rollup recovers",
+            );
+            progress.tick();
+            continue;
+        }
         match scan_file(&conn, path.clone(), &layout, pinned) {
             Ok(scan) => out.push(scan),
             Err(e) => {
@@ -656,6 +708,17 @@ fn scan_corpus(
         progress.tick();
     }
     Ok((out, skipped))
+}
+
+/// The day directories under `data_dir` that hold a rollup marker. An `Err`
+/// means the markers could not be read.
+fn pending_rollup_days(data_dir: &Path) -> std::io::Result<HashSet<PathBuf>> {
+    let mut markers = HashSet::new();
+    crate::publication::scan_markers(data_dir, &mut markers)?;
+    Ok(markers
+        .iter()
+        .filter_map(|marker| marker.parent().map(Path::to_path_buf))
+        .collect())
 }
 
 /// Whether a pending publication marker claims the file at `layout`.
@@ -1378,5 +1441,83 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// A one-row parquet file at `data/{rel}`.
+    fn standing_parquet(data: &std::path::Path, rel: &str) -> PathBuf {
+        let path = data.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT TIMESTAMP '2026-01-15 10:00:00' AS _time, 'api' AS service) \
+                 TO '{}' (FORMAT PARQUET)",
+                path.to_string_lossy().replace('\'', "''")
+            ))
+            .unwrap();
+        path
+    }
+
+    /// A day directory holding a rollup marker that boot recovery left
+    /// unresolved is deferred whole, hourly and daily files alike; other
+    /// days are scanned (ADR-0041 slice 2).
+    #[test]
+    fn rollup_boot_recovery_conformance_defers_a_day_with_an_unresolved_marker() {
+        use crate::ingest::publication_marker::PublicationClaims;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let hourly = standing_parquet(&data, "prod/2026-01-15/10/api.parquet");
+        let daily = standing_parquet(&data, "prod/2026-01-15/api.parquet");
+        let other = standing_parquet(&data, "prod/2026-01-16/10/api.parquet");
+        std::fs::write(
+            data.join("prod/2026-01-15/.rollup-api"),
+            hourly.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+
+        let rollups = super::pending_rollup_days(&data);
+        assert_eq!(
+            rollups.as_ref().unwrap(),
+            &std::collections::HashSet::from([data.join("prod/2026-01-15")])
+        );
+        let (scanned, skipped) = super::scan_corpus(
+            &data,
+            "256MB",
+            &HashMap::new(),
+            Ok(&PublicationClaims::default()),
+            rollups.as_ref(),
+        )
+        .unwrap();
+        let scanned: Vec<PathBuf> = scanned.into_iter().map(|scan| scan.path).collect();
+        assert_eq!(scanned, vec![other]);
+        assert_eq!(skipped, 2, "{hourly:?} and {daily:?} are deferred");
+    }
+
+    /// Rollup markers that cannot be read fail closed: any day may hold an
+    /// unresolved rollup, so the pass scans no file at all.
+    #[cfg(unix)]
+    #[test]
+    fn rollup_boot_recovery_failed_scan_makes_conformance_skip_every_file() {
+        use crate::ingest::publication_marker::PublicationClaims;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        standing_parquet(&data, "prod/2026-01-16/10/api.parquet");
+        standing_parquet(&data, "prod/2026-01-16/api.parquet");
+        // An env entry that cannot be resolved: the marker scan fails, while
+        // the corpus walk, which follows no symlink, lists both files.
+        std::os::unix::fs::symlink(data.join("loop"), data.join("loop")).unwrap();
+
+        let rollups = super::pending_rollup_days(&data);
+        assert!(rollups.is_err());
+        let (scanned, skipped) = super::scan_corpus(
+            &data,
+            "256MB",
+            &HashMap::new(),
+            Ok(&PublicationClaims::default()),
+            rollups.as_ref(),
+        )
+        .unwrap();
+        assert!(scanned.is_empty());
+        assert_eq!(skipped, 2);
     }
 }

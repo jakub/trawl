@@ -976,20 +976,7 @@ async fn recover_pending_rollups(
             // release either guard while recovery still relocates files.
             let _corpus_guard = corpus_guard;
             let _publication_guard = publication_guard;
-            // A previous cleanup or retention pass may already have removed a
-            // marker. Clear only confirmed missing paths before selecting days.
-            for marker in &markers {
-                publication.finish_rollup(marker);
-            }
-            let days: std::collections::BTreeSet<PathBuf> = publication
-                .pending_rollup_markers()
-                .iter()
-                .filter_map(|marker| marker.parent().map(Path::to_path_buf))
-                .collect();
-            for day in days {
-                recover_rollup_markers_coordinated(&day, Some(&publication))?;
-            }
-            Ok(())
+            relocate_pending_rollups(&publication, &markers)
         })
         .await
         .map_err(|e| {
@@ -1006,6 +993,63 @@ async fn recover_pending_rollups(
         .await
         .map_err(|_| "pending rollup recovery is incomplete".to_owned())?;
     Ok(())
+}
+
+/// The relocation half of rollup recovery, shared by boot and each
+/// compaction pass: forget `markers` already confirmed gone, then recover
+/// every day directory that still holds one. The caller holds the
+/// publication write guard.
+fn relocate_pending_rollups(
+    publication: &PublicationGate,
+    markers: &[PathBuf],
+) -> Result<(), String> {
+    // A previous cleanup or retention pass may already have removed a
+    // marker. Clear only confirmed missing paths before selecting days.
+    for marker in markers {
+        publication.finish_rollup(marker);
+    }
+    let days: std::collections::BTreeSet<PathBuf> = publication
+        .pending_rollup_markers()
+        .iter()
+        .filter_map(|marker| marker.parent().map(Path::to_path_buf))
+        .collect();
+    for day in days {
+        recover_rollup_markers_coordinated(&day, Some(publication))?;
+    }
+    Ok(())
+}
+
+/// Recover the rollup markers the gate's boot scan registered, before boot
+/// conformance and hydration (ADR-0041 slice 2). Blocking file I/O: call it
+/// from a blocking thread, before any reader, producer or compaction pass
+/// exists. No repin job can hold the corpus gate yet, so the publication
+/// write guard alone excludes every other relocator.
+///
+/// Recovery only renames or retires files and reads parquet footers. A
+/// failure does not stop the boot: it logs one `rollup_boot_recovery`
+/// ERROR, naming no path, and leaves the marker pending, so reads refuse
+/// `rollup_pending` until a compaction pass recovers it. A marker scan that
+/// failed at boot stays latched until a compaction pass rescans.
+pub(crate) fn recover_rollups_at_boot(publication: &PublicationGate) {
+    let markers = publication.pending_rollup_markers();
+    let _publication_guard = publication.blocking_write();
+    // The error names hourly paths, so it is not logged; the failure
+    // counter has recorded it.
+    if relocate_pending_rollups(publication, &markers).is_ok() {
+        tracing::info!(
+            event_type = "rollup_boot_recovery",
+            markers = markers.len(),
+            "boot rollup recovery finished"
+        );
+    } else {
+        tracing::error!(
+            event_type = "rollup_boot_recovery",
+            markers = markers.len(),
+            pending = publication.pending_rollup_markers().len(),
+            "boot rollup recovery failed; corpus reads are refused as \
+             rollup_pending until a compaction pass recovers the marker"
+        );
+    }
 }
 
 /// Consolidate hourly per-service parquet files into daily files.
@@ -6960,6 +7004,100 @@ mod tests {
         assert!(!file.exists(), "the pass drained the WAL");
         assert_eq!(gate.unsettled(), None);
         assert!(gate.read().await.is_ok());
+    }
+
+    /// Boot recovers every rollup marker the gate's scan registered, on a
+    /// gate born starting, and leaves the restart state to hydration
+    /// (ADR-0041 slice 2).
+    #[test]
+    fn rollup_boot_recovery_recovers_the_scanned_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let old = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"nginx","msg":"old"}"#;
+        let new = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"new"}"#;
+        let first = write_hourly_parquet(&env, "2026-01-15", "00", "nginx", &[old]);
+        let second = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[new]);
+        let merged = write_hourly_parquet(&env, "2026-01-15", "02", "nginx", &[old, new]);
+        let day = env.join("2026-01-15");
+        let daily = day.join("nginx.parquet");
+        std::fs::rename(merged, &daily).unwrap();
+        write_rollup_marker(&day, "nginx", &[first.clone(), second.clone()]).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+        let gate = PublicationGate::starting();
+        gate.initialize(&data);
+        assert_eq!(gate.pending_rollup_markers(), vec![marker.clone()]);
+
+        recover_rollups_at_boot(&gate);
+
+        assert!(!marker.exists());
+        assert!(!first.exists() && !second.exists(), "hourlies retired");
+        assert_eq!(read_strings(&daily, "msg"), vec!["old", "new"]);
+        assert!(gate.pending_rollup_markers().is_empty());
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RestartBacklog),
+            "only hydration settles the restart"
+        );
+    }
+
+    /// A boot recovery that fails does not stop the boot: it logs one
+    /// ERROR naming no path and leaves the marker pending, so reads refuse
+    /// `rollup_pending` until a compaction pass recovers it.
+    #[test]
+    fn rollup_boot_recovery_failure_leaves_the_marker_pending() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let day = data.join("prod/2026-01-15");
+        // The hourly input can be neither removed nor set aside.
+        let hourly = day.join("01/nginx.parquet");
+        for dir in [hourly.clone(), day.join("01/nginx.parquet.merged")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("child"), b"occupied").unwrap();
+        }
+        std::fs::write(day.join("nginx.parquet"), b"daily").unwrap();
+        write_rollup_marker(&day, "nginx", &[hourly]).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+        let gate = PublicationGate::starting();
+        gate.initialize(&data);
+
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || recover_rollups_at_boot(&gate));
+
+        assert!(marker.exists(), "the marker stays for a compaction pass");
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+        let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let failures: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("event_type=\"rollup_boot_recovery\""))
+            .collect();
+        assert_eq!(failures.len(), 1, "{log}");
+        assert!(failures[0].contains("ERROR"), "{log}");
+        assert!(
+            !log.contains(&*tmp.path().to_string_lossy()),
+            "no path is logged: {log}"
+        );
     }
 
     /// The pass-through shortcut is a claim about the conform, not about

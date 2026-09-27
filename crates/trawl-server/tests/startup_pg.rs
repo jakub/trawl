@@ -31,6 +31,8 @@ struct Fixture {
     crash_at: Option<&'static str>,
     /// Enable the syslog listeners (ephemeral ports) and the scheduler.
     producers: bool,
+    /// `[ingest] enabled`; false boots a query-only node.
+    ingest: bool,
 }
 
 impl Fixture {
@@ -53,6 +55,7 @@ impl Fixture {
             compaction_interval_secs: None,
             crash_at: None,
             producers: false,
+            ingest: true,
         }
     }
 
@@ -164,7 +167,7 @@ impl Fixture {
              tls_cert_path = {}\ntls_key_path = {}\n{log_file}\n\
              [data]\npath = {}\n[auth]\ndatabase_url = {}\naudit_interval_secs = 0\n\
              [storage]\ndatabase_url = {}\n\
-             [ingest]\nenabled = true\ninternal_telemetry = {telemetry}\nwal_dir = {}\n\
+             [ingest]\nenabled = {ingest}\ninternal_telemetry = {telemetry}\nwal_dir = {}\n\
              envs = ['prod']\ndefault_env = 'prod'\n{compaction}\
              [retention]\nmax_age_days = 0\nmin_free_disk_bytes = 0\n\
              [scheduler]\nenabled = {producers}\n{syslog}",
@@ -175,6 +178,7 @@ impl Fixture {
             quote(&self.app_url),
             quote(&self.storage_root().join("wal").to_string_lossy()),
             telemetry = self.internal_telemetry,
+            ingest = self.ingest,
             producers = self.producers,
             syslog = if self.producers {
                 "[syslog]\nenabled = true\nudp_addr = '127.0.0.1:0'\ntcp_addr = '127.0.0.1:0'\n"
@@ -779,16 +783,21 @@ async fn boot_recovers_publication_markers_before_serving() {
     let data = fixture.data();
     let day = chrono::NaiveDate::from_ymd_opt(2026, 9, 22).unwrap();
     std::fs::create_dir_all(wal.join("prod")).unwrap();
+    // The live writer's name and line format: the unpublished file that
+    // recovery keeps is hydrated at boot, not left as overhang.
     let plant = |service: &str, seq: u32| {
         let name = format!("{service}_1730000000000_{seq:04x}.ndjson");
         let path = wal.join("prod").join(&name);
-        std::fs::write(
-            &path,
-            format!(
-                r#"{{"_time":"2026-09-22T07:00:00Z","_ingested":"2026-09-22T07:00:00Z","service":"{service}","message":"m","crash_tag":"boot-recovery-{service}"}}"#
-            ),
-        )
+        let mut line = serde_json::to_vec(&serde_json::json!({
+            "_time": "2026-09-22T07:00:00Z",
+            "_ingested": "2026-09-22T07:00:00Z",
+            "service": service,
+            "message": "m",
+            "crash_tag": format!("boot-recovery-{service}"),
+        }))
         .unwrap();
+        line.push(b'\n');
+        std::fs::write(&path, line).unwrap();
         (name, path)
     };
 
@@ -853,6 +862,15 @@ async fn boot_recovers_publication_markers_before_serving() {
     assert!(!api_wal.exists(), "published WAL retired");
     assert!(canonical.is_file(), "published output kept");
     assert!(!web_tmp.exists(), "no staged output left");
+    let log = daemon.log();
+    let hydration = log
+        .lines()
+        .find(|line| line.contains("event_type=\"boot_hydration\""))
+        .unwrap_or_else(|| panic!("no boot_hydration line: {log}"));
+    assert!(
+        hydration.contains("hydrated=1") && hydration.contains("overhang=false"),
+        "the kept WAL file is resident: {hydration}"
+    );
     assert_eq!(
         parquet_count(&data, "boot-recovery-web"),
         1,
@@ -864,14 +882,17 @@ async fn boot_recovers_publication_markers_before_serving() {
     fixture.assert_lock_free().await;
 }
 
-/// Assert both `publication_recovered` outcomes precede the first line each
-/// later boot step emits: boot conformance (its skip on an already-conformed
-/// root still logs `catalog_conform`), the ingest pipeline, the compaction,
-/// retention, syslog and scheduler tasks, and the listener. Some of these
-/// tasks log after the listener, so wait for every line first.
+/// Assert the boot order (ADR-0041): both `publication_recovered` outcomes,
+/// then rollup-marker recovery, then boot conformance (its skip on an
+/// already-conformed root still logs `catalog_conform`), then hydration,
+/// each strictly after the one before. Every later step's first line
+/// follows hydration: the ingest pipeline (logged after self-telemetry is
+/// activated, and before compaction is spawned), the compaction,
+/// retention, syslog and scheduler tasks, and the listener. Those tasks log
+/// from their own threads, some after the listener, so they are ordered
+/// against hydration only; wait for every line first.
 async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
-    let anchors: [(&str, &str); 9] = [
-        ("boot conformance", "event_type=\"catalog_conform"),
+    let later: [(&str, &str); 9] = [
         ("ingest pipeline", "ingest pipeline enabled"),
         ("compaction task", "action=\"compaction_start\""),
         ("retention task", "action=\"retention_start\""),
@@ -880,31 +901,58 @@ async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
         ("syslog TCP", "event_type=\"syslog_tcp_listening\""),
         ("scheduler", "event_type=\"scheduler_started\""),
         ("listener", "HTTPS server listening"),
+        ("hydration", "event_type=\"boot_hydration\""),
     ];
     let deadline = Instant::now() + Duration::from_secs(10);
     let log = loop {
         let log = daemon.log();
-        if anchors.iter().all(|(_, needle)| log.contains(needle)) {
+        if later.iter().all(|(_, needle)| log.contains(needle)) {
             break log;
         }
         assert!(Instant::now() < deadline, "missing a boot step line: {log}");
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     let line_of = |needle: &dyn Fn(&str) -> bool| log.lines().position(needle);
+    let first = |needle: &str| {
+        line_of(&|line| line.contains(needle)).unwrap_or_else(|| panic!("no {needle}: {log}"))
+    };
+    let mut recovered = Vec::new();
     for outcome in ["published", "unpublished"] {
-        let recovered = line_of(&|line| {
-            line.contains("event_type=\"publication_recovered\"")
-                && line.contains(&format!("outcome=\"{outcome}\""))
-        })
-        .unwrap_or_else(|| panic!("no {outcome} recovery line: {log}"));
-        for (step, needle) in anchors {
-            let first = line_of(&|line| line.contains(needle)).unwrap();
-            assert!(
-                recovered < first,
-                "{outcome} recovery must precede the {step}: {log}"
-            );
-        }
+        recovered.push(
+            line_of(&|line| {
+                line.contains("event_type=\"publication_recovered\"")
+                    && line.contains(&format!("outcome=\"{outcome}\""))
+            })
+            .unwrap_or_else(|| panic!("no {outcome} recovery line: {log}")),
+        );
     }
+    let rollups = first("event_type=\"rollup_boot_recovery\"");
+    let conformance = first("event_type=\"catalog_conform");
+    let hydration = first("event_type=\"boot_hydration\"");
+    for recovered in recovered {
+        assert!(
+            recovered < rollups,
+            "publication recovery precedes rollup recovery: {log}"
+        );
+    }
+    assert!(
+        rollups < conformance,
+        "rollup recovery precedes conformance: {log}"
+    );
+    assert!(
+        conformance < hydration,
+        "conformance precedes hydration: {log}"
+    );
+    for (step, needle) in &later[..later.len() - 1] {
+        assert!(
+            hydration < first(needle),
+            "hydration must precede the {step}: {log}"
+        );
+    }
+    assert!(
+        first("ingest pipeline enabled") < first("action=\"compaction_start\""),
+        "self-telemetry is active before compaction starts: {log}"
+    );
 }
 
 // Real-process crash tests for the publication protocol (#252, ADR-0041).
@@ -953,24 +1001,8 @@ impl CrashedPublish {
         // One second between ticks and as the WAL min-age: the WAL file
         // becomes eligible a second after it is written.
         fixture.compaction_interval_secs = Some(1);
-        let store = fleet_auth::KeyStore::from_pool(fixture.fleet.clone());
-        store
-            .create_role("writer", None, &common::trawl_perms(&["ingest", "query"]))
-            .await
-            .unwrap();
-        let key = store
-            .create_key(
-                "crash-test",
-                fleet_auth::PrincipalKind::Service,
-                &common::roles(&["writer"]),
-                None,
-            )
-            .await
-            .unwrap();
-        let token = key.plaintext_token.as_str().to_owned();
-        let time = (chrono::Utc::now() - chrono::Duration::minutes(5))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
+        let token = writer_token(&fixture).await;
+        let time = recent_time();
         let tag = format!("acked-{}-{}", std::process::id(), point.replace(':', "-"));
 
         fixture.crash_at = Some(point);
@@ -1007,16 +1039,22 @@ impl CrashedPublish {
     }
 
     /// Restart without a crash point and assert every acknowledged event is
-    /// counted exactly once, `after_restart` right at readiness (when the
-    /// output was published before the kill) and always after two further
-    /// completed compaction ticks. Boot recovery and the first compaction
-    /// pass, which runs at boot, leave no marker. Ends with no marker, no
-    /// tmp and no WAL.
+    /// counted exactly once: `after_restart`, by the first query at
+    /// readiness, whether the rows are in the published output or in the
+    /// hot buffer the boot hydrated from the kept WAL (ADR-0041 slice 2);
+    /// and always over the parquet files and the query API after two
+    /// further completed compaction ticks. Boot recovery and the first
+    /// compaction pass, which runs at boot, leave no marker. Ends with no
+    /// marker, no tmp and no WAL.
     async fn restart_exactly_once(&self, after_restart: bool) {
         let mut daemon = self.fixture.spawn();
         let client = client(&daemon.ready().await, &self.token);
         if after_restart {
-            self.assert_counted_once(&client, "after the restart").await;
+            assert_eq!(
+                api_count(&client, &self.tag).await,
+                self.acknowledged,
+                "the first query after the restart"
+            );
         }
         // The boot pass (ADR-0041 slice 2) may be publishing kept WAL under
         // a marker of its own at the crashed marker's path.
@@ -1103,6 +1141,32 @@ impl CrashedPublish {
 
 fn client(url: &str, token: &str) -> trawl_client::HttpClient {
     trawl_client::HttpClient::new_insecure(url, token).unwrap()
+}
+
+/// A key allowed to ingest and query, minted in the fixture's keystore.
+async fn writer_token(fixture: &Fixture) -> String {
+    let store = fleet_auth::KeyStore::from_pool(fixture.fleet.clone());
+    store
+        .create_role("writer", None, &common::trawl_perms(&["ingest", "query"]))
+        .await
+        .unwrap();
+    let key = store
+        .create_key(
+            "crash-test",
+            fleet_auth::PrincipalKind::Service,
+            &common::roles(&["writer"]),
+            None,
+        )
+        .await
+        .unwrap();
+    key.plaintext_token.as_str().to_owned()
+}
+
+/// An `_time` five minutes ago, inside `last=24h`.
+fn recent_time() -> String {
+    (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
 }
 
 /// Ingest `size` events tagged `tag` in one request; returns the count the
@@ -1236,13 +1300,14 @@ async fn compaction_crash_after_publish_before_retire_is_exactly_once() {
 
 /// AC3 (#252): a kill after the marker and before the rename leaves the
 /// marker, the staged tmp and the WAL. Recovery removes the tmp and the
-/// marker and keeps the WAL, and the next tick publishes it once.
+/// marker and keeps the WAL, the boot hydrates it, so the first query
+/// counts it (#265), and the next tick publishes it once.
 #[tokio::test]
-async fn compaction_crash_after_marker_before_rename_is_exactly_once() {
+async fn restart_compaction_crash_after_marker_before_rename_is_exactly_once() {
     let crashed = CrashedPublish::at("publish:after_marker").await;
     assert!(marker_path(&crashed.fixture).exists());
     crashed.assert_staged_unpublished();
-    crashed.restart_exactly_once(false).await;
+    crashed.restart_exactly_once(true).await;
 }
 
 /// AC2 (#252), real-process complement of the in-process `ac2_*` matrix: a
@@ -1265,9 +1330,10 @@ async fn publication_recovery_crash_in_published_branch_reruns_exactly_once() {
 
 /// AC2 (#252), real-process complement: a kill during boot recovery of an
 /// unpublished marker, after the marker is removed and before the tmp is,
-/// reruns without the marker: the WAL is kept and published once.
+/// reruns without the marker: the WAL is kept, hydrated at boot (#265) and
+/// published once.
 #[tokio::test]
-async fn publication_recovery_crash_in_unpublished_branch_reruns_exactly_once() {
+async fn restart_publication_recovery_crash_in_unpublished_branch_reruns_exactly_once() {
     let mut crashed = CrashedPublish::at("publish:after_marker").await;
     crashed.assert_staged_unpublished();
     crashed
@@ -1284,5 +1350,161 @@ async fn publication_recovery_crash_in_unpublished_branch_reruns_exactly_once() 
     );
     assert!(!crashed.marker.canonical(&data).exists());
     crashed.assert_wal_kept();
-    crashed.restart_exactly_once(false).await;
+    crashed.restart_exactly_once(true).await;
+}
+
+/// AC1 (#265): events acknowledged before the process stops, and still in
+/// the WAL, are counted exactly once by the first successful query after
+/// the restart. All of them arrive in ONE request, so one WAL file holds
+/// them, and the boot's `boot_hydration` line proves that file became
+/// resident before the listener bound. An hour between compaction ticks
+/// keeps any pass from publishing it before the stop. A pass after the
+/// restart publishes it and drains the hydrated batch under one guard, so
+/// the count is exact whichever the query sees.
+async fn restart_counts_every_acknowledged_event_once(kill: bool) {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.compaction_interval_secs = Some(3600);
+    let token = writer_token(&fixture).await;
+    let time = recent_time();
+    let tag = format!(
+        "restart-{}-{}",
+        std::process::id(),
+        if kill { "kill9" } else { "graceful" }
+    );
+
+    let mut daemon = fixture.spawn();
+    let acknowledged = ingest(
+        &client(&daemon.ready().await, &token),
+        &time,
+        &tag,
+        CRASH_EVENTS,
+    )
+    .await;
+    let [wal_file] = <[PathBuf; 1]>::try_from(wal_files(&fixture))
+        .unwrap_or_else(|files| panic!("one request, one WAL file: {files:?}"));
+    if kill {
+        daemon.child.kill().unwrap();
+        daemon.child.wait().unwrap();
+    } else {
+        daemon.stop().await;
+    }
+    fixture.assert_lock_free().await;
+    assert!(wal_file.is_file(), "the acknowledged WAL survived the stop");
+    assert!(
+        !fixture.data().join("prod").exists(),
+        "nothing was compacted before the stop"
+    );
+
+    let mut daemon = fixture.spawn();
+    let client = client(&daemon.ready().await, &token);
+    assert_eq!(
+        api_count(&client, &tag).await,
+        acknowledged,
+        "the first query after the restart"
+    );
+    let log = daemon.log();
+    let hydration = log
+        .lines()
+        .find(|line| line.contains("event_type=\"boot_hydration\""))
+        .unwrap_or_else(|| panic!("no boot_hydration line: {log}"));
+    assert!(
+        hydration.contains("hydrated=1")
+            && hydration.contains(&format!("events={CRASH_EVENTS}"))
+            && hydration.contains("overhang=false"),
+        "the acknowledged WAL file became resident: {hydration}"
+    );
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
+}
+
+#[tokio::test]
+async fn restart_graceful_stop_counts_every_acknowledged_event_once() {
+    restart_counts_every_acknowledged_event_once(false).await;
+}
+
+#[tokio::test]
+async fn restart_kill9_counts_every_acknowledged_event_once() {
+    restart_counts_every_acknowledged_event_once(true).await;
+}
+
+/// AC14 (#265): a query-only node never reads the WAL. Booted over WAL an
+/// ingest node left behind, it hydrates nothing, answers from parquet
+/// alone, leaves the WAL untouched and logs exactly one warning carrying
+/// the file count and no path.
+#[tokio::test]
+async fn query_only_boot_with_wal() {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.compaction_interval_secs = Some(1);
+    let token = writer_token(&fixture).await;
+    let time = recent_time();
+
+    // An ingest node publishes one tagged batch to parquet.
+    let mut daemon = fixture.spawn();
+    let published = ingest(
+        &client(&daemon.ready().await, &token),
+        &time,
+        "published",
+        3,
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !wal_files(&fixture).is_empty() || marker_path(&fixture).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "compaction never published the batch"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
+
+    // WAL left behind, in the live writer's format.
+    let wal = fixture.storage_root().join("wal");
+    for seq in 1..=2_u32 {
+        let mut line = serde_json::to_vec(&serde_json::json!({
+            "_time": time,
+            "_ingested": time,
+            "env": "prod",
+            "service": CRASH_SERVICE,
+            "crash_tag": "unread",
+            "message": "never read",
+        }))
+        .unwrap();
+        line.push(b'\n');
+        std::fs::write(
+            wal.join(format!(
+                "prod/{CRASH_SERVICE}_1730000000000_{seq:04x}.ndjson"
+            )),
+            line,
+        )
+        .unwrap();
+    }
+    let before = bytes(&wal);
+
+    fixture.ingest = false;
+    let mut daemon = fixture.spawn();
+    let client = client(&daemon.ready().await, &token);
+    assert_eq!(api_count(&client, "published").await, published);
+    assert_eq!(api_count(&client, "unread").await, 0, "the WAL is not read");
+    let log = daemon.log();
+    let warnings: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("event_type=\"wal_present_on_query_node\""))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{log}");
+    assert!(warnings[0].contains("WARN"), "{log}");
+    assert!(warnings[0].contains("files=2"), "{log}");
+    assert!(
+        !warnings[0].contains(&*fixture.root.path().to_string_lossy()),
+        "no path: {log}"
+    );
+    assert!(
+        !log.contains("event_type=\"boot_hydration\""),
+        "a query-only node hydrates nothing: {log}"
+    );
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
+    assert_eq!(bytes(&wal), before, "the WAL is untouched");
 }

@@ -742,6 +742,16 @@ impl HotBuffer {
         self
     }
 
+    /// Replace the settled gate [`new`](Self::new) builds, before the buffer
+    /// is shared. An ingest node's buffer gets a gate born
+    /// [`starting`](crate::publication::PublicationGate::starting), so reads
+    /// refuse until boot hydration finishes (ADR-0041 slice 2).
+    #[must_use]
+    pub fn with_publication(mut self, gate: crate::publication::PublicationGate) -> Self {
+        self.publication = Arc::new(gate);
+        self
+    }
+
     /// Admit `charge` for `producer`, or refuse it without changing any
     /// state but the refusal counter (and, for [`Refusal::Full`], the
     /// latched [`AdmissionState::Refusing`] and a pressure wake).
@@ -2390,7 +2400,6 @@ mod hydrate {
 
     use super::tests::{batch_of, charge, ledger_buffer};
     use super::*;
-    use crate::bus::{EventBus as _, EventSubscriber as _, LocalEventBus};
     use crate::ingest::producer::ProducerKind::{Http, Trawld};
 
     fn fresh(id: &str, of: Charge) -> HydratedBatch {
@@ -2488,12 +2497,13 @@ mod hydrate {
         });
     }
 
-    #[tokio::test]
-    async fn hydration_publishes_nothing_and_wakes_nothing() {
-        // Subscribe to everything a producer's insert can touch before the
+    /// The buffer holds no event bus, so "hydration publishes nothing to the
+    /// bus" is proven against a real `AppState` at boot, in
+    /// `tests/boot_corpus.rs`.
+    #[test]
+    fn hydration_wakes_nothing() {
+        // Subscribe to every watch a producer's insert can touch before the
         // hydration, so a signal it sends cannot be missed.
-        let bus = LocalEventBus::new(16);
-        let mut subscriber = bus.subscribe();
         let buf = ledger_buffer(100, 1_000);
         let mut pressure = buf.subscribe_pressure();
         let mut released = buf.subscribe_released();
@@ -2507,12 +2517,6 @@ mod hydrate {
         .unwrap();
         assert_eq!(buf.admission_state(), AdmissionState::Pressure);
 
-        assert!(
-            tokio::time::timeout(Duration::ZERO, subscriber.recv())
-                .await
-                .is_err(),
-            "hydration publishes nothing to the event bus"
-        );
         assert!(
             !pressure.has_changed().unwrap(),
             "hydration sends no pressure wake"
@@ -2562,6 +2566,25 @@ mod hydrate {
             assert_eq!(buf.charged(), Charge::ZERO);
             assert_eq!(buf.admission_state(), AdmissionState::Open);
         });
+    }
+
+    /// Only a buffer given a starting gate refuses reads before hydration:
+    /// [`HotBuffer::new`] stays settled, so every buffer built outside
+    /// `AppState::from_parts` serves at once (ADR-0041 slice 2).
+    #[test]
+    fn only_a_buffer_given_a_starting_gate_starts_unsettled() {
+        use crate::publication::{CorpusUnsettled, PublicationGate};
+        assert_eq!(ledger_buffer(10, 100).publication().unsettled(), None);
+
+        let buf = ledger_buffer(10, 100).with_publication(PublicationGate::starting());
+        let gate = buf.publication();
+        assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RestartBacklog));
+        assert!(
+            Arc::ptr_eq(&gate, &buf.publication()),
+            "the buffer shares the one installed gate"
+        );
+        gate.finish_hydration(false).unwrap();
+        assert_eq!(buf.publication().unsettled(), None);
     }
 
     #[test]
