@@ -15,4 +15,5 @@
 # when both are set. trawl-web honours the variable only for a loopback
 # upstream (127.0.0.0/8, ::1 or localhost) and refuses to start for any
 # other upstream host.
+# Set here for an older package? Remove it when you upgrade to the pinned one.
 # TRAWL_WEB_INSECURE_UPSTREAM=1

@@ -57,6 +57,17 @@ APT repository from [Installation](/getting-started/).
    configuration names no real databases yet. An upgrade keeps the units you
    enabled and restarts the ones that are running.
 
+   The package now pins trawld's generated certificate with
+   `[web] upstream_ca_path` in `trawld.toml`. If you set
+   `TRAWL_WEB_INSECURE_UPSTREAM=1` in `/etc/default/trawl-web` for an earlier
+   package, remove that line before or after you upgrade. An upgrade keeps
+   your edited `/etc/default/trawl-web`, and `trawl-web` refuses to start when
+   both settings are present. systemd then restarts it every 5 seconds, and
+   `systemctl status trawl-web` shows `activating (auto-restart)` with a log
+   line that names `TRAWL_WEB_INSECURE_UPSTREAM` and `upstream_ca_path`. After
+   you remove the line, run `sudo systemctl restart trawl-web` and check that
+   `systemctl status trawl-web` shows `active (running)`.
+
 2. Put the two DSNs in `/etc/default/trawld`. They take precedence over
    `[auth] database_url` and `[storage] database_url` in the TOML file, and
    only root and the `trawl` group can read the file:
