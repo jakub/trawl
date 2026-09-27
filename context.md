@@ -188,6 +188,10 @@ _Avoid_: leaked permit, stuck query (the permit is the thing named)
 Counted by the per-key rate limiter. A metered request is attributable to a verified key and bounded by that key's rate; an unmetered one reached the server before any key was counted.
 _Avoid_: authenticated (a request can be authenticated and still refused before metering)
 
+**Query phase**:
+One named kind of work in the life of one executed query, such as waiting for a permit, binding, or executing. A query's time is split across its phases; repeated work of the same kind adds to one phase.
+_Avoid_: stage (that is a DSL pipeline stage), lane, step
+
 ### Schedules
 
 **Schedule**:
