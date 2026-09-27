@@ -108,10 +108,25 @@ struct CorpusState {
 impl CorpusState {
     /// The one evaluator behind every answer about the corpus: forget
     /// markers whose files are confirmed gone, then report what holds.
+    ///
+    /// The caller holds a publication guard. A writer registers its rollup
+    /// marker before it writes the marker file, so a prune without a guard
+    /// could forget a marker that a failed rollup then leaves on disk.
     fn evaluate(&mut self) -> UnsettledReasons {
         self.markers.retain(|path| !is_missing(path));
         UnsettledReasons {
             rollup_pending: self.scan_failed || !self.markers.is_empty(),
+            restart_backlog: self.restart != Restart::Settled,
+        }
+    }
+
+    /// What holds while a writer holds or waits for the publication lock.
+    /// Its markers may be in flight, so the registered markers are neither
+    /// pruned nor reported: only a failed marker scan and the restart
+    /// state count.
+    fn beside_a_writer(&self) -> UnsettledReasons {
+        UnsettledReasons {
+            rollup_pending: self.scan_failed,
             restart_backlog: self.restart != Restart::Settled,
         }
     }
@@ -236,24 +251,35 @@ impl PublicationGate {
     }
 
     /// Why reads would refuse now, by precedence, or `None` when settled.
-    /// Takes no guard, so it never waits behind a publication.
+    /// Never waits behind a publication; see
+    /// [`unsettled_reasons`](Self::unsettled_reasons).
     #[must_use]
     pub fn unsettled(&self) -> Option<CorpusUnsettled> {
         self.unsettled_reasons().first()
     }
 
-    /// Every reason that holds now, each on its own. Takes no guard.
+    /// Every reason that holds now, each on its own. Never waits: when the
+    /// publication lock is free, it evaluates under a read guard taken
+    /// without waiting. While a writer holds the lock or waits for it, the
+    /// writer's rollup marker may be in flight, so no registered marker is
+    /// pruned or reported; a failed marker scan and the restart state
+    /// still are. A normal rollup therefore never moves the answer, and a
+    /// marker that a failed rollup leaves is reported once the writer is
+    /// gone. [`read`](Self::read) always waits for the writer and
+    /// evaluates everything.
     #[must_use]
     pub fn unsettled_reasons(&self) -> UnsettledReasons {
-        self.corpus.lock().evaluate()
+        match self.lock.try_read() {
+            Ok(_guard) => self.corpus.lock().evaluate(),
+            Err(_) => self.corpus.lock().beside_a_writer(),
+        }
     }
 
     /// Whether the WAL from before the restart is not yet proven covered:
-    /// hydration has not finished, or it left overhang.
+    /// hydration has not finished, or it left overhang. Takes no guard.
     #[must_use]
     pub fn overhang(&self) -> bool {
-        self.unsettled_reasons()
-            .contains(CorpusUnsettled::RestartBacklog)
+        self.corpus.lock().restart != Restart::Settled
     }
 
     /// Whether hydration finished and left overhang, which only compaction's
@@ -833,6 +859,92 @@ mod tests {
             gate.read_rollups_only().await,
             Err(CorpusUnsettled::RollupPending)
         ));
+    }
+
+    /// A rollup registers its marker before it writes the marker file. A
+    /// query that takes no guard, inside that window, neither forgets the
+    /// marker nor reports it. If the rollup then fails with its marker on
+    /// disk, reads refuse `rollup_pending` once the writer is gone
+    /// (ADR-0026, ADR-0041).
+    #[tokio::test]
+    async fn a_lock_free_query_inside_a_rollup_keeps_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-svc");
+        let gate = PublicationGate::new();
+        {
+            let _writer = gate.write().await;
+            gate.mark_rollup(&marker);
+            assert_eq!(
+                gate.unsettled(),
+                None,
+                "an in-flight marker is not reported"
+            );
+            assert_eq!(gate.unsettled_reasons(), UnsettledReasons::default());
+            assert!(!gate.overhang());
+            assert!(
+                gate.corpus.lock().markers.contains(&marker),
+                "nor forgotten while its file does not exist yet"
+            );
+            // The rollup writes its marker, then fails before retiring it.
+            std::fs::write(&marker, "hourly inputs").unwrap();
+            assert_eq!(gate.unsettled(), None);
+        }
+        assert!(matches!(
+            gate.read().await,
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RollupPending
+            ))
+        ));
+        assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RollupPending));
+        std::fs::remove_file(&marker).unwrap();
+        assert!(gate.read().await.is_ok());
+    }
+
+    /// A normal rollup, as health, `/metrics`, the scheduler and a manual
+    /// run see it without a guard: the corpus reads the same from
+    /// `mark_rollup` to the marker's removal, so none of them flaps. A
+    /// restart backlog is still reported throughout.
+    #[test]
+    fn a_normal_rollup_never_moves_a_lock_free_query() {
+        for overhang in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join(".rollup-svc");
+            let gate = if overhang {
+                let gate = PublicationGate::starting();
+                gate.finish_hydration(true).unwrap();
+                gate
+            } else {
+                PublicationGate::new()
+            };
+            let expected = overhang.then_some(CorpusUnsettled::RestartBacklog);
+            assert_eq!(gate.unsettled(), expected, "before");
+
+            // No query between the registration and the marker file: one
+            // there is the other test's window.
+            let writer = gate.blocking_write();
+            gate.mark_rollup(&marker);
+            std::fs::write(&marker, "hourly inputs").unwrap();
+            assert_eq!(gate.unsettled(), expected, "marker written");
+            assert_eq!(gate.overhang(), overhang);
+            std::fs::remove_file(&marker).unwrap();
+            gate.finish_rollup(&marker);
+            assert_eq!(gate.unsettled(), expected, "marker removed");
+            drop(writer);
+            assert_eq!(gate.unsettled(), expected, "after");
+        }
+    }
+
+    /// A failed marker scan is no writer's marker: a lock-free query
+    /// reports it while a writer holds the lock as well.
+    #[test]
+    fn a_failed_scan_is_reported_while_a_writer_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("file");
+        std::fs::write(&root, "").unwrap();
+        let gate = PublicationGate::new();
+        gate.initialize(&root);
+        let _writer = gate.blocking_write();
+        assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RollupPending));
     }
 
     #[tokio::test]

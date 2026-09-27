@@ -2036,6 +2036,19 @@ mod tests {
             assert_eq!(collected(&gate), (0, 1), "starting");
             gate.finish_hydration(true).unwrap();
             assert_eq!(collected(&gate), (0, 1), "overhang");
+
+            // A scrape during a normal rollup: the rollup's own marker is
+            // in flight and moves no series.
+            let rollup = dir.path().join(".rollup-normal");
+            {
+                let _writer = gate.blocking_write();
+                gate.mark_rollup(&rollup);
+                std::fs::write(&rollup, "").unwrap();
+                assert_eq!(collected(&gate), (0, 1), "during a rollup");
+                std::fs::remove_file(&rollup).unwrap();
+                gate.finish_rollup(&rollup);
+            }
+            assert_eq!(collected(&gate), (0, 1), "after the rollup");
             {
                 let _writer = gate.blocking_write();
                 gate.mark_rollup(&marker);

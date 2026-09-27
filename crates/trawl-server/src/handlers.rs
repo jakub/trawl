@@ -4164,6 +4164,19 @@ mod tests {
         assert_eq!(corpus_check(&gate), "restart_backlog");
 
         let dir = tempfile::tempdir().unwrap();
+        // A probe during a normal rollup: the rollup's own marker is in
+        // flight, so the check does not flap to `rollup_pending`.
+        let rollup = dir.path().join(".rollup-normal");
+        {
+            let _writer = gate.blocking_write();
+            gate.mark_rollup(&rollup);
+            std::fs::write(&rollup, "").unwrap();
+            assert_eq!(corpus_check(&gate), "restart_backlog", "during a rollup");
+            std::fs::remove_file(&rollup).unwrap();
+            gate.finish_rollup(&rollup);
+        }
+        assert_eq!(corpus_check(&gate), "restart_backlog", "after the rollup");
+
         let marker = dir.path().join(".rollup-svc");
         std::fs::write(&marker, "").unwrap();
         {
