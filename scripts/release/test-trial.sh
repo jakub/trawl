@@ -214,6 +214,14 @@ scan() { # scan [--classes C,...] PATH...: nothing in the private list may appea
   python3 "$here/scan-trial-secrets.py" "$SECRETS" "$@" || fail "a secret value was found (see above)"
 }
 
+# publish SRC NAME: a raw artifact is written to the private work directory
+# first and scanned there; only a clean copy reaches the evidence directory,
+# so a failed scan never leaves a secret-bearing file in what CI uploads.
+publish() {
+  scan "$1"
+  cp "$1" "$EVIDENCE/$2"
+}
+
 # Counts per sample service, as `service count` lines.
 sample_counts() {
   t -p trial query '* | stats count() as events by service' -f json |
@@ -481,9 +489,9 @@ note "stdout is byte-identical to operator.token (one line); stderr is empty"
 
 step "trial A: no container has a secret in its environment, command, or labels"
 mapfile -t containers < <(docker ps -aq --filter "label=$LABEL=$(state .trial_id)")
-docker inspect "${containers[@]}" >"$EVIDENCE/docker-inspect-trial-a.json"
+docker inspect "${containers[@]}" >"$WORK/docker-inspect-trial-a.json"
 note "docker inspect of ${#containers[@]} containers: $(docker inspect --format '{{.Name}}' "${containers[@]}" | tr '\n' ' ')"
-scan "$EVIDENCE/docker-inspect-trial-a.json"
+publish "$WORK/docker-inspect-trial-a.json" docker-inspect-trial-a.json
 ! grep -q TRAWL_WEB_INSECURE_UPSTREAM "$EVIDENCE/docker-inspect-trial-a.json" || fail "a container sets TRAWL_WEB_INSECURE_UPSTREAM"
 jq -r '.[] | "\(.Name): env=\(.Config.Env | map(select(startswith("PATH=") | not)) | join(" ")) cmd=\(.Config.Cmd // [] | join(" "))"' \
   "$EVIDENCE/docker-inspect-trial-a.json" | sed 's/^/   /'
@@ -533,14 +541,16 @@ jq -c '.services | to_entries[] | {service: .key, ports: .value.ports, restart: 
 [[ "$(jq '[.services[] | select(has("restart"))] | length' "$STATE_DIR/compose.json")" == 0 ]] || fail "a service has a restart policy"
 [[ "$(jq '[.services[].ports // [] | .[] | select(.host_ip != "127.0.0.1")] | length' "$STATE_DIR/compose.json")" == 0 ]] ||
   fail "a port is published beyond 127.0.0.1"
-docker exec "$(cid trawld)" cat /var/lib/trawl/trial/trawld.toml >"$EVIDENCE/trawld.toml"
-docker exec "$(cid trawl-web)" cat /var/lib/trawl/trial/web.toml >"$EVIDENCE/web.toml"
+docker exec "$(cid trawld)" cat /var/lib/trawl/trial/trawld.toml >"$WORK/trawld.toml"
+docker exec "$(cid trawl-web)" cat /var/lib/trawl/trial/web.toml >"$WORK/web.toml"
+publish "$WORK/trawld.toml" trawld.toml
+publish "$WORK/web.toml" web.toml
 echo "-- trawld.toml [syslog]:"
 sed -n '/^\[syslog\]/,/^\[/p' "$EVIDENCE/trawld.toml" | sed 's/^/   /'
 grep -qx 'enabled = false' <(sed -n '/^\[syslog\]/,/^\[/p' "$EVIDENCE/trawld.toml") || fail "syslog is not disabled"
 
 step "trial A: the rendered project has no insecure setting"
-cp "$STATE_DIR/compose.json" "$EVIDENCE/compose.json"
+publish "$STATE_DIR/compose.json" compose.json
 insecure=$(grep -Hin 'insecure' "$EVIDENCE/compose.json" "$EVIDENCE/trawld.toml" "$EVIDENCE/web.toml" |
   grep -v 'web.toml:[0-9]*:allow_insecure_cookies = true$' || true)
 grep -Hin 'insecure' "$EVIDENCE/compose.json" "$EVIDENCE/trawld.toml" "$EVIDENCE/web.toml" | sed 's/^/   /' || true
@@ -781,7 +791,8 @@ says up-b "https://127.0.0.1:25514"
 collect_secrets
 scan --classes password,cookie,key "$STATE_HOME" "$TRIAL_HOME"
 note "no database password, superuser password, cookie key, or TLS private key is on the host"
-docker exec "$(cid trawl-web)" cat /var/lib/trawl/trial/web.toml >"$EVIDENCE/web-b.toml"
+docker exec "$(cid trawl-web)" cat /var/lib/trawl/trial/web.toml >"$WORK/web-b.toml"
+publish "$WORK/web-b.toml" web-b.toml
 grep -F 'public_origins' "$EVIDENCE/web-b.toml" | sed 's/^/   /'
 grep -qxF 'public_origins = ["http://localhost:28090", "http://127.0.0.1:28090"]' "$EVIDENCE/web-b.toml" ||
   fail "the origins do not follow --web-port"
