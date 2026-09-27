@@ -375,6 +375,26 @@ impl Engine {
     }
 }
 
+/// Port 0 names no port: its bind test passes on an ephemeral port, and
+/// the trial would record 0 and print addresses nothing listens on. The
+/// argument parser refuses it, naming the flag, before anything is
+/// created.
+#[test]
+fn up_refuses_port_zero() {
+    for (zero, other) in [("--api-port", "--web-port"), ("--web-port", "--api-port")] {
+        let engine = Engine::new("engine-a");
+        let out = engine.trawl(&["up", zero, "0", other, &free_port(), "--no-sample-data"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{zero}: {stderr}");
+        assert!(
+            stderr.contains(&format!("'{zero} <PORT>'")),
+            "{zero}: {stderr}"
+        );
+        assert!(!engine.dir().exists(), "{zero}: {stderr}");
+        assert_eq!(engine.calls(), "", "{zero}: {stderr}");
+    }
+}
+
 /// (a) The engine made the claim and the response to the create was
 /// denied. Our inspect finds the claim with our id, so `up` goes on,
 /// and so does a rerun.

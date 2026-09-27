@@ -92,11 +92,14 @@ pub enum TrialCommand {
 
 /// `trawl trial up` arguments. Ports and the image are fixed when the
 /// trial is created: on resume an omitted flag means the recorded value.
+/// A port is 1 to 65535: 0 would pass the bind test on an ephemeral port
+/// and leave the trial on no port at all.
 #[derive(Debug, clap::Args)]
 pub struct UpArgs {
     #[arg(
         long,
         value_name = "PORT",
+        value_parser = clap::value_parser!(u16).range(1..),
         help = format!("Loopback port for the HTTPS API [default: {DEFAULT_API_PORT}]")
     )]
     pub api_port: Option<u16>,
@@ -104,6 +107,7 @@ pub struct UpArgs {
     #[arg(
         long,
         value_name = "PORT",
+        value_parser = clap::value_parser!(u16).range(1..),
         help = format!("Loopback port for the browser UI [default: {DEFAULT_WEB_PORT}]")
     )]
     pub web_port: Option<u16>,
