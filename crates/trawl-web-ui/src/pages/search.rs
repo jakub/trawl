@@ -58,6 +58,7 @@ use crate::components::histogram::Histogram;
 use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::query_error_notice::QueryErrorNotice;
+use crate::components::recovering_notice::RecoveringNotice;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
@@ -714,18 +715,46 @@ pub fn Search() -> impl IntoView {
             _ => None,
         })
     });
-    // A query error the resource still holds after a newer request
-    // superseded it: the same text re-sent, or new text not yet answered.
-    // The tables would render it as "Couldn't load results" with a Retry,
-    // which is the one thing a query error never offers, so the region
-    // waits for the new answer instead.
+    // The recovering notice, when the failure on screen is the CURRENT
+    // request refused as `corpus_recovering` (ADR-0041): the server
+    // cannot yet count every stored event once, which is neither an
+    // empty result nor a fault. Identity decides, as for the query error
+    // notice: an older request's refusal describes a request that is no
+    // longer the one on screen. Live reads the stream, which this
+    // refusal never touches, so live shows no such notice.
+    let recovering_notice = Memo::new(move |_| -> Option<String> {
+        if unreadable.get() || live.get() || snapshot_q.get().trim().is_empty() || loading.get() {
+            return None;
+        }
+        rows.with(|result| match result {
+            Some(Err(failure))
+                if failure.intent == request_intent.get()
+                    && failure.generation == request_generation.get() =>
+            {
+                failure.error.recovering().map(str::to_owned)
+            }
+            _ => None,
+        })
+    });
+    // A named refusal (a query error, or the corpus recovering) the
+    // resource still holds after a newer request superseded it: the same
+    // text re-sent, or new text not yet answered. The tables would render
+    // it as "Couldn't load results" with a Retry, which a query error
+    // never offers and which would misname a recovering server, so the
+    // region waits for the new answer instead.
     let refusal_superseded = Signal::derive(move || {
         query_notice.get().is_none()
+            && recovering_notice.get().is_none()
             && !unreadable.get()
             && !live.get()
             && !snapshot_q.get().trim().is_empty()
             && rows.with(|result| {
-                matches!(result, Some(Err(failure)) if failure.error.query_error().is_some())
+                matches!(
+                    result,
+                    Some(Err(failure))
+                        if failure.error.query_error().is_some()
+                            || failure.error.recovering().is_some()
+                )
             })
     });
     let execution = Signal::derive(move || {
@@ -1187,6 +1216,16 @@ pub fn Search() -> impl IntoView {
                     view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
                             <QueryErrorNotice model=model/>
+                        </div>
+                    }.into_any()
+                } else if let Some(message) = recovering_notice.get() {
+                    // The corpus is not settled, on either tab: neither
+                    // the empty table nor "Couldn't load results" mounts,
+                    // since both would misname the state. Retry sends the
+                    // same request again, the way a Haul does.
+                    view! {
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <RecoveringNotice message=message on_retry=Callback::new(move |()| rerun_request())/>
                         </div>
                     }.into_any()
                 } else if refusal_superseded.get() {

@@ -125,6 +125,27 @@
  * excerpt does not pick it up twice. */
 .query-error-caret-pad { visibility: hidden; user-select: none; }
 
+/* Recovering notice (ADR-0041): the server refused the snapshot while
+ * its stored events are not yet settled. Not a failure of the query or
+ * a fault, so the title reads in ink, not the error tone; the server's
+ * sentence sits under it and the shared Retry row closes it. */
+.recovering-notice {
+  padding: 12px 16px;
+  font-family: var(--font-ui);
+  font-size: var(--fs-ui);
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.recovering-notice-title {
+  margin: 0;
+  color: var(--ink);
+  font-weight: 600;
+}
+.recovering-notice-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 /* The shared pre-query guide stays inside the results scroller. Its
  * columns respond to the sheet width, including when the rail is open. */
 .search-quick-start { container-type: inline-size; }

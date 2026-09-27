@@ -70,6 +70,7 @@ const API_ERROR_RS: &str = include_str!("../src/api_error.rs");
 const CODEMIRROR_TS: &str = include_str!("../vendor/src/codemirror.ts");
 const QUERY_ERROR_NOTICE_RS: &str = include_str!("../src/components/query_error_notice.rs");
 const SEARCH_RS: &str = include_str!("../src/pages/search.rs");
+const RECOVERING_NOTICE_RS: &str = include_str!("../src/components/recovering_notice.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -2165,6 +2166,48 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/query_error_notice.rs",
         source: QUERY_ERROR_NOTICE_RS,
         hook: "class=\"query-error-caret-pad\"",
+    },
+    Contract {
+        assignment: "recoveringNotice: '#search-results .recovering-notice[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<RecoveringNotice message=message",
+    },
+    Contract {
+        assignment: "recoveringNotice: '#search-results .recovering-notice[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<div id=\"search-results\" class=\"results\"",
+    },
+    Contract {
+        assignment: "recoveringNotice: '#search-results .recovering-notice[role=\"alert\"]',",
+        source_path: "src/components/recovering_notice.rs",
+        source: RECOVERING_NOTICE_RS,
+        hook: "<div class=\"recovering-notice\" role=\"alert\">",
+    },
+    Contract {
+        assignment: "recoveringNoticeTitle: '.recovering-notice-title',",
+        source_path: "src/components/recovering_notice.rs",
+        source: RECOVERING_NOTICE_RS,
+        hook: "class=\"recovering-notice-title\"",
+    },
+    Contract {
+        assignment: "recoveringNoticeText: '.recovering-notice-text',",
+        source_path: "src/components/recovering_notice.rs",
+        source: RECOVERING_NOTICE_RS,
+        hook: "class=\"recovering-notice-text\"",
+    },
+    Contract {
+        assignment: "recoveringTitle: 'Search is recovering',",
+        source_path: "src/components/recovering_notice.rs",
+        source: RECOVERING_NOTICE_RS,
+        hook: "\"Search is recovering\"",
+    },
+    Contract {
+        assignment: "resultsEmptyCell: '.results-empty-cell',",
+        source_path: "src/components/results_table.rs",
+        source: RESULTS_TABLE_RS,
+        hook: "class=\"results-empty-cell\"",
     },
     Contract {
         assignment: "queryErrorCaption: 'Query sent to server',",

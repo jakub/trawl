@@ -51,8 +51,12 @@ Snapshot (a one-shot query, paged by the server for events and in the browser fo
 _Avoid_: view, tab, pause
 
 **Query error**:
-A snapshot the server refused as a parse or validation failure. It renders in the results region on both results tabs as a notice quoting the server's message and, for each detail with a span, an excerpt of the query as sent with a caret under the span. It offers no Retry. Any other failure is a load error and keeps its Retry. In live the browser cannot read why a stream closed, so only one live case is a query error: a stream that closed before it opened, on text the local parser also refuses. That notice carries the local parser's errors on the sent text under a lead saying the stream did not start. A live validation error, or any stream that opened, keeps the generic unavailable copy and its Retry.
+A snapshot the server refused as a parse or validation failure. It renders in the results region on both results tabs as a notice quoting the server's message and, for each detail with a span, an excerpt of the query as sent with a caret under the span. It offers no Retry. A recovering corpus has its own notice. Any other failure is a load error and keeps its Retry. In live the browser cannot read why a stream closed, so only one live case is a query error: a stream that closed before it opened, on text the local parser also refuses. That notice carries the local parser's errors on the sent text under a lead saying the stream did not start. A live validation error, or any stream that opened, keeps the generic unavailable copy and its Retry.
 _Avoid_: 400, bad request, syntax banner
+
+**Recovering notice**:
+What the results region shows on both results tabs when the server refuses a snapshot as `corpus_recovering`. The server is still loading data from before a restart, or finishing an interrupted storage rollup, and cannot yet count every stored event once. The notice has the title "Search is recovering", the server's own sentence and a Retry. It is never an empty result or a load error. Live mode reads the stream, which this refusal does not touch.
+_Avoid_: outage, server error, no results
 
 **Draft diagnostic**:
 What the local parser says about the editor buffer while you type: the gutter marker, named "Query syntax error", and the visible line under the editor that carries the first message in full as `Line L:C — message`, with the rest behind a `+N more` disclosure that any edit closes. Advisory only: it never blocks Haul and never speaks for the server.

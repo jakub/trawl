@@ -41,7 +41,7 @@ pub enum ApiError {
     },
 
     /// The server refused the query text itself: a [query
-    /// error](is_query_error). The whole envelope rides along, `details`
+    /// error](Kept::Query). The whole envelope rides along, `details`
     /// and their byte spans included, because the query error notice
     /// quotes the sent text under each span (ADR-0039). Display is the
     /// summary alone, the same text [`ApiError::Server`] would show, so a
@@ -52,6 +52,21 @@ pub enum ApiError {
         status: u16,
         /// The server's envelope, unabridged.
         envelope: ErrorEnvelope,
+    },
+
+    /// The server refused a read because the events it has stored cannot
+    /// yet be counted exactly once: it is still loading data from before
+    /// a restart, or finishing an interrupted storage rollup
+    /// (`corpus_recovering`, ADR-0041). The message is the server's fixed
+    /// sentence for the reason, with no counts or paths, so it renders
+    /// verbatim. The search page names this state rather than reading it
+    /// as an empty result or a generic failure.
+    #[error("{message}")]
+    Recovering {
+        /// The HTTP status the refusal came with.
+        status: u16,
+        /// The envelope's human-readable summary.
+        message: String,
     },
 
     #[error("decode: {0}")]
@@ -75,9 +90,10 @@ impl ApiError {
     #[must_use]
     pub fn http_status(&self) -> Option<u16> {
         match self {
-            Self::Status(status) | Self::Server { status, .. } | Self::Query { status, .. } => {
-                Some(*status)
-            }
+            Self::Status(status)
+            | Self::Server { status, .. }
+            | Self::Query { status, .. }
+            | Self::Recovering { status, .. } => Some(*status),
             // The one status this enum spells as a word rather than a
             // number.
             Self::Unauthorized => Some(401),
@@ -96,20 +112,43 @@ impl ApiError {
             _ => None,
         }
     }
+
+    /// The server's sentence when this failure is a `corpus_recovering`
+    /// refusal, else `None`.
+    #[must_use]
+    pub fn recovering(&self) -> Option<&str> {
+        match self {
+            Self::Recovering { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
-/// Whether an error code says the query text itself is wrong, which
-/// is what a query error is (ADR-0039): the server read the text and
-/// refused it before running anything. Every other code is about the
-/// run, the caller or the server, and keeps the generic failure copy
-/// with its Retry.
+/// How [`decode_error_body`] keeps an envelope with a given code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// The query text itself is wrong, which is what a query error is
+    /// (ADR-0039): the server read the text and refused it before
+    /// running anything. The whole envelope is kept.
+    Query,
+    /// The corpus is not settled after a restart or an interrupted
+    /// rollup (ADR-0041). Nothing is wrong with the query or the caller,
+    /// and the same request can succeed once the server catches up.
+    Recovering,
+    /// About the run, the caller or the server. Only the summary is kept,
+    /// and it takes the generic failure copy with its Retry.
+    Summary,
+}
+
+/// Classify an error code for [`decode_error_body`].
 ///
 /// No wildcard arm: a code added to the wire enum has to be classified
 /// here before this crate compiles again.
 #[must_use]
-pub fn is_query_error(code: &ErrorCode) -> bool {
+pub fn kept_as(code: &ErrorCode) -> Kept {
     match code {
-        ErrorCode::ParseError | ErrorCode::ValidationError => true,
+        ErrorCode::ParseError | ErrorCode::ValidationError => Kept::Query,
+        ErrorCode::CorpusRecovering => Kept::Recovering,
         ErrorCode::ExecutionError
         | ErrorCode::ResultTooLarge
         | ErrorCode::AuthError
@@ -123,62 +162,112 @@ pub fn is_query_error(code: &ErrorCode) -> bool {
         | ErrorCode::InternalError
         | ErrorCode::ServiceUnavailable
         | ErrorCode::HotBufferFull
-        | ErrorCode::IngestBatchTooLarge
-        | ErrorCode::CorpusRecovering => false,
+        | ErrorCode::IngestBatchTooLarge => Kept::Summary,
     }
 }
 
 /// Read a non-2xx body. A query error keeps its whole envelope
-/// ([`ApiError::Query`]); any other envelope keeps its summary
-/// ([`ApiError::Server`]); a body that is not the envelope at all falls
-/// back to the bare status.
+/// ([`ApiError::Query`]); a `corpus_recovering` refusal keeps its
+/// sentence as [`ApiError::Recovering`]; any other envelope keeps its
+/// summary ([`ApiError::Server`]); a body that is not the envelope at all
+/// falls back to the bare status.
 #[must_use]
 pub fn decode_error_body(status: u16, body: &str) -> ApiError {
-    match serde_json::from_str::<ErrorResponse>(body) {
-        Ok(ErrorResponse { error }) if is_query_error(&error.code) => ApiError::Query {
+    let Ok(ErrorResponse { error }) = serde_json::from_str::<ErrorResponse>(body) else {
+        return ApiError::Status(status);
+    };
+    match kept_as(&error.code) {
+        Kept::Query => ApiError::Query {
             status,
             envelope: error,
         },
-        Ok(ErrorResponse { error }) => ApiError::Server {
+        Kept::Recovering => ApiError::Recovering {
             status,
             message: error.message,
         },
-        Err(_) => ApiError::Status(status),
+        Kept::Summary => ApiError::Server {
+            status,
+            message: error.message,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, decode_error_body, is_query_error};
+    use super::{ApiError, Kept, decode_error_body, kept_as};
     use trawl_api::ErrorCode;
 
-    /// Every wire code, spelled out. The match in `is_query_error` has no
+    /// Every wire code, spelled out. The match in `kept_as` has no
     /// wildcard, so a new code already fails to compile there; this list
-    /// makes the test say which way each existing code is classified.
-    const EVERY_CODE: [(ErrorCode, bool); 17] = [
-        (ErrorCode::ParseError, true),
-        (ErrorCode::ValidationError, true),
-        (ErrorCode::ExecutionError, false),
-        (ErrorCode::ResultTooLarge, false),
-        (ErrorCode::AuthError, false),
-        (ErrorCode::Forbidden, false),
-        (ErrorCode::BadRequest, false),
-        (ErrorCode::NotFound, false),
-        (ErrorCode::Timeout, false),
-        (ErrorCode::IngestError, false),
-        (ErrorCode::RateLimited, false),
-        (ErrorCode::TooManyStreams, false),
-        (ErrorCode::InternalError, false),
-        (ErrorCode::ServiceUnavailable, false),
-        (ErrorCode::HotBufferFull, false),
-        (ErrorCode::IngestBatchTooLarge, false),
-        (ErrorCode::CorpusRecovering, false),
+    /// makes the test say how each existing code is kept.
+    const EVERY_CODE: [(ErrorCode, Kept); 17] = [
+        (ErrorCode::ParseError, Kept::Query),
+        (ErrorCode::ValidationError, Kept::Query),
+        (ErrorCode::ExecutionError, Kept::Summary),
+        (ErrorCode::ResultTooLarge, Kept::Summary),
+        (ErrorCode::AuthError, Kept::Summary),
+        (ErrorCode::Forbidden, Kept::Summary),
+        (ErrorCode::BadRequest, Kept::Summary),
+        (ErrorCode::NotFound, Kept::Summary),
+        (ErrorCode::Timeout, Kept::Summary),
+        (ErrorCode::IngestError, Kept::Summary),
+        (ErrorCode::RateLimited, Kept::Summary),
+        (ErrorCode::TooManyStreams, Kept::Summary),
+        (ErrorCode::InternalError, Kept::Summary),
+        (ErrorCode::ServiceUnavailable, Kept::Summary),
+        (ErrorCode::HotBufferFull, Kept::Summary),
+        (ErrorCode::IngestBatchTooLarge, Kept::Summary),
+        (ErrorCode::CorpusRecovering, Kept::Recovering),
     ];
 
     #[test]
-    fn only_parse_and_validation_errors_are_query_errors() {
+    fn every_code_is_kept_as_its_class() {
         for (code, expected) in EVERY_CODE {
-            assert_eq!(is_query_error(&code), expected, "{code:?}");
+            assert_eq!(kept_as(&code), expected, "{code:?}");
+        }
+    }
+
+    /// Both of the server's fixed `corpus_recovering` sentences, as it
+    /// writes them. Neither is a query error, and neither is folded into
+    /// the generic summary: the search page names the state.
+    #[test]
+    fn a_corpus_recovering_refusal_keeps_its_message_as_recovering() {
+        for message in [
+            "Search is unavailable while the server finishes loading data from before its restart.",
+            "Search is unavailable while the server finishes an interrupted storage rollup.",
+        ] {
+            let body =
+                format!(r#"{{"error":{{"code":"corpus_recovering","message":"{message}"}}}}"#);
+            let err = decode_error_body(503, &body);
+            assert!(
+                matches!(&err, ApiError::Recovering { status: 503, message: m } if m == message),
+                "{err:?}"
+            );
+            assert_eq!(err.http_status(), Some(503));
+            assert_eq!(err.recovering(), Some(message));
+            assert!(err.query_error().is_none());
+            assert_eq!(err.to_string(), message);
+        }
+    }
+
+    /// Only `corpus_recovering` reads as recovering. A plain 503, the
+    /// generic `service_unavailable` a hot snapshot I/O failure answers,
+    /// stays a server error with its Retry.
+    #[test]
+    fn service_unavailable_is_not_recovering() {
+        let body = r#"{"error":{"code":"service_unavailable","message":"service unavailable"}}"#;
+        let err = decode_error_body(503, body);
+        assert!(
+            matches!(err, ApiError::Server { status: 503, .. }),
+            "{err:?}"
+        );
+        assert_eq!(err.recovering(), None);
+        for err in [
+            ApiError::Status(503),
+            ApiError::Unauthorized,
+            ApiError::Network("offline".to_owned()),
+        ] {
+            assert_eq!(err.recovering(), None, "{err:?}");
         }
     }
 
