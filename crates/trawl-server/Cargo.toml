@@ -68,9 +68,11 @@ rustix = { workspace = true }
 
 [features]
 # Exposes the pool's query-delay hook (`pool::TEST_QUERY_DELAY_MS`) to this
-# crate's own integration tests via the self-dev-dependency below. No
-# production consumer enables it, so release builds never carry the hook.
-test-support = []
+# crate's own integration tests via the self-dev-dependency below, and the
+# engine's phase-clock hold hook (`PhaseClock::hold_on_enter`) to the pool's
+# timing tests. No production consumer enables it, so release builds never
+# carry either hook.
+test-support = ["trawl-engine/test-support"]
 
 [dev-dependencies]
 # Self-dependency: enables the test-support hook for this crate's own
