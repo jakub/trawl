@@ -1,6 +1,6 @@
 # First run is a trial the CLI owns; an installation starts fresh
 
-status: accepted (2026-09-25), prep record for #203; amended (2026-09-25) during the #203 run, see the Amendment
+status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, see the Amendments
 
 Before a first query, an evaluator needs five executables, PostgreSQL with two databases, two roles, two keys, a certificate, and a hand-written config. No install channel creates a key. A fresh `apt install` starts `trawld` against placeholder database URLs, and systemd restarts it every five seconds. This record adds a **trial**: a disposable installation that the `trawl` CLI creates, runs, and deletes on one Linux machine. It also makes the Debian package install without starting anything.
 
@@ -56,3 +56,7 @@ The Decision said the Debian package uses `TRAWL_WEB_INSECURE_UPSTREAM`. It did 
 The packaged `trawld.toml` sets `[web] upstream_ca_path` to `/var/lib/trawl/tls/cert.pem`. `trawld` writes that certificate on its first start when `tls_cert_path` is not set. Until the file exists, `trawl-web` refuses to start, and systemd restarts it every 5 seconds. An operator who sets `tls_cert_path` points `upstream_ca_path` at the CA that issued that certificate. To use the switch instead, the operator removes `upstream_ca_path`, because `trawl-web` refuses to start with both set.
 
 The Helm chart keeps the loopback switch. There, `trawl-web` runs beside `trawld` in the same pod and reaches it on loopback.
+
+## Amendment: the image tag drops build metadata, 2026-09-27
+
+The Decision names the image `ghcr.io/jakub/trawl:<CLI version>`. The release workflow publishes the version without its semver build metadata, because `docker/metadata-action` renders the tag from the semver version and a Docker tag cannot contain `+`. So `1.1.0-rc.1+build.7` is published, and pulled by the trial, as `1.1.0-rc.1`. The chart keeps the full version.
