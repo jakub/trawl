@@ -523,10 +523,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_env_that_cannot_be_listed_is_one_unlisted_scope() {
         use std::os::unix::fs::PermissionsExt as _;
+
+        super::super::enforce_mode_bits_on_this_thread();
 
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path();
@@ -536,11 +538,10 @@ mod tests {
         plant(wal, "locked", "web", BASE + 2, &one);
         let locked = wal.join("locked");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::read_dir(&locked).is_ok() {
-            // Running as root: mode bits are not enforced.
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-            return;
-        }
+        assert!(
+            std::fs::read_dir(&locked).is_err(),
+            "mode 000 must lock the env directory for this thread"
+        );
         let selection = select(wal, caps(100, 1 << 20));
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(selected(&selection), [prod]);

@@ -90,6 +90,11 @@ reqwest = { workspace = true }
 # logger does. Already in the graph through sqlx and tracing-log.
 log = { workspace = true }
 
+# Tests that lock a directory with mode bits drop the DAC capabilities
+# from the test thread, so the lock binds when the suite runs as root.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true, features = ["thread"] }
+
 [package.metadata.deb]
 name = "trawl-server"
 maintainer = "Jakub Burgis <mail@jakub.me>"

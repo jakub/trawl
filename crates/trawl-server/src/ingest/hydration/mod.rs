@@ -199,6 +199,20 @@ fn file_age(now: SystemTime, millis: u64) -> Duration {
         .saturating_sub(Duration::from_millis(millis))
 }
 
+/// Make mode bits bind on the calling thread even when the tests run as
+/// root, for a test that locks a directory with mode `000`: drop
+/// `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` from the thread's effective
+/// set. Capabilities belong to a thread, so no other test loses them, and
+/// the permitted set is kept.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn enforce_mode_bits_on_this_thread() {
+    use rustix::thread::{CapabilitySet, capabilities, set_capabilities};
+    let mut sets = capabilities(None).expect("capget on the test thread");
+    sets.effective
+        .remove(CapabilitySet::DAC_OVERRIDE | CapabilitySet::DAC_READ_SEARCH);
+    set_capabilities(None, sets).expect("capset on the test thread");
+}
+
 #[cfg(test)]
 mod test_support {
     use std::path::Path;
