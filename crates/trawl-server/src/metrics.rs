@@ -46,7 +46,8 @@ pub const HOT_BUFFER_BYTES: &str = "trawl_hot_buffer_bytes";
 pub const HOT_BUFFER_MAX_EVENTS: &str = "trawl_hot_buffer_max_events";
 /// The full byte cap (`ingest.hot_buffer_max_bytes`).
 pub const HOT_BUFFER_MAX_BYTES: &str = "trawl_hot_buffer_max_bytes";
-/// Seconds since the oldest resident batch was inserted; 0 when empty.
+/// Age in seconds of the oldest resident batch, 0 when empty. A batch
+/// hydrated at boot counts from the time in its WAL file name.
 pub const HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS: &str = "trawl_hot_buffer_oldest_batch_age_seconds";
 /// [`crate::hot_buffer::AdmissionState`] as 0 (open), 1 (pressure) or
 /// 2 (refusing).
@@ -55,6 +56,9 @@ pub const HOT_BUFFER_ADMISSION_STATE: &str = "trawl_hot_buffer_admission_state";
 /// ([`crate::ingest::producer::ProducerKind`] ×
 /// [`crate::hot_buffer::Refusal`]); the full matrix is zero-initialized.
 pub const HOT_BUFFER_ADMISSION_REFUSALS_TOTAL: &str = "trawl_hot_buffer_admission_refusals_total";
+/// Batches dropped because their id was already resident; the resident
+/// stays. A writer bug, so any increment is worth an operator's look.
+pub const HOT_BUFFER_DUPLICATE_BATCHES_TOTAL: &str = "trawl_hot_buffer_duplicate_batches_total";
 /// The configured compaction interval, so an alert can scale the drain
 /// stall threshold to it.
 pub const COMPACTION_INTERVAL_SECONDS: &str = "trawl_compaction_interval_seconds";
@@ -274,6 +278,7 @@ pub fn init_operational_alert_metrics() {
         SYSLOG_WAL_EVENTS_DISCARDED_TOTAL,
         SYSLOG_WRITE_TASKS_FAILED_TOTAL,
         TELEMETRY_WAL_WRITE_FAILURES_TOTAL,
+        HOT_BUFFER_DUPLICATE_BATCHES_TOTAL,
     ] {
         metrics::counter!(name).increment(0);
     }
@@ -405,7 +410,8 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS,
-        "Seconds since the oldest resident hot-buffer batch was inserted, \
+        "Age in seconds of the oldest resident hot-buffer batch (a batch \
+         reloaded from the WAL at boot counts from its file's timestamp), \
          0 when the buffer is empty; rising past a few compaction intervals \
          means compaction is not draining"
     );
@@ -422,6 +428,11 @@ pub fn describe_metrics() {
          syslog, trawld) and kind (full = no free space, retry after \
          compaction drains; oversized = larger than the producer's ceiling, \
          can never fit)"
+    );
+    describe_counter!(
+        HOT_BUFFER_DUPLICATE_BATCHES_TOTAL,
+        "Hot-buffer batches dropped because their batch id was already \
+         resident; the resident batch is kept. Nonzero means a WAL writer bug"
     );
     describe_gauge!(
         COMPACTION_INTERVAL_SECONDS,
@@ -1696,6 +1707,7 @@ mod tests {
                 "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"oversized\"}",
                 "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"full\"}",
                 "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"oversized\"}",
+                "trawl_hot_buffer_duplicate_batches_total",
                 "trawl_syslog_wal_events_discarded_total",
                 "trawl_syslog_write_tasks_failed_total",
                 "trawl_telemetry_wal_write_failures_total",
