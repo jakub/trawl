@@ -27,7 +27,7 @@ The [from saved stage](/reference/dsl/#from-saved) queries materialized runs ins
 
 ## Internal telemetry
 
-With internal telemetry enabled, a tracing layer turns daemon events into ordinary `service=trawld` records through the same [event contract](/reference/events/) as any producer. Payload fields cannot rename its service.
+With internal telemetry enabled, a tracing layer turns daemon events into ordinary `service=trawld` records through the same [event contract](/reference/events/) as any producer. Payload fields cannot rename its service. The layer starts writing after boot hydration, and the daemon then logs `internal telemetry enabled` at INFO. See [boot order](/architecture/recovery/#boot-order).
 
 A flush writes its batch through the ingest WAL on Tokio's blocking pool, and only a successful write reaches the hot buffer and SSE. A failed write keeps its batch in a FIFO retry queue that drains oldest first, in coalesced writes of at most 4 MiB each. A cancelled write has already consumed its batch, so Trawl counts those events as lost.
 

@@ -839,7 +839,8 @@ async fn fresh_boot_restart_and_interrupted_current_cutover() {
 /// conformance, of every producer and background task, and of the
 /// listener. The first compaction pass runs at boot, after recovery, and
 /// publishes the kept WAL once (ADR-0041 slice 2); a long compaction
-/// interval keeps every later tick out of the picture.
+/// interval keeps every later tick out of the picture. The restarted
+/// daemon runs internal telemetry, so its activation is ordered too.
 #[tokio::test]
 async fn boot_recovers_publication_markers_before_serving() {
     use trawl_server::ingest::publication_marker::{ValidatedMarker, identity_of, write_marker};
@@ -919,6 +920,8 @@ async fn boot_recovers_publication_markers_before_serving() {
     assert_eq!(web_marker.tmp(&data), web_tmp);
     write_marker(&wal, &web_marker).unwrap();
 
+    // Only now, or hydration would also load the first daemon's own events.
+    fixture.internal_telemetry = true;
     let mut daemon = fixture.spawn();
     daemon.ready().await;
     // The boot pass publishes the kept WAL under a marker and a tmp of its
@@ -939,10 +942,7 @@ async fn boot_recovers_publication_markers_before_serving() {
     assert!(canonical.is_file(), "published output kept");
     assert!(!web_tmp.exists(), "no staged output left");
     let log = daemon.log();
-    let hydration = log
-        .lines()
-        .find(|line| line.contains("event_type=\"boot_hydration\""))
-        .unwrap_or_else(|| panic!("no boot_hydration line: {log}"));
+    let hydration = boot_hydration(&log);
     assert!(
         hydration.contains("hydrated=1") && hydration.contains("overhang=false"),
         "the kept WAL file is resident: {hydration}"
@@ -961,14 +961,17 @@ async fn boot_recovers_publication_markers_before_serving() {
 /// Assert the boot order (ADR-0041): both `publication_recovered` outcomes,
 /// then rollup-marker recovery, then boot conformance (its skip on an
 /// already-conformed root still logs `catalog_conform`), then hydration,
-/// each strictly after the one before. Every later step's first line
-/// follows hydration: the ingest pipeline (logged after self-telemetry is
-/// activated, and before compaction is spawned), the compaction,
-/// retention, syslog and scheduler tasks, and the listener. Those tasks log
-/// from their own threads, some after the listener, so they are ordered
-/// against hydration only; wait for every line first.
+/// then internal telemetry activation, each strictly after the one before.
+/// From activation on, a WAL file telemetry writes is inserted, so a
+/// hydration after it would count that file twice. Every later step's first
+/// line follows activation: the ingest pipeline (logged before compaction
+/// is spawned), the compaction, retention, syslog and scheduler tasks, and
+/// the listener. Those tasks log from their own threads, some after the
+/// listener, so they are ordered against activation only; wait for every
+/// line first. The daemon must run internal telemetry.
 async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
-    let later: [(&str, &str); 9] = [
+    const TELEMETRY_ACTIVATED: &str = "internal telemetry enabled";
+    let later: [(&str, &str); 10] = [
         ("ingest pipeline", "ingest pipeline enabled"),
         ("compaction task", "action=\"compaction_start\""),
         ("retention task", "action=\"retention_start\""),
@@ -978,6 +981,7 @@ async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
         ("scheduler", "event_type=\"scheduler_started\""),
         ("listener", "HTTPS server listening"),
         ("hydration", "event_type=\"boot_hydration\""),
+        ("telemetry activation", TELEMETRY_ACTIVATED),
     ];
     let deadline = Instant::now() + Duration::from_secs(10);
     let log = loop {
@@ -1005,6 +1009,7 @@ async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
     let rollups = first("event_type=\"rollup_boot_recovery\"");
     let conformance = first("event_type=\"catalog_conform");
     let hydration = first("event_type=\"boot_hydration\"");
+    let activation = first(TELEMETRY_ACTIVATED);
     for recovered in recovered {
         assert!(
             recovered < rollups,
@@ -1019,16 +1024,16 @@ async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
         conformance < hydration,
         "conformance precedes hydration: {log}"
     );
-    for (step, needle) in &later[..later.len() - 1] {
+    assert!(
+        hydration < activation,
+        "hydration precedes telemetry activation: {log}"
+    );
+    for (step, needle) in &later[..later.len() - 2] {
         assert!(
-            hydration < first(needle),
-            "hydration must precede the {step}: {log}"
+            activation < first(needle),
+            "telemetry activation must precede the {step}: {log}"
         );
     }
-    assert!(
-        first("ingest pipeline enabled") < first("action=\"compaction_start\""),
-        "self-telemetry is active before compaction starts: {log}"
-    );
 }
 
 // Real-process crash tests for the publication protocol (#252, ADR-0041).

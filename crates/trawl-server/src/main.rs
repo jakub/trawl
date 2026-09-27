@@ -346,6 +346,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         if let Some(buf) = &state.query.hot_buffer {
             layer.set_hot_buffer(Arc::clone(buf));
         }
+        tracing::info!(event_type = "lifecycle", "internal telemetry enabled");
     }
 
     let compaction_handle = spawn_ingest_pipeline(&config, &state)?;
