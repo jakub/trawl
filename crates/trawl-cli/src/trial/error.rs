@@ -208,7 +208,7 @@ pub enum TrialError {
         "the sample post's result is unknown: after {secs}s the sample services hold \
          {counts}{detail}. trawl never posts the samples twice. Start over with \
          `trawl trial down --yes` and then `trawl trial up`, or keep this trial without \
-         samples with `trawl trial up --no-sample-data`"
+         samples with `trawl trial up --no-sample-data`; later `up`s then skip them too"
     )]
     SamplesUnverified {
         secs: u64,
@@ -221,7 +221,7 @@ pub enum TrialError {
          post's result is unknown: the sample services hold {counts} (found/expected). \
          trawl never posts the samples twice. Start over with `trawl trial down --yes` \
          and then `trawl trial up`, or keep this trial without samples with \
-         `trawl trial up --no-sample-data`"
+         `trawl trial up --no-sample-data`; later `up`s then skip them too"
     )]
     SamplesPostUnknown { counts: String },
 
@@ -230,7 +230,7 @@ pub enum TrialError {
          ({counts}), and posting the samples could duplicate them; trawl never posts the \
          samples twice. Start over with `trawl trial down --yes` and then \
          `trawl trial up`, or keep this trial without samples with \
-         `trawl trial up --no-sample-data`"
+         `trawl trial up --no-sample-data`; later `up`s then skip them too"
     )]
     SamplesUnaccounted { counts: String },
 

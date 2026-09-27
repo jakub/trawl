@@ -356,6 +356,13 @@ a message that points to `down`. The samples are loaded once, and a resume
 never posts them again. A trial created with `--no-sample-data` gets them on
 a later `up` without the flag, when the sample services still hold no events.
 
+When `up` cannot verify a sample post, or the sample services hold events that
+the trial did not post, `up` refuses and posts nothing. Then
+`trawl trial up --no-sample-data` keeps the trial without samples for good:
+every later `up` skips them, and `status` shows them as declined.
+`trawl trial down --yes` and then `trawl trial up` start a fresh trial with
+samples.
+
 `up` checks Docker before it creates anything, and the message names the
 missing requirement: the `docker` command, the Compose plugin or a version
 below 2.20, an unreachable engine, or a `DOCKER_HOST` or active Docker context

@@ -39,7 +39,9 @@
 //! 9. samples, unless `--no-sample-data`: the intent is recorded before
 //!    the one POST, and completion only after the counts are verified.
 //!    [`sample::decide_samples`] rules every branch, and a result `up`
-//!    cannot verify is never posted again.
+//!    cannot verify is never posted again. `--no-sample-data` over such a
+//!    result records that the trial declines the samples, and every later
+//!    `up` skips them.
 //!
 //! `status`, `key`, and `-p trial` take no lock: they read files that are
 //! only ever replaced by an atomic rename.
@@ -1162,6 +1164,10 @@ pub fn check_identity(key: TrialKey, who: &trawl_api::WhoAmIResponse) -> Result<
 /// How long `up` waits for posted samples to become queryable.
 const SAMPLE_WAIT: Duration = Duration::from_mins(1);
 
+/// How a trial that declined the samples gets them: a fresh trial.
+const FRESH_WITH_SAMPLES: &str =
+    "`trawl trial down --yes` and then `trawl trial up` start a fresh trial with samples";
+
 /// Counts events per service. Only the sample services are compared, so
 /// trawld's self-telemetry never enters a decision.
 const COUNT_QUERY: &str = "* | stats count() as events by service";
@@ -1169,7 +1175,8 @@ const COUNT_QUERY: &str = "* | stats count() as events by service";
 /// The sample step. [`sample::decide_samples`] decides; this carries it
 /// out. `Intent` is saved before the single POST, and `Complete` only
 /// once the sample services hold exactly the expected counts. Anything
-/// else refuses with recovery text and never posts again.
+/// else refuses with recovery text and never posts again, or, under
+/// `--no-sample-data`, records `Declined`.
 async fn seed(
     paths: &TrialPaths,
     state: &mut TrialState,
@@ -1199,6 +1206,22 @@ async fn seed(
             progress("the earlier sample post landed; recording it");
             state.samples = complete(*seed, &sample::generate(*seed, anchor));
             state.save(&paths.state_file())
+        }
+        SampleAction::Decline => {
+            progress(format_args!(
+                "keeping this trial without samples (--no-sample-data): trawl cannot verify \
+                 what the sample services hold, and later `trawl trial up` runs skip the \
+                 samples too. {FRESH_WITH_SAMPLES}"
+            ));
+            state.samples = Samples::Declined;
+            state.save(&paths.state_file())
+        }
+        SampleAction::KeepDeclined => {
+            progress(format_args!(
+                "skipping the samples: this trial declined them with --no-sample-data. \
+                 {FRESH_WITH_SAMPLES}"
+            ));
+            Ok(())
         }
         SampleAction::RefuseUnknownPost { observed, expected } => {
             Err(TrialError::SamplesPostUnknown {
@@ -2314,6 +2337,10 @@ fi"#,
                 message.contains("never posts the samples twice"),
                 "{message}"
             );
+            assert!(
+                message.contains("later `up`s then skip them too"),
+                "{message}"
+            );
         }
     }
 
@@ -2352,6 +2379,149 @@ fi"#,
             message.contains("trawl trial up --no-sample-data"),
             "{message}"
         );
+    }
+
+    /// A plain-HTTP stand-in for trawld's query and ingest endpoints.
+    /// Every query answers `counts` as [`COUNT_QUERY`]'s rows; every
+    /// ingest post is accepted and counted. Returns the two clients and
+    /// the post count.
+    async fn fake_api(
+        counts: std::collections::BTreeMap<String, u64>,
+    ) -> (Clients, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use trawl_api::value::{Column, QueryResult, Value};
+
+        let rows: Vec<Vec<Value>> = counts
+            .into_iter()
+            .map(|(service, n)| vec![Value::String(service), Value::UInt(n)])
+            .collect();
+        let query = serde_json::to_vec(&trawl_api::QueryResponse {
+            execution: None,
+            pagination: trawl_api::PaginationMeta {
+                limit: rows.len(),
+                offset: 0,
+                returned: rows.len(),
+                total: rows.len(),
+            },
+            result: QueryResult {
+                columns: vec![
+                    Column {
+                        name: "service".into(),
+                    },
+                    Column {
+                        name: "events".into(),
+                    },
+                ],
+                rows,
+            },
+            degraded_fields: Vec::new(),
+            severity_columns: Vec::new(),
+        })
+        .unwrap();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let counted = Arc::clone(&posts);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = vec![0; 16 * 1024];
+                let head_end = loop {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break None;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break Some(i + 4);
+                    }
+                };
+                let Some(head_end) = head_end else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |n| n.trim().parse().unwrap());
+                while request.len() < head_end + length {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "the client closed mid-body");
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let body = if head.starts_with("post /api/v1/ingest ") {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    br#"{"accepted":2000}"#.to_vec()
+                } else {
+                    assert!(head.starts_with("post /api/v1/query "), "{head}");
+                    query.clone()
+                };
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                socket.write_all(&response).await.unwrap();
+            }
+        });
+        let clients = Clients {
+            operator: HttpClient::new(base.clone(), "operator").unwrap(),
+            ingest: HttpClient::new(base, "ingest").unwrap(),
+        };
+        (clients, posts)
+    }
+
+    /// Both refusals that name `trawl trial up --no-sample-data` keep
+    /// their word: once an `up --no-sample-data` has run, every later
+    /// plain `up` goes on without the samples. It never refuses again,
+    /// and never posts.
+    #[tokio::test]
+    async fn declining_the_samples_lasts() {
+        let expected: std::collections::BTreeMap<String, u64> = sample::expected_counts()
+            .into_iter()
+            .map(|(service, count)| (service.to_owned(), count))
+            .collect();
+        let unknown_post = Samples::Intent {
+            seed: sample::SAMPLE_SEED,
+            anchor: "2026-09-25T12:00:00.123Z".into(),
+            expected,
+        };
+        let partial = [("web".to_owned(), 350)].into();
+        let stray = [("checkout".to_owned(), 1), ("trawld".to_owned(), 41)].into();
+        for (samples, counts) in [(unknown_post, partial), (Samples::Skipped, stray)] {
+            let (clients, posts) = fake_api(counts).await;
+            let home = tempfile::tempdir().unwrap();
+            let paths = TrialPaths::resolve(Some(&home.path().join("state")), None).unwrap();
+            paths.ensure_dir().unwrap();
+            let mut state = TrialState {
+                samples: samples.clone(),
+                ..fixture(DEFAULT_API_PORT)
+            };
+            state.save(&paths.state_file()).unwrap();
+
+            let refused = seed(&paths, &mut state, &clients, true).await.unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains("trawl trial up --no-sample-data"),
+                "{samples:?}: {refused}"
+            );
+            seed(&paths, &mut state, &clients, false).await.unwrap();
+            for _ in 0..2 {
+                let mut resumed = TrialState::load(&paths.state_file()).unwrap().unwrap();
+                seed(&paths, &mut resumed, &clients, true)
+                    .await
+                    .unwrap_or_else(|e| panic!("{samples:?}: a later plain `up` refused: {e}"));
+            }
+            assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let recorded = TrialState::load(&paths.state_file()).unwrap().unwrap();
+            assert_eq!(recorded.samples, Samples::Declined, "{samples:?}");
+        }
     }
 
     #[test]

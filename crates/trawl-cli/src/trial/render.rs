@@ -93,6 +93,13 @@ pub fn render_summary(
                 "No sample data. `trawl trial up` without --no-sample-data adds it."
             )?;
         }
+        Samples::Declined => {
+            writeln!(
+                out,
+                "No sample data: this trial declined it. `trawl trial down --yes` and then"
+            )?;
+            writeln!(out, "`trawl trial up` start a fresh trial with samples.")?;
+        }
         Samples::Intent { .. } => {
             writeln!(
                 out,
@@ -177,6 +184,10 @@ pub fn render_status(
     match &state.samples {
         Samples::NotRequested => writeln!(out, "  not loaded yet")?,
         Samples::Skipped => writeln!(out, "  none (--no-sample-data)")?,
+        Samples::Declined => writeln!(
+            out,
+            "  declined (--no-sample-data): trawl could not verify what the sample services hold"
+        )?,
         Samples::Intent {
             anchor, expected, ..
         } => {
@@ -440,6 +451,32 @@ mod tests {
         let summary = text(|out| render_summary(out, &state, &paths()));
         assert!(!summary.contains(DOCUMENTED_QUERY), "{summary}");
         assert!(summary.contains("No sample data"), "{summary}");
+    }
+
+    /// A declined trial says so, and says how to get samples: a plain `up`
+    /// does not add them.
+    #[test]
+    fn a_declined_trial_names_the_way_to_samples() {
+        let mut state = fixture(crate::trial::DEFAULT_API_PORT);
+        state.samples = Samples::Declined;
+        let summary = text(|out| render_summary(out, &state, &paths()));
+        assert!(!summary.contains(DOCUMENTED_QUERY), "{summary}");
+        assert!(
+            !summary.contains("without --no-sample-data adds it"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(
+                "No sample data: this trial declined it. `trawl trial down --yes` and then\n\
+                 `trawl trial up` start a fresh trial with samples.\n"
+            ),
+            "{summary}"
+        );
+        let status = text(|out| render_status(out, &state, &paths(), &containers()));
+        assert!(
+            status.contains("Samples\n  declined (--no-sample-data): "),
+            "{status}"
+        );
     }
 
     /// The trial publishes on 127.0.0.1 only. A browser tries `localhost`

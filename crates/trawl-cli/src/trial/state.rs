@@ -138,8 +138,15 @@ impl std::fmt::Debug for KeyRecord {
 pub enum Samples {
     /// No `up` has reached the sample step yet.
     NotRequested,
-    /// `up --no-sample-data`.
+    /// `up --no-sample-data`. A later `up` without the flag posts the
+    /// samples when the sample services are empty.
     Skipped,
+    /// `up --no-sample-data` where an `up` without the flag refuses,
+    /// because trawl cannot verify what the sample services hold: an
+    /// earlier post's result is unknown, or they hold events no post of
+    /// this trial accounts for. The trial keeps no samples for good, and
+    /// every later `up` skips them.
+    Declined,
     /// About to post, or posted with an unverified result.
     Intent {
         seed: u64,
@@ -331,6 +338,7 @@ pub(crate) mod tests {
         let samples = [
             Samples::NotRequested,
             Samples::Skipped,
+            Samples::Declined,
             Samples::Intent {
                 seed: 203,
                 anchor: "2026-09-25T12:00:00Z".into(),
@@ -355,8 +363,31 @@ pub(crate) mod tests {
     fn samples_carry_a_snake_case_state_tag() {
         let json = serde_json::to_value(Samples::NotRequested).unwrap();
         assert_eq!(json, serde_json::json!({"state": "not_requested"}));
+        let json = serde_json::to_value(Samples::Declined).unwrap();
+        assert_eq!(json, serde_json::json!({"state": "declined"}));
         let json = serde_json::to_value(fixture(1).samples).unwrap();
         assert_eq!(json["state"], "complete");
+    }
+
+    /// A declined trial is still one `stop` and `down` read, and a state
+    /// written before `declined` existed still resumes.
+    #[test]
+    fn a_declined_trial_loads_for_every_verb() {
+        let (_tmp, path) = state_path();
+        let declined = TrialState {
+            samples: Samples::Declined,
+            ..fixture(1)
+        };
+        declined.save(&path).unwrap();
+        assert_eq!(TrialState::load(&path).unwrap(), Some(declined));
+        let view = DownView::load(&path).unwrap().expect("present");
+        assert_eq!(view.trial_id, "0123456789abcdef0123456789abcdef");
+
+        let mut older = serde_json::to_value(fixture(1)).unwrap();
+        older["samples"] = serde_json::json!({"state": "skipped"});
+        write_private(&path, older.to_string().as_bytes(), 0o600).unwrap();
+        let loaded = TrialState::load(&path).unwrap().expect("present");
+        assert_eq!(loaded.samples, Samples::Skipped);
     }
 
     #[test]

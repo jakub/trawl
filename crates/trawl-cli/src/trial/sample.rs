@@ -418,6 +418,12 @@ pub enum SampleAction {
     /// Nothing to post. When the state was `NotRequested` and samples were
     /// not requested, `up` records `Skipped`.
     Skip,
+    /// `--no-sample-data` where an `up` without it would refuse: `up`
+    /// records `Declined`, so no later `up` refuses or posts.
+    Decline,
+    /// The trial declined the samples: nothing to post, and `up` says how
+    /// to start a trial that has them.
+    KeepDeclined,
     /// An earlier `up` recorded `Intent`, and the sample services do not
     /// hold exactly the expected counts, so that post's result is unknown.
     /// Posting again could duplicate it, so `up` stops with recovery text.
@@ -442,21 +448,31 @@ pub enum SampleAction {
 /// trawld's self-telemetry; those are ignored, and a missing sample
 /// service counts as zero.
 ///
-/// - `Complete`: skip.
-/// - `Intent`: exactly the recorded expected counts means the earlier post
-///   landed, so mark it complete. Anything else refuses, and never posts
-///   again; with `--no-sample-data` it is left as it is.
-/// - `NotRequested` or `Skipped`: post when samples are requested and
-///   every sample service is empty, refuse when one is not, and skip when
-///   samples are not requested.
+/// | state | exact expected counts | every sample service empty | otherwise |
+/// |---|---|---|---|
+/// | `Complete` | skip | skip | skip |
+/// | `Declined` | keep declined | keep declined | keep declined |
+/// | `Intent` | mark complete | refuse, unknown post | refuse, unknown post |
+/// | `NotRequested`, `Skipped` | refuse, unaccounted | post | refuse, unaccounted |
+///
+/// That is the table for an `up` without `--no-sample-data`. With it,
+/// nothing is posted: every refusal becomes a decline, keep declined
+/// becomes skip, and mark complete and skip stay.
+///
+/// An `Intent` whose post landed exactly is complete. Any other count
+/// leaves that post's result unknown, and posting again could duplicate
+/// it. A sample service that holds events no post of this trial accounts
+/// for could be duplicated too. Both refusals name `--no-sample-data`, and
+/// the decline it leads to lasts: no later `up` refuses or posts.
 pub fn decide_samples(
     state: &Samples,
     requested: bool,
     observed: &BTreeMap<String, u64>,
 ) -> SampleAction {
     let observed = sample_counts(observed);
-    match state {
+    let action = match state {
         Samples::Complete { .. } => SampleAction::Skip,
+        Samples::Declined => SampleAction::KeepDeclined,
         Samples::Intent { expected, .. } => {
             let exact = observed
                 .iter()
@@ -466,24 +482,30 @@ pub fn decide_samples(
                     .all(|(service, count)| observed.get(service).copied().unwrap_or(0) == *count);
             if exact {
                 SampleAction::MarkComplete
-            } else if requested {
+            } else {
                 SampleAction::RefuseUnknownPost {
                     observed,
                     expected: expected.clone(),
                 }
-            } else {
-                SampleAction::Skip
             }
         }
         Samples::NotRequested | Samples::Skipped => {
-            if !requested {
-                SampleAction::Skip
-            } else if observed.values().all(|count| *count == 0) {
+            if observed.values().all(|count| *count == 0) {
                 SampleAction::Post
             } else {
                 SampleAction::RefuseUnaccounted { observed }
             }
         }
+    };
+    if requested {
+        return action;
+    }
+    match action {
+        SampleAction::RefuseUnknownPost { .. } | SampleAction::RefuseUnaccounted { .. } => {
+            SampleAction::Decline
+        }
+        SampleAction::Post | SampleAction::KeepDeclined => SampleAction::Skip,
+        other => other,
     }
 }
 
@@ -844,7 +866,7 @@ mod tests {
 
     #[test]
     fn decide_samples_before_any_post() {
-        use SampleAction::{Post, Skip};
+        use SampleAction::{Decline, Post, Skip};
         let none = Counts::new();
         let zeros: Counts = expected_owned().into_keys().map(|s| (s, 0)).collect();
         let stray = with(&telemetry(), "checkout", 1);
@@ -864,12 +886,26 @@ mod tests {
                 refuse(&stray),
             ),
             ("skipped, not requested", skipped, false, none, Skip),
+            (
+                "fresh, stray, not requested",
+                fresh,
+                false,
+                stray.clone(),
+                Decline,
+            ),
+            (
+                "skipped, stray, not requested",
+                skipped,
+                false,
+                stray,
+                Decline,
+            ),
         ]);
     }
 
     #[test]
     fn decide_samples_after_an_unverified_post_never_posts() {
-        use SampleAction::{MarkComplete, Skip};
+        use SampleAction::{Decline, MarkComplete};
         let expected = expected_owned();
         let intent = &Samples::Intent {
             seed: SAMPLE_SEED,
@@ -918,8 +954,27 @@ mod tests {
                 doubled.clone(),
                 unknown_post(&doubled),
             ),
-            ("partial, not requested", intent, false, partial, Skip),
-            ("nothing, not requested", intent, false, none, Skip),
+            ("partial, not requested", intent, false, partial, Decline),
+            ("nothing, not requested", intent, false, none, Decline),
+        ]);
+    }
+
+    /// A declined trial never posts and never refuses, whatever the
+    /// sample services hold.
+    #[test]
+    fn decide_samples_once_declined_never_posts() {
+        use SampleAction::{KeepDeclined, Skip};
+        let declined = &Samples::Declined;
+        let none = Counts::new();
+        let partial = with(&expected_owned(), "web", 350);
+        let stray = with(&telemetry(), "checkout", 1);
+        check(vec![
+            ("nothing", declined, true, none.clone(), KeepDeclined),
+            ("exact", declined, true, expected_owned(), KeepDeclined),
+            ("partial", declined, true, partial.clone(), KeepDeclined),
+            ("stray", declined, true, stray, KeepDeclined),
+            ("nothing, not requested", declined, false, none, Skip),
+            ("partial, not requested", declined, false, partial, Skip),
         ]);
     }
 
