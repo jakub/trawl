@@ -1528,7 +1528,8 @@ pub fn confirm(
 /// What `down` shows before it asks.
 #[derive(Debug, Clone, Copy)]
 pub enum Listing<'a> {
-    /// The trial's resources on the engine, then its directory.
+    /// The trial's resources on the engine, then its directory as one
+    /// line: the directory is deleted with everything in it.
     Trial(&'a Inventory),
     /// A trial directory that holds no state, and the entries in it. The
     /// engine then holds nothing of a trial's.
@@ -1584,9 +1585,12 @@ pub async fn down(paths: &TrialPaths, yes: bool) -> Result<(), TrialError> {
 }
 
 /// `down` on its own engine. `approve` shows the listing and answers;
-/// nothing is deleted before it answers [`Confirmation::Proceed`], and
-/// then exactly what it was shown is deleted: the inventory by id, or the
-/// listed entries of a directory without a state.
+/// nothing is deleted before it answers [`Confirmation::Proceed`]. Then
+/// the engine resources it was shown are deleted by id, and nothing else
+/// on the engine. The trial directory of a trial is deleted with
+/// everything in it, including files added while `approve` waited. For a
+/// directory without a state, [`remove_leftover`] checks the top-level
+/// entries against the listing.
 async fn remove_trial(
     docker: &Docker,
     paths: &TrialPaths,
@@ -1708,8 +1712,9 @@ async fn delete(docker: &Docker, inventory: &Inventory, our_id: &str) -> Result<
     Ok(())
 }
 
-/// Remove the trial directory, after checking it is a real directory of
-/// ours. `remove_dir_all` does not follow symlinks inside it.
+/// Remove the trial directory with everything in it at that moment, after
+/// checking it is a real directory of ours. `remove_dir_all` does not
+/// follow symlinks inside it.
 fn remove_dir(paths: &TrialPaths) -> Result<(), TrialError> {
     if paths.check_dir()? {
         std::fs::remove_dir_all(&paths.dir).map_err(|e| TrialError::io("remove", &paths.dir, e))?;

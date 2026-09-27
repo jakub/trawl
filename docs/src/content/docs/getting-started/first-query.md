@@ -216,8 +216,8 @@ trawl trial down
 `down` prints the containers, volumes, and network it will delete and asks
 `Delete all of it? [y/N]`. Without a terminal it exits non-zero and deletes
 nothing. Pass `--yes` to skip the question. It deletes only resources that
-carry this trial's id, then the trial directory, and exits 0. A second `down`
-prints that there is nothing to delete and exits 0.
+carry this trial's id, then the trial directory with everything in it, and
+exits 0. A second `down` prints that there is nothing to delete and exits 0.
 
 ## From trial to installation
 

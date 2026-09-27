@@ -390,6 +390,10 @@ written by any CLI version. When no trial exists it prints so and exits `0`.
 When the trial directory has no `state.json`, `down` lists the directory and
 each entry in it, and asks the same way, even when the directory is empty.
 It deletes those entries and the directory only after a yes or with `--yes`.
+A listed subdirectory is deleted with everything in it. `down` checks only
+the top-level entries against the listing: when an entry appears at the top
+level while `down` asks, `down` keeps that entry and the directory, and exits
+non-zero.
 
 ### State and lock
 
@@ -397,8 +401,9 @@ The trial directory is `$XDG_STATE_HOME/trawl/trial`, or
 `~/.local/state/trawl/trial` when `XDG_STATE_HOME` is unset. It is mode
 `0700` and holds `state.json`, `compose.json`, the public certificate
 `ca.pem`, and the two token files `operator.token` and `ingest.token` at mode
-`0600`. A symbolic link at the directory or its parent is refused. `down`
-deletes the directory.
+`0600`. A symbolic link at the directory or its parent is refused. For a trial,
+`down` lists the directory as one line and then deletes it with everything
+in it, including files added while `down` asked.
 
 `up`, `stop`, and `down` hold an exclusive lock on
 `$XDG_STATE_HOME/trawl/trial.lock`, outside the directory `down` deletes. A
