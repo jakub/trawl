@@ -106,10 +106,11 @@ The corpus is unsettled while overhang holds or a [rollup marker](/architecture/
 - queries and exports
 - field values that are not cached
 - a manual run of a saved query, which creates no run
+- a repin, which ends its job `blocked` before the scan
 
 The cause kind is `rollup_pending` while a rollup marker is pending, and `restart_backlog` otherwise. The response carries no `Retry-After`: the next pass may clear the state at once, and a standing fault never clears without an operator.
 
-A repin is refused before its scan, and the job ends `blocked` with a message that names the reason. The scheduler skips its whole poll while the corpus is unsettled, so it claims no window and no fire cursor moves. After the corpus settles, one claim covers the gap.
+The blocked repin job's `error` names the reason. The scheduler skips its whole poll while the corpus is unsettled, so it claims no window and no fire cursor moves. After the corpus settles, one claim covers the gap.
 
 These answer as usual: live tail over SSE, a `| from saved` query, which reads saved report files only, `/api/v1/schema`, `/api/v1/schema/services`, `/api/v1/health`, `/metrics`, and a cached field-values hit. The schema routes count from Parquet footers, so their counts are cold-only and approximate in any case.
 

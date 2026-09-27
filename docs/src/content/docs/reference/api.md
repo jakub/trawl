@@ -89,7 +89,7 @@ Every error that trawld itself produces has this body:
 
 #### Corpus recovering
 
-A read answers 503 `corpus_recovering` while the corpus is unsettled: after a restart, until compaction proves that the WAL from before the restart is covered, or while a daily rollup marker is unfinished. It applies to [queries](#run-a-query), [exports](#export-query-results), uncached [field values](#field-values), and [manual runs](#run-a-saved-query-now). The message is fixed for each reason and names no count, path, or marker:
+A read answers 503 `corpus_recovering` while the corpus is unsettled: after a restart, until compaction proves that the WAL from before the restart is covered, or while a daily rollup marker is unfinished. It applies to [queries](#run-a-query), [exports](#export-query-results), uncached [field values](#field-values), [manual runs](#run-a-saved-query-now), and [repins](#repin-a-field). The message is fixed for each reason and names no count, path, or marker:
 
 | Reason | Message |
 |--------|---------|
@@ -919,7 +919,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | 409 | none | The body is a job with status `refused_needs_force`: the scan found values the new type cannot read, or ambiguous numerals under the `otel` reading, and `force` was not set, or the finished rewrite exceeded an accepted ceiling. `requires_force_reason` names which. |
 | 409 | `bad_request` | A repin job is already running |
 | 400 | `bad_request` | `field` is an envelope field or not pinned, `to` is not a catalog type, `to` equals the current pin without `force`, `dialect` is unknown or given with a target other than `SEVERITY`, a ceiling is given without `force`, the pin changed between lookup and claim, the staging directory is on a different filesystem from the data root, or free disk is below the affected bytes plus the retention floor |
-| 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, or the job could not claim the corpus before its scan and ended `blocked`. An unsettled corpus also ends the job `blocked`, and its `error` names the reason. |
+| 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, or the job could not claim the corpus before its scan and ended `blocked` |
+| 503 | `corpus_recovering` | The corpus is unsettled. The job ends `blocked`, and its `error` names the reason. See [corpus recovering](#corpus-recovering). |
 
 ### Repin status
 

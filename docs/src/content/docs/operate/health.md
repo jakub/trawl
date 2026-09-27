@@ -64,7 +64,7 @@ alone. The response shape is in [the API reference](/reference/api/#health).
 | `storage_db` | The app-state database did not answer. Saved queries, history, and repin jobs fail. | Check the app-state database and the `[storage]` settings. |
 | `data_path` | `[data] path` is missing or is not a readable directory. Cold data is unreadable. | Check the mount and the directory permissions for the `trawl` user. |
 | `ingest_capacity` | Reads `refusing`, not `error`. The hot buffer is full, so ingest is refused until compaction drains it. Reads stay complete. | Follow [ingest admission refusing](/operate/operational-alerts/#ingest-admission-refusing). |
-| `corpus` | Reads `restart_backlog` or `rollup_pending`, not `error`. The server cannot yet count every stored event once, so searches, exports, and manual runs answer 503 `corpus_recovering`. Live tail still works. `restart_backlog` means WAL from before a restart is not yet proven covered. `rollup_pending` means a daily rollup marker is unfinished. | Wait for compaction to clear it. If it stays, follow [corpus unsettled](/operate/operational-alerts/#corpus-unsettled). |
+| `corpus` | Reads `restart_backlog` or `rollup_pending`, not `error`. The server cannot yet count every stored event once, so searches, exports, manual runs, and repins answer 503 `corpus_recovering`. Live tail still works. `restart_backlog` means WAL from before a restart is not yet proven covered. `rollup_pending` means a daily rollup marker is unfinished. | Wait for compaction to clear it. If it stays, follow [corpus unsettled](/operate/operational-alerts/#corpus-unsettled). |
 
 ## Inspect capacity
 

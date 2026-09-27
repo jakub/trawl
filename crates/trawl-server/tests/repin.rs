@@ -222,6 +222,7 @@ fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
 #[allow(clippy::too_many_lines)] // one incomplete rollup, its recovery, and both repin paths
 async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
     use trawl_server::error::ServerError;
+    use trawl_server::publication::CorpusUnsettled;
     use trawl_server::store::RepinJobStatus;
 
     let h = harness().await;
@@ -275,6 +276,30 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
         .collect();
     let engine = h.engine();
     let coordinator = h.server.state.ingest.repin_coordinator.as_ref().unwrap();
+    // Over HTTP the refusal is the typed `corpus_recovering` one, as for
+    // every other corpus read (ADR-0041), not a generic 503.
+    match h
+        .schema_admin
+        .schema_repin(
+            "dur",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        )
+        .await
+    {
+        Err(trawl_client::ClientError::Server { status, error }) => {
+            assert_eq!(status, 503);
+            assert_eq!(error.code, trawl_api::ErrorCode::CorpusRecovering);
+            assert_eq!(
+                error.message,
+                "Search is unavailable while the server finishes an interrupted storage rollup."
+            );
+        }
+        other => panic!("a pending rollup must refuse the repin request: {other:?}"),
+    }
     for dry_run in [true, false] {
         assert!(matches!(
             engine
@@ -288,10 +313,17 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
                     Some("op")
                 )
                 .await,
-            Err(ServerError::ServiceUnavailable(_))
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RollupPending
+            ))
         ));
         let job = engine.store().latest().await.unwrap().unwrap();
         assert_eq!(job.status, RepinJobStatus::Blocked);
+        assert_eq!(
+            job.error.as_deref(),
+            Some("repin is blocked while rollup publication is incomplete; retry after recovery"),
+            "the job row keeps the reason-specific text"
+        );
         assert!(
             job.planned_at.is_none(),
             "no scan report may describe a pending rollup"

@@ -345,6 +345,57 @@ fn assert_restart_backlog_refusal(what: &str, answer: &Answer) {
     );
 }
 
+/// A dry-run repin of a pinned field while the corpus is unsettled.
+/// Asserts the job it claimed ended `blocked` with the text that names the
+/// reason, and returns the request's answer.
+async fn refused_repin(server: &TestServer) -> Answer {
+    // Admission reaches the corpus check only for a pinned field. The
+    // fixture compacts nothing, so pin the planted one here.
+    let seq = [("seq".to_owned(), trawl_core::schema::CanonicalType::BigInt)];
+    server
+        .state
+        .storage
+        .catalog
+        .pin_missing(&[trawl_server::store::PinProposal {
+            field: seq[0].0.clone(),
+            ty: seq[0].1,
+            pinned_from: SERVICE.to_owned(),
+        }])
+        .await
+        .unwrap();
+    server.state.query.field_catalog.merge(seq);
+
+    let answer = post(
+        server,
+        &server.schema_admin_token,
+        "/api/v1/schema/repin",
+        serde_json::json!({ "field": "seq", "to": "VARCHAR", "dry_run": true }),
+    )
+    .await;
+    let job = server
+        .state
+        .repin
+        .as_ref()
+        .unwrap()
+        .store()
+        .latest()
+        .await
+        .unwrap()
+        .expect("the refused repin left its job row");
+    assert_eq!(
+        (job.status, job.error.as_deref()),
+        (
+            trawl_server::store::RepinJobStatus::Blocked,
+            Some(
+                "repin is blocked while the server finishes loading data from before its \
+                 restart; retry once it settles"
+            )
+        ),
+        "the job row keeps the reason-specific text"
+    );
+    answer
+}
+
 // -- AC6: refusal and release --------------------------------------------------
 
 /// With WAL above the caps and compaction held (the fixture runs none),
@@ -390,6 +441,7 @@ async fn overhang_refuses_corpus_reads_until_compaction_settles_it() {
             )
             .await,
         ),
+        ("repin", refused_repin(&server).await),
     ];
     for (what, answer) in &refusals {
         assert_restart_backlog_refusal(what, answer);
