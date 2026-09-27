@@ -216,7 +216,6 @@ struct Account {
     /// handler guard leaves it alone.
     pool_owns_emit: bool,
     work_started: bool,
-    physical: Option<PhysicalOutcome>,
 }
 
 #[derive(Debug)]
@@ -247,7 +246,6 @@ impl QueryTiming {
                 emitted: false,
                 pool_owns_emit: false,
                 work_started: false,
-                physical: None,
             }),
         }))
     }
@@ -308,14 +306,11 @@ impl QueryTiming {
         self.account().pool_owns_emit = true;
     }
 
-    /// Record how the physical work ended, for the reclaim event.
-    pub fn set_physical(&self, physical: PhysicalOutcome) {
-        self.account().physical = Some(physical);
-    }
-
-    #[must_use]
-    pub fn physical(&self) -> Option<PhysicalOutcome> {
-        self.account().physical
+    /// The pool's result reached the handler, which writes the account
+    /// from here on; a handler guard dropped before it does writes
+    /// `outcome=abandoned`.
+    pub fn hand_emit_back(&self) {
+        self.account().pool_owns_emit = false;
     }
 
     /// Whether the final `query_timing` has been written.

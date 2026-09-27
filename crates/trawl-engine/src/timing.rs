@@ -396,8 +396,14 @@ impl PhaseClock {
     }
 
     /// Abandon `phase` without booking it: the phase turned out not to
-    /// apply (a `from saved` probe that found an ordinary query), so its
-    /// elapsed time stays in the residual.
+    /// apply (a `from saved` probe that found an ordinary query, a
+    /// startup the work never finished), so its elapsed time stays in the
+    /// residual.
+    ///
+    /// A phase that is no longer active is a no-op, as for [`Self::exit`]:
+    /// a refused start is discarded by whichever of the request and its
+    /// worker gets there first. Discarding a phase while a different one
+    /// is active is a bug in the caller's instrumentation.
     pub fn discard(&self, phase: QueryPhase) {
         let Some(mut state) = self.state() else {
             return;
@@ -407,7 +413,10 @@ impl PhaseClock {
                 state.active = None;
                 state.note(Transition::Discard(phase));
             }
-            other => debug_assert!(false, "discarded {phase:?} while {other:?} is active"),
+            None => {}
+            Some((other, _)) => {
+                debug_assert!(false, "discarded {phase:?} while {other:?} is active");
+            }
         }
     }
 
