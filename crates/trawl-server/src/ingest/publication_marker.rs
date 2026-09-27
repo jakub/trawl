@@ -674,6 +674,17 @@ impl RecoveryReport {
         }
         blocked
     }
+
+    /// Markers whose interrupted publish recovery completed: each retired
+    /// the WAL files it names, whose rows the canonical output holds.
+    /// Compaction counts them as drained, so a pass whose only progress was
+    /// finishing a publish does not read as stuck.
+    pub fn retired(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind() == RecoveryOutcomeKind::Published)
+            .count() as u64
+    }
 }
 
 /// Recover every pending marker under `wal_dir`.
@@ -1600,6 +1611,7 @@ mod tests {
         let f = published_fixture();
         let report = recover(&f.wal, &f.data, |_| Err("drain failed".to_owned())).unwrap();
         assert_eq!(only_result(&report), &Err("drain failed".to_owned()));
+        assert_eq!(report.retired(), 0);
         assert!(f.marker.marker_path(&f.wal).is_file());
         for path in f.marker.wal_paths(&f.wal) {
             assert!(path.is_file());
@@ -1657,6 +1669,7 @@ mod tests {
                 ("prod", "nginx", Ok(RecoveryOutcome::Published)),
             ]
         );
+        assert_eq!(report.retired(), 1, "only the published marker retired WAL");
         assert!(!scan_claims(&f.wal).unwrap().any());
     }
 

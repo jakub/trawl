@@ -757,8 +757,9 @@ async fn fresh_boot_restart_and_interrupted_current_cutover() {
 /// the published WAL is retired, the unpublished WAL is kept and its tmp is
 /// removed, and both outcomes are logged before the first line of boot
 /// conformance, of every producer and background task, and of the
-/// listener. A long compaction interval keeps the first tick, which would
-/// also recover, out of the picture.
+/// listener. The first compaction pass runs at boot, after recovery, and
+/// publishes the kept WAL once (ADR-0041 slice 2); a long compaction
+/// interval keeps every later tick out of the picture.
 #[tokio::test]
 async fn boot_recovers_publication_markers_before_serving() {
     use trawl_server::ingest::publication_marker::{ValidatedMarker, identity_of, write_marker};
@@ -784,7 +785,7 @@ async fn boot_recovers_publication_markers_before_serving() {
         std::fs::write(
             &path,
             format!(
-                r#"{{"_time":"2026-09-22T07:00:00Z","_ingested":"2026-09-22T07:00:00Z","service":"{service}","message":"m"}}"#
+                r#"{{"_time":"2026-09-22T07:00:00Z","_ingested":"2026-09-22T07:00:00Z","service":"{service}","message":"m","crash_tag":"boot-recovery-{service}"}}"#
             ),
         )
         .unwrap();
@@ -835,19 +836,28 @@ async fn boot_recovers_publication_markers_before_serving() {
 
     let mut daemon = fixture.spawn();
     daemon.ready().await;
+    // The boot pass publishes the kept WAL under a marker and a tmp of its
+    // own, at the paths recovery removed. Read the end state after it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while web_wal.exists() || web_marker.marker_path(&wal).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the boot pass publishes the WAL recovery kept"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(
         !api_marker.marker_path(&wal).exists(),
         "published marker removed"
     );
-    assert!(
-        !web_marker.marker_path(&wal).exists(),
-        "unpublished marker removed"
-    );
     assert!(!api_wal.exists(), "published WAL retired");
     assert!(canonical.is_file(), "published output kept");
-    assert!(web_wal.is_file(), "unpublished WAL kept for compaction");
-    assert!(!web_tmp.exists(), "unpublished tmp removed");
-    assert!(!web_marker.canonical(&data).exists());
+    assert!(!web_tmp.exists(), "no staged output left");
+    assert_eq!(
+        parquet_count(&data, "boot-recovery-web"),
+        1,
+        "recovery kept the unpublished WAL, and the boot pass published it once"
+    );
 
     assert_recovery_precedes_boot_steps(&daemon).await;
     daemon.stop().await;
@@ -999,17 +1009,22 @@ impl CrashedPublish {
     /// Restart without a crash point and assert every acknowledged event is
     /// counted exactly once, `after_restart` right at readiness (when the
     /// output was published before the kill) and always after two further
-    /// completed compaction ticks. Ends with no marker, no tmp and no WAL.
+    /// completed compaction ticks. Boot recovery and the first compaction
+    /// pass, which runs at boot, leave no marker. Ends with no marker, no
+    /// tmp and no WAL.
     async fn restart_exactly_once(&self, after_restart: bool) {
         let mut daemon = self.fixture.spawn();
         let client = client(&daemon.ready().await, &self.token);
-        assert!(
-            !marker_path(&self.fixture).exists(),
-            "boot recovered the marker"
-        );
         if after_restart {
             self.assert_counted_once(&client, "after the restart").await;
         }
+        // The boot pass (ADR-0041 slice 2) may be publishing kept WAL under
+        // a marker of its own at the crashed marker's path.
+        wait_for_drain(
+            &self.fixture,
+            "boot recovery and the boot pass left a marker or WAL",
+        )
+        .await;
         let probes = complete_ticks(&self.fixture, &client, &self.time, 2).await;
         self.assert_counted_once(&client, "after two further ticks")
             .await;
@@ -1188,17 +1203,23 @@ async fn complete_ticks(
     let mut probes = 0;
     for _ in 0..=ticks {
         probes += ingest(client, time, "probe", 1).await;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !wal_files(fixture).is_empty() || marker_path(fixture).exists() {
-            assert!(
-                Instant::now() < deadline,
-                "compaction never retired the probe: {:?}",
-                wal_files(fixture)
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        wait_for_drain(fixture, "compaction never retired the probe").await;
     }
     probes
+}
+
+/// Wait up to 30 s until compaction has retired every WAL file and left no
+/// publication marker.
+async fn wait_for_drain(fixture: &Fixture, failure: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !wal_files(fixture).is_empty() || marker_path(fixture).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{failure}: {:?}",
+            wal_files(fixture)
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// AC1 (#252): a kill after the canonical rename and before WAL retirement

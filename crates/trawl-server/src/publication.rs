@@ -256,6 +256,14 @@ impl PublicationGate {
             .contains(CorpusUnsettled::RestartBacklog)
     }
 
+    /// Whether hydration finished and left overhang, which only compaction's
+    /// coverage proof clears. Unlike [`overhang`](Self::overhang), false
+    /// while hydration has not finished: there is nothing to prove yet.
+    #[must_use]
+    pub fn awaits_coverage_proof(&self) -> bool {
+        self.corpus.lock().restart == Restart::Overhang
+    }
+
     /// End boot hydration: settled when every surviving WAL file became
     /// resident, overhang otherwise.
     ///
@@ -733,6 +741,23 @@ mod tests {
 
             assert_eq!(capture.count("corpus_settled"), 0);
         });
+    }
+
+    /// Only overhang left by a finished hydration awaits a coverage proof: a
+    /// starting gate is overhang too, but has nothing to prove yet.
+    #[test]
+    fn only_overhang_awaits_a_coverage_proof() {
+        assert!(!PublicationGate::new().awaits_coverage_proof());
+        let starting = PublicationGate::starting();
+        assert!(starting.overhang());
+        assert!(!starting.awaits_coverage_proof());
+        for overhang in [false, true] {
+            let gate = PublicationGate::starting();
+            gate.finish_hydration(overhang).unwrap();
+            assert_eq!(gate.awaits_coverage_proof(), overhang);
+            gate.settle_overhang();
+            assert!(!gate.awaits_coverage_proof());
+        }
     }
 
     #[tokio::test]

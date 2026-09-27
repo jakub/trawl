@@ -721,6 +721,19 @@ impl HotBuffer {
         Arc::clone(&self.publication)
     }
 
+    /// Share `publication` in place of the settled gate [`new`](Self::new)
+    /// builds, for tests whose buffer needs a gate born starting
+    /// (ADR-0041 slice 2).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_publication_for_test(
+        mut self,
+        publication: Arc<crate::publication::PublicationGate>,
+    ) -> Self {
+        self.publication = publication;
+        self
+    }
+
     /// Attach the shared in-process pin cache; snapshots then carry the
     /// pins intersected with their observed key set.
     #[must_use]
@@ -926,13 +939,6 @@ impl HotBuffer {
     }
 
     /// Whether `batch_id` (`{env}/{WAL filename stem}`) is resident.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "boot hydration (ADR-0041 slice 2) is its only production caller; remove once it is wired"
-        )
-    )]
     pub(crate) fn is_resident(&self, batch_id: &str) -> bool {
         self.batches.read().contains_key(batch_id)
     }

@@ -6,6 +6,7 @@
 //! by the HTTP handler, the syslog listener and internal telemetry.
 
 pub mod compaction;
+pub(crate) mod coverage_proof;
 pub mod envelope;
 pub mod handler;
 pub mod hydration;

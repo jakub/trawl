@@ -10,7 +10,9 @@
 //! whether a file is exactly what the live writer produced. WAL that
 //! existed at boot and did not become resident is the **overhang**: the
 //! report says whether there is any, and the boot keeps corpus reads
-//! refused until compaction's coverage proof clears it.
+//! refused until compaction's coverage proof
+//! ([`crate::ingest::coverage_proof`]) clears it. Both list the WAL through
+//! one walk, [`walk_wal`].
 //!
 //! Hydration charges the hot buffer's full caps once
 //! ([`HotBuffer::hydrate`]). It never publishes to the event bus, never
@@ -18,6 +20,8 @@
 
 mod recognizer;
 mod selection;
+
+pub(crate) use selection::walk_wal;
 
 use std::path::Path;
 use std::sync::Arc;

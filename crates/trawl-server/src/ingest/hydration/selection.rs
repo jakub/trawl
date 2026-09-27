@@ -126,73 +126,105 @@ pub(crate) fn select(wal_dir: &Path, caps: Charge) -> Selection {
     selection
 }
 
-/// List the WAL in compaction's zero-age scope and keep the oldest `bound`
-/// writer-named candidates, oldest first. Every other entry is counted
-/// here: `claimed`, `unlisted` and non-writer names as `undecodable`.
-/// Candidates beyond the bound set `bound_hit` and are not counted.
+/// What [`walk_wal`] saw of the WAL besides its files.
+#[derive(Debug)]
+pub(crate) struct WalWalk {
+    /// Scopes that could not be listed, each counted once: a WAL root entry
+    /// that could not be inspected, or an env directory.
+    pub unlisted: u64,
+    /// The pending publication markers, from one scan of the WAL root.
+    pub claims: PublicationClaims,
+}
+
+/// Walk the WAL under `wal_dir` in compaction's zero-age scope: every env
+/// directory [`try_list_env_dirs_observed`] finds and every `.ndjson`
+/// entry [`compaction::scan_wal_files`] lists in it. `visit` gets each
+/// `(env, service)` group, grouped as [`compaction::group_by_service`]
+/// groups it, and whether a publication marker blocks the service
+/// ([`PublicationClaims::blocks_service`]).
+///
+/// This one listing is the WAL boot hydration selects from and the WAL
+/// compaction's coverage proof checks (ADR-0041 slice 2), so the two agree
+/// on what existed. Listing names costs what one compaction scan costs;
+/// nothing is opened.
+///
+/// `None` when the WAL root or its publication markers could not be
+/// listed: that hides every scope, and nothing was visited. A missing root
+/// is a cold start: an empty walk.
+pub(crate) fn walk_wal(
+    wal_dir: &Path,
+    mut visit: impl FnMut(&str, &str, Vec<PathBuf>, bool),
+) -> Option<WalWalk> {
+    let claims = publication_marker::scan_claims(wal_dir).ok()?;
+    let mut unlisted = 0;
+    let envs = try_list_env_dirs_observed(wal_dir, || unlisted += 1).ok()?;
+    for (env, env_dir) in envs {
+        let Ok(files) = compaction::scan_wal_files(&env_dir, Duration::ZERO) else {
+            unlisted += 1;
+            continue;
+        };
+        for (service, files) in compaction::group_by_service(files) {
+            let blocked = claims.blocks_service(&env, &service);
+            visit(&env, &service, files, blocked);
+        }
+    }
+    Some(WalWalk { unlisted, claims })
+}
+
+/// List the WAL in compaction's zero-age scope ([`walk_wal`]) and keep the
+/// oldest `bound` writer-named candidates, oldest first. Every other entry
+/// is counted here: `claimed`, `unlisted` and non-writer names as
+/// `undecodable`. Candidates beyond the bound set `bound_hit` and are not
+/// counted.
 fn list(
     wal_dir: &Path,
     bound: usize,
     counts: &mut OutcomeCounts,
     bound_hit: &mut bool,
 ) -> Vec<Candidate> {
-    // An unreadable root hides every scope, markers included.
-    let Ok(claims) = publication_marker::scan_claims(wal_dir) else {
-        counts.add(HydrationOutcome::Unlisted, 1);
-        return Vec::new();
-    };
-    let mut skipped_entries = 0;
-    let Ok(envs) = try_list_env_dirs_observed(wal_dir, || skipped_entries += 1) else {
-        counts.add(HydrationOutcome::Unlisted, 1);
-        return Vec::new();
-    };
-    counts.add(HydrationOutcome::Unlisted, skipped_entries);
-
     let mut heap = BinaryHeap::new();
-    for (env, env_dir) in envs {
-        let Ok(files) = compaction::scan_wal_files(&env_dir, Duration::ZERO) else {
-            counts.add(HydrationOutcome::Unlisted, 1);
-            continue;
-        };
-        keep_oldest(&env, files, &claims, bound, &mut heap, counts, bound_hit);
-    }
+    let walk = walk_wal(wal_dir, |env, _service, files, blocked| {
+        if blocked {
+            counts.add(HydrationOutcome::Claimed, files.len() as u64);
+        } else {
+            keep_oldest(env, files, bound, &mut heap, counts, bound_hit);
+        }
+    });
+    // An unreadable root hides every scope, markers included.
+    counts.add(
+        HydrationOutcome::Unlisted,
+        walk.map_or(1, |walk| walk.unlisted),
+    );
     heap.into_sorted_vec()
 }
 
-/// Push one env's unclaimed, writer-named files into `heap`, dropping the
-/// newest candidate whenever it holds more than `bound`.
+/// Push one unclaimed service's writer-named files into `heap`, dropping
+/// the newest candidate whenever it holds more than `bound`.
 fn keep_oldest(
     env: &str,
     files: Vec<PathBuf>,
-    claims: &PublicationClaims,
     bound: usize,
     heap: &mut BinaryHeap<Candidate>,
     counts: &mut OutcomeCounts,
     bound_hit: &mut bool,
 ) {
-    for (service, files) in compaction::group_by_service(files) {
-        if claims.blocks_service(env, &service) {
-            counts.add(HydrationOutcome::Claimed, files.len() as u64);
+    for path in files {
+        let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(WalName::parse)
+        else {
+            counts.add(HydrationOutcome::Undecodable, 1);
             continue;
-        }
-        for path in files {
-            let Some(name) = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(WalName::parse)
-            else {
-                counts.add(HydrationOutcome::Undecodable, 1);
-                continue;
-            };
-            heap.push(Candidate {
-                millis: name.millis,
-                env: env.to_owned(),
-                file_name: name.file_name(),
-            });
-            if heap.len() > bound {
-                heap.pop();
-                *bound_hit = true;
-            }
+        };
+        heap.push(Candidate {
+            millis: name.millis,
+            env: env.to_owned(),
+            file_name: name.file_name(),
+        });
+        if heap.len() > bound {
+            heap.pop();
+            *bound_hit = true;
         }
     }
 }
