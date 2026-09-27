@@ -371,6 +371,17 @@ impl Daemon {
     /// Wait up to 30 s for a log line matching `matches`, while the daemon
     /// runs; returns the log.
     async fn wait_for_log(&mut self, failure: &str, matches: impl Fn(&str) -> bool) -> String {
+        self.wait_for_lines(failure, 1, matches).await
+    }
+
+    /// Wait up to 30 s for `at_least` log lines matching `matches`, while
+    /// the daemon runs; returns the log.
+    async fn wait_for_lines(
+        &mut self,
+        failure: &str,
+        at_least: usize,
+        matches: impl Fn(&str) -> bool,
+    ) -> String {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
@@ -379,7 +390,7 @@ impl Daemon {
                 self.log()
             );
             let log = self.log();
-            if log.lines().any(&matches) {
+            if log.lines().filter(|line| matches(line)).count() >= at_least {
                 return log;
             }
             assert!(Instant::now() < deadline, "{failure}: {log}");
@@ -1689,4 +1700,218 @@ async fn query_only_boot_with_wal() {
     daemon.stop().await;
     fixture.assert_lock_free().await;
     assert_eq!(bytes(&wal), before, "the WAL is untouched");
+}
+
+/// A query for every event tagged `tag` answers 503 `corpus_recovering`,
+/// with no `Retry-After` (ADR-0041 slice 2).
+async fn assert_search_refused(url: &str, token: &str, tag: &str) {
+    let response = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .post(format!("{url}/api/v1/query"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "query": format!("crash_tag=\"{tag}\" last=24h | stats count()"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert!(
+        response.headers().get("retry-after").is_none(),
+        "no retry hint for a corpus refusal"
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "corpus_recovering", "{body}");
+}
+
+/// `/api/v1/health` at HTTP 200: its `status` and `checks.corpus`.
+async fn corpus_health(url: &str) -> (String, String) {
+    let response = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .get(format!("{url}/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    (
+        body["status"].as_str().unwrap().to_owned(),
+        body["checks"]["corpus"].as_str().unwrap().to_owned(),
+    )
+}
+
+/// AC13 (#265): a contradictory publication marker at boot keeps its scope
+/// out of hydration, and search stays refused as `restart_backlog` pass
+/// after pass for as long as the marker stays: a standing fault refuses
+/// all search (ADR-0041 slice 2). Another service's WAL hydrates and
+/// drains meanwhile.
+///
+/// The marker's canonical output and its temporary output are both gone
+/// (`output_missing`), so the WAL it lists was never published. That is
+/// what the `TrawlPublicationRecoveryBlocked` runbook asks an operator to
+/// establish before removing a marker, because removing it makes
+/// compaction merge that WAL. With the marker gone, the next compaction
+/// pass merges the WAL once and its coverage proof settles the corpus:
+/// `corpus_settled` is logged, health reads `ok`, and reads answer 200
+/// with every planted event counted once.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one scenario, stated in order
+async fn blocked_marker_at_boot_refuses_reads_until_resolved() {
+    use trawl_server::ingest::publication_marker::{ValidatedMarker, identity_of, write_marker};
+
+    const BLOCKED: &str = "blockedsvc";
+    const FREE: &str = "freesvc";
+    const BLOCKED_EVENTS: i64 = 7;
+    const FREE_EVENTS: i64 = 5;
+
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.compaction_interval_secs = Some(1);
+    let token = writer_token(&fixture).await;
+    // A first boot initializes the data root and databases.
+    let mut daemon = fixture.spawn();
+    daemon.ready().await;
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
+
+    // WAL in the live writer's name and line format, every event tagged
+    // with its service.
+    let wal = fixture.storage_root().join("wal");
+    let data = fixture.data();
+    let observed = chrono::Utc::now() - chrono::Duration::minutes(5);
+    let time = observed.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let millis = chrono::Utc::now().timestamp_millis();
+    std::fs::create_dir_all(wal.join("prod")).unwrap();
+    let plant = |service: &str, seq: u32, count: i64| {
+        let name = format!("{service}_{millis}_{seq:04x}.ndjson");
+        let mut ndjson = Vec::new();
+        for n in 0..count {
+            serde_json::to_writer(
+                &mut ndjson,
+                &serde_json::json!({
+                    "_time": time,
+                    "_ingested": time,
+                    "env": "prod",
+                    "service": service,
+                    "crash_tag": service,
+                    "seq": n,
+                    "message": format!("{service} {n}"),
+                }),
+            )
+            .unwrap();
+            ndjson.push(b'\n');
+        }
+        let path = wal.join("prod").join(&name);
+        std::fs::write(&path, ndjson).unwrap();
+        (name, path)
+    };
+    let (blocked_name, blocked_wal) = plant(BLOCKED, 1, BLOCKED_EVENTS);
+    let (_, free_wal) = plant(FREE, 2, FREE_EVENTS);
+
+    // A marker for a publish of the blocked WAL whose staged output was
+    // then lost, before any rename: recovery cannot tell whether the rows
+    // were published, so it touches nothing.
+    let hour = u8::try_from(chrono::Timelike::hour(&observed)).unwrap();
+    let day = observed.date_naive();
+    let tmp = data.join(format!("prod/{day}/{hour:02}/{BLOCKED}.parquet.tmp"));
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    std::fs::write(&tmp, b"PAR1 staged output PAR1").unwrap();
+    let marker = ValidatedMarker::new(
+        "prod",
+        BLOCKED,
+        day,
+        hour,
+        vec![blocked_name],
+        identity_of(&tmp).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker.tmp(&data), tmp);
+    write_marker(&wal, &marker).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+
+    // The boot serves, degraded: the blocked scope is not hydrated, so the
+    // corpus is overhang and every search is refused.
+    let mut daemon = fixture.spawn();
+    let url = daemon.serving("degraded").await;
+    let log = daemon.log();
+    assert!(
+        log.lines().any(|line| {
+            line.contains("event_type=\"publication_recovery_failed\"")
+                && line.contains("reason=\"output_missing\"")
+        }),
+        "boot recovery left the contradiction alone: {log}"
+    );
+    let hydration = boot_hydration(&log);
+    assert_eq!(
+        (
+            log_field(hydration, "hydrated"),
+            log_field(hydration, "claimed"),
+            log_field(hydration, "overhang"),
+        ),
+        ("1", "1", "true"),
+        "only the unblocked scope is hydrated: {hydration}"
+    );
+    assert_eq!(
+        corpus_health(&url).await,
+        ("degraded".to_owned(), "restart_backlog".to_owned())
+    );
+    for tag in [BLOCKED, FREE] {
+        assert_search_refused(&url, &token, tag).await;
+    }
+    daemon
+        .wait_for_log("the refusal was not logged as restart_backlog", |line| {
+            line.contains("event_type=\"http_failure\"")
+                && line.contains("cause_kind=\"restart_backlog\"")
+        })
+        .await;
+
+    // A standing fault: pass after pass, the proof finds the marker
+    // pending, while the unblocked service drains.
+    daemon
+        .wait_for_lines("no second pass found the marker pending", 2, |line| {
+            line.contains("event_type=\"coverage_proof\"")
+                && line.contains("outcome=\"marker_pending\"")
+        })
+        .await;
+    assert!(!free_wal.exists(), "the unblocked WAL drained");
+    assert_eq!(parquet_count(&data, FREE), FREE_EVENTS);
+    assert!(blocked_wal.is_file(), "the blocked WAL is untouched");
+    assert!(marker.marker_path(&wal).is_file(), "the marker stays");
+    assert_search_refused(&url, &token, FREE).await;
+    assert_eq!(
+        corpus_health(&url).await,
+        ("degraded".to_owned(), "restart_backlog".to_owned())
+    );
+
+    // Resolve it as the runbook directs: neither the canonical output nor
+    // the temporary one exists, so the rows the marker lists are not in a
+    // published file, and the marker can go.
+    assert!(!marker.canonical(&data).exists() && !marker.tmp(&data).exists());
+    std::fs::remove_file(marker.marker_path(&wal)).unwrap();
+    let log = daemon
+        .wait_for_log("the next pass never settled the corpus", |line| {
+            line.contains("event_type=\"corpus_settled\"")
+        })
+        .await;
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("event_type=\"corpus_settled\""))
+            .count(),
+        1,
+        "{log}"
+    );
+    assert!(!blocked_wal.exists(), "the pass merged the blocked WAL");
+    assert_eq!(
+        corpus_health(&url).await,
+        ("ok".to_owned(), "ok".to_owned())
+    );
+    let client = client(&url, &token);
+    for (tag, events) in [(BLOCKED, BLOCKED_EVENTS), (FREE, FREE_EVENTS)] {
+        assert_api_exactly_once(&client, tag, events, "after the corpus settled").await;
+        assert_eq!(parquet_count(&data, tag), events, "{tag} published once");
+    }
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
 }
