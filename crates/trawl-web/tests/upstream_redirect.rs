@@ -95,7 +95,25 @@ async fn login(state: AppState) -> axum::response::Response {
         .expect("router answers")
 }
 
-async fn assert_untouched(elsewhere: &MockServer, mode: &str) {
+async fn requests_to(server: &MockServer, route: &str) -> usize {
+    let seen = server.received_requests().await.expect("recording on");
+    seen.iter().filter(|r| r.url.path() == route).count()
+}
+
+/// The upstream answered `route` with its redirect after `before` earlier
+/// requests (the positive control: the redirect path really ran), and the
+/// proxy never contacted `elsewhere`.
+async fn assert_untouched(
+    upstream: &MockServer,
+    elsewhere: &MockServer,
+    route: &str,
+    before: usize,
+    mode: &str,
+) {
+    assert!(
+        requests_to(upstream, route).await > before,
+        "{mode}: the upstream never saw {route}, so no redirect was exercised"
+    );
     let seen = elsewhere.received_requests().await.expect("recording on");
     assert!(
         seen.is_empty(),
@@ -113,13 +131,14 @@ async fn login_does_not_follow_an_upstream_redirect() {
         let elsewhere = MockServer::start().await;
         redirect(&upstream, &elsewhere, "/api/v1/whoami", whoami_ok()).await;
 
+        let before = requests_to(&upstream, "/api/v1/whoami").await;
         let response = login(state(&upstream, tls)).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{mode}");
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
             "{mode}: a redirected login must not issue a session"
         );
-        assert_untouched(&elsewhere, &mode).await;
+        assert_untouched(&upstream, &elsewhere, "/api/v1/whoami", before, &mode).await;
     }
 }
 
@@ -189,8 +208,9 @@ async fn forwarding_does_not_follow_or_pass_on_an_upstream_redirect() {
         )
         .await;
 
+        let before = requests_to(&upstream, "/api/v1/schema").await;
         assert_redirect_refused(state, &cookie, "/api/v1/schema", &mode).await;
-        assert_untouched(&elsewhere, &mode).await;
+        assert_untouched(&upstream, &elsewhere, "/api/v1/schema", before, &mode).await;
     }
 }
 
@@ -205,8 +225,9 @@ async fn me_does_not_follow_or_pass_on_an_upstream_redirect() {
         let cookie = session_cookie(state.clone(), &upstream, &mode).await;
         redirect(&upstream, &elsewhere, "/api/v1/whoami", whoami_ok()).await;
 
+        let before = requests_to(&upstream, "/api/v1/whoami").await;
         assert_redirect_refused(state, &cookie, "/api/auth/me", &mode).await;
-        assert_untouched(&elsewhere, &mode).await;
+        assert_untouched(&upstream, &elsewhere, "/api/v1/whoami", before, &mode).await;
     }
 }
 
@@ -233,8 +254,9 @@ async fn streams_do_not_follow_or_pass_on_an_upstream_redirect() {
             )
             .await;
 
+            let before = requests_to(&upstream, route).await;
             assert_redirect_refused(state, &cookie, uri, &mode).await;
-            assert_untouched(&elsewhere, &mode).await;
+            assert_untouched(&upstream, &elsewhere, route, before, &mode).await;
         }
     }
 }
