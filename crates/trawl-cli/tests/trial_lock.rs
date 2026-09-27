@@ -4,14 +4,16 @@
 
 //! Two real `trawl trial` invocations run one at a time.
 //!
-//! Both run `trawl trial down --yes` against an empty temp
-//! `XDG_STATE_HOME`, with `docker` on `PATH` replaced by a stub that
-//! passes preflight and lists an empty engine, and `DOCKER_HOST` naming
-//! a socket the test binds, because preflight trusts only a real socket. The stub's container
-//! listing blocks until the test releases it, so the first invocation
-//! holds the lifecycle lock while it lists. The second must report that it
-//! is waiting, and must not reach its own listing until the first has
-//! finished.
+//! Each case runs two of `trawl trial down --yes` and `trawl trial up`
+//! against an empty temp `XDG_STATE_HOME`, with `docker` on `PATH`
+//! replaced by a stub that passes preflight and lists an empty engine,
+//! and `DOCKER_HOST` naming a socket the test binds, because preflight
+//! trusts only a real socket. The stub's container listing blocks until
+//! the test releases it, so the first invocation holds the lifecycle lock
+//! while it lists. The second must report that it is waiting, and must
+//! not reach its own listing until the first has finished. The stub
+//! answers nothing past the listing, so `up` fails at its image check
+//! after the listing and never creates a resource.
 
 use std::io::{BufRead as _, BufReader};
 use std::os::unix::fs::PermissionsExt as _;
@@ -51,7 +53,7 @@ esac
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn down(state: &Path, stub: &Path, host: &str) -> (Child, mpsc::Receiver<String>) {
+fn trial(verb: &[&str], state: &Path, stub: &Path, host: &str) -> (Child, mpsc::Receiver<String>) {
     let path = std::env::join_paths(
         std::iter::once(stub.to_owned()).chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
@@ -66,7 +68,8 @@ fn down(state: &Path, stub: &Path, host: &str) -> (Child, mpsc::Receiver<String>
         }
     }
     let mut child = command
-        .args(["trial", "down", "--yes"])
+        .arg("trial")
+        .args(verb)
         .env("XDG_STATE_HOME", state)
         .env("HOME", state)
         .env("DOCKER_HOST", host)
@@ -105,15 +108,20 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-fn finish(mut child: Child, lines: &mpsc::Receiver<String>) -> Vec<String> {
+/// Wait for `child` and return whether it succeeded, with its stderr.
+fn finish(mut child: Child, lines: &mpsc::Receiver<String>) -> (bool, Vec<String>) {
     let status = child.wait().unwrap();
     let stderr: Vec<String> = lines.iter().collect();
-    assert!(status.success(), "trawl trial down failed: {stderr:?}");
-    stderr
+    (status.success(), stderr)
 }
 
-#[test]
-fn concurrent_trial_commands_run_one_at_a_time() {
+const DOWN: &[&str] = &["down", "--yes"];
+const UP: &[&str] = &["up"];
+
+/// Start `first`, hold it in its listing, start `second`, and check that
+/// `second` waits for the lock and lists only after `first` has finished.
+/// Returns the two results, first then second.
+fn race(first: &[&str], second: &[&str]) -> [(bool, Vec<String>); 2] {
     let tmp = tempfile::tempdir().unwrap();
     let stub = tmp.path().join("stub");
     std::fs::create_dir(&stub).unwrap();
@@ -123,12 +131,12 @@ fn concurrent_trial_commands_run_one_at_a_time() {
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let host = format!("unix://{}", socket.display());
 
-    let (first, first_lines) = down(&state, &stub, &host);
+    let (first, first_lines) = trial(first, &state, &stub, &host);
     wait_for("the first command's listing", || log(&stub).len() == 1);
     let first_pid = first.id();
     assert_eq!(log(&stub), [format!("start {first_pid}")]);
 
-    let (second, second_lines) = down(&state, &stub, &host);
+    let (second, second_lines) = trial(second, &state, &stub, &host);
     let second_pid = second.id();
     let deadline = Instant::now() + STEP;
     loop {
@@ -144,12 +152,8 @@ fn concurrent_trial_commands_run_one_at_a_time() {
     assert_eq!(log(&stub), [format!("start {first_pid}")]);
 
     std::fs::write(stub.join("release"), "").unwrap();
-    finish(first, &first_lines);
-    let stderr = finish(second, &second_lines);
-    assert!(
-        stderr.iter().any(|l| l.contains("nothing to delete")),
-        "{stderr:?}"
-    );
+    let first = finish(first, &first_lines);
+    let second = finish(second, &second_lines);
     assert_eq!(
         log(&stub),
         [
@@ -158,9 +162,54 @@ fn concurrent_trial_commands_run_one_at_a_time() {
             format!("start {second_pid}"),
             format!("end {second_pid}"),
         ],
-        "the second listing starts only after the first command finished"
+        "the second listing starts only after the first command finished: {first:?} {second:?}"
     );
     let lock = state.join("trawl/trial.lock");
     assert!(lock.is_file(), "the lock file stays");
-    assert!(!state.join("trawl/trial").exists(), "down created no trial");
+    assert!(
+        !state.join("trawl/trial").exists(),
+        "a trial directory was created: {first:?} {second:?}"
+    );
+    [first, second]
+}
+
+/// `up` passed its listing and stopped at the stub's first unanswered
+/// call, the image check, having created nothing.
+fn assert_up_stopped_after_listing((ok, stderr): &(bool, Vec<String>)) {
+    assert!(!ok, "up cannot succeed against the stub: {stderr:?}");
+    assert!(
+        stderr
+            .iter()
+            .any(|l| l.contains("unexpected docker image inspect")),
+        "{stderr:?}"
+    );
+}
+
+fn assert_down_found_nothing((ok, stderr): &(bool, Vec<String>)) {
+    assert!(ok, "trawl trial down failed: {stderr:?}");
+    assert!(
+        stderr.iter().any(|l| l.contains("nothing to delete")),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn concurrent_trial_commands_run_one_at_a_time() {
+    let [first, second] = race(DOWN, DOWN);
+    assert_down_found_nothing(&first);
+    assert_down_found_nothing(&second);
+}
+
+#[test]
+fn down_waits_for_up() {
+    let [up, down] = race(UP, DOWN);
+    assert_up_stopped_after_listing(&up);
+    assert_down_found_nothing(&down);
+}
+
+#[test]
+fn up_waits_for_down() {
+    let [down, up] = race(DOWN, UP);
+    assert_down_found_nothing(&down);
+    assert_up_stopped_after_listing(&up);
 }
