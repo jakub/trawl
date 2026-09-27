@@ -76,7 +76,9 @@ APT repository from [Installation](/getting-started/).
       ```
 
       trawld writes that certificate when `[server] tls_cert_path` is not
-      set. If you set your own `tls_cert_path`, use the file of the CA that
+      set. If you moved `[data] path`, use `tls/cert.pem` in the parent
+      directory of that path, where trawld writes the certificate instead.
+      If you set your own `tls_cert_path`, use the file of the CA that
       issued it.
    2. If `/etc/default/trawl-web` sets `TRAWL_WEB_INSECURE_UPSTREAM=1`,
       remove that line. `trawl-web` refuses to start when both settings are

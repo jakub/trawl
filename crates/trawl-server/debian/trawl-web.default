@@ -16,5 +16,6 @@
 # upstream (127.0.0.0/8, ::1 or localhost) and refuses to start for any
 # other upstream host.
 # Set here for an older package? Remove it on upgrade. If you kept your trawld.toml,
-# add upstream_ca_path = "/var/lib/trawl/tls/cert.pem" under its [web] first.
+# add upstream_ca_path = "/var/lib/trawl/tls/cert.pem" under its [web] first
+# (with a moved [data] path: <its parent>/tls/cert.pem).
 # TRAWL_WEB_INSECURE_UPSTREAM=1
