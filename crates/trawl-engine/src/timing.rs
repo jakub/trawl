@@ -209,6 +209,13 @@ impl PhaseTotals {
         self.present()
             .fold(0_u64, |sum, (_, us)| sum.saturating_add(us))
     }
+
+    /// Set `phase`'s total outright, for tests that need distinct,
+    /// known values in every field.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set(&mut self, phase: QueryPhase, us: Option<u64>) {
+        self.us[phase.index()] = us;
+    }
 }
 
 /// A test-support hook run when a phase is entered.
@@ -366,6 +373,12 @@ impl PhaseClock {
     }
 
     /// Finish `phase` now and add its elapsed time to its total.
+    ///
+    /// A phase that is no longer active was already booked by
+    /// [`Self::close_at`]: an account written while a guard was still in
+    /// scope, as when a dropped request future releases its locals in
+    /// any order. That exit is a no-op. Exiting a phase while a different
+    /// one is active is a bug in the caller's instrumentation.
     pub fn exit(&self, phase: QueryPhase) {
         let now = Instant::now();
         let Some(mut state) = self.state() else {
@@ -377,7 +390,8 @@ impl PhaseClock {
                 state.book(phase, now.saturating_duration_since(start));
                 state.note(Transition::Exit(phase));
             }
-            other => debug_assert!(false, "exited {phase:?} while {other:?} is active"),
+            None => {}
+            Some((other, _)) => debug_assert!(false, "exited {phase:?} while {other:?} is active"),
         }
     }
 
@@ -564,6 +578,17 @@ mod tests {
         let complete = clock.close_at(Instant::now()).expect("on");
         assert!(complete.active.is_none());
         assert!(complete.get(QueryPhase::Bind).is_some());
+    }
+
+    /// A guard that outlives the close finds its phase already booked,
+    /// and its exit changes nothing.
+    #[test]
+    fn an_exit_after_close_is_a_no_op() {
+        let clock = PhaseClock::new();
+        let guard = clock.guard(QueryPhase::SavedLookup);
+        let closed = clock.close_at(Instant::now()).expect("on");
+        drop(guard);
+        assert_eq!(clock.close_at(Instant::now()).expect("on"), closed);
     }
 
     #[test]
