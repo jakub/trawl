@@ -903,12 +903,20 @@ mod tests {
         assert_eq!(pool_wait + active + other, observed);
     }
 
-    /// A worker that finishes a phase after the request decided to write
-    /// its partial account, and before the copy is taken, cannot book
-    /// time past the window's end: the window is cut with the copy,
-    /// under the clock's lock, not at the moment the request decided.
+    /// A phase the worker finishes after the request decided to write its
+    /// partial account, and before the account is written, is booked and
+    /// still inside the observed window: `emit_partial` ends the window at
+    /// the instant `snapshot` reads for itself, so the window reaches past
+    /// every total the copy holds.
+    ///
+    /// This does not reproduce the race of a window cut outside the
+    /// clock's lock, a phase finishing between the cut and the copy: bind
+    /// exits here before the snapshot starts, so a cut taken any time
+    /// after the decision would pass as well. The guard against that race
+    /// is structural. `snapshot` takes no cutoff, so no caller can supply
+    /// one read outside the lock.
     #[test]
-    fn a_partial_window_covers_a_phase_finished_while_deciding() {
+    fn a_phase_finished_after_the_decision_is_inside_the_partial_window() {
         use std::sync::Barrier;
         use trawl_engine::timing::Transition;
 
