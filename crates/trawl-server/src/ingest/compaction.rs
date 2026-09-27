@@ -2734,6 +2734,42 @@ fn timestamp_repair_list(prov_col: &str) -> String {
         .join(", ")
 }
 
+/// Whether [`timestamp_repair_list`] leaves `row` as it is. Boot hydration
+/// (ADR-0041) loads a WAL row into the hot buffer only if this holds, so the
+/// row reads the same hot as it will cold.
+///
+/// The hot read casts each envelope TIMESTAMP column with a bare `TRY_CAST`
+/// (`trawl_core`'s hot `REPLACE` list), where the repair falls back to the
+/// file name's instant, then the compaction instant, when that cast fails.
+/// A row is left as it is only if the cast succeeds for every column in
+/// [`trawl_core::schema::TIMESTAMP_COLUMNS`], the list the repair walks.
+/// Rust cannot run `DuckDB`'s cast, so the check is stricter than the cast:
+/// each column must hold a string spelled exactly as ingest spells an
+/// instant, RFC 3339 UTC at microsecond precision
+/// (`SecondsFormat::Micros`), with a year from 1 to 9999 and no leap
+/// second. `repair_leaves_unchanged_agrees_with_repair_expr` runs
+/// [`repair_expr`] itself over values on both sides of the check.
+pub(crate) fn repair_leaves_unchanged(row: &serde_json::Map<String, serde_json::Value>) -> bool {
+    trawl_core::schema::TIMESTAMP_COLUMNS.iter().all(|column| {
+        row.get(*column)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_ingest_instant)
+    })
+}
+
+/// Whether `text` is an instant exactly as ingest writes one (see
+/// [`repair_leaves_unchanged`]).
+fn is_ingest_instant(text: &str) -> bool {
+    use chrono::{Datelike as _, Timelike as _};
+    chrono::DateTime::parse_from_rfc3339(text).is_ok_and(|parsed| {
+        let instant = parsed.to_utc();
+        // chrono keeps a leap second as a nanosecond count past one second.
+        (1..=9999).contains(&instant.year())
+            && instant.nanosecond() < 1_000_000_000
+            && instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true) == text
+    })
+}
+
 /// The nested-key collision shape: keys inside a nested object that
 /// collide (case-insensitively) when `DuckDB` builds the auto-detected
 /// STRUCT at `maximum_depth=2`. Verified by execution: only reachable via
@@ -10630,6 +10666,177 @@ mod tests {
                 nulls, 0,
                 "variant {variant}: no parquet row may have a NULL timestamp"
             );
+        }
+    }
+
+    /// The instant every probe row starts from, spelled as ingest spells it.
+    const PROBE_INSTANT: &str = "2026-09-27T12:00:00.123456Z";
+
+    /// WAL rows for [`repair_leaves_unchanged_agrees_with_repair_expr`]: for
+    /// each envelope TIMESTAMP column, one row per probe value in that column
+    /// with [`PROBE_INSTANT`] in the others, then one row per missing column.
+    fn repair_probe_rows() -> Vec<serde_json::Map<String, serde_json::Value>> {
+        use serde_json::json;
+        use trawl_core::schema::TIMESTAMP_COLUMNS;
+
+        let values = [
+            // Accepted.
+            json!(PROBE_INSTANT),
+            json!("0001-01-01T00:00:00.000000Z"),
+            json!("9999-12-31T23:59:59.999999Z"),
+            json!("1970-01-01T00:00:00.000000Z"),
+            json!("2024-02-29T23:59:59.000001Z"),
+            // Refused.
+            json!(null),
+            json!(true),
+            json!(1_790_000_000_000_i64),
+            json!(""),
+            json!("not-a-date"),
+            json!("2026-02-30T00:00:00.000000Z"),
+            // Instants the repair may keep, spelled as ingest never spells
+            // them: refused, because the check is stricter than the cast.
+            json!("2026-09-27T12:00:00Z"),
+            json!("2026-09-27T12:00:00.123456789Z"),
+            json!("2026-09-27T14:00:00.123456+02:00"),
+            json!("2026-09-27 12:00:00.123456Z"),
+            json!("2026-09-27t12:00:00.123456z"),
+            json!("2026-06-30T23:59:60.000000Z"),
+            json!("0000-01-01T00:00:00.000000Z"),
+            json!("+10000-01-01T00:00:00.000000Z"),
+        ];
+        let stamped = || -> serde_json::Map<String, serde_json::Value> {
+            TIMESTAMP_COLUMNS
+                .iter()
+                .map(|column| ((*column).to_owned(), json!(PROBE_INSTANT)))
+                .collect()
+        };
+        let mut rows = Vec::new();
+        for value in values {
+            for column in TIMESTAMP_COLUMNS {
+                let mut row = stamped();
+                row.insert((*column).to_owned(), value.clone());
+                rows.push(row);
+            }
+        }
+        for column in TIMESTAMP_COLUMNS {
+            let mut row = stamped();
+            row.remove(*column);
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Write the indexed rows as `dir/svc_1000_abcd.ndjson`, each carrying
+    /// its `idx`. The file name gives the repair's second arm an instant no
+    /// probe row holds: 1970-01-01 00:00:01.
+    fn write_probe_wal(
+        dir: &Path,
+        rows: &[(usize, &serde_json::Map<String, serde_json::Value>)],
+    ) -> PathBuf {
+        let path = dir.join("svc_1000_abcd.ndjson");
+        let mut ndjson = Vec::new();
+        for (idx, row) in rows {
+            let mut row = (*row).clone();
+            row.insert("idx".into(), serde_json::json!(idx));
+            row.insert("service".into(), serde_json::json!("svc"));
+            crate::ingest::wal::encode_line(&row, &mut ndjson).unwrap();
+        }
+        std::fs::write(&path, ndjson).unwrap();
+        path
+    }
+
+    /// `(idx, one instant per envelope TIMESTAMP column)` from `from`, ordered
+    /// by `idx`. With `hot_cast`, each column goes through the hot read's
+    /// bare `TRY_CAST` first.
+    fn probe_instants(
+        conn: &duckdb::Connection,
+        from: &str,
+        hot_cast: bool,
+    ) -> Vec<(usize, Vec<Option<String>>)> {
+        use trawl_core::schema::TIMESTAMP_COLUMNS;
+
+        let columns: Vec<String> = TIMESTAMP_COLUMNS
+            .iter()
+            .map(|column| {
+                if hot_cast {
+                    format!("CAST(TRY_CAST(\"{column}\" AS TIMESTAMP) AS VARCHAR)")
+                } else {
+                    format!("CAST(\"{column}\" AS VARCHAR)")
+                }
+            })
+            .collect();
+        let sql = format!(
+            "SELECT idx::BIGINT, {} FROM {from} ORDER BY idx",
+            columns.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |row| {
+            let values = (1..=TIMESTAMP_COLUMNS.len())
+                .map(|i| row.get(i))
+                .collect::<Result<_, _>>()?;
+            Ok((row.get::<_, i64>(0)?, values))
+        })
+        .unwrap()
+        .map(|row| {
+            let (idx, values) = row.unwrap();
+            (usize::try_from(idx).unwrap(), values)
+        })
+        .collect()
+    }
+
+    /// [`repair_leaves_unchanged`] is the Rust reading of [`repair_expr`]
+    /// that boot hydration trusts. Run the repair itself, through
+    /// [`build_wal_batch`], over rows whose instants fall on both sides of
+    /// the check, and read the same rows as the hot side does: the hot
+    /// reader and a bare `TRY_CAST` per envelope TIMESTAMP column. Every
+    /// row the check accepts must leave the repair with the instants the
+    /// hot read gives it, and every row the repair changes must be refused.
+    #[test]
+    fn repair_leaves_unchanged_agrees_with_repair_expr() {
+        let rows = repair_probe_rows();
+        let verdicts: Vec<bool> = rows.iter().map(repair_leaves_unchanged).collect();
+        assert!(verdicts.iter().any(|v| *v) && verdicts.iter().any(|v| !*v));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let all: Vec<_> = rows.iter().enumerate().collect();
+        let path = write_probe_wal(tmp.path(), &all);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let hot_reader = trawl_core::emitter::hot_source_reader(path.to_str().unwrap()).unwrap();
+        let hot = probe_instants(&conn, &hot_reader, true);
+        build_wal_batch(&conn, std::slice::from_ref(&path), "svc").unwrap();
+        let repaired = probe_instants(&conn, "wal_batch", false);
+        assert_eq!(hot.len(), rows.len());
+        assert_eq!(repaired.len(), rows.len());
+        for ((idx, hot), (_, cold)) in hot.iter().zip(&repaired) {
+            let row = &rows[*idx];
+            if verdicts[*idx] {
+                assert!(hot.iter().all(Option::is_some), "{row:?}: {hot:?}");
+                assert_eq!(hot, cold, "an accepted row changed: {row:?}");
+            }
+            if hot != cold {
+                assert!(!verdicts[*idx], "a repaired row was accepted: {row:?}");
+            }
+        }
+        let changed = hot.iter().zip(&repaired).filter(|(h, c)| h != c).count();
+        assert!(
+            changed > 0,
+            "the refused values include some the repair changes"
+        );
+
+        // A batch of accepted rows alone can be typed differently by
+        // `read_json`'s detection; the repair still leaves every instant as
+        // the hot read gave it above.
+        let tmp = tempfile::tempdir().unwrap();
+        let accepted: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| verdicts[*idx])
+            .collect();
+        let path = write_probe_wal(tmp.path(), &accepted);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        build_wal_batch(&conn, std::slice::from_ref(&path), "svc").unwrap();
+        for (idx, cold) in probe_instants(&conn, "wal_batch", false) {
+            assert_eq!(hot[idx].1, cold, "{:?}", rows[idx]);
         }
     }
 

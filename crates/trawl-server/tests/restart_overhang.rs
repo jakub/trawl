@@ -87,8 +87,7 @@ fn events_of(name: &str) -> Vec<Captured> {
 /// `dir/wal/prod`, holding `count` events of [`SERVICE`] tagged `tag`.
 fn plant_wal(dir: &Path, tag: &str, count: usize) -> PathBuf {
     let time = (Utc::now() - chrono::Duration::minutes(5))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let mut ndjson = Vec::new();
     for seq in 0..count {
         let event = serde_json::json!({

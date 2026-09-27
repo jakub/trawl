@@ -637,8 +637,7 @@ async fn overhang_stall_stays_bounded() {
     // under the caps; the third is overhang. Every event carries a field
     // no pin covers yet, so compacting it must reach the catalog.
     let time = (chrono::Utc::now() - chrono::Duration::minutes(5))
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string();
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let writer = trawl_server::ingest::wal::WalWriter::new(dir.path().join("wal"));
     writer.ensure_dir().unwrap();
     let mut planted = Vec::new();

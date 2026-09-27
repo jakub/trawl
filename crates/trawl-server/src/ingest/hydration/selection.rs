@@ -258,7 +258,7 @@ mod tests {
             event.insert("n".into(), json!(n));
             event.insert("msg".into(), json!("x".repeat(pad)));
             event.insert("ratio".into(), json!(0.1 * f64::from(n)));
-            batch.push(event);
+            batch.push(super::super::test_support::stamped(event));
         }
         batch
     }
@@ -427,6 +427,23 @@ mod tests {
         );
         assert_eq!(selected(&selection), [first]);
         assert_eq!(counts(&selection), [("hydrated", 1), ("capacity", 1)]);
+    }
+
+    /// A row whose `_time` compaction's repair would replace reads NULL
+    /// hot but a real instant cold, so its whole file stays for compaction.
+    #[test]
+    fn a_file_with_a_row_compaction_would_repair_is_undecodable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path();
+        let mut bytes = batch(2, 4).ndjson;
+        bytes.extend_from_slice(
+            b"{\"_ingested\":\"2026-09-27T12:00:00Z\",\"_time\":\"not-a-date\",\"env\":\"prod\",\"service\":\"api\"}\n",
+        );
+        plant_bytes(wal, "api", BASE, &bytes);
+        let later = plant(wal, "prod", "later", BASE + 1, &batch(1, 4));
+        let selection = select(wal, caps(100, 1 << 20));
+        assert_eq!(selected(&selection), [later]);
+        assert_eq!(counts(&selection), [("hydrated", 1), ("undecodable", 1)]);
     }
 
     #[test]

@@ -223,6 +223,25 @@ mod test_support {
     use crate::ingest::pipeline::ServiceBatch;
     use crate::ingest::wal::WalName;
 
+    /// The instant [`stamped`] writes, spelled as ingest spells every
+    /// envelope instant: RFC 3339 UTC at microsecond precision.
+    pub(super) fn instant() -> String {
+        chrono::DateTime::from_timestamp_micros(1_790_000_000_123_456)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    }
+
+    /// `event` with the `_time` and `_ingested` that canonicalization puts
+    /// on every event the live writer writes, unless it has them already.
+    pub(super) fn stamped(
+        mut event: serde_json::Map<String, serde_json::Value>,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        for column in trawl_core::schema::TIMESTAMP_COLUMNS {
+            event.entry(*column).or_insert_with(|| json!(instant()));
+        }
+        event
+    }
+
     pub(super) fn buffer(max_events: usize, max_bytes: usize) -> HotBuffer {
         HotBuffer::new(HotBufferConfig {
             max_events,
@@ -238,7 +257,7 @@ mod test_support {
             let mut event = serde_json::Map::new();
             event.insert("n".into(), json!(n));
             event.insert("service".into(), json!(service));
-            batch.push(event);
+            batch.push(stamped(event));
         }
         let name = WalName {
             service: service.into(),

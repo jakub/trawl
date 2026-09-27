@@ -11,8 +11,9 @@
 //! covers the whole file. A file that fails anywhere is rejected whole,
 //! never loaded as a prefix, and stays for compaction's decoder, which
 //! handles every other file as it always has. Hydration never
-//! canonicalizes an event again, so a hydrated event reads the same hot as
-//! it will cold.
+//! canonicalizes an event again, and it takes no row whose envelope
+//! instants compaction would repair, so a hydrated event reads the same hot
+//! as it will cold.
 //!
 //! Only Linux opens a WAL file without following a symlink and without
 //! blocking on a FIFO. Off Linux every entry is [`Rejection::Unreadable`],
@@ -25,6 +26,7 @@ use std::path::Path;
 
 use serde_json::{Map, Value};
 
+use crate::ingest::compaction;
 use crate::ingest::envelope::is_folded_name;
 use crate::ingest::wal::{self, WalName};
 
@@ -107,13 +109,14 @@ pub(crate) fn examine(
 ///
 /// Accepted: non-empty UTF-8 with no NUL, ending in `\n`, with no blank
 /// line, where every line is a JSON object whose values are scalars
-/// (null, bool, number, string) and whose keys are folded
-/// ([`is_folded_name`]), and where [`wal::encode_line`] of the parsed
-/// object gives back that line byte for byte. The last check rejects
-/// whitespace, key order, escapes and number spellings the writer does not
-/// produce, and a duplicate key, which parses to one fewer key. Float
-/// values need `serde_json`'s `float_roundtrip` to parse back to the value
-/// the writer printed.
+/// (null, bool, number, string), whose keys are folded
+/// ([`is_folded_name`]), whose `_time` and `_ingested` compaction's repair
+/// leaves as they are ([`compaction::repair_leaves_unchanged`]), and where
+/// [`wal::encode_line`] of the parsed object gives back that line byte for
+/// byte. The last check rejects whitespace, key order, escapes and number
+/// spellings the writer does not produce, and a duplicate key, which
+/// parses to one fewer key. Float values need `serde_json`'s
+/// `float_roundtrip` to parse back to the value the writer printed.
 ///
 /// The charge of the returned events is `(events.len(), bytes.len())`,
 /// what `ServiceBatch::push` charged for them, and `events.len()` is the
@@ -139,6 +142,7 @@ pub(crate) fn recognize(bytes: &[u8]) -> Option<Vec<Event>> {
         if !event
             .iter()
             .all(|(key, value)| is_folded_name(key) && is_scalar(value))
+            || !compaction::repair_leaves_unchanged(&event)
         {
             return None;
         }
@@ -250,6 +254,7 @@ fn open_no_follow(_path: &Path) -> std::io::Result<File> {
 mod tests {
     use serde_json::json;
 
+    use super::super::test_support::{instant, stamped};
     use super::*;
     use crate::ingest::pipeline::ServiceBatch;
 
@@ -312,7 +317,14 @@ mod tests {
         text.insert("ключ".into(), json!("non-ASCII key"));
         events.push(text);
         events.push(Event::new());
-        events
+        events.into_iter().map(stamped).collect()
+    }
+
+    /// The opening of a writer line whose envelope instants are stamped,
+    /// for hand-spelled lines: every key after it sorts after `_time`.
+    fn stamped_prefix() -> String {
+        let line = String::from_utf8(line(&stamped(Event::new()))).unwrap();
+        format!("{},", line.strip_suffix("}\n").unwrap())
     }
 
     /// The bytes and charge the live writer produces for `events`.
@@ -413,7 +425,7 @@ mod tests {
     #[test]
     fn rejects_a_nested_object_or_array() {
         for nested in [json!({"a": 1}), json!([1, 2]), json!({}), json!([])] {
-            let mut event = Event::new();
+            let mut event = stamped(Event::new());
             event.insert("nested".into(), nested);
             assert_rejected(&with_bad_line_inside(&line(&event)), "a nested value");
         }
@@ -421,14 +433,14 @@ mod tests {
 
     #[test]
     fn rejects_a_duplicate_key() {
-        assert_rejected(
-            &with_bad_line_inside(b"{\"a\":1,\"a\":1}\n"),
-            "a duplicate key",
-        );
-        assert_rejected(
-            &with_bad_line_inside(b"{\"a\":1,\"a\":2}\n"),
-            "a duplicate key",
-        );
+        let stamps = stamped_prefix();
+        assert!(recognize(format!("{stamps}\"a\":1}}\n").as_bytes()).is_some());
+        for duplicated in ["\"a\":1,\"a\":1", "\"a\":1,\"a\":2"] {
+            assert_rejected(
+                &with_bad_line_inside(format!("{stamps}{duplicated}}}\n").as_bytes()),
+                "a duplicate key",
+            );
+        }
     }
 
     #[test]
@@ -451,9 +463,10 @@ mod tests {
 
     #[test]
     fn rejects_a_nul_byte() {
-        let mut event = Event::new();
+        let mut event = stamped(Event::new());
         event.insert("msg".into(), json!("ab"));
         let good = line(&event);
+        assert!(recognize(&good).is_some());
         let nul_inside: Vec<u8> = good
             .iter()
             .flat_map(|&b| if b == b'a' { vec![b'a', 0] } else { vec![b] })
@@ -481,9 +494,10 @@ mod tests {
 
     #[test]
     fn rejects_invalid_utf8() {
-        let mut event = Event::new();
+        let mut event = stamped(Event::new());
         event.insert("msg".into(), json!("é"));
         let good = line(&event);
+        assert!(recognize(&good).is_some());
         // Cut the two-byte `é` in half.
         let cut: Vec<u8> = good.iter().copied().filter(|&b| b != 0xa9).collect();
         assert_ne!(cut, good);
@@ -525,30 +539,125 @@ mod tests {
     #[test]
     fn rejects_an_uppercase_key() {
         for key in ["Service", "_Time", "mSg", "A"] {
-            let mut event = Event::new();
+            let mut event = stamped(Event::new());
             event.insert(key.into(), json!("v"));
             assert!(!is_folded_name(key));
             assert_rejected(&with_bad_line_inside(&line(&event)), "an uppercase key");
         }
         // Non-ASCII case is not folded, so it is not refused.
-        let mut event = Event::new();
+        let mut event = stamped(Event::new());
         event.insert("cafÉ".into(), json!("v"));
         assert!(recognize(&line(&event)).is_some());
     }
 
     #[test]
     fn rejects_spellings_the_writer_does_not_produce() {
+        let stamps = stamped_prefix();
+        assert!(recognize(format!("{stamps}\"a\":2,\"b\":1}}\n").as_bytes()).is_some());
         for spelled in [
-            b"{\"b\":1,\"a\":2}\n".as_slice(),
-            b"{\"a\":1.0e2}\n",
-            b"{\"a\":1E2}\n",
-            b"{\"a\":0.10}\n",
-            b"{\"a\":-0}\n",
-            b"{\"a\":\"\\u0041\"}\n",
-            b"{\"a\":\"\\/\"}\n",
+            "\"b\":1,\"a\":2",
+            "\"a\":1.0e2",
+            "\"a\":1E2",
+            "\"a\":0.10",
+            "\"a\":-0",
+            "\"a\":\"\\u0041\"",
+            "\"a\":\"\\/\"",
         ] {
-            assert_rejected(&with_bad_line_inside(spelled), "a non-writer spelling");
+            assert_rejected(
+                &with_bad_line_inside(format!("{stamps}{spelled}}}\n").as_bytes()),
+                "a non-writer spelling",
+            );
         }
+    }
+
+    /// The row from the final review: `_time` is not an instant, so
+    /// compaction's repair would replace it with the file name's instant
+    /// while the hot read casts it to NULL.
+    #[test]
+    fn rejects_a_row_compaction_would_repair() {
+        assert_rejected(
+            &with_bad_line_inside(
+                b"{\"_ingested\":\"2026-09-27T12:00:00Z\",\"_time\":\"not-a-date\",\"env\":\"prod\",\"service\":\"api\"}\n",
+            ),
+            "a row compaction would repair",
+        );
+    }
+
+    /// Every envelope instant compaction repairs is checked, and each value
+    /// its repair would replace, or that is not spelled as ingest spells
+    /// it, rejects the file.
+    #[test]
+    fn rejects_each_instant_compaction_would_repair() {
+        let unrepaired = [
+            json!(null),
+            json!(true),
+            json!(1_790_000_000_000_i64),
+            json!(""),
+            json!("not-a-date"),
+            json!("2026-02-30T00:00:00.000000Z"),
+            // Instants ingest never spells this way.
+            json!("2026-09-27T12:00:00Z"),
+            json!("2026-09-27T12:00:00.123456789Z"),
+            json!("2026-09-27T14:00:00.123456+02:00"),
+            json!("2026-09-27 12:00:00.123456Z"),
+            json!("2026-09-27t12:00:00.123456z"),
+            json!("2026-06-30T23:59:60.000000Z"),
+            json!("0000-01-01T00:00:00.000000Z"),
+        ];
+        for column in trawl_core::schema::TIMESTAMP_COLUMNS {
+            let mut missing = stamped(Event::new());
+            missing.remove(*column);
+            assert_rejected(&with_bad_line_inside(&line(&missing)), column);
+            for value in &unrepaired {
+                let mut event = stamped(Event::new());
+                event.insert((*column).to_owned(), value.clone());
+                assert_rejected(
+                    &with_bad_line_inside(&line(&event)),
+                    &format!("{column} = {value}"),
+                );
+            }
+        }
+        assert!(recognize(&line(&stamped(Event::new()))).is_some());
+    }
+
+    /// Real writer output: client events through the canonicalizer, then
+    /// the writer's `ServiceBatch::push`.
+    #[test]
+    fn canonicalized_events_are_recognized() {
+        use crate::ingest::envelope::{EnvelopeContext, canonicalize};
+        use crate::ingest::producer::{Derivation, Producer};
+
+        let arrival_instant = chrono::DateTime::parse_from_rfc3339(&instant())
+            .unwrap()
+            .to_utc();
+        let arrival = arrival_instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let envs = ["prod".to_owned()];
+        let derivation = Derivation::defaults();
+        let ctx = EnvelopeContext {
+            arrival: &arrival,
+            arrival_instant,
+            envs: &envs,
+            default_env: "prod",
+            producer: Producer::Http {
+                peer_host: "10.0.4.55",
+                peer_is_trusted_relay: false,
+            },
+            derivation: &derivation,
+        };
+        let clients = [
+            json!({"service": "api", "message": "no time at all"}),
+            json!({"service": "api", "_time": "2026-09-27T14:00:00.5+02:00", "level": "warn"}),
+            json!({"service": "api", "timestamp": "2026/09/27 12:00:00", "n": 1.5}),
+            json!({"service": "api", "_time": "not-a-date", "Mixed_Case": true}),
+            json!({"service": "api", "time": 1_790_000_000, "nested": {"a": [1, 2]}}),
+            json!({"Service": "api", "_env": "prod", "_host": "web-1", "@timestamp": "2026-09-27"}),
+        ];
+        let mut batch = ServiceBatch::default();
+        for client in clients {
+            let canonical = canonicalize(client.as_object().unwrap(), &ctx).unwrap();
+            batch.push(canonical.obj);
+        }
+        assert_eq!(recognize(&batch.ndjson), Some(batch.maps));
     }
 
     fn examine_path(path: &Path) -> Result<Recognized, Rejection> {

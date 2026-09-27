@@ -865,8 +865,8 @@ async fn boot_recovers_publication_markers_before_serving() {
         let name = format!("{service}_1730000000000_{seq:04x}.ndjson");
         let path = wal.join("prod").join(&name);
         let mut line = serde_json::to_vec(&serde_json::json!({
-            "_time": "2026-09-22T07:00:00Z",
-            "_ingested": "2026-09-22T07:00:00Z",
+            "_time": "2026-09-22T07:00:00.000000Z",
+            "_ingested": "2026-09-22T07:00:00.000000Z",
             "service": service,
             "message": "m",
             "crash_tag": format!("boot-recovery-{service}"),
@@ -1781,7 +1781,7 @@ async fn blocked_marker_at_boot_refuses_reads_until_resolved() {
     let wal = fixture.storage_root().join("wal");
     let data = fixture.data();
     let observed = chrono::Utc::now() - chrono::Duration::minutes(5);
-    let time = observed.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let time = observed.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let millis = chrono::Utc::now().timestamp_millis();
     std::fs::create_dir_all(wal.join("prod")).unwrap();
     let plant = |service: &str, seq: u32, count: i64| {
