@@ -29,8 +29,10 @@ tempfile = { workspace = true }
 
 [features]
 # Exposes `executor::prepare_probe`, the count of statements handed to
-# DuckDB, to this crate's own integration tests via the self-dependency
-# above. No production consumer enables it.
+# DuckDB, and the phase clock's hold hook and transition log
+# (`timing::PhaseClock::hold_on_enter`, `transitions`) to tests: this
+# crate's own via the self-dependency above, and trawl-server's through its
+# own test-support feature. No production consumer enables it.
 test-support = []
 
 [lints]
