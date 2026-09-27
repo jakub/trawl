@@ -325,7 +325,7 @@ config file is read, so a broken client config does not block them.
 | Verb | Description |
 |------|-------------|
 | `up` | Create the trial, or resume it. Pulls the images when absent, starts PostgreSQL, creates the databases and roles, applies the Fleet schema, generates a certificate, mints two keys, starts `trawld` and `trawl-web`, checks one authenticated query, and loads the samples. Prints the addresses and the token file paths, never a token |
-| `status` | Print the trial id, addresses, image ids and digests, certificate fingerprint, sample range as absolute timestamps, setup phases, and containers. Warns on stderr for each `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_INSECURE`, or `TRAWL_PROFILE` that is set |
+| `status` | Print the trial id, addresses, image ids and digests, certificate fingerprint, sample range as absolute timestamps, setup phases, and containers. Warns on stderr when `TRAWL_URL` or `TRAWL_TOKEN` is set, when `TRAWL_INSECURE` is `true`, and when `TRAWL_PROFILE` names a profile other than `trial` |
 | `key` | Print the operator token and one newline to stdout, nothing else |
 | `stop` | Stop the containers. The databases, keys, samples, and state stay, and a later `up` resumes |
 | `down` | Print the containers, volumes, and network that carry this trial's id, ask `Delete all of it? [y/N]` on a terminal, delete them and the trial directory |

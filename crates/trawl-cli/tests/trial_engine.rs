@@ -164,6 +164,11 @@ esac
     }
 
     fn trawl(&self, verb: &[&str]) -> Output {
+        self.trawl_with(verb, &[])
+    }
+
+    /// [`Self::trawl`] with `env` set on top.
+    fn trawl_with(&self, verb: &[&str], env: &[(&str, &str)]) -> Output {
         let path = std::env::join_paths(std::iter::once(self.stub.clone()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
         ))
@@ -182,6 +187,7 @@ esac
             .env("HOME", &self.state_home)
             .env("DOCKER_HOST", &self.host)
             .env("PATH", path)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .output()
             .expect("run trawl")
@@ -293,6 +299,39 @@ fn status_lists_containers_only_on_its_own_engine() {
         elsewhere.starts_with("  unknown: this command reached Docker engine engine-b"),
         "{elsewhere}"
     );
+}
+
+/// `status` warns about a connection variable only when it changes where
+/// commands go, and reads `TRAWL_INSECURE` and `TRAWL_PROFILE` as the
+/// argument parser does.
+#[test]
+fn status_warns_only_about_variables_that_move_commands() {
+    let engine = Engine::new("engine-a");
+    engine.trial_on("engine-a");
+    let warnings = |env: &[(&str, &str)]| {
+        let out = engine.trawl_with(&["status"], env);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{env:?}: {stderr}");
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("trawl: warning: "))
+            .map(|line| line.split(' ').nth(2).unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let none: Vec<String> = Vec::new();
+    // `TRAWL_PROFILE=trial` sends commands without -p to the trial, and
+    // `TRAWL_INSECURE=false` leaves `-p trial` working.
+    assert_eq!(warnings(&[("TRAWL_PROFILE", "trial")]), none);
+    assert_eq!(warnings(&[("TRAWL_INSECURE", "false")]), none);
+    for (name, value) in [
+        ("TRAWL_PROFILE", "home"),
+        ("TRAWL_PROFILE", ""),
+        ("TRAWL_INSECURE", "true"),
+        ("TRAWL_URL", ""),
+        ("TRAWL_TOKEN", ""),
+    ] {
+        assert_eq!(warnings(&[(name, value)]), [name], "{name}={value:?}");
+    }
 }
 
 /// A free loopback port, for `up`'s bind test.

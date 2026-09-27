@@ -242,26 +242,48 @@ fn image(out: &mut impl Write, role: &str, record: &ImageRecord, note: &str) -> 
     }
 }
 
-/// The connection variables whose presence changes what `trawl -p trial`
-/// does.
-pub const CONNECTION_VARIABLES: [&str; 4] = [
-    "TRAWL_URL",
-    "TRAWL_TOKEN",
-    "TRAWL_INSECURE",
-    "TRAWL_PROFILE",
-];
+/// The connection variables that change where commands go, by name:
+///
+/// - `TRAWL_URL` and `TRAWL_TOKEN` when set at all, even empty, because
+///   `trawl -p trial` then refuses.
+/// - `TRAWL_INSECURE` when the argument parser reads it as on, because
+///   `trawl -p trial` then refuses. `false` changes nothing.
+/// - `TRAWL_PROFILE` when it names a profile other than `trial`, because
+///   commands without -p then use that profile. `trial` sends them to the
+///   trial.
+pub fn moving_variables(
+    url_set: bool,
+    token_set: bool,
+    insecure: bool,
+    profile: Option<&str>,
+) -> Vec<&'static str> {
+    [
+        ("TRAWL_URL", url_set),
+        ("TRAWL_TOKEN", token_set),
+        ("TRAWL_INSECURE", insecure),
+        ("TRAWL_PROFILE", profile.is_some_and(|name| name != PROFILE)),
+    ]
+    .into_iter()
+    .filter_map(|(name, moves)| moves.then_some(name))
+    .collect()
+}
 
-/// One stderr warning per set connection variable, by name only.
-pub fn render_env_warnings(out: &mut impl Write, set: &[&str]) -> io::Result<()> {
-    for name in set {
-        let effect = match *name {
-            "TRAWL_PROFILE" => "commands without -p use that profile, not the trial",
-            "TRAWL_INSECURE" => {
-                "`trawl -p trial` refuses to run, because the trial is reached only through its pinned certificate"
-            }
-            _ => "`trawl -p trial` refuses to run until it is unset",
+/// One stderr warning per variable [`moving_variables`] names, by name
+/// only.
+pub fn render_env_warnings(out: &mut impl Write, moving: &[&str]) -> io::Result<()> {
+    for name in moving {
+        let warning = match *name {
+            "TRAWL_PROFILE" => format!(
+                "{name} names a profile other than `{PROFILE}`, so commands without -p use \
+                 that profile, not the trial"
+            ),
+            "TRAWL_INSECURE" => format!(
+                "{name} is true, so `trawl -p {PROFILE}` refuses to run, because the trial is \
+                 reached only through its pinned certificate"
+            ),
+            _ => format!("{name} is set, so `trawl -p {PROFILE}` refuses to run until it is unset"),
         };
-        writeln!(out, "trawl: warning: {name} is set, so {effect}")?;
+        writeln!(out, "trawl: warning: {warning}")?;
     }
     Ok(())
 }
@@ -441,7 +463,42 @@ mod tests {
         let warnings = text(|out| render_env_warnings(out, &["TRAWL_URL", "TRAWL_PROFILE"]));
         assert_eq!(warnings.lines().count(), 2);
         assert!(warnings.starts_with("trawl: warning: TRAWL_URL is set, so"));
+        assert!(
+            warnings.contains("TRAWL_PROFILE names a profile other than `trial`"),
+            "{warnings}"
+        );
         assert!(text(|out| render_env_warnings(out, &[])).is_empty());
+    }
+
+    /// A variable counts by what it does to where commands go, not by
+    /// being set: `TRAWL_PROFILE=trial` sends commands to the trial, and
+    /// `TRAWL_INSECURE=false` leaves `-p trial` working.
+    #[test]
+    fn only_variables_that_move_commands_are_warned_about() {
+        let none: Vec<&str> = Vec::new();
+        assert_eq!(moving_variables(false, false, false, None), none);
+        assert_eq!(moving_variables(false, false, false, Some("trial")), none);
+        assert_eq!(
+            moving_variables(false, false, false, Some("home")),
+            ["TRAWL_PROFILE"]
+        );
+        assert_eq!(
+            moving_variables(false, false, false, Some("")),
+            ["TRAWL_PROFILE"]
+        );
+        assert_eq!(
+            moving_variables(false, false, true, None),
+            ["TRAWL_INSECURE"]
+        );
+        assert_eq!(
+            moving_variables(true, true, true, Some("home")),
+            [
+                "TRAWL_URL",
+                "TRAWL_TOKEN",
+                "TRAWL_INSECURE",
+                "TRAWL_PROFILE"
+            ]
+        );
     }
 
     #[test]

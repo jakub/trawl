@@ -1374,14 +1374,30 @@ pub async fn status(paths: &TrialPaths) -> Result<(), TrialError> {
         },
         Err(e) => Containers::Unknown(e.to_string()),
     };
-    let set: Vec<&str> = render::CONNECTION_VARIABLES
-        .into_iter()
-        .filter(|name| std::env::var_os(name).is_some())
-        .collect();
-    render::render_env_warnings(&mut io::stderr().lock(), &set)
+    render::render_env_warnings(&mut io::stderr().lock(), &moving_variables())
         .map_err(|e| TrialError::io("write", "stderr", e))?;
     render::render_status(&mut io::stdout().lock(), &state, paths, &containers)
         .map_err(|e| TrialError::io("write", "stdout", e))
+}
+
+/// [`render::moving_variables`] for this process. `TRAWL_INSECURE` and
+/// `TRAWL_PROFILE` are read by the argument parser, as every other command
+/// reads them: the top-level arguments parsed from the program name alone
+/// hold only what the environment gives. That parse cannot fail where
+/// this process's own succeeded; if it does, the two count when set.
+fn moving_variables() -> Vec<&'static str> {
+    use clap::Parser as _;
+    let set = |name: &str| std::env::var_os(name).is_some();
+    let (insecure, profile) = match crate::Cli::try_parse_from(["trawl"]) {
+        Ok(cli) => (cli.insecure, cli.profile),
+        Err(_) => (set("TRAWL_INSECURE"), std::env::var("TRAWL_PROFILE").ok()),
+    };
+    render::moving_variables(
+        set(super::profile::URL_ENV),
+        set(super::profile::TOKEN_ENV),
+        insecure,
+        profile.as_deref(),
+    )
 }
 
 /// `(name, state)` of the trial's containers, one-offs excluded.
