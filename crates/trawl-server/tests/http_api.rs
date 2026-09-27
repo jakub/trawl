@@ -860,7 +860,8 @@ async fn query_timing_refused_at_dsl_check() {
 
 /// Every export format reports its render, parquet its `COPY` too, and
 /// `export_complete.duration_ms` keeps its own narrower window: it starts
-/// after the admission check, and for CSV and JSON it ends before render.
+/// after the admission check, for CSV and JSON it ends before render, and
+/// it holds every phase from the permit wait on.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_timing_export_formats() {
     use timing::{int, phases, text};
@@ -911,20 +912,33 @@ async fn query_timing_export_formats() {
         assert_eq!(completes.len(), 1, "{format}: {completes:?}");
         let duration_ms = int(&completes[0], "duration_ms").expect("duration_ms");
         let observed = int(&event, "query_observed_us").expect("observed");
-        let outside_legacy = present["dsl_check"]
-            + if format == "parquet" {
-                0
-            } else {
-                present["render"]
-            };
+        let parquet = format == "parquet";
+        // Pinned from both sides. Parquet's readback is its render and
+        // runs inside the worker, so that format's legacy window holds it.
+        let (outside_legacy, inside_legacy): (Vec<&str>, Vec<&str>) =
+            trawl_engine::timing::QueryPhase::ALL
+                .iter()
+                .map(|p| p.as_str())
+                .partition(|p| {
+                    matches!(*p, "dsl_check" | "saved_lookup") || (*p == "render" && !parquet)
+                });
+        let outside: u64 = outside_legacy.iter().filter_map(|p| present.get(p)).sum();
+        let inside: u64 = inside_legacy.iter().filter_map(|p| present.get(p)).sum();
+        // Excluded: the legacy window lies inside the account's, after
+        // the check and (CSV, JSON) before the render. `duration_ms`
+        // floors, so it needs no slack; the one microsecond covers each
+        // field of the account flooring on its own.
         assert!(
-            duration_ms * 1_000 <= observed - outside_legacy,
-            "{format}: export_complete's {duration_ms}ms excludes the check{} ({event:?})",
-            if format == "parquet" {
-                ""
-            } else {
-                " and the render"
-            }
+            duration_ms * 1_000 <= observed - outside + 1,
+            "{format}: export_complete's {duration_ms}ms excludes {outside_legacy:?} \
+             ({event:?})"
+        );
+        // Included: every phase from the permit wait on ran inside the
+        // legacy window. The millisecond is `duration_ms` flooring.
+        assert!(
+            duration_ms * 1_000 + 1_000 > inside,
+            "{format}: export_complete's {duration_ms}ms includes {inside_legacy:?} \
+             ({event:?})"
         );
     }
 }
