@@ -182,9 +182,11 @@ pub async fn query(
     // the pre-start capacity refusal, since no work was ever started and a
     // timeout history row would claim otherwise.
     //
-    // `saved_lookup` is booked only for a `from saved` read that resolved,
-    // and only then is the account a `from_saved` one: every query takes
-    // the detection parse, and an ordinary query's is not a lookup.
+    // `saved_lookup` is booked for a `from saved` read that resolved, and
+    // only then is the account a `from_saved` one: every query takes the
+    // detection parse, and an ordinary query's is not a lookup. A lookup
+    // the deadline cut is booked too, like any request-side wait a
+    // deadline ends (ADR-0046): the refusal shows where its time went.
     let checked = timing.clock().time(QueryPhase::DslCheck, || {
         crate::admission::check_dsl(&req.query)
     });
@@ -206,7 +208,7 @@ pub async fn query(
                 resolved
             }
             Err(crate::deadline::Expired) => {
-                timing.clock().discard(QueryPhase::SavedLookup);
+                timing.clock().exit(QueryPhase::SavedLookup);
                 // Refused here, before any work: named where it is made,
                 // like the pool's own capacity refusals.
                 timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());

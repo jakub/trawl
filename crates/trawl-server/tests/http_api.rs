@@ -745,6 +745,49 @@ async fn query_timing_from_saved_skips_publication() {
     timing::assert_sums(&event);
 }
 
+/// A `from saved` lookup the deadline cuts is a capacity refusal that
+/// books the lookup: the refusal shows where its time went. The lookup
+/// reads postgres, so a lock held on `saved_queries` parks it until the
+/// one-second budget runs out.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_books_an_expired_saved_lookup() {
+    use sqlx::{Connection as _, Executor as _};
+    use timing::{flag, int, phases, text};
+
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup_with_query_timeout(RateLimitConfig::default(), 1).await;
+    let mut lock = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .expect("connect to the app database");
+    lock.execute("BEGIN; LOCK TABLE saved_queries IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock saved_queries");
+
+    let (status, request_id, body) = post_query(
+        &server,
+        "| from saved timing_parked run=latest | stats count()",
+    )
+    .await;
+    lock.execute("ROLLBACK").await.expect("release the lock");
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    let event = timing::only(capture, &request_id);
+    assert_eq!(text(&event, "outcome"), Some("capacity_refused"));
+    assert_eq!(text(&event, "kind"), Some("query"), "never resolved");
+    assert_eq!(flag(&event, "work_started"), Some(false));
+    assert_eq!(flag(&event, "timing_complete"), Some(true));
+    assert_eq!(
+        phases(&event).into_keys().collect::<Vec<_>>(),
+        ["dsl_check", "saved_lookup"],
+        "{event:?}"
+    );
+    assert!(
+        int(&event, "query_saved_lookup_us").is_some_and(|us| us >= 500_000),
+        "the lookup holds most of the one-second budget: {event:?}"
+    );
+    timing::assert_sums(&event);
+}
+
 /// A query refused at its admission check reports that check alone, with
 /// its class and without its text.
 #[tokio::test(flavor = "multi_thread")]
