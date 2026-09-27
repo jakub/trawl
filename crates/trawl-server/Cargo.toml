@@ -30,6 +30,7 @@ flate2 = { workspace = true }
 fs4 = { workspace = true }
 governor = { workspace = true }
 indexmap = { workspace = true }
+memchr = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 hyper = { workspace = true }

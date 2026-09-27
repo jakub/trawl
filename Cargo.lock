@@ -6401,6 +6401,7 @@ dependencies = [
  "indexmap",
  "insta",
  "log",
+ "memchr",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-process",

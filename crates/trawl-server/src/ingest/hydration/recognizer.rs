@@ -52,24 +52,48 @@ pub(crate) enum Rejection {
     Unreadable,
     /// The file is longer than the caller allowed. Nothing was read.
     TooLong { len: u64 },
+    /// The file was read and has more lines than the caller allowed events.
+    /// No line was parsed.
+    TooMany { lines: usize },
     /// The bytes were read in full and are not writer output.
     Unrecognized,
 }
 
+/// How much of one WAL file [`examine`] may take.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Limits {
+    /// The longest file it reads.
+    pub bytes: u64,
+    /// The most lines it parses. Writer output has one event per line.
+    pub events: usize,
+}
+
 /// Examine one WAL entry: its name, then the file, which is read in full
-/// if it is at most `max_len` bytes long. Every byte read is added to
+/// if it is at most `limits.bytes` long, then its lines, which are parsed
+/// only if there are at most `limits.events` of them. Counting the
+/// newlines of bytes already read costs no allocation, so a file of tiny
+/// lines never builds more events than fit. Every byte read is added to
 /// `spent`, including the bytes of a file rejected after reading.
-pub(crate) fn examine(path: &Path, max_len: u64, spent: &mut u64) -> Result<Recognized, Rejection> {
+pub(crate) fn examine(
+    path: &Path,
+    limits: Limits,
+    spent: &mut u64,
+) -> Result<Recognized, Rejection> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(WalName::parse)
         .ok_or(Rejection::Name)?;
     let file = WalFile::open(path).map_err(|_| Rejection::Unreadable)?;
-    if file.len > max_len {
+    if file.len > limits.bytes {
         return Err(Rejection::TooLong { len: file.len });
     }
     let bytes = file.read_whole(spent).map_err(|_| Rejection::Unreadable)?;
+    // Writer output ends every line, and so every event, with a newline.
+    let lines = memchr::memchr_iter(b'\n', &bytes).count();
+    if lines > limits.events {
+        return Err(Rejection::TooMany { lines });
+    }
     let events = recognize(&bytes).ok_or(Rejection::Unrecognized)?;
     Ok(Recognized {
         name,
@@ -92,7 +116,8 @@ pub(crate) fn examine(path: &Path, max_len: u64, spent: &mut u64) -> Result<Reco
 /// the writer printed.
 ///
 /// The charge of the returned events is `(events.len(), bytes.len())`,
-/// what `ServiceBatch::push` charged for them.
+/// what `ServiceBatch::push` charged for them, and `events.len()` is the
+/// number of newlines in `bytes`.
 pub(crate) fn recognize(bytes: &[u8]) -> Option<Vec<Event>> {
     if bytes.is_empty() || bytes.contains(&0) {
         return None;
@@ -108,6 +133,8 @@ pub(crate) fn recognize(bytes: &[u8]) -> Option<Vec<Event>> {
         if json.is_empty() {
             return None;
         }
+        #[cfg(test)]
+        PARSED_LINES.with(|parsed| parsed.set(parsed.get() + 1));
         let event: Event = serde_json::from_str(json).ok()?;
         if !event
             .iter()
@@ -123,6 +150,19 @@ pub(crate) fn recognize(bytes: &[u8]) -> Option<Vec<Event>> {
         events.push(event);
     }
     Some(events)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lines [`recognize`] parsed on this thread.
+    static PARSED_LINES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many lines [`recognize`] has parsed on this thread, for a test that
+/// checks a file was refused before any of its lines was parsed.
+#[cfg(test)]
+pub(crate) fn parsed_lines_for_test() -> u64 {
+    PARSED_LINES.with(std::cell::Cell::get)
 }
 
 const fn is_scalar(value: &Value) -> bool {
@@ -302,6 +342,14 @@ mod tests {
         bytes
     }
 
+    /// Limits of `bytes` and as many events as the lines any test writes.
+    fn limits(bytes: u64) -> Limits {
+        Limits {
+            bytes,
+            events: usize::MAX,
+        }
+    }
+
     fn assert_rejected(bytes: &[u8], why: &str) {
         assert!(recognize(bytes).is_none(), "{why}: {bytes:?}");
     }
@@ -355,7 +403,7 @@ mod tests {
         let path = tmp.path().join(name.file_name());
         std::fs::write(&path, &batch.ndjson).unwrap();
         let mut spent = 0;
-        let recognized = examine(&path, batch.ndjson.len() as u64, &mut spent).unwrap();
+        let recognized = examine(&path, limits(batch.ndjson.len() as u64), &mut spent).unwrap();
         assert_eq!(recognized.name, name);
         assert_eq!(recognized.events, batch.maps);
         assert_eq!(recognized.bytes, batch.ndjson.len());
@@ -505,7 +553,7 @@ mod tests {
 
     fn examine_path(path: &Path) -> Result<Recognized, Rejection> {
         let mut spent = 0;
-        let result = examine(path, u64::MAX, &mut spent);
+        let result = examine(path, limits(u64::MAX), &mut spent);
         if result.is_err() {
             assert_eq!(spent, 0, "a rejection before the read reads nothing");
         }
@@ -609,12 +657,42 @@ mod tests {
         let len = bytes.len() as u64;
         let mut spent = 0;
         assert_eq!(
-            examine(&path, len - 1, &mut spent).unwrap_err(),
+            examine(&path, limits(len - 1), &mut spent).unwrap_err(),
             Rejection::TooLong { len }
         );
         assert_eq!(spent, 0);
-        assert!(examine(&path, len, &mut spent).is_ok());
+        assert!(examine(&path, limits(len), &mut spent).is_ok());
         assert_eq!(spent, len);
+    }
+
+    #[test]
+    fn a_file_with_more_lines_than_allowed_is_read_but_not_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(writer_name());
+        let bytes = written(&awkward_events()).ndjson;
+        std::fs::write(&path, &bytes).unwrap();
+        let lines = awkward_events().len();
+        let len = bytes.len() as u64;
+        let mut spent = 0;
+        let parsed = parsed_lines_for_test();
+        let fewer = Limits {
+            bytes: len,
+            events: lines - 1,
+        };
+        assert_eq!(
+            examine(&path, fewer, &mut spent).unwrap_err(),
+            Rejection::TooMany { lines }
+        );
+        assert_eq!(parsed_lines_for_test(), parsed, "no line parsed");
+        assert_eq!(spent, len, "the read counts");
+        let exact = Limits {
+            bytes: len,
+            events: lines,
+        };
+        assert_eq!(
+            examine(&path, exact, &mut spent).unwrap().events.len(),
+            lines
+        );
     }
 
     #[test]
@@ -625,7 +703,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         let mut spent = 7;
         assert_eq!(
-            examine(&path, u64::MAX, &mut spent).unwrap_err(),
+            examine(&path, limits(u64::MAX), &mut spent).unwrap_err(),
             Rejection::Unrecognized
         );
         assert_eq!(spent, 7 + bytes.len() as u64);

@@ -30,10 +30,15 @@
 //! - longer than the remaining budget or byte capacity: `capacity`, not read;
 //! - not a regular file, a symlink, or a read that failed or changed
 //!   length: `unreadable`;
+//! - more lines than the full event cap: `oversized`, not parsed;
+//! - more lines than the remaining event capacity: `capacity`, not parsed;
 //! - not writer output ([`recognizer::recognize`]): `undecodable`;
-//! - more events than the full event cap: `oversized`;
-//! - more events than the remaining event capacity: `capacity`;
 //! - otherwise `hydrated`.
+//!
+//! Lines are counted before any is parsed, so at most the event capacity
+//! left is ever built as events, however small the lines. Writer output
+//! has one event per line, so for a recognized file the line count is its
+//! event count.
 //!
 //! The same WAL gives the same selection: the order is total and the
 //! decisions depend only on the files' bytes.
@@ -42,7 +47,7 @@ use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::recognizer::{self, Recognized, Rejection};
+use super::recognizer::{self, Limits, Recognized, Rejection};
 use super::{HydrationOutcome, OutcomeCounts};
 use crate::env_dirs::try_list_env_dirs_observed;
 use crate::hot_buffer::Charge;
@@ -97,23 +102,28 @@ pub(crate) fn select(wal_dir: &Path, caps: Charge) -> Selection {
     for candidate in candidates {
         let path = wal_dir.join(&candidate.env).join(&candidate.file_name);
         // Every hydrated byte was read, so the budget left never exceeds
-        // the byte capacity left; both bound the read.
-        let limit = full_bytes
-            .saturating_sub(selection.bytes_read)
-            .min(remaining.bytes as u64);
-        let outcome = match recognizer::examine(&path, limit, &mut selection.bytes_read) {
+        // the byte capacity left; both bound the read. The event capacity
+        // left bounds the lines parsed.
+        let limits = Limits {
+            bytes: full_bytes
+                .saturating_sub(selection.bytes_read)
+                .min(remaining.bytes as u64),
+            events: remaining.events,
+        };
+        let outcome = match recognizer::examine(&path, limits, &mut selection.bytes_read) {
             Err(Rejection::Name | Rejection::Unrecognized) => HydrationOutcome::Undecodable,
             Err(Rejection::Unreadable) => HydrationOutcome::Unreadable,
             Err(Rejection::TooLong { len }) if len > full_bytes => HydrationOutcome::Oversized,
-            Err(Rejection::TooLong { .. }) => HydrationOutcome::Capacity,
-            Ok(file) if file.events.len() > caps.events => HydrationOutcome::Oversized,
-            Ok(file) if file.events.len() > remaining.events => HydrationOutcome::Capacity,
+            Err(Rejection::TooMany { lines }) if lines > caps.events => HydrationOutcome::Oversized,
+            Err(Rejection::TooLong { .. } | Rejection::TooMany { .. }) => {
+                HydrationOutcome::Capacity
+            }
             Ok(file) => match compaction::wal_batch_id(&candidate.env, &path) {
                 // A writer name always has a UTF-8 stem.
                 None => HydrationOutcome::Undecodable,
                 Some(batch_id) => {
-                    // The limit bounded the bytes and the guard above the
-                    // events, so neither subtraction underflows.
+                    // The limits bounded the bytes and the lines, one per
+                    // event, so neither subtraction underflows.
                     remaining.events -= file.events.len();
                     remaining.bytes -= file.bytes;
                     selection.files.push(Selected { batch_id, file });
@@ -309,7 +319,7 @@ mod tests {
         assert_eq!(selected(&selection), [a.as_str(), &c, &d]);
         assert_eq!(counts(&selection), [("hydrated", 3), ("capacity", 1)]);
         assert!(!selection.examine_bound_hit);
-        // b was read before its event count refused it.
+        // b was read before its line count refused it.
         let all: u64 = [&a, &b, &c, &d]
             .iter()
             .map(|name| std::fs::metadata(wal.join(name)).unwrap().len())
@@ -345,7 +355,7 @@ mod tests {
     fn an_oversized_oldest_file_is_skipped_and_later_files_hydrate() {
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path();
-        // Over the full event cap: read, then refused on its count.
+        // Over the full event cap: read, then refused on its line count.
         plant(wal, "prod", "big", BASE, &batch(6, 1));
         let b = plant(wal, "prod", "b", BASE + 1, &batch(2, 1));
         let c = plant(wal, "prod", "c", BASE + 2, &batch(2, 1));
@@ -367,6 +377,56 @@ mod tests {
         assert_eq!(selected(&selection), [b, c]);
         assert_eq!(counts(&selection), [("hydrated", 2), ("oversized", 1)]);
         assert_eq!(selection.bytes_read, 2 * small.ndjson.len() as u64);
+    }
+
+    /// Write `bytes` as the writer-named WAL file of `service`.
+    fn plant_bytes(wal: &Path, service: &str, millis: u64, bytes: &[u8]) {
+        let name = WalName {
+            service: service.into(),
+            millis,
+            nonce: 0x0001,
+        }
+        .file_name();
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        std::fs::write(wal.join("prod").join(name), bytes).unwrap();
+    }
+
+    /// Materializing a file's events before checking their count would let
+    /// a file of tiny lines inside the byte budget build millions of maps.
+    /// A file with more lines than fit is refused before any line is
+    /// parsed.
+    #[test]
+    fn a_file_with_more_lines_than_fit_is_refused_before_any_is_parsed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path();
+        // Ten tiny lines: far inside the byte budget, over the event cap.
+        let tiny = b"{}\n".repeat(10);
+        plant_bytes(wal, "tiny", BASE, &tiny);
+        let parsed = recognizer::parsed_lines_for_test();
+        let selection = select(wal, caps(3, 1 << 20));
+        assert_eq!(
+            recognizer::parsed_lines_for_test(),
+            parsed,
+            "no line parsed"
+        );
+        assert_eq!(counts(&selection), [("oversized", 1)]);
+        assert_eq!(selection.bytes_read, tiny.len() as u64, "the read counts");
+
+        // Over the event capacity left but not the full cap: `capacity`,
+        // and again no line of it is parsed.
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path();
+        let first = plant(wal, "prod", "first", BASE, &batch(2, 4));
+        plant(wal, "prod", "second", BASE + 1, &batch(2, 4));
+        let parsed = recognizer::parsed_lines_for_test();
+        let selection = select(wal, caps(3, 1 << 20));
+        assert_eq!(
+            recognizer::parsed_lines_for_test() - parsed,
+            2,
+            "only the first file's lines were parsed"
+        );
+        assert_eq!(selected(&selection), [first]);
+        assert_eq!(counts(&selection), [("hydrated", 1), ("capacity", 1)]);
     }
 
     #[test]
