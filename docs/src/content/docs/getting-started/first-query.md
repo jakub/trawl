@@ -84,8 +84,9 @@ a token. The trial keeps its files in `$XDG_STATE_HOME/trawl/trial`, which is
 `~/.local/state/trawl/trial` by default. Nothing restarts at boot, and
 nothing edits `~/.config/trawl/config.toml`.
 
-The samples cover the 24 hours before `up` loaded them. The newest events sit
-in the last 10 minutes before that moment, and the three `service=tutorial`
+The samples cover the 24 hours before the first `up` loaded them, and a later
+`up` does not move them. `trawl trial status` prints their exact range. The
+newest events sit in the last 10 minutes before that moment, and the three `service=tutorial`
 events that [Build a query](/use/query-tutorial/) uses sit at the newest
 timestamp. With the default retention of 90 days, the samples age out 90 days
 after `up`.
@@ -107,10 +108,14 @@ after `up`.
 3. Search opens with **Quick start** and four examples. Each example's **Run**
    uses the selected **Date range**. The default range is the last 15 minutes,
    and the newest samples fall inside it right after `up`. Select `7d` in
-   **Date range** to see all 2000 events for the trial's life.
+   **Date range** to see all 2000 events. `7d` is the widest preset, and it
+   ends at the current time, so it covers every sample for about six days
+   after the first `up`. After that, open **Date range**, select **Absolute**,
+   paste the first timestamp that `trawl trial status` prints into **From**,
+   leave **To** at `now`, and select **Apply**.
 4. Enter `service=checkout _severity>=error | stats count() as errors by service`
    and select **Haul**. Expect one row with service `checkout` and errors
-   `20`.
+   `20`. A range that misses some samples gives a smaller count.
 
 The [browser guide](/reference/web-ui/) explains the time range, filters,
 live mode, and saved queries.

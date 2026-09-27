@@ -7,10 +7,15 @@ A query selects events, then passes them through pipe stages. Run each example
 in browser Search or pass it, quoted, to `trawl -p trial query`. The examples
 use the three `service=tutorial` events that `trawl trial up` loads with its
 sample data ([Your first query](/getting-started/first-query/)). They carry the
-time at which the samples were loaded, so the examples name no time range.
-`trawl query` adds none. In the browser, select `7d` in **Date range**, because
-the default 15 minutes stops covering the events soon after `up`. With your own
-logs, replace the service and look at a few rows first.
+time at which the first `trawl trial up` loaded the samples, and a later `up`
+does not move them, so the examples name no time range. `trawl query` adds
+none. In the browser, select `7d` in **Date range**, because the default 15
+minutes stops covering the events soon after `up`. `7d` ends at the current
+time, so it covers the events for about seven days. After that, open
+**Date range**, select **Absolute**, paste the first sample timestamp that
+`trawl trial status` prints into **From**, leave **To** at `now`, and select
+**Apply**. With your own logs, replace the service and look at a few rows
+first.
 
 ## Find your events
 

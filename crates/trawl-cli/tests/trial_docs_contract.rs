@@ -14,6 +14,11 @@ const FIRST_QUERY: &str =
     include_str!("../../../docs/src/content/docs/getting-started/first-query.md");
 const QUERY_TUTORIAL: &str = include_str!("../../../docs/src/content/docs/use/query-tutorial.md");
 const CLI_REFERENCE: &str = include_str!("../../../docs/src/content/docs/reference/cli.md");
+/// The browser's range presets and its range dialog: the tutorials say how
+/// long the widest preset covers the samples and name the tab that reaches
+/// them afterwards.
+const WEB_QUERY_MERGE: &str = include_str!("../../trawl-web-ui/src/query_merge.rs");
+const RANGE_DIALOG: &str = include_str!("../../fleet-ui/src/range_dialog.rs");
 const SUMMARY_SNAPSHOT: &str = include_str!(
     "../src/trial/snapshots/trawl_cli__trial__render__tests__the_summary_of_a_fixture_trial.snap"
 );
@@ -166,6 +171,32 @@ fn the_query_tutorial_examples_hold_for_the_trials_life() {
             !example.contains("last=") && !example.contains("earliest="),
             "a time bound on the tutorial events ages out: {example:?}"
         );
+    }
+}
+
+#[test]
+fn the_tutorials_say_when_the_widest_preset_stops_covering_the_samples() {
+    // The samples keep the timestamps of the first `up`, and the browser's
+    // widest preset is a window that ends now: it loses them within a week.
+    assert!(
+        WEB_QUERY_MERGE.contains(r#"&["5m", "15m", "1h", "4h", "24h", "7d"]"#),
+        "the browser's range presets moved; recheck how long `7d` covers the samples"
+    );
+    assert!(RANGE_DIALOG.contains(r#"SegmentedOption::new("absolute", "Absolute")"#));
+    assert!(FIRST_QUERY.contains("about six days"));
+    assert!(QUERY_TUTORIAL.contains("about seven days"));
+    for (page, text) in [
+        ("first-query", FIRST_QUERY),
+        ("query-tutorial", QUERY_TUTORIAL),
+    ] {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for claim in [
+            "a later `up` does not move them",
+            "select **Absolute**",
+            "`trawl trial status` prints",
+        ] {
+            assert!(flat.contains(claim), "{page}: {claim}");
+        }
     }
 }
 
