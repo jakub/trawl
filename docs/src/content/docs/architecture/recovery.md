@@ -115,7 +115,7 @@ A marker claims the files it names until recovery removes it. While it exists:
 - retention keeps that date directory.
 - a repin cutover is refused.
 - boot hydration skips that environment and service.
-- the WAL writer does not reuse a file name that the marker lists.
+- the WAL writer does not reuse a file name that the marker lists. If the marker is invalid or cannot be read, the writer refuses every write for that environment and service instead.
 
 ### Directory fsync is part of the acknowledgement
 

@@ -31,6 +31,8 @@ A batch writes one file per environment and service group under `wal/{env}/`. Th
 
 The writer never replaces an existing file. The link fails when the name already exists, where a rename would replace the file. A name that exists, or that a pending [publication marker](/architecture/recovery/#publication-markers) in the environment lists, gets a fresh name. If eight names in a row are taken, the write fails, and the writer removes the `.tmp` and publishes nothing.
 
+The writer reads the service's marker before it takes a name. If that marker is invalid, is over its size limit, or cannot be read, the writer cannot tell which names it claims. The write then fails the same way, before any link, and every write for that environment and service fails until the marker is resolved. A missing marker claims no name.
+
 A failure after the link either completes the write, withdraws the file durably, or reports that the file stayed:
 
 - If the `.tmp` cannot be removed, the write still succeeds and logs `wal_tmp_unlink_failed`. No WAL scan reads a `.tmp` file.

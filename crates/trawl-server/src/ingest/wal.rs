@@ -234,6 +234,9 @@ impl WalWriter {
     /// link, which fails on an existing entry where a rename would replace
     /// it. A taken name, or one that the pending publication marker of this
     /// `(env, service)` lists, gets a fresh name ([`Self::link_free_name`]).
+    /// A marker of this `(env, service)` that is invalid or cannot be read
+    /// refuses the write as [`WalWriteError::NotPublished`], so the sender
+    /// retries once recovery or an operator resolves it.
     ///
     /// The parent-directory fsync makes the link durable. Without it, a
     /// power loss can drop an acknowledged batch. When it fails, the file
@@ -384,7 +387,8 @@ impl WalWriter {
     /// or when the pending publication marker of its service lists it
     /// ([`claimed_by_marker`]). A taken name gets a fresh one. After
     /// [`MAX_NAME_ATTEMPTS`] taken names the write fails with
-    /// `AlreadyExists`, having published nothing.
+    /// `AlreadyExists`, having published nothing. A marker whose claims
+    /// cannot be established fails the write before any link.
     fn link_free_name(
         &self,
         env_dir: &Path,
@@ -396,7 +400,7 @@ impl WalWriter {
                 name = self.next_name(&name.service)?;
             }
             let file_name = name.file_name();
-            if claimed_by_marker(env_dir, &name.service, &file_name) {
+            if claimed_by_marker(env_dir, &name.service, &file_name)? {
                 continue;
             }
             let final_path = env_dir.join(file_name);
@@ -634,13 +638,25 @@ impl WalWriter {
 /// Whether the pending publication marker of `service` in `env_dir` lists
 /// `file_name` among its consumed WAL files. Recovery retires every file a
 /// marker lists, so a new file under such a name would be retired as if it
-/// had been merged. A missing, unreadable or invalid marker claims
-/// nothing: recovery never acts on an invalid marker, and a marker lists
-/// only files that existed before it, whose millis a new name exceeds.
-fn claimed_by_marker(env_dir: &Path, service: &str, file_name: &str) -> bool {
+/// had been merged. A missing marker claims nothing.
+///
+/// A marker that exists but whose claims cannot be established is an
+/// error, which refuses the write: one that is invalid, over the size
+/// bound, or that cannot be read. It may claim any name, and it may yet be
+/// repaired and recovered, so no name is safe to take until it resolves.
+/// The error names the service, not the path: it can reach the sender.
+fn claimed_by_marker(env_dir: &Path, service: &str, file_name: &str) -> std::io::Result<bool> {
     let marker = env_dir.join(publication_marker::marker_file_name(service));
-    publication_marker::read_marker(&marker)
-        .is_ok_and(|marker| marker.wal_names().iter().any(|name| name == file_name))
+    let why = match publication_marker::read_marker(&marker) {
+        Ok(marker) => return Ok(marker.wal_names().iter().any(|name| name == file_name)),
+        Err(publication_marker::MarkerError::Missing) => return Ok(false),
+        Err(publication_marker::MarkerError::Invalid(_)) => "is invalid",
+        Err(publication_marker::MarkerError::Io(_)) => "cannot be read",
+    };
+    Err(std::io::Error::other(format!(
+        "the pending publication marker of service {service:?} {why}, so the names it \
+         claims are unknown; writes for the service are refused until the marker is resolved"
+    )))
 }
 
 #[cfg(test)]
@@ -1248,7 +1264,7 @@ mod no_clobber {
     }
 
     #[test]
-    fn a_marker_claims_only_the_names_it_lists_and_an_invalid_marker_claims_nothing() {
+    fn a_marker_claims_only_the_names_it_lists() {
         let tmp = tempfile::tempdir().unwrap();
         let writer = warmed(tmp.path());
         let env_dir = writer.dir().join("prod");
@@ -1258,14 +1274,110 @@ mod no_clobber {
         writer.force_names_for_test([unclaimed.clone()]);
         let path = writer.write("prod", "svc", b"{\"id\":1}\n").unwrap();
         assert_eq!(path, env_dir.join(unclaimed.file_name()));
+    }
 
-        // Recovery never acts on an invalid marker, so it cannot retire the
-        // name either.
-        std::fs::write(env_dir.join(".publish-svc.json"), b"not json").unwrap();
-        let named = forced("svc", 1_000, 0x0001);
+    #[test]
+    fn a_missing_marker_claims_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = warmed(tmp.path());
+        let env_dir = writer.dir().join("prod");
+        // Only this service's marker can claim its names: another
+        // service's invalid marker does not stop it.
+        std::fs::write(env_dir.join(".publish-other.json"), b"not json").unwrap();
+
+        let named = forced("svc", 1_000, 0xabcd);
         writer.force_names_for_test([named.clone()]);
-        let path = writer.write("prod", "svc", b"{\"id\":2}\n").unwrap();
+        let path = writer.write("prod", "svc", b"{\"id\":1}\n").unwrap();
         assert_eq!(path, env_dir.join(named.file_name()));
+    }
+
+    /// Plant `.publish-svc.json` with `body`, try a write for `svc`, and
+    /// check that it was refused as retryable with nothing published: the
+    /// `.tmp` is gone and no `.ndjson` name holds the batch. Returns the
+    /// refusal's text.
+    fn refused_by_marker(writer: &WalWriter) -> String {
+        let env_dir = writer.dir().join("prod");
+        writer.force_names_for_test([forced("svc", 1_000, 0xabcd)]);
+        let err = writer.write("prod", "svc", b"{\"id\":1}\n").unwrap_err();
+        let WalWriteError::NotPublished(ref cause) = err else {
+            panic!("nothing was linked, so a retry is safe: {err:?}");
+        };
+        assert_eq!(
+            entries(&env_dir),
+            [".publish-svc.json"],
+            "no staging file and no WAL file is left"
+        );
+        assert!(
+            writer.take_synced_dirs_for_test().is_empty(),
+            "nothing was published, so nothing needed a directory sync"
+        );
+        cause.to_string()
+    }
+
+    #[test]
+    fn an_invalid_marker_refuses_the_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = warmed(tmp.path());
+        let env_dir = writer.dir().join("prod");
+        std::fs::write(env_dir.join(".publish-svc.json"), b"not json").unwrap();
+
+        // The writer cannot tell which names the marker claims, and
+        // recovery may yet retire them: taking any name could lose the
+        // batch.
+        let refusal = refused_by_marker(&writer);
+        assert!(refusal.contains("is invalid"), "{refusal}");
+        assert!(!refusal.contains(tmp.path().to_str().unwrap()), "{refusal}");
+
+        // Other services write as before, and so does this one once the
+        // marker is resolved.
+        writer.write("prod", "other", b"{\"id\":2}\n").unwrap();
+        std::fs::remove_file(env_dir.join(".publish-svc.json")).unwrap();
+        writer.write("prod", "svc", b"{\"id\":3}\n").unwrap();
+    }
+
+    /// A marker far over the size bound refuses the write from its `lstat`
+    /// alone. Mode `000` makes any open fail, so a refusal for a marker that
+    /// cannot be read would mean the body was opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_oversized_marker_refuses_the_write_without_being_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        crate::ingest::hydration::enforce_mode_bits_on_this_thread();
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = warmed(tmp.path());
+        let marker = writer.dir().join("prod").join(".publish-svc.json");
+        std::fs::File::create(&marker)
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(std::fs::File::open(&marker).is_err());
+
+        let refusal = refused_by_marker(&writer);
+        assert!(refusal.contains("is invalid"), "{refusal}");
+    }
+
+    /// A marker that exists but cannot be read may claim any name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_marker_that_cannot_be_read_refuses_the_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        crate::ingest::hydration::enforce_mode_bits_on_this_thread();
+        let tmp = tempfile::tempdir().unwrap();
+        let writer = warmed(tmp.path());
+        pending_marker(writer.dir(), "svc", &["svc_1000_0001.ndjson"]);
+        let marker = writer.dir().join("prod").join(".publish-svc.json");
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(std::fs::File::open(&marker).is_err());
+
+        let refusal = refused_by_marker(&writer);
+        assert!(refusal.contains("cannot be read"), "{refusal}");
+        assert!(!refusal.contains(tmp.path().to_str().unwrap()), "{refusal}");
+
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+        writer.write("prod", "svc", b"{\"id\":2}\n").unwrap();
     }
 
     #[test]

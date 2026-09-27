@@ -341,6 +341,8 @@ fn parse_hex_digest(hex: &str) -> Option<blake3::Hash> {
 /// Why a marker could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerError {
+    /// No marker exists at the path.
+    Missing,
     /// The marker is readable but fails confinement or parsing.
     Invalid(String),
     /// The marker could not be inspected or read.
@@ -350,9 +352,19 @@ pub enum MarkerError {
 impl fmt::Display for MarkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Missing => f.write_str("the publication marker is gone"),
             Self::Invalid(reason) => write!(f, "invalid publication marker: {reason}"),
             Self::Io(error) => f.write_str(error),
         }
+    }
+}
+
+/// [`MarkerError::Missing`] for `NotFound`, else [`MarkerError::Io`].
+fn io_error(path: &Path, operation: &str, error: &io::Error) -> MarkerError {
+    if error.kind() == io::ErrorKind::NotFound {
+        MarkerError::Missing
+    } else {
+        MarkerError::Io(format!("failed to {operation} {}: {error}", path.display()))
     }
 }
 
@@ -377,8 +389,7 @@ pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     validate_env(env).map_err(MarkerError::Invalid)?;
     validate_service(service).map_err(MarkerError::Invalid)?;
 
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| MarkerError::Io(format!("failed to inspect {}: {e}", path.display())))?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|e| io_error(path, "inspect", &e))?;
     if !metadata.file_type().is_file() {
         return Err(MarkerError::Invalid(
             "marker is not a regular file".to_owned(),
@@ -392,7 +403,7 @@ pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     let mut body = Vec::new();
     std::fs::File::open(path)
         .and_then(|file| file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut body))
-        .map_err(|e| MarkerError::Io(format!("failed to read {}: {e}", path.display())))?;
+        .map_err(|e| io_error(path, "read", &e))?;
     if body.len() as u64 > MAX_MARKER_BYTES {
         return Err(over_limit());
     }
@@ -849,7 +860,9 @@ pub fn recover_one(
                 Contradiction::InvalidMarker(reason),
             ));
         }
-        Err(MarkerError::Io(error)) => return Err(error),
+        Err(error @ (MarkerError::Missing | MarkerError::Io(_))) => {
+            return Err(error.to_string());
+        }
     };
     let canonical = marker.canonical(data_dir);
     let published = match inspect(&canonical)? {

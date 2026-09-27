@@ -503,6 +503,14 @@ While search is refused as `restart_backlog`, any pending publication marker
 keeps it refused, because compaction's coverage proof fails while a marker is
 pending.
 
+A marker that is invalid, or that cannot be read, also refuses ingest for its
+environment and service. The WAL writer cannot tell which file names such a
+marker claims, so it refuses every write for that service until the marker is
+resolved. HTTP ingest answers 500 and counts the events as `wal_failure`,
+which fires [HTTP persistence rejection](#http-persistence-rejection). Syslog
+discards the group and counts it, and self-telemetry keeps the batch for
+retry. A contradictory marker that is valid does not refuse ingest.
+
 - `failed`: a filesystem error stopped recovery of one marker, for example a
   WAL directory where the consumed files cannot be removed. Check whether
   the marker still exists: while it does, the service stays blocked and the
