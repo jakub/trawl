@@ -81,7 +81,10 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 tokio-stream = "0.1"
 shellexpand = "3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# float_roundtrip: boot hydration (ADR-0041) accepts a WAL line only if it
+# parses back to the exact float the writer printed. Enabling it makes float
+# parsing exact for every serde_json user in the build.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_path_to_error = "0.1.20"
 sha2 = "0.10"
 # Umbrella sqlx: the rusqlite (links = "sqlite3") collision that forced the

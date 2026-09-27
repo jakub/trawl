@@ -8,6 +8,7 @@
 pub mod compaction;
 pub mod envelope;
 pub mod handler;
+pub mod hydration;
 pub mod pipeline;
 pub mod producer;
 pub mod publication_marker;

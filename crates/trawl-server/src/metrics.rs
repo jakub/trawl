@@ -134,6 +134,11 @@ pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
 /// `contradictory` or `failed` outcome leaves the marker blocking its
 /// service's compaction until a later pass or an operator resolves it.
 pub const PUBLICATION_RECOVERY_TOTAL: &str = "trawl_publication_recovery_total";
+/// WAL files boot hydration looked at, by `outcome`
+/// ([`crate::ingest::hydration::HydrationOutcome`]); `unlisted` counts
+/// scopes that could not be listed. Any outcome but `hydrated` leaves
+/// overhang, so corpus reads stay refused until compaction proves coverage.
+pub const HYDRATION_FILES_TOTAL: &str = "trawl_hydration_files_total";
 
 /// Failed durability operations on an already-published WAL file. Each
 /// failure rejects the write it belonged to.
@@ -325,6 +330,9 @@ pub fn init_operational_alert_metrics() {
     for reason in crate::publication::CorpusUnsettled::ALL {
         metrics::gauge!(CORPUS_UNSETTLED, "reason" => reason.label()).set(0.0);
     }
+    for outcome in crate::ingest::hydration::HydrationOutcome::ALL {
+        metrics::counter!(HYDRATION_FILES_TOTAL, "outcome" => outcome.label()).increment(0);
+    }
     init_publication_recovery_metrics();
 }
 
@@ -508,6 +516,10 @@ pub fn describe_metrics() {
     describe_counter!(
         PUBLICATION_RECOVERY_TOTAL,
         "Compaction publication markers examined by recovery, labelled by outcome (published, unpublished, contradictory, failed); contradictory and failed markers keep their service's compaction blocked"
+    );
+    describe_counter!(
+        HYDRATION_FILES_TOTAL,
+        "WAL files boot hydration looked at, labelled by outcome (hydrated, capacity, oversized, undecodable, unreadable, claimed, unlisted; unlisted counts scopes); any outcome but hydrated keeps corpus reads refused until compaction proves coverage"
     );
     describe_counter!(
         FILES_QUARANTINED_TOTAL,
@@ -1762,6 +1774,13 @@ mod tests {
                 "trawl_publication_recovery_total{outcome=\"failed\"}",
                 "trawl_corpus_unsettled{reason=\"rollup_pending\"}",
                 "trawl_corpus_unsettled{reason=\"restart_backlog\"}",
+                "trawl_hydration_files_total{outcome=\"hydrated\"}",
+                "trawl_hydration_files_total{outcome=\"capacity\"}",
+                "trawl_hydration_files_total{outcome=\"oversized\"}",
+                "trawl_hydration_files_total{outcome=\"undecodable\"}",
+                "trawl_hydration_files_total{outcome=\"unreadable\"}",
+                "trawl_hydration_files_total{outcome=\"claimed\"}",
+                "trawl_hydration_files_total{outcome=\"unlisted\"}",
             ];
             for series in selected {
                 assert_eq!(test_support::sample(&handle, series), 0);

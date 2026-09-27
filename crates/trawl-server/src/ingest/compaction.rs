@@ -2142,7 +2142,9 @@ async fn compact_service_batch(
 }
 
 /// The hot batch id of a WAL file: `{env}/{file stem}`, as ingest names it.
-fn wal_batch_id(env: &str, wal_file: &Path) -> Option<String> {
+/// Boot hydration (ADR-0041) installs WAL under this identity, so the drain
+/// that follows a publish finds it.
+pub(crate) fn wal_batch_id(env: &str, wal_file: &Path) -> Option<String> {
     Some(format!("{env}/{}", wal_file.file_stem()?.to_str()?))
 }
 
@@ -4465,7 +4467,9 @@ pub(crate) fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Resu
 }
 
 /// Group WAL file paths by service name (extracted from filename prefix).
-fn group_by_service(files: Vec<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
+/// Boot hydration groups the same way, so a publication marker blocks the
+/// same files for both.
+pub(crate) fn group_by_service(files: Vec<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
     for path in files {

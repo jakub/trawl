@@ -581,13 +581,6 @@ impl Resident {
 
 /// One batch reloaded from the WAL at boot, for [`HotBuffer::hydrate`].
 #[derive(Debug)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "boot hydration (ADR-0041 slice 2) is its only production caller; remove once it is wired"
-    )
-)]
 pub(crate) struct HydratedBatch {
     /// The batch under its existing id (`{env}/{WAL filename stem}`); its
     /// `(events.len(), byte_size)` is the charge.
@@ -668,13 +661,6 @@ pub struct HotBuffer {
     ledger: Arc<Ledger>,
     /// Set by the first [`hydrate`](Self::hydrate) call, whatever its
     /// outcome: hydration happens at most once per buffer.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "boot hydration (ADR-0041 slice 2) is its only production caller; remove once it is wired"
-        )
-    )]
     hydrated: AtomicBool,
     /// Monotonic counter bumped on every mutation (insert, hydrate, drain).
     /// Used to invalidate the snapshot cache.
@@ -884,13 +870,6 @@ impl HotBuffer {
     /// order), so the map's first entry stays the oldest. A batch id that
     /// repeats within the plan keeps its first occurrence, like a duplicate
     /// [`insert`](Self::insert).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "boot hydration (ADR-0041 slice 2) is its only production caller; remove once it is wired"
-        )
-    )]
     pub(crate) fn hydrate(&self, batches: Vec<HydratedBatch>) -> Result<Charge, HydrateError> {
         if self.hydrated.swap(true, Ordering::AcqRel) {
             return Err(HydrateError::AlreadyHydrated);
