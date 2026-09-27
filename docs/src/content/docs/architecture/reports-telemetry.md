@@ -97,7 +97,7 @@ fields carries a user, a role, DSL, SQL, a literal, a path, or error text.
 | `active_query_phase`, `active_elapsed_us` | On a partial event, the phase still running and how long it had run. |
 | `duckdb_attempts` | How many times DuckDB bound the main statement. |
 | `fallback` | Why there was more than one attempt: `none`, `raw_retry`, `hot_only`, or `both`. |
-| `query_observed_us` | The whole window. It starts at the same instant as the response's `execution.duration_ms`, and for an export it runs through `render`. |
+| `query_observed_us` | The whole window. For a query, it starts at the same instant as the response's `execution.duration_ms`. An export has no `execution.duration_ms`: its window starts before `dsl_check`, earlier than `export_complete.duration_ms` starts, and runs through `render`. |
 | `query_other_us` | The observed time no phase measured. Never negative. |
 
 On a complete event, the present phases plus `query_other_us` add up exactly

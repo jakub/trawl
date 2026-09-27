@@ -215,8 +215,9 @@ and the other fields.
    - A present `0` is a measurement: the phase ran for less than one
      microsecond.
    - `query_observed_us` is the whole window. It starts at the same instant as
-     the response's `execution.duration_ms`. For an export it also covers
-     `render`.
+     the response's `execution.duration_ms`. An export has no
+     `execution.duration_ms`: its window starts before `dsl_check`, earlier
+     than `export_complete.duration_ms` starts, and runs through `render`.
    - `query_other_us` is the observed time that no phase measured. On a
      complete event, the present phases plus `query_other_us` add up exactly to
      `query_observed_us`. A large `query_other_us` is a gap in trawld's
@@ -237,8 +238,10 @@ and the other fields.
 
 `outcome` is `success`, `error`, `capacity_refused`, `timeout`, or `abandoned`.
 An `error` event carries `error_class`, never the error text. A
-`capacity_refused` event has `work_started=false`, carries `query_pool_wait_us`
-or `query_publication_wait_us`, and has no worker phase. It is the 503 in
+`capacity_refused` event has `work_started=false` and no worker phase. It
+carries the wait that ran out: `query_pool_wait_us` or
+`query_publication_wait_us`, or `query_saved_lookup_us` when the deadline cut a
+`from saved` lookup before the pool was reached. It is the 503 in
 [Diagnose a 503 or 504 from a query](#diagnose-a-503-or-504-from-a-query).
 `abandoned` with `work_started=false` means the client went away before any
 work started, and nothing is left to report.
@@ -249,10 +252,13 @@ When a query times out, or its client goes away while its work runs, trawld
 writes `query_timing` at once. It does not wait for the worker. That event
 carries `timing_complete=false`, and it is partial:
 
-- It carries the phases that finished. The phase still running has no
-  `query_<phase>_us` field.
+- It carries the phases that finished. The time of the unfinished iteration is
+  not booked. A phase with no earlier completed iteration has no
+  `query_<phase>_us` field. A phase that also ran to completion earlier keeps
+  those earlier iterations in its field. For example, on the second bind of a
+  `raw_retry`, `query_bind_us` holds the first bind only.
 - `active_query_phase` names the phase still running, and `active_elapsed_us`
-  says how long it had run.
+  says how long its current iteration had run.
 - `query_observed_us` equals the finished phases, plus `active_elapsed_us`,
   plus `query_other_us`.
 

@@ -63,7 +63,7 @@ A phase entered more than once adds to the same field. `duckdb_attempts` counts 
 
 ## Amendment (2026-09-27): what the implementation settled
 
-Building slice A settled five points that the decision above left loose or stated too narrowly. The decision stands. These rulings refine it.
+Building slice A settled six points that the decision above left loose or stated too narrowly. The decision stands. These rulings refine it.
 
 **Timing covers every query attempt that reaches `dsl_check`, not only work the pool runs.** trawld opens the account after it validates the request and before `dsl_check`, and allocates `query_id` there. A query that fails `dsl_check` reports `outcome=error` with only `query_dsl_check_us`. A capacity refusal reports `outcome=capacity_refused`, `work_started=false`, and the wait that ran out. A request abandoned before the pool took over reports a complete `outcome=abandoned` with `work_started=false`, because no work is left running to report later. Live tail, the pool ping, and field sampling still open no account.
 
@@ -74,3 +74,5 @@ Building slice A settled five points that the decision above left loose or state
 **An export's window starts before `dsl_check`.** The export account takes its own origin before `dsl_check`, so `query_observed_us` covers the check. The legacy start instant is unchanged, and `export_complete.duration_ms` keeps its meaning.
 
 **`run_id` is the `report_runs` row ID, not a ULID.** It is the BIGSERIAL key of the run record. It survives a restart, which is the property the decision needs. The sentence above that calls the key beside `query_id` a ULID holds for `request_id` only.
+
+**The worker's totals do not travel back in `ExecuteOutcome`.** The issue asked for the phase record to cross `spawn_blocking` as a plain value, the way `debug` does. That wording is superseded. The `Arc`-shared phase clock is the single accumulator. The worker closes it before its slot drops, and whoever writes the account reads it after the join. No second record exists, so no second record can drift from the first.
