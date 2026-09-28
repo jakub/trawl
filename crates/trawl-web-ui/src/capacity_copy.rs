@@ -5,8 +5,8 @@
 //! The sentences of the Health page's Disk and retention card
 //! (ADR-0042). Pure so native `cargo test` pins the copy: a headroom row
 //! shares its attempt's status and age, a floor is stated with its
-//! deficit only while below it, a reach range never averages mixed ends,
-//! and a withheld reach carries no digit.
+//! deficit only while below it, every pair of reach ends reads as one
+//! conditional sentence, and a withheld reach carries no digit.
 //!
 //! On native, only the tests consume some of these items: the card that
 //! renders them is wasm-only.
@@ -115,19 +115,22 @@ pub fn policy_line(env: &EnvironmentCapacity) -> String {
     )
 }
 
-/// One end of a range when the two ends need spelling out separately.
+/// One end of the reach, as the clause that follows "at the largest
+/// observed day," or "at the mean day,".
 fn reach_end(end: ReachEnd, max_age_days: u64) -> String {
     match end {
-        ReachEnd::Days { days } => format!("about {days} days"),
+        ReachEnd::Days { days } => format!("about {days} of {max_age_days} days"),
         ReachEnd::FullPolicy => format!("the full {max_age_days} days"),
-        ReachEnd::DiskFillsFirst => "the disk filling before retention is reached".into(),
+        ReachEnd::DiskFillsFirst => "the disk fills before retention is reached".into(),
     }
 }
 
-/// The range from the largest observed day (`low`) to the mean (`high`).
-/// Matching ends collapse into one phrase; mixed ends stay honest.
-pub fn reach_range(low: ReachEnd, high: ReachEnd, max_age_days: u64) -> String {
-    match (low, high) {
+/// The reach sentence for the range from the largest observed day (`low`)
+/// to the mean (`high`). Ends in one unit collapse into one phrase, and a
+/// range of days never averages its ends. Ends of different kinds are
+/// named one at a time. Every form keeps the projection conditional.
+pub fn reach_sentence(low: ReachEnd, high: ReachEnd, max_age_days: u64) -> String {
+    let range = match (low, high) {
         (ReachEnd::Days { days: a }, ReachEnd::Days { days: b }) if a == b => {
             format!("about {a} of {max_age_days} days")
         }
@@ -141,12 +144,15 @@ pub fn reach_range(low: ReachEnd, high: ReachEnd, max_age_days: u64) -> String {
         (ReachEnd::DiskFillsFirst, ReachEnd::DiskFillsFirst) => {
             "the disk fills before retention is reached".into()
         }
-        (low, high) => format!(
-            "{} to {}",
-            reach_end(low, max_age_days),
-            reach_end(high, max_age_days)
-        ),
-    }
+        (low, high) => {
+            return format!(
+                "Reach if the observed days repeat: at the largest observed day, {}; at the mean day, {}.",
+                reach_end(low, max_age_days),
+                reach_end(high, max_age_days)
+            );
+        }
+    };
+    format!("Reach: {range} if the observed days repeat.")
 }
 
 /// The reach sentence. A projection names the observed days it came
@@ -162,8 +168,8 @@ pub fn reach_line(reach: &Reach, max_age_days: u64) -> String {
             low,
             high,
         } => format!(
-            "Reach: {} if the observed days repeat. Observed: {observed_days} days, {observed_first} to {observed_last}.",
-            reach_range(*low, *high, max_age_days)
+            "{} Observed: {observed_days} days, {observed_first} to {observed_last}.",
+            reach_sentence(*low, *high, max_age_days)
         ),
         Reach::KeepForever {
             observed_first,
@@ -206,30 +212,92 @@ pub fn growth_excluded_note(excluded: &[String]) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// Every low/high pair reads as one plain sentence that keeps the
+    /// projection conditional. The server's math reaches only some pairs
+    /// (`capacity::project`): with a floor, days or the full policy; with
+    /// a floor of 0, the disk filling first or the full policy; and the
+    /// low end never exceeds the high. The rest are pinned too, so a wire
+    /// that ever carries one still reads as a sentence.
     #[test]
-    fn reach_range_reads_as_days_of_policy_and_never_averages_mixed_ends() {
+    fn reach_line_reads_every_end_pair_as_a_sentence() {
+        const OBSERVED: &str = " Observed: 7 days, 2026-09-19 to 2026-09-25.";
         let days = |days| ReachEnd::Days { days };
-        assert_eq!(
-            reach_range(days(38), days(52), 90),
-            "about 38\u{2013}52 of 90 days"
-        );
-        assert_eq!(reach_range(days(38), days(38), 90), "about 38 of 90 days");
-        assert_eq!(
-            reach_range(ReachEnd::FullPolicy, ReachEnd::FullPolicy, 90),
-            "the full 90 days"
-        );
-        assert_eq!(
-            reach_range(days(38), ReachEnd::FullPolicy, 90),
-            "about 38 days to the full 90"
-        );
-        assert_eq!(
-            reach_range(ReachEnd::DiskFillsFirst, ReachEnd::DiskFillsFirst, 7),
-            "the disk fills before retention is reached"
-        );
-        assert_eq!(
-            reach_range(ReachEnd::DiskFillsFirst, ReachEnd::FullPolicy, 7),
-            "the disk filling before retention is reached to the full 7 days"
-        );
+        let line = |low, high, max_age_days| {
+            reach_line(
+                &Reach::Projected {
+                    observed_first: "2026-09-19".into(),
+                    observed_last: "2026-09-25".into(),
+                    observed_days: 7,
+                    low,
+                    high,
+                },
+                max_age_days,
+            )
+        };
+        let full = ReachEnd::FullPolicy;
+        let disk = ReachEnd::DiskFillsFirst;
+        for (low, high, max_age_days, sentence) in [
+            // Reachable with a floor.
+            (
+                days(38),
+                days(52),
+                90,
+                "Reach: about 38\u{2013}52 of 90 days if the observed days repeat.",
+            ),
+            (
+                days(38),
+                days(38),
+                90,
+                "Reach: about 38 of 90 days if the observed days repeat.",
+            ),
+            (
+                days(38),
+                full,
+                90,
+                "Reach: about 38 days to the full 90 if the observed days repeat.",
+            ),
+            (
+                full,
+                full,
+                90,
+                "Reach: the full 90 days if the observed days repeat.",
+            ),
+            // Reachable with a floor of 0.
+            (
+                disk,
+                disk,
+                7,
+                "Reach: the disk fills before retention is reached if the observed days repeat.",
+            ),
+            (
+                disk,
+                full,
+                7,
+                "Reach if the observed days repeat: at the largest observed day, the disk fills \
+                 before retention is reached; at the mean day, the full 7 days.",
+            ),
+            // Not produced by the server, still a sentence.
+            (
+                disk,
+                days(3),
+                7,
+                "Reach if the observed days repeat: at the largest observed day, the disk fills \
+                 before retention is reached; at the mean day, about 3 of 7 days.",
+            ),
+            (
+                full,
+                disk,
+                7,
+                "Reach if the observed days repeat: at the largest observed day, the full 7 days; \
+                 at the mean day, the disk fills before retention is reached.",
+            ),
+        ] {
+            assert_eq!(
+                line(low, high, max_age_days),
+                format!("{sentence}{OBSERVED}"),
+                "{low:?} {high:?}"
+            );
+        }
     }
 
     #[test]
