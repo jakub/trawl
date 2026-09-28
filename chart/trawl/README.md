@@ -67,6 +67,11 @@ two Certificates do not manage that Secret.
 The `trawl-web` sidecar connects to trawld over the pod's loopback and always
 verifies trawld's certificate. With `tls.mode: auto`, it mounts the `tls`
 directory of the data volume read-only and pins the generated `cert.pem`.
+The `init-tls-dir` init container first creates that directory as trawld's
+uid. Without it, kubelet could create the directory as root when it mounts
+the sidecar, and trawld could not write its certificate there. If another uid
+already owns the directory, the pod stops at `init-tls-dir` and its log names
+the owner.
 trawld keeps its key in `tls-key/`, outside that mount, and the sidecar runs
 as `web.runAsUser`, a uid that cannot read the key's 0600 file. With
 `secret` or `certManager`, the sidecar requests `https://<tls.upstreamServerName>:<port>`

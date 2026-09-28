@@ -181,7 +181,7 @@ assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
 assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
   "$security_enabled" trawld
 assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_enabled" trawld
-for sidecar in init-auth trawl-web; do
+for sidecar in init-auth init-tls-dir trawl-web; do
   assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
     "$security_enabled" "$sidecar"
   assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_enabled" "$sidecar"

@@ -2,6 +2,7 @@
 """Exercise TLS contracts with real offline Helm renders, without a cluster."""
 
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -67,6 +68,20 @@ def pod(objects):
 
 def container(objects, name):
     return next(c for c in pod(objects)["containers"] if c["name"] == name)
+
+
+def init_container(objects, name):
+    return next((c for c in pod(objects).get("initContainers", []) if c["name"] == name), None)
+
+
+def effective_uid(objects, spec):
+    # A container's runAsUser wins over the pod's.
+    return spec["securityContext"].get("runAsUser", pod(objects)["securityContext"].get("runAsUser"))
+
+
+def run_tls_dir_script(init, path):
+    # The rendered command itself, under the host's /bin/sh, as this uid.
+    return subprocess.run(init["command"][:4] + [str(path)], capture_output=True, text=True)
 
 
 def web_config(objects):
@@ -314,6 +329,119 @@ class TLS(unittest.TestCase):
         for raw in ['[server]\nhttp_addr = "0.0.0.0:5514"\n', '[data\n']:
             with self.subTest(raw=raw):
                 self.objects({"config": {"raw": raw}})
+
+    def assert_creates_tls_dir(self, objects, tls_dir):
+        # Before any app container starts, trawld's uid creates the directory
+        # the sidecar mounts, so kubelet never creates it as root.
+        init = init_container(objects, "init-tls-dir")
+        self.assertIsNotNone(init, pod(objects).get("initContainers"))
+        daemon = container(objects, "trawld")
+        self.assertEqual(init["image"], daemon["image"])
+        self.assertEqual(init["command"][:2], ["/bin/sh", "-c"])
+        self.assertEqual(init["command"][3:], ["init-tls-dir", tls_dir])
+        self.assertNotIn("args", init)
+        # Exactly the directory trawl-web mounts and pins.
+        mount = next(m for m in container(objects, "trawl-web")["volumeMounts"] if m["name"] == "data")
+        self.assertEqual(mount["mountPath"], tls_dir)
+        self.assertEqual(web_config(objects)["upstream_ca_path"], f"{tls_dir}/cert.pem")
+        # Only the data volume, where trawld mounts it.
+        self.assertEqual(init["volumeMounts"], [{"name": "data", "mountPath": "/var/lib/trawl"}])
+        self.assertIn(init["volumeMounts"][0], daemon["volumeMounts"])
+        # The shared securityContext: trawld's uid, and none of its added
+        # capabilities or the sidecar's uid.
+        self.assertEqual(init["securityContext"]["readOnlyRootFilesystem"], True)
+        self.assertEqual(init["securityContext"]["allowPrivilegeEscalation"], False)
+        self.assertEqual(init["securityContext"]["capabilities"], {"drop": ["ALL"]})
+        self.assertEqual(effective_uid(objects, init), effective_uid(objects, daemon))
+        self.assertIsNotNone(effective_uid(objects, init))
+        self.assertIn("limits", init["resources"])
+        return init
+
+    def test_auto_mode_creates_tls_dir_before_the_sidecar_mounts_it(self):
+        objects = self.objects({"web": web()})
+        init = self.assert_creates_tls_dir(objects, "/var/lib/trawl/tls")
+        self.assertEqual(effective_uid(objects, init), 1000)
+        self.assertNotIn("runAsUser", init["securityContext"])
+        # Beside init-auth, which keeps its place.
+        self.assertEqual([c["name"] for c in pod(objects)["initContainers"]], ["init-auth", "init-tls-dir"])
+        objects = self.objects({"web": web(), "initAuth": {"enabled": False}})
+        self.assertEqual([c["name"] for c in pod(objects)["initContainers"]], ["init-tls-dir"])
+
+        # It follows trawld's uid wherever that is set.
+        objects = self.objects({"web": web(), "securityContext": {"runAsUser": 1234}})
+        self.assertEqual(effective_uid(objects, self.assert_creates_tls_dir(objects, "/var/lib/trawl/tls")), 1234)
+        objects = self.objects({"web": web(), "podSecurityContext": {"runAsUser": 2000}})
+        self.assertEqual(effective_uid(objects, self.assert_creates_tls_dir(objects, "/var/lib/trawl/tls")), 2000)
+        # Crash dumps add a capability to trawld alone.
+        objects = self.objects({"web": web(), "crashDump": {"enabled": True}})
+        self.assert_creates_tls_dir(objects, "/var/lib/trawl/tls")
+
+        # It follows the state directory, from structured values or config.raw.
+        objects = self.objects({"web": web(), "config": {"data": {"path": "/var/lib/trawl/nested/data"}}})
+        self.assert_creates_tls_dir(objects, "/var/lib/trawl/nested/tls")
+        raw = ('[data]\npath = "/var/lib/trawl/raw/data"\n'
+               '[web]\nupstream_ca_path = "/var/lib/trawl/raw/tls/cert.pem"\n')
+        objects = self.objects({"web": web(), "config": {"raw": raw}})
+        self.assert_creates_tls_dir(objects, "/var/lib/trawl/raw/tls")
+
+        # Nothing mounts a subPath of the data volume without the sidecar in
+        # auto mode, so there is nothing to create.
+        cases = [
+            {},
+            {"initAuth": {"enabled": False}},
+            {"tls": {"mode": "secret", "secretName": "operator-api-tls"}},
+            {"web": web(), "tls": {"mode": "secret", "secretName": "operator-api-tls",
+                                   "upstreamServerName": "trawl.example.com", "upstreamCa": "secret"}},
+            {**managed(upstreamCa="secret"), "web": web()},
+        ]
+        for settings in cases:
+            with self.subTest(settings=settings):
+                objects = self.objects(settings)
+                self.assertIsNone(init_container(objects, "init-tls-dir"))
+                for c in pod(objects)["containers"]:
+                    self.assertNotIn("subPath", next((m for m in c["volumeMounts"] if m["name"] == "data"), {}))
+        objects = self.objects({"initAuth": {"enabled": False}})
+        self.assertNotIn("initContainers", pod(objects))
+
+    def test_tls_dir_script_creates_or_refuses(self):
+        init = init_container(self.objects({"web": web()}), "init-tls-dir")
+        with tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
+            state = Path(directory) / "nested"
+            tls_dir = state / "tls"
+            # Creates the directory and any missing parent, 0755, as this uid.
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(tls_dir.is_dir())
+            self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o755)
+            self.assertEqual(tls_dir.stat().st_uid, os.getuid())
+            # Idempotent: a directory trawld already owns, with its
+            # certificate in it, is left as it is.
+            (tls_dir / "cert.pem").write_text("certificate")
+            tls_dir.chmod(0o750)
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((tls_dir / "cert.pem").read_text(), "certificate")
+            self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o750)
+
+            # Refusals name the path and the reason.
+            file_path = Path(directory) / "file"
+            file_path.write_text("")
+            link = Path(directory) / "link"
+            link.symlink_to(tls_dir)
+            read_only = Path(directory) / "read-only"
+            read_only.mkdir(mode=0o555)
+            for path, expected in [
+                (file_path, "is not a directory"),
+                (link, "is not a directory"),
+                (read_only, "is not writable"),
+                # Owned by root: another uid, which this container cannot change.
+                (Path("/usr/share"), f"is owned by uid 0, not trawld's uid {os.getuid()}"),
+            ]:
+                with self.subTest(path=path):
+                    result = run_tls_dir_script(init, path)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"{path} {expected}", result.stderr)
+            read_only.chmod(0o755)
 
     def test_upstream_trust_secret_modes(self):
         secret = {"mode": "secret", "secretName": "operator-api-tls", "upstreamServerName": "trawl.example.com"}

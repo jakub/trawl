@@ -45,8 +45,10 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       terminationGracePeriodSeconds: {{ .Values.config.server.shutdownDrainSecs }}
-      {{- if .Values.initAuth.enabled }}
+      {{- if or .Values.initAuth.enabled $trust.dataSubPath }}
       initContainers:
+      {{- end }}
+      {{- if .Values.initAuth.enabled }}
         # Apply Fleet-auth schema migrations on every pod start when enabled.
         # sqlx tracks applied migrations. Create keys with fleet-admin as
         # described in https://trawl.sh/operate/access/#create-roles-and-keys.
@@ -64,6 +66,60 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.initAuth.resources | nindent 12 }}
+      {{- end }}
+      {{- if $trust.dataSubPath }}
+        # tls.mode=auto with the sidecar: create the directory trawl-web
+        # mounts by subPath before either app container starts. kubelet
+        # creates a missing subPath directory itself, as root, when it sets
+        # up trawl-web's mounts. Containers start in spec order without
+        # waiting for each other, so trawld may not have made it yet, and a
+        # root-owned tls/ leaves trawld unable to publish cert.pem into it.
+        # Init containers finish before kubelet prepares any app container.
+        #
+        # The shared securityContext gives this container trawld's uid and
+        # gid. It cannot take ownership of a directory another uid owns
+        # (that needs root or CAP_CHOWN), so it fails the pod here, naming
+        # the owner, rather than letting trawld crash-loop on it. Nothing
+        # else in the pod runs yet, so nothing races the check.
+        - name: init-tls-dir
+          image: {{ include "trawl.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              dir=$1
+              uid=$(id -u)
+              if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+                mkdir -p -m 0755 -- "$dir"
+              fi
+              if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+                echo "$0: $dir is not a directory. trawld publishes its generated certificate there; remove it so this container creates the directory." >&2
+                exit 1
+              fi
+              owner=$(stat -c %u -- "$dir")
+              if [ "$owner" != "$uid" ]; then
+                echo "$0: $dir is owned by uid $owner, not trawld's uid $uid, so trawld cannot publish its generated certificate there. Change its owner to $uid, or remove it so this container creates it." >&2
+                exit 1
+              fi
+              if [ ! -w "$dir" ] || [ ! -x "$dir" ]; then
+                echo "$0: $dir is not writable by trawld's uid $uid, so trawld cannot publish its generated certificate there. Grant the owner write and search permission." >&2
+                exit 1
+              fi
+            - init-tls-dir
+            - {{ $trust.dataMountPath | quote }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: data
+              mountPath: {{ include "trawl.dataMountPath" . }}
       {{- end }}
       containers:
         - name: trawld

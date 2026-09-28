@@ -86,8 +86,8 @@ capability other than NET_BIND_SERVICE is what the Restricted Pod
 Security profile refuses, so an enabled install is still incompatible
 with Restricted. The chart documents that rather than enforcing it,
 because admission policy is cluster state the chart cannot read
-(ADR-0023 ruling 7, as amended). Only trawld is touched; init-auth and
-trawl-web keep the unmodified securityContext.
+(ADR-0023 ruling 7, as amended). Only trawld is touched; init-auth,
+init-tls-dir and trawl-web keep the unmodified securityContext.
 */}}
 {{- define "trawl.trawldSecurityContext" -}}
 {{- $sc := deepCopy .Values.securityContext -}}

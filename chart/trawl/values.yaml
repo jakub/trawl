@@ -83,7 +83,7 @@ persistence:
 # process still exits and is restarted. The monitor ptraces the crashed trawld
 # (a process can't ptrace its own thread group), so the trawld container is
 # granted CAP_SYS_PTRACE, only when this is enabled and only on trawld
-# (init-auth and trawl-web are untouched).
+# (init-auth, init-tls-dir and trawl-web are untouched).
 #
 # That added capability is the whole grant. The container runtime hands it to
 # the container's init process as permitted and effective, and the
