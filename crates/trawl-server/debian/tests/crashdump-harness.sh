@@ -926,7 +926,12 @@ sleep 3
        die "trawl-web exited after starting; check whether the mask hid /var/lib/trawl/web.cookie or $WEB_UPSTREAM_CA"; }
 web_invocation=$(nshq "systemctl show trawl-web -p InvocationID --value" | tr -d ' \r')
 [[ -n "$web_invocation" ]] || die "systemd reports no invocation id for the running trawl-web"
-if nshq "journalctl _SYSTEMD_INVOCATION_ID=$web_invocation --no-pager -o cat" | grep -q upstream_ca_pending; then
+web_journal=$(nshq "journalctl _SYSTEMD_INVOCATION_ID=$web_invocation --no-pager -o cat")
+# Positive control: trawl-web logs "loaded config" only after resolving its
+# pin, so without that line the missing upstream_ca_pending proves nothing.
+grep -q "loaded config" <<<"$web_journal" \
+  || die "the journal for trawl-web invocation $web_invocation has no 'loaded config' line, so the pin check cannot see this run"
+if grep -q upstream_ca_pending <<<"$web_journal"; then
   docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true
   die "trawl-web started without $WEB_UPSTREAM_CA, which trawld had written; the mask may be hiding it"
 fi
