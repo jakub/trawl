@@ -41,9 +41,18 @@ the snapshot: the capacity object with the Parquet and WAL fields it was
 assembled beside. The card reads the Parquet measurement to tell an
 unmeasured empty list from a measured one.
 
-The server's `capacity::assemble` produced each fixture's capacity object
-from chosen partition bytes, headroom samples and retention settings, on
-2026-09-27. [`e2e_wire_fixture_contract.rs`](../../crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs)
+Each fixture is producer output.
+[`capacity_fixtures.rs`](../../crates/trawl-server/tests/capacity_fixtures.rs)
+builds every scenario from fixed inputs: partition bytes per environment
+and date, a headroom attempt through the server's own sampling function,
+retention evidence recorded through the retention loop's own methods, and
+a retention config. The server's `capacity::assemble` turns them into the
+capacity object on 2026-09-27, and the test fails with a line diff when a
+committed fixture differs from what it produces. The base snapshot's
+capacity slice in `health-dashboard.json` is checked the same way. After a
+deliberate change to the producer or a scenario, run
+`TRAWL_REGEN_CAPACITY_FIXTURES=1 cargo test -p trawl-server --test capacity_fixtures`
+to rewrite the fixtures that differ, then rerun the spec and recapture. [`e2e_wire_fixture_contract.rs`](../../crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs)
 checks every fixture against the producer's invariants. A reason of
 `measurement_unavailable` or `retention_suppressed` applies to every
 environment and excludes none from growth. Each env's observed days start
