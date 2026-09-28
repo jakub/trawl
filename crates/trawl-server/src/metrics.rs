@@ -328,25 +328,24 @@ pub fn init_operational_alert_metrics() {
         metrics::counter!(FILES_QUARANTINED_TOTAL, "kind" => kind.label()).increment(0);
     }
     init_publication_recovery_metrics();
-    init_retention_metrics();
 }
 
-/// Publish retention's removal counters (both triggers) and its pressure
-/// attempts at zero, so a flat `disk_pressure` series reads as "no pressure
-/// deletion since start" rather than "never wired up". Repeated calls never
-/// reset counters.
-pub fn init_retention_metrics() {
+/// Publish retention's series from its config: the configured deletion
+/// floor, and the removal counters (both triggers) and pressure attempts at
+/// zero, so a flat `disk_pressure` series reads as "no pressure deletion
+/// since start" rather than "never wired up".
+///
+/// Called where app state is built from config
+/// ([`crate::state::AppState::from_parts`]), after the recorder is
+/// installed, so every server built from a config publishes them. The
+/// config is fixed for the process. Repeated calls never reset counters.
+#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
+pub fn init_retention_metrics(min_free_disk_bytes: u64) {
+    gauge!(RETENTION_MIN_FREE_DISK_BYTES).set(min_free_disk_bytes as f64);
     for trigger in crate::retention::RemovalTrigger::ALL {
         metrics::counter!(RETENTION_DELETIONS_TOTAL, "trigger" => trigger.label()).increment(0);
     }
     metrics::counter!(RETENTION_PRESSURE_ATTEMPTS_TOTAL).increment(0);
-}
-
-/// Publish the configured deletion floor. Call once at startup, after the
-/// recorder is installed; the config is fixed for the process.
-#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
-pub fn publish_retention_floor(min_free_disk_bytes: u64) {
-    gauge!(RETENTION_MIN_FREE_DISK_BYTES).set(min_free_disk_bytes as f64);
 }
 
 /// Publish the publication-recovery outcome matrix at zero, so a flat
@@ -2369,9 +2368,12 @@ mod tests {
         let handle = recorder.handle();
         // No ingest state, listeners or telemetry writer is constructed.
         // These series must exist even when every producer is disabled.
+        // Retention's baselines are published at state build, which every
+        // server performs, so they join the startup sequence here.
         metrics::with_local_recorder(&recorder, || {
             describe_metrics();
             init_operational_alert_metrics();
+            init_retention_metrics(0);
             let selected = [
                 "trawl_syslog_events_dropped_total{reason=\"backpressure\"}",
                 "trawl_syslog_events_dropped_total{reason=\"queue_full\"}",
@@ -2424,12 +2426,15 @@ mod tests {
             metrics::counter!(TELEMETRY_EVENTS_DROPPED_TOTAL,
                 "reason" => TelemetryDropReason::WriteCrashed.label())
             .increment(2);
+            metrics::counter!(RETENTION_PRESSURE_ATTEMPTS_TOTAL).increment(4);
             init_operational_alert_metrics();
+            init_retention_metrics(0);
             handle.run_upkeep();
             for series in selected {
                 let expected = match series {
                     "trawl_syslog_wal_events_discarded_total" => 3,
                     "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}" => 2,
+                    "trawl_retention_pressure_attempts_total" => 4,
                     _ => 0,
                 };
                 assert_eq!(test_support::sample(&handle, series), expected);
@@ -2668,7 +2673,7 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             describe_metrics();
             init_operational_alert_metrics();
-            publish_retention_floor(1_073_741_824);
+            init_retention_metrics(1_073_741_824);
             // A first attempt that fails publishes no headroom series.
             cache.collect(|| first, || attempt(true), |s| publish_headroom_gauges(&s));
             assert!(!handle.render().contains(&format!("{DISK_TOTAL_BYTES}{{")));

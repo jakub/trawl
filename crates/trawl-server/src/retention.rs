@@ -2326,7 +2326,7 @@ mod tests {
         assert_eq!(evidence_after(&evidence), (0, 0, 0, None));
         metrics::with_local_recorder(&recorder, || {
             // Startup publishes both triggers and the attempts at zero.
-            crate::metrics::init_retention_metrics();
+            crate::metrics::init_retention_metrics(0);
             retention_tick_at(
                 tmp.path(),
                 &no_wal(),

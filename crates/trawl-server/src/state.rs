@@ -686,6 +686,10 @@ impl AppState {
         // floor: two readers of the same retention config must not answer
         // differently about how far back the corpus still reaches.
         let retention_horizon_secs = crate::retention::maximum_enabled_age_secs(&config.retention);
+        // The floor gauge and retention's zeroed counters come from the same
+        // config the retention loop enforces, published here so every
+        // server built from a config exposes them on /metrics.
+        crate::metrics::init_retention_metrics(config.retention.min_free_disk_bytes);
 
         let state = Self {
             query: QueryState {
