@@ -46,6 +46,7 @@ use crate::repin::cutover::{
     finish_post_swap_staging, prepare_shadow_root, swap_envs, sweep_pre_swap_staging,
 };
 use crate::repin::gate::{RepinCoordinator, RollupPause};
+use crate::repin::jobs::JobGeneration;
 use crate::repin::marker::{
     RepinMarker, RepinPhase, aside_root, remove_marker, shadow_root, write_marker,
 };
@@ -322,6 +323,9 @@ pub struct RepinEngine {
     /// cancel is a request to the daemon doing the work, and the node that
     /// owns the data root is the only one that can stop it.
     cancel: Arc<CancelRegistry>,
+    /// The job generation each job's background half enters for its disk
+    /// work (see [`Self::run_job`]); the capacity samples read it.
+    jobs: Arc<JobGeneration>,
 }
 
 impl RepinEngine {
@@ -337,6 +341,7 @@ impl RepinEngine {
         wal_dir: PathBuf,
         memory_limit: String,
         min_free_disk_bytes: u64,
+        jobs: Arc<JobGeneration>,
     ) -> Self {
         Self {
             store,
@@ -349,6 +354,7 @@ impl RepinEngine {
             memory_limit,
             min_free_disk_bytes,
             cancel: Arc::new(CancelRegistry::default()),
+            jobs,
         }
     }
 
@@ -1185,6 +1191,17 @@ impl RepinEngine {
     /// `scanned` carries the mandatory pre-build scan's per-file readings
     /// so the build does not immediately re-measure a corpus nothing has
     /// touched (see [`ScanTallies`]).
+    ///
+    /// The job generation's begin and end live here, the one function
+    /// every job that writes under the data root runs through. Everything
+    /// before it (claim, scan, the scan's force refusal, a dry run's
+    /// report) only reads. The guard is taken before the marker write and
+    /// dropped as this function returns, after the abandon unwind or the
+    /// post-cutover sweep and after the disarm, on every outcome. A panic
+    /// in this task drops it during the unwind and may leave staging
+    /// behind, which the fence reads as on-disk evidence. The
+    /// process-exit paths past the point of no return never end it, and
+    /// the next boot's recovery owns what they leave.
     #[allow(clippy::too_many_arguments)] // one bundle per claimed job
     async fn run_job(
         self: Arc<Self>,
@@ -1197,6 +1214,7 @@ impl RepinEngine {
         cancel: CancelHandle,
         rollup_pause: RollupPause,
     ) {
+        let _job = self.jobs.begin();
         let started = std::time::Instant::now();
         let _rollup_pause = rollup_pause;
         metrics::gauge!(crate::metrics::CATALOG_REPIN_RUNNING).set(1.0);

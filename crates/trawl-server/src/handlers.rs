@@ -567,6 +567,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         .wal_writer
         .as_ref()
         .map(|w| w.dir().to_path_buf());
+    let repin_jobs = std::sync::Arc::clone(&state.repin_jobs);
     let _ = tokio::task::spawn_blocking(move || {
         #[cfg(target_os = "linux")]
         metrics_process::Collector::default().collect();
@@ -575,6 +576,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             &fallback_glob,
             wal_dir.as_deref(),
             retained_permits,
+            &repin_jobs,
         );
     })
     .await;

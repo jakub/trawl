@@ -89,3 +89,9 @@ Withholding every finite environment instead was rejected. An environment with a
 ## Amendment: the oldest surviving date holds Parquet, 2026-09-27
 
 The Decision anchors the zero-fill on the environment's oldest surviving date. During the #202 run the human decided that this date is the oldest date directory holding Parquet. An empty date directory does not anchor the zero-fill. It is no evidence of a quiet ingest day, and anchoring on it would add days of zero bytes and overstate reach. The same date is the oldest date shown beside `max_age_days` as pressure-deletion evidence.
+
+## Amendment: retention suppressed means a repin job overlapped a sample, 2026-09-27
+
+The Decision withholds a projection while a repin holds two generations. During the #202 run, reviews showed that no reading of the data root can prove that. A job can build a shadow, then swap or abandon it, sweep, and drop its marker while a sample runs. After that, nothing on disk shows it happened. So each sample reads the repin engine's job generation before and after it measures. The engine enters that generation before a job's first write under the data root. It leaves after the job's last cleanup, whatever the outcome. A sample that overlaps any job in the process reports the repin, and the projection is withheld as `retention_suppressed`. The sample also reads the marker and the staging roots at both ends. Those catch staging that an earlier process left behind.
+
+Writes to the data directory from outside the process are out of scope. The data root is trusted storage that only trawld rearranges. Inferring a repin from directory inodes was rejected. Each review found an interleaving that the inference missed.

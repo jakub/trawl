@@ -124,23 +124,23 @@ pub fn filesystem_rows(sample: &HeadroomSample, floor_bytes: u64) -> Vec<Filesys
 ///
 /// `stat` answers `(device, total_bytes, available_bytes)` for a path
 /// ([`stat_filesystem`] in production). The stats run inside a
-/// [`fence::RepinFence`] on the data root, the same fence the Parquet scan
-/// takes, so a repin that holds two generations on the data filesystem
-/// while the stats read its free space is recorded in the sample or fails
-/// the attempt. Any error fails the whole attempt, so the cache keeps the
-/// last complete sample rather than publish a partial one that would lose
-/// a device's row. `wal_dir` is `None` when ingest is off.
+/// [`fence::RepinFence`] on the data root and `jobs`, the same fence the
+/// Parquet scan takes, so any repin job that overlaps the stats is
+/// recorded in the sample. Any error fails the whole attempt, so the cache
+/// keeps the last complete sample rather than publish a partial one that
+/// would lose a device's row. `wal_dir` is `None` when ingest is off.
 ///
 /// # Errors
 /// The fence's open error, then the first `stat` error in role order,
-/// then the fence's close error or a torn fence.
+/// then the fence's close error.
 pub fn sample_headroom(
     data_root: &Path,
     wal_dir: Option<&Path>,
     spill_dir: &Path,
+    jobs: &crate::repin::JobGeneration,
     stat: impl Fn(&Path) -> std::io::Result<(u64, u64, u64)>,
 ) -> std::io::Result<HeadroomSample> {
-    let fence = fence::RepinFence::open(data_root)?;
+    let fence = fence::RepinFence::open(data_root, jobs)?;
     let roles = [
         (FilesystemRole::Data, Some(data_root)),
         (FilesystemRole::Wal, wal_dir),
@@ -159,7 +159,7 @@ pub fn sample_headroom(
     }
     Ok(HeadroomSample {
         filesystems: group_by_device(&readings),
-        repin_in_flight: fence.close()?.saw_repin()?,
+        repin_in_flight: fence.close()?,
     })
 }
 
@@ -651,90 +651,100 @@ mod tests {
         // WAL: ingest off stats no WAL path at all.
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
+        let jobs = crate::repin::JobGeneration::default();
         let stat = stat_table(&[
             (data, 1, 100, 40),
             (Path::new("/wal"), 2, 50, 5),
             (Path::new("/tmp"), 1, 100, 40),
         ]);
-        let sample =
-            sample_headroom(data, Some(Path::new("/wal")), Path::new("/tmp"), &stat).unwrap();
+        let sample = sample_headroom(
+            data,
+            Some(Path::new("/wal")),
+            Path::new("/tmp"),
+            &jobs,
+            &stat,
+        )
+        .unwrap();
         assert_eq!(
             sample.filesystems,
             [device(&[DATA, SPILL], 100, 40), device(&[WAL], 50, 5)]
         );
         assert!(!sample.repin_in_flight);
-        // The repin fence's evidence rides the sample.
-        std::fs::write(crate::repin::marker::marker_path(data), "{}").unwrap();
-        let query_only = sample_headroom(data, None, Path::new("/tmp"), &stat).unwrap();
+        // The repin fence's answer rides the sample: a running job, and
+        // on-disk evidence with no job.
+        let job = jobs.begin();
+        let query_only = sample_headroom(data, None, Path::new("/tmp"), &jobs, &stat).unwrap();
         assert_eq!(query_only.filesystems, [device(&[DATA, SPILL], 100, 40)]);
         assert!(query_only.repin_in_flight);
+        drop(job);
+        std::fs::write(crate::repin::marker::marker_path(data), "{}").unwrap();
+        let leftover = sample_headroom(data, None, Path::new("/tmp"), &jobs, &stat).unwrap();
+        assert!(leftover.repin_in_flight);
 
-        // Any role's failure fails the whole attempt; so does a data root
-        // the fence cannot read.
+        // Any role's failure fails the whole attempt, the data root's
+        // included.
         assert!(
             sample_headroom(
                 data,
                 Some(Path::new("/missing-wal")),
                 Path::new("/tmp"),
+                &jobs,
                 &stat,
             )
             .is_err()
         );
         let missing = data.join("missing");
-        let stat = stat_table(&[(&missing, 1, 100, 40), (Path::new("/tmp"), 1, 100, 40)]);
-        assert!(sample_headroom(&missing, None, Path::new("/tmp"), &stat).is_err());
+        let stat = stat_table(&[(Path::new("/tmp"), 1, 100, 40)]);
+        assert!(sample_headroom(&missing, None, Path::new("/tmp"), &jobs, &stat).is_err());
     }
 
-    /// A repin that is in flight when the stat reads free space, and whose
-    /// swap, sweep and marker removal all finish before the attempt asks
-    /// the repin authority, left that transiently low free space admitted
-    /// as clean. The stat seam here runs the real cutover and sweep: the
-    /// attempt either fails as torn or reports the repin, never a clean
-    /// sample with no repin.
+    /// A repin job cancelled or refused before its cutover builds a big
+    /// shadow while the stat reads free space, then sweeps the shadow and
+    /// drops its marker without replacing any env directory. Nothing on
+    /// disk tells the fence's close it happened. The stat seam here runs
+    /// that whole job, with the engine's real abandon sweep, inside the
+    /// stats: the sample reports the repin rather than admitting the
+    /// transiently low free space as clean.
     #[test]
-    fn headroom_sample_sees_a_repin_that_finishes_after_the_stat() {
-        use crate::repin::marker::{aside_root, marker_path, shadow_root};
-        let plant = |base: &Path, env: &str| {
-            let dir = base.join(env).join("2026-09-20");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("x.parquet"), "0123456789").unwrap();
-        };
-        // The shadow carries `prod`, so the cutover replaces it, or carries
-        // nothing, so the repin holds only its marker and an empty shadow.
-        for shadow_envs in [&["prod"][..], &[]] {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path().join("data");
-            plant(&root, "prod");
-            let shadow = shadow_root(&root);
-            std::fs::create_dir_all(&shadow).unwrap();
-            for env in shadow_envs {
-                plant(&shadow, env);
-            }
+    fn headroom_sample_sees_a_repin_aborted_before_cutover() {
+        use crate::repin::marker::{marker_path, remove_marker, shadow_root};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let live = root.join("prod/2026-09-20");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("x.parquet"), "0123456789").unwrap();
+        let before = std::fs::metadata(root.join("prod")).unwrap();
+        let jobs = crate::repin::JobGeneration::default();
+        let abort_a_repin = || {
+            let _job = jobs.begin();
             std::fs::write(marker_path(&root), "{}").unwrap();
-            let finish_repin = || {
-                crate::repin::cutover::swap_envs(&root, &shadow, &aside_root(&root)).unwrap();
-                crate::repin::cutover::finish_post_swap_staging(&root);
-                assert_eq!(crate::repin::in_flight_evidence(&root).unwrap(), None);
-            };
-            let stat = |path: &Path| {
-                if path == root {
-                    finish_repin();
-                }
-                Ok((1, 1_000, 10))
-            };
-            let attempt = sample_headroom(&root, None, Path::new("/tmp"), stat);
-            if shadow_envs.is_empty() {
-                // Nothing replaced: the evidence read at open reports it.
-                assert!(attempt.unwrap().repin_in_flight);
-            } else {
-                // An env replaced under the stats fails the attempt.
-                let error = attempt.expect_err("a torn sample is not complete");
-                assert!(
-                    error.to_string().contains("environment directory"),
-                    "{error}"
-                );
+            let built = shadow_root(&root).join("prod/2026-09-20");
+            std::fs::create_dir_all(&built).unwrap();
+            std::fs::write(built.join("x.parquet"), vec![b'x'; 4096]).unwrap();
+            assert!(crate::repin::cutover::sweep_pre_swap_staging(&root));
+            remove_marker(&root).unwrap();
+        };
+        let stat = |path: &Path| {
+            if path == root {
+                abort_a_repin();
             }
+            Ok((1, 1_000, 10))
+        };
+        let sample = sample_headroom(&root, None, Path::new("/tmp"), &jobs, stat).unwrap();
+        assert!(sample.repin_in_flight);
+        // The job left the live generation as it found it and no evidence.
+        assert_eq!(crate::repin::in_flight_evidence(&root).unwrap(), None);
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let after = std::fs::metadata(root.join("prod")).unwrap();
+            assert_eq!(after.ino(), before.ino());
         }
+        // Idle again, the next sample is clean.
+        let quiet = sample_headroom(&root, None, Path::new("/tmp"), &jobs, |_| {
+            Ok((1, 1_000, 10))
+        })
+        .unwrap();
+        assert!(!quiet.repin_in_flight);
     }
 
     #[test]

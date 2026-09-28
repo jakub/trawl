@@ -169,6 +169,7 @@ fn sample(headroom: &Headroom, partitions: Option<&EnvDateBytes>) -> HeadroomSam
         &data_root,
         headroom.wal.map(|_| wal_dir.as_path()),
         &spill_dir,
+        &trawl_server::repin::JobGeneration::default(),
         stat,
     )
     .unwrap()

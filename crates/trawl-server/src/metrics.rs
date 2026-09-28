@@ -1053,12 +1053,16 @@ fn headroom_cache() -> &'static StorageCache<crate::capacity::HeadroomSample> {
 ///
 /// Called by Prometheus scrapes and the stats emitter. Filesystem scans and
 /// competing attempts may block; dashboard readers only read the short cache.
+/// `repin_jobs` is this process's repin job generation
+/// ([`crate::state::AppState::repin_jobs`]), which fences both capacity
+/// samples.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
 pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
     fallback_glob: &str,
     wal_dir: Option<&Path>,
     retained_permits: usize,
+    repin_jobs: &crate::repin::JobGeneration,
 ) {
     // Callers snapshot the pool count before collection. No pool registry lock
     // travels with this number through a storage scan or attempt-owner wait.
@@ -1079,13 +1083,13 @@ pub fn collect_gauges(
 
     // Parquet file gauges — walk the glob pattern's parent directory.
     let data_root = data_root(fallback_glob);
-    collect_parquet_gauges(data_root);
+    collect_parquet_gauges(data_root, repin_jobs);
 
     if let Some(dir) = wal_dir {
         collect_wal_gauges(dir);
     }
 
-    collect_headroom(data_root, wal_dir);
+    collect_headroom(data_root, wal_dir, repin_jobs);
 }
 
 /// The data root the fallback glob selects: the Parquet scan walks it and
@@ -1105,10 +1109,10 @@ fn data_root(fallback_glob: &str) -> &Path {
 }
 
 /// Collect the ingested Parquet totals with the shared attempt/cache policy.
-fn collect_parquet_gauges(base: &Path) {
+fn collect_parquet_gauges(base: &Path, repin_jobs: &crate::repin::JobGeneration) {
     parquet_cache().collect(
         Instant::now,
-        || scan_parquet(base).map(Arc::new),
+        || scan_parquet(base, repin_jobs).map(Arc::new),
         |scan| publish_storage_gauges(StorageKind::Parquet, scan.totals),
     );
 }
@@ -1116,33 +1120,40 @@ fn collect_parquet_gauges(base: &Path) {
 /// One Parquet attempt: the walk inside the repin fence
 /// ([`crate::capacity::fence::RepinFence`]) the headroom sample also takes.
 ///
-/// A repin that overlaps the walk is either recorded, and the projection
-/// withholds reach from the scan because a repin holds two generations of
-/// stored bytes, or it replaced an env directory mid-walk and the attempt
-/// fails, because the walk may have read some envs from each generation.
+/// Any repin job that overlaps the walk is recorded, and the projection
+/// withholds reach from the scan: the walk may have counted two
+/// generations of stored bytes, or some envs from each.
 ///
 /// # Errors
-/// The walk's error, the fence's, or a torn fence. Each fails the attempt,
-/// so the cache keeps the last complete scan (ADR-0033).
-fn scan_parquet(root: &Path) -> std::io::Result<StorageScan> {
-    scan_parquet_with(root, &mut |_, _| Ok(()))
+/// The walk's error or the fence's. Each fails the attempt, so the cache
+/// keeps the last complete scan (ADR-0033).
+fn scan_parquet(
+    root: &Path,
+    repin_jobs: &crate::repin::JobGeneration,
+) -> std::io::Result<StorageScan> {
+    scan_parquet_with(root, repin_jobs, &mut |_, _| Ok(()))
 }
 
 /// [`scan_parquet`] with the walk's test seam ([`scan_storage_with`]).
 fn scan_parquet_with(
     root: &Path,
+    repin_jobs: &crate::repin::JobGeneration,
     walk_op: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<StorageScan> {
-    let fence = crate::capacity::fence::RepinFence::open(root)?;
+    let fence = crate::capacity::fence::RepinFence::open(root, repin_jobs)?;
     let mut scan = scan_storage_with(root, StorageKind::Parquet, walk_op)?;
-    scan.repin_in_flight = fence.close()?.saw_repin()?;
+    scan.repin_in_flight = fence.close()?;
     Ok(scan)
 }
 
 /// Sample the data, WAL and spill filesystems with the shared attempt/cache
 /// policy (ADR-0042 headroom under ADR-0033 status and age). `wal_dir` is the
 /// live WAL writer's directory, so a query-only node stats no WAL role.
-fn collect_headroom(data_root: &Path, wal_dir: Option<&Path>) {
+fn collect_headroom(
+    data_root: &Path,
+    wal_dir: Option<&Path>,
+    repin_jobs: &crate::repin::JobGeneration,
+) {
     headroom_cache().collect(
         Instant::now,
         || {
@@ -1150,6 +1161,7 @@ fn collect_headroom(data_root: &Path, wal_dir: Option<&Path>) {
                 data_root,
                 wal_dir,
                 &trawl_engine::spill_dir(),
+                repin_jobs,
                 crate::capacity::stat_filesystem,
             )
         },
@@ -1990,26 +2002,27 @@ mod tests {
         assert_eq!((snapshot.files, snapshot.bytes), (2, 10));
     }
 
-    /// The Parquet attempt runs inside the repin fence, so a scan that
-    /// overlaps either end of a repin records it, and unreadable evidence
-    /// fails the attempt like a walk error: the cache keeps the last
-    /// complete scan with the flag it was taken under.
-    #[test]
-    fn storage_scan_records_repin_evidence_or_fails_the_attempt() {
-        use std::time::Duration;
-        // Run `during` once, at the walk's first directory read.
-        fn mid_walk(
-            during: &dyn Fn(),
-        ) -> impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()> + '_ {
-            let mut ran = false;
-            move |op, _| {
-                if !ran && op == StorageWalkOp::ReadDir {
-                    ran = true;
-                    during();
-                }
-                Ok(())
+    /// Run `during` once, at the walk's first directory read.
+    fn mid_walk(during: &dyn Fn()) -> impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()> + '_ {
+        let mut ran = false;
+        move |op, _| {
+            if !ran && op == StorageWalkOp::ReadDir {
+                ran = true;
+                during();
             }
+            Ok(())
         }
+    }
+
+    /// The Parquet attempt runs inside the repin fence, so a scan that
+    /// overlaps a repin job, or finds staging on disk at either end,
+    /// records it, and unreadable evidence fails the attempt like a walk
+    /// error: the cache keeps the last complete scan with the flag it was
+    /// taken under.
+    #[test]
+    fn storage_scan_records_a_repin_or_fails_the_attempt() {
+        use std::cell::RefCell;
+        use std::time::Duration;
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("data");
@@ -2017,24 +2030,40 @@ mod tests {
         std::fs::write(root.join("prod/2026-09-20/x.parquet"), "12345").unwrap();
         let marker = crate::repin::marker::marker_path(&root);
         let shadow = crate::repin::marker::shadow_root(&root);
-
-        // No repin, a repin that ends mid-walk, one that starts mid-walk,
-        // and one that spans it: evidence at either end is recorded, and
-        // the scan is otherwise the plain walk.
+        let jobs = crate::repin::JobGeneration::default();
         let plain = scan_storage(&root, StorageKind::Parquet).unwrap().totals;
+
+        // No repin, then a job that ends mid-walk, one that begins
+        // mid-walk, and one that spans the walk. The scan is otherwise the
+        // plain walk.
+        let job = RefCell::new(None);
         let cases: [(bool, &dyn Fn(), bool); 4] = [
             (false, &|| {}, false),
-            (true, &|| std::fs::remove_file(&marker).unwrap(), true),
-            (false, &|| std::fs::write(&marker, "{}").unwrap(), true),
+            (true, &|| drop(job.borrow_mut().take()), true),
+            (false, &|| *job.borrow_mut() = Some(jobs.begin()), true),
             (true, &|| {}, true),
         ];
         for (at_open, during, expected) in cases {
             if at_open {
-                std::fs::write(&marker, "{}").unwrap();
+                *job.borrow_mut() = Some(jobs.begin());
             }
-            let scan = scan_parquet_with(&root, &mut mid_walk(during)).unwrap();
+            let scan = scan_parquet_with(&root, &jobs, &mut mid_walk(during)).unwrap();
             assert_eq!(scan.repin_in_flight, expected, "{at_open} {expected}");
             assert_eq!(scan.totals, plain);
+            drop(job.borrow_mut().take());
+        }
+
+        // Staging on disk with no job in this process, at either end.
+        let cases: [(bool, &dyn Fn()); 2] = [
+            (true, &|| std::fs::remove_file(&marker).unwrap()),
+            (false, &|| std::fs::write(&marker, "{}").unwrap()),
+        ];
+        for (at_open, during) in cases {
+            if at_open {
+                std::fs::write(&marker, "{}").unwrap();
+            }
+            let scan = scan_parquet_with(&root, &jobs, &mut mid_walk(during)).unwrap();
+            assert!(scan.repin_in_flight, "{at_open}");
             let _ = std::fs::remove_file(&marker);
         }
 
@@ -2043,11 +2072,11 @@ mod tests {
         // complete scan and its flag.
         let cache = StorageCache::<Arc<StorageScan>>::default();
         let now = Instant::now();
-        cache.collect(|| now, || scan_parquet(&root).map(Arc::new), |_| {});
+        cache.collect(|| now, || scan_parquet(&root, &jobs).map(Arc::new), |_| {});
         let unreadable = || std::os::unix::fs::symlink(&shadow, &shadow).unwrap();
         cache.collect(
             || now + Duration::from_secs(30),
-            || scan_parquet_with(&root, &mut mid_walk(&unreadable)).map(Arc::new),
+            || scan_parquet_with(&root, &jobs, &mut mid_walk(&unreadable)).map(Arc::new),
             |_| {},
         );
         let (measurement, scan) = cache.read(true, now + Duration::from_secs(30));
@@ -2057,61 +2086,65 @@ mod tests {
         );
         assert!(!scan.expect("retained").repin_in_flight);
         // Unreadable at open fails the attempt before the walk.
-        assert!(scan_parquet(&root).is_err());
+        assert!(scan_parquet(&root, &jobs).is_err());
+    }
+
+    fn write_env_date(base: &Path, env: &str, bytes: usize) {
+        let dir = base.join(env).join("2026-09-20");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.parquet"), vec![b'x'; bytes]).unwrap();
+    }
+
+    /// A whole repin job, run the way the engine runs one: the job begins,
+    /// writes its marker and a shadow of 1000 bytes per env in `envs`,
+    /// swaps them in with the real cutover, sweeps and drops its marker,
+    /// and ends. It leaves no evidence on disk.
+    fn whole_repin(root: &Path, jobs: &crate::repin::JobGeneration, envs: &[&str]) {
+        let _job = jobs.begin();
+        let shadow = crate::repin::marker::shadow_root(root);
+        let aside = crate::repin::marker::aside_root(root);
+        std::fs::write(crate::repin::marker::marker_path(root), "{}").unwrap();
+        for env in envs {
+            write_env_date(&shadow, env, 1000);
+        }
+        crate::repin::cutover::swap_envs(root, &shadow, &aside).unwrap();
+        crate::repin::cutover::finish_post_swap_staging(root);
+        assert_eq!(crate::repin::in_flight_evidence(root).unwrap(), None);
+    }
+
+    /// Run `during` once, as the walk opens its second env directory.
+    fn before_second_env<'a>(
+        root: &'a Path,
+        during: &'a dyn Fn(),
+    ) -> impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()> + 'a {
+        let mut envs_opened = 0;
+        move |op, path| {
+            if op == StorageWalkOp::ReadDir && path.parent() == Some(root) {
+                envs_opened += 1;
+                if envs_opened == 2 {
+                    during();
+                }
+            }
+            Ok(())
+        }
     }
 
     /// A whole repin can build, swap, sweep and clear its marker while the
-    /// scanning thread is descheduled, so both evidence reads say no repin
-    /// and the walk has read one env from each generation. The real cutover
-    /// (`swap_envs`) runs mid-walk here: the attempt fails and the cache
-    /// keeps the last complete scan (ADR-0033).
+    /// scanning thread is descheduled, so the walk reads one env from each
+    /// generation and neither evidence read finds anything. The job
+    /// generation saw it: the scan reports the repin, and the projection
+    /// withholds reach from it as retention suppressed.
     #[test]
-    fn storage_scan_fails_when_an_env_dir_is_swapped_during_the_walk() {
-        use std::time::Duration;
+    fn storage_scan_sees_a_repin_that_swaps_an_env_dir_during_the_walk() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("data");
-        let shadow = crate::repin::marker::shadow_root(&root);
-        let aside = crate::repin::marker::aside_root(&root);
-        let write = |base: &Path, env: &str, bytes: usize| {
-            let dir = base.join(env).join("2026-09-20");
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("x.parquet"), vec![b'x'; bytes]).unwrap();
-        };
-        // The live generation holds 10 bytes per env.
-        let plant = || {
-            for env in ["lab", "prod"] {
-                write(&root, env, 10);
-            }
-        };
-        // A whole repin lands between envs: its marker and a shadow of
-        // 1000 bytes per env, the real swap, then the real sweep and
-        // marker removal. The first env is counted whole from the live
-        // generation, the second from the new one, and no repin evidence
-        // is left for the fence's close to read.
-        let swap_before_second_env = || {
-            let (root, shadow, aside) = (&root, &shadow, &aside);
-            let mut envs_opened = 0;
-            move |op: StorageWalkOp, path: &Path| {
-                if op == StorageWalkOp::ReadDir && path.parent() == Some(root.as_path()) {
-                    envs_opened += 1;
-                    if envs_opened == 2 {
-                        std::fs::write(crate::repin::marker::marker_path(root), "{}")?;
-                        for env in ["lab", "prod"] {
-                            write(shadow, env, 1000);
-                        }
-                        crate::repin::cutover::swap_envs(root, shadow, aside)
-                            .map_err(std::io::Error::other)?;
-                        crate::repin::cutover::finish_post_swap_staging(root);
-                        assert_eq!(crate::repin::in_flight_evidence(root).unwrap(), None);
-                    }
-                }
-                Ok(())
-            }
-        };
+        let jobs = crate::repin::JobGeneration::default();
+        for env in ["lab", "prod"] {
+            write_env_date(&root, env, 10);
+        }
 
         // Control: the same walk seam with nothing moving is the plain scan.
-        plant();
-        let scan = scan_parquet_with(&root, &mut |_, _| Ok(())).unwrap();
+        let scan = scan_parquet_with(&root, &jobs, &mut |_, _| Ok(())).unwrap();
         assert_eq!(
             scan.totals,
             StorageTotals {
@@ -2121,39 +2154,51 @@ mod tests {
         );
         assert!(!scan.repin_in_flight);
 
-        // The swap mid-walk fails the attempt, with no repin evidence at
-        // either end.
-        let error = scan_parquet_with(&root, &mut swap_before_second_env())
-            .expect_err("a torn walk is not a complete scan");
-        assert!(
-            error.to_string().contains("environment directory"),
-            "{error}"
-        );
+        let repin = || whole_repin(&root, &jobs, &["lab", "prod"]);
+        let scan = scan_parquet_with(&root, &jobs, &mut before_second_env(&root, &repin)).unwrap();
+        // One env from each generation.
+        assert_eq!(scan.totals.bytes, 1010);
+        assert!(scan.repin_in_flight);
 
-        // Through the cache: the torn attempt is failed and the complete
-        // scan taken before it is retained.
-        std::fs::remove_dir_all(&root).unwrap();
-        plant();
-        let cache = StorageCache::<Arc<StorageScan>>::default();
-        let now = Instant::now();
-        cache.collect(|| now, || scan_parquet(&root).map(Arc::new), |_| {});
-        cache.collect(
-            || now + Duration::from_secs(30),
-            || scan_parquet_with(&root, &mut swap_before_second_env()).map(Arc::new),
-            |_| {},
-        );
-        let (measurement, scan) = cache.read(true, now + Duration::from_secs(30));
+        let complete = trawl_api::StorageMeasurement {
+            status: trawl_api::StorageMeasurementStatus::Complete,
+            sample_age_secs: Some(0),
+        };
+        let sample = crate::capacity::HeadroomSample {
+            filesystems: vec![crate::capacity::DeviceHeadroom {
+                roles: vec![trawl_api::FilesystemRole::Data],
+                total_bytes: 1 << 40,
+                available_bytes: 1 << 30,
+            }],
+            repin_in_flight: false,
+        };
         assert_eq!(
-            measurement.status,
-            trawl_api::StorageMeasurementStatus::Failed
+            crate::capacity::projection_basis(
+                &complete,
+                scan.repin_in_flight,
+                &complete,
+                Some(&sample)
+            ),
+            Err(trawl_api::WithheldReason::RetentionSuppressed)
         );
-        assert_eq!(
-            scan.expect("retained").totals,
-            StorageTotals {
-                files: 2,
-                bytes: 20
-            }
-        );
+    }
+
+    /// An env created after the fence opened and then swapped by a repin
+    /// during the walk is no ordinary addition: the job generation reports
+    /// the repin whatever the walk's order.
+    #[test]
+    fn storage_scan_sees_a_repin_that_swaps_an_env_created_mid_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let jobs = crate::repin::JobGeneration::default();
+        write_env_date(&root, "prod", 10);
+        let create_then_repin = || {
+            write_env_date(&root, "newenv", 10);
+            whole_repin(&root, &jobs, &["newenv", "prod"]);
+        };
+        let scan = scan_parquet_with(&root, &jobs, &mut mid_walk(&create_then_repin)).unwrap();
+        assert!(scan.repin_in_flight);
+        assert!(!jobs.read().in_flight());
     }
 
     /// Compaction creates an env directory on the env's first write, which
@@ -2170,14 +2215,15 @@ mod tests {
         };
         write("prod");
         let mut created = false;
-        let scan = scan_parquet_with(&root, &mut |op, path: &Path| {
+        let jobs = crate::repin::JobGeneration::default();
+        let scan = scan_parquet_with(&root, &jobs, &mut |op, path: &Path| {
             if !created && op == StorageWalkOp::ReadDir && path.parent() == Some(root.as_path()) {
                 created = true;
                 write("newenv");
             }
             Ok(())
         })
-        .expect("an added env directory is no tear");
+        .expect("an added env directory is no repin");
         assert!(created);
         assert!(!scan.repin_in_flight);
     }
@@ -2585,6 +2631,7 @@ mod tests {
             data_root.path(),
             Some(Path::new("/wal")),
             Path::new("/tmp"),
+            &crate::repin::JobGeneration::default(),
             |_| Ok((1, 1_000, available)),
         )
     }
@@ -2674,7 +2721,15 @@ mod tests {
         std::os::unix::fs::symlink(&shadow, &shadow).unwrap();
         cache.collect(
             || repin_unreadable,
-            || sample_headroom(&data_root, None, Path::new("/tmp"), |_| Ok((1, 1_000, 10))),
+            || {
+                sample_headroom(
+                    &data_root,
+                    None,
+                    Path::new("/tmp"),
+                    &crate::repin::JobGeneration::default(),
+                    |_| Ok((1, 1_000, 10)),
+                )
+            },
             |_| {},
         );
         let (measurement, sample) = cache.read(true, repin_unreadable);
@@ -2770,7 +2825,13 @@ mod tests {
             if fail {
                 return Err(io_failure());
             }
-            sample_headroom(&data_root, Some(&wal_dir), tmp.path(), stat_seam)
+            sample_headroom(
+                &data_root,
+                Some(&wal_dir),
+                tmp.path(),
+                &crate::repin::JobGeneration::default(),
+                stat_seam,
+            )
         };
 
         let recorder = prometheus_builder().build_recorder();
@@ -2961,7 +3022,13 @@ mod tests {
     #[test]
     fn collect_gauges_no_hot_buffer_no_panic() {
         // With no recorder installed and no hot buffer, should be a no-op.
-        collect_gauges(None, "/nonexistent/path/**/*.parquet", None, 0);
+        collect_gauges(
+            None,
+            "/nonexistent/path/**/*.parquet",
+            None,
+            0,
+            &crate::repin::JobGeneration::default(),
+        );
     }
 
     /// One rendered sample value, verbatim (gauges need not be integers).
@@ -2990,7 +3057,13 @@ mod tests {
                 max_events: 100,
                 max_bytes: 1_000,
             }));
-            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            collect_gauges(
+                Some(&buf),
+                "/nonexistent/path/**/*.parquet",
+                None,
+                0,
+                &crate::repin::JobGeneration::default(),
+            );
             let rendered = handle.render();
             assert_eq!(gauge_value(&rendered, HOT_BUFFER_MAX_EVENTS), "100");
             assert_eq!(gauge_value(&rendered, HOT_BUFFER_MAX_BYTES), "1000");
@@ -3008,7 +3081,13 @@ mod tests {
                 events: vec![serde_json::Map::new(); 10],
             }));
             std::thread::sleep(std::time::Duration::from_millis(5));
-            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            collect_gauges(
+                Some(&buf),
+                "/nonexistent/path/**/*.parquet",
+                None,
+                0,
+                &crate::repin::JobGeneration::default(),
+            );
             let rendered = handle.render();
             assert_eq!(
                 gauge_value(&rendered, HOT_BUFFER_ADMISSION_STATE),
@@ -3029,7 +3108,13 @@ mod tests {
                 )
                 .is_err()
             );
-            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            collect_gauges(
+                Some(&buf),
+                "/nonexistent/path/**/*.parquet",
+                None,
+                0,
+                &crate::repin::JobGeneration::default(),
+            );
             let rendered = handle.render();
             assert_eq!(gauge_value(&rendered, HOT_BUFFER_ADMISSION_STATE), "2");
             assert_eq!(
@@ -3091,7 +3176,13 @@ mod tests {
                 max_events: trawl_config::DEFAULT_HOT_BUFFER_MAX_EVENTS,
                 max_bytes: trawl_config::DEFAULT_HOT_BUFFER_MAX_BYTES,
             }));
-            collect_gauges(Some(&buf), "/nonexistent/path/**/*.parquet", None, 0);
+            collect_gauges(
+                Some(&buf),
+                "/nonexistent/path/**/*.parquet",
+                None,
+                0,
+                &crate::repin::JobGeneration::default(),
+            );
             let rendered = handle.render();
             for name in names {
                 let series_prefix = [format!("{name} "), format!("{name}{{")];

@@ -4044,3 +4044,140 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
         "a boot replay must not re-announce a clear that happened once"
     );
 }
+
+// -- the job generation the capacity samples read (ADR-0042) ----------------
+
+use trawl_server::repin::JobReading;
+
+impl Harness {
+    fn repin_jobs(&self) -> JobReading {
+        self.server.state.repin_jobs.read()
+    }
+
+    /// Wait for the job generation to read idle, then check the job's disk
+    /// work was already done by then: the guard ends after the job's last
+    /// cleanup, so no marker and no staging root may outlive it. Polled
+    /// from the job's release, not from its terminal row: a success row
+    /// lands before the post-cutover sweep. Bounded.
+    async fn await_jobs_idle(&self) -> JobReading {
+        for _ in 0..600 {
+            let reading = self.repin_jobs();
+            if !reading.in_flight() {
+                assert!(!trawl_server::repin::marker_path(&self.data_dir).exists());
+                assert!(!trawl_server::repin::shadow_root(&self.data_dir).exists());
+                assert!(!trawl_server::repin::aside_root(&self.data_dir).exists());
+                return reading;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the repin job generation never read idle again");
+    }
+
+    /// Start a `status` BIGINT → VARCHAR repin over a three-service corpus
+    /// and hold it at its first published progress: the shadow and the
+    /// marker exist, and the job runs until [`TEST_RELEASE_JOB`].
+    async fn start_a_held_repin(&self) -> RepinJobResponse {
+        for svc in ["api", "web", "worker"] {
+            self.ingest_and_compact(&[
+                event(svc, &json!({"status": 200})),
+                event(svc, &json!({"status": 404})),
+            ])
+            .await;
+        }
+        TEST_PROGRESS_PUBLISHED.store(false, Ordering::SeqCst);
+        TEST_RELEASE_JOB.store(false, Ordering::SeqCst);
+        TEST_HOLD_AFTER_PROGRESS.store(true, Ordering::SeqCst);
+        let started = match self
+            .schema_admin
+            .schema_repin(
+                "status",
+                "VARCHAR",
+                None,
+                false,
+                false,
+                RepinCeilings::default(),
+            )
+            .await
+            .expect("execute")
+        {
+            RepinStart::Started(job) => job,
+            other => panic!("expected started, got {other:?}"),
+        };
+        await_barrier(
+            &TEST_PROGRESS_PUBLISHED,
+            "the build never published progress",
+        )
+        .await;
+        started
+    }
+}
+
+/// A held job reads in flight: one running, one generation step past idle.
+fn assert_one_job_running(running: JobReading, idle: JobReading) {
+    assert!(running.in_flight());
+    assert_eq!(running.running(), 1);
+    assert_eq!(running.changes_since(idle), 1);
+}
+
+/// A completed job enters the generation for its build and leaves it
+/// after the post-cutover sweep. A dry run only reads the corpus, so it
+/// never enters it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_repin_job_generation_brackets_a_completed_job() {
+    let h = harness().await;
+    h.ingest_and_compact(&[event("api", &json!({"status": 200}))])
+        .await;
+    let idle = h.repin_jobs();
+    assert!(!idle.in_flight());
+
+    let report = dry_run(&h.schema_admin, "status", "VARCHAR", None, false).await;
+    assert_eq!(report.status, "succeeded");
+    assert_eq!(h.repin_jobs().changes_since(idle), 0);
+
+    let started = h.start_a_held_repin().await;
+    assert_one_job_running(h.repin_jobs(), idle);
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    assert_eq!(h.await_jobs_idle().await.changes_since(idle), 2);
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "succeeded", "error: {:?}", done.error);
+    assert_eq!(h.pinned_type("status").await, "VARCHAR");
+}
+
+/// A job cancelled mid-build leaves the generation after its abandon
+/// sweep has removed the shadow and the marker.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_repin_job_generation_brackets_a_cancelled_job() {
+    let h = harness().await;
+    let idle = h.repin_jobs();
+    let started = h.start_a_held_repin().await;
+    assert_one_job_running(h.repin_jobs(), idle);
+    match h.schema_admin.schema_repin_cancel().await.expect("cancel") {
+        RepinCancel::Cancelling(_) => {}
+        other => panic!("expected an accepted cancel, got {other:?}"),
+    }
+    h.await_cancel_request(started.id).await;
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    assert_eq!(h.await_jobs_idle().await.changes_since(idle), 2);
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(done.status, "cancelled", "error: {:?}", done.error);
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+}
+
+/// A job the finished shadow refuses leaves the generation after its
+/// abandon sweep, like a cancelled one.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_repin_job_generation_brackets_a_refused_job() {
+    let h = harness().await;
+    let idle = h.repin_jobs();
+    let started = start_a_repin_the_finished_shadow_will_refuse(&h).await;
+    assert_one_job_running(h.repin_jobs(), idle);
+    TEST_RELEASE_JOB.store(true, Ordering::SeqCst);
+    assert_eq!(h.await_jobs_idle().await.changes_since(idle), 2);
+    let done = h.wait_terminal(started.id).await;
+    assert_eq!(
+        done.status, "refused_needs_force",
+        "error: {:?}",
+        done.error
+    );
+    assert_eq!(h.pinned_type("dur").await, "VARCHAR");
+}
