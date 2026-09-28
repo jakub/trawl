@@ -2,9 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `[web] upstream_ca_path` against a real rustls upstream.
+//! `[web] upstream_ca_path` and `upstream_connect_addr` against a real
+//! rustls upstream.
 //!
-//! Each test starts a TLS server on `127.0.0.1` that answers
+//! Each connection test starts a TLS server on `127.0.0.1` that answers
 //! `GET /api/v1/whoami`, writes a CA to a file, and resolves a `[web]`
 //! section naming it through `ResolvedConfig::from_parsed` and
 //! `AppState::from_config`, the path `trawl-web` starts through. The
@@ -12,6 +13,9 @@
 //! `/whoami` before it issues a cookie. A refusal is checked from both
 //! ends: the login fails, and the server sees its handshake fail. A plain
 //! connection error would pass the first check but not the second.
+//!
+//! The configuration rules for `upstream_connect_addr` are checked at
+//! resolution, with no upstream: a refused pair never builds a client.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +33,9 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 use trawl_config::WebConfig;
-use trawl_web::config::{ResolvedConfig, UpstreamTls};
+use trawl_web::config::{
+    ConfigError, ConnectAddrError, ResolvedConfig, UpstreamTls, UpstreamUrlError,
+};
 use trawl_web::routes;
 use trawl_web::state::AppState;
 
@@ -362,4 +368,78 @@ async fn pinned_ca_excludes_the_platform_roots() {
         upstream.handshake().await.is_err(),
         "the upstream completed a handshake the pinned proxy should have refused"
     );
+}
+
+/// `upstream_connect_addr` needs a name for TLS to verify: an upstream URL
+/// whose host is an IP literal refuses at startup, as do the other shapes
+/// under which the address could not mean what it says.
+#[test]
+fn connect_addr_requires_dns_host() {
+    let resolve = |upstream_url: &str, connect_addr: &str| {
+        let web = WebConfig {
+            upstream_url: Some(upstream_url.to_owned()),
+            upstream_connect_addr: Some(connect_addr.to_owned()),
+            public_origins: vec!["https://trawl.example.com".to_owned()],
+            ..WebConfig::default()
+        };
+        ResolvedConfig::from_parsed(&web, None).expect_err("the pair must refuse")
+    };
+
+    for (upstream_url, connect_addr) in [
+        ("https://127.0.0.1:5514", "127.0.0.1:5514"),
+        ("https://10.0.0.7:5514", "127.0.0.1:5514"),
+        ("https://[::1]:5514", "[::1]:5514"),
+    ] {
+        let error = resolve(upstream_url, connect_addr);
+        assert!(
+            matches!(
+                error,
+                ConfigError::UpstreamConnectAddr(ConnectAddrError::IpHost)
+            ),
+            "{upstream_url} via {connect_addr} gave {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("upstream_connect_addr"), "got: {message}");
+        assert!(message.contains("DNS name"), "got: {message}");
+    }
+
+    // The URL's port and the address's port must agree.
+    let error = resolve("https://trawl.test:5514", "127.0.0.1:5515");
+    assert!(
+        matches!(
+            error,
+            ConfigError::UpstreamConnectAddr(ConnectAddrError::PortMismatch {
+                url_port: 5514,
+                addr_port: 5515
+            })
+        ),
+        "{error:?}"
+    );
+
+    // A plain-http upstream refuses whatever the connect address says.
+    let error = resolve("http://trawl.test:5514", "127.0.0.1:5514");
+    assert!(
+        matches!(
+            &error,
+            ConfigError::UpstreamUrl(UpstreamUrlError::NotHttps { scheme }) if scheme == "http"
+        ),
+        "{error:?}"
+    );
+
+    // Only an IP address and port: never a name, never a bare address.
+    for connect_addr in [
+        "trawl.test:5514",
+        "localhost:5514",
+        "127.0.0.1",
+        "not an address",
+    ] {
+        let error = resolve("https://trawl.test:5514", connect_addr);
+        assert!(
+            matches!(
+                error,
+                ConfigError::UpstreamConnectAddr(ConnectAddrError::Malformed)
+            ),
+            "{connect_addr:?} gave {error:?}"
+        );
+    }
 }

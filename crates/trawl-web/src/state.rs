@@ -25,7 +25,7 @@ use fleet_auth::{
 };
 use reqwest::{Client, ClientBuilder};
 
-use crate::config::{ResolvedConfig, UpstreamTls};
+use crate::config::{ResolvedConfig, UpstreamConnect, UpstreamTls};
 
 /// Handler-visible runtime state.
 #[derive(Clone)]
@@ -58,7 +58,12 @@ impl AppState {
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let http = upstream_client(Client::builder(), cfg.upstream_tls).build()?;
+        let http = upstream_client(
+            Client::builder(),
+            cfg.upstream_tls,
+            cfg.upstream_connect.as_ref(),
+        )
+        .build()?;
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -176,7 +181,12 @@ impl AppState {
 ///   and the trust mode accepts: under the platform roots, any host with a
 ///   public certificate.
 /// - Ignores proxy settings, such as `HTTPS_PROXY`. trawl-web always dials
-///   trawld directly.
+///   trawld directly. A proxy would also resolve the host name on its own
+///   side, past any connect address.
+///
+/// With a connect address (`[web] upstream_connect_addr`), the client dials
+/// that address for the URL's host and never asks the resolver. TLS still
+/// verifies the host name from the URL.
 ///
 /// A pinned CA replaces the platform roots, with host-name verification
 /// left on. A pin whose file did not exist at startup trusts no root at
@@ -184,11 +194,19 @@ impl AppState {
 ///
 /// Split from [`AppState::from_config`] so a test can pass a builder with
 /// its own resolver or proxy and see what the modes override.
-fn upstream_client(builder: ClientBuilder, tls: UpstreamTls) -> ClientBuilder {
+fn upstream_client(
+    builder: ClientBuilder,
+    tls: UpstreamTls,
+    connect: Option<&UpstreamConnect>,
+) -> ClientBuilder {
     let builder = builder
         .redirect(reqwest::redirect::Policy::none())
         .https_only(true)
         .no_proxy();
+    let builder = match connect {
+        Some(connect) => builder.resolve(&connect.host, connect.addr),
+        None => builder,
+    };
     match tls {
         UpstreamTls::System => builder,
         UpstreamTls::PinnedCa { roots, .. } => builder.tls_certs_only(roots.unwrap_or_default()),
@@ -210,8 +228,10 @@ impl std::fmt::Debug for AppState {
 mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use reqwest::dns::{Name, Resolve, Resolving};
     use tokio::net::TcpListener;
 
     use super::*;
@@ -241,6 +261,57 @@ mod tests {
         accepted
     }
 
+    /// A host resolver that answers nothing and counts how often it is
+    /// asked, standing in for one that would name another machine.
+    struct RefusingResolver(Arc<AtomicUsize>);
+
+    impl Resolve for RefusingResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(
+                Err("the host resolver was asked".into()),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connect_addr_is_dialed_without_asking_the_resolver() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Two copies of each mode: one for the control, one under test.
+        for (control, tls) in every_mode().into_iter().zip(every_mode()) {
+            let mode = format!("{tls:?}");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let url = format!("https://trawl.test:{}/api/v1/whoami", addr.port());
+
+            // Control: without a connect address the name goes to the
+            // resolver, which refuses, so the injected resolver is in use.
+            let asked = Arc::new(AtomicUsize::new(0));
+            let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
+            let client = upstream_client(base, control, None).build().unwrap();
+            let err = client.get(&url).send().await.expect_err("nothing resolves");
+            assert!(err.is_connect(), "{mode}: {err:?}");
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "{mode}");
+
+            let asked = Arc::new(AtomicUsize::new(0));
+            let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
+            let connect = UpstreamConnect {
+                host: "trawl.test".to_owned(),
+                addr,
+            };
+            let client = upstream_client(base, tls, Some(&connect)).build().unwrap();
+            assert!(
+                dials(&client, url, &listener).await,
+                "{mode}: the client did not dial the connect address"
+            );
+            assert_eq!(
+                asked.load(Ordering::SeqCst),
+                0,
+                "{mode}: the client asked the resolver for a name it has an address for"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn every_mode_ignores_a_configured_proxy() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -251,7 +322,7 @@ mod tests {
             let base = Client::builder().proxy(
                 reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap(),
             );
-            let client = upstream_client(base, tls).build().unwrap();
+            let client = upstream_client(base, tls, None).build().unwrap();
 
             let url = format!(
                 "https://127.0.0.1:{}/api/v1/whoami",
@@ -276,7 +347,9 @@ mod tests {
         for tls in every_mode() {
             let mode = format!("{tls:?}");
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = upstream_client(Client::builder(), tls).build().unwrap();
+            let client = upstream_client(Client::builder(), tls, None)
+                .build()
+                .unwrap();
             let url = format!(
                 "http://127.0.0.1:{}/api/v1/whoami",
                 listener.local_addr().unwrap().port()
@@ -336,6 +409,7 @@ mod tests {
             session_ttl_secs: 3_600,
             allow_insecure_cookies: !cookie_secure,
             upstream_tls: UpstreamTls::System,
+            upstream_connect: None,
             cookie_key: SessionKey::from_bytes([0x42; fleet_auth::KEY_LEN]),
             shared_domain: None,
             public_origins: PublicOrigins::parse(["http://127.0.0.1:8090"])

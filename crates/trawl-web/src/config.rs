@@ -22,6 +22,7 @@
 //! this allowlist exists to close, silently.
 
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use fleet_auth::{
@@ -68,6 +69,10 @@ pub struct ResolvedConfig {
     pub session_ttl_secs: u64,
     pub allow_insecure_cookies: bool,
     pub upstream_tls: UpstreamTls,
+    /// Where the connection to trawld goes when `[web]
+    /// upstream_connect_addr` is set. `None`: the `upstream_url` host is
+    /// resolved normally.
+    pub upstream_connect: Option<UpstreamConnect>,
     pub cookie_key: SessionKey,
     /// Parent domain for the shared `fleet_session` SSO cookie
     /// (`Domain=` attribute). `None` (unset or empty in config) means
@@ -119,6 +124,21 @@ impl std::fmt::Debug for UpstreamTls {
             }
         }
     }
+}
+
+/// A fixed socket address for the connection to trawld, from `[web]
+/// upstream_connect_addr` (ADR-0048).
+///
+/// The client dials `addr` whenever the upstream URL names `host`, and
+/// never asks a resolver for it. TLS still verifies `host`, so a sidecar can
+/// reach trawld over loopback and check that the certificate names the
+/// host in `upstream_url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamConnect {
+    /// The `upstream_url` host: a DNS name, never an IP literal.
+    pub host: String,
+    /// Where the connection goes. Its port equals the `upstream_url` port.
+    pub addr: SocketAddr,
 }
 
 /// Errors while loading or validating proxy configuration.
@@ -190,6 +210,10 @@ pub enum ConfigError {
     #[error("`[web] upstream_url` {0}")]
     UpstreamUrl(UpstreamUrlError),
 
+    /// `[web] upstream_connect_addr` cannot be used with this upstream.
+    #[error("`[web] upstream_connect_addr` {0}")]
+    UpstreamConnectAddr(ConnectAddrError),
+
     /// `[web] upstream_ca_path` cannot be used as a trust root.
     #[error("upstream CA file {path}: {reason}")]
     UpstreamCa { path: PathBuf, reason: String },
@@ -219,6 +243,35 @@ pub enum UpstreamUrlError {
     /// The URL names no host.
     #[error("names no host")]
     NoHost,
+}
+
+/// Why `[web] upstream_connect_addr` was refused. The address is not
+/// echoed; the operator has it in the file.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectAddrError {
+    /// Not an IP address and port.
+    #[error(
+        "is not an IP address and port, such as `127.0.0.1:5514` or `[::1]:5514`. \
+         A host name is not accepted"
+    )]
+    Malformed,
+    /// Port 0 would let the client pick the port from the URL instead.
+    #[error("needs a port other than 0")]
+    PortZero,
+    /// The upstream URL's host is an IP address, so there is no name for
+    /// TLS to verify apart from the address the connection goes to.
+    #[error(
+        "needs an `upstream_url` whose host is a DNS name. TLS verifies that name \
+         while the connection goes to this address, and the URL names an IP address"
+    )]
+    IpHost,
+    /// The URL's port and the address's port differ.
+    #[error(
+        "has port {addr_port}, but `upstream_url` has port {url_port} \
+         (443 when the URL states none). The client would ignore one of them, \
+         so use the same port in both"
+    )]
+    PortMismatch { url_port: u16, addr_port: u16 },
 }
 
 impl ResolvedConfig {
@@ -275,7 +328,13 @@ impl ResolvedConfig {
             .upstream_url
             .clone()
             .unwrap_or_else(|| default_upstream_from_server(server));
-        check_upstream_url(&upstream_url).map_err(ConfigError::UpstreamUrl)?;
+        let checked_url = check_upstream_url(&upstream_url).map_err(ConfigError::UpstreamUrl)?;
+        let upstream_connect = web
+            .upstream_connect_addr
+            .as_deref()
+            .map(|addr| resolve_upstream_connect(&checked_url, addr))
+            .transpose()
+            .map_err(ConfigError::UpstreamConnectAddr)?;
         let upstream_tls = resolve_upstream_tls(
             resolve_upstream_ca_path(
                 std::env::var(ENV_UPSTREAM_CA_PATH).ok().as_deref(),
@@ -304,6 +363,7 @@ impl ResolvedConfig {
             session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
             allow_insecure_cookies,
             upstream_tls,
+            upstream_connect,
             cookie_key,
             shared_domain,
             public_origins,
@@ -514,6 +574,51 @@ pub fn check_upstream_url(upstream_url: &str) -> Result<reqwest::Url, UpstreamUr
         return Err(UpstreamUrlError::NoHost);
     }
     Ok(url)
+}
+
+/// Parse `[web] upstream_connect_addr` against the checked upstream URL
+/// (ADR-0048).
+///
+/// - The value is an IP address and port, IPv6 in brackets. A name is
+///   refused: resolving it would be the resolver answer this setting
+///   exists to replace.
+/// - The URL's host is a DNS name. TLS verifies that name while the
+///   connection goes to `addr`; with an IP literal there is nothing to
+///   verify apart from the address itself.
+/// - The ports agree. The client dials the URL's port when the URL states
+///   one and the address's port when it does not, so a mismatch would
+///   silently drop one of them. The URL's port counts as 443 when it
+///   states none, which also covers an explicit `:443` that the parser
+///   normalizes away.
+///
+/// `url` has passed [`check_upstream_url`], so it is https and names a
+/// host.
+///
+/// # Errors
+/// Returns the [`ConnectAddrError`] naming the rule that refused.
+pub fn resolve_upstream_connect(
+    url: &reqwest::Url,
+    addr: &str,
+) -> Result<UpstreamConnect, ConnectAddrError> {
+    let addr: SocketAddr = addr.parse().map_err(|_| ConnectAddrError::Malformed)?;
+    if addr.port() == 0 {
+        return Err(ConnectAddrError::PortZero);
+    }
+    // `domain` is `None` for an IPv4 or IPv6 literal.
+    let Some(host) = url.domain() else {
+        return Err(ConnectAddrError::IpHost);
+    };
+    let url_port = url.port_or_known_default().unwrap_or(443);
+    if url_port != addr.port() {
+        return Err(ConnectAddrError::PortMismatch {
+            url_port,
+            addr_port: addr.port(),
+        });
+    }
+    Ok(UpstreamConnect {
+        host: host.to_owned(),
+        addr,
+    })
 }
 
 /// Decide how the upstream client verifies trawld's certificate.
@@ -1557,6 +1662,108 @@ session_ttl_secs = 3600
                 assert!(!format!("{error:?}").contains(upstream), "{error:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_connect_addr_resolves_for_a_dns_named_upstream() {
+        for (upstream, addr, host, expected) in [
+            (
+                "https://trawl.test:5514",
+                "127.0.0.1:5514",
+                "trawl.test",
+                "127.0.0.1:5514",
+            ),
+            (
+                "https://trawl.test:5514",
+                "[::1]:5514",
+                "trawl.test",
+                "[::1]:5514",
+            ),
+            // The parser lowercases the host, and the client matches the
+            // lowercased name.
+            (
+                "https://Trawl.Lab.Example:5514",
+                "127.0.0.1:5514",
+                "trawl.lab.example",
+                "127.0.0.1:5514",
+            ),
+            // No port in the URL, or `:443` written out: both are 443.
+            (
+                "https://trawl.test",
+                "127.0.0.1:443",
+                "trawl.test",
+                "127.0.0.1:443",
+            ),
+            (
+                "https://trawl.test:443",
+                "127.0.0.1:443",
+                "trawl.test",
+                "127.0.0.1:443",
+            ),
+        ] {
+            let web = WebConfig {
+                upstream_url: Some(upstream.to_owned()),
+                upstream_connect_addr: Some(addr.to_owned()),
+                ..configured_web()
+            };
+            let resolved = resolve(&web).unwrap_or_else(|e| panic!("{upstream} via {addr}: {e}"));
+            assert_eq!(
+                resolved.upstream_connect,
+                Some(UpstreamConnect {
+                    host: host.to_owned(),
+                    addr: expected.parse().unwrap(),
+                }),
+                "{upstream} via {addr}"
+            );
+        }
+        // Unset: the host resolves normally.
+        let web = WebConfig {
+            upstream_url: Some("https://trawl.test:5514".to_owned()),
+            ..configured_web()
+        };
+        assert_eq!(resolve(&web).unwrap().upstream_connect, None);
+    }
+
+    #[test]
+    fn a_connect_addr_refuses_a_name_a_zero_port_or_a_hidden_port_mismatch() {
+        let url = check_upstream_url("https://trawl.test:5514").unwrap();
+        for addr in [
+            "",
+            "localhost:5514",
+            "trawl.test:5514",
+            "127.0.0.1",
+            "::1:5514",
+        ] {
+            assert_eq!(
+                resolve_upstream_connect(&url, addr),
+                Err(ConnectAddrError::Malformed),
+                "{addr:?}"
+            );
+        }
+        assert_eq!(
+            resolve_upstream_connect(&url, "127.0.0.1:0"),
+            Err(ConnectAddrError::PortZero)
+        );
+        // `:443` is normalized away by the parser, and the client would
+        // then dial the address's port. It still counts as a mismatch.
+        let default_port = check_upstream_url("https://trawl.test:443").unwrap();
+        let error = resolve_upstream_connect(&default_port, "127.0.0.1:5514").unwrap_err();
+        assert_eq!(
+            error,
+            ConnectAddrError::PortMismatch {
+                url_port: 443,
+                addr_port: 5514
+            }
+        );
+        let message = ConfigError::UpstreamConnectAddr(error).to_string();
+        assert!(
+            message.starts_with("`[web] upstream_connect_addr`"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("5514") && message.contains("443"),
+            "got: {message}"
+        );
     }
 
     #[test]
