@@ -125,8 +125,14 @@ is false, except that auto refuses the values it would contradict.
        that uid could read it. In auto mode the key is in tls-key/, outside
        the tls/ directory the sidecar mounts, so the uid is a second
        barrier there. */ -}}
-  {{- $daemonUid := coalesce (dig "runAsUser" nil (.Values.securityContext | default dict)) (dig "runAsUser" nil (.Values.podSecurityContext | default dict)) -}}
-  {{- if and $daemonUid (eq (int $daemonUid) (int $web.runAsUser)) -}}
+  {{- /* Kubernetes takes the container's runAsUser over the pod's when the
+       key is set, 0 included, so resolve by key presence, not truthiness. */ -}}
+  {{- $daemonUid := dig "runAsUser" nil (.Values.podSecurityContext | default dict) -}}
+  {{- $container := .Values.securityContext | default dict -}}
+  {{- if and (hasKey $container "runAsUser") (not (kindIs "invalid" $container.runAsUser)) -}}
+    {{- $daemonUid = $container.runAsUser -}}
+  {{- end -}}
+  {{- if and (not (kindIs "invalid" $daemonUid)) (eq (int $daemonUid) (int $web.runAsUser)) -}}
     {{- fail (printf "web.runAsUser must differ from trawld's uid %d, so trawl-web cannot read trawld's private key" (int $daemonUid)) -}}
   {{- end -}}
   {{- if eq $tls.mode "auto" -}}

@@ -393,7 +393,8 @@ web:
   # The sidecar's own uid. In tls.mode=auto it mounts trawld's tls
   # directory, which holds only cert.pem. trawld's key.pem is in tls-key/,
   # outside that mount, 0600 and owned by trawld's uid
-  # (podSecurityContext.runAsUser). A separate uid keeps the key unreadable
+  # (securityContext.runAsUser when that key is set, even to 0, else
+  # podSecurityContext.runAsUser). A separate uid keeps the key unreadable
   # as well; the render fails if the two are equal. The pod's
   # runAsGroup and fsGroup still apply, so the sidecar reads its ConfigMap
   # and cookie Secret through the group.

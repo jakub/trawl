@@ -281,6 +281,14 @@ class TLS(unittest.TestCase):
                     self.fails({"web": web_values, "tls": {field: value}}, f"tls.{field}")
         self.fails({"web": web(runAsUser=1000)}, "web.runAsUser")
         self.fails({"web": web(runAsUser=1234), "securityContext": {"runAsUser": 1234}}, "web.runAsUser")
+        # trawld's uid is the container's runAsUser when that key is set,
+        # even to 0, and the pod's otherwise.
+        root = {"runAsUser": 0, "runAsNonRoot": False}
+        objects = self.objects({"web": web(runAsUser=1000), "securityContext": root})
+        self.assertEqual(effective_uid(objects, container(objects, "trawld")), 0)
+        self.assertEqual(effective_uid(objects, container(objects, "trawl-web")), 1000)
+        # The pod's uid still applies when the container sets none.
+        self.fails({"web": web(runAsUser=2000), "podSecurityContext": {"runAsUser": 2000}}, "web.runAsUser must differ from trawld's uid 2000")
 
     def test_auto_mode_generated_tls_dir_is_not_shadowed(self):
         # A crash-dump mount at, under, or above <state_dir>/tls would put
