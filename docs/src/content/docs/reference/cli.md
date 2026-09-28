@@ -421,7 +421,7 @@ The doctor runs the checks in this order. When a check's prerequisite is not
 | `api.transport` | A connection to the API origin opens. The doctor sends one `GET /api/v1/health` with no key | `connection.config` |
 | `api.tls` | The API's certificate verifies under the trust mode that the report names: system roots or the pinned CA. An `http` URL fails with `connection is not TLS`. `insecure` fails with `certificate not verified` | `api.transport` |
 | `api.health` | The health answer parses as a Trawl health response with the status `ok`, `degraded`, or `unavailable`, a `checks` map, and a `version`. `trawld` always sends all three. An answer without the map or the version fails with `not a trawl health answer`. The answer must also come with the HTTP status that `trawld` sends for its status: HTTP 200 with `ok` or `degraded`, or HTTP 503 with `unavailable`. Any other pair fails with `status and body disagree`, and any other HTTP status fails as not a health answer. A failed `api.health` sends no key | `api.tls` |
-| `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `error`, `refusing`, and every other value are `failed` | `api.health` |
+| `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `api.health.corpus` with `rollup_pending` or `restart_backlog` is `not_sampled` with the reason `recovering`: `trawld` is still recovering its corpus after a restart. Wait for the recovery to finish, then run the doctor again. `error`, `refusing`, and every other value are `failed` | `api.health` |
 | `api.health._invalid` | The server reported a check name that is not `[a-z][a-z0-9_]{0,63}`. This row is always `failed`, and the report does not show the names. No check name starts with `_`, so this ID cannot match a server's check | `api.health` |
 | `api.identity` | `GET /api/v1/whoami` answers HTTP 200 and accepts the key. `detail` shows the key's name, its kind, and its permissions, never the key or its prefix. The name shows at most 32 characters. The kind is `human` or `service`: any other kind fails with `the answer is not a trawl whoami response`. Only Trawl's own permission names show, such as `query` or `ingest`. Any other permission string is counted as `N unrecognized` and not shown. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail. Any other 2xx status fails with `unexpected status` | `api.health`, and a key selected |
 | `web.transport` | `GET /healthz` on `--web-url` answers HTTP 200 with the body `ok`. HTTP 429 gives `not_sampled` with the reason `rate_limited`, and `web.origin` is then `blocked` | `--web-url` given |
@@ -469,7 +469,7 @@ Every check has one of four outcomes.
 | `complete` | The doctor saw the check's assertion hold |
 | `failed` | The doctor saw evidence against it |
 | `not_configured` | You did not select what the check needs, such as a key |
-| `not_sampled` | The doctor could not look. `reason` says why: `blocked`, `rate_limited`, or `timed_out` |
+| `not_sampled` | The doctor could not look. `reason` says why: `blocked`, `rate_limited`, `recovering`, or `timed_out` |
 
 The verdict follows from the outcomes and sets the exit status.
 

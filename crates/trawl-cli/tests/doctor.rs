@@ -1616,8 +1616,53 @@ fn doctor_accepts_the_health_answers_trawld_sends() {
     }
 }
 
+/// A corpus that trawld is still recovering after a restart makes the
+/// answer 200 `degraded`. The corpus row is `not_sampled` with the reason
+/// `recovering`, not failed, and names the next step. `api.health` is
+/// complete, identity still runs, and with nothing else failing the run is
+/// incomplete and exits 3.
+#[test]
+fn doctor_recovering_corpus_is_not_sampled() {
+    for value in ["rollup_pending", "restart_backlog"] {
+        let body = format!(
+            r#"{{"status":"degraded","checks":{{"duckdb":"ok","corpus":"{value}"}},"version":"{}"}}"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        let (output, stub) = doctor_against(vec![(HEALTH_PATH, 200, body), whoami(r#""query""#)]);
+        assert_eq!(output.status.code(), Some(3), "{value}: {}", text(&output));
+        let report = report(&output);
+        assert_eq!(report["verdict"], "incomplete", "{value}");
+        assert_eq!(
+            check_by_id(&report, "api.health")["outcome"],
+            "complete",
+            "{value}"
+        );
+        assert_eq!(
+            check_by_id(&report, "api.health.duckdb")["outcome"],
+            "complete",
+            "{value}"
+        );
+        let corpus = check_by_id(&report, "api.health.corpus");
+        assert_eq!(corpus["outcome"], "not_sampled", "{value}: {corpus}");
+        assert_eq!(corpus["reason"], "recovering", "{value}: {corpus}");
+        assert_eq!(corpus["detail"], format!("reported {value}"), "{value}");
+        assert_eq!(
+            corpus["next_action"], "wait for trawld to finish recovery, then rerun",
+            "{value}"
+        );
+        assert_eq!(
+            check_by_id(&report, "api.identity")["outcome"],
+            "complete",
+            "{value}"
+        );
+        let requests = stub.requests();
+        let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, [HEALTH_PATH, WHOAMI_PATH], "{value}");
+    }
+}
+
 /// A 503 keeps its per-check body. Rows are sorted by name: `ok` is
-/// complete (the unknown `corpus` included), `error` and `refusing` fail, an
+/// complete (the unknown `wal` included), `error` and `refusing` fail, an
 /// unrecognized value fails and is shown when it is a plain identifier, and
 /// a name that is not one becomes `api.health._invalid` without being
 /// echoed. A server check named `_invalid` is not one either, so it cannot
@@ -1627,7 +1672,7 @@ fn doctor_health_rows_map_values() {
     let home = Sandbox::new();
     let server_ca = ca("trawl doctor server CA");
     let pem = home.file("ca.pem", &server_ca.pem());
-    let body = r#"{"status":"unavailable","checks":{"duckdb":"error","corpus":"ok","auth_db":"ok","data_path":"recovering","storage_db":"Weird Value!","ingest_capacity":"refusing","Bad-Key":"ok","_invalid":"ok"},"version":"9.9.9"}"#;
+    let body = r#"{"status":"unavailable","checks":{"duckdb":"error","wal":"ok","auth_db":"ok","data_path":"recovering","storage_db":"Weird Value!","ingest_capacity":"refusing","Bad-Key":"ok","_invalid":"ok"},"version":"9.9.9"}"#;
     let stub = Stub::tls(
         leaf(&server_ca),
         vec![(HEALTH_PATH, 503, body.to_owned()), whoami(r#""query""#)],
@@ -1654,7 +1699,6 @@ fn doctor_health_rows_map_values() {
         [
             own("api.health", "complete", None),
             own("api.health.auth_db", "complete", None),
-            own("api.health.corpus", "complete", None),
             own(
                 "api.health.data_path",
                 "failed",
@@ -1671,6 +1715,7 @@ fn doctor_health_rows_map_values() {
                 "failed",
                 Some("unrecognized value")
             ),
+            own("api.health.wal", "complete", None),
             own(
                 "api.health._invalid",
                 "failed",

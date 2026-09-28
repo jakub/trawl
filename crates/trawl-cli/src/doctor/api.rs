@@ -678,6 +678,11 @@ fn health_rows(checks: &HashMap<String, String>, secret: Option<&str>) -> Vec<Ch
     rows
 }
 
+/// The health check that trawld reports while its corpus recovers after a
+/// restart (ADR-0041). Only this key has values beyond `ok`, `error`, and
+/// `refusing`.
+const CORPUS_KEY: &str = "corpus";
+
 fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
     let id = format!("{API_HEALTH_KEY_PREFIX}{name}");
     match value {
@@ -685,6 +690,15 @@ fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
             detail: Some("reported ok".to_owned()),
             ..row(&id, Outcome::Complete)
         },
+        // A recovering corpus is not a failure: the server cannot yet vouch
+        // for what it holds, so the doctor could not look (ADR-0047).
+        "rollup_pending" | "restart_backlog" if name == CORPUS_KEY => with_next(
+            Check {
+                detail: Some(format!("reported {value}")),
+                ..with_reason(row(&id, Outcome::NotSampled), reason::RECOVERING)
+            },
+            "wait for trawld to finish recovery, then rerun",
+        ),
         "error" | "refusing" => with_next(
             with_reason(row(&id, Outcome::Failed), format!("reported {value}")),
             format!("read the server's log for why {name} reports {value}"),
@@ -774,7 +788,9 @@ mod tests {
     fn health_rows_sort_and_map_values() {
         let checks = HashMap::from([
             ("duckdb".to_owned(), "error".to_owned()),
-            ("corpus".to_owned(), "recovering".to_owned()),
+            ("wal".to_owned(), "recovering".to_owned()),
+            ("corpus".to_owned(), "rollup_pending".to_owned()),
+            ("storage_db".to_owned(), "restart_backlog".to_owned()),
             ("auth_db".to_owned(), "ok".to_owned()),
             ("ingest_capacity".to_owned(), "refusing".to_owned()),
             ("data_path".to_owned(), "Weird\u{1b}Value".to_owned()),
@@ -793,8 +809,8 @@ mod tests {
                 ("api.health.auth_db", Outcome::Complete, None),
                 (
                     "api.health.corpus",
-                    Outcome::Failed,
-                    Some("reported recovering, a value this CLI does not know")
+                    Outcome::NotSampled,
+                    Some(reason::RECOVERING)
                 ),
                 (
                     "api.health.data_path",
@@ -806,6 +822,16 @@ mod tests {
                     "api.health.ingest_capacity",
                     Outcome::Failed,
                     Some("reported refusing")
+                ),
+                (
+                    "api.health.storage_db",
+                    Outcome::Failed,
+                    Some("reported restart_backlog, a value this CLI does not know")
+                ),
+                (
+                    "api.health.wal",
+                    Outcome::Failed,
+                    Some("reported recovering, a value this CLI does not know")
                 ),
                 (
                     API_HEALTH_INVALID_KEY,

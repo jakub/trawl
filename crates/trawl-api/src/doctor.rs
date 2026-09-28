@@ -275,6 +275,9 @@ pub mod reason {
     pub const PERMISSION_DENIED: &str = "permission_denied";
     /// A prerequisite did not complete; [`super::Check::blocked_by`] names it.
     pub const BLOCKED: &str = "blocked";
+    /// The target is still recovering what it holds, such as trawld's
+    /// corpus after a restart, and cannot answer for it yet.
+    pub const RECOVERING: &str = "recovering";
 }
 
 #[cfg(test)]

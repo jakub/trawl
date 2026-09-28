@@ -84,7 +84,12 @@ fn every_outcome_and_reason_code_is_documented() {
     for outcome in all_outcomes() {
         assert_documented(&format!("| `{}` |", serde_name(outcome)), "the outcome");
     }
-    for code in [reason::BLOCKED, reason::RATE_LIMITED, reason::TIMED_OUT] {
+    for code in [
+        reason::BLOCKED,
+        reason::RATE_LIMITED,
+        reason::RECOVERING,
+        reason::TIMED_OUT,
+    ] {
         assert_documented(&format!("`{code}`"), "the reason code");
     }
 }
