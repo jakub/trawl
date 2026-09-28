@@ -525,7 +525,9 @@ The doctor sends only these requests: `GET /api/v1/health` and
 configured, but three effects remain:
 
 - `GET /api/v1/whoami` updates the key's last-used time.
-- Every request spends rate-limit budget on the server that answers it.
+- `GET /api/v1/whoami` counts against the key's rate limit on trawld.
+  Trawl does not rate limit the health request or `/healthz`, but a proxy
+  in front of either origin may count every request.
 - An HTTP 5xx answer that a request provokes emits its `http_failure` event.
 
 ### Limits
