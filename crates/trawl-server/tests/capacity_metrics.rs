@@ -110,10 +110,19 @@ async fn capacity_metrics_endpoint_exposes_role_series_only() {
             .min_free_disk_bytes
             .to_string()
     );
-    assert!(
-        body.contains("trawl_disk_total_bytes{role=\"data\"}"),
-        "the data row is a series:\n{body}"
-    );
+    // The data row always exists; a WAL or spill row joins it only on
+    // another device, so only the data role is required here.
+    for series in [
+        "trawl_disk_total_bytes{role=\"data\"}",
+        "trawl_disk_available_bytes{role=\"data\"}",
+        "trawl_retention_deletions_total{trigger=\"age\"}",
+        "trawl_retention_deletions_total{trigger=\"disk_pressure\"}",
+    ] {
+        assert!(
+            body.contains(series),
+            "{series} is missing from /metrics:\n{body}"
+        );
+    }
 }
 
 /// The dashboard's capacity row for `env`, once a snapshot lists it.
