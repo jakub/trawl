@@ -148,7 +148,10 @@ fn pinned_state(dir: &tempfile::TempDir, upstream_url: String, ca_pem: &str) -> 
     };
     let resolved = ResolvedConfig::from_parsed(&web, None).expect("resolve config");
     assert!(
-        matches!(resolved.upstream_tls, UpstreamTls::PinnedCa(_)),
+        matches!(
+            resolved.upstream_tls,
+            UpstreamTls::PinnedCa { roots: Some(_), .. }
+        ),
         "{:?}",
         resolved.upstream_tls
     );

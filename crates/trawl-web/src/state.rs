@@ -15,7 +15,6 @@
 //! set, because browsers ignore a clear directive whose
 //! `Domain`/`Path`/`SameSite` don't match issuance.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use axum::http::HeaderValue;
@@ -166,44 +165,33 @@ impl AppState {
     }
 }
 
-/// Where the insecure-loopback client dials the name `localhost`. Port 0
-/// defers to the upstream URL's port, which reqwest always prefers.
-const LOCALHOST_ADDRS: [SocketAddr; 2] = [
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-];
-
-/// Set the upstream trust mode on `builder`.
+/// Set the upstream trust mode and dialing rules on `builder`.
 ///
-/// The client follows no redirect in any mode: trawld never sends one, and
-/// a followed 3xx would carry the proxy past the loopback-only rule of the
-/// insecure mode to a second host with verification off.
+/// In every mode the client:
 ///
-/// The insecure-loopback mode also fixes where it dials. Resolution
-/// accepts the name `localhost`, and the host resolver would otherwise
-/// answer for it later, from `/etc/hosts`, NSS or DNS, any of which can
-/// name another machine. So the client maps `localhost` to `127.0.0.1` and
-/// `::1` itself and never asks the resolver. The alternative, a resolver
-/// that drops non-loopback answers, still depends on the system resolver
-/// answering loopback at all; the fixed map has no such dependency, and it
-/// covers every name the mode admits, since the other spellings are IP
-/// literals that are never resolved. The mode also ignores proxy settings,
-/// such as `HTTPS_PROXY`: a proxy resolves the name on its own side, so
-/// requests with verification off would leave the machine.
+/// - Speaks https only. Resolution already refuses a plain-http
+///   `upstream_url`; this also refuses any other cleartext hop.
+/// - Follows no redirect. trawld never sends one, and a followed 3xx would
+///   carry the signed-in user's key to whatever host the `Location` names
+///   and the trust mode accepts: under the platform roots, any host with a
+///   public certificate.
+/// - Ignores proxy settings, such as `HTTPS_PROXY`. trawl-web always dials
+///   trawld directly.
+///
+/// A pinned CA replaces the platform roots, with host-name verification
+/// left on. A pin whose file did not exist at startup trusts no root at
+/// all, so every handshake fails.
 ///
 /// Split from [`AppState::from_config`] so a test can pass a builder with
-/// its own resolver or proxy and see what the mode overrides.
+/// its own resolver or proxy and see what the modes override.
 fn upstream_client(builder: ClientBuilder, tls: UpstreamTls) -> ClientBuilder {
-    let builder = builder.redirect(reqwest::redirect::Policy::none());
+    let builder = builder
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .no_proxy();
     match tls {
         UpstreamTls::System => builder,
-        // Only the pinned roots, hostname verification left on. A
-        // plain-http hop would skip the pin, so the client refuses one.
-        UpstreamTls::PinnedCa(roots) => builder.tls_certs_only(roots).https_only(true),
-        UpstreamTls::InsecureLoopback => builder
-            .danger_accept_invalid_certs(true)
-            .resolve_to_addrs("localhost", &LOCALHOST_ADDRS)
-            .no_proxy(),
+        UpstreamTls::PinnedCa { roots, .. } => builder.tls_certs_only(roots.unwrap_or_default()),
     }
 }
 
@@ -221,25 +209,24 @@ impl std::fmt::Debug for AppState {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::path::PathBuf;
     use std::time::Duration;
 
-    use reqwest::dns::{Name, Resolve, Resolving};
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::test_support::TlsUpstream;
 
-    /// A host resolver that answers nothing and counts how often it is
-    /// asked, standing in for one that would name another machine.
-    struct RefusingResolver(Arc<AtomicUsize>);
-
-    impl Resolve for RefusingResolver {
-        fn resolve(&self, _name: Name) -> Resolving {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(std::future::ready(
-                Err("the host resolver was asked".into()),
-            ))
-        }
+    /// Both trust modes, the pin pending so no file is needed: the rules
+    /// under test do not depend on which roots are trusted.
+    fn every_mode() -> [UpstreamTls; 2] {
+        [
+            UpstreamTls::System,
+            UpstreamTls::PinnedCa {
+                path: PathBuf::from("/nonexistent/ca.pem"),
+                roots: None,
+            },
+        ]
     }
 
     /// Send one request to `url` with `client` and report whether
@@ -255,68 +242,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insecure_loopback_dials_localhost_without_asking_the_resolver() {
+    async fn every_mode_ignores_a_configured_proxy() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!(
-            "https://localhost:{}/api/v1/whoami",
-            listener.local_addr().unwrap().port()
-        );
+        for tls in every_mode() {
+            let mode = format!("{tls:?}");
+            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = Client::builder().proxy(
+                reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap(),
+            );
+            let client = upstream_client(base, tls).build().unwrap();
 
-        // Control: in the verifying mode the name goes to the resolver,
-        // which refuses, so the injected resolver is the one in use.
-        let asked = Arc::new(AtomicUsize::new(0));
-        let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
-        let client = upstream_client(base, UpstreamTls::System).build().unwrap();
-        let err = client.get(&url).send().await.expect_err("nothing resolves");
-        assert!(err.is_connect(), "got: {err:?}");
-        assert_eq!(asked.load(Ordering::SeqCst), 1);
-
-        let asked = Arc::new(AtomicUsize::new(0));
-        let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
-        let client = upstream_client(base, UpstreamTls::InsecureLoopback)
-            .build()
-            .unwrap();
-        assert!(
-            dials(&client, url, &listener).await,
-            "the insecure client did not dial localhost on 127.0.0.1"
-        );
-        assert_eq!(
-            asked.load(Ordering::SeqCst),
-            0,
-            "the insecure client asked the host resolver for localhost"
-        );
+            let url = format!(
+                "https://127.0.0.1:{}/api/v1/whoami",
+                upstream.local_addr().unwrap().port()
+            );
+            assert!(
+                dials(&client, url, &upstream).await,
+                "{mode}: the client did not dial the upstream directly"
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), proxy.accept())
+                    .await
+                    .is_err(),
+                "{mode}: the client went through the proxy"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn insecure_loopback_ignores_a_configured_proxy() {
+    async fn every_mode_refuses_a_plain_http_request() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap());
-        let client = upstream_client(base, UpstreamTls::InsecureLoopback)
-            .build()
-            .unwrap();
-
-        let url = format!(
-            "https://localhost:{}/api/v1/whoami",
-            upstream.local_addr().unwrap().port()
-        );
-        assert!(
-            dials(&client, url, &upstream).await,
-            "the insecure client did not dial the upstream directly"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), proxy.accept())
+        for tls in every_mode() {
+            let mode = format!("{tls:?}");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = upstream_client(Client::builder(), tls).build().unwrap();
+            let url = format!(
+                "http://127.0.0.1:{}/api/v1/whoami",
+                listener.local_addr().unwrap().port()
+            );
+            // Bounded: a client that did dial would wait forever on the
+            // silent listener, and the test must fail rather than hang.
+            let err = tokio::time::timeout(Duration::from_secs(5), client.get(&url).send())
                 .await
-                .is_err(),
-            "the insecure client went through the proxy"
+                .unwrap_or_else(|_| panic!("{mode}: the client dialed a plain-http upstream"))
+                .expect_err("a cleartext request must refuse");
+            assert!(err.is_builder(), "{mode}: {err:?}");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "{mode}: the client dialed a plain-http upstream"
+            );
+        }
+    }
+
+    /// A pin whose file was absent at startup trusts nothing, not the
+    /// platform roots and not the upstream's own CA.
+    #[tokio::test]
+    async fn a_pending_pin_trusts_no_upstream() {
+        let upstream = TlsUpstream::start().await;
+        let state = AppState::from_config(ResolvedConfig {
+            upstream_url: upstream.url(),
+            upstream_tls: UpstreamTls::PinnedCa {
+                path: upstream.ca_path().to_owned(),
+                roots: None,
+            },
+            ..config(false)
+        })
+        .expect("a pending pin still builds a client");
+        let err = state
+            .http()
+            .get(format!("{}/api/v1/whoami", upstream.url()))
+            .send()
+            .await
+            .expect_err("no root is trusted");
+        assert!(err.is_connect(), "{err:?}");
+        assert!(
+            upstream
+                .mock()
+                .received_requests()
+                .await
+                .expect("recording on")
+                .is_empty(),
+            "a request crossed a handshake that should have failed"
         );
     }
 
-    fn state(cookie_secure: bool) -> AppState {
-        AppState::from_config(ResolvedConfig {
+    fn config(cookie_secure: bool) -> ResolvedConfig {
+        ResolvedConfig {
             bind_addr: "127.0.0.1:8090".into(),
             upstream_url: "https://127.0.0.1:5514".into(),
             session_ttl_secs: 3_600,
@@ -326,8 +340,11 @@ mod tests {
             shared_domain: None,
             public_origins: PublicOrigins::parse(["http://127.0.0.1:8090"])
                 .expect("fixture origin parses"),
-        })
-        .unwrap()
+        }
+    }
+
+    fn state(cookie_secure: bool) -> AppState {
+        AppState::from_config(config(cookie_secure)).unwrap()
     }
 
     fn scope_attributes(header: &str) -> BTreeSet<String> {

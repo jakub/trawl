@@ -150,10 +150,9 @@ pub(crate) fn clear_cookie_for_proxied_response(
 ///
 /// trawld never redirects, and the client follows no redirect (see
 /// [`AppState::from_config`]). Mirroring the 3xx would let the browser
-/// follow it instead: in the insecure-loopback mode another process can
-/// answer on the upstream port, and a `Location` naming another port on
-/// the browser's host would carry the host-scoped session cookie there,
-/// since a cookie's scope ignores the port. Every 3xx is refused, 304
+/// follow it instead: a `Location` naming another port on the browser's
+/// host would carry the host-scoped session cookie there, since a
+/// cookie's scope ignores the port. Every 3xx is refused, 304
 /// included: trawld sends no validators, so a 304 is not an answer it
 /// gives. Shared by every route that relays an upstream status.
 ///
