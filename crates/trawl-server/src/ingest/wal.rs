@@ -1337,7 +1337,7 @@ mod no_clobber {
 
     /// A marker far over the size bound refuses the write from `fstat` on
     /// its descriptor, before any read. It is sparse, so it costs no disk.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn an_oversized_marker_refuses_the_write_without_being_read() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1370,7 +1370,7 @@ mod no_clobber {
     /// A symlink at the marker path refuses the write, even to a valid
     /// marker that claims no name the write would take: the writer never
     /// follows it.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_marker_refuses_the_write() {
         let tmp = tempfile::tempdir().unwrap();

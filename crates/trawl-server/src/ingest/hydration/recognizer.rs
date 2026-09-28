@@ -15,8 +15,8 @@
 //! instants compaction would repair, so a hydrated event reads the same hot
 //! as it will cold.
 //!
-//! Only Linux opens a WAL file without following a symlink and without
-//! blocking on a FIFO. Off Linux every entry is [`Rejection::Unreadable`],
+//! A Unix host opens a WAL file without following a symlink and without
+//! blocking on a FIFO. Off Unix every entry is [`Rejection::Unreadable`],
 //! so the boot hydrates nothing and compaction clears the WAL as
 //! overhang.
 
@@ -735,9 +735,9 @@ mod tests {
         assert_eq!(examine_path(&gone).unwrap_err(), Rejection::Unreadable);
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     #[test]
-    fn off_linux_even_writer_output_is_unreadable() {
+    fn off_unix_even_writer_output_is_unreadable() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(writer_name());
         std::fs::write(&path, written(&awkward_events()).ndjson).unwrap();

@@ -1517,7 +1517,7 @@ fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
 /// Read the rollup marker at `path`, opened with [`open_regular`]. A marker
 /// over [`MAX_ROLLUP_MARKER_BYTES`] is an error: one `fstat` reports is
 /// never read, and one that grows after the `fstat` is read only up to one
-/// byte past the bound. Off Linux no marker is opened, so a present one
+/// byte past the bound. Off Unix no marker is opened, so a present one
 /// cannot be read.
 fn read_rollup_marker(path: &Path) -> Result<String, String> {
     use std::io::Read as _;
@@ -7311,7 +7311,7 @@ mod tests {
 
     /// Run boot rollup recovery over `data` on its own thread, failing the
     /// test if it blocks, and return the gate it recovered through.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     fn recover_at_boot_promptly(data: &Path) -> Arc<PublicationGate> {
         let gate = Arc::new(PublicationGate::starting());
         gate.initialize(data);
@@ -7394,7 +7394,7 @@ mod tests {
     /// A rollup marker over [`MAX_ROLLUP_MARKER_BYTES`] is not read, so no
     /// path it lists is retired, and it stays pending. One at the bound is
     /// read and recovered.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn rollup_boot_recovery_reads_no_marker_over_the_bound() {
         for (len, recovered) in [

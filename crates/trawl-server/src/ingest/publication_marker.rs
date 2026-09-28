@@ -379,7 +379,7 @@ fn io_error(path: &Path, operation: &str, error: &io::Error) -> MarkerError {
 /// read. Anything but a regular file is invalid. A marker over
 /// [`MAX_MARKER_BYTES`] is invalid: one `fstat` reports is never read, and
 /// one that grows after the `fstat` is read only up to one byte past the
-/// bound. Off Linux no marker is opened, so a present one cannot be read.
+/// bound. Off Unix no marker is opened, so a present one cannot be read.
 pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     let file_name = path
         .file_name()
@@ -1420,7 +1420,7 @@ mod tests {
 
     /// A marker far over the size bound is refused from `fstat` on its
     /// descriptor, before any read. It is sparse, so it costs no disk.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn an_oversized_marker_is_invalid_without_being_read() {
         let tmp = tempfile::tempdir().unwrap();
