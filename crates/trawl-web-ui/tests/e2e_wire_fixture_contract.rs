@@ -554,6 +554,20 @@ fn assert_dashboard_measurement_metadata_is_required(dashboard: &trawl_api::Dash
     }
 }
 
+/// The base snapshot carries a complete capacity object (ADR-0042): the
+/// daemon always sends one, and the snapshot refuses to decode without it.
+fn assert_dashboard_carries_capacity(dashboard: &trawl_api::DashboardSnapshot) {
+    assert_eq!(
+        dashboard.capacity.headroom.measurement.status,
+        trawl_api::StorageMeasurementStatus::Complete
+    );
+    assert_eq!(dashboard.capacity.headroom.filesystems.len(), 2);
+    assert_eq!(dashboard.capacity.environments.len(), 1);
+    let mut without_capacity = serde_json::to_value(dashboard).unwrap();
+    without_capacity.as_object_mut().unwrap().remove("capacity");
+    assert!(serde_json::from_value::<trawl_api::DashboardSnapshot>(without_capacity).is_err());
+}
+
 /// The ingest-refusal chip and Warn badge (ADR-0043) are built on refusal
 /// ALONE degrading the report; any other failed check would make the
 /// spec test a different case. The daemon ships `ingest_capacity` in
@@ -621,6 +635,7 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
     );
     assert_eq!(dashboard.parquet_measurement.sample_age_secs, Some(2));
     assert_dashboard_measurement_metadata_is_required(&dashboard);
+    assert_dashboard_carries_capacity(&dashboard);
     assert_eq!(dashboard.hot_buffer_events, 731);
     assert_eq!(dashboard.pool_active, 3);
     assert_eq!(dashboard.pool_retained, stats.pool_retained);
@@ -682,6 +697,437 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
             );
         }
     }
+}
+
+/// Every Disk and retention case (ADR-0042) loads one capacity fixture
+/// over the base snapshot. Each is a slice of `DashboardSnapshot`: the
+/// capacity object with the Parquet and WAL fields it was assembled
+/// beside, because the card reads the Parquet measurement and the
+/// producer derives reach from both measurements. Each field is the
+/// snapshot field of the same name and type, and nothing else rides along.
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct CapacitySnapshotPart {
+    parquet_files: u64,
+    parquet_bytes: u64,
+    parquet_measurement: trawl_api::StorageMeasurement,
+    wal_files: u64,
+    wal_bytes: u64,
+    wal_measurement: trawl_api::StorageMeasurement,
+    capacity: trawl_api::Capacity,
+}
+
+/// The fields `CapacitySnapshotPart` takes from a whole snapshot.
+const CAPACITY_PART_FIELDS: [&str; 7] = [
+    "parquet_files",
+    "parquet_bytes",
+    "parquet_measurement",
+    "wal_files",
+    "wal_bytes",
+    "wal_measurement",
+    "capacity",
+];
+
+const CAPACITY_FIXTURES: [(&str, &str); 7] = [
+    (
+        "health-capacity-complete.json",
+        include_str!("../e2e/harness/wire/health-capacity-complete.json"),
+    ),
+    (
+        "health-capacity-failed-retained.json",
+        include_str!("../e2e/harness/wire/health-capacity-failed-retained.json"),
+    ),
+    (
+        "health-capacity-repin-suppressed.json",
+        include_str!("../e2e/harness/wire/health-capacity-repin-suppressed.json"),
+    ),
+    (
+        "health-capacity-floor-zero.json",
+        include_str!("../e2e/harness/wire/health-capacity-floor-zero.json"),
+    ),
+    (
+        "health-capacity-pressure.json",
+        include_str!("../e2e/harness/wire/health-capacity-pressure.json"),
+    ),
+    (
+        "health-capacity-awaiting.json",
+        include_str!("../e2e/harness/wire/health-capacity-awaiting.json"),
+    ),
+    (
+        "health-capacity-scan-failed.json",
+        include_str!("../e2e/harness/wire/health-capacity-scan-failed.json"),
+    ),
+];
+
+/// The UTC date every capacity fixture was assembled on. Its observed
+/// window runs from `FIXTURE_TODAY` − 8 through `FIXTURE_TODAY` − 2
+/// (`capacity::observed_days` in trawl-server).
+const FIXTURE_TODAY: &str = "2026-09-27";
+
+fn capacity_fixture(name: &str) -> CapacitySnapshotPart {
+    let (name, text) = CAPACITY_FIXTURES
+        .iter()
+        .find(|(file, _)| *file == name)
+        .unwrap_or_else(|| panic!("no capacity fixture {name}"));
+    decode(name, text)
+}
+
+/// Every capacity fixture, and the base snapshot's capacity slice, decodes
+/// as the snapshot fields of the same names with nothing left over, and a
+/// withheld reach carries its reason and no number. The fixtures are
+/// producer output (`src/metrics/capacity_fixtures.rs` in trawl-server
+/// fails when one differs from what `capacity::assemble` emits), so the states
+/// themselves are not modelled here; this checks what the wire promises
+/// the page, and the pins below check the state each case relies on.
+#[test]
+fn health_capacity_fixtures_decode_as_the_wire_types() {
+    let base: serde_json::Value =
+        serde_json::from_str(include_str!("../e2e/harness/wire/health-dashboard.json")).unwrap();
+    let base_part = CAPACITY_PART_FIELDS
+        .iter()
+        .map(|field| ((*field).to_owned(), base[*field].clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let fixtures = CAPACITY_FIXTURES
+        .iter()
+        .map(|(name, text)| (*name, serde_json::from_str(text).unwrap()))
+        .chain([(
+            "health-dashboard.json",
+            serde_json::Value::Object(base_part),
+        )]);
+    for (name, raw) in fixtures {
+        let part: CapacitySnapshotPart = serde_json::from_value(raw.clone())
+            .unwrap_or_else(|e| panic!("{name} does not decode: {e}"));
+        assert_eq!(
+            serde_json::to_value(&part).unwrap(),
+            raw,
+            "{name} carries a field the wire types drop"
+        );
+        for env in raw["capacity"]["environments"].as_array().unwrap() {
+            if env["reach"]["state"] == "withheld" {
+                let keys = env["reach"].as_object().unwrap().keys().collect::<Vec<_>>();
+                assert_eq!(
+                    keys,
+                    ["reason", "state"],
+                    "{name}: {} carries a number on a withheld reach",
+                    env["env"]
+                );
+            }
+        }
+    }
+}
+
+/// A complete sample with a floor: two rows, a completed sweep, three
+/// projected envs sharing one fraction per end, keep-forever growth, and
+/// one env left out of the growth for want of history.
+#[test]
+fn health_capacity_complete_fixture_carries_every_projected_form() {
+    use trawl_api::{
+        DeletionFloor, FilesystemRole, Reach, ReachEnd, StorageMeasurementStatus, SweepOutcome,
+        WithheldReason,
+    };
+
+    let part = capacity_fixture("health-capacity-complete.json");
+    let complete = &part.capacity;
+    assert_eq!(
+        part.parquet_measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(
+        complete.headroom.measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(complete.headroom.measurement.sample_age_secs, Some(2));
+    assert_eq!(
+        complete.headroom.filesystems[0].roles,
+        [FilesystemRole::Data, FilesystemRole::Wal]
+    );
+    assert_eq!(
+        complete.headroom.filesystems[0].floor,
+        Some(DeletionFloor::Armed {
+            floor_bytes: 1_073_741_824,
+            deficit_bytes: 0
+        })
+    );
+    assert_eq!(
+        complete.headroom.filesystems[1].roles,
+        [FilesystemRole::Spill]
+    );
+    assert_eq!(
+        complete.pressure.last_sweep.map(|s| s.outcome),
+        Some(SweepOutcome::Completed)
+    );
+    let reach = |env: &str| {
+        complete
+            .environments
+            .iter()
+            .find(|e| e.env == env)
+            .unwrap_or_else(|| panic!("health-capacity-complete.json lacks env {env}"))
+            .reach
+            .clone()
+    };
+    for (env, low, high, observed) in [
+        ("prod", 38, 52, 7),
+        ("staging", 12, 17, 7),
+        ("lab", 3, 4, 6),
+    ] {
+        assert!(
+            matches!(
+                reach(env),
+                Reach::Projected {
+                    low: ReachEnd::Days { days: l },
+                    high: ReachEnd::Days { days: h },
+                    observed_days: o,
+                    ..
+                } if (l, h, o) == (low, high, observed)
+            ),
+            "{env}: {:?}",
+            reach(env)
+        );
+    }
+    assert!(matches!(
+        reach("archive"),
+        Reach::KeepForever {
+            mean_daily_bytes: 120_000_000,
+            observed_days: 7,
+            ..
+        }
+    ));
+    assert_eq!(
+        reach("k8s"),
+        Reach::Withheld {
+            reason: WithheldReason::InsufficientHistory
+        }
+    );
+    assert_eq!(complete.growth_excluded, ["k8s"]);
+}
+
+/// The headroom attempt failed after a complete sample with a deficit:
+/// the rows are kept with their age, and every reach is withheld as
+/// measurement unavailable, the rate-less k8s included, so nothing is
+/// excluded. The edge env's only partition is dated after the fixture's
+/// today, as a fast agent clock writes one: its oldest date is still the
+/// one on disk.
+#[test]
+fn health_capacity_failed_retained_fixture_withholds_every_reach() {
+    use trawl_api::{DeletionFloor, Reach, StorageMeasurementStatus, SweepOutcome, WithheldReason};
+
+    let part = capacity_fixture("health-capacity-failed-retained.json");
+    let failed = &part.capacity;
+    assert_eq!(
+        part.parquet_measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(
+        failed.headroom.measurement.status,
+        StorageMeasurementStatus::Failed
+    );
+    assert_eq!(failed.headroom.measurement.sample_age_secs, Some(3600));
+    assert_eq!(
+        failed.headroom.filesystems.len(),
+        2,
+        "the failed attempt retains its rows"
+    );
+    assert!(matches!(
+        failed.headroom.filesystems[0].floor,
+        Some(DeletionFloor::Armed { deficit_bytes, .. }) if deficit_bytes > 0
+    ));
+    assert_eq!(
+        failed.pressure.last_sweep.map(|s| s.outcome),
+        Some(SweepOutcome::Failed)
+    );
+    assert_eq!(
+        failed
+            .environments
+            .iter()
+            .map(|e| (e.env.as_str(), e.reach.clone()))
+            .collect::<Vec<_>>(),
+        ["archive", "edge", "k8s", "prod"].map(|env| (
+            env,
+            Reach::Withheld {
+                reason: WithheldReason::MeasurementUnavailable
+            }
+        ))
+    );
+    assert!(failed.growth_excluded.is_empty());
+    let edge = &failed.environments[1];
+    assert_eq!(edge.env, "edge");
+    assert!(
+        edge.oldest_date.as_str() > FIXTURE_TODAY,
+        "{}",
+        edge.oldest_date
+    );
+}
+
+/// Both samples are complete, but the headroom attempt saw a repin: every
+/// reach is withheld as retention suppressed, the rate-less k8s included,
+/// and retention's last sweep stood down.
+#[test]
+fn health_capacity_repin_suppressed_fixture_withholds_every_reach() {
+    use trawl_api::{Reach, StorageMeasurementStatus, SweepOutcome, WithheldReason};
+
+    let part = capacity_fixture("health-capacity-repin-suppressed.json");
+    let suppressed = &part.capacity;
+    assert_eq!(
+        part.parquet_measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(
+        suppressed.headroom.measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(
+        suppressed.pressure.last_sweep.map(|s| s.outcome),
+        Some(SweepOutcome::Suppressed)
+    );
+    assert_eq!(
+        suppressed
+            .environments
+            .iter()
+            .map(|e| (e.env.as_str(), e.reach.clone()))
+            .collect::<Vec<_>>(),
+        ["k8s", "prod", "staging"].map(|env| (
+            env,
+            Reach::Withheld {
+                reason: WithheldReason::RetentionSuppressed
+            }
+        ))
+    );
+    assert!(suppressed.growth_excluded.is_empty());
+}
+
+/// A floor of 0 turns pressure deletion off: at the largest observed day
+/// the disk fills first for every projected env, and at the mean day
+/// every one keeps its full policy.
+#[test]
+fn health_capacity_floor_zero_fixture_turns_pressure_deletion_off() {
+    use trawl_api::{DeletionFloor, Reach, ReachEnd, WithheldReason};
+
+    let part = capacity_fixture("health-capacity-floor-zero.json");
+    let off = &part.capacity;
+    assert_eq!(off.headroom.filesystems.len(), 1);
+    assert_eq!(off.headroom.filesystems[0].floor, Some(DeletionFloor::Off));
+    assert_eq!(off.pressure.pressure_attempts, 0);
+    for env in ["lab", "prod"] {
+        assert!(
+            matches!(
+                off.environments
+                    .iter()
+                    .find(|e| e.env == env)
+                    .unwrap()
+                    .reach,
+                Reach::Projected {
+                    low: ReachEnd::DiskFillsFirst,
+                    high: ReachEnd::FullPolicy,
+                    ..
+                }
+            ),
+            "{env}"
+        );
+    }
+    assert_eq!(
+        off.environments
+            .iter()
+            .find(|e| e.env == "fresh")
+            .unwrap()
+            .reach,
+        Reach::Withheld {
+            reason: WithheldReason::InsufficientHistory
+        }
+    );
+    assert_eq!(off.growth_excluded, ["fresh"]);
+}
+
+/// Under pressure the sweep ran out of candidates below the floor.
+/// Pressure deletion spares only today's partition, so every env holds
+/// today alone, none has a rate, and every finite one is excluded.
+#[test]
+fn health_capacity_pressure_fixture_carries_the_evidence() {
+    use trawl_api::{DeletionFloor, FilesystemRole, Reach, SweepOutcome, WithheldReason};
+
+    let part = capacity_fixture("health-capacity-pressure.json");
+    let pressure = &part.capacity;
+    assert_eq!(pressure.headroom.filesystems.len(), 1);
+    assert_eq!(
+        pressure.headroom.filesystems[0].roles,
+        [
+            FilesystemRole::Data,
+            FilesystemRole::Wal,
+            FilesystemRole::Spill
+        ]
+    );
+    assert_eq!(
+        pressure.headroom.filesystems[0].floor,
+        Some(DeletionFloor::Armed {
+            floor_bytes: 1_073_741_824,
+            deficit_bytes: 473_741_824
+        })
+    );
+    assert_eq!(pressure.pressure.removals_age, 30);
+    assert_eq!(pressure.pressure.removals_disk_pressure, 12);
+    assert_eq!(pressure.pressure.pressure_attempts, 5);
+    let last = pressure.pressure.last_sweep.unwrap();
+    assert_eq!(
+        (last.outcome, last.age_secs),
+        (SweepOutcome::ExhaustedBelowFloor, 61)
+    );
+    // Both samples postdate the sweep, so they see what it left.
+    for age in [
+        part.parquet_measurement.sample_age_secs,
+        pressure.headroom.measurement.sample_age_secs,
+    ] {
+        assert!(age.unwrap() < last.age_secs);
+    }
+    assert_eq!(part.parquet_files, pressure.environments.len() as u64);
+    for env in &pressure.environments {
+        assert_eq!(env.oldest_date, FIXTURE_TODAY, "{}", env.env);
+        assert_eq!(
+            env.reach,
+            Reach::Withheld {
+                reason: WithheldReason::InsufficientHistory
+            },
+            "{}",
+            env.env
+        );
+    }
+    assert_eq!(pressure.growth_excluded, ["lab", "prod"]);
+}
+
+/// No environments, and no complete Parquet scan to establish that: one
+/// case before the first scan, one after a scan that failed with nothing
+/// retained. Neither may read as a measured empty list (ADR-0033).
+#[test]
+fn health_capacity_unmeasured_fixtures_carry_no_complete_scan() {
+    use trawl_api::StorageMeasurementStatus;
+
+    let awaiting = capacity_fixture("health-capacity-awaiting.json");
+    let scan_failed = capacity_fixture("health-capacity-scan-failed.json");
+    for (name, part, status) in [
+        ("awaiting", &awaiting, StorageMeasurementStatus::NotSampled),
+        (
+            "scan-failed",
+            &scan_failed,
+            StorageMeasurementStatus::Failed,
+        ),
+    ] {
+        assert_eq!(part.parquet_measurement.status, status, "{name}");
+        assert_eq!(
+            part.parquet_measurement.sample_age_secs, None,
+            "{name}: no retained scan"
+        );
+        assert!(part.capacity.environments.is_empty(), "{name}");
+        assert_eq!(part.capacity.pressure.last_sweep, None, "{name}");
+    }
+    // Before the first attempt nothing is measured; after a failed scan
+    // the headroom attempt, a separate cache, can still be complete.
+    assert_eq!(
+        awaiting.capacity.headroom.measurement.status,
+        StorageMeasurementStatus::NotSampled
+    );
+    assert_eq!(
+        scan_failed.capacity.headroom.measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(scan_failed.capacity.headroom.filesystems.len(), 1);
 }
 
 #[test]

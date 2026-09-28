@@ -114,6 +114,24 @@ pub const CATALOG_REPIN_ROWS_NULLED_TOTAL: &str = "trawl_catalog_repin_rows_null
 pub const CATALOG_REPIN_ROWS_RESURRECTED_TOTAL: &str = "trawl_catalog_repin_rows_resurrected_total";
 pub const CATALOG_REPIN_DURATION_SECONDS: &str = "trawl_catalog_repin_duration_seconds";
 pub const RETENTION_SUPPRESSED: &str = "trawl_retention_suppressed";
+/// Date directories retention confirmed removed since process start, by
+/// `trigger` ([`crate::retention::RemovalTrigger`]). Incremented only when
+/// the removal returned success, never inferred from a later absence.
+pub const RETENTION_DELETIONS_TOTAL: &str = "trawl_retention_deletions_total";
+/// Retention sweeps since process start whose first free-space check found
+/// the data filesystem below the deletion floor.
+pub const RETENTION_PRESSURE_ATTEMPTS_TOTAL: &str = "trawl_retention_pressure_attempts_total";
+/// The configured deletion floor (`retention.min_free_disk_bytes`); 0 turns
+/// pressure deletion off.
+pub const RETENTION_MIN_FREE_DISK_BYTES: &str = "trawl_retention_min_free_disk_bytes";
+/// A filesystem trawl writes to, by `role` (ADR-0042). One series per
+/// device, labelled with the first role it holds (data, then wal, then
+/// spill), so a `sum()` never counts a device twice. No path, device or
+/// environment label.
+pub const DISK_TOTAL_BYTES: &str = "trawl_disk_total_bytes";
+/// Available bytes on the filesystem [`DISK_TOTAL_BYTES`] describes, with
+/// the same `role` label.
+pub const DISK_AVAILABLE_BYTES: &str = "trawl_disk_available_bytes";
 pub const SCHEDULER_WINDOW_TRUNCATED_TOTAL: &str = "trawl_scheduler_window_truncated_total";
 pub const AUTH_FAILURES_TOTAL: &str = "trawl_auth_failures_total";
 pub const TELEMETRY_WAL_WRITE_FAILURES_TOTAL: &str = "trawl_telemetry_wal_write_failures_total";
@@ -334,6 +352,24 @@ pub fn init_operational_alert_metrics() {
         metrics::counter!(HYDRATION_FILES_TOTAL, "outcome" => outcome.label()).increment(0);
     }
     init_publication_recovery_metrics();
+}
+
+/// Publish retention's series from its config: the configured deletion
+/// floor, and the removal counters (both triggers) and pressure attempts at
+/// zero, so a flat `disk_pressure` series reads as "no pressure deletion
+/// since start" rather than "never wired up".
+///
+/// Called where app state is built from config
+/// ([`crate::state::AppState::from_parts`]), after the recorder is
+/// installed, so every server built from a config publishes them. The
+/// config is fixed for the process. Repeated calls never reset counters.
+#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
+pub fn init_retention_metrics(min_free_disk_bytes: u64) {
+    gauge!(RETENTION_MIN_FREE_DISK_BYTES).set(min_free_disk_bytes as f64);
+    for trigger in crate::retention::RemovalTrigger::ALL {
+        metrics::counter!(RETENTION_DELETIONS_TOTAL, "trigger" => trigger.label()).increment(0);
+    }
+    metrics::counter!(RETENTION_PRESSURE_ATTEMPTS_TOTAL).increment(0);
 }
 
 /// Publish the publication-recovery outcome matrix at zero, so a flat
@@ -649,6 +685,39 @@ pub fn describe_metrics() {
          high across ticks: the archive grows unbounded meanwhile"
     );
     describe_counter!(
+        RETENTION_DELETIONS_TOTAL,
+        "Date directories retention confirmed removed since process start, \
+         labelled by trigger (age = older than the env's max_age_days, \
+         disk_pressure = free space on the data filesystem was below \
+         retention.min_free_disk_bytes). Counted only when the removal \
+         returned success; no bytes-freed figure is kept"
+    );
+    describe_counter!(
+        RETENTION_PRESSURE_ATTEMPTS_TOTAL,
+        "Retention sweeps since process start whose first free-space check \
+         found the data filesystem below retention.min_free_disk_bytes"
+    );
+    describe_gauge!(
+        RETENTION_MIN_FREE_DISK_BYTES,
+        "Configured deletion floor (retention.min_free_disk_bytes): below \
+         this many free bytes on the data filesystem, retention deletes the \
+         date directories nearest their expiry; 0 = pressure deletion off"
+    );
+    describe_gauge!(
+        DISK_TOTAL_BYTES,
+        "Total bytes of each filesystem trawl writes to, one series per \
+         device labelled by the first role it holds (data, then wal, then \
+         spill), so sum() never counts a device twice. From the last \
+         complete measurement; retained after collection failure"
+    );
+    describe_gauge!(
+        DISK_AVAILABLE_BYTES,
+        "Bytes available to trawl on each filesystem it writes to, one \
+         series per device labelled by the first role it holds (data, then \
+         wal, then spill). From the last complete measurement; retained \
+         after collection failure"
+    );
+    describe_counter!(
         SCHEDULER_WINDOW_TRUNCATED_TOTAL,
         "Report runs, scheduled or manual, whose since_last catch-up window \
          was clamped to max_catchup_intervals"
@@ -805,26 +874,115 @@ struct StorageTotals {
     bytes: u64,
 }
 
-#[derive(Clone, Copy)]
-struct CompleteStorageSample {
+/// One storage walk: its flat totals and, for the Parquet tree, the same
+/// bytes split by date partition (ADR-0042).
+///
+/// Every counted byte lands in exactly one place, so the partition bytes
+/// plus `unattributed_bytes` always equal `totals.bytes`. A Parquet file
+/// at any depth under a `{env}/{date}/` partition
+/// ([`crate::env_dirs::date_partition`]) counts toward that partition.
+/// Any other counted file is unattributed: a stray top-level Parquet file,
+/// one under a non-date directory, and every WAL file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StorageScan {
     totals: StorageTotals,
+    pub(crate) env_dates: crate::capacity::EnvDateBytes,
+    pub(crate) unattributed_bytes: u64,
+    /// Whether the repin fence around a Parquet attempt's walk saw a repin
+    /// ([`scan_parquet`]). The Parquet cache ages apart from
+    /// the headroom cache, so this scan carries its own evidence rather than
+    /// borrow the headroom sample's. Always `false` for the WAL.
+    pub(crate) repin_in_flight: bool,
+}
+
+impl StorageScan {
+    /// Count one file of `bytes` into the totals and its partition.
+    ///
+    /// # Errors
+    /// Any sum that would overflow `u64`. A sparse file's logical length
+    /// can approach it, and a wrapped sum would understate stored bytes and
+    /// overstate reach, so the attempt fails instead and the cache keeps
+    /// the last complete scan (ADR-0033). Nothing is counted on error.
+    fn count(&mut self, partition: Partition<'_>, bytes: u64) -> std::io::Result<()> {
+        let overflow = || std::io::Error::other("storage scan byte or file count overflows u64");
+        let files = self.totals.files.checked_add(1).ok_or_else(overflow)?;
+        let total = self.totals.bytes.checked_add(bytes).ok_or_else(overflow)?;
+        let slot = match partition {
+            Partition::Date(env, date) => self.env_dates.entry((env.to_owned(), date)).or_default(),
+            Partition::Root | Partition::Env(_) | Partition::Unattributed => {
+                &mut self.unattributed_bytes
+            }
+        };
+        *slot = slot.checked_add(bytes).ok_or_else(overflow)?;
+        self.totals = StorageTotals {
+            files,
+            bytes: total,
+        };
+        Ok(())
+    }
+}
+
+/// A cached sample that carries a file and byte total.
+trait StorageSample: Clone {
+    fn totals(&self) -> StorageTotals;
+}
+
+impl StorageSample for StorageTotals {
+    fn totals(&self) -> StorageTotals {
+        *self
+    }
+}
+
+/// The Parquet cache holds the whole scan behind an `Arc`, so a reader
+/// never clones the partition map under the cache lock.
+impl StorageSample for Arc<StorageScan> {
+    fn totals(&self) -> StorageTotals {
+        self.totals
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CompleteStorageSample<T> {
+    value: T,
     completed_at: Instant,
 }
 
-#[derive(Default)]
-struct StorageState {
-    complete: Option<CompleteStorageSample>,
+struct StorageState<T> {
+    complete: Option<CompleteStorageSample<T>>,
     /// Completion of any attempt throttles retries independently of sample age.
     attempt_finished_at: Option<Instant>,
     failed: bool,
 }
 
+impl<T> Default for StorageState<T> {
+    fn default() -> Self {
+        Self {
+            complete: None,
+            attempt_finished_at: None,
+            failed: false,
+        }
+    }
+}
+
 /// One source's attempts and gauge publication share ownership. Dashboard reads
 /// only lock `state`, which is never held over a scan or gauge publication.
-#[derive(Default)]
-struct StorageCache {
+///
+/// Generic over the sample so every measured source (WAL and Parquet totals,
+/// filesystem headroom) shares one implementation of the ADR-0033 contract:
+/// serialized attempts, the retry TTL, retain-last-complete on failure, and
+/// age measured from completion on the monotonic clock.
+struct StorageCache<T> {
     attempt: Mutex<()>,
-    state: Mutex<StorageState>,
+    state: Mutex<StorageState<T>>,
+}
+
+impl<T> Default for StorageCache<T> {
+    fn default() -> Self {
+        Self {
+            attempt: Mutex::default(),
+            state: Mutex::default(),
+        }
+    }
 }
 
 /// A coherent view assembled under one short cache lock.
@@ -834,29 +992,41 @@ pub(crate) struct StorageSnapshot {
     pub measurement: trawl_api::StorageMeasurement,
 }
 
-impl StorageCache {
+impl<T: StorageSample> StorageCache<T> {
     fn snapshot(&self, configured: bool, now: Instant) -> StorageSnapshot {
+        let (measurement, sample) = self.read(configured, now);
+        let totals = sample.map(|sample| sample.totals()).unwrap_or_default();
+        StorageSnapshot {
+            files: totals.files,
+            bytes: totals.bytes,
+            measurement,
+        }
+    }
+}
+
+impl<T: Clone> StorageCache<T> {
+    /// The status, age, and retained sample, read under one short lock.
+    /// Without a complete sample there is no value to present.
+    fn read(&self, configured: bool, now: Instant) -> (trawl_api::StorageMeasurement, Option<T>) {
         use trawl_api::StorageMeasurementStatus as Status;
         let state = self.state.lock().expect("storage cache poisoned");
         let (status, sample) = if !configured {
             (Status::NotConfigured, None)
         } else if state.failed {
-            (Status::Failed, state.complete)
+            (Status::Failed, state.complete.as_ref())
         } else if state.complete.is_some() {
-            (Status::Complete, state.complete)
+            (Status::Complete, state.complete.as_ref())
         } else {
             (Status::NotSampled, None)
         };
-        let totals = sample.map_or_else(StorageTotals::default, |s| s.totals);
-        StorageSnapshot {
-            files: totals.files,
-            bytes: totals.bytes,
-            measurement: trawl_api::StorageMeasurement {
+        (
+            trawl_api::StorageMeasurement {
                 status,
                 sample_age_secs: sample
                     .map(|s| now.saturating_duration_since(s.completed_at).as_secs()),
             },
-        }
+            sample.map(|s| s.value.clone()),
+        )
     }
 
     /// `clock`, `scan`, and `publish` are instance-scoped seams: tests control
@@ -865,8 +1035,8 @@ impl StorageCache {
     fn collect(
         &self,
         clock: impl Fn() -> Instant,
-        scan: impl FnOnce() -> std::io::Result<StorageTotals>,
-        mut publish: impl FnMut(StorageTotals),
+        scan: impl FnOnce() -> std::io::Result<T>,
+        mut publish: impl FnMut(T),
     ) {
         let _owner = self.attempt.lock().expect("storage attempt poisoned");
         // Recheck after ownership: another emitter or scrape may have finished
@@ -883,29 +1053,40 @@ impl StorageCache {
             let mut state = self.state.lock().expect("storage cache poisoned");
             state.attempt_finished_at = Some(completed_at);
             state.failed = result.is_err();
-            if let Ok(totals) = result {
+            if let Ok(value) = result {
                 state.complete = Some(CompleteStorageSample {
-                    totals,
+                    value,
                     completed_at,
                 });
             }
         }
-        let sample = self.state.lock().expect("storage cache poisoned").complete;
+        let sample = self
+            .state
+            .lock()
+            .expect("storage cache poisoned")
+            .complete
+            .as_ref()
+            .map(|s| s.value.clone());
         if let Some(sample) = sample {
             // No first-success sample means no invented numeric gauge. A failed
             // attempt retains complete totals, including genuinely measured zero.
-            publish(sample.totals);
+            publish(sample);
         }
     }
 }
 
-fn parquet_cache() -> &'static StorageCache {
-    static CACHE: OnceLock<StorageCache> = OnceLock::new();
+fn parquet_cache() -> &'static StorageCache<Arc<StorageScan>> {
+    static CACHE: OnceLock<StorageCache<Arc<StorageScan>>> = OnceLock::new();
     CACHE.get_or_init(StorageCache::default)
 }
 
-fn wal_cache() -> &'static StorageCache {
-    static CACHE: OnceLock<StorageCache> = OnceLock::new();
+fn wal_cache() -> &'static StorageCache<StorageTotals> {
+    static CACHE: OnceLock<StorageCache<StorageTotals>> = OnceLock::new();
+    CACHE.get_or_init(StorageCache::default)
+}
+
+fn headroom_cache() -> &'static StorageCache<crate::capacity::HeadroomSample> {
+    static CACHE: OnceLock<StorageCache<crate::capacity::HeadroomSample>> = OnceLock::new();
     CACHE.get_or_init(StorageCache::default)
 }
 
@@ -914,6 +1095,9 @@ fn wal_cache() -> &'static StorageCache {
 ///
 /// Called by Prometheus scrapes and the stats emitter. Filesystem scans and
 /// competing attempts may block; dashboard readers only read the short cache.
+/// `repin_jobs` is this process's repin job generation
+/// ([`crate::state::AppState::repin_jobs`]), which fences both capacity
+/// samples.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
 pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
@@ -921,6 +1105,7 @@ pub fn collect_gauges(
     fallback_glob: &str,
     wal_dir: Option<&Path>,
     retained_permits: usize,
+    repin_jobs: &crate::repin::JobGeneration,
 ) {
     // Callers snapshot the pool count before collection. No pool registry lock
     // travels with this number through a storage scan or attempt-owner wait.
@@ -948,31 +1133,116 @@ pub fn collect_gauges(
     }
 
     // Parquet file gauges — walk the glob pattern's parent directory.
-    collect_parquet_gauges(fallback_glob);
+    let data_root = data_root(fallback_glob);
+    collect_parquet_gauges(data_root, repin_jobs);
 
     if let Some(dir) = wal_dir {
         collect_wal_gauges(dir);
     }
+
+    collect_headroom(data_root, wal_dir, repin_jobs);
 }
 
-/// Collect the ingested Parquet totals with the shared attempt/cache policy.
-fn collect_parquet_gauges(fallback_glob: &str) {
+/// The data root the fallback glob selects: the Parquet scan walks it and
+/// headroom stats its filesystem.
+fn data_root(fallback_glob: &str) -> &Path {
     // Preserve the fallback glob's existing root selection.
     let base = fallback_glob
         .find('*')
         .map_or(fallback_glob, |pos| &fallback_glob[..pos]);
     // Preserve `/` itself rather than turning an absolute root into an empty path.
     let trimmed = base.trim_end_matches('/');
-    let base = Path::new(if trimmed.is_empty() && base.starts_with('/') {
+    Path::new(if trimmed.is_empty() && base.starts_with('/') {
         "/"
     } else {
         trimmed
-    });
+    })
+}
+
+/// Collect the ingested Parquet totals with the shared attempt/cache policy.
+fn collect_parquet_gauges(base: &Path, repin_jobs: &crate::repin::JobGeneration) {
     parquet_cache().collect(
         Instant::now,
-        || scan_storage(base, StorageKind::Parquet),
-        |totals| publish_storage_gauges(StorageKind::Parquet, totals),
+        || scan_parquet(base, repin_jobs).map(Arc::new),
+        |scan| publish_storage_gauges(StorageKind::Parquet, scan.totals),
     );
+}
+
+/// One Parquet attempt: the walk inside the repin fence
+/// ([`crate::capacity::fence::RepinFence`]) the headroom sample also takes.
+///
+/// Any repin job that overlaps the walk is recorded, and the projection
+/// withholds reach from the scan: the walk may have counted two
+/// generations of stored bytes, or some envs from each.
+///
+/// # Errors
+/// The walk's error or the fence's. Each fails the attempt, so the cache
+/// keeps the last complete scan (ADR-0033).
+fn scan_parquet(
+    root: &Path,
+    repin_jobs: &crate::repin::JobGeneration,
+) -> std::io::Result<StorageScan> {
+    scan_parquet_with(root, repin_jobs, &mut |_, _| Ok(()))
+}
+
+/// [`scan_parquet`] with the walk's test seam ([`scan_storage_with`]).
+fn scan_parquet_with(
+    root: &Path,
+    repin_jobs: &crate::repin::JobGeneration,
+    walk_op: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
+) -> std::io::Result<StorageScan> {
+    let fence = crate::capacity::fence::RepinFence::open(root, repin_jobs)?;
+    let mut scan = scan_storage_with(root, StorageKind::Parquet, walk_op)?;
+    scan.repin_in_flight = fence.close()?;
+    Ok(scan)
+}
+
+/// Sample the data, WAL and spill filesystems with the shared attempt/cache
+/// policy (ADR-0042 headroom under ADR-0033 status and age). `wal_dir` is the
+/// live WAL writer's directory, so a query-only node stats no WAL role.
+fn collect_headroom(
+    data_root: &Path,
+    wal_dir: Option<&Path>,
+    repin_jobs: &crate::repin::JobGeneration,
+) {
+    headroom_cache().collect(
+        Instant::now,
+        || {
+            crate::capacity::sample_headroom(
+                data_root,
+                wal_dir,
+                &trawl_engine::spill_dir(),
+                repin_jobs,
+                crate::capacity::stat_filesystem,
+            )
+        },
+        |sample| publish_headroom_gauges(&sample),
+    );
+}
+
+/// The `role` label for a headroom row: its first role, so each device has
+/// exactly one series.
+const fn role_label(role: trawl_api::FilesystemRole) -> &'static str {
+    match role {
+        trawl_api::FilesystemRole::Data => "data",
+        trawl_api::FilesystemRole::Wal => "wal",
+        trawl_api::FilesystemRole::Spill => "spill",
+    }
+}
+
+/// Called only while the headroom attempt owner is held, with the last
+/// complete sample: nothing is published before one exists, and a failed
+/// attempt republishes the retained sample, as for the storage totals.
+#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
+fn publish_headroom_gauges(sample: &crate::capacity::HeadroomSample) {
+    for device in &sample.filesystems {
+        let Some(&first) = device.roles.first() else {
+            continue;
+        };
+        let role = role_label(first);
+        gauge!(DISK_TOTAL_BYTES, "role" => role).set(device.total_bytes as f64);
+        gauge!(DISK_AVAILABLE_BYTES, "role" => role).set(device.available_bytes as f64);
+    }
 }
 
 /// One walked `.parquet` file and its size on disk.
@@ -1072,6 +1342,41 @@ impl StorageKind {
     }
 }
 
+/// Where a walked directory sits in the `{env}/{date}/…` layout.
+#[derive(Clone, Copy)]
+enum Partition<'a> {
+    /// The Parquet root: a child directory may be an env.
+    Root,
+    /// A root child: a child directory may be a date partition.
+    Env(&'a str),
+    /// A date partition, at any depth below it.
+    Date(&'a str, chrono::NaiveDate),
+    /// Anywhere else, and the whole WAL tree.
+    Unattributed,
+}
+
+impl StorageKind {
+    /// The WAL is never bucketed: its partitions are not retention's.
+    fn root_partition(self) -> Partition<'static> {
+        match self {
+            Self::Parquet => Partition::Root,
+            Self::Wal => Partition::Unattributed,
+        }
+    }
+}
+
+/// The partition of `parent`'s child directory `name`. A non-UTF-8 name is
+/// no env and no date.
+fn child_partition<'a>(parent: Partition<'a>, name: Option<&'a str>) -> Partition<'a> {
+    match parent {
+        Partition::Root => name.map_or(Partition::Unattributed, Partition::Env),
+        Partition::Env(env) => name
+            .and_then(|name| crate::env_dirs::date_partition(env, name))
+            .map_or(Partition::Unattributed, |date| Partition::Date(env, date)),
+        Partition::Date(..) | Partition::Unattributed => parent,
+    }
+}
+
 /// Operations at which tests can inject faults or remove real descendants.
 /// Production still uses the same filesystem calls and error policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1084,7 +1389,7 @@ enum StorageWalkOp {
     CompleteRoot,
 }
 
-fn scan_storage(root: &Path, kind: StorageKind) -> std::io::Result<StorageTotals> {
+fn scan_storage(root: &Path, kind: StorageKind) -> std::io::Result<StorageScan> {
     scan_storage_with(root, kind, &mut |_, _| Ok(()))
 }
 
@@ -1092,8 +1397,9 @@ fn scan_storage_with(
     root: &Path,
     kind: StorageKind,
     before: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
-) -> std::io::Result<StorageTotals> {
-    let totals = scan_storage_dir(root, root, kind, before)?;
+) -> std::io::Result<StorageScan> {
+    let mut scan = StorageScan::default();
+    scan_storage_dir(root, root, kind, kind.root_partition(), &mut scan, before)?;
     // Even a successful empty traversal must finish with an enumerable root.
     // Consume entries as read_dir can succeed and subsequently yield an error.
     before(StorageWalkOp::CompleteRoot, root)?;
@@ -1101,7 +1407,12 @@ fn scan_storage_with(
         before(StorageWalkOp::Entry, root)?;
         entry?;
     }
-    Ok(totals)
+    debug_assert_eq!(
+        scan.env_dates.values().sum::<u64>() + scan.unattributed_bytes,
+        scan.totals.bytes,
+        "every counted byte is bucketed exactly once"
+    );
+    Ok(scan)
 }
 
 fn confirmed_absent(
@@ -1117,20 +1428,21 @@ fn confirmed_absent(
             .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Walk `dir`, counting into `scan`. A failed walk's partial counts are
+/// discarded with the scan, never published.
 fn scan_storage_dir(
     root: &Path,
     dir: &Path,
     kind: StorageKind,
+    partition: Partition<'_>,
+    scan: &mut StorageScan,
     before: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
-) -> std::io::Result<StorageTotals> {
+) -> std::io::Result<()> {
     let entries = match before(StorageWalkOp::ReadDir, dir).and_then(|()| std::fs::read_dir(dir)) {
         Ok(entries) => entries,
-        Err(error) if confirmed_absent(root, dir, &error, before) => {
-            return Ok(StorageTotals::default());
-        }
+        Err(error) if confirmed_absent(root, dir, &error, before) => return Ok(()),
         Err(error) => return Err(error),
     };
-    let mut totals = StorageTotals::default();
     for entry in entries {
         // An iterator failure has no trustworthy descendant path. Never excuse
         // it as a disappearing file, even when its error kind is NotFound.
@@ -1144,9 +1456,9 @@ fn scan_storage_dir(
                 Err(error) => return Err(error),
             };
         if file_type.is_dir() && !kind.excluded_dir(&path) {
-            let child = scan_storage_dir(root, &path, kind, before)?;
-            totals.files += child.files;
-            totals.bytes += child.bytes;
+            let name = entry.file_name();
+            let child = child_partition(partition, name.to_str());
+            scan_storage_dir(root, &path, kind, child, scan, before)?;
         } else if file_type.is_file() && kind.selected(&path) {
             let metadata =
                 match before(StorageWalkOp::Metadata, &path).and_then(|()| entry.metadata()) {
@@ -1154,18 +1466,17 @@ fn scan_storage_dir(
                     Err(error) if confirmed_absent(root, &path, &error, before) => continue,
                     Err(error) => return Err(error),
                 };
-            totals.files += 1;
-            totals.bytes += metadata.len();
+            scan.count(partition, metadata.len())?;
         }
     }
-    Ok(totals)
+    Ok(())
 }
 
 /// WAL and Parquet use separate owners, but the same invariant implementation.
 fn collect_wal_gauges(wal_dir: &Path) {
     wal_cache().collect(
         Instant::now,
-        || scan_storage(wal_dir, StorageKind::Wal),
+        || scan_storage(wal_dir, StorageKind::Wal).map(|scan| scan.totals),
         |totals| publish_storage_gauges(StorageKind::Wal, totals),
     );
 }
@@ -1187,11 +1498,46 @@ pub(crate) fn cached_wal_stats(configured: bool) -> StorageSnapshot {
     wal_cache().snapshot(configured, Instant::now())
 }
 
+/// The Parquet totals and the scan they came from, from one cache read, so
+/// the dashboard's totals and its per-date buckets describe the same walk.
+/// The scan is shared behind its `Arc`, never cloned under the cache lock.
+///
 /// The fallback archive is configured even on a query-only cold start. An absent
 /// directory is a failed measurement, never a measured empty directory.
-pub(crate) fn cached_parquet_stats() -> StorageSnapshot {
-    parquet_cache().snapshot(true, Instant::now())
+pub(crate) fn cached_parquet_scan() -> (StorageSnapshot, Option<Arc<StorageScan>>) {
+    read_parquet_scan(parquet_cache(), Instant::now())
 }
+
+/// [`cached_parquet_scan`] over any Parquet cache, read at `now`.
+fn read_parquet_scan(
+    cache: &StorageCache<Arc<StorageScan>>,
+    now: Instant,
+) -> (StorageSnapshot, Option<Arc<StorageScan>>) {
+    let (measurement, scan) = cache.read(true, now);
+    let totals = scan.as_ref().map(StorageSample::totals).unwrap_or_default();
+    (
+        StorageSnapshot {
+            files: totals.files,
+            bytes: totals.bytes,
+            measurement,
+        },
+        scan,
+    )
+}
+
+/// The headroom measurement and its retained sample, from one short cache
+/// read. The data root and the spill directory always exist as roles, so
+/// headroom is always configured: before the first attempt it is
+/// `not_sampled`.
+pub(crate) fn cached_headroom() -> (
+    trawl_api::StorageMeasurement,
+    Option<crate::capacity::HeadroomSample>,
+) {
+    headroom_cache().read(true, Instant::now())
+}
+
+#[cfg(test)]
+mod capacity_fixtures;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -1217,7 +1563,7 @@ mod tests {
     }
 
     fn assert_storage(
-        cache: &StorageCache,
+        cache: &StorageCache<StorageTotals>,
         now: Instant,
         status: trawl_api::StorageMeasurementStatus,
         totals: StorageTotals,
@@ -1494,7 +1840,7 @@ mod tests {
         ] {
             let tmp = tempfile::tempdir().unwrap();
             assert_eq!(
-                scan_storage(tmp.path(), kind).unwrap(),
+                scan_storage(tmp.path(), kind).unwrap().totals,
                 StorageTotals::default()
             );
             let env = tmp.path().join("prod");
@@ -1502,7 +1848,7 @@ mod tests {
             std::fs::write(env.join(format!("selected.{extension}")), "123").unwrap();
             std::fs::write(env.join("ignored.tmp"), "12345").unwrap();
             assert_eq!(
-                scan_storage(tmp.path(), kind).unwrap(),
+                scan_storage(tmp.path(), kind).unwrap().totals,
                 StorageTotals { files: 1, bytes: 3 }
             );
             let absent = tmp.path().join("query-only-archive-not-created");
@@ -1514,8 +1860,504 @@ mod tests {
         std::fs::create_dir(tmp.path().join("scheduled")).unwrap();
         std::fs::write(tmp.path().join("scheduled/report.parquet"), "123").unwrap();
         assert_eq!(
-            scan_storage(tmp.path(), StorageKind::Parquet).unwrap(),
+            scan_storage(tmp.path(), StorageKind::Parquet)
+                .unwrap()
+                .totals,
             StorageTotals::default()
+        );
+    }
+
+    #[test]
+    fn storage_scan_buckets_env_date_bytes() {
+        use chrono::NaiveDate;
+        use std::collections::BTreeMap;
+        let date = |day| NaiveDate::from_ymd_opt(2026, 9, day).unwrap();
+        let bucket = |env: &str, day| (env.to_owned(), date(day));
+        let write = |root: &Path, path: &str, bytes: usize| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; bytes]).unwrap();
+        };
+        let assert_invariant = |scan: &StorageScan| {
+            assert_eq!(
+                scan.env_dates.values().sum::<u64>() + scan.unattributed_bytes,
+                scan.totals.bytes,
+                "{scan:?}"
+            );
+        };
+
+        // A valid layout: hourly files under {env}/{date}/{hour}/, daily
+        // files under {env}/{date}/, a non-Parquet sibling, and saved
+        // report output under scheduled/.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "prod/2026-09-20/00/nginx.parquet", 10);
+        write(root, "prod/2026-09-20/01/nginx.parquet", 20);
+        write(root, "prod/2026-09-20/nginx.parquet.tmp", 999);
+        write(root, "prod/2026-09-19/nginx.parquet", 100);
+        write(root, "prod/2026-09-19/api.parquet", 1);
+        write(root, "lab/2026-09-20/api.parquet", 7);
+        write(root, "lab/2026-09-20/03/api.parquet", 3);
+        write(root, "scheduled/report.parquet", 5_000);
+        write(root, "scheduled/2026-09-20/report.parquet", 5_000);
+
+        let scan = scan_storage(root, StorageKind::Parquet).unwrap();
+        let buckets = BTreeMap::from([
+            (bucket("lab", 20), 10),
+            (bucket("prod", 19), 101),
+            (bucket("prod", 20), 30),
+        ]);
+        assert_eq!(
+            scan.totals,
+            StorageTotals {
+                files: 6,
+                bytes: 141
+            }
+        );
+        assert_eq!(scan.env_dates, buckets);
+        assert_eq!(scan.unattributed_bytes, 0);
+        assert_invariant(&scan);
+
+        // Parquet outside a date partition is counted but unattributed: a
+        // stray top-level file, one directly under an env, one under a
+        // non-date directory, and one under a reserved name.
+        write(root, "stray.parquet", 11);
+        write(root, "prod/stray.parquet", 17);
+        write(root, "prod/not-a-date/x.parquet", 5);
+        write(root, "prod/2026-02-30/x.parquet", 19);
+        write(root, "wal/2026-09-20/x.parquet", 13);
+        let scan = scan_storage(root, StorageKind::Parquet).unwrap();
+        assert_eq!(
+            scan.totals,
+            StorageTotals {
+                files: 11,
+                bytes: 206
+            }
+        );
+        assert_eq!(scan.env_dates, buckets, "stray files never join a bucket");
+        assert_eq!(scan.unattributed_bytes, 65);
+        assert_invariant(&scan);
+
+        // The WAL never buckets, even laid out as {env}/{date}/.
+        write(root, "prod/2026-09-20/batch.ndjson", 8);
+        write(root, "stray.ndjson", 4);
+        let wal = scan_storage(root, StorageKind::Wal).unwrap();
+        assert_eq!(
+            wal.totals,
+            StorageTotals {
+                files: 2,
+                bytes: 12
+            }
+        );
+        assert!(wal.env_dates.is_empty());
+        assert_eq!(wal.unattributed_bytes, 12);
+        assert_invariant(&wal);
+    }
+
+    /// A sparse file's logical length can be near `u64::MAX`, so the walk's
+    /// sums can overflow. Wrapping would understate the stored bytes and
+    /// overstate reach, so every accumulator is checked and an overflow
+    /// fails the attempt: the cache keeps the last complete scan (ADR-0033).
+    /// The walk runs over real files, into an accumulator seeded next to
+    /// the limit, since no portable filesystem holds files that large.
+    #[test]
+    fn storage_scan_overflow_fails_the_attempt() {
+        use chrono::NaiveDate;
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("prod/2026-09-20")).unwrap();
+        std::fs::write(root.join("prod/2026-09-20/x.parquet"), "12345").unwrap();
+        std::fs::write(root.join("stray.parquet"), "12345").unwrap();
+        let bucket = (
+            "prod".to_owned(),
+            NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
+        );
+        let near = u64::MAX - 2;
+        let walk = |mut scan: StorageScan| {
+            scan_storage_dir(
+                root,
+                root,
+                StorageKind::Parquet,
+                StorageKind::Parquet.root_partition(),
+                &mut scan,
+                &mut |_, _| Ok(()),
+            )
+            .map(|()| scan)
+        };
+
+        // Each accumulator on its own: the file count, the flat bytes, a
+        // date partition's bytes, and the unattributed bytes.
+        let seeds = [
+            StorageScan {
+                totals: StorageTotals {
+                    files: u64::MAX,
+                    bytes: 0,
+                },
+                ..StorageScan::default()
+            },
+            StorageScan {
+                totals: StorageTotals {
+                    files: 0,
+                    bytes: near,
+                },
+                ..StorageScan::default()
+            },
+            StorageScan {
+                env_dates: [(bucket.clone(), near)].into(),
+                ..StorageScan::default()
+            },
+            StorageScan {
+                unattributed_bytes: near,
+                ..StorageScan::default()
+            },
+        ];
+        for seed in seeds {
+            let error = walk(seed.clone()).expect_err("overflow fails the walk");
+            assert!(error.to_string().contains("overflow"), "{error} {seed:?}");
+        }
+        let scan = walk(StorageScan::default()).unwrap();
+        assert_eq!(
+            scan.totals,
+            StorageTotals {
+                files: 2,
+                bytes: 10
+            }
+        );
+
+        // Through the cache: the overflowing attempt is failed, and the last
+        // complete scan is retained and republished.
+        let cache = StorageCache::<Arc<StorageScan>>::default();
+        let now = Instant::now();
+        cache.collect(
+            || now,
+            || walk(StorageScan::default()).map(Arc::new),
+            |_| {},
+        );
+        let mut published = None;
+        cache.collect(
+            || now + Duration::from_secs(30),
+            || {
+                walk(StorageScan {
+                    totals: StorageTotals {
+                        files: 0,
+                        bytes: near,
+                    },
+                    ..StorageScan::default()
+                })
+                .map(Arc::new)
+            },
+            |scan| published = Some(scan.totals),
+        );
+        assert_eq!(
+            published,
+            Some(StorageTotals {
+                files: 2,
+                bytes: 10
+            })
+        );
+        let snapshot = cache.snapshot(true, now + Duration::from_secs(30));
+        assert_eq!(
+            snapshot.measurement.status,
+            trawl_api::StorageMeasurementStatus::Failed
+        );
+        assert_eq!((snapshot.files, snapshot.bytes), (2, 10));
+    }
+
+    /// Run `during` once, at the walk's first directory read.
+    fn mid_walk(during: &dyn Fn()) -> impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()> + '_ {
+        let mut ran = false;
+        move |op, _| {
+            if !ran && op == StorageWalkOp::ReadDir {
+                ran = true;
+                during();
+            }
+            Ok(())
+        }
+    }
+
+    /// The Parquet attempt runs inside the repin fence, so a scan that
+    /// overlaps a repin job, or finds staging on disk at either end,
+    /// records it, and unreadable evidence fails the attempt like a walk
+    /// error: the cache keeps the last complete scan with the flag it was
+    /// taken under.
+    #[test]
+    fn storage_scan_records_a_repin_or_fails_the_attempt() {
+        use std::cell::RefCell;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        std::fs::create_dir_all(root.join("prod/2026-09-20")).unwrap();
+        std::fs::write(root.join("prod/2026-09-20/x.parquet"), "12345").unwrap();
+        let marker = crate::repin::marker::marker_path(&root);
+        let shadow = crate::repin::marker::shadow_root(&root);
+        let jobs = crate::repin::JobGeneration::default();
+        let plain = scan_storage(&root, StorageKind::Parquet).unwrap().totals;
+
+        // No repin, then a job that ends mid-walk, one that begins
+        // mid-walk, and one that spans the walk. The scan is otherwise the
+        // plain walk.
+        let job = RefCell::new(None);
+        let cases: [(bool, &dyn Fn(), bool); 4] = [
+            (false, &|| {}, false),
+            (true, &|| drop(job.borrow_mut().take()), true),
+            (false, &|| *job.borrow_mut() = Some(jobs.begin()), true),
+            (true, &|| {}, true),
+        ];
+        for (at_open, during, expected) in cases {
+            if at_open {
+                *job.borrow_mut() = Some(jobs.begin());
+            }
+            let scan = scan_parquet_with(&root, &jobs, &mut mid_walk(during)).unwrap();
+            assert_eq!(scan.repin_in_flight, expected, "{at_open} {expected}");
+            assert_eq!(scan.totals, plain);
+            drop(job.borrow_mut().take());
+        }
+
+        // Staging on disk with no job in this process, at either end.
+        let cases: [(bool, &dyn Fn()); 2] = [
+            (true, &|| std::fs::remove_file(&marker).unwrap()),
+            (false, &|| std::fs::write(&marker, "{}").unwrap()),
+        ];
+        for (at_open, during) in cases {
+            if at_open {
+                std::fs::write(&marker, "{}").unwrap();
+            }
+            let scan = scan_parquet_with(&root, &jobs, &mut mid_walk(during)).unwrap();
+            assert!(scan.repin_in_flight, "{at_open}");
+            let _ = std::fs::remove_file(&marker);
+        }
+
+        // Evidence that turns unreadable mid-walk (a looping shadow root
+        // symlink) fails the attempt, and the cache retains the last
+        // complete scan and its flag.
+        let cache = StorageCache::<Arc<StorageScan>>::default();
+        let now = Instant::now();
+        cache.collect(|| now, || scan_parquet(&root, &jobs).map(Arc::new), |_| {});
+        let unreadable = || std::os::unix::fs::symlink(&shadow, &shadow).unwrap();
+        cache.collect(
+            || now + Duration::from_secs(30),
+            || scan_parquet_with(&root, &jobs, &mut mid_walk(&unreadable)).map(Arc::new),
+            |_| {},
+        );
+        let (measurement, scan) = cache.read(true, now + Duration::from_secs(30));
+        assert_eq!(
+            measurement.status,
+            trawl_api::StorageMeasurementStatus::Failed
+        );
+        assert!(!scan.expect("retained").repin_in_flight);
+        // Unreadable at open fails the attempt before the walk.
+        assert!(scan_parquet(&root, &jobs).is_err());
+    }
+
+    fn write_env_date(base: &Path, env: &str, bytes: usize) {
+        let dir = base.join(env).join("2026-09-20");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.parquet"), vec![b'x'; bytes]).unwrap();
+    }
+
+    /// A whole repin job, run the way the engine runs one: the job begins,
+    /// writes its marker and a shadow of 1000 bytes per env in `envs`,
+    /// swaps them in with the real cutover, sweeps and drops its marker,
+    /// and ends. It leaves no evidence on disk.
+    fn whole_repin(root: &Path, jobs: &crate::repin::JobGeneration, envs: &[&str]) {
+        let _job = jobs.begin();
+        let shadow = crate::repin::marker::shadow_root(root);
+        let aside = crate::repin::marker::aside_root(root);
+        std::fs::write(crate::repin::marker::marker_path(root), "{}").unwrap();
+        for env in envs {
+            write_env_date(&shadow, env, 1000);
+        }
+        crate::repin::cutover::swap_envs(root, &shadow, &aside).unwrap();
+        crate::repin::cutover::finish_post_swap_staging(root);
+        assert_eq!(crate::repin::in_flight_evidence(root).unwrap(), None);
+    }
+
+    /// Run `during` once, as the walk opens its second env directory.
+    fn before_second_env<'a>(
+        root: &'a Path,
+        during: &'a dyn Fn(),
+    ) -> impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()> + 'a {
+        let mut envs_opened = 0;
+        move |op, path| {
+            if op == StorageWalkOp::ReadDir && path.parent() == Some(root) {
+                envs_opened += 1;
+                if envs_opened == 2 {
+                    during();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A whole repin can build, swap, sweep and clear its marker while the
+    /// scanning thread is descheduled, so the walk reads one env from each
+    /// generation and neither evidence read finds anything. The job
+    /// generation saw it: the scan reports the repin, and the projection
+    /// withholds reach from it as retention suppressed.
+    #[test]
+    fn storage_scan_sees_a_repin_that_swaps_an_env_dir_during_the_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let jobs = crate::repin::JobGeneration::default();
+        for env in ["lab", "prod"] {
+            write_env_date(&root, env, 10);
+        }
+
+        // Control: the same walk seam with nothing moving is the plain scan.
+        let scan = scan_parquet_with(&root, &jobs, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(
+            scan.totals,
+            StorageTotals {
+                files: 2,
+                bytes: 20
+            }
+        );
+        assert!(!scan.repin_in_flight);
+
+        let repin = || whole_repin(&root, &jobs, &["lab", "prod"]);
+        let scan = scan_parquet_with(&root, &jobs, &mut before_second_env(&root, &repin)).unwrap();
+        // One env from each generation.
+        assert_eq!(scan.totals.bytes, 1010);
+        assert!(scan.repin_in_flight);
+
+        let complete = trawl_api::StorageMeasurement {
+            status: trawl_api::StorageMeasurementStatus::Complete,
+            sample_age_secs: Some(0),
+        };
+        let sample = crate::capacity::HeadroomSample {
+            filesystems: vec![crate::capacity::DeviceHeadroom {
+                roles: vec![trawl_api::FilesystemRole::Data],
+                total_bytes: 1 << 40,
+                available_bytes: 1 << 30,
+            }],
+            repin_in_flight: false,
+        };
+        assert_eq!(
+            crate::capacity::projection_basis(
+                &complete,
+                scan.repin_in_flight,
+                &complete,
+                Some(&sample)
+            ),
+            Err(trawl_api::WithheldReason::RetentionSuppressed)
+        );
+    }
+
+    /// An env created after the fence opened and then swapped by a repin
+    /// during the walk is no ordinary addition: the job generation reports
+    /// the repin whatever the walk's order.
+    #[test]
+    fn storage_scan_sees_a_repin_that_swaps_an_env_created_mid_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let jobs = crate::repin::JobGeneration::default();
+        write_env_date(&root, "prod", 10);
+        let create_then_repin = || {
+            write_env_date(&root, "newenv", 10);
+            whole_repin(&root, &jobs, &["newenv", "prod"]);
+        };
+        let scan = scan_parquet_with(&root, &jobs, &mut mid_walk(&create_then_repin)).unwrap();
+        assert!(scan.repin_in_flight);
+        assert!(!jobs.read().in_flight());
+    }
+
+    /// Compaction creates an env directory on the env's first write, which
+    /// can land mid-walk. An added env directory is no repin: the attempt
+    /// is complete.
+    #[test]
+    fn storage_scan_tolerates_a_new_env_dir_created_mid_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let write = |env: &str| {
+            let dir = root.join(env).join("2026-09-20");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("x.parquet"), "0123456789").unwrap();
+        };
+        write("prod");
+        let mut created = false;
+        let jobs = crate::repin::JobGeneration::default();
+        let scan = scan_parquet_with(&root, &jobs, &mut |op, path: &Path| {
+            if !created && op == StorageWalkOp::ReadDir && path.parent() == Some(root.as_path()) {
+                created = true;
+                write("newenv");
+            }
+            Ok(())
+        })
+        .expect("an added env directory is no repin");
+        assert!(created);
+        assert!(!scan.repin_in_flight);
+    }
+
+    /// An empty date directory holds no counted Parquet, so it gets no
+    /// bucket and never anchors an environment's oldest date: it is no
+    /// evidence of a quiet ingest day, and zero-filling from it would
+    /// overstate reach.
+    #[test]
+    fn storage_scan_ignores_empty_date_dirs() {
+        use crate::capacity::{HeadroomSample, project, projection_basis};
+        use chrono::NaiveDate;
+        use trawl_api::{Reach, StorageMeasurement, StorageMeasurementStatus};
+        let date = |day| NaiveDate::from_ymd_opt(2026, 9, day).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 09-10 is an empty date directory (and one holding only a
+        // non-Parquet file), then a gap, then Parquet from 09-20 on.
+        std::fs::create_dir_all(root.join("prod/2026-09-10/00")).unwrap();
+        std::fs::create_dir_all(root.join("prod/2026-09-11")).unwrap();
+        std::fs::write(root.join("prod/2026-09-11/x.parquet.tmp"), "xxxx").unwrap();
+        for day in 20..=25 {
+            let dir = root.join(format!("prod/2026-09-{day}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("x.parquet"), "0123456789").unwrap();
+        }
+        let scan = scan_storage(root, StorageKind::Parquet).unwrap();
+        assert_eq!(scan.env_dates.len(), 6, "{scan:?}");
+        assert_eq!(
+            scan.env_dates.keys().next(),
+            Some(&("prod".to_owned(), date(20)))
+        );
+        assert_eq!(scan.unattributed_bytes, 0);
+
+        // Projected against 2026-09-27 the window is 09-19..09-25. Anchored
+        // on the empty 09-10 it would hold seven days, one a false zero;
+        // anchored on 09-20 it holds six, all measured.
+        let complete = StorageMeasurement {
+            status: StorageMeasurementStatus::Complete,
+            sample_age_secs: Some(0),
+        };
+        let sample = HeadroomSample {
+            filesystems: vec![crate::capacity::DeviceHeadroom {
+                roles: vec![FilesystemRole::Data],
+                total_bytes: 1 << 40,
+                available_bytes: 1 << 30,
+            }],
+            repin_in_flight: false,
+        };
+        let projection = project(
+            date(27),
+            &scan.env_dates,
+            projection_basis(&complete, scan.repin_in_flight, &complete, Some(&sample)),
+            &trawl_config::RetentionConfig {
+                max_age_days: 90,
+                min_free_disk_bytes: 1,
+                ..trawl_config::RetentionConfig::default()
+            },
+        );
+        let [prod] = projection.environments.as_slice() else {
+            panic!("{projection:?}");
+        };
+        assert_eq!(prod.oldest_date, "2026-09-20");
+        assert_eq!(prod.stored_bytes, 60);
+        assert!(
+            matches!(
+                &prod.reach,
+                Reach::Projected { observed_first, observed_days: 6, .. }
+                    if observed_first == "2026-09-20"
+            ),
+            "{:?}",
+            prod.reach
         );
     }
 
@@ -1539,7 +2381,11 @@ mod tests {
                 std::fs::write(nested.join(format!("events.{extension}")), "12345").unwrap();
                 let cache = StorageCache::default();
                 let now = Instant::now();
-                cache.collect(|| now, || scan_storage(tmp.path(), kind), |_| {});
+                cache.collect(
+                    || now,
+                    || scan_storage(tmp.path(), kind).map(|scan| scan.totals),
+                    |_| {},
+                );
                 cache.collect(
                     || now + Duration::from_secs(30),
                     || {
@@ -1550,6 +2396,7 @@ mod tests {
                                 Ok(())
                             }
                         })
+                        .map(|scan| scan.totals)
                     },
                     |totals| assert_eq!(totals, StorageTotals { files: 1, bytes: 5 }),
                 );
@@ -1596,7 +2443,8 @@ mod tests {
                     }
                     Ok(())
                 })
-                .unwrap();
+                .unwrap()
+                .totals;
                 assert_eq!(totals, StorageTotals::default());
             }
             let tmp = tempfile::tempdir().unwrap();
@@ -1637,7 +2485,10 @@ mod tests {
                 .is_err()
             );
             std::fs::create_dir(&root).unwrap();
-            assert_eq!(scan_storage(&root, kind).unwrap(), StorageTotals::default());
+            assert_eq!(
+                scan_storage(&root, kind).unwrap().totals,
+                StorageTotals::default()
+            );
         }
     }
 
@@ -1650,7 +2501,7 @@ mod tests {
         let now = Instant::now();
         cache.collect(
             || now,
-            || scan_storage(&root, StorageKind::Parquet),
+            || scan_storage(&root, StorageKind::Parquet).map(|scan| scan.totals),
             |_| panic!("absent archive was not measured"),
         );
         assert_storage(
@@ -1735,9 +2586,12 @@ mod tests {
         let handle = recorder.handle();
         // No ingest state, listeners or telemetry writer is constructed.
         // These series must exist even when every producer is disabled.
+        // Retention's baselines are published at state build, which every
+        // server performs, so they join the startup sequence here.
         metrics::with_local_recorder(&recorder, || {
             describe_metrics();
             init_operational_alert_metrics();
+            init_retention_metrics(0);
             let selected = [
                 "trawl_syslog_events_dropped_total{reason=\"backpressure\"}",
                 "trawl_syslog_events_dropped_total{reason=\"queue_full\"}",
@@ -1772,6 +2626,9 @@ mod tests {
                 "trawl_files_quarantined_total{kind=\"rollup_temporary\"}",
                 "trawl_publication_recovery_total{outcome=\"contradictory\"}",
                 "trawl_publication_recovery_total{outcome=\"failed\"}",
+                "trawl_retention_deletions_total{trigger=\"age\"}",
+                "trawl_retention_deletions_total{trigger=\"disk_pressure\"}",
+                "trawl_retention_pressure_attempts_total",
                 "trawl_corpus_unsettled{reason=\"rollup_pending\"}",
                 "trawl_corpus_unsettled{reason=\"restart_backlog\"}",
                 "trawl_hydration_files_total{outcome=\"hydrated\"}",
@@ -1797,12 +2654,15 @@ mod tests {
             metrics::counter!(TELEMETRY_EVENTS_DROPPED_TOTAL,
                 "reason" => TelemetryDropReason::WriteCrashed.label())
             .increment(2);
+            metrics::counter!(RETENTION_PRESSURE_ATTEMPTS_TOTAL).increment(4);
             init_operational_alert_metrics();
+            init_retention_metrics(0);
             handle.run_upkeep();
             for series in selected {
                 let expected = match series {
                     "trawl_syslog_wal_events_discarded_total" => 3,
                     "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}" => 2,
+                    "trawl_retention_pressure_attempts_total" => 4,
                     _ => 0,
                 };
                 assert_eq!(test_support::sample(&handle, series), expected);
@@ -1825,6 +2685,345 @@ mod tests {
             init_publication_recovery_metrics();
             assert_eq!(test_support::sample(&handle, &series("contradictory")), 1);
         });
+    }
+
+    // -- headroom measurement (ADR-0042 under ADR-0033) ------------------
+
+    use crate::capacity::{DeviceHeadroom, HeadroomSample, sample_headroom};
+    use trawl_api::FilesystemRole;
+
+    /// One headroom attempt through the real sampling function and repin
+    /// fence on a fresh data root, with the filesystem behind a `stat`
+    /// seam: every role on device 1 with `available` bytes free, or a
+    /// failure.
+    fn headroom_attempt(available: std::io::Result<u64>) -> std::io::Result<HeadroomSample> {
+        let available = available?;
+        let data_root = tempfile::tempdir()?;
+        sample_headroom(
+            data_root.path(),
+            Some(Path::new("/wal")),
+            Path::new("/tmp"),
+            &crate::repin::JobGeneration::default(),
+            |_| Ok((1, 1_000, available)),
+        )
+    }
+
+    fn one_device(available: u64) -> HeadroomSample {
+        HeadroomSample {
+            filesystems: vec![DeviceHeadroom {
+                roles: vec![
+                    FilesystemRole::Data,
+                    FilesystemRole::Wal,
+                    FilesystemRole::Spill,
+                ],
+                total_bytes: 1_000,
+                available_bytes: available,
+            }],
+            repin_in_flight: false,
+        }
+    }
+
+    #[test]
+    fn capacity_measurement_not_sampled_before_first_attempt() {
+        use trawl_api::StorageMeasurementStatus as Status;
+        let cache = StorageCache::<HeadroomSample>::default();
+        let start = Instant::now();
+        let (measurement, sample) = cache.read(true, start);
+        assert_eq!(measurement.status, Status::NotSampled);
+        assert_eq!(measurement.sample_age_secs, None);
+        assert_eq!(sample, None, "no rows before any attempt");
+        // A first attempt that fails is failed, still with nothing measured.
+        cache.collect(
+            || start,
+            || headroom_attempt(Err(io_failure())),
+            |_| panic!("no sample to publish"),
+        );
+        let (measurement, sample) = cache.read(true, start);
+        assert_eq!(measurement.status, Status::Failed);
+        assert_eq!(measurement.sample_age_secs, None);
+        assert_eq!(sample, None);
+    }
+
+    #[test]
+    fn capacity_measurement_failed_retains_last_complete_and_ages() {
+        use std::time::Duration;
+        use trawl_api::StorageMeasurementStatus as Status;
+        let cache = StorageCache::<HeadroomSample>::default();
+        let start = Instant::now();
+        cache.collect(|| start, || headroom_attempt(Ok(400)), |_| {});
+        assert_eq!(
+            cache.read(true, start),
+            (
+                trawl_api::StorageMeasurement {
+                    status: Status::Complete,
+                    sample_age_secs: Some(0),
+                },
+                Some(one_device(400)),
+            )
+        );
+        // A failed stat keeps the last complete rows, and their age keeps
+        // growing from that sample's completion.
+        let failed = start + Duration::from_secs(30);
+        cache.collect(|| failed, || headroom_attempt(Err(io_failure())), |_| {});
+        for (now, age) in [(failed, 30), (failed + Duration::from_secs(15), 45)] {
+            assert_eq!(
+                cache.read(true, now),
+                (
+                    trawl_api::StorageMeasurement {
+                        status: Status::Failed,
+                        sample_age_secs: Some(age),
+                    },
+                    Some(one_device(400)),
+                )
+            );
+        }
+        // The failed attempt, not the retained sample, sets the retry.
+        cache.collect(
+            || failed + Duration::from_secs(29),
+            || panic!("failure retry too soon"),
+            |_| {},
+        );
+        // Repin evidence that cannot be read (a looping shadow root
+        // symlink) fails the attempt the same way.
+        let repin_unreadable = failed + Duration::from_secs(30);
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        std::fs::create_dir(&data_root).unwrap();
+        let shadow = crate::repin::marker::shadow_root(&data_root);
+        std::os::unix::fs::symlink(&shadow, &shadow).unwrap();
+        cache.collect(
+            || repin_unreadable,
+            || {
+                sample_headroom(
+                    &data_root,
+                    None,
+                    Path::new("/tmp"),
+                    &crate::repin::JobGeneration::default(),
+                    |_| Ok((1, 1_000, 10)),
+                )
+            },
+            |_| {},
+        );
+        let (measurement, sample) = cache.read(true, repin_unreadable);
+        assert_eq!(measurement.status, Status::Failed);
+        assert_eq!(measurement.sample_age_secs, Some(60));
+        assert_eq!(sample, Some(one_device(400)));
+        // Recovery replaces the sample and restarts its age.
+        let recovered = repin_unreadable + Duration::from_secs(30);
+        cache.collect(|| recovered, || headroom_attempt(Ok(300)), |_| {});
+        assert_eq!(
+            cache.read(true, recovered),
+            (
+                trawl_api::StorageMeasurement {
+                    status: Status::Complete,
+                    sample_age_secs: Some(0),
+                },
+                Some(one_device(300)),
+            )
+        );
+    }
+
+    #[test]
+    fn capacity_measurement_zero_is_measured() {
+        use trawl_api::StorageMeasurementStatus as Status;
+        let cache = StorageCache::<HeadroomSample>::default();
+        let start = Instant::now();
+        let unmeasured = cache.read(true, start);
+        cache.collect(|| start, || headroom_attempt(Ok(0)), |_| {});
+        let measured = cache.read(true, start);
+        assert_eq!(measured.0.status, Status::Complete);
+        assert_eq!(measured.0.sample_age_secs, Some(0));
+        assert_eq!(measured.1, Some(one_device(0)), "a full disk is a reading");
+        assert_ne!(measured, unmeasured, "zero free is not unmeasured");
+        assert_eq!(unmeasured.1, None);
+    }
+
+    /// Every sample line's series name and label pairs.
+    fn rendered_series(rendered: &str) -> Vec<(String, Vec<(String, String)>)> {
+        rendered
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .map(|line| {
+                let (series, _value) = line.rsplit_once(' ').expect("a sample line");
+                let Some((name, labels)) = series.split_once('{') else {
+                    return (series.to_owned(), Vec::new());
+                };
+                let labels = labels
+                    .trim_end_matches('}')
+                    .split("\",")
+                    .filter(|pair| !pair.is_empty())
+                    .map(|pair| {
+                        let (key, value) = pair.split_once('=').expect("key=value");
+                        (key.to_owned(), value.trim_matches('"').to_owned())
+                    })
+                    .collect();
+                (name.to_owned(), labels)
+            })
+            .collect()
+    }
+
+    /// Publish the ADR-0042 series into a fresh recorder the way production
+    /// does: startup init, the floor, headroom attempts through the real
+    /// cache and stat seam (planted under an env named `plantedenv`), and
+    /// one pressure deletion. Returns the recorder's handle and the device
+    /// numbers the data and WAL rows carried.
+    fn capacity_metrics_fixture() -> (metrics_exporter_prometheus::PrometheusHandle, [u64; 2]) {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        let planted_env = data_root.join("plantedenv/2026-09-20");
+        std::fs::create_dir_all(&planted_env).unwrap();
+        std::fs::write(planted_env.join("x.parquet"), "0123456789").unwrap();
+        let wal_dir = tmp.path().join("wal");
+        std::fs::create_dir_all(wal_dir.join("plantedenv")).unwrap();
+        // The real stat seam, so the device number is the one this host
+        // reports for the planted tree. The WAL is made to look like its
+        // own device, and spill shares the WAL's.
+        let (data_device, ..) = crate::capacity::stat_filesystem(&data_root).unwrap();
+        let wal_device = data_device ^ 0x5a5a;
+        let stat_seam = |path: &Path| {
+            let (device, total, available) = crate::capacity::stat_filesystem(path)?;
+            Ok((
+                if path == data_root {
+                    device
+                } else {
+                    wal_device
+                },
+                total,
+                available,
+            ))
+        };
+        let attempt = |fail: bool| {
+            if fail {
+                return Err(io_failure());
+            }
+            sample_headroom(
+                &data_root,
+                Some(&wal_dir),
+                tmp.path(),
+                &crate::repin::JobGeneration::default(),
+                stat_seam,
+            )
+        };
+
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        let cache = StorageCache::<HeadroomSample>::default();
+        let first = Instant::now();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            init_operational_alert_metrics();
+            init_retention_metrics(1_073_741_824);
+            // A first attempt that fails publishes no headroom series.
+            cache.collect(|| first, || attempt(true), |s| publish_headroom_gauges(&s));
+            assert!(!handle.render().contains(&format!("{DISK_TOTAL_BYTES}{{")));
+            cache.collect(
+                || first + Duration::from_secs(30),
+                || attempt(false),
+                |s| publish_headroom_gauges(&s),
+            );
+            // A later failure keeps the complete sample's series.
+            cache.collect(
+                || first + Duration::from_secs(60),
+                || attempt(true),
+                |s| publish_headroom_gauges(&s),
+            );
+            let evidence = crate::retention::RetentionEvidence::default();
+            evidence.record_removal(crate::retention::RemovalTrigger::DiskPressure);
+            evidence.record_pressure_attempt();
+        });
+        (handle, [data_device, wal_device])
+    }
+
+    /// The ADR-0042 series: headroom per role, the floor, and retention's
+    /// two counters. Closed label sets, no path, device or env in a label,
+    /// and no projection series.
+    #[test]
+    fn capacity_metrics_labels_and_series() {
+        let (handle, devices) = capacity_metrics_fixture();
+        let rendered = handle.render();
+
+        let capacity_names: std::collections::BTreeSet<String> = rendered_series(&rendered)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| name.starts_with("trawl_disk_") || name.starts_with("trawl_retention_"))
+            .collect();
+        assert_eq!(
+            capacity_names,
+            [
+                DISK_AVAILABLE_BYTES,
+                DISK_TOTAL_BYTES,
+                RETENTION_DELETIONS_TOTAL,
+                RETENTION_MIN_FREE_DISK_BYTES,
+                RETENTION_PRESSURE_ATTEMPTS_TOTAL,
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            "{rendered}"
+        );
+        for name in &capacity_names {
+            assert!(
+                rendered.contains(&format!("# HELP {name} ")),
+                "{name} is described"
+            );
+        }
+        let mut roles = std::collections::BTreeSet::new();
+        let mut triggers = std::collections::BTreeSet::new();
+        let devices = devices.map(|device| device.to_string());
+        for (name, labels) in rendered_series(&rendered) {
+            assert!(
+                !(name.contains("reach") || name.contains("projection")),
+                "no projection series: {name}"
+            );
+            if !capacity_names.contains(&name) {
+                continue;
+            }
+            for (key, value) in labels {
+                assert!(
+                    !value.contains('/')
+                        && !value.contains("plantedenv")
+                        && !devices.contains(&value),
+                    "{name}{{{key}={value}}}"
+                );
+                match key.as_str() {
+                    "role" => roles.insert(value),
+                    "trigger" => triggers.insert(value),
+                    other => panic!("{name} carries label {other}"),
+                };
+            }
+        }
+        // Data alone on one device, wal and spill on another: two series
+        // per gauge, each under its first role. Spill has none of its own.
+        assert_eq!(roles, ["data", "wal"].map(str::to_owned).into());
+        assert_eq!(triggers, ["age", "disk_pressure"].map(str::to_owned).into());
+        for role in ["data", "wal"] {
+            let total = gauge_value(&rendered, &format!("{DISK_TOTAL_BYTES}{{role=\"{role}\"}}"));
+            let available = gauge_value(
+                &rendered,
+                &format!("{DISK_AVAILABLE_BYTES}{{role=\"{role}\"}}"),
+            );
+            assert!(total.parse::<f64>().unwrap() > 0.0, "{role}: {total}");
+            assert!(
+                available.parse::<f64>().unwrap() <= total.parse::<f64>().unwrap(),
+                "{role}"
+            );
+        }
+        assert_eq!(
+            gauge_value(&rendered, RETENTION_MIN_FREE_DISK_BYTES),
+            "1073741824"
+        );
+        let deletions = |trigger: &str| {
+            test_support::sample(
+                &handle,
+                &format!("{RETENTION_DELETIONS_TOTAL}{{trigger=\"{trigger}\"}}"),
+            )
+        };
+        assert_eq!((deletions("age"), deletions("disk_pressure")), (0, 1));
+        assert_eq!(
+            test_support::sample(&handle, RETENTION_PRESSURE_ATTEMPTS_TOTAL),
+            1
+        );
     }
 
     #[test]
@@ -1854,7 +3053,7 @@ mod tests {
                 .expect("write corrupt file");
         }
 
-        let totals = scan_storage(wal_dir, StorageKind::Wal).unwrap();
+        let totals = scan_storage(wal_dir, StorageKind::Wal).unwrap().totals;
         assert_eq!(totals.files, 2);
         assert_eq!(totals.bytes, 6);
     }
@@ -1901,6 +3100,7 @@ mod tests {
             "/nonexistent/path/**/*.parquet",
             None,
             0,
+            &crate::repin::JobGeneration::default(),
         );
     }
 
@@ -1936,6 +3136,7 @@ mod tests {
                 "/nonexistent/path/**/*.parquet",
                 None,
                 0,
+                &crate::repin::JobGeneration::default(),
             );
             let rendered = handle.render();
             assert_eq!(gauge_value(&rendered, HOT_BUFFER_MAX_EVENTS), "100");
@@ -1960,6 +3161,7 @@ mod tests {
                 "/nonexistent/path/**/*.parquet",
                 None,
                 0,
+                &crate::repin::JobGeneration::default(),
             );
             let rendered = handle.render();
             assert_eq!(
@@ -1987,6 +3189,7 @@ mod tests {
                 "/nonexistent/path/**/*.parquet",
                 None,
                 0,
+                &crate::repin::JobGeneration::default(),
             );
             let rendered = handle.render();
             assert_eq!(gauge_value(&rendered, HOT_BUFFER_ADMISSION_STATE), "2");
@@ -2022,7 +3225,14 @@ mod tests {
                 )
             };
             let collected = |gate: &PublicationGate| {
-                collect_gauges(None, gate, "/nonexistent/path/**/*.parquet", None, 0);
+                collect_gauges(
+                    None,
+                    gate,
+                    "/nonexistent/path/**/*.parquet",
+                    None,
+                    0,
+                    &crate::repin::JobGeneration::default(),
+                );
                 (series(RollupPending), series(RestartBacklog))
             };
             assert_eq!(
@@ -2116,6 +3326,7 @@ mod tests {
                 "/nonexistent/path/**/*.parquet",
                 None,
                 0,
+                &crate::repin::JobGeneration::default(),
             );
             let rendered = handle.render();
             for name in names {

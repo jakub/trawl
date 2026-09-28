@@ -1,0 +1,142 @@
+{
+  "parquet_files": 285,
+  "parquet_bytes": 137796000000,
+  "parquet_measurement": {
+    "status": "complete",
+    "sample_age_secs": 2
+  },
+  "wal_files": 7,
+  "wal_bytes": 2048,
+  "wal_measurement": {
+    "status": "complete",
+    "sample_age_secs": 2
+  },
+  "capacity": {
+    "headroom": {
+      "measurement": {
+        "status": "complete",
+        "sample_age_secs": 2
+      },
+      "filesystems": [
+        {
+          "roles": [
+            "data",
+            "wal"
+          ],
+          "total_bytes": 250000000000,
+          "available_bytes": 26000000000,
+          "floor": {
+            "state": "armed",
+            "floor_bytes": 1073741824,
+            "deficit_bytes": 0
+          }
+        },
+        {
+          "roles": [
+            "spill"
+          ],
+          "total_bytes": 68719476736,
+          "available_bytes": 64424509440,
+          "floor": null
+        }
+      ]
+    },
+    "pressure": {
+      "removals_age": 14,
+      "removals_disk_pressure": 0,
+      "pressure_attempts": 0,
+      "last_sweep": {
+        "outcome": "completed",
+        "age_secs": 754
+      }
+    },
+    "environments": [
+      {
+        "env": "archive",
+        "max_age_days": 0,
+        "oldest_date": "2026-03-14",
+        "stored_bytes": 19980000000,
+        "reach": {
+          "state": "keep_forever",
+          "observed_first": "2026-09-19",
+          "observed_last": "2026-09-25",
+          "observed_days": 7,
+          "mean_daily_bytes": 120000000
+        }
+      },
+      {
+        "env": "k8s",
+        "max_age_days": 14,
+        "oldest_date": "2026-09-24",
+        "stored_bytes": 36000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "insufficient_history"
+        }
+      },
+      {
+        "env": "lab",
+        "max_age_days": 7,
+        "oldest_date": "2026-09-20",
+        "stored_bytes": 480000000,
+        "reach": {
+          "state": "projected",
+          "observed_first": "2026-09-20",
+          "observed_last": "2026-09-25",
+          "observed_days": 6,
+          "low": {
+            "kind": "days",
+            "days": 3
+          },
+          "high": {
+            "kind": "days",
+            "days": 4
+          }
+        }
+      },
+      {
+        "env": "prod",
+        "max_age_days": 90,
+        "oldest_date": "2026-08-15",
+        "stored_bytes": 111100000000,
+        "reach": {
+          "state": "projected",
+          "observed_first": "2026-09-19",
+          "observed_last": "2026-09-25",
+          "observed_days": 7,
+          "low": {
+            "kind": "days",
+            "days": 38
+          },
+          "high": {
+            "kind": "days",
+            "days": 52
+          }
+        }
+      },
+      {
+        "env": "staging",
+        "max_age_days": 30,
+        "oldest_date": "2026-08-28",
+        "stored_bytes": 6200000000,
+        "reach": {
+          "state": "projected",
+          "observed_first": "2026-09-19",
+          "observed_last": "2026-09-25",
+          "observed_days": 7,
+          "low": {
+            "kind": "days",
+            "days": 12
+          },
+          "high": {
+            "kind": "days",
+            "days": 17
+          }
+        }
+      }
+    ],
+    "growth_excluded": [
+      "k8s"
+    ]
+  }
+}

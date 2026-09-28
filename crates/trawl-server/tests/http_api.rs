@@ -2539,6 +2539,75 @@ async fn dashboard_stream_rejects_analyst() {
     assert_eq!(body["error"]["message"], "insufficient permissions");
 }
 
+/// Capacity rides the admin-only dashboard (ADR-0042): the GET and the
+/// stream still refuse a non-admin, and an admin's payload carries it.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_capacity_requires_admin() {
+    let server = setup().await;
+    let client = raw_client();
+    let get = |token: &str| {
+        client
+            .get(format!("{}/api/v1/dashboard", server.url))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+    let stream = |token: &str| {
+        client
+            .get(format!("{}/api/v1/dashboard/stream", server.url))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+    };
+
+    for resp in [
+        get(&server.analyst_token).await.unwrap(),
+        stream(&server.analyst_token).await.unwrap(),
+    ] {
+        assert_eq!(resp.status(), 403);
+        let body = resp.text().await.unwrap();
+        assert!(!body.contains("capacity"), "{body}");
+    }
+
+    let snapshot: serde_json::Value = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let resp = get(&server.admin_token).await.unwrap();
+            if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            assert_eq!(resp.status(), 200);
+            break resp.json().await.unwrap();
+        }
+    })
+    .await
+    .expect("dashboard snapshot");
+    assert!(snapshot["capacity"].is_object(), "{snapshot}");
+
+    let mut resp = stream(&server.admin_token).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let frame = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut buf = String::new();
+        loop {
+            let chunk = resp.chunk().await.unwrap().expect("stream ended early");
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+            if let Some(start) = buf.find("event: stats")
+                && let Some(end) = buf[start..].find("\n\n")
+            {
+                return buf[start..start + end].to_owned();
+            }
+        }
+    })
+    .await
+    .expect("no stats event within 10s");
+    let data = frame
+        .lines()
+        .find_map(|l| l.strip_prefix("data: "))
+        .expect("stats frame missing data line");
+    let streamed: serde_json::Value = serde_json::from_str(data).unwrap();
+    assert!(streamed["capacity"].is_object(), "{streamed}");
+    // Typed, too: the stream decodes as the wire type with its capacity.
+    let _: trawl_api::DashboardSnapshot = serde_json::from_value(streamed).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn dashboard_stream_emits_stats_event() {
     let server = setup().await;

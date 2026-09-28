@@ -1,0 +1,80 @@
+{
+  "parquet_files": 79,
+  "parquet_bytes": 116236000000,
+  "parquet_measurement": {
+    "status": "complete",
+    "sample_age_secs": 3
+  },
+  "wal_files": 7,
+  "wal_bytes": 2048,
+  "wal_measurement": {
+    "status": "complete",
+    "sample_age_secs": 3
+  },
+  "capacity": {
+    "headroom": {
+      "measurement": {
+        "status": "complete",
+        "sample_age_secs": 3
+      },
+      "filesystems": [
+        {
+          "roles": [
+            "data",
+            "wal",
+            "spill"
+          ],
+          "total_bytes": 250000000000,
+          "available_bytes": 90000000000,
+          "floor": {
+            "state": "armed",
+            "floor_bytes": 1073741824,
+            "deficit_bytes": 0
+          }
+        }
+      ]
+    },
+    "pressure": {
+      "removals_age": 14,
+      "removals_disk_pressure": 0,
+      "pressure_attempts": 0,
+      "last_sweep": {
+        "outcome": "suppressed",
+        "age_secs": 300
+      }
+    },
+    "environments": [
+      {
+        "env": "k8s",
+        "max_age_days": 14,
+        "oldest_date": "2026-09-24",
+        "stored_bytes": 36000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "retention_suppressed"
+        }
+      },
+      {
+        "env": "prod",
+        "max_age_days": 90,
+        "oldest_date": "2026-08-15",
+        "stored_bytes": 110000000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "retention_suppressed"
+        }
+      },
+      {
+        "env": "staging",
+        "max_age_days": 30,
+        "oldest_date": "2026-08-28",
+        "stored_bytes": 6200000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "retention_suppressed"
+        }
+      }
+    ],
+    "growth_excluded": []
+  }
+}

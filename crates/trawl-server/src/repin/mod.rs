@@ -12,7 +12,8 @@
 //! `rewrite` (per-file hardlink-or-rewrite), `cutover` (the idempotent
 //! per-env swap), `engine` (the job lifecycle), `cancel` (the cooperative
 //! cancel registry and its point-of-no-return latch), `recover` (the boot
-//! decision table), `ceiling` (the numbers a forced job accepted).
+//! decision table), `ceiling` (the numbers a forced job accepted), `jobs`
+//! (the in-process job generation capacity samples read).
 
 /// How recently the field must have been observed for a repin's report to
 /// call it live (ADR-0013 ruling 10).
@@ -37,6 +38,7 @@ pub mod ceiling;
 pub mod cutover;
 pub mod engine;
 pub mod gate;
+pub mod jobs;
 pub mod marker;
 pub mod plan;
 pub mod recover;
@@ -50,6 +52,7 @@ pub use cancel::{
 };
 pub use engine::{RepinEngine, StartOutcome};
 pub use gate::{RepinCoordinator, RollupPause};
+pub use jobs::{JobGeneration, JobReading};
 pub use marker::{
     RepinMarker, RepinPhase, aside_root, in_flight_evidence, marker_path, shadow_root,
 };

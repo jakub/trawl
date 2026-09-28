@@ -38,6 +38,7 @@ pub fn spawn_stats_emitter(
         .wal_writer
         .as_ref()
         .map(|w| w.dir().to_path_buf());
+    let repin_jobs = Arc::clone(&state.repin_jobs);
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
@@ -59,6 +60,7 @@ pub fn spawn_stats_emitter(
                     let publication = pool.publication();
                     let fallback_glob = fallback_glob.clone();
                     let wal_dir = wal_dir.clone();
+                    let repin_jobs = Arc::clone(&repin_jobs);
                     let retained_permits = pool.retained();
                     // Storage scans and competing collection attempts can block.
                     // Await completion so ticks never overlap and shutdown still
@@ -70,6 +72,7 @@ pub fn spawn_stats_emitter(
                             &fallback_glob,
                             wal_dir.as_deref(),
                             retained_permits,
+                            &repin_jobs,
                         );
                     })
                     .await

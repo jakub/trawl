@@ -49,11 +49,20 @@ pub struct AppState {
     /// node owns nothing under the data root, so `POST /api/v1/schema/repin`
     /// answers 503 there.
     pub repin: Option<Arc<crate::repin::RepinEngine>>,
+    /// This process's repin job generation. The repin engine enters it
+    /// for each job's disk work, and both capacity samples read it as
+    /// their repin fence (ADR-0042). Present on a query-only node too,
+    /// where no job ever runs and it stays idle.
+    pub repin_jobs: Arc<crate::repin::JobGeneration>,
     /// The pin garbage collector. `Some` on the same terms as
     /// [`Self::repin`]: proving a pin dead means reading every parquet
     /// footer under the data root, and a query-only node owns none of
     /// them.
     pub gc: Option<Arc<crate::catalog::gc::PinGc>>,
+    /// The retention config and the evidence the retention loop records
+    /// (ADR-0042). The loop is handed this same `Arc`, so the dashboard
+    /// reads the counts the loop wrote.
+    pub retention: Arc<crate::retention::RetentionShared>,
 }
 
 /// Maximum concurrent admin dashboard-stats SSE streams. Hard-coded (no
@@ -687,6 +696,10 @@ impl AppState {
         // floor: two readers of the same retention config must not answer
         // differently about how far back the corpus still reaches.
         let retention_horizon_secs = crate::retention::maximum_enabled_age_secs(&config.retention);
+        // The floor gauge and retention's zeroed counters come from the same
+        // config the retention loop enforces, published here so every
+        // server built from a config exposes them on /metrics.
+        crate::metrics::init_retention_metrics(config.retention.min_free_disk_bytes);
 
         let state = Self {
             query: QueryState {
@@ -747,7 +760,11 @@ impl AppState {
             metrics_handle,
             dashboard_snapshot: Arc::new(Mutex::new(None)),
             repin: None,
+            repin_jobs: Arc::default(),
             gc: None,
+            retention: Arc::new(crate::retention::RetentionShared::new(
+                config.retention.clone(),
+            )),
         };
         let state = {
             let mut state = state;
@@ -762,6 +779,7 @@ impl AppState {
                     config.wal_dir(),
                     config.ingest.compaction_memory_limit.clone(),
                     config.retention.min_free_disk_bytes,
+                    Arc::clone(&state.repin_jobs),
                 ))
             });
             // The retention floor is the same horizon the schema window

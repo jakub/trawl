@@ -74,6 +74,9 @@ pub struct MonitorSnapshot {
     pub parquet_bytes: u64,
     pub parquet_measurement: trawl_api::StorageMeasurement,
 
+    // -- capacity (ADR-0042) --
+    pub capacity: trawl_api::Capacity,
+
     // -- SSE --
     pub sse_active: usize,
     pub sse_max: usize,
@@ -127,6 +130,7 @@ impl MonitorSnapshot {
             parquet_files: self.parquet_files,
             parquet_bytes: self.parquet_bytes,
             parquet_measurement: self.parquet_measurement,
+            capacity: self.capacity.clone(),
             sse_active: self.sse_active,
             sse_max: self.sse_max,
             scheduler_enabled: self.scheduler_enabled,
@@ -344,7 +348,27 @@ impl MonitorState {
         // WAL configuredness comes from the same writer used by collection,
         // including before the first stats-emitter tick or scrape.
         let wal = crate::metrics::cached_wal_stats(self.state.ingest.wal_writer.is_some());
-        let parquet = crate::metrics::cached_parquet_stats();
+        let (parquet, parquet_scan) = crate::metrics::cached_parquet_scan();
+
+        // Capacity reads the same Parquet sample as the totals above, the
+        // headroom cache, and retention's evidence. Today's UTC date is read
+        // once, so every environment is projected against the same day.
+        let (headroom, headroom_sample) = crate::metrics::cached_headroom();
+        let retention = &self.state.retention;
+        let capacity = crate::capacity::assemble(
+            chrono::Utc::now().date_naive(),
+            crate::capacity::CapacityReadings {
+                parquet: &parquet.measurement,
+                env_dates: parquet_scan.as_deref().map(|scan| &scan.env_dates),
+                parquet_repin_in_flight: parquet_scan
+                    .as_deref()
+                    .is_some_and(|scan| scan.repin_in_flight),
+                headroom: &headroom,
+                sample: headroom_sample.as_ref(),
+            },
+            retention.evidence.snapshot(Instant::now()),
+            &retention.config,
+        );
 
         MonitorSnapshot {
             hostname: self.hostname.clone(),
@@ -383,6 +407,7 @@ impl MonitorState {
             parquet_files: parquet.files,
             parquet_bytes: parquet.bytes,
             parquet_measurement: parquet.measurement,
+            capacity,
             sse_active,
             sse_max: self.sse_max,
             scheduler_enabled: self.scheduler_enabled,

@@ -1,0 +1,31 @@
+{
+  "parquet_files": 0,
+  "parquet_bytes": 0,
+  "parquet_measurement": {
+    "status": "not_sampled",
+    "sample_age_secs": null
+  },
+  "wal_files": 0,
+  "wal_bytes": 0,
+  "wal_measurement": {
+    "status": "not_sampled",
+    "sample_age_secs": null
+  },
+  "capacity": {
+    "headroom": {
+      "measurement": {
+        "status": "not_sampled",
+        "sample_age_secs": null
+      },
+      "filesystems": []
+    },
+    "pressure": {
+      "removals_age": 0,
+      "removals_disk_pressure": 0,
+      "pressure_attempts": 0,
+      "last_sweep": null
+    },
+    "environments": [],
+    "growth_excluded": []
+  }
+}

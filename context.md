@@ -129,7 +129,7 @@ Retention deleting date directories because free space fell below the deletion f
 _Avoid_: cleanup, eviction
 
 **Observed day**:
-One of an environment's recent, stored date partitions that a capacity projection reads for its daily volume. Today and yesterday are never observed days; they are still settling.
+One of an environment's recent dates, from today−8 through today−2, that a capacity projection reads for its daily volume. A date newer than the environment's oldest date holding Parquet is observed even with no partition; it counts as a quiet day of zero bytes. Today and yesterday are never observed days; they are still settling.
 _Avoid_: settled day, sample
 
 **Retention reach**:

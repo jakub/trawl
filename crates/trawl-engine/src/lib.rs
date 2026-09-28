@@ -16,6 +16,7 @@ pub mod post_process;
 pub mod timezone;
 pub mod timing;
 
+pub use executor::spill_dir;
 pub use trawl_api::value;
 
 // Nothing on the read path classifies conversion errors; the classifier

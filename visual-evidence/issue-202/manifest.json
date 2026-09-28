@@ -1,0 +1,150 @@
+{
+  "evidence": "Stub fixtures only; no daemon, database, or real ingest",
+  "head": "39181a030cd248af604bbbe6832033bafc9f5a07",
+  "rebased_from": "f70b556f3887bebeb44e93370b0458f29af561dc",
+  "git_status": "",
+  "spec": "crates/trawl-web-ui/e2e/tests/health-page.spec.ts",
+  "spec_sha256": "d8b08ba71ec6580ba1aa408bd7ca745e1ab7010bcd53f5f38c3194f157426884",
+  "spec_filter": "tests/health-page.spec.ts (whole file, 61 cases)",
+  "captured_at": "2026-09-28T05:46:47.733099Z",
+  "port": 8641,
+  "color_scheme": "light",
+  "dist": {
+    "sha256": "fd30fc188319a01eccc21df16ddb13a64172b74f05e882f695304b8cef93d6d3",
+    "sha256_of": "the sha256sum listing of every file under crates/trawl-web-ui/dist, sorted by relative path",
+    "files": [
+      "fleet-ui-a30215ee41c73bb7.css",
+      "fonts/AlbertSans-Variable.ttf",
+      "fonts/ChivoMono-Variable.ttf",
+      "fonts/OFL-AlbertSans.txt",
+      "fonts/OFL-ChivoMono.txt",
+      "fonts/README.md",
+      "fonts/SHA256SUMS",
+      "index.html",
+      "main-a63150e1c0a707f1.css",
+      "snippets/fleet-ui-2165a24593f0a7f1/vendor/paper-shaders.js",
+      "snippets/trawl-web-ui-f99d61b89517acef/vendor/codemirror.js",
+      "snippets/trawl-web-ui-f99d61b89517acef/vendor/uplot.js",
+      "theme-bootstrap-e7acc838d5582fa1.js",
+      "trawl-web-ui-5bc7c98c17df5238.js",
+      "trawl-web-ui-5bc7c98c17df5238_bg.wasm",
+      "uplot-5e0d12c918aed906.css",
+      "vendor/codemirror.js",
+      "vendor/uplot.js"
+    ]
+  },
+  "captures": [
+    {
+      "file": "disk-retention-complete-1440.png",
+      "claim": "Complete sample with a floor: two headroom rows and no deficit, a completed sweep, three envs projected in whole days from one shared fraction per end, keep-forever growth, and one env withheld for history with the growth-excluded note",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-complete.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1284
+      },
+      "theme": "light",
+      "sha256": "60def3f1c9b5fa6b05d391837a550e70b292df4f3c0a1d955741090a02754add",
+      "bytes": 117448
+    },
+    {
+      "file": "disk-retention-complete-390.png",
+      "claim": "The same complete sample at a 390px phone width: every sentence wraps inside the card",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-complete.json",
+      "viewport": {
+        "width": 390,
+        "height": 1590
+      },
+      "theme": "light",
+      "sha256": "e05e958790474723c647a8fb8a548609bfb3a622c93d6bb0f80ae230f974911d",
+      "bytes": 116955
+    },
+    {
+      "file": "disk-retention-failed-retained-1440.png",
+      "claim": "Failed headroom attempt with a retained sample: rows read \"Collection failed; last complete reading\" with a 3600s age and a deficit, and every reach, a future-dated env's included, is withheld as measurement unavailable with no digit and no growth-excluded note",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-failed-retained.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1190
+      },
+      "theme": "light",
+      "sha256": "14faf441166327eea3d12d6b36c8bbb04315b2f9cb4afa2078133be9c881c20b",
+      "bytes": 104976
+    },
+    {
+      "file": "disk-retention-repin-suppressed-1440.png",
+      "claim": "A repin in flight with both samples complete: the last sweep was suppressed, and every reach is withheld as retention suppressed with no digit and no growth-excluded note",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-repin-suppressed.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "theme": "light",
+      "sha256": "f1723969dbb93b190bcda8d1b99846d972f69c17a04300ecf1e4299319040a1a",
+      "bytes": 88590
+    },
+    {
+      "file": "disk-retention-floor-zero-1440.png",
+      "claim": "Floor of 0 reads as pressure deletion off with no pressure attempts; both projected envs read the disk filling first at the largest observed day and the full policy at the mean day, and a fresh env is withheld for history with the growth-excluded note",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-floor-zero.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1056
+      },
+      "theme": "light",
+      "sha256": "3908d783d70ea36ab2428a36d225be72417962093fadd02232a6da623289d4b4",
+      "bytes": 95525
+    },
+    {
+      "file": "disk-retention-pressure-1440.png",
+      "claim": "Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, and a sweep that ran out of candidates below the floor; each env holds today alone, so every reach is withheld for history and the finite envs are excluded",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-pressure.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "theme": "light",
+      "sha256": "6ec1dbc7971c89e0b8f9465ce0b543c92e5de46d777b16d169d4bd763827af26",
+      "bytes": 80612
+    },
+    {
+      "file": "disk-retention-awaiting-1440.png",
+      "claim": "Before the first measurement: headroom and reach both read \"Awaiting measurement\", no sweep yet, and the empty environment list is not presented as measured",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-awaiting.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "theme": "light",
+      "sha256": "bdc7f9c96a3313f3d2303f8d2ba0dbec6cc75d012658f55862f43892f80168a8",
+      "bytes": 42139
+    },
+    {
+      "file": "disk-retention-scan-failed-1440.png",
+      "claim": "A Parquet scan that failed with nothing retained: headroom still reads its complete row, and reach reads \"Measurement unavailable; collection failed\" instead of a measured empty list",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-scan-failed.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "theme": "light",
+      "sha256": "94a84da3a97208a2a69c79095ed20d817ac2ab758c65cb2a0c1a22f47e8ba8ff",
+      "bytes": 50079
+    }
+  ]
+}

@@ -641,6 +641,180 @@ pub struct StorageMeasurement {
     pub sample_age_secs: Option<u64>,
 }
 
+/// Disk headroom, pressure-deletion evidence and per-environment retention
+/// reach (ADR-0042). Capacity reads as how much of each environment's
+/// policy the data disk is projected to hold, never as a countdown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    pub headroom: HeadroomReading,
+    pub pressure: PressureEvidence,
+    /// Environments with at least one stored date partition, sorted by name.
+    pub environments: Vec<EnvironmentCapacity>,
+    /// Finite-retention environments with too few observed days to project.
+    /// The projection reserves their stored bytes as it does keep-forever
+    /// bytes, and leaves their growth out. Sorted by name.
+    pub growth_excluded: Vec<String>,
+}
+
+/// One headroom measurement attempt stats every filesystem role, so the
+/// rows share its status and age.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadroomReading {
+    pub measurement: StorageMeasurement,
+    /// One row per device, from the last complete sample. Empty until a
+    /// complete sample exists: before one, which roles share a device is
+    /// unknown. A failed attempt retains the last complete rows.
+    pub filesystems: Vec<FilesystemHeadroom>,
+}
+
+/// One filesystem trawl writes to. Roles that share a device share a row;
+/// available bytes are never summed across devices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemHeadroom {
+    /// Non-empty, ordered data, wal, spill.
+    pub roles: Vec<FilesystemRole>,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    /// The deletion floor. Present only on the row holding
+    /// [`FilesystemRole::Data`]: nothing reclaims the other filesystems.
+    pub floor: Option<DeletionFloor>,
+}
+
+/// What trawl writes to a filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemRole {
+    /// The data root. Repin staging and compaction spill share it.
+    Data,
+    /// The live WAL directory, when ingest is enabled.
+    Wal,
+    /// The query engine's spill directory.
+    Spill,
+}
+
+/// The data filesystem's deletion floor (`min_free_disk_bytes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeletionFloor {
+    /// A floor of 0: pressure deletion is off.
+    Off,
+    /// Pressure deletion runs while available bytes are strictly below
+    /// `floor_bytes`. `deficit_bytes` is `floor_bytes - available_bytes`
+    /// while below it and zero otherwise, including at equality.
+    Armed {
+        floor_bytes: u64,
+        deficit_bytes: u64,
+    },
+}
+
+/// Retention's record of what it deleted, stated as facts. The counters
+/// start at process start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PressureEvidence {
+    /// Date directories confirmed removed because they aged out.
+    pub removals_age: u64,
+    /// Date directories confirmed removed by pressure deletion.
+    pub removals_disk_pressure: u64,
+    /// Sweeps that found available bytes below the floor.
+    pub pressure_attempts: u64,
+    /// The last finished sweep, or `None` before the first one.
+    pub last_sweep: Option<LastSweep>,
+}
+
+/// The outcome of the last retention sweep and its age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastSweep {
+    pub outcome: SweepOutcome,
+    /// Monotonic seconds since the sweep finished, evaluated when the
+    /// snapshot was assembled.
+    pub age_secs: u64,
+}
+
+/// How a retention sweep ended. When several apply, the first listed
+/// here wins: failed, suppressed, exhausted below floor, completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepOutcome {
+    /// Every step ran and every deletion it attempted succeeded.
+    Completed,
+    /// A repin or unreadable publication markers stood the sweep down.
+    Suppressed,
+    /// The sweep errored, a deletion failed, or the sweep task panicked.
+    Failed,
+    /// Pressure deletion ran out of candidates with available bytes still
+    /// below the floor.
+    ExhaustedBelowFloor,
+}
+
+/// One environment's stored data and projected retention reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentCapacity {
+    pub env: String,
+    /// The effective `max_age_days`; 0 keeps the data forever.
+    pub max_age_days: u64,
+    /// The oldest surviving date partition holding Parquet, `YYYY-MM-DD`.
+    /// An empty date directory does not count.
+    pub oldest_date: String,
+    /// Parquet bytes stored under the environment's date partitions.
+    pub stored_bytes: u64,
+    pub reach: Reach,
+}
+
+/// How many days of its policy an environment is projected to keep if
+/// the observed days repeat. A conditional projection, not a guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Reach {
+    /// A finite-retention environment's projected reach. `low` uses the
+    /// largest observed day and `high` the mean observed day.
+    Projected {
+        /// First observed date, `YYYY-MM-DD`.
+        observed_first: String,
+        /// Last observed date, `YYYY-MM-DD`.
+        observed_last: String,
+        observed_days: u8,
+        low: ReachEnd,
+        high: ReachEnd,
+    },
+    /// A keep-forever environment: its growth, with no time claim.
+    KeepForever {
+        /// First observed date, `YYYY-MM-DD`.
+        observed_first: String,
+        /// Last observed date, `YYYY-MM-DD`.
+        observed_last: String,
+        observed_days: u8,
+        mean_daily_bytes: u64,
+    },
+    /// No projection, and deliberately no number.
+    Withheld { reason: WithheldReason },
+}
+
+/// One end of a projected reach range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReachEnd {
+    /// About this many whole days of the policy.
+    Days { days: u64 },
+    /// The full policy fits.
+    FullPolicy,
+    /// With a floor of 0, the disk fills before the policy is reached.
+    DiskFillsFirst,
+}
+
+/// Why a reach projection was withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithheldReason {
+    /// Fewer than 3 observed days.
+    InsufficientHistory,
+    /// A repin job overlapped the Parquet scan or the headroom sample, or
+    /// repin staging was on the data root, so the samples may count files
+    /// twice or miss free space.
+    RetentionSuppressed,
+    /// The Parquet scan or the data filesystem sample is not complete.
+    MeasurementUnavailable,
+}
+
 /// Full dashboard snapshot returned by the admin-only dashboard endpoint.
 ///
 /// Contains all metrics displayed by the server's live monitor: executor pool,
@@ -755,6 +929,11 @@ pub struct DashboardSnapshot {
     pub parquet_bytes: u64,
     /// Availability and age of the ingested Parquet totals.
     pub parquet_measurement: StorageMeasurement,
+    /// Disk headroom, retention's pressure-deletion evidence and each
+    /// environment's projected retention reach (ADR-0042). Required, like
+    /// the storage measurements: a missing object is a contract break, not
+    /// "nothing to report".
+    pub capacity: Capacity,
 
     // -- SSE --
     /// Active SSE streaming connections.
@@ -1811,6 +1990,61 @@ mod tests {
         serde_json::from_str(&json).expect("deserialize")
     }
 
+    /// The capacity enums' wire tokens are the contract the SPA and the
+    /// wire fixtures decode, so they are pinned here rather than inferred.
+    #[test]
+    fn capacity_enums_serialize_with_their_tags() {
+        use serde_json::json;
+        for (floor, wire) in [
+            (DeletionFloor::Off, json!({"state": "off"})),
+            (
+                DeletionFloor::Armed {
+                    floor_bytes: 10,
+                    deficit_bytes: 0,
+                },
+                json!({"state": "armed", "floor_bytes": 10, "deficit_bytes": 0}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(floor).unwrap(), wire);
+            assert_eq!(roundtrip(&floor), floor);
+        }
+        for (end, wire) in [
+            (
+                ReachEnd::Days { days: 38 },
+                json!({"kind": "days", "days": 38}),
+            ),
+            (ReachEnd::FullPolicy, json!({"kind": "full_policy"})),
+            (
+                ReachEnd::DiskFillsFirst,
+                json!({"kind": "disk_fills_first"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(end).unwrap(), wire);
+        }
+        let withheld = Reach::Withheld {
+            reason: WithheldReason::MeasurementUnavailable,
+        };
+        assert_eq!(
+            serde_json::to_value(&withheld).unwrap(),
+            json!({"state": "withheld", "reason": "measurement_unavailable"})
+        );
+        for (outcome, token) in [
+            (SweepOutcome::Completed, "completed"),
+            (SweepOutcome::Suppressed, "suppressed"),
+            (SweepOutcome::Failed, "failed"),
+            (SweepOutcome::ExhaustedBelowFloor, "exhausted_below_floor"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), token);
+        }
+        for (role, token) in [
+            (FilesystemRole::Data, "data"),
+            (FilesystemRole::Wal, "wal"),
+            (FilesystemRole::Spill, "spill"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), token);
+        }
+    }
+
     #[test]
     fn catalog_fields_response_roundtrip() {
         let resp = CatalogFieldsResponse {
@@ -2591,6 +2825,166 @@ mod tests {
         assert!(!rt.cached);
     }
 
+    /// A capacity object carrying every reach, reach-end and withheld
+    /// variant at once.
+    fn capacity_fixture() -> Capacity {
+        let observed = |first: &str| (first.to_owned(), "2026-09-25".to_owned());
+        let projected = |low, high| {
+            let (observed_first, observed_last) = observed("2026-09-19");
+            Reach::Projected {
+                observed_first,
+                observed_last,
+                observed_days: 7,
+                low,
+                high,
+            }
+        };
+        let env = |env: &str, max_age_days, reach| EnvironmentCapacity {
+            env: env.into(),
+            max_age_days,
+            oldest_date: "2026-06-01".into(),
+            stored_bytes: 9_000_000_000,
+            reach,
+        };
+        let (observed_first, observed_last) = observed("2026-09-22");
+        Capacity {
+            headroom: HeadroomReading {
+                measurement: StorageMeasurement {
+                    status: StorageMeasurementStatus::Failed,
+                    sample_age_secs: Some(45),
+                },
+                filesystems: vec![
+                    FilesystemHeadroom {
+                        roles: vec![FilesystemRole::Data, FilesystemRole::Spill],
+                        total_bytes: 500_000_000_000,
+                        available_bytes: 800_000_000,
+                        floor: Some(DeletionFloor::Armed {
+                            floor_bytes: 1_073_741_824,
+                            deficit_bytes: 273_741_824,
+                        }),
+                    },
+                    FilesystemHeadroom {
+                        roles: vec![FilesystemRole::Wal],
+                        total_bytes: 64_000_000_000,
+                        available_bytes: 60_000_000_000,
+                        floor: None,
+                    },
+                ],
+            },
+            pressure: PressureEvidence {
+                removals_age: 14,
+                removals_disk_pressure: 3,
+                pressure_attempts: 2,
+                last_sweep: Some(LastSweep {
+                    outcome: SweepOutcome::ExhaustedBelowFloor,
+                    age_secs: 754,
+                }),
+            },
+            environments: vec![
+                env(
+                    "archive",
+                    0,
+                    Reach::KeepForever {
+                        observed_first,
+                        observed_last,
+                        observed_days: 4,
+                        mean_daily_bytes: 120_000_000,
+                    },
+                ),
+                env(
+                    "fresh",
+                    30,
+                    Reach::Withheld {
+                        reason: WithheldReason::InsufficientHistory,
+                    },
+                ),
+                env(
+                    "lab",
+                    7,
+                    projected(ReachEnd::DiskFillsFirst, ReachEnd::FullPolicy),
+                ),
+                env(
+                    "prod",
+                    90,
+                    projected(ReachEnd::Days { days: 38 }, ReachEnd::Days { days: 52 }),
+                ),
+                env(
+                    "repinned",
+                    30,
+                    Reach::Withheld {
+                        reason: WithheldReason::RetentionSuppressed,
+                    },
+                ),
+                env(
+                    "unmeasured",
+                    30,
+                    Reach::Withheld {
+                        reason: WithheldReason::MeasurementUnavailable,
+                    },
+                ),
+            ],
+            growth_excluded: vec!["fresh".into()],
+        }
+    }
+
+    /// Every capacity variant survives the wire, alone and inside the
+    /// dashboard snapshot, and the snapshot refuses to decode without it.
+    #[test]
+    fn dashboard_capacity_roundtrip() {
+        let full = capacity_fixture();
+        assert_eq!(roundtrip(&full), full);
+
+        // The variants one object cannot hold at once: the other floor
+        // state, every sweep outcome, no sweep yet, and no sample yet.
+        let mut variants = Vec::new();
+        for outcome in [
+            SweepOutcome::Completed,
+            SweepOutcome::Suppressed,
+            SweepOutcome::Failed,
+            SweepOutcome::ExhaustedBelowFloor,
+        ] {
+            let mut capacity = capacity_fixture();
+            capacity.pressure.last_sweep = Some(LastSweep {
+                outcome,
+                age_secs: 1,
+            });
+            variants.push(capacity);
+        }
+        let mut floor_off = capacity_fixture();
+        floor_off.headroom.filesystems[0].floor = Some(DeletionFloor::Off);
+        variants.push(floor_off);
+        let mut unsampled = capacity_fixture();
+        unsampled.headroom = HeadroomReading {
+            measurement: StorageMeasurement {
+                status: StorageMeasurementStatus::NotSampled,
+                sample_age_secs: None,
+            },
+            filesystems: vec![],
+        };
+        unsampled.pressure.last_sweep = None;
+        unsampled.environments.clear();
+        unsampled.growth_excluded.clear();
+        variants.push(unsampled);
+        for capacity in variants {
+            assert_eq!(roundtrip(&capacity), capacity);
+            let snapshot = DashboardSnapshot {
+                capacity: capacity.clone(),
+                ..dashboard_fixture()
+            };
+            assert_eq!(roundtrip(&snapshot).capacity, capacity);
+        }
+
+        let mut missing = serde_json::to_value(dashboard_fixture()).unwrap();
+        assert!(
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("capacity")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<DashboardSnapshot>(missing).is_err());
+    }
+
     /// One fully populated snapshot, shared by the tests that need a
     /// complete wire shape to take a field away from.
     fn dashboard_fixture() -> DashboardSnapshot {
@@ -2637,6 +3031,7 @@ mod tests {
                 status: StorageMeasurementStatus::Complete,
                 sample_age_secs: Some(2),
             },
+            capacity: capacity_fixture(),
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,

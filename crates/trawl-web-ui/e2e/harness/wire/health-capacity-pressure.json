@@ -1,0 +1,83 @@
+{
+  "parquet_files": 3,
+  "parquet_bytes": 5600000000,
+  "parquet_measurement": {
+    "status": "complete",
+    "sample_age_secs": 1
+  },
+  "wal_files": 7,
+  "wal_bytes": 2048,
+  "wal_measurement": {
+    "status": "complete",
+    "sample_age_secs": 1
+  },
+  "capacity": {
+    "headroom": {
+      "measurement": {
+        "status": "complete",
+        "sample_age_secs": 1
+      },
+      "filesystems": [
+        {
+          "roles": [
+            "data",
+            "wal",
+            "spill"
+          ],
+          "total_bytes": 100000000000,
+          "available_bytes": 600000000,
+          "floor": {
+            "state": "armed",
+            "floor_bytes": 1073741824,
+            "deficit_bytes": 473741824
+          }
+        }
+      ]
+    },
+    "pressure": {
+      "removals_age": 30,
+      "removals_disk_pressure": 12,
+      "pressure_attempts": 5,
+      "last_sweep": {
+        "outcome": "exhausted_below_floor",
+        "age_secs": 61
+      }
+    },
+    "environments": [
+      {
+        "env": "archive",
+        "max_age_days": 0,
+        "oldest_date": "2026-09-27",
+        "stored_bytes": 1200000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "insufficient_history"
+        }
+      },
+      {
+        "env": "lab",
+        "max_age_days": 7,
+        "oldest_date": "2026-09-27",
+        "stored_bytes": 300000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "insufficient_history"
+        }
+      },
+      {
+        "env": "prod",
+        "max_age_days": 90,
+        "oldest_date": "2026-09-27",
+        "stored_bytes": 4100000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "insufficient_history"
+        }
+      }
+    ],
+    "growth_excluded": [
+      "lab",
+      "prod"
+    ]
+  }
+}

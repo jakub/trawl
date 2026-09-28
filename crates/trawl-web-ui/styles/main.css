@@ -2300,6 +2300,22 @@
 .health-storage-source { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
 .health-storage-source h3 { margin: 0; font-size: var(--fs-control); }
 .health-storage-source p { line-height: 1.5; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+/* Disk and retention (ADR-0042): three groups in one card. Headroom rows
+ * and environments are a stacked list, not the wrapping facts, so each
+ * reading keeps its whole sentence on narrow widths. No tone anywhere:
+ * the card states measurements and a conditional projection, never a
+ * verdict. */
+.health-disk-group { border-top: 1px solid var(--line); margin-top: 14px; padding-top: 12px; }
+.health-disk-group h3 { margin: 0; font-size: var(--fs-control); }
+.health-disk-group p { line-height: 1.5; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.health-disk-group .health-facts { margin-top: 8px; padding-top: 0; border-top: 0; }
+.health-disk-list { margin: 4px 0 0; }
+.health-disk-list > div { padding: 8px 0; border-bottom: 1px solid var(--line-2); }
+.health-disk-list > div:last-child { border-bottom: 0; padding-bottom: 0; }
+.health-disk-list dt { font-weight: 500; font-size: var(--fs-control); color: var(--ink); }
+.health-disk-list dd { margin: 2px 0 0; }
+.health-disk-list dd p { margin: 0; }
+.health-disk-date { white-space: nowrap; }
 @media (min-width: 1100px) {
   .health-diagnostics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

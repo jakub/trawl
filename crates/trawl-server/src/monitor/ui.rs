@@ -23,6 +23,66 @@ mod tests {
         trawl_dashboard::render_dashboard(&ds, f, f.area(), &opts);
     }
 
+    /// A complete headroom sample: data and spill share a 500 GB device
+    /// with 120 GB free above a 1 GB floor, and the WAL has its own. One
+    /// pressure-deleting sweep has run.
+    fn test_capacity() -> trawl_api::Capacity {
+        use trawl_api::{
+            Capacity, DeletionFloor, EnvironmentCapacity, FilesystemHeadroom, FilesystemRole,
+            HeadroomReading, LastSweep, PressureEvidence, Reach, ReachEnd, StorageMeasurement,
+            StorageMeasurementStatus, SweepOutcome,
+        };
+        const GIB: u64 = 1024 * 1024 * 1024;
+        Capacity {
+            headroom: HeadroomReading {
+                measurement: StorageMeasurement {
+                    status: StorageMeasurementStatus::Complete,
+                    sample_age_secs: Some(2),
+                },
+                filesystems: vec![
+                    FilesystemHeadroom {
+                        roles: vec![FilesystemRole::Data, FilesystemRole::Spill],
+                        total_bytes: 500 * GIB,
+                        available_bytes: 120 * GIB,
+                        floor: Some(DeletionFloor::Armed {
+                            floor_bytes: GIB,
+                            deficit_bytes: 0,
+                        }),
+                    },
+                    FilesystemHeadroom {
+                        roles: vec![FilesystemRole::Wal],
+                        total_bytes: 64 * GIB,
+                        available_bytes: 60 * GIB,
+                        floor: None,
+                    },
+                ],
+            },
+            pressure: PressureEvidence {
+                removals_age: 14,
+                removals_disk_pressure: 3,
+                pressure_attempts: 2,
+                last_sweep: Some(LastSweep {
+                    outcome: SweepOutcome::Completed,
+                    age_secs: 754,
+                }),
+            },
+            environments: vec![EnvironmentCapacity {
+                env: "prod".into(),
+                max_age_days: 90,
+                oldest_date: "2026-07-01".into(),
+                stored_bytes: 12 * GIB,
+                reach: Reach::Projected {
+                    observed_first: "2026-09-19".into(),
+                    observed_last: "2026-09-25".into(),
+                    observed_days: 7,
+                    low: ReachEnd::Days { days: 38 },
+                    high: ReachEnd::Days { days: 52 },
+                },
+            }],
+            growth_excluded: vec![],
+        }
+    }
+
     fn test_snapshot() -> MonitorSnapshot {
         MonitorSnapshot {
             hostname: "test-host".into(),
@@ -67,6 +127,7 @@ mod tests {
                 status: trawl_api::StorageMeasurementStatus::Complete,
                 sample_age_secs: Some(2),
             },
+            capacity: test_capacity(),
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,
@@ -136,6 +197,7 @@ mod tests {
             assert_eq!((wire.parquet_files, wire.parquet_bytes), (files, bytes));
             assert_eq!(wire.wal_measurement, measurement);
             assert_eq!(wire.parquet_measurement, measurement);
+            assert_eq!(wire.capacity, monitor.capacity);
         }
     }
 
@@ -164,6 +226,17 @@ mod tests {
         snapshot.recent_queries = vec![];
         snapshot.active_queries = vec![];
         let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(&snapshot, f)).unwrap();
+        insta::assert_snapshot!(terminal.backend().to_string());
+    }
+
+    /// The whole capacity line (ADR-0042), unclipped: a monitor wide
+    /// enough to show every field of the data pipeline panel.
+    #[test]
+    fn render_dashboard_capacity_wide() {
+        let snapshot = test_snapshot();
+        let backend = TestBackend::new(180, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| render(&snapshot, f)).unwrap();
         insta::assert_snapshot!(terminal.backend().to_string());

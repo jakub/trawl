@@ -2758,6 +2758,7 @@ mod hydrate {
                 "/nonexistent/*.parquet",
                 None,
                 0,
+                &crate::repin::JobGeneration::default(),
             );
         });
         let rendered = handle.render();
