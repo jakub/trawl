@@ -257,7 +257,7 @@ impl HttpClient {
             let (body, _) = read_capped(resp, HEALTH_BODY_CAP).await?;
             return Err(server_error(status.as_u16(), &body));
         }
-        read_json_capped(resp, HEALTH_BODY_CAP).await
+        read_json_capped(resp, HEALTH_BODY_CAP, "health").await
     }
 
     /// Fetch schema introspection from the daemon.
@@ -506,7 +506,7 @@ impl HttpClient {
             let (body, _) = read_capped(resp, WHOAMI_BODY_CAP).await?;
             return Err(server_error(status.as_u16(), &body));
         }
-        read_json_capped(resp, WHOAMI_BODY_CAP).await
+        read_json_capped(resp, WHOAMI_BODY_CAP, "whoami").await
     }
 
     /// Fetch the full dashboard snapshot (needs `server_manage`).
@@ -1046,15 +1046,22 @@ const WHOAMI_BODY_CAP: usize = 64 * 1024;
 
 /// Read a success body of at most `cap` bytes and parse it as JSON. A body
 /// past the cap is [`ClientError::TooLarge`], and the rest is never read.
+///
+/// A body that does not decode is a [`ClientError::Parse`] naming only
+/// `what`, never serde's reason: that reason quotes the offending value
+/// (``unknown variant `…` ``), and the value is whatever the server sent,
+/// an echoed key included.
 async fn read_json_capped<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
     cap: usize,
+    what: &str,
 ) -> Result<T, ClientError> {
     let (body, truncated) = read_capped(resp, cap).await?;
     if truncated {
         return Err(ClientError::TooLarge { cap });
     }
-    serde_json::from_slice(&body).map_err(|e| ClientError::Parse(e.to_string()))
+    serde_json::from_slice(&body)
+        .map_err(|_| ClientError::Parse(format!("response is not valid JSON for {what}")))
 }
 
 /// A `Server` error for `status`, carrying the body's error envelope when
@@ -1798,6 +1805,46 @@ mod tests {
         assert!(
             matches!(err, ClientError::TooLarge { cap } if cap == WHOAMI_BODY_CAP),
             "{err:?}"
+        );
+    }
+
+    /// A body that does not decode names only the endpoint. serde's reason
+    /// quotes the offending value, so a server that echoes the bearer key
+    /// into a typed field (here `kind`) would otherwise put it in the
+    /// error, and from there into the TUI's log and the trial's failure
+    /// message, which both render this error.
+    #[tokio::test]
+    async fn parse_errors_never_quote_the_response() {
+        const KEY: &str = "flt_Ab3dEf9hIjKlMnOpQrStUvWxYz0123456789";
+        let body = format!(
+            r#"{{"prefix":"abcd1234","name":"ops","kind":"{KEY}","roles":[],"permissions":[]}}"#
+        );
+        let err =
+            whoami_answered_with(http_response("200 OK", "application/json", body.as_bytes()))
+                .await
+                .expect_err("an unknown kind does not decode");
+        assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "response parse error: response is not valid JSON for whoami"
+        );
+        let debug = format!("{err:?}");
+        for piece in KEY.as_bytes().chunks(4) {
+            let piece = std::str::from_utf8(piece).unwrap();
+            assert!(!err.to_string().contains(piece), "{err}");
+            assert!(!debug.contains(piece), "{debug}");
+        }
+
+        let err = health_answered_with(http_response(
+            "200 OK",
+            "application/json",
+            format!(r#"{{"status":"{KEY}"}}"#).as_bytes(),
+        ))
+        .await
+        .expect_err("an unknown status does not decode");
+        assert_eq!(
+            err.to_string(),
+            "response parse error: response is not valid JSON for health"
         );
     }
 
