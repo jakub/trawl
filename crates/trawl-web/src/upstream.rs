@@ -16,6 +16,17 @@
 //!   the read produced, or answers 503 `upstream certificate not
 //!   available`.
 //!
+//! Reads are single-flight, and each runs on tokio's blocking pool, never
+//! on a runtime worker: opening, reading and parsing the file and building
+//! a client are all synchronous, and a file on a stalled network volume
+//! can block for as long as the volume stalls. The open itself never
+//! waits, and a path that is not a regular file, such as a FIFO, is a
+//! refusal. A request waits for a read at most [`CA_READ_WAIT`], then
+//! answers 503; the read goes on, and what it finds is still used. A
+//! request that queued behind a read which started after it arrived takes
+//! that read's result instead of reading again. Routes that never reach
+//! trawld, `/healthz` among them, never wait on the file.
+//!
 //! A read compares the file's bytes with the bytes behind the client in
 //! use, never its modification time. Unchanged bytes do nothing. Bytes
 //! that parse become a new client. Bytes that do not parse, a file that
@@ -28,23 +39,33 @@
 //! takes and never touches a client already taken.
 
 use std::path::PathBuf;
-use std::sync::{PoisonError, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use reqwest::{Certificate, Client, ClientBuilder};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
-use crate::config::{UpstreamConnect, UpstreamTls, pinned_roots};
+use crate::config::{UpstreamConnect, UpstreamTls, pinned_roots, read_pin_file};
 use crate::error::ProxyError;
 
 /// How often the pinned CA file is read again.
 pub const CA_REREAD_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The longest a request waits for a read of the pin file, queueing
+/// behind another read included, before it answers 503. A local file reads
+/// in well under this; only a stalled volume takes longer, and then a
+/// prompt 503 serves the browser better than a hung request.
+pub const CA_READ_WAIT: Duration = Duration::from_secs(5);
 
 /// The upstream client for one trust mode.
 pub struct Upstream(Trust);
 
 enum Trust {
     System(Client),
-    Pinned(Pin),
+    /// Shared with the read in flight on the blocking pool, which outlives
+    /// any request that stops waiting for it.
+    Pinned(Arc<Pin>),
 }
 
 struct Pin {
@@ -56,8 +77,18 @@ struct Pin {
     /// clone or replace the client, never across an `.await` or a build.
     client: RwLock<Option<Client>>,
     /// Makes every read of the file single-flight, and owns what the reads
-    /// have seen so far.
-    reread: tokio::sync::Mutex<Observed>,
+    /// have seen so far. A read holds it from start to end, on the
+    /// blocking pool, through an owned guard.
+    reread: Arc<Mutex<Observed>>,
+    /// How many reads have started. Incremented while holding `reread`,
+    /// before the file is opened, so a request that saw a lower count on
+    /// arrival and now holds the mutex knows a read that began after it
+    /// arrived has finished.
+    reads_started: AtomicU64,
+    /// Write-locked by a test to stall reads on the blocking pool, as a
+    /// stalled volume would.
+    #[cfg(test)]
+    stall: tokio::sync::RwLock<()>,
 }
 
 /// What earlier reads of the pin file found.
@@ -116,12 +147,15 @@ impl Upstream {
                         },
                     ),
                 };
-                Ok(Self(Trust::Pinned(Pin {
+                Ok(Self(Trust::Pinned(Arc::new(Pin {
                     path,
                     connect,
                     client: RwLock::new(client),
-                    reread: tokio::sync::Mutex::new(observed),
-                })))
+                    reread: Arc::new(Mutex::new(observed)),
+                    reads_started: AtomicU64::new(0),
+                    #[cfg(test)]
+                    stall: tokio::sync::RwLock::new(()),
+                }))))
             }
         }
     }
@@ -134,11 +168,14 @@ impl Upstream {
     /// The client for one request.
     ///
     /// While a pin has no client, this reads the file once, single-flight
-    /// with every other read, and takes the client that read produced.
+    /// with every other read, and takes the client that read produced. A
+    /// read that started after this request arrived and finished while it
+    /// queued serves instead of a new one.
     ///
     /// # Errors
     /// [`ProxyError::UpstreamCertificateUnavailable`] when the pin file has
-    /// never held a usable certificate.
+    /// never held a usable certificate, or no read finished within
+    /// [`CA_READ_WAIT`].
     pub async fn client(&self) -> Result<Client, ProxyError> {
         let pin = match &self.0 {
             Trust::System(client) => return Ok(client.clone()),
@@ -147,13 +184,20 @@ impl Upstream {
         if let Some(client) = pin.current() {
             return Ok(client);
         }
-        let mut observed = pin.reread.lock().await;
-        // Another request may have loaded the file while this one waited.
-        if let Some(client) = pin.current() {
-            return Ok(client);
-        }
-        pin.observe(&mut observed);
-        drop(observed);
+        let arrived = pin.reads_started.load(Ordering::Acquire);
+        let read = async {
+            let observed = Arc::clone(&pin.reread).lock_owned().await;
+            // A client may have been loaded while this request queued. A
+            // read that began after it arrived has finished, too: its
+            // result, a client or none, answers this request as well.
+            if pin.current().is_some() || pin.reads_started.load(Ordering::Acquire) != arrived {
+                return;
+            }
+            Pin::observe(Arc::clone(pin), observed).await;
+        };
+        // On timeout the read in flight, this request's or another's, goes
+        // on and installs what it finds; only the wait ends.
+        let _ = tokio::time::timeout(CA_READ_WAIT, read).await;
         pin.current()
             .ok_or(ProxyError::UpstreamCertificateUnavailable)
     }
@@ -162,8 +206,8 @@ impl Upstream {
     /// changed and parse. Nothing to do under the platform roots.
     pub async fn reread(&self) {
         if let Trust::Pinned(pin) = &self.0 {
-            let mut observed = pin.reread.lock().await;
-            pin.observe(&mut observed);
+            let observed = Arc::clone(&pin.reread).lock_owned().await;
+            Pin::observe(Arc::clone(pin), observed).await;
         }
     }
 }
@@ -176,10 +220,37 @@ impl Pin {
             .clone()
     }
 
-    /// Read the file once and act on what it holds. The caller holds the
-    /// re-read mutex, whose contents `observed` is.
-    fn observe(&self, observed: &mut Observed) {
-        let (refusal, reason) = match std::fs::read(&self.path) {
+    /// Read the file once on the blocking pool, holding `observed`, the
+    /// re-read mutex, until the read has acted on what it found.
+    ///
+    /// The read cannot be cancelled: dropping this future stops only the
+    /// wait for it.
+    async fn observe(pin: Arc<Self>, mut observed: OwnedMutexGuard<Observed>) {
+        pin.reads_started.fetch_add(1, Ordering::AcqRel);
+        // The read logs as if it ran here: to this thread's subscriber,
+        // inside the span of the request or task that started it.
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let span = tracing::Span::current();
+        let read = tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(|| {
+                    #[cfg(test)]
+                    drop(pin.stall.blocking_read());
+                    pin.observe_blocking(&mut observed);
+                });
+            });
+        });
+        if let Err(e) = read.await
+            && e.is_panic()
+        {
+            std::panic::resume_unwind(e.into_panic());
+        }
+    }
+
+    /// Read the file once and act on what it holds. Blocks; the caller
+    /// holds the re-read mutex, whose contents `observed` is.
+    fn observe_blocking(&self, observed: &mut Observed) {
+        let (refusal, reason) = match read_pin_file(&self.path) {
             Ok(pem) if observed.loaded.as_deref() == Some(pem.as_slice()) => {
                 observed.refusal = None;
                 return;
@@ -517,6 +588,89 @@ mod tests {
         assert!(!trusts(&after, &front_a).await, "the swap kept the old CA");
     }
 
+    fn pin_of(upstream: &Upstream) -> &Arc<Pin> {
+        match &upstream.0 {
+            Trust::Pinned(pin) => pin,
+            Trust::System(_) => panic!("not a pin"),
+        }
+    }
+
+    /// A read that outlasts [`CA_READ_WAIT`]: the request answers 503 when
+    /// its wait ends, and the read goes on to install the client it builds.
+    #[tokio::test]
+    async fn a_request_stops_waiting_for_a_stalled_read() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        let upstream = pinned(&path);
+        let pin = Arc::clone(pin_of(&upstream));
+        std::fs::write(&path, TestCa::generate().pem()).unwrap();
+
+        let stall = pin.stall.write().await;
+        let started = tokio::time::Instant::now();
+        let outcome = tokio::time::timeout(CA_READ_WAIT * 2, upstream.client())
+            .await
+            .expect("the request kept waiting past its bound");
+        let waited = started.elapsed();
+        assert!(
+            matches!(outcome, Err(ProxyError::UpstreamCertificateUnavailable)),
+            "{outcome:?}"
+        );
+        assert!(
+            waited >= CA_READ_WAIT,
+            "the request gave up before its bound: {waited:?}"
+        );
+        assert!(pin.current().is_none());
+
+        drop(stall);
+        // The read holds the re-read mutex until it has acted, so once the
+        // mutex is free the read has finished.
+        drop(
+            tokio::time::timeout(Duration::from_secs(10), pin.reread.lock())
+                .await
+                .expect("the stalled read finished"),
+        );
+        assert!(
+            pin.current().is_some(),
+            "the stalled read's client was not installed"
+        );
+        assert_eq!(pin.reads_started.load(Ordering::SeqCst), 1);
+    }
+
+    /// Requests that queue behind a read which started before they arrived
+    /// read the file once more between them: the first to get the mutex
+    /// reads, and the rest take that read's result.
+    #[tokio::test]
+    async fn queued_requests_share_one_read() {
+        use futures::FutureExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let upstream = pinned(&path);
+        let pin = Arc::clone(pin_of(&upstream));
+
+        let stall = pin.stall.write().await;
+        let mut first = Box::pin(upstream.client());
+        assert!((&mut first).now_or_never().is_none(), "the read stalls");
+        assert_eq!(pin.reads_started.load(Ordering::SeqCst), 1);
+        let mut queued: Vec<_> = (0..3).map(|_| Box::pin(upstream.client())).collect();
+        for request in &mut queued {
+            assert!(request.now_or_never().is_none(), "the request queues");
+        }
+        drop(stall);
+
+        assert!(first.await.is_err());
+        for request in queued {
+            assert!(request.await.is_err());
+        }
+        assert_eq!(
+            pin.reads_started.load(Ordering::SeqCst),
+            2,
+            "each queued request read the file itself"
+        );
+    }
+
     /// Each distinct refusal logs one warning, however often a re-read
     /// meets it.
     #[test]
@@ -527,6 +681,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let upstream = pinned(&path);
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
         let reread_with = |contents: &str| {
@@ -574,6 +729,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (upstream, _) = captured_logs(|| pinned(&path));
         let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
             .build()
             .unwrap();
 

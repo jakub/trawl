@@ -657,9 +657,9 @@ pub fn resolve_upstream_connect(
 /// - Absent (`NotFound`): the pin is pending, and one `upstream_ca_pending`
 ///   warning says so. trawld writes its generated certificate on its first
 ///   start, which may come after trawl-web's.
-/// - Any other read error, or contents that do not parse as a certificate
-///   bundle: refused, so a broken pin stops startup instead of failing
-///   every request later.
+/// - Any other read error, a path that is not a regular file, or contents
+///   that do not parse as a certificate bundle: refused, so a broken pin
+///   stops startup instead of failing every request later.
 ///
 /// # Errors
 /// Returns [`ConfigError::UpstreamCa`] naming the file and the reason.
@@ -677,7 +677,7 @@ pub fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, Confi
             "the path is empty. Name trawld's CA file, or remove the setting to trust the platform roots",
         ));
     }
-    let roots = match std::fs::read(&path) {
+    let roots = match read_pin_file(&path) {
         Ok(pem) => Some(pinned_roots(&pem).map_err(refuse)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
@@ -690,6 +690,38 @@ pub fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, Confi
         Err(e) => return Err(refuse(&e.to_string())),
     };
     Ok(UpstreamTls::PinnedCa { path, roots })
+}
+
+/// Read the pin file at `path`, refusing anything but a regular file.
+///
+/// The open never waits: on unix it passes `O_NONBLOCK`, so a FIFO with
+/// no writer opens at once instead of blocking until one appears. The
+/// type check runs on the opened handle, so the path cannot be swapped
+/// between check and read. A FIFO, directory or device is refused with
+/// `InvalidInput`. Reading a regular file can still stall, on a network
+/// volume for one, so callers on the async runtime run this on the
+/// blocking pool. The one reader for a pin file, at startup and on any
+/// later read.
+pub(crate) fn read_pin_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path is not a regular file",
+        ));
+    }
+    let mut pem = Vec::new();
+    file.read_to_end(&mut pem)?;
+    Ok(pem)
 }
 
 /// Parse a PEM bundle into trust anchors, refusing one that yields none.

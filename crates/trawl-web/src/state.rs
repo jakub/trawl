@@ -157,7 +157,8 @@ impl AppState {
     ///
     /// # Errors
     /// [`ProxyError::UpstreamCertificateUnavailable`] while a pinned CA
-    /// file has never held a usable certificate.
+    /// file has never held a usable certificate, or when no read of it
+    /// finished within [`crate::upstream::CA_READ_WAIT`].
     pub async fn upstream_client(&self) -> Result<Client, ProxyError> {
         self.inner.upstream.client().await
     }

@@ -54,7 +54,8 @@ pub enum ProxyError {
     /// `[web] upstream_ca_path` has never held a usable certificate, so
     /// no client can verify trawld yet (ADR-0048). trawld writes its
     /// generated certificate on its first start, which may come after
-    /// trawl-web's.
+    /// trawl-web's. Also the answer when no read of the file finished
+    /// within [`crate::upstream::CA_READ_WAIT`], as on a stalled volume.
     ///
     /// 503, distinct from [`Self::ServiceUnavailable`] so an operator can
     /// tell the cause from the body alone, and no cookie mutation: the

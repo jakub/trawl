@@ -697,3 +697,149 @@ async fn unparseable_ca_change_keeps_last_good() {
     state.reread_upstream_ca().await;
     expect_accepted(&mut upstream, state).await;
 }
+
+/// Run `body` on a current-thread runtime of its own, and fail if it has
+/// not finished within `bound`. A call that blocks the runtime's only
+/// thread also stops every tokio timer on it, so the bound is kept here,
+/// outside the runtime.
+#[cfg(unix)]
+fn on_one_runtime_thread<F>(bound: Duration, body: impl FnOnce() -> F + Send + 'static)
+where
+    F: std::future::Future<Output = ()>,
+{
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(body());
+        let _ = done.send(());
+    });
+    match finished.recv_timeout(bound) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("the runtime's only thread stalled for {bound:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the test body panicked; its message is above")
+        }
+    }
+}
+
+/// Make a FIFO at `path`. Nothing ever opens its write end, so a plain
+/// `open` for reading waits forever.
+#[cfg(unix)]
+fn mkfifo(path: &std::path::Path) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("create the directory");
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo {}: {status}", path.display());
+}
+
+/// A proxy whose pin file did not exist at startup. Nothing listens at
+/// the upstream URL: no test that uses it may get as far as dialing.
+#[cfg(unix)]
+fn pending_pin_state(ca_path: &std::path::Path) -> AppState {
+    let web = WebConfig {
+        upstream_url: Some("https://127.0.0.1:9".to_owned()),
+        upstream_ca_path: Some(ca_path.to_owned()),
+        public_origins: vec!["https://trawl.example.com".to_owned()],
+        ..WebConfig::default()
+    };
+    let resolved = ResolvedConfig::from_parsed(&web, None).expect("an absent pin still resolves");
+    AppState::from_config(resolved).expect("trawl-web starts without the file")
+}
+
+#[cfg(unix)]
+async fn expect_healthy(state: AppState) {
+    let health = routes::build(state)
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router answers");
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(body_text(health).await, "ok");
+}
+
+/// A FIFO with no writer at the pin path, on a runtime with one thread:
+/// a login gets its 503 at once, as a refusal rather than a wait, and
+/// `/healthz` keeps answering.
+#[cfg(unix)]
+#[test]
+fn a_fifo_pin_is_refused_without_blocking_a_request() {
+    on_one_runtime_thread(Duration::from_secs(30), || async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("tls").join("cert.pem");
+        let state = pending_pin_state(&ca_path);
+        mkfifo(&ca_path);
+
+        expect_healthy(state.clone()).await;
+        let started = tokio::time::Instant::now();
+        expect_unavailable(login_response(state.clone()).await).await;
+        expect_unavailable(forwarded(state.clone(), "/api/v1/whoami").await).await;
+        assert!(
+            started.elapsed() < trawl_web::upstream::CA_READ_WAIT,
+            "the FIFO was waited on, not refused: {:?}",
+            started.elapsed()
+        );
+        expect_healthy(state).await;
+    });
+}
+
+/// The same FIFO met by the interval task: requests keep being served
+/// while it re-reads the pin every few milliseconds.
+#[cfg(unix)]
+#[test]
+fn a_fifo_pin_does_not_stall_the_reread_task() {
+    on_one_runtime_thread(Duration::from_secs(30), || async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca_path = dir.path().join("tls").join("cert.pem");
+        let state = pending_pin_state(&ca_path);
+        mkfifo(&ca_path);
+        let interval = Duration::from_millis(10);
+        let _reread = state
+            .spawn_upstream_ca_reread(interval)
+            .expect("a pin starts the re-read task");
+
+        for _ in 0..10 {
+            tokio::time::sleep(interval * 2).await;
+            expect_healthy(state.clone()).await;
+        }
+        expect_unavailable(login_response(state).await).await;
+    });
+}
+
+/// A FIFO at the pin path at startup is refused, not waited on.
+#[cfg(unix)]
+#[test]
+fn a_fifo_pin_is_refused_at_startup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("cert.pem");
+    mkfifo(&ca_path);
+    let (done, resolved) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let web = WebConfig {
+            upstream_url: Some("https://127.0.0.1:9".to_owned()),
+            upstream_ca_path: Some(ca_path),
+            public_origins: vec!["https://trawl.example.com".to_owned()],
+            ..WebConfig::default()
+        };
+        let _ = done.send(
+            ResolvedConfig::from_parsed(&web, None)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        );
+    });
+    let error = resolved
+        .recv_timeout(Duration::from_secs(30))
+        .expect("resolution stalled on the FIFO")
+        .expect_err("a FIFO is not a CA file");
+    assert!(error.contains("not a regular file"), "got: {error}");
+}
