@@ -1723,7 +1723,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/dashboard
   "last_compaction_secs": 4, "compaction_runs": 8640, "compaction_errors": 0,
   "parquet_files": 12, "parquet_bytes": 5242880,
   "parquet_measurement": { "status": "complete", "sample_age_secs": 5 },
-  "capacity": { "headroom": { "measurement": { "status": "complete", "sample_age_secs": 3 }, "filesystems": [] }, "pressure": { "removals_age": 0, "removals_disk_pressure": 0, "pressure_attempts": 0, "last_sweep": null }, "environments": [], "growth_excluded": [] },
+  "capacity": { "headroom": { "measurement": { "status": "not_sampled", "sample_age_secs": null }, "filesystems": [] }, "pressure": { "removals_age": 0, "removals_disk_pressure": 0, "pressure_attempts": 0, "last_sweep": null }, "environments": [], "growth_excluded": [] },
   "sse_active": 0, "sse_max": 32,
   "scheduler_enabled": true, "scheduler_schedules": 1,
   "recent_queries": [], "active_queries": []
