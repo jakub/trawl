@@ -1,6 +1,7 @@
 {
   "evidence": "Stub fixtures only; no daemon, database, or real ingest",
-  "head": "f70b556f3887bebeb44e93370b0458f29af561dc",
+  "head": "39181a030cd248af604bbbe6832033bafc9f5a07",
+  "rebased_from": "f70b556f3887bebeb44e93370b0458f29af561dc",
   "git_status": "",
   "spec": "crates/trawl-web-ui/e2e/tests/health-page.spec.ts",
   "spec_sha256": "d8b08ba71ec6580ba1aa408bd7ca745e1ab7010bcd53f5f38c3194f157426884",
