@@ -263,7 +263,8 @@ class TLS(unittest.TestCase):
                 self.fails({"web": web(), "config": {"data": {"path": path}}}, "config.data.path")
 
         # config.raw owns its TOML, but the sidecar still mounts per mode.
-        raw = '[server]\nhttp_addr = "0.0.0.0:5514"\n[data]\npath = "/var/lib/trawl/data"\n'
+        raw = ('[server]\nhttp_addr = "0.0.0.0:5514"\n[data]\npath = "/var/lib/trawl/data"\n'
+               '[web]\nupstream_ca_path = "/var/lib/trawl/tls/cert.pem"\n')
         objects = self.objects({"web": web(), "config": {"raw": raw}})
         self.assertEqual(objects["configmap"]["data"]["trawld.toml"].strip(), raw.strip())
         self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl")
@@ -355,7 +356,50 @@ class TLS(unittest.TestCase):
         self.fails({"web": web(), "config": {"raw": f'server.tls_key_path = "/var/lib/trawl/tls/key.pem"\n{data}'}},
                    "tls_key_path")
         # Other [server] keys are the operator's own.
-        self.objects({"web": web(), "config": {"raw": f'[server]\ntls_reload_interval_secs = 60\n{data}'}})
+        pin = '[web]\nupstream_ca_path = "/var/lib/trawl/tls/cert.pem"\n'
+        self.objects({"web": web(), "config": {"raw": f'[server]\ntls_reload_interval_secs = 60\n{data}{pin}'}})
+
+    def test_auto_mode_raw_config_pins_generated_certificate(self):
+        # trawl-web reads its trust anchor from the raw TOML's [web]
+        # upstream_ca_path, and an absent one means the platform roots.
+        # auto pins the certificate trawld generates, so the raw TOML must
+        # name exactly the file the chart mounts: without the key, any
+        # publicly trusted certificate would receive users' bearer keys.
+        data = '[data]\npath = "/var/lib/trawl/nested/data"\n'
+        pinned = "/var/lib/trawl/nested/tls/cert.pem"
+        refused = [f"{web_toml}{data}" for web_toml in [
+            '',
+            '[web]\n',
+            '[web]\nupstream_url = "https://trawld.example.com:5514"\n',
+            '[web]\nupstream_ca_path = "/etc/ssl/certs/ca-certificates.crt"\n',
+            '[web]\nupstream_ca_path = "/var/lib/trawl/tls/cert.pem"\n',
+            '[web]\nupstream_ca_path = "/var/lib/trawl/nested/tls/cert.pem/"\n',
+            '[web]\nupstream_ca_path = "tls/cert.pem"\n',
+            '[web]\nupstream_ca_path = ""\n',
+            '[web]\nupstream_ca_path = 5\n',
+            'web.upstream_ca_path = "/etc/ssl/certs/ca-certificates.crt"\n',
+        ]]
+        # Under [data], a dotted web.upstream_ca_path is data.web's.
+        refused.append(f'{data}web.upstream_ca_path = "{pinned}"\n')
+        for raw in refused:
+            with self.subTest(raw=raw):
+                result = render({"web": web(), "config": {"raw": raw}})
+                self.assertNotEqual(result.returncode, 0)
+                for expected in ["config.raw", "[web] upstream_ca_path", f'"{pinned}"']:
+                    self.assertIn(expected, result.stderr)
+        # The exact pin renders, as a table or as a top-level dotted key
+        # (which parses to the same table), and other [web] keys stay the
+        # operator's own.
+        for web_toml in [
+            f'[web]\nupstream_ca_path = "{pinned}"\n',
+            f'web.upstream_ca_path = "{pinned}"\n',
+            f'[web]\nupstream_ca_path = "{pinned}"\nsession_ttl_secs = 3600\n',
+        ]:
+            with self.subTest(web=web_toml):
+                objects = self.objects({"web": web(), "config": {"raw": f"{web_toml}{data}"}})
+                self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl/nested")
+        # Without the sidecar nothing is pinned, so nothing is required.
+        self.objects({"config": {"raw": data}})
 
     def assert_creates_tls_dir(self, objects, tls_dir):
         # Before any app container starts, trawld's uid creates the directory

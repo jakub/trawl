@@ -283,9 +283,10 @@ written the certificate. It then loads the file with no restart.
 With `web.enabled`, a `config.raw` must set `[data] path`, because the chart
 mounts the `tls/` directory beside it. It must also set
 `upstream_ca_path` under `[web]` to `tls/cert.pem` in the parent directory of
-that path. It must not set `tls_cert_path` or `tls_key_path` under `[server]`:
-either one stops trawld generating the certificate the sidecar pins, so the
-chart refuses to render. To serve your own certificate, use `tls.mode=secret`.
+that path, or the chart refuses to render. It must not set `tls_cert_path` or
+`tls_key_path` under `[server]`: either one stops trawld generating the
+certificate the sidecar pins, so the chart refuses to render. To serve your
+own certificate, use `tls.mode=secret`.
 
 #### Mount an existing TLS Secret
 

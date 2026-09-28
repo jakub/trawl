@@ -252,9 +252,10 @@ assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
 
 # config.raw replaces the generated TOML wholesale, so the env var is the
 # only thing carrying the allowlist in that topology. With the sidecar on,
-# the chart reads the raw [data] path to mount trawld's certificate.
+# the chart reads the raw [data] path to mount trawld's certificate, and
+# the raw [web] block must pin it.
 raw_toml="$work_dir/raw.toml"
-printf '[server]\n[data]\npath = "/var/lib/trawl/data"\n' >"$raw_toml"
+printf '[server]\n[data]\npath = "/var/lib/trawl/data"\n[web]\nupstream_ca_path = "/var/lib/trawl/tls/cert.pem"\n' >"$raw_toml"
 raw_sts="$work_dir/raw-sts.yaml"
 render "${web_enabled[@]}" --set-file "config.raw=$raw_toml" >"$raw_sts"
 assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \

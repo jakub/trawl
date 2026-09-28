@@ -86,9 +86,11 @@ accepted only with `tls.mode: auto`, where the raw TOML controls TLS and the
 chart mounts no TLS Secret. Helm cannot validate arbitrary TOML certificate
 paths against its volume mounts. With `web.enabled`, the chart reads the raw
 TOML's `[data] path` and mounts the `tls` directory beside it, so the raw
-TOML must set `[data] path` and the matching `[web]` keys. It must not set
-`[server] tls_cert_path` or `tls_key_path`, because the sidecar pins the
-generated certificate.
+TOML must set `[data] path`, and `[web] upstream_ca_path` to exactly the
+`tls/cert.pem` in that path's parent directory. Without that key, trawl-web
+trusts the platform roots. The raw TOML must not set `[server] tls_cert_path`
+or `tls_key_path`, because the sidecar pins the generated certificate. The
+chart refuses to render a raw TOML that breaks any of these rules.
 
 Follow [configure the daemon API certificate](https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate)
 for complete values, issuance checks, and client verification. cert-manager's

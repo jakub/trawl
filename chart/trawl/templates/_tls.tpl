@@ -136,13 +136,14 @@ is false, except that auto refuses the values it would contradict.
     {{- $data := include "trawl.dataMountPath" . -}}
     {{- $field := "config.data.path" -}}
     {{- $path := toString .Values.config.data.path -}}
+    {{- $raw := dict -}}
     {{- /* config.raw replaces the structured values, so config.data.path
          says nothing about where trawld puts its state. Read the raw
          TOML's own [data] path. The parse error is not echoed: it can
          quote a line of the config, secrets included. */ -}}
     {{- if .Values.config.raw -}}
       {{- $field = "config.raw [data] path" -}}
-      {{- $raw := fromToml .Values.config.raw -}}
+      {{- $raw = fromToml .Values.config.raw -}}
       {{- if hasKey $raw "Error" -}}
         {{- fail "config.raw is not valid TOML: when tls.mode=auto and web.enabled=true the chart reads its [data] path to mount trawld's generated certificate into trawl-web" -}}
       {{- end -}}
@@ -185,6 +186,17 @@ is false, except that auto refuses the values it would contradict.
     {{- $_ := set $trust "dataSubPath" $subPath -}}
     {{- $_ := set $trust "dataMountPath" (printf "%s/tls" $stateDir) -}}
     {{- $_ := set $trust "caPath" (printf "%s/tls/cert.pem" $stateDir) -}}
+    {{- /* trawl-web reads its trust anchor from the raw TOML, and an
+         absent upstream_ca_path means the platform roots: any publicly
+         trusted certificate would then receive users' bearer keys. The
+         raw TOML must pin exactly the file the chart mounts. A dotted
+         web.upstream_ca_path parses to the same table. */ -}}
+    {{- if .Values.config.raw -}}
+      {{- $rawWeb := get $raw "web" -}}
+      {{- if not (and (kindIs "map" $rawWeb) (kindIs "string" (get $rawWeb "upstream_ca_path")) (eq (get $rawWeb "upstream_ca_path") $trust.caPath)) -}}
+        {{- fail (printf "config.raw must set [web] upstream_ca_path = %q when tls.mode=auto and web.enabled=true: trawl-web pins the certificate trawld generates there; without the key it trusts the platform roots, and another value trusts another certificate" $trust.caPath) -}}
+      {{- end -}}
+    {{- end -}}
   {{- else -}}
     {{- $name := toString (default "" $tls.upstreamServerName) -}}
     {{- $explicit := ne $name "" -}}
