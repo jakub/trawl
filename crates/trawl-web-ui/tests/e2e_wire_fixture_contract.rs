@@ -705,7 +705,7 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
 /// beside, because the card reads the Parquet measurement and the
 /// producer derives reach from both measurements. Each field is the
 /// snapshot field of the same name and type, and nothing else rides along.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct CapacitySnapshotPart {
     parquet_files: u64,
@@ -772,513 +772,47 @@ fn capacity_fixture(name: &str) -> CapacitySnapshotPart {
     decode(name, text)
 }
 
-fn fixture_date(text: &str) -> chrono::NaiveDate {
-    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-        .unwrap_or_else(|e| panic!("{text:?} is not a YYYY-MM-DD date: {e}"))
-}
-
-/// Every way `raw`, a capacity snapshot part, departs from what the
-/// server's producer (`capacity::assemble` in trawl-server) can emit.
-/// Empty when the fixture is a state the server can be in.
-///
-/// The producer's invariants, checked here:
-/// - Rows exist only from a sample (complete or retained after failure);
-///   roles are disjoint, each row's roles ordered, the data row alone
-///   carries the floor, and its deficit is the floor less the available
-///   bytes. The WAL role is present exactly when the WAL is configured.
-/// - Environments exist only from a Parquet sample, sorted by name, and
-///   their stored bytes fit in the Parquet total.
-/// - `measurement_unavailable` and `retention_suppressed` are global:
-///   every environment carries the one reason and nothing is excluded.
-///   The first holds exactly when the two measurements are not both
-///   complete; the second needs both complete.
-/// - Otherwise each environment's observed days are the dates from
-///   max(oldest date, today − 8) through today − 2, so the count equals
-///   the span, and three or more give a rate. A finite env with a rate is
-///   projected, a keep-forever one reports its growth, and any env
-///   without a rate is withheld for history; the finite ones among those
-///   are exactly `growth_excluded`.
-/// - One fraction per end drives every projected env (`run_ends`): per
-///   end, every env is at the full policy or none is; below it, whole
-///   days with a floor and the disk filling first without one. The days
-///   fit one shared fraction, stay under the policy, and the low end
-///   never exceeds the high.
-/// - A withheld reach carries no field but its reason.
-/// - Pressure counters need a pressure attempt, and none happen with a
-///   floor of 0.
-#[allow(clippy::too_many_lines)] // one list of the producer's invariants
-fn capacity_violations(raw: &serde_json::Value) -> Vec<String> {
-    use std::collections::BTreeSet;
-    use trawl_api::{
-        DeletionFloor, FilesystemRole, Reach, ReachEnd, StorageMeasurementStatus as Status,
-        SweepOutcome, WithheldReason,
-    };
-
-    let mut violations: Vec<String> = Vec::new();
-    // The message is built only when the check fails.
-    macro_rules! check {
-        ($ok:expr, $what:expr $(,)?) => {
-            if !$ok {
-                violations.push($what.into());
-            }
-        };
-    }
-    // On the raw JSON first: the decode below may drop or refuse a field.
-    for env in raw["capacity"]["environments"]
-        .as_array()
-        .into_iter()
-        .flatten()
-    {
-        if env["reach"]["state"] == "withheld" {
-            let keys = env["reach"]
-                .as_object()
-                .map(|reach| reach.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            check!(
-                keys == ["reason", "state"],
-                format!("{}: a withheld reach carries {keys:?}", env["env"])
-            );
-        }
-    }
-    let part: CapacitySnapshotPart = match serde_json::from_value(raw.clone()) {
-        Ok(part) => part,
-        Err(e) => {
-            violations.push(format!("does not decode: {e}"));
-            return violations;
-        }
-    };
-    let capacity = &part.capacity;
-    check!(
-        serde_json::to_value(&part.capacity).unwrap() == raw["capacity"],
-        "carries a field the wire type drops"
-    );
-
-    // Headroom rows.
-    let headroom = &capacity.headroom;
-    let rows = &headroom.filesystems;
-    check!(
-        rows.is_empty() == headroom.measurement.sample_age_secs.is_none(),
-        "headroom rows exist exactly when a sample was taken",
-    );
-    check!(
-        headroom.measurement.status != Status::Complete
-            || headroom.measurement.sample_age_secs.is_some(),
-        "a complete headroom measurement has an age",
-    );
-    let mut seen = BTreeSet::new();
-    let mut floor = None;
-    for row in rows {
-        check!(!row.roles.is_empty(), "a headroom row has no role");
-        check!(
-            row.roles.windows(2).all(|pair| pair[0] < pair[1]),
-            format!("{:?} is not ordered data, wal, spill", row.roles),
-        );
-        for role in &row.roles {
-            check!(seen.insert(*role), format!("{role:?} is on two rows"));
-        }
-        check!(
-            row.available_bytes <= row.total_bytes,
-            format!("{:?} has more available than total", row.roles),
-        );
-        let holds_data = row.roles.contains(&FilesystemRole::Data);
-        check!(
-            row.floor.is_some() == holds_data,
-            format!("{:?}: only the data row carries the floor", row.roles),
-        );
-        if let Some(DeletionFloor::Armed {
-            floor_bytes,
-            deficit_bytes,
-        }) = row.floor
-        {
-            check!(floor_bytes > 0, "an armed floor of 0");
-            check!(
-                deficit_bytes == floor_bytes.saturating_sub(row.available_bytes),
-                format!("deficit {deficit_bytes} is not the floor less the available bytes"),
-            );
-        }
-        if holds_data {
-            floor = row.floor;
-        }
-    }
-    check!(
-        rows.windows(2)
-            .all(|pair| pair[0].roles[0] < pair[1].roles[0]),
-        "headroom rows are not ordered by their first role",
-    );
-    if !rows.is_empty() {
-        check!(
-            seen.contains(&FilesystemRole::Data) && seen.contains(&FilesystemRole::Spill),
-            "a sample stats the data and spill roles",
-        );
-        check!(
-            seen.contains(&FilesystemRole::Wal)
-                == (part.wal_measurement.status != Status::NotConfigured),
-            "the WAL role is present exactly when the WAL is configured",
-        );
-    }
-    if part.wal_measurement.sample_age_secs.is_none() {
-        check!(
-            (part.wal_files, part.wal_bytes) == (0, 0),
-            "WAL totals without a WAL sample",
-        );
-    }
-
-    // Pressure evidence.
-    let pressure = &capacity.pressure;
-    check!(
-        pressure.removals_disk_pressure == 0 || pressure.pressure_attempts > 0,
-        "pressure removals without a pressure attempt",
-    );
-    check!(
-        pressure.last_sweep.map(|s| s.outcome) != Some(SweepOutcome::ExhaustedBelowFloor)
-            || pressure.pressure_attempts > 0,
-        "a sweep exhausted below the floor without a pressure attempt",
-    );
-    if floor == Some(DeletionFloor::Off) {
-        check!(
-            pressure.pressure_attempts == 0 && pressure.removals_disk_pressure == 0,
-            "pressure deletion ran with a floor of 0",
-        );
-    }
-
-    // Environments and their Parquet sample.
-    let envs = &capacity.environments;
-    let parquet = &part.parquet_measurement;
-    if parquet.sample_age_secs.is_none() {
-        check!(
-            envs.is_empty() && (part.parquet_files, part.parquet_bytes) == (0, 0),
-            "environments or Parquet totals without a Parquet sample",
-        );
-    }
-    check!(
-        envs.windows(2).all(|pair| pair[0].env < pair[1].env),
-        "environments are not sorted by name",
-    );
-    check!(
-        capacity
-            .growth_excluded
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]),
-        "growth_excluded is not sorted",
-    );
-    let stored = envs.iter().map(|e| e.stored_bytes).sum::<u64>();
-    check!(
-        stored <= part.parquet_bytes,
-        format!(
-            "stored bytes {stored} exceed the Parquet total {}",
-            part.parquet_bytes
-        ),
-    );
-    check!(
-        part.parquet_files >= u64::try_from(envs.len()).unwrap(),
-        "fewer Parquet files than environments",
-    );
-
-    // Global reasons.
-    let both_complete = parquet.status == Status::Complete
-        && headroom.measurement.status == Status::Complete
-        && seen.contains(&FilesystemRole::Data);
-    let withheld_for = |reason| {
-        envs.iter()
-            .filter(|e| e.reach == Reach::Withheld { reason })
-            .count()
-    };
-    for reason in [
-        WithheldReason::MeasurementUnavailable,
-        WithheldReason::RetentionSuppressed,
-    ] {
-        let count = withheld_for(reason);
-        if count > 0 {
-            check!(
-                count == envs.len(),
-                format!(
-                    "{reason:?} is global, yet {count} of {} envs carry it",
-                    envs.len()
-                ),
-            );
-            check!(
-                capacity.growth_excluded.is_empty(),
-                format!("{reason:?} withholds everything, yet growth is excluded"),
-            );
-        }
-    }
-    let unavailable = withheld_for(WithheldReason::MeasurementUnavailable) > 0;
-    check!(
-        envs.is_empty() || unavailable != both_complete,
-        format!(
-            "measurement_unavailable holds exactly when the measurements are not both \
-             complete (Parquet {:?}, headroom {:?})",
-            parquet.status, headroom.measurement.status
-        ),
-    );
-    if unavailable || withheld_for(WithheldReason::RetentionSuppressed) > 0 {
-        return violations;
-    }
-
-    // A projection: each env's observed days, reach form and exclusion.
-    let today = fixture_date(FIXTURE_TODAY);
-    let window_start = today - chrono::Days::new(8);
-    let window_end = today - chrono::Days::new(2);
-    let mut rate_less_finite = Vec::new();
-    let mut by_end: [Vec<(ReachEnd, u64)>; 2] = [Vec::new(), Vec::new()];
-    for env in envs {
-        let name = &env.env;
-        let oldest = fixture_date(&env.oldest_date);
-        check!(oldest <= today, format!("{name}: oldest date after today"));
-        let first = oldest.max(window_start);
-        let observed = u64::try_from((window_end - first).num_days() + 1).unwrap_or(0);
-        let rated = observed >= 3;
-        let window = |observed_first: &str, observed_last: &str, observed_days: u8| {
-            observed_first == first.format("%Y-%m-%d").to_string()
-                && observed_last == window_end.format("%Y-%m-%d").to_string()
-                && u64::from(observed_days) == observed
-                && (3..=7).contains(&observed_days)
-        };
-        match (&env.reach, env.max_age_days, rated) {
-            (
-                Reach::Projected {
-                    observed_first,
-                    observed_last,
-                    observed_days,
-                    low,
-                    high,
-                },
-                max_age,
-                true,
-            ) if max_age > 0 => {
-                check!(
-                    window(observed_first, observed_last, *observed_days),
-                    format!(
-                        "{name}: observed {observed_days} days {observed_first}..{observed_last}, \
-                         but oldest {oldest} gives {observed} from {first} to {window_end}"
-                    ),
-                );
-                for (index, end) in [*low, *high].into_iter().enumerate() {
-                    by_end[index].push((end, max_age));
-                    if let ReachEnd::Days { days } = end {
-                        check!(
-                            days < max_age,
-                            format!("{name}: {days} days is not below the {max_age}-day policy"),
-                        );
-                    }
-                    check!(
-                        !matches!(
-                            (floor, end),
-                            (Some(DeletionFloor::Off), ReachEnd::Days { .. })
-                                | (Some(DeletionFloor::Armed { .. }), ReachEnd::DiskFillsFirst)
-                        ),
-                        format!("{name}: {end:?} with floor {floor:?}")
-                    );
-                }
-                check!(
-                    match (low, high) {
-                        (ReachEnd::FullPolicy, high) => *high == ReachEnd::FullPolicy,
-                        (ReachEnd::Days { days: a }, ReachEnd::Days { days: b }) => a <= b,
-                        _ => true,
-                    },
-                    format!("{name}: the low end {low:?} exceeds the high end {high:?}"),
-                );
-            }
-            (
-                Reach::KeepForever {
-                    observed_first,
-                    observed_last,
-                    observed_days,
-                    mean_daily_bytes,
-                },
-                0,
-                true,
-            ) => {
-                check!(
-                    window(observed_first, observed_last, *observed_days),
-                    format!(
-                        "{name}: observed {observed_days} days {observed_first}..{observed_last}, \
-                         but oldest {oldest} gives {observed} from {first} to {window_end}"
-                    ),
-                );
-                check!(
-                    mean_daily_bytes.saturating_mul(u64::from(*observed_days)) <= env.stored_bytes,
-                    format!("{name}: the observed days hold more than is stored"),
-                );
-            }
-            (
-                Reach::Withheld {
-                    reason: WithheldReason::InsufficientHistory,
-                },
-                max_age,
-                false,
-            ) => {
-                if max_age > 0 {
-                    rate_less_finite.push(name.clone());
-                }
-            }
-            (reach, max_age, rated) => check!(
-                false,
-                format!(
-                    "{name}: {reach:?} for a {max_age}-day policy with {observed} observed days \
-                     (rated: {rated})"
-                ),
-            ),
-        }
-    }
-    check!(
-        capacity.growth_excluded == rate_less_finite,
-        format!(
-            "growth_excluded {:?} is not the finite envs without a rate {rate_less_finite:?}",
-            capacity.growth_excluded
-        ),
-    );
-    for (end, readings) in ["low", "high"].into_iter().zip(&by_end) {
-        let full = readings
-            .iter()
-            .filter(|(reach, _)| *reach == ReachEnd::FullPolicy)
-            .count();
-        check!(
-            full == 0 || full == readings.len(),
-            format!(
-                "the {end} end puts {full} of {} envs at the full policy",
-                readings.len()
-            ),
-        );
-        // Each Days{d} of a policy m says the shared fraction f lies in
-        // [d/m, (d+1)/m); those intervals must meet.
-        let days = readings
-            .iter()
-            .filter_map(|(reach, max_age)| match reach {
-                ReachEnd::Days { days } => Some((u128::from(*days), u128::from(*max_age))),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for &(d1, m1) in &days {
-            for &(d2, m2) in &days {
-                check!(
-                    d1 * m2 < (d2 + 1) * m1,
-                    format!(
-                        "the {end} end's {d1} of {m1} and {d2} of {m2} days fit no shared fraction"
-                    ),
-                );
-            }
-        }
-    }
-    violations
-}
-
-/// Every capacity fixture, and the base snapshot's capacity, is a state
-/// the server can emit.
+/// Every capacity fixture, and the base snapshot's capacity slice, decodes
+/// as the snapshot fields of the same names with nothing left over, and a
+/// withheld reach carries its reason and no number. The fixtures are
+/// producer output (`tests/capacity_fixtures.rs` in trawl-server fails
+/// when one differs from what `capacity::assemble` emits), so the states
+/// themselves are not modelled here; this checks what the wire promises
+/// the page, and the pins below check the state each case relies on.
 #[test]
-fn health_capacity_fixtures_are_states_the_server_can_emit() {
-    for (name, text) in CAPACITY_FIXTURES {
-        let raw: serde_json::Value = serde_json::from_str(text).unwrap();
-        let violations = capacity_violations(&raw);
-        assert!(violations.is_empty(), "{name}: {violations:#?}");
-    }
+fn health_capacity_fixtures_decode_as_the_wire_types() {
     let base: serde_json::Value =
         serde_json::from_str(include_str!("../e2e/harness/wire/health-dashboard.json")).unwrap();
-    let part = CAPACITY_PART_FIELDS
+    let base_part = CAPACITY_PART_FIELDS
         .iter()
         .map(|field| ((*field).to_owned(), base[*field].clone()))
         .collect::<serde_json::Map<_, _>>();
-    let violations = capacity_violations(&serde_json::Value::Object(part));
-    assert!(
-        violations.is_empty(),
-        "health-dashboard.json: {violations:#?}"
-    );
-}
-
-/// The check rejects each contradiction the earlier fixtures carried, so
-/// a fixture cannot drift back into one.
-#[test]
-fn capacity_violations_reject_states_the_server_cannot_emit() {
-    fn env_index(raw: &serde_json::Value, name: &str) -> usize {
-        raw["capacity"]["environments"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .position(|e| e["env"] == name)
-            .unwrap()
-    }
-    fn set_reach(raw: &mut serde_json::Value, name: &str, reach: serde_json::Value) {
-        let index = env_index(raw, name);
-        raw["capacity"]["environments"][index]["reach"] = reach;
-    }
-    let complete: serde_json::Value = serde_json::from_str(CAPACITY_FIXTURES[0].1).unwrap();
-    let mutated = |mutate: &dyn Fn(&mut serde_json::Value)| {
-        let mut raw = complete.clone();
-        mutate(&mut raw);
-        capacity_violations(&raw)
-    };
-    for (case, mutate, expect) in [
-        (
-            "a global reason on one env beside a projection",
-            Box::new(|raw: &mut serde_json::Value| {
-                set_reach(
-                    raw,
-                    "prod",
-                    serde_json::json!({"state": "withheld", "reason": "measurement_unavailable"}),
-                );
-            }) as Box<dyn Fn(&mut serde_json::Value)>,
-            "is global",
-        ),
-        (
-            "measurement_unavailable while both measurements are complete",
-            Box::new(|raw: &mut serde_json::Value| {
-                for env in raw["capacity"]["environments"].as_array_mut().unwrap() {
-                    env["reach"] = serde_json::json!({"state": "withheld", "reason": "measurement_unavailable"});
-                }
-                raw["capacity"]["growth_excluded"] = serde_json::json!([]);
-            }),
-            "not both complete",
-        ),
-        (
-            "one env at the full policy beside one at whole days",
-            Box::new(|raw: &mut serde_json::Value| {
-                let index = env_index(raw, "lab");
-                raw["capacity"]["environments"][index]["reach"]["low"] =
-                    serde_json::json!({"kind": "full_policy"});
-            }),
-            "at the full policy",
-        ),
-        (
-            "an observed day before the oldest date",
-            Box::new(|raw: &mut serde_json::Value| {
-                let index = env_index(raw, "lab");
-                raw["capacity"]["environments"][index]["reach"]["observed_first"] =
-                    serde_json::json!("2026-09-19");
-                raw["capacity"]["environments"][index]["reach"]["observed_days"] =
-                    serde_json::json!(7);
-            }),
-            "lab: observed 7 days",
-        ),
-        (
-            "days that fit no shared fraction",
-            Box::new(|raw: &mut serde_json::Value| {
-                let index = env_index(raw, "staging");
-                raw["capacity"]["environments"][index]["reach"]["low"] =
-                    serde_json::json!({"kind": "days", "days": 20});
-            }),
-            "fit no shared fraction",
-        ),
-        (
-            "a rate-less env missing from growth_excluded",
-            Box::new(|raw: &mut serde_json::Value| {
-                raw["capacity"]["growth_excluded"] = serde_json::json!([]);
-            }),
-            "growth_excluded",
-        ),
-        (
-            "a number on a withheld reach",
-            Box::new(|raw: &mut serde_json::Value| {
-                let index = env_index(raw, "k8s");
-                raw["capacity"]["environments"][index]["reach"]["days"] = serde_json::json!(3);
-            }),
-            "a withheld reach carries",
-        ),
-    ] {
-        let violations = mutated(&*mutate);
-        assert!(
-            violations.iter().any(|v| v.contains(expect)),
-            "{case}: expected a violation naming {expect:?}, got {violations:#?}"
+    let fixtures = CAPACITY_FIXTURES
+        .iter()
+        .map(|(name, text)| (*name, serde_json::from_str(text).unwrap()))
+        .chain([(
+            "health-dashboard.json",
+            serde_json::Value::Object(base_part),
+        )]);
+    for (name, raw) in fixtures {
+        let part: CapacitySnapshotPart = serde_json::from_value(raw.clone())
+            .unwrap_or_else(|e| panic!("{name} does not decode: {e}"));
+        assert_eq!(
+            serde_json::to_value(&part).unwrap(),
+            raw,
+            "{name} carries a field the wire types drop"
         );
+        for env in raw["capacity"]["environments"].as_array().unwrap() {
+            if env["reach"]["state"] == "withheld" {
+                let keys = env["reach"].as_object().unwrap().keys().collect::<Vec<_>>();
+                assert_eq!(
+                    keys,
+                    ["reason", "state"],
+                    "{name}: {} carries a number on a withheld reach",
+                    env["env"]
+                );
+            }
+        }
     }
 }
 

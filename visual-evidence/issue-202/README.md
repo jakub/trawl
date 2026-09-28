@@ -52,14 +52,12 @@ committed fixture differs from what it produces. The base snapshot's
 capacity slice in `health-dashboard.json` is checked the same way. After a
 deliberate change to the producer or a scenario, run
 `TRAWL_REGEN_CAPACITY_FIXTURES=1 cargo test -p trawl-server --test capacity_fixtures`
-to rewrite the fixtures that differ, then rerun the spec and recapture. [`e2e_wire_fixture_contract.rs`](../../crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs)
-checks every fixture against the producer's invariants. A reason of
-`measurement_unavailable` or `retention_suppressed` applies to every
-environment and excludes none from growth. Each env's observed days start
-at its oldest date or 8 days before 2026-09-27, whichever is later. At each
-end of the range, every projected env reads the full policy or none does.
-A withheld reach carries no number. The same test pins each fixture to the
-state its case asserts, so a drifted fixture cannot pass the wrong case.
+to rewrite the fixtures that differ, then rerun the spec and recapture.
+[`e2e_wire_fixture_contract.rs`](../../crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs)
+decodes every fixture as the snapshot's own wire types with no field left
+over, and checks that a withheld reach carries no number. It also pins
+each fixture to the state its case asserts, so a drifted fixture cannot
+pass the wrong case.
 The spec writes a JSON sidecar per capture with its claim and SHA-256. The
 manifest here is assembled from those sidecars.
 
