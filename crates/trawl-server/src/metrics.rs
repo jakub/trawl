@@ -856,17 +856,29 @@ pub(crate) struct StorageScan {
 }
 
 impl StorageScan {
-    fn count(&mut self, partition: Partition<'_>, bytes: u64) {
-        self.totals.files += 1;
-        self.totals.bytes += bytes;
-        match partition {
-            Partition::Date(env, date) => {
-                *self.env_dates.entry((env.to_owned(), date)).or_default() += bytes;
-            }
+    /// Count one file of `bytes` into the totals and its partition.
+    ///
+    /// # Errors
+    /// Any sum that would overflow `u64`. A sparse file's logical length
+    /// can approach it, and a wrapped sum would understate stored bytes and
+    /// overstate reach, so the attempt fails instead and the cache keeps
+    /// the last complete scan (ADR-0033). Nothing is counted on error.
+    fn count(&mut self, partition: Partition<'_>, bytes: u64) -> std::io::Result<()> {
+        let overflow = || std::io::Error::other("storage scan byte or file count overflows u64");
+        let files = self.totals.files.checked_add(1).ok_or_else(overflow)?;
+        let total = self.totals.bytes.checked_add(bytes).ok_or_else(overflow)?;
+        let slot = match partition {
+            Partition::Date(env, date) => self.env_dates.entry((env.to_owned(), date)).or_default(),
             Partition::Root | Partition::Env(_) | Partition::Unattributed => {
-                self.unattributed_bytes += bytes;
+                &mut self.unattributed_bytes
             }
-        }
+        };
+        *slot = slot.checked_add(bytes).ok_or_else(overflow)?;
+        self.totals = StorageTotals {
+            files,
+            bytes: total,
+        };
+        Ok(())
     }
 }
 
@@ -1392,7 +1404,7 @@ fn scan_storage_dir(
                     Err(error) if confirmed_absent(root, &path, &error, before) => continue,
                     Err(error) => return Err(error),
                 };
-            scan.count(partition, metadata.len());
+            scan.count(partition, metadata.len())?;
         }
     }
     Ok(())
@@ -1867,6 +1879,116 @@ mod tests {
         assert!(wal.env_dates.is_empty());
         assert_eq!(wal.unattributed_bytes, 12);
         assert_invariant(&wal);
+    }
+
+    /// A sparse file's logical length can be near `u64::MAX`, so the walk's
+    /// sums can overflow. Wrapping would understate the stored bytes and
+    /// overstate reach, so every accumulator is checked and an overflow
+    /// fails the attempt: the cache keeps the last complete scan (ADR-0033).
+    /// The walk runs over real files, into an accumulator seeded next to
+    /// the limit, since no portable filesystem holds files that large.
+    #[test]
+    fn storage_scan_overflow_fails_the_attempt() {
+        use chrono::NaiveDate;
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("prod/2026-09-20")).unwrap();
+        std::fs::write(root.join("prod/2026-09-20/x.parquet"), "12345").unwrap();
+        std::fs::write(root.join("stray.parquet"), "12345").unwrap();
+        let bucket = (
+            "prod".to_owned(),
+            NaiveDate::from_ymd_opt(2026, 9, 20).unwrap(),
+        );
+        let near = u64::MAX - 2;
+        let walk = |mut scan: StorageScan| {
+            scan_storage_dir(
+                root,
+                root,
+                StorageKind::Parquet,
+                StorageKind::Parquet.root_partition(),
+                &mut scan,
+                &mut |_, _| Ok(()),
+            )
+            .map(|()| scan)
+        };
+
+        // Each accumulator on its own: the file count, the flat bytes, a
+        // date partition's bytes, and the unattributed bytes.
+        let seeds = [
+            StorageScan {
+                totals: StorageTotals {
+                    files: u64::MAX,
+                    bytes: 0,
+                },
+                ..StorageScan::default()
+            },
+            StorageScan {
+                totals: StorageTotals {
+                    files: 0,
+                    bytes: near,
+                },
+                ..StorageScan::default()
+            },
+            StorageScan {
+                env_dates: [(bucket.clone(), near)].into(),
+                ..StorageScan::default()
+            },
+            StorageScan {
+                unattributed_bytes: near,
+                ..StorageScan::default()
+            },
+        ];
+        for seed in seeds {
+            let error = walk(seed.clone()).expect_err("overflow fails the walk");
+            assert!(error.to_string().contains("overflow"), "{error} {seed:?}");
+        }
+        let scan = walk(StorageScan::default()).unwrap();
+        assert_eq!(
+            scan.totals,
+            StorageTotals {
+                files: 2,
+                bytes: 10
+            }
+        );
+
+        // Through the cache: the overflowing attempt is failed, and the last
+        // complete scan is retained and republished.
+        let cache = StorageCache::<Arc<StorageScan>>::default();
+        let now = Instant::now();
+        cache.collect(
+            || now,
+            || walk(StorageScan::default()).map(Arc::new),
+            |_| {},
+        );
+        let mut published = None;
+        cache.collect(
+            || now + Duration::from_secs(30),
+            || {
+                walk(StorageScan {
+                    totals: StorageTotals {
+                        files: 0,
+                        bytes: near,
+                    },
+                    ..StorageScan::default()
+                })
+                .map(Arc::new)
+            },
+            |scan| published = Some(scan.totals),
+        );
+        assert_eq!(
+            published,
+            Some(StorageTotals {
+                files: 2,
+                bytes: 10
+            })
+        );
+        let snapshot = cache.snapshot(true, now + Duration::from_secs(30));
+        assert_eq!(
+            snapshot.measurement.status,
+            trawl_api::StorageMeasurementStatus::Failed
+        );
+        assert_eq!((snapshot.files, snapshot.bytes), (2, 10));
     }
 
     /// The Parquet attempt reads the repin authority before and after its
