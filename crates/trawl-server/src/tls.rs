@@ -217,24 +217,31 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
 
     // Both are read, so a symlink at either name is refused on every start,
     // not only on the one that finds the pair complete.
-    let key = match key_dir.read(GENERATED_KEY_FILE, |path, source| TlsError::ReadKey {
-        path,
-        source,
-    })? {
-        Some((pem, meta)) => match key_exposure(&meta) {
-            None => Some(pem),
-            Some(reason) => {
-                tracing::warn!(
-                    event_type = "lifecycle",
-                    key = %key_path.display(),
-                    reason = %reason,
-                    "discarding a private key that may be readable outside trawld, generating a new pair"
-                );
-                None
-            }
-        },
-        None => None,
-    };
+    //
+    // The key is judged by its directory entry before it is opened: a key
+    // another uid owns (root `0600` after a restore) may be unreadable to
+    // trawld, and the open would fail before its owner could be seen. That
+    // look is advisory; the check of the opened file below is the one that
+    // decides what is loaded.
+    let read_err = |path, source| TlsError::ReadKey { path, source };
+    let mut exposure = key_dir.entry_exposure(GENERATED_KEY_FILE, read_err)?;
+    let mut key = None;
+    if exposure.is_none()
+        && let Some((pem, meta)) = key_dir.read(GENERATED_KEY_FILE, read_err)?
+    {
+        exposure = metadata_exposure(&meta);
+        if exposure.is_none() {
+            key = Some(pem);
+        }
+    }
+    if let Some(reason) = exposure {
+        tracing::warn!(
+            event_type = "lifecycle",
+            key = %key_path.display(),
+            reason = %reason,
+            "discarding a private key that may be readable outside trawld, generating a new pair"
+        );
+    }
     let cert = tls_dir
         .read(GENERATED_CERT_FILE, |path, source| TlsError::ReadCert {
             path,
@@ -309,8 +316,9 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
 }
 
-/// Why the generated key read with `meta` may be readable through something
-/// other than `tls-key/key.pem`, or `None` when it is trawld's alone.
+/// Why a generated key with `links` hard links, owned by uid `owner`, may be
+/// readable through something other than `tls-key/key.pem` when trawld runs
+/// as `euid`, or `None` when it is trawld's alone.
 ///
 /// A second hard link, for one inside the `tls/` directory the sidecar
 /// mounts, exposes the same inode under that name; a key another uid owns
@@ -321,27 +329,34 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
 /// The permission bits are not checked: Kubernetes' fsGroup walk adds group
 /// bits to the key, and `tls-key/` itself is `0700` and outside the mount.
 #[cfg(unix)]
-fn key_exposure(meta: &fs::Metadata) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-
-    let euid = rustix::process::geteuid().as_raw();
-    if meta.nlink() != 1 {
+fn key_exposure(links: u64, owner: u32, euid: u32) -> Option<String> {
+    if links != 1 {
         Some(format!(
-            "it has {} hard links; another name may expose it",
-            meta.nlink()
+            "it has {links} hard links; another name may expose it"
         ))
-    } else if meta.uid() != euid {
+    } else if owner != euid {
         Some(format!(
-            "it is owned by uid {}, not by trawld's uid {euid}",
-            meta.uid()
+            "it is owned by uid {owner}, not by trawld's uid {euid}"
         ))
     } else {
         None
     }
 }
 
+/// [`key_exposure`] of the key file whose metadata is `meta`.
+#[cfg(unix)]
+fn metadata_exposure(meta: &fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    key_exposure(
+        meta.nlink(),
+        meta.uid(),
+        rustix::process::geteuid().as_raw(),
+    )
+}
+
 #[cfg(not(unix))]
-fn key_exposure(_meta: &fs::Metadata) -> Option<String> {
+fn metadata_exposure(_meta: &fs::Metadata) -> Option<String> {
     None
 }
 
@@ -489,6 +504,50 @@ impl GeneratedDir {
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(|e| err(path, e))?;
             Ok(Some((bytes, meta)))
+        }
+    }
+
+    /// [`key_exposure`] of the file `name`, judged from its directory entry
+    /// without opening it, so a file trawld cannot read is judged too.
+    /// `None` when there is no file or nothing exposes it. A symlink or
+    /// anything but a regular file is refused, as [`read`](Self::read)
+    /// refuses it; any other failure is reported through `err`.
+    fn entry_exposure(
+        &self,
+        name: &str,
+        err: impl FnOnce(PathBuf, std::io::Error) -> TlsError,
+    ) -> Result<Option<String>, TlsError> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{AtFlags, FileType};
+            use rustix::io::Errno;
+
+            let path = self.path.join(name);
+            let stat = match rustix::fs::statat(&self.handle, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => stat,
+                Err(Errno::NOENT) => return Ok(None),
+                Err(e) => return Err(err(path, e.into())),
+            };
+            match FileType::from_raw_mode(stat.st_mode) {
+                FileType::RegularFile => {}
+                FileType::Symlink => return Err(unsafe_path(&path, SYMLINK_REFUSAL.to_owned())),
+                _ => return Err(unsafe_path(&path, "it is not a regular file".to_owned())),
+            }
+            #[allow(
+                clippy::useless_conversion,
+                reason = "the link count is narrower than u64 on some targets"
+            )]
+            let links = u64::from(stat.st_nlink);
+            Ok(key_exposure(
+                links,
+                stat.st_uid,
+                rustix::process::geteuid().as_raw(),
+            ))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (name, err);
+            Ok(None)
         }
     }
 
@@ -1000,9 +1059,11 @@ mod tests {
     /// the exposed inode holds only a key whose certificate is no longer
     /// served, and the start after loads the new pair.
     ///
-    /// A key owned by another uid is discarded the same way, but planting
-    /// one inside trawld's own `0700` key directory needs root, so no test
-    /// covers it.
+    /// A key owned by another uid is discarded the same way. Planting one
+    /// inside trawld's own `0700` key directory needs root, so
+    /// [`key_exposure_names_extra_links_and_a_foreign_owner`] covers the
+    /// owner rule and [`an_unreadable_generated_key_is_judged_before_it_is_opened`]
+    /// the check that applies it before any open.
     #[cfg(unix)]
     #[test]
     fn a_generated_key_with_extra_links_is_regenerated() {
@@ -1033,6 +1094,70 @@ mod tests {
             );
         }
 
+        let (_, self_signed) =
+            build_server_config(None, None, tmp.path()).expect("the new pair loads");
+        assert!(!self_signed, "the start after loads the new pair");
+    }
+
+    /// Which keys are trawld's alone: one link, owned by trawld's uid. A
+    /// second link or another owner is a reason to regenerate, and the
+    /// reason names what was found.
+    #[cfg(unix)]
+    #[test]
+    fn key_exposure_names_extra_links_and_a_foreign_owner() {
+        assert_eq!(key_exposure(1, 1000, 1000), None);
+        let links = key_exposure(2, 1000, 1000).expect("a second link exposes the key");
+        assert!(links.contains("2 hard links"), "{links}");
+        let owner = key_exposure(1, 0, 1000).expect("another owner exposes the key");
+        assert!(
+            owner.contains("uid 0") && owner.contains("uid 1000"),
+            "{owner}"
+        );
+    }
+
+    /// A key trawld cannot read because another uid owns it (root `0600`
+    /// after a restore) must be judged by its owner before any open: the
+    /// open would fail with `EACCES` and stop the start. Staging another
+    /// owner needs root, so this stages the same unreadable file with an
+    /// extra link, which the same directory-entry check routes to
+    /// regeneration. A self-owned key that is unreadable and trawld's alone
+    /// is a start error naming the key.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_generated_key_is_judged_before_it_is_opened() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        build_server_config(None, None, tmp.path()).unwrap();
+        let key_path = tmp.path().join(GENERATED_KEY_DIR).join(GENERATED_KEY_FILE);
+        let old_key = fs::read(&key_path).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&key_path).is_ok() {
+            // Root reads past the mode; there is nothing unreadable to stage.
+            return;
+        }
+
+        // trawld's alone, but unreadable: refused, naming the key.
+        let err = build_server_config(None, None, tmp.path())
+            .expect_err("an unreadable key trawld owns stops the start");
+        assert!(
+            matches!(&err, TlsError::ReadKey { path, source }
+                if *path == key_path && source.kind() == std::io::ErrorKind::PermissionDenied),
+            "{err:?}"
+        );
+
+        // Exposed and unreadable: regenerated without being opened.
+        let exposed = tmp.path().join("exposed.pem");
+        fs::hard_link(&key_path, &exposed).unwrap();
+        let (_, self_signed) = build_server_config(None, None, tmp.path())
+            .expect("an exposed key gives way to a new pair even unread");
+        assert!(self_signed, "the exposed key is not loaded");
+        assert_ne!(
+            fs::read(&key_path).unwrap(),
+            old_key,
+            "the key was regenerated"
+        );
+        assert_eq!(fs::metadata(&key_path).unwrap().nlink(), 1);
         let (_, self_signed) =
             build_server_config(None, None, tmp.path()).expect("the new pair loads");
         assert!(!self_signed, "the start after loads the new pair");
