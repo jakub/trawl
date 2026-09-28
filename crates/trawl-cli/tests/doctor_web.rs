@@ -12,9 +12,12 @@
 //! trawld, and a test that needed it would fail rather than pass.
 //!
 //! A recording layer in front of every router notes each request's method,
-//! path, `Origin`, whether it carried `Authorization` or `Cookie`, and the
-//! `api_key` its body held. Every test asserts that no request carried a
-//! credential and that each one is in [`trawl_cli::doctor::REQUESTS`].
+//! path, `Origin`, whether it carried `Authorization` or `Cookie`, the
+//! `api_key` its body held, and the raw text of its headers and body. The
+//! doctor runs with a key selected (`--token-file` naming a canary), so a
+//! probe has a key it could leak. Every test asserts that no request
+//! carried a credential or the canary, and that each one is in
+//! [`trawl_cli::doctor::REQUESTS`].
 //!
 //! The API target is a closed port in every test, so the `api.*` rows fail
 //! and the verdict is `fail` throughout; the web rows are checked by id.
@@ -46,7 +49,12 @@ struct Seen {
     cookie: bool,
     /// The body's `api_key`, when the body is JSON that has one.
     api_key: Option<String>,
+    /// Every header name and value and the body, as text.
+    raw: String,
 }
+
+/// The key the doctor is given. It must reach no web origin.
+const CANARY: &str = "flt_canary00_doctorwebmustneversendthis";
 
 type Log = Arc<Mutex<Vec<Seen>>>;
 
@@ -63,6 +71,14 @@ async fn record(State(log): State<Log>, request: Request, next: Next) -> Respons
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
         });
+    let mut raw = String::new();
+    for (name, value) in &parts.headers {
+        raw.push_str(name.as_str());
+        raw.push_str(": ");
+        raw.push_str(&String::from_utf8_lossy(value.as_bytes()));
+        raw.push('\n');
+    }
+    raw.push_str(&String::from_utf8_lossy(&bytes));
     log.lock().unwrap().push(Seen {
         method: parts.method.to_string(),
         path: parts.uri.path().to_owned(),
@@ -73,6 +89,7 @@ async fn record(State(log): State<Log>, request: Request, next: Next) -> Respons
         authorization: parts.headers.contains_key(header::AUTHORIZATION),
         cookie: parts.headers.contains_key(header::COOKIE),
         api_key,
+        raw,
     });
     next.run(Request::from_parts(parts, Body::from(bytes)))
         .await
@@ -159,6 +176,12 @@ impl Origin {
             assert!(!seen.authorization, "{case}: Authorization sent: {seen:?}");
             assert!(!seen.cookie, "{case}: Cookie sent: {seen:?}");
             assert!(
+                !seen.raw.contains(CANARY),
+                "{case}: the selected key reached {} {}",
+                seen.method,
+                seen.path
+            );
+            assert!(
                 seen.api_key.as_deref().is_none_or(str::is_empty),
                 "{case}: a non-empty api_key was sent"
             );
@@ -180,10 +203,13 @@ fn closed_port() -> u16 {
     listener.local_addr().expect("addr").port()
 }
 
-/// Run `trawl doctor --url <closed> --web-url <web> --format json` with no
-/// inherited `TRAWL_*` variables and a temp `HOME`.
+/// Run `trawl doctor --url <closed> --token-file <canary> --web-url <web>
+/// --format json` with no inherited `TRAWL_*` variables and a temp `HOME`
+/// holding the [`CANARY`] key file.
 fn doctor(web: &str) -> (Output, serde_json::Value) {
     let home = tempfile::tempdir().expect("tempdir");
+    let key = home.path().join("key");
+    std::fs::write(&key, format!("{CANARY}\n")).expect("key file");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_trawl"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("TRAWL_") {
@@ -200,6 +226,8 @@ fn doctor(web: &str) -> (Output, serde_json::Value) {
             "doctor",
             "--url",
             &api,
+            "--token-file",
+            key.to_str().expect("utf-8 key path"),
             "--web-url",
             web,
             "--format",
@@ -263,6 +291,12 @@ fn assert_api_failed_independently(report: &serde_json::Value, case: &str) {
             "web.transport",
             "web.origin"
         ],
+        "{case}"
+    );
+    // The canary key was resolved: the probes had a key they could leak.
+    assert_eq!(
+        outcome(report, "connection.config"),
+        ("complete".to_owned(), None, None),
         "{case}"
     );
     assert_eq!(outcome(report, "api.transport").0, "failed", "{case}");

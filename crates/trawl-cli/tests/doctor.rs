@@ -381,8 +381,15 @@ fn answer<S: std::io::Read + std::io::Write>(
         let _ = stream.flush();
         return;
     }
+    // Every 3xx points back at this origin's whoami, the worst case: a
+    // client that followed it would send the key to the same server.
+    let location = if (300..400).contains(&status) {
+        format!("location: {WHOAMI_PATH}\r\n")
+    } else {
+        String::new()
+    };
     let response = format!(
-        "HTTP/1.1 {status} Stub\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} Stub\r\ncontent-type: application/json\r\n{location}content-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(response.as_bytes());

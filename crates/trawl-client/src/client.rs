@@ -2006,6 +2006,42 @@ mod tests {
         }
     }
 
+    /// A keyed whoami does not follow a redirect: the 3xx is a server
+    /// error that keeps its status, and its target never sees a
+    /// connection, so the key never travels to it.
+    #[tokio::test]
+    async fn whoami_refuses_redirects() {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = elsewhere.local_addr().unwrap();
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://{target}/api/v1/whoami\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let served = tokio::spawn(serve_once(listener, redirect));
+        tokio::select! {
+            result = client.whoami() => {
+                let error = result.expect_err("a redirect is not a whoami answer");
+                assert!(
+                    matches!(error, ClientError::Server { status: 302, .. }),
+                    "{error:?}"
+                );
+            }
+            _ = elsewhere.accept() => panic!("whoami followed a redirect"),
+        }
+        let request = served.await.unwrap();
+        assert!(request.starts_with("GET /api/v1/whoami "), "{request}");
+    }
+
     fn probe(address: std::net::SocketAddr) -> OriginProbe {
         init();
         OriginProbe::new(
