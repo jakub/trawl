@@ -904,7 +904,9 @@ fn health_capacity_complete_fixture_carries_every_projected_form() {
 /// The headroom attempt failed after a complete sample with a deficit:
 /// the rows are kept with their age, and every reach is withheld as
 /// measurement unavailable, the rate-less k8s included, so nothing is
-/// excluded.
+/// excluded. The edge env's only partition is dated after the fixture's
+/// today, as a fast agent clock writes one: its oldest date is still the
+/// one on disk.
 #[test]
 fn health_capacity_failed_retained_fixture_withholds_every_reach() {
     use trawl_api::{DeletionFloor, Reach, StorageMeasurementStatus, SweepOutcome, WithheldReason};
@@ -939,7 +941,7 @@ fn health_capacity_failed_retained_fixture_withholds_every_reach() {
             .iter()
             .map(|e| (e.env.as_str(), e.reach.clone()))
             .collect::<Vec<_>>(),
-        ["archive", "k8s", "prod"].map(|env| (
+        ["archive", "edge", "k8s", "prod"].map(|env| (
             env,
             Reach::Withheld {
                 reason: WithheldReason::MeasurementUnavailable
@@ -947,6 +949,13 @@ fn health_capacity_failed_retained_fixture_withholds_every_reach() {
         ))
     );
     assert!(failed.growth_excluded.is_empty());
+    let edge = &failed.environments[1];
+    assert_eq!(edge.env, "edge");
+    assert!(
+        edge.oldest_date.as_str() > FIXTURE_TODAY,
+        "{}",
+        edge.oldest_date
+    );
 }
 
 /// Both samples are complete, but the headroom attempt saw a repin: every

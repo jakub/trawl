@@ -281,10 +281,12 @@ fn complete_scenario() -> Scenario {
 }
 
 /// The headroom attempt failed an hour after its last complete sample,
-/// which held a deficit.
+/// which held a deficit. The complete Parquet scan holds an env whose only
+/// partition is dated tomorrow, as an agent with a fast clock writes one.
 fn failed_retained_scenario() -> Scenario {
     let mut p = EnvDateBytes::new();
     fill(&mut p, "archive", date(3, 14), today(), |_| 100 * M);
+    fill(&mut p, "edge", date(9, 28), date(9, 28), |_| 3 * M);
     fill(&mut p, "k8s", date(9, 24), today(), |_| 9 * M);
     fill(&mut p, "prod", date(8, 15), today(), |_| 2_500 * M);
     Scenario {

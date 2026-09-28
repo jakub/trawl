@@ -1097,11 +1097,14 @@ test.describe('Disk and retention', () => {
     await fact(group(disk, 'pressure'), 'Last sweep', 'Failed, 41s ago');
     // Global: the rate-less k8s is withheld for the measurement too, and
     // nothing is excluded from a projection that did not run.
-    await withheld(disk, ['archive', 'k8s', 'prod'], WITHHELD.measurement);
+    await withheld(disk, ['archive', 'edge', 'k8s', 'prod'], WITHHELD.measurement);
+    // A partition dated after today, from a fast agent clock, is still the
+    // env's oldest date on disk.
+    await expect(env(disk, 'edge')).toContainText('Policy: 90 days. Oldest date: 2026-09-28. Stored: 3 MB.');
     await expect(disk.locator('.health-disk-excluded')).toHaveCount(0);
     await noVerdict(page, disk);
     await capture(page, testInfo, disk, 'disk-retention-failed-retained-1440.png',
-      'Failed headroom attempt with a retained sample: rows read "Collection failed; last complete reading" with a 3600s age and a deficit, and every reach is withheld as measurement unavailable with no digit and no growth-excluded note');
+      'Failed headroom attempt with a retained sample: rows read "Collection failed; last complete reading" with a 3600s age and a deficit, and every reach, a future-dated env\'s included, is withheld as measurement unavailable with no digit and no growth-excluded note');
   });
 
   test('a repin in flight withholds every reach as suppressed without a number', async ({ page, request }, testInfo) => {

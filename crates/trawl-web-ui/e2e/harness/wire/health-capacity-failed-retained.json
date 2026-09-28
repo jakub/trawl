@@ -1,6 +1,6 @@
 {
-  "parquet_files": 246,
-  "parquet_bytes": 129836000000,
+  "parquet_files": 247,
+  "parquet_bytes": 129839000000,
   "parquet_measurement": {
     "status": "complete",
     "sample_age_secs": 2
@@ -56,6 +56,16 @@
         "max_age_days": 0,
         "oldest_date": "2026-03-14",
         "stored_bytes": 19800000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "measurement_unavailable"
+        }
+      },
+      {
+        "env": "edge",
+        "max_age_days": 90,
+        "oldest_date": "2026-09-28",
+        "stored_bytes": 3000000,
         "reach": {
           "state": "withheld",
           "reason": "measurement_unavailable"

@@ -541,7 +541,7 @@ mod tests {
             (
                 "failed-retained",
                 include_str!("../e2e/harness/wire/health-capacity-failed-retained.json"),
-                ["archive", "k8s", "prod"]
+                ["archive", "edge", "k8s", "prod"]
                     .map(|env| (env, "Reach withheld: measurement unavailable; the disk or Parquet sample is not complete.".to_owned()))
                     .to_vec(),
                 None,
