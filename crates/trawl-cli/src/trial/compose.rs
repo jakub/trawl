@@ -578,7 +578,10 @@ mod tests {
             );
             if let Value::String(s) = value {
                 assert!(!s.to_ascii_lowercase().contains("insecure"), "{path}: {s}");
-                assert!(!s.contains("TRAWL_WEB_INSECURE_UPSTREAM"), "{path}");
+                assert!(
+                    !s.contains(concat!("TRAWL_WEB_", "INSECURE_UPSTREAM")),
+                    "{path}"
+                );
             }
         });
         for (name, service) in project["services"].as_object().unwrap() {
@@ -691,7 +694,10 @@ mod tests {
                 if lower.contains("insecure") {
                     assert_eq!(line, "allow_insecure_cookies = true");
                 }
-                assert!(!line.contains("TRAWL_WEB_INSECURE_UPSTREAM"), "{line}");
+                assert!(
+                    !line.contains(concat!("TRAWL_WEB_", "INSECURE_UPSTREAM")),
+                    "{line}"
+                );
             }
         }
     }
