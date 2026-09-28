@@ -27,7 +27,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use rcgen::{
@@ -43,10 +43,19 @@ const SAVED_TOKEN: &str = "flt_savedservertokenvalue";
 struct Seen {
     connections: usize,
     authorization_headers: usize,
+    /// Barrier connections fully handled; see [`Recorder::assert_untouched`].
+    barriers: usize,
 }
+
+/// The whole request a barrier connection sends to a [`Recorder`].
+const BARRIER: &[u8] = b"TRAWL-RECORDER-BARRIER\r\n\r\n";
 
 /// A plain TCP listener on `127.0.0.1` that records, answers nothing, and
 /// closes.
+///
+/// One thread accepts and handles connections one at a time, in the order
+/// the kernel queued them. Once it has handled a connection, it has counted
+/// every connection queued before that one.
 struct Recorder {
     port: u16,
     seen: Arc<Mutex<Seen>>,
@@ -73,6 +82,10 @@ impl Recorder {
                         Ok(n) => head.extend_from_slice(&buf[..n]),
                     }
                 }
+                if head == BARRIER {
+                    record.lock().unwrap().barriers += 1;
+                    continue;
+                }
                 let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
                 if head.contains("\nauthorization:") {
                     record.lock().unwrap().authorization_headers += 1;
@@ -86,9 +99,34 @@ impl Recorder {
         format!("{scheme}://127.0.0.1:{}", self.port)
     }
 
+    /// Wait up to ten seconds for `done` to hold, then return the counts.
+    fn wait_for(&self, done: impl Fn(&Seen) -> bool) -> MutexGuard<'_, Seen> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = self.seen.lock().unwrap();
+            if done(&seen) || Instant::now() > deadline {
+                return seen;
+            }
+            drop(seen);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Nothing but this call's own barrier connection reached the recorder.
+    ///
+    /// Call it after every doctor run has exited. A connection a run made is
+    /// queued before the barrier, and the accept loop is sequential, so once
+    /// the barrier is handled every earlier connection has been counted.
     fn assert_untouched(&self, case: &str) {
-        let seen = self.seen.lock().unwrap();
-        assert_eq!(seen.connections, 0, "{case}: nothing may connect");
+        let mut barrier = TcpStream::connect(("127.0.0.1", self.port)).expect("barrier connect");
+        barrier.write_all(BARRIER).expect("barrier write");
+        drop(barrier);
+        let seen = self.wait_for(|seen| seen.barriers >= 1);
+        assert_eq!(seen.barriers, 1, "{case}: the barrier was not handled");
+        assert_eq!(
+            seen.connections, 1,
+            "{case}: nothing but the barrier may connect"
+        );
         assert_eq!(seen.authorization_headers, 0, "{case}: no key may be sent");
     }
 }
@@ -481,6 +519,21 @@ fn connection_config(report: &serde_json::Value) -> &serde_json::Value {
     let check = &report["checks"][0];
     assert_eq!(check["id"], "connection.config");
     check
+}
+
+/// Positive control for [`Recorder::assert_untouched`]: a recorder counts a
+/// connection and the `Authorization` header a keyed request carries.
+#[test]
+fn recorder_counts_a_keyed_request() {
+    let recorder = Recorder::start();
+    let mut stream = TcpStream::connect(("127.0.0.1", recorder.port)).expect("connect");
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer canary\r\n\r\n")
+        .expect("write");
+    drop(stream);
+    let seen = recorder.wait_for(|seen| seen.connections >= 1 && seen.authorization_headers >= 1);
+    assert_eq!(seen.connections, 1, "{seen:?}");
+    assert_eq!(seen.authorization_headers, 1, "{seen:?}");
 }
 
 /// Each ambient variable refuses the run by name, never by value, even when
