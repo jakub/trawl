@@ -1,15 +1,15 @@
 {
   "evidence": "Stub fixtures only; no daemon, database, or real ingest",
-  "head": "2b1ea66a0d95e32f1e29a4d9c02fe69337f1cd0b",
+  "head": "7351022e1f45a46ec5d16b9558ee3f35a54353d2",
   "git_status": "",
   "spec": "crates/trawl-web-ui/e2e/tests/health-page.spec.ts",
-  "spec_sha256": "e781fa6a5c29556c9d0fd7237ceea1b68512bb0a318e30afe19fe17ae4d21c2f",
+  "spec_sha256": "d984a8f6578b25e429768cbf76878369eca26daf618d4aac43d46b838c641162",
   "spec_filter": "tests/health-page.spec.ts (whole file, 61 cases)",
-  "captured_at": "2026-09-28T04:44:05.745847Z",
+  "captured_at": "2026-09-28T04:50:15.114030Z",
   "port": 8641,
   "color_scheme": "light",
   "dist": {
-    "sha256": "25a88e6a61025b8c6642852d2c68b1e7522e5f140e9faa8f9422c3d7ec8d5075",
+    "sha256": "a8d504a82429a77a246f7b4ab611e463733ced594b52f9426241009cf66c50fc",
     "sha256_of": "the sha256sum listing of every file under crates/trawl-web-ui/dist, sorted by relative path",
     "files": [
       "fleet-ui-a30215ee41c73bb7.css",
