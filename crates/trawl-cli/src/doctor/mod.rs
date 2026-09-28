@@ -156,7 +156,7 @@ pub(crate) struct Globals {
 }
 
 /// The name clap gives the subcommand.
-const NAME: &str = "doctor";
+pub(crate) const NAME: &str = "doctor";
 
 /// Every environment variable clap binds to an argument of `trawl doctor`,
 /// global ones included. All of them are refused when present.

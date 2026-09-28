@@ -453,7 +453,9 @@ fn connection_config(report: &serde_json::Value) -> &serde_json::Value {
 }
 
 /// Each ambient variable refuses the run by name, never by value, even when
-/// it is empty or a flag would shadow it.
+/// it is empty, malformed, or a flag would shadow it. clap never reads these
+/// variables for `doctor`, so a value it would reject (a non-bool
+/// `TRAWL_INSECURE`) is refused by name like any other.
 #[test]
 fn doctor_refuses_ambient_env() {
     const PLANTED: &str = "flt_plantedambientvalue";
@@ -466,30 +468,96 @@ fn doctor_refuses_ambient_env() {
         "TRAWL_TOKEN",
         "TRAWL_INSECURE",
     ] {
-        // TRAWL_INSECURE is a bool clap parses before the doctor runs: an
-        // empty or malformed value is clap's own usage error (still exit 2,
-        // and a bool is no secret), so its table holds values clap accepts.
         let values: &[&str] = if name == "TRAWL_INSECURE" {
-            &["true", "false"]
+            &[PLANTED, "", "true", "false"]
         } else {
             &[PLANTED, ""]
         };
         for value in values {
             let case = format!("{name}={value:?}");
-            let output = home.trawl(&["doctor", "--url", &url], &[(name, value)]);
-            assert_usage_error(&output, &format!("{name} is set"), &[PLANTED], &case);
-            if !value.is_empty() {
-                assert!(
-                    !text(&output).contains(&format!("{name}={value}")),
-                    "{case}: the value is not shown"
-                );
+            for args in [
+                vec!["doctor", "--url", url.as_str()],
+                // A flag that shadows the variable does not hide it.
+                vec!["doctor", "--url", url.as_str(), "--insecure"],
+                // Neither does an argv error: the variable is never parsed.
+                vec!["doctor", "--no-such-flag"],
+            ] {
+                let output = home.trawl(&args, &[(name, value)]);
+                let all = text(&output);
+                assert_eq!(output.status.code(), Some(2), "{case} {args:?}: {all}");
+                assert!(output.stdout.is_empty(), "{case} {args:?}: {all}");
+                assert!(!all.contains(PLANTED), "{case} {args:?}: {all}");
+                if !args.contains(&"--no-such-flag") {
+                    assert!(
+                        all.contains(&format!("{name} is set")),
+                        "{case} {args:?}: {all}"
+                    );
+                }
             }
         }
     }
-    let output = home.trawl(&["doctor", "--url", &url], &[("TRAWL_INSECURE", "")]);
-    assert_eq!(output.status.code(), Some(2), "{}", text(&output));
-    assert!(output.stdout.is_empty());
     recorder.assert_untouched("ambient environment");
+}
+
+/// No `--help` prints an environment value, for `doctor` or any other
+/// command, even when a variable carries credentials or clap would reject
+/// it.
+#[test]
+fn help_never_prints_environment_values() {
+    const SENTINEL: &str = "s3ntinelvalue";
+    let home = Sandbox::new();
+    let env = [
+        ("TRAWL_URL", "https://user:s3ntinelvalue@localhost:1"),
+        ("TRAWL_PROFILE", "s3ntinelvalue"),
+        ("TRAWL_TOKEN", "flt_s3ntinelvalue"),
+        ("TRAWL_INSECURE", "s3ntinelvalue"),
+    ];
+    for args in [
+        vec!["--help"],
+        vec!["doctor", "--help"],
+        vec!["help", "doctor"],
+        vec!["query", "--help"],
+    ] {
+        let output = home.trawl(&args, &env);
+        let all = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {all}");
+        assert!(!all.contains(SENTINEL), "{args:?} printed a value: {all}");
+        for (name, _) in env {
+            assert!(all.contains(&format!("[env: {name}]")), "{args:?}: {all}");
+        }
+    }
+}
+
+/// Other commands still read the environment as before: `TRAWL_URL` and
+/// `TRAWL_TOKEN` select the server a query goes to, and a malformed
+/// `TRAWL_INSECURE` is still clap's own usage error.
+#[test]
+fn other_commands_still_read_the_environment() {
+    let home = Sandbox::new();
+    let port = closed_port();
+    let output = home.trawl(
+        &["query", "* | head 1"],
+        &[
+            ("TRAWL_URL", &format!("https://127.0.0.1:{port}")),
+            ("TRAWL_TOKEN", "flt_querytoken"),
+        ],
+    );
+    let all = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{all}");
+    assert!(
+        all.contains(&format!(
+            "connection failed for API https://127.0.0.1:{port}"
+        )),
+        "the query went to TRAWL_URL: {all}"
+    );
+
+    let output = home.trawl(
+        &["validate", "* | head 1"],
+        &[("TRAWL_INSECURE", "garbage")],
+    );
+    let all = text(&output);
+    assert_eq!(output.status.code(), Some(2), "{all}");
+    assert!(all.contains("for '--insecure'"), "{all}");
 }
 
 /// Selection errors on the command line: all exit 2, before anything is
