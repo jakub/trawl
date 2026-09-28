@@ -237,7 +237,7 @@ pub(crate) async fn run(globals: Globals, args: DoctorArgs) -> Result<u8, CliErr
     let mut out = stdout.lock();
     render(&report, format, &mut out)?;
     out.flush()?;
-    Ok(report.verdict.exit_code())
+    Ok(report.verdict().exit_code())
 }
 
 /// Run every check the selection allows and build the report.
@@ -320,25 +320,25 @@ pub fn render(report: &Report, format: Format, out: &mut impl Write) -> io::Resu
             writeln!(out)
         }
         Format::Table => {
-            let origin = report.target.origin.as_deref().unwrap_or("(unresolved)");
-            writeln!(out, "target: {origin} ({})", report.target.source)?;
+            let origin = report.target().origin.as_deref().unwrap_or("(unresolved)");
+            writeln!(out, "target: {origin} ({})", report.target().source)?;
             let width = report
-                .checks
+                .checks()
                 .iter()
                 .map(|check| check.id.len())
                 .max()
                 .unwrap_or(0);
-            for check in &report.checks {
+            for check in report.checks() {
                 writeln!(out, "{}", check_line(check, width))?;
             }
-            for note in &report.notes {
+            for note in report.notes() {
                 writeln!(out, "note: {note}")?;
             }
-            let verdict = verdict_name(report.verdict);
+            let verdict = verdict_name(report.verdict());
             writeln!(
                 out,
                 "verdict: {verdict} (exit {})",
-                report.verdict.exit_code()
+                report.verdict().exit_code()
             )
         }
     }
@@ -484,7 +484,7 @@ mod tests {
         };
         let report = check(&selection).await;
         let rows: Vec<(&str, Outcome, Option<&str>, Option<&str>)> = report
-            .checks
+            .checks()
             .iter()
             .map(|c| {
                 (
@@ -530,7 +530,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(report.verdict, Verdict::Fail);
+        assert_eq!(report.verdict(), Verdict::Fail);
     }
 
     #[test]

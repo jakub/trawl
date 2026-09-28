@@ -92,7 +92,7 @@ async fn doctor_child() {
         doctor::render(&report, format, &mut rendered).expect("render the report");
         std::fs::write(out.join(file), rendered).expect("write the rendered report");
     }
-    std::process::exit(i32::from(report.verdict.exit_code()));
+    std::process::exit(i32::from(report.verdict().exit_code()));
 }
 
 /// How the child selects its target.
@@ -117,7 +117,7 @@ struct Run {
 impl Run {
     fn check(&self, id: &str) -> &Check {
         self.report
-            .checks
+            .checks()
             .iter()
             .find(|check| check.id == id)
             .unwrap_or_else(|| panic!("no {id} row in:\n{}", self.text))
@@ -182,7 +182,7 @@ async fn run_doctor(target: Target<'_>, ssl_cert_file: Option<&Path>) -> Run {
     let report: Report = serde_json::from_str(&json).expect("the JSON report parses");
     assert_eq!(
         status,
-        i32::from(report.verdict.exit_code()),
+        i32::from(report.verdict().exit_code()),
         "the exit status is the verdict's:\n{text}"
     );
     Run {
@@ -232,7 +232,7 @@ fn assert_api_reachable(run: &Run) {
     }
     for check in run
         .report
-        .checks
+        .checks()
         .iter()
         .filter(|check| check.id.starts_with("api.health."))
     {
@@ -260,11 +260,11 @@ async fn doctor_pass_without_key() {
     )
     .await;
     assert_eq!(run.status, 0, "{}", run.text);
-    assert_eq!(run.report.verdict, Verdict::Pass);
+    assert_eq!(run.report.verdict(), Verdict::Pass);
     assert_api_reachable(&run);
     assert!(
         run.report
-            .checks
+            .checks()
             .iter()
             .any(|check| check.id.starts_with("api.health.")),
         "the health body's checks become rows:\n{}",
@@ -345,7 +345,7 @@ async fn doctor_identity_reports_permissions_without_secrets() {
 
     for run in [&by_url, &by_profile] {
         assert_eq!(run.status, 0, "{}", run.text);
-        assert_eq!(run.report.verdict, Verdict::Pass);
+        assert_eq!(run.report.verdict(), Verdict::Pass);
         assert_api_reachable(run);
         let identity = run.check("api.identity");
         assert_eq!(identity.outcome, Outcome::Complete, "{}", run.text);
@@ -361,7 +361,7 @@ async fn doctor_identity_reports_permissions_without_secrets() {
     assert!(
         by_profile
             .report
-            .notes
+            .notes()
             .iter()
             .any(|note| note.contains("lacks the ingest permission")),
         "{}",
@@ -399,7 +399,7 @@ async fn doctor_revoked_key_fails() {
     )
     .await;
     assert_eq!(run.status, 1, "{}", run.text);
-    assert_eq!(run.report.verdict, Verdict::Fail);
+    assert_eq!(run.report.verdict(), Verdict::Fail);
     assert_api_reachable(&run);
     let identity = run.check("api.identity");
     assert_eq!(identity.outcome, Outcome::Failed, "{}", run.text);
@@ -423,7 +423,7 @@ async fn doctor_permissionless_key_fails() {
     )
     .await;
     assert_eq!(run.status, 1, "{}", run.text);
-    assert_eq!(run.report.verdict, Verdict::Fail);
+    assert_eq!(run.report.verdict(), Verdict::Fail);
     assert_api_reachable(&run);
     let identity = run.check("api.identity");
     assert_eq!(identity.outcome, Outcome::Failed, "{}", run.text);
@@ -463,7 +463,7 @@ async fn doctor_rate_limited_is_incomplete() {
     )
     .await;
     assert_eq!(run.status, 3, "{}", run.text);
-    assert_eq!(run.report.verdict, Verdict::Incomplete);
+    assert_eq!(run.report.verdict(), Verdict::Incomplete);
     assert_api_reachable(&run);
     let identity = run.check("api.identity");
     assert_eq!(identity.outcome, Outcome::NotSampled, "{}", run.text);

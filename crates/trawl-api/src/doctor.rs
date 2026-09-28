@@ -19,21 +19,41 @@ use serde::{Deserialize, Serialize};
 pub const REPORT_VERSION: u32 = 1;
 
 /// One doctor run: what it checked, from where, and what it concluded.
+///
+/// The fields are private so the verdict always agrees with the checks:
+/// [`Report::new`] is the only constructor and computes it, nothing can
+/// change the checks afterwards, and deserializing recomputes the verdict
+/// and refuses a document whose stated verdict disagrees with its checks.
+///
+/// A struct literal does not compile outside this module:
+///
+/// ```compile_fail
+/// use trawl_api::doctor::{Report, Target, Vantage, Verdict};
+/// let forged = Report {
+///     version: 1,
+///     vantage: Vantage::Client,
+///     target: Target { origin: None, source: String::new() },
+///     verdict: Verdict::Pass,
+///     checks: Vec::new(),
+///     notes: Vec::new(),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ReportDocument")]
 pub struct Report {
     /// Document version, always [`REPORT_VERSION`] when built here.
-    pub version: u32,
+    version: u32,
     /// Which process ran the checks.
-    pub vantage: Vantage,
+    vantage: Vantage,
     /// What the checks were aimed at.
-    pub target: Target,
+    target: Target,
     /// Conclusion over every check, computed by [`Report::new`].
-    pub verdict: Verdict,
+    verdict: Verdict,
     /// Every check, in the order the doctor ran them.
-    pub checks: Vec<Check>,
+    checks: Vec<Check>,
     /// Report-level notes that never change an outcome, e.g. a version
     /// mismatch between client and server.
-    pub notes: Vec<String>,
+    notes: Vec<String>,
 }
 
 impl Report {
@@ -52,6 +72,96 @@ impl Report {
             checks,
             notes,
         }
+    }
+
+    /// Document version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Which process ran the checks.
+    #[must_use]
+    pub const fn vantage(&self) -> Vantage {
+        self.vantage
+    }
+
+    /// What the checks were aimed at.
+    #[must_use]
+    pub const fn target(&self) -> &Target {
+        &self.target
+    }
+
+    /// Conclusion over every check.
+    #[must_use]
+    pub const fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// Every check, in the order the doctor ran them.
+    #[must_use]
+    pub fn checks(&self) -> &[Check] {
+        &self.checks
+    }
+
+    /// Report-level notes.
+    #[must_use]
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+}
+
+/// The JSON form of a [`Report`] as read, before its verdict is checked.
+#[derive(Deserialize)]
+struct ReportDocument {
+    version: u32,
+    vantage: Vantage,
+    target: Target,
+    verdict: Verdict,
+    checks: Vec<Check>,
+    notes: Vec<String>,
+}
+
+/// A report document whose stated verdict is not the one its checks give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerdictMismatch {
+    /// The verdict the document states.
+    pub stated: Verdict,
+    /// The verdict its checks give.
+    pub computed: Verdict,
+}
+
+impl std::fmt::Display for VerdictMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the report states verdict {:?} but its checks give {:?}",
+            self.stated, self.computed
+        )
+    }
+}
+
+impl std::error::Error for VerdictMismatch {}
+
+impl TryFrom<ReportDocument> for Report {
+    type Error = VerdictMismatch;
+
+    fn try_from(document: ReportDocument) -> Result<Self, Self::Error> {
+        let computed = Verdict::of(document.checks.iter().map(|check| &check.outcome));
+        if computed != document.verdict {
+            return Err(VerdictMismatch {
+                stated: document.verdict,
+                computed,
+            });
+        }
+        Ok(Self {
+            version: document.version,
+            vantage: document.vantage,
+            target: document.target,
+            verdict: computed,
+            checks: document.checks,
+            notes: document.notes,
+        })
     }
 }
 
@@ -224,8 +334,8 @@ mod tests {
             assert_eq!(Verdict::of(outcomes.iter()), *verdict, "{outcomes:?}");
             assert_eq!(verdict.exit_code(), *code, "{verdict:?}");
             let built = report(outcomes);
-            assert_eq!(built.verdict, *verdict, "Report::new over {outcomes:?}");
-            assert_eq!(built.verdict.exit_code(), *code);
+            assert_eq!(built.verdict(), *verdict, "Report::new over {outcomes:?}");
+            assert_eq!(built.verdict().exit_code(), *code);
         }
     }
 
@@ -293,5 +403,32 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(verdict).unwrap(), name);
         }
+    }
+
+    /// A document whose stated verdict disagrees with its checks is
+    /// refused; one that agrees round-trips unchanged.
+    #[test]
+    fn doctor_report_deserialize_checks_the_verdict() {
+        let built = report(&[Outcome::Complete, Outcome::NotSampled]);
+        assert_eq!(built.verdict(), Verdict::Incomplete);
+        let encoded = serde_json::to_value(&built).unwrap();
+        let decoded: Report = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, built);
+
+        for stated in ["pass", "fail"] {
+            let mut forged = encoded.clone();
+            forged["verdict"] = serde_json::Value::from(stated);
+            let err = serde_json::from_value::<Report>(forged)
+                .expect_err("a verdict that disagrees with the checks is refused");
+            assert!(
+                err.to_string().contains("but its checks give Incomplete"),
+                "{err}"
+            );
+        }
+
+        // An empty report passes, and must say so.
+        let mut forged = serde_json::to_value(report(&[])).unwrap();
+        forged["verdict"] = serde_json::Value::from("fail");
+        assert!(serde_json::from_value::<Report>(forged).is_err());
     }
 }
