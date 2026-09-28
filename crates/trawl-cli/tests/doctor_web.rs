@@ -124,9 +124,13 @@ impl Origin {
     }
 
     /// Something that is not `trawl-web`, answering its two paths.
-    fn stub(healthz: (u16, &'static str), login: (u16, &'static str)) -> Self {
-        let answer = |(status, body): (u16, &'static str)| {
-            move || async move { (StatusCode::from_u16(status).unwrap(), body) }
+    fn stub(healthz: (u16, &str), login: (u16, &str)) -> Self {
+        let answer = |(status, body): (u16, &str)| {
+            let body = body.to_owned();
+            move || {
+                let body = body.clone();
+                async move { (StatusCode::from_u16(status).unwrap(), body) }
+            }
         };
         Self::serve(|_| {
             Router::new()
@@ -389,4 +393,70 @@ fn doctor_web_foreign_endpoint() {
     );
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(web.keyless_requests("foreign health"), ["GET /healthz"]);
+}
+
+/// A probe body past the cap is too large, never judged by its prefix. A
+/// foreign endpoint whose body opens with trawl-web's exact answer, pads
+/// it with JSON whitespace to the cap, and then goes on, is not taken for
+/// `trawl-web`, for either answer `web.origin` recognizes.
+#[test]
+fn doctor_web_truncated_body_is_too_large() {
+    for (case, status, signature) in [
+        ("accepted signature", 400, r#"{"error":"bad request"}"#),
+        (
+            "rejected signature",
+            403,
+            r#"{"error":"cross-origin request rejected"}"#,
+        ),
+    ] {
+        let mut body = signature.to_owned();
+        body.push_str(&" ".repeat(trawl_client::OriginProbe::BODY_CAP - signature.len()));
+        body.push_str("trailing garbage");
+        let web = Origin::stub((200, "ok"), (status, &body));
+        let (output, report) = doctor(&web.url);
+        assert_api_failed_independently(&report, case);
+        assert_eq!(
+            outcome(&report, "web.transport"),
+            ("complete".to_owned(), None, None),
+            "{case}"
+        );
+        assert_eq!(
+            outcome(&report, "web.origin"),
+            (
+                "failed".to_owned(),
+                Some("response too large".to_owned()),
+                None
+            ),
+            "{case}"
+        );
+        assert_eq!(output.status.code(), Some(1), "{case}");
+        assert_eq!(web.keyless_requests(case), PROBES, "{case}");
+    }
+}
+
+/// `GET /healthz` answering 429 samples nothing: `web.transport` is
+/// `not_sampled` with `rate_limited`, and `web.origin` is not sent.
+#[test]
+fn doctor_web_health_rate_limited() {
+    let web = Origin::stub((429, "slow down"), (400, r#"{"error":"bad request"}"#));
+    let (output, report) = doctor(&web.url);
+    assert_api_failed_independently(&report, "rate limited");
+    assert_eq!(
+        outcome(&report, "web.transport"),
+        (
+            "not_sampled".to_owned(),
+            Some("rate_limited".to_owned()),
+            None
+        )
+    );
+    assert_eq!(
+        outcome(&report, "web.origin"),
+        (
+            "not_sampled".to_owned(),
+            Some("blocked".to_owned()),
+            Some("web.transport".to_owned())
+        )
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(web.keyless_requests("rate limited"), ["GET /healthz"]);
 }

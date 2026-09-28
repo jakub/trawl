@@ -65,6 +65,9 @@ impl<'a> WebRun<'a> {
     }
 
     /// `web.transport`: `GET /healthz` must answer 200 with the body `ok`.
+    /// A 429 is `not_sampled` with `rate_limited`: the origin answered, but
+    /// not with the answer this check judges, so `web.origin` stays
+    /// blocked.
     pub async fn transport(&mut self) -> Check {
         let check = row(WEB_TRANSPORT, Outcome::Failed);
         let Ok(probe) = OriginProbe::new(self.url.origin(), &TlsTrust::System, REQUEST_TIMEOUT)
@@ -78,6 +81,7 @@ impl<'a> WebRun<'a> {
                 outcome: Outcome::Complete,
                 ..check
             },
+            Ok(ProbeResponse { status: 429, .. }) => rate_limited(check),
             Ok(ProbeResponse { status, .. }) => with_next(
                 Check {
                     detail: Some(format!("GET /healthz answered HTTP {status}")),
@@ -124,16 +128,7 @@ impl<'a> WebRun<'a> {
                      or FLEET_SESSION_PUBLIC_ORIGINS), then restart trawl-web"
                 ),
             ),
-            429 => with_next(
-                with_reason(
-                    Check {
-                        outcome: Outcome::NotSampled,
-                        ..check
-                    },
-                    reason::RATE_LIMITED,
-                ),
-                "wait a minute, then run trawl doctor again",
-            ),
+            429 => rate_limited(check),
             status => with_next(
                 Check {
                     detail: Some(format!("POST /api/auth/login answered HTTP {status}")),
@@ -159,9 +154,30 @@ fn is_error_body(body: &[u8], expected: &str) -> bool {
     })
 }
 
+/// `check` as `not_sampled` with `rate_limited`: the origin answered 429.
+fn rate_limited(check: Check) -> Check {
+    with_next(
+        with_reason(
+            Check {
+                outcome: Outcome::NotSampled,
+                ..check
+            },
+            reason::RATE_LIMITED,
+        ),
+        "wait a minute, then run trawl doctor again",
+    )
+}
+
 /// The outcome of a probe that got no complete HTTP answer, from the
-/// error's kind alone.
+/// error's kind alone. A body past the probe's cap is too large, never
+/// judged by its first bytes.
 fn network_failure(check: Check, e: &ClientError) -> Check {
+    if let ClientError::TooLarge { .. } = e {
+        return with_next(
+            with_reason(check, "response too large"),
+            "check that --web-url names trawl-web itself, not trawld's API or another service",
+        );
+    }
     match e.network_kind() {
         Some(NetworkKind::UntrustedCertificate) => with_next(
             with_reason(check, "certificate not trusted under system roots"),

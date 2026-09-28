@@ -424,7 +424,7 @@ The doctor runs the checks in this order. When a check's prerequisite is not
 | `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `error`, `refusing`, and every other value are `failed` | `api.health` |
 | `api.health._invalid` | The server reported a check name that is not `[a-z][a-z0-9_]{0,63}`. This row is always `failed`, and the report does not show the names. No check name starts with `_`, so this ID cannot match a server's check | `api.health` |
 | `api.identity` | `GET /api/v1/whoami` answers HTTP 200 and accepts the key. `detail` shows the key's name, its kind, and its permissions, never the key or its prefix. The name shows at most 32 characters. The kind is `human` or `service`: any other kind fails with `the answer is not a trawl whoami response`. Only Trawl's own permission names show, such as `query` or `ingest`. Any other permission string is counted as `N unrecognized` and not shown. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail. Any other 2xx status fails with `unexpected status` | `api.health`, and a key selected |
-| `web.transport` | `GET /healthz` on `--web-url` answers HTTP 200 with the body `ok` | `--web-url` given |
+| `web.transport` | `GET /healthz` on `--web-url` answers HTTP 200 with the body `ok`. HTTP 429 gives `not_sampled` with the reason `rate_limited`, and `web.origin` is then `blocked` | `--web-url` given |
 | `web.origin` | `trawl-web` accepts `--web-url` as a browser origin. The doctor sends `POST /api/auth/login` with `Origin: <web-url>` and an empty `api_key`. Only `400 {"error":"bad request"}` is `complete`. `403 {"error":"cross-origin request rejected"}` fails with `origin not in public_origins`. HTTP 429 gives `not_sampled` with the reason `rate_limited`. Any other answer fails with `not a trawl-web login endpoint` | `web.transport` |
 
 The doctor sends the key only in `GET /api/v1/whoami`, and only after the
@@ -451,8 +451,9 @@ proved: `api.transport` and `api.tls` are `complete`, and only the check that
 reads the body is `not_sampled` with `timed_out`. An HTTP 429 answer gives
 `not_sampled` with the reason `rate_limited`. The doctor does not follow a
 redirect: the check fails with `redirect refused`. The doctor reads at most
-64 KiB of a health or `whoami` answer. A larger answer fails the check with
-`response too large`.
+64 KiB of a health or `whoami` answer, and at most 4 KiB of a `web.*` answer.
+A larger answer fails the check with `response too large`, whatever its
+status, and the doctor never judges the part that it read.
 
 ### Outcomes and verdict
 
