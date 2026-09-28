@@ -126,7 +126,9 @@ config:
   # Set to a complete trawld.toml string to bypass structured templating.
   # Only supported with tls.mode=auto; raw TOML owns its TLS paths. With
   # web.enabled it must set [data] path: the chart mounts trawld's generated
-  # certificate into trawl-web from <parent of that path>/tls.
+  # certificate into trawl-web from <parent of that path>/tls. It must not
+  # set [server] tls_cert_path or tls_key_path then, because trawl-web pins
+  # the generated certificate.
   raw: ""
 
   server:

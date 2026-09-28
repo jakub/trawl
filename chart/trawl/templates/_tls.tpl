@@ -146,6 +146,13 @@ is false, except that auto refuses the values it would contradict.
       {{- if hasKey $raw "Error" -}}
         {{- fail "config.raw is not valid TOML: when tls.mode=auto and web.enabled=true the chart reads its [data] path to mount trawld's generated certificate into trawl-web" -}}
       {{- end -}}
+      {{- /* auto means trawld generates its certificate, and trawl-web pins
+           it. Either path turns generation off, and a key at or under
+           <state_dir>/tls would be in the directory trawl-web mounts. */ -}}
+      {{- $server := get $raw "server" -}}
+      {{- if and (kindIs "map" $server) (or (hasKey $server "tls_cert_path") (hasKey $server "tls_key_path")) -}}
+        {{- fail "config.raw must not set [server] tls_cert_path or tls_key_path when tls.mode=auto and web.enabled=true: trawl-web pins the certificate trawld generates, and mounts the directory it is in; to serve your own certificate, put it in a TLS Secret and use tls.mode=secret with structured config values" -}}
+      {{- end -}}
       {{- $table := get $raw "data" -}}
       {{- if not (and (kindIs "map" $table) (hasKey $table "path") (kindIs "string" (get $table "path"))) -}}
         {{- fail "config.raw must set [data] path when tls.mode=auto and web.enabled=true: trawld generates its certificate in the parent of that path, and the chart mounts it into trawl-web from there" -}}

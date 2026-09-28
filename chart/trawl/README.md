@@ -71,7 +71,8 @@ The `init-tls-dir` init container first creates that directory as trawld's
 uid. Without it, kubelet could create the directory as root when it mounts
 the sidecar, and trawld could not write its certificate there. If another uid
 already owns the directory, the pod stops at `init-tls-dir` and its log names
-the owner.
+the owner. It also deletes a `key.pem` that an older trawld left in that
+directory, before the sidecar starts.
 trawld keeps its key in `tls-key/`, outside that mount, and the sidecar runs
 as `web.runAsUser`, a uid that cannot read the key's 0600 file. With
 `secret` or `certManager`, the sidecar requests `https://<tls.upstreamServerName>:<port>`
@@ -85,7 +86,9 @@ accepted only with `tls.mode: auto`, where the raw TOML controls TLS and the
 chart mounts no TLS Secret. Helm cannot validate arbitrary TOML certificate
 paths against its volume mounts. With `web.enabled`, the chart reads the raw
 TOML's `[data] path` and mounts the `tls` directory beside it, so the raw
-TOML must set `[data] path` and the matching `[web]` keys.
+TOML must set `[data] path` and the matching `[web]` keys. It must not set
+`[server] tls_cert_path` or `tls_key_path`, because the sidecar pins the
+generated certificate.
 
 Follow [configure the daemon API certificate](https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate)
 for complete values, issuance checks, and client verification. cert-manager's

@@ -410,9 +410,10 @@ always verifies. In `secret` and `certManager` modes with `web.enabled`, set
 value to set. `auto` mode needs no new value.
 
 In `auto` mode, trawld now keeps its generated key in `tls-key/`, outside the
-directory the sidecar mounts. The first trawld start after the upgrade deletes
-the old `tls/key.pem` and generates a new certificate and key. A client that
-pinned the old certificate needs a copy of the new one.
+directory the sidecar mounts. After the upgrade, the `init-tls-dir` container
+deletes the old `tls/key.pem` before trawld and the sidecar start, and trawld
+then generates a new certificate and key. A client that pinned the old
+certificate needs a copy of the new one.
 
 #### Verify the requested name and trust
 

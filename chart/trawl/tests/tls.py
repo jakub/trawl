@@ -326,9 +326,36 @@ class TLS(unittest.TestCase):
         self.fails({"web": web(), "config": {"raw": '[data]\npath = "/var/lib/trawl/nested/data"\n'},
                     "crashDump": {"enabled": True, "mountPath": "/var/lib/trawl/nested"}}, "crashDump.mountPath")
         # Without the sidecar the chart never reads the raw TOML.
-        for raw in ['[server]\nhttp_addr = "0.0.0.0:5514"\n', '[data\n']:
+        for raw in ['[server]\nhttp_addr = "0.0.0.0:5514"\n', '[data\n',
+                    '[server]\ntls_key_path = "/var/lib/trawl/tls/key.pem"\n']:
             with self.subTest(raw=raw):
                 self.objects({"config": {"raw": raw}})
+
+    def test_auto_mode_raw_config_refuses_its_own_certificate(self):
+        # tls.mode=auto means trawld generates its certificate, and the
+        # sidecar pins that one. A raw tls_cert_path or tls_key_path turns
+        # generation off, and a key at or under <state_dir>/tls would sit in
+        # the directory the sidecar mounts, group-readable after the fsGroup
+        # walk. The chart refuses both paths, as it refuses the other values
+        # auto contradicts.
+        data = '[data]\npath = "/var/lib/trawl/data"\n'
+        for server in [
+            'tls_cert_path = "/var/lib/trawl/tls/cert.pem"\ntls_key_path = "/var/lib/trawl/tls/key.pem"\n',
+            'tls_key_path = "/var/lib/trawl/tls/key.pem"\n',
+            'tls_key_path = "/var/lib/trawl/tls/nested/key.pem"\n',
+            'tls_cert_path = "/etc/trawl/own/cert.pem"\ntls_key_path = "/etc/trawl/own/key.pem"\n',
+            'tls_cert_path = "/etc/trawl/own/cert.pem"\n',
+        ]:
+            with self.subTest(server=server):
+                result = render({"web": web(), "config": {"raw": f"[server]\n{server}{data}"}})
+                self.assertNotEqual(result.returncode, 0)
+                for expected in ["config.raw", "tls_key_path", "tls.mode=auto", "tls.mode=secret"]:
+                    self.assertIn(expected, result.stderr)
+        # The same keys as a dotted table are the same TOML.
+        self.fails({"web": web(), "config": {"raw": f'server.tls_key_path = "/var/lib/trawl/tls/key.pem"\n{data}'}},
+                   "tls_key_path")
+        # Other [server] keys are the operator's own.
+        self.objects({"web": web(), "config": {"raw": f'[server]\ntls_reload_interval_secs = 60\n{data}'}})
 
     def assert_creates_tls_dir(self, objects, tls_dir):
         # Before any app container starts, trawld's uid creates the directory
@@ -442,6 +469,49 @@ class TLS(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(f"{path} {expected}", result.stderr)
             read_only.chmod(0o755)
+
+    def test_tls_dir_script_removes_the_legacy_key(self):
+        # An older trawld kept key.pem beside cert.pem. kubelet's fsGroup
+        # walk can make it group-readable by the sidecar, and trawld removes
+        # it only late in its boot, so the chart removes it before any app
+        # container starts.
+        init = init_container(self.objects({"web": web()}), "init-tls-dir")
+        with tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
+            tls_dir = Path(directory) / "tls"
+            tls_dir.mkdir()
+            (tls_dir / "cert.pem").write_text("certificate")
+            key = tls_dir / "key.pem"
+            key.write_text("private key")
+            key.chmod(0o640)
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(key.exists())
+            self.assertEqual((tls_dir / "cert.pem").read_text(), "certificate")
+
+            # Anything else named key.pem is not trawld's: refuse, and never
+            # follow or remove it.
+            target = Path(directory) / "target.pem"
+            target.write_text("elsewhere")
+            key.symlink_to(target)
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"{key} is not a regular file", result.stderr)
+            self.assertTrue(key.is_symlink())
+            self.assertEqual(target.read_text(), "elsewhere")
+            key.unlink()
+            # A dangling link is refused the same way.
+            key.symlink_to(Path(directory) / "missing.pem")
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"{key} is not a regular file", result.stderr)
+            self.assertTrue(key.is_symlink())
+            key.unlink()
+            key.mkdir()
+            (key / "inside").write_text("kept")
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"{key} is not a regular file", result.stderr)
+            self.assertEqual((key / "inside").read_text(), "kept")
 
     def test_upstream_trust_secret_modes(self):
         secret = {"mode": "secret", "secretName": "operator-api-tls", "upstreamServerName": "trawl.example.com"}

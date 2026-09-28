@@ -107,6 +107,20 @@ spec:
                 echo "$0: $dir is not writable by trawld's uid $uid, so trawld cannot publish its generated certificate there. Grant the owner write and search permission." >&2
                 exit 1
               fi
+              # An older trawld kept its private key beside the certificate.
+              # The fsGroup walk can make it readable by trawl-web, so it goes
+              # before any app container starts. Only a regular file is
+              # trawld's; anything else is refused and never followed.
+              key=$dir/key.pem
+              if [ -L "$key" ] || { [ -e "$key" ] && [ ! -f "$key" ]; }; then
+                echo "$0: $key is not a regular file. trawl-web mounts $dir, where no private key may be; remove it." >&2
+                exit 1
+              fi
+              rm -f -- "$key"
+              if [ -e "$key" ] || [ -L "$key" ]; then
+                echo "$0: could not remove the private key $key from $dir, which trawl-web mounts." >&2
+                exit 1
+              fi
             - init-tls-dir
             - {{ $trust.dataMountPath | quote }}
           securityContext:
