@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use trawl_cli::cli::ConnectionParams;
-use trawl_client::{ClientError, HealthStatus, TlsTrust};
+use trawl_client::{ClientError, HealthStatus, NetworkKind, TlsTrust};
 
 const HEALTH_BODY: &str = r#"{"status":"ok"}"#;
 
@@ -157,7 +157,11 @@ async fn expect_refused(server: &mut Server, conn: &ConnectionParams) {
         .health()
         .await
         .expect_err("the certificate must be refused");
-    assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+    assert_eq!(
+        err.network_kind(),
+        Some(NetworkKind::UntrustedCertificate),
+        "got {err:?}"
+    );
     let message = err.to_string();
     assert_eq!(
         message,
@@ -255,7 +259,11 @@ async fn a_refused_connection_still_says_connection_failed() {
         .health()
         .await
         .expect_err("nothing listens on the port");
-    assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+    assert_eq!(
+        err.network_kind(),
+        Some(NetworkKind::Connect),
+        "got {err:?}"
+    );
     let message = err.to_string();
     assert!(message.contains("connection failed"), "{message}");
     assert!(!message.contains("certificate"), "{message}");

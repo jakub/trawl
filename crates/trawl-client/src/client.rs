@@ -10,7 +10,7 @@ use futures::Stream;
 use reqwest::Client;
 use zeroize::Zeroizing;
 
-use crate::error::ClientError;
+use crate::error::{ClientError, NetworkError, NetworkKind};
 use crate::types::{
     CancelResponse, CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse,
     ClearHistoryResponse, DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldAck,
@@ -155,6 +155,18 @@ impl HttpClient {
         Self::build(base_url, token, trust)
     }
 
+    /// Like [`Self::with_trust`], with `timeout` bounding each request in
+    /// place of the long default meant for analytical queries.
+    pub fn with_trust_timeout(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        trust: &TlsTrust,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ClientError> {
+        let client = reqwest_client(trust, timeout, reqwest::redirect::Policy::none())?;
+        Ok(Self::with_client(base_url, token, client))
+    }
+
     /// Create a client with a pre-configured `reqwest::Client`.
     pub fn with_client(
         base_url: impl Into<String>,
@@ -173,47 +185,12 @@ impl HttpClient {
         token: impl Into<String>,
         trust: &TlsTrust,
     ) -> Result<Self, ClientError> {
-        // Ensure ring is available as the rustls crypto provider.
-        // Idempotent — returns Err if already installed, which we ignore.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let mut builder = Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Self::DEFAULT_TIMEOUT);
-
-        match trust {
-            TlsTrust::System => {}
-            TlsTrust::PinnedCa(pem) => {
-                let roots = reqwest::Certificate::from_pem_bundle(pem)
-                    .map_err(|_| ClientError::InvalidCa("the bundle is not valid PEM".into()))?;
-                if roots.is_empty() {
-                    return Err(ClientError::InvalidCa(
-                        "the bundle holds no PEM certificate".into(),
-                    ));
-                }
-                // Only these roots: no platform or built-in store is
-                // consulted, and hostname verification stays on. A plain
-                // `http://` URL would skip the pin entirely, so refuse it.
-                builder = builder.tls_certs_only(roots).https_only(true);
-            }
-            TlsTrust::AcceptInvalid => {
-                builder = builder.danger_accept_invalid_certs(true);
-            }
-        }
-
-        let client = builder.build().map_err(|e| match trust {
-            // The only input a pinned build adds is the roots, and the root
-            // store rejects a certificate whose DER does not parse.
-            TlsTrust::PinnedCa(_) if e.is_builder() => {
-                ClientError::InvalidCa("a certificate in the bundle does not parse".into())
-            }
-            _ => sanitize_reqwest_error(e),
-        })?;
-        Ok(Self {
-            base_url: normalize_base_url(base_url.into()),
-            token: Zeroizing::new(token.into()),
-            client,
-        })
+        let client = reqwest_client(
+            trust,
+            Self::DEFAULT_TIMEOUT,
+            reqwest::redirect::Policy::none(),
+        )?;
+        Ok(Self::with_client(base_url, token, client))
     }
 
     /// Build a full URL for an API endpoint.
@@ -251,6 +228,12 @@ impl HttpClient {
     }
 
     /// Check daemon health (unauthenticated).
+    ///
+    /// A 503 whose body is a health body is an answer, not an error: an
+    /// unavailable daemon still reports its per-subsystem checks, so it is
+    /// returned as `Ok` with `status: unavailable`. Any other failure status,
+    /// or a 503 with a foreign body (a proxy's error page), stays a
+    /// [`ClientError::Server`].
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
         let url = self.endpoint("/api/v1/health");
 
@@ -261,6 +244,13 @@ impl HttpClient {
             .await
             .map_err(sanitize_reqwest_error)?;
 
+        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            let (body, truncated) = read_capped(resp, HEALTH_BODY_CAP).await?;
+            if !truncated && let Ok(health) = serde_json::from_slice::<HealthResponse>(&body) {
+                return Ok(health);
+            }
+            return Err(server_error(503, &body));
+        }
         let resp = check_status(resp).await?;
         resp.json()
             .await
@@ -1001,6 +991,147 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Clie
     Ok(resp)
 }
 
+/// The most a 503 health body may hold and still be read as one. The
+/// daemon's is a few hundred bytes; anything this large is not its body.
+const HEALTH_BODY_CAP: usize = 64 * 1024;
+
+/// A `Server` error for `status`, carrying the body's error envelope when
+/// it holds one.
+fn server_error(status: u16, body: &[u8]) -> ClientError {
+    let error = serde_json::from_slice::<ErrorResponse>(body).map_or_else(
+        |_| trawl_api::ErrorEnvelope::simple(trawl_api::ErrorCode::InternalError, "unknown error"),
+        |e| e.error,
+    );
+    ClientError::Server { status, error }
+}
+
+/// Read at most `cap` bytes of a response body. The flag is true when the
+/// body held more; the rest is never read.
+async fn read_capped(
+    mut resp: reqwest::Response,
+    cap: usize,
+) -> Result<(Vec<u8>, bool), ClientError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(sanitize_reqwest_error)? {
+        let room = cap - body.len();
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, false))
+}
+
+/// Build the `reqwest` client for `trust`, with `timeout` bounding each
+/// request and `redirect` deciding what a 3xx does.
+fn reqwest_client(
+    trust: &TlsTrust,
+    timeout: std::time::Duration,
+    redirect: reqwest::redirect::Policy,
+) -> Result<Client, ClientError> {
+    // Ensure ring is available as the rustls crypto provider.
+    // Idempotent — returns Err if already installed, which we ignore.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut builder = Client::builder().redirect(redirect).timeout(timeout);
+
+    match trust {
+        TlsTrust::System => {}
+        TlsTrust::PinnedCa(pem) => {
+            let roots = reqwest::Certificate::from_pem_bundle(pem)
+                .map_err(|_| ClientError::InvalidCa("the bundle is not valid PEM".into()))?;
+            if roots.is_empty() {
+                return Err(ClientError::InvalidCa(
+                    "the bundle holds no PEM certificate".into(),
+                ));
+            }
+            // Only these roots: no platform or built-in store is
+            // consulted, and hostname verification stays on. A plain
+            // `http://` URL would skip the pin entirely, so refuse it.
+            builder = builder.tls_certs_only(roots).https_only(true);
+        }
+        TlsTrust::AcceptInvalid => {
+            builder = builder.danger_accept_invalid_certs(true);
+        }
+    }
+
+    builder.build().map_err(|e| match trust {
+        // The only input a pinned build adds is the roots, and the root
+        // store rejects a certificate whose DER does not parse.
+        TlsTrust::PinnedCa(_) if e.is_builder() => {
+            ClientError::InvalidCa("a certificate in the bundle does not parse".into())
+        }
+        _ => sanitize_reqwest_error(e),
+    })
+}
+
+/// A status and a capped body from an [`OriginProbe`] request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// At most [`OriginProbe::BODY_CAP`] bytes of the body.
+    pub body: Vec<u8>,
+}
+
+/// Unauthenticated probes of a browser origin, the address `trawl-web`
+/// serves (ADR-0047).
+///
+/// It holds no key and has no way to send one: a doctor probes the browser
+/// origin precisely when that address may be wrong. Redirects are refused
+/// as [`NetworkKind::Redirect`], so a probe reaches only the origin named.
+#[derive(Debug, Clone)]
+pub struct OriginProbe {
+    origin: String,
+    client: Client,
+}
+
+impl OriginProbe {
+    /// The most body bytes a probe reads. `trawl-web`'s answers to both
+    /// probes are a few dozen bytes.
+    pub const BODY_CAP: usize = 4096;
+
+    /// A probe of `origin` (`scheme://host:port`), verifying TLS under
+    /// `trust`, with `timeout` bounding each request.
+    pub fn new(
+        origin: impl Into<String>,
+        trust: &TlsTrust,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ClientError> {
+        let refuse = reqwest::redirect::Policy::custom(|attempt| attempt.error("redirect refused"));
+        Ok(Self {
+            origin: normalize_base_url(origin.into()),
+            client: reqwest_client(trust, timeout, refuse)?,
+        })
+    }
+
+    /// `GET /healthz`: `trawl-web` answers a static `ok`.
+    pub async fn healthz(&self) -> Result<ProbeResponse, ClientError> {
+        let req = self.client.get(format!("{}/healthz", self.origin));
+        Self::send(req).await
+    }
+
+    /// `POST /api/auth/login` with `Origin: origin_header` and an empty
+    /// `api_key`. `trawl-web` checks the origin before the key, so its
+    /// answer says whether it accepts that origin, and no key is sent.
+    pub async fn login_probe(&self, origin_header: &str) -> Result<ProbeResponse, ClientError> {
+        let req = self
+            .client
+            .post(format!("{}/api/auth/login", self.origin))
+            .header(reqwest::header::ORIGIN, origin_header)
+            .json(&serde_json::json!({ "api_key": "" }));
+        Self::send(req).await
+    }
+
+    async fn send(req: reqwest::RequestBuilder) -> Result<ProbeResponse, ClientError> {
+        let resp = req.send().await.map_err(sanitize_reqwest_error)?;
+        let status = resp.status().as_u16();
+        let (body, _) = read_capped(resp, Self::BODY_CAP).await?;
+        Ok(ProbeResponse { status, body })
+    }
+}
+
 /// Strip trailing slashes so `endpoint()` can simply concatenate.
 fn normalize_base_url(url: String) -> String {
     let trimmed = url.trim_end_matches('/');
@@ -1017,35 +1148,39 @@ fn normalize_base_url(url: String) -> String {
 /// named as such, without the certificate or the verifier's reason.
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_reqwest_error)`
 fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
-    if e.is_connect() && rejected_certificate(&e) {
+    let (kind, message) = if e.is_connect() && rejected_certificate(&e) {
         let origin = e.url().map_or_else(String::new, |url| {
             format!(" of API {}", url.origin().ascii_serialization())
         });
-        ClientError::Network(format!(
-            "TLS: the server certificate{origin} is not trusted (check ca_cert or the trial's CA)"
-        ))
+        (
+            NetworkKind::UntrustedCertificate,
+            format!(
+                "TLS: the server certificate{origin} is not trusted (check ca_cert or the trial's CA)"
+            ),
+        )
     } else if e.is_timeout() || e.is_connect() {
-        let reason = if e.is_timeout() {
-            "request timed out"
+        let (kind, reason) = if e.is_timeout() {
+            (NetworkKind::Timeout, "request timed out")
         } else {
-            "connection failed"
+            (NetworkKind::Connect, "connection failed")
         };
         let message = e.url().map_or_else(
             || reason.to_owned(),
             |url| format!("{reason} for API {}", url.origin().ascii_serialization()),
         );
-        ClientError::Network(message)
+        (kind, message)
     } else if e.is_builder() {
-        ClientError::Network("invalid request configuration".into())
+        (NetworkKind::Other, "invalid request configuration".into())
     } else if e.is_redirect() {
-        ClientError::Network("unexpected redirect".into())
+        (NetworkKind::Redirect, "unexpected redirect".into())
     } else if e.is_decode() {
-        ClientError::Network("response decode error".into())
+        (NetworkKind::Other, "response decode error".into())
     } else if e.is_body() {
-        ClientError::Network("request body error".into())
+        (NetworkKind::Other, "request body error".into())
     } else {
-        ClientError::Network("request failed".into())
-    }
+        (NetworkKind::Other, "request failed".into())
+    };
+    ClientError::Network(NetworkError::new(kind, message))
 }
 
 /// Whether `e` failed because rustls did not accept the server's
@@ -1198,6 +1333,7 @@ mod tests {
             error.to_string(),
             format!("network error: connection failed for API https://{address}")
         );
+        assert_eq!(error.network_kind(), Some(NetworkKind::Connect));
         assert!(!format!("{error:?}").contains("private-"));
     }
 
@@ -1217,10 +1353,322 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is_timeout());
+        let error = sanitize_reqwest_error(error);
         assert_eq!(
-            sanitize_reqwest_error(error).to_string(),
+            error.to_string(),
             format!("network error: request timed out for API http://{address}")
         );
+        assert_eq!(error.network_kind(), Some(NetworkKind::Timeout));
+    }
+
+    /// Nothing listening is `Connect`, not a timeout or a certificate.
+    #[tokio::test]
+    async fn refused_connection_is_connect_kind() {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let error = client.health().await.unwrap_err();
+        assert_eq!(
+            error.network_kind(),
+            Some(NetworkKind::Connect),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("network error: connection failed for API http://{address}")
+        );
+    }
+
+    /// `with_trust_timeout` bounds each request by its own timeout.
+    #[tokio::test]
+    async fn with_trust_timeout_bounds_the_request() {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap();
+        // Accept the connection and never answer.
+        let (result, _socket) =
+            tokio::join!(client.health(), async { listener.accept().await.unwrap() });
+        let error = result.unwrap_err();
+        assert_eq!(
+            error.network_kind(),
+            Some(NetworkKind::Timeout),
+            "{error:?}"
+        );
+    }
+
+    // ── real listeners ──────────────────────────────────────────────────
+
+    /// Accept one connection on `listener`, read one request (head and a
+    /// `content-length` body), answer with `response`, and hand back the
+    /// raw request.
+    async fn serve_once(listener: tokio::net::TcpListener, response: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        let head_end = loop {
+            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed mid-head");
+            request.extend_from_slice(&buf[..n]);
+        };
+        let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+        let length = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+        while request.len() < head_end + length {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed mid-body");
+            request.extend_from_slice(&buf[..n]);
+        }
+        socket.write_all(&response).await.unwrap();
+        socket.shutdown().await.unwrap();
+        String::from_utf8(request).unwrap()
+    }
+
+    fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    async fn health_answered_with(response: Vec<u8>) -> Result<HealthResponse, ClientError> {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let (result, request) = tokio::join!(client.health(), serve_once(listener, response));
+        assert!(request.starts_with("GET /api/v1/health "), "{request}");
+        result
+    }
+
+    /// An unavailable daemon answers 503 with its per-check body. That body
+    /// is the answer, so it survives instead of becoming an opaque error.
+    #[tokio::test]
+    async fn health_503_keeps_check_body() {
+        let body = br#"{"status":"unavailable","checks":{"duckdb":"error","corpus":"recovering"},"version":"0.9.0"}"#;
+        let health = health_answered_with(http_response(
+            "503 Service Unavailable",
+            "application/json",
+            body,
+        ))
+        .await
+        .expect("a 503 health body is an answer");
+        assert_eq!(health.status, trawl_api::HealthStatus::Unavailable);
+        assert_eq!(
+            health.checks,
+            Some(std::collections::HashMap::from([
+                ("duckdb".to_owned(), "error".to_owned()),
+                ("corpus".to_owned(), "recovering".to_owned()),
+            ]))
+        );
+        assert_eq!(health.version.as_deref(), Some("0.9.0"));
+    }
+
+    /// Only a 503 carrying a health body is kept. A 502 is an error whatever
+    /// its body says, and a 503 from something else (a proxy's page, the
+    /// error envelope, a body past the cap) stays an error too.
+    #[tokio::test]
+    async fn health_foreign_bodies_still_error() {
+        let health = br#"{"status":"ok","checks":{"duckdb":"ok"}}"#;
+        let err =
+            health_answered_with(http_response("502 Bad Gateway", "application/json", health))
+                .await
+                .expect_err("a 502 is never a health answer");
+        assert!(
+            matches!(err, ClientError::Server { status: 502, .. }),
+            "{err:?}"
+        );
+
+        let err = health_answered_with(http_response(
+            "502 Bad Gateway",
+            "text/html",
+            b"<html>bad gateway</html>",
+        ))
+        .await
+        .expect_err("a proxy page is not a health answer");
+        assert!(
+            matches!(err, ClientError::Server { status: 502, .. }),
+            "{err:?}"
+        );
+
+        let err = health_answered_with(http_response(
+            "503 Service Unavailable",
+            "text/html",
+            b"<html>maintenance</html>",
+        ))
+        .await
+        .expect_err("a foreign 503 page is not a health answer");
+        assert!(
+            matches!(err, ClientError::Server { status: 503, .. }),
+            "{err:?}"
+        );
+
+        let envelope =
+            br#"{"error":{"code":"internal_error","message":"shutting down","details":[]}}"#;
+        let err = health_answered_with(http_response(
+            "503 Service Unavailable",
+            "application/json",
+            envelope,
+        ))
+        .await
+        .expect_err("an error envelope is not a health answer");
+        assert_eq!(
+            err.error_envelope().map(|e| e.message.as_str()),
+            Some("shutting down")
+        );
+
+        // A health body padded past the cap is not read as one.
+        let mut oversized =
+            br#"{"status":"unavailable","checks":{"duckdb":"error"},"pad":""#.to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', HEALTH_BODY_CAP));
+        oversized.extend_from_slice(br#""}"#);
+        let err = health_answered_with(http_response(
+            "503 Service Unavailable",
+            "application/json",
+            &oversized,
+        ))
+        .await
+        .expect_err("a body past the cap is not a health answer");
+        assert!(
+            matches!(err, ClientError::Server { status: 503, .. }),
+            "{err:?}"
+        );
+    }
+
+    fn probe(address: std::net::SocketAddr) -> OriginProbe {
+        init();
+        OriginProbe::new(
+            format!("http://{address}/"),
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap()
+    }
+
+    /// Neither probe carries a key: no `Authorization` header, no cookie,
+    /// and the login body's `api_key` is empty.
+    #[tokio::test]
+    async fn origin_probe_sends_no_authorization_header() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let web = probe(address);
+        let (result, request) = tokio::join!(
+            web.healthz(),
+            serve_once(listener, http_response("200 OK", "text/plain", b"ok"))
+        );
+        assert_eq!(
+            result.unwrap(),
+            ProbeResponse {
+                status: 200,
+                body: b"ok".to_vec()
+            }
+        );
+        assert!(request.starts_with("GET /healthz "), "{request}");
+        let lower = request.to_ascii_lowercase();
+        assert!(!lower.contains("\r\nauthorization:"), "{request}");
+        assert!(!lower.contains("\r\ncookie:"), "{request}");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let answer = br#"{"error":"bad request"}"#;
+        let web = probe(address);
+        let (result, request) = tokio::join!(
+            web.login_probe("https://logs.example"),
+            serve_once(
+                listener,
+                http_response("400 Bad Request", "application/json", answer)
+            )
+        );
+        assert_eq!(
+            result.unwrap(),
+            ProbeResponse {
+                status: 400,
+                body: answer.to_vec()
+            }
+        );
+        assert!(request.starts_with("POST /api/auth/login "), "{request}");
+        let lower = request.to_ascii_lowercase();
+        assert!(
+            lower.contains("\r\norigin: https://logs.example\r\n"),
+            "{request}"
+        );
+        assert!(
+            lower.contains("\r\ncontent-type: application/json\r\n"),
+            "{request}"
+        );
+        assert!(!lower.contains("\r\nauthorization:"), "{request}");
+        assert!(!lower.contains("\r\ncookie:"), "{request}");
+        assert!(request.ends_with("\r\n\r\n{\"api_key\":\"\"}"), "{request}");
+    }
+
+    /// A probe reads at most `BODY_CAP` bytes of a body.
+    #[tokio::test]
+    async fn origin_probe_caps_the_body() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let big = vec![b'a'; OriginProbe::BODY_CAP * 4];
+        let web = probe(address);
+        let (result, _) = tokio::join!(
+            web.healthz(),
+            serve_once(listener, http_response("200 OK", "text/plain", &big))
+        );
+        let response = result.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.len(), OriginProbe::BODY_CAP);
+    }
+
+    /// A redirect is refused as `Redirect`, and its target never sees a
+    /// connection.
+    #[tokio::test]
+    async fn origin_probe_refuses_redirects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = elsewhere.local_addr().unwrap();
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://{target}/healthz\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        let probe = probe(address);
+        let served = tokio::spawn(serve_once(listener, redirect));
+        tokio::select! {
+            result = probe.healthz() => {
+                let error = result.expect_err("a redirect must be refused");
+                assert_eq!(error.network_kind(), Some(NetworkKind::Redirect), "{error:?}");
+                assert_eq!(error.to_string(), "network error: unexpected redirect");
+            }
+            _ = elsewhere.accept() => panic!("the probe followed a redirect"),
+        }
+        assert!(served.await.unwrap().starts_with("GET /healthz "));
     }
 
     #[tokio::test]
