@@ -41,8 +41,10 @@ pub async fn forward(
         state.upstream_url().trim_end_matches('/')
     );
 
+    // One client for the request and the whole stream it opens.
     let upstream_resp = state
-        .http()
+        .upstream_client()
+        .await?
         .get(&upstream_url)
         .bearer_auth(auth.token())
         .query(&[("query", &params.query)])
@@ -64,8 +66,10 @@ pub async fn forward_dashboard(
         state.upstream_url().trim_end_matches('/')
     );
 
+    // One client for the request and the whole stream it opens.
     let upstream_resp = state
-        .http()
+        .upstream_client()
+        .await?
         .get(&upstream_url)
         .bearer_auth(auth.token())
         .send()

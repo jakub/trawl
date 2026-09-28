@@ -269,3 +269,71 @@ impl TlsUpstream {
         self.front.web_config()
     }
 }
+
+/// Collects one formatted `field=value` line per event.
+///
+/// Same shape as fleet-auth's guard-log capture: where a log line is the
+/// deliverable, the test reads what was recorded rather than trusting that
+/// the code meant to record it.
+#[derive(Clone, Default)]
+struct CaptureLayer {
+    lines: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+struct FieldWriter<'a>(&'a mut String);
+
+impl tracing::field::Visit for FieldWriter<'_> {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value} ", field.name());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        let _ = write!(self.0, "{}={value:?} ", field.name());
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut line = format!("{} ", event.metadata().level());
+        event.record(&mut FieldWriter(&mut line));
+        self.lines.lock().expect("capture mutex").push(line);
+    }
+}
+
+/// Serializes the capture tests against each other.
+///
+/// `tracing` caches each callsite's `Interest` process-wide and rebuilds
+/// that cache when a subscriber registers or dies. Two capture tests
+/// running at once can leave a callsite cached as "never interested" for
+/// the thread about to emit, so the event vanishes and the test reads "it
+/// did not log", the exact failure it exists to catch, arriving at random.
+/// Poisoning is ignored on purpose: one panicking test must not cascade
+/// into the others.
+static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `f` under a capturing subscriber on this thread, returning its
+/// result and every line it logged. `f` must not move work to another
+/// thread: the subscriber is this thread's default only.
+pub fn captured_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let _serialized = CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let capture = CaptureLayer::default();
+    let lines = Arc::clone(&capture.lines);
+    let subscriber = tracing_subscriber::registry().with(capture);
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let outcome = f();
+    let recorded = lines.lock().expect("capture mutex").clone();
+    (outcome, recorded)
+}

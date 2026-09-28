@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 use trawl_web::config::ResolvedConfig;
 use trawl_web::routes;
 use trawl_web::state::AppState;
+use trawl_web::upstream::CA_REREAD_INTERVAL;
 
 /// Default config path — kept in sync with `trawl-server`'s default so a
 /// single `trawld.toml` configures both daemons.
@@ -65,6 +66,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind_addr = resolved.bind_addr.clone();
     let state = AppState::from_config(resolved)?;
+    // Held for the life of the process; `None` under the platform roots.
+    let _ca_reread = state.spawn_upstream_ca_reread(CA_REREAD_INTERVAL);
     let router = routes::build(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;

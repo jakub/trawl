@@ -68,7 +68,6 @@ async fn do_forward(
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
-    let http = state.http();
     let (parts, body) = req.into_parts();
 
     // CSRF defense already ran: `auth` is here, which means the request
@@ -80,6 +79,15 @@ async fn do_forward(
     // victim's logs. Owning the check in the extractor is what makes the
     // rule hold for every cookie route, including the next one.
     let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
+
+    let body_bytes = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
+        .await
+        .map_err(|e| ProxyError::BadRequest(format!("request body: {e}")))?;
+
+    // After every local check, so a request refused here never waits on
+    // the pin file. This one client carries the request and its streamed
+    // response body.
+    let http = state.upstream_client().await?;
 
     let mut upstream_req = http
         .request(reqwest_method(&parts.method), upstream_uri)
@@ -97,9 +105,6 @@ async fn do_forward(
         upstream_req = upstream_req.header(name.as_str(), value);
     }
 
-    let body_bytes = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
-        .await
-        .map_err(|e| ProxyError::BadRequest(format!("request body: {e}")))?;
     if !body_bytes.is_empty() {
         upstream_req = upstream_req.body(body_bytes.to_vec());
     }

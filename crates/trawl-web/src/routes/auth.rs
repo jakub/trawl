@@ -130,7 +130,8 @@ async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyErro
         state.upstream_url().trim_end_matches('/')
     );
     let resp = state
-        .http()
+        .upstream_client()
+        .await?
         .get(&url)
         .bearer_auth(token)
         .send()

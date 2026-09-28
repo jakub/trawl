@@ -51,6 +51,19 @@ pub enum ProxyError {
     #[error("upstream returned {0}")]
     Upstream(StatusCode),
 
+    /// `[web] upstream_ca_path` has never held a usable certificate, so
+    /// no client can verify trawld yet (ADR-0048). trawld writes its
+    /// generated certificate on its first start, which may come after
+    /// trawl-web's.
+    ///
+    /// 503, distinct from [`Self::ServiceUnavailable`] so an operator can
+    /// tell the cause from the body alone, and no cookie mutation: the
+    /// session is fine, only the hop to trawld is not ready. Logged per
+    /// request at debug only; the pin's own log lines say when the file
+    /// is missing, refused or loaded.
+    #[error("upstream certificate not available")]
+    UpstreamCertificateUnavailable,
+
     /// Network failure reaching upstream trawld.
     #[error("upstream network error: {0}")]
     Network(#[from] reqwest::Error),
@@ -87,13 +100,20 @@ impl IntoResponse for ProxyError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error")
             }
             Self::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "service unavailable"),
+            Self::UpstreamCertificateUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream certificate not available",
+            ),
         };
 
         // Severity per variant: network and upstream failures are outage
         // signal and must be visible at the default `info` level, while
         // routine client errors stay at debug.
         match &self {
-            Self::Unauthorized | Self::ExpiredSession { .. } | Self::BadRequest(_) => {
+            Self::Unauthorized
+            | Self::ExpiredSession { .. }
+            | Self::BadRequest(_)
+            | Self::UpstreamCertificateUnavailable => {
                 tracing::debug!(error = %self, "proxy error (expected)");
             }
             Self::OriginMismatch => {

@@ -16,6 +16,11 @@
 //!
 //! The configuration rules for `upstream_connect_addr` are checked at
 //! resolution, with no upstream: a refused pair never builds a client.
+//!
+//! The reload tests change the pin file under a running proxy, and the
+//! upstream can change the certificate it serves. Every response closes
+//! its connection, so each request makes a fresh handshake and a pooled
+//! connection cannot hide a change of trust.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,7 +34,7 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 use trawl_config::WebConfig;
@@ -73,25 +78,31 @@ struct Identity {
 struct Upstream {
     port: u16,
     handshakes: mpsc::UnboundedReceiver<Result<(), String>>,
+    /// The certificate the next handshake presents.
+    identity: watch::Sender<TlsAcceptor>,
+}
+
+fn acceptor(identity: Identity) -> TlsAcceptor {
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_no_client_auth()
+    .with_single_cert(identity.chain, identity.key)
+    .expect("server certificate");
+    TlsAcceptor::from(Arc::new(config))
 }
 
 impl Upstream {
     async fn start(identity: Identity) -> Self {
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .expect("protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(identity.chain, identity.key)
-        .expect("server certificate");
-        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let (identity, current) = watch::channel(acceptor(identity));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("local addr").port();
         let (tx, handshakes) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let acceptor = acceptor.clone();
+                let acceptor = current.borrow().clone();
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     match acceptor.accept(tcp).await {
@@ -106,7 +117,26 @@ impl Upstream {
                 });
             }
         });
-        Self { port, handshakes }
+        Self {
+            port,
+            handshakes,
+            identity,
+        }
+    }
+
+    /// Serve `identity` from the next handshake on, as trawld does after
+    /// its certificate is re-issued.
+    fn rotate(&self, identity: Identity) {
+        self.identity.send_replace(acceptor(identity));
+    }
+
+    /// Whether the upstream has seen no connection since the last outcome
+    /// a test read.
+    fn saw_nothing(&mut self) -> bool {
+        matches!(
+            self.handshakes.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        )
     }
 
     /// The next handshake outcome the upstream saw.
@@ -141,13 +171,27 @@ async fn answer_whoami<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: &mut S) 
     let _ = stream.shutdown().await;
 }
 
+/// The pin file [`pinned_state`] writes, in the test's directory.
+const CA_FILE: &str = "upstream-ca.pem";
+
 /// The proxy's state for an upstream at `upstream_url` pinned to `ca_pem`,
 /// resolved the way `trawl-web` resolves it at startup.
 fn pinned_state(dir: &tempfile::TempDir, upstream_url: String, ca_pem: &str) -> AppState {
-    let ca_path = dir.path().join("upstream-ca.pem");
+    pinned_state_via(dir, upstream_url, None, ca_pem)
+}
+
+/// [`pinned_state`], dialing `connect_addr` when set.
+fn pinned_state_via(
+    dir: &tempfile::TempDir,
+    upstream_url: String,
+    connect_addr: Option<String>,
+    ca_pem: &str,
+) -> AppState {
+    let ca_path = dir.path().join(CA_FILE);
     std::fs::write(&ca_path, ca_pem).expect("write CA");
     let web = WebConfig {
         upstream_url: Some(upstream_url),
+        upstream_connect_addr: connect_addr,
         upstream_ca_path: Some(ca_path),
         public_origins: vec!["https://trawl.example.com".to_owned()],
         ..WebConfig::default()
@@ -166,6 +210,10 @@ fn pinned_state(dir: &tempfile::TempDir, upstream_url: String, ca_pem: &str) -> 
 
 /// A browser login through the proxy's router.
 async fn login(state: AppState) -> StatusCode {
+    login_response(state).await.status()
+}
+
+async fn login_response(state: AppState) -> axum::response::Response {
     let request = Request::builder()
         .method("POST")
         .uri("/api/auth/login")
@@ -176,7 +224,26 @@ async fn login(state: AppState) -> StatusCode {
         .oneshot(request)
         .await
         .expect("router answers")
-        .status()
+}
+
+/// A bearer client's `GET` through the generic `/api/v1/*` forwarder.
+async fn forwarded(state: AppState, path: &str) -> axum::response::Response {
+    let request = Request::builder()
+        .uri(path)
+        .header(header::AUTHORIZATION, "Bearer flt_test_not_real")
+        .body(Body::empty())
+        .expect("request");
+    routes::build(state)
+        .oneshot(request)
+        .await
+        .expect("router answers")
+}
+
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    String::from_utf8(bytes.to_vec()).expect("UTF-8 body")
 }
 
 async fn expect_accepted(upstream: &mut Upstream, state: AppState) {
@@ -442,4 +509,191 @@ fn connect_addr_requires_dns_host() {
             "{connect_addr:?} gave {error:?}"
         );
     }
+}
+
+/// The upstream the proxy dials for `trawl.test` over loopback, with the
+/// certificate `identity`: `upstream_url` names the host TLS verifies, and
+/// `upstream_connect_addr` says where the connection goes. `trawl.test`
+/// is a reserved name no resolver answers, so reaching it at all proves
+/// the connect address was used.
+async fn via_connect_addr(
+    dir: &tempfile::TempDir,
+    identity: Identity,
+    ca_pem: &str,
+) -> (Upstream, AppState) {
+    let upstream = Upstream::start(identity).await;
+    let state = pinned_state_via(
+        dir,
+        format!("https://trawl.test:{}", upstream.port),
+        Some(format!("127.0.0.1:{}", upstream.port)),
+        ca_pem,
+    );
+    (upstream, state)
+}
+
+#[tokio::test]
+async fn connect_addr_verifies_dns_name() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_a = ca("trawl test CA A");
+    let (mut upstream, state) =
+        via_connect_addr(&dir, leaf(&ca_a, &["trawl.test"]), &ca_a.pem()).await;
+    expect_accepted(&mut upstream, state).await;
+}
+
+/// The leaf covers the address the proxy dials, but not the name in
+/// `upstream_url`: the name is what TLS verifies.
+#[tokio::test]
+async fn connect_addr_wrong_name_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_a = ca("trawl test CA A");
+    let (mut upstream, state) = via_connect_addr(
+        &dir,
+        leaf(&ca_a, &["other.test", "localhost", "127.0.0.1"]),
+        &ca_a.pem(),
+    )
+    .await;
+    expect_refused(&mut upstream, state).await;
+}
+
+/// The 503 a request gets while the pin file has never held a usable
+/// certificate.
+const CA_UNAVAILABLE_BODY: &str = r#"{"error":"upstream certificate not available"}"#;
+
+async fn expect_unavailable(response: axum::response::Response) {
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        response.headers().get(header::SET_COOKIE).is_none(),
+        "a missing pin must not touch the session cookie"
+    );
+    assert_eq!(body_text(response).await, CA_UNAVAILABLE_BODY);
+}
+
+/// trawld writes its generated certificate on its first start, which may
+/// come after trawl-web's. The interval is an hour, so the load below is
+/// the one a request makes.
+#[tokio::test]
+async fn late_ca_is_loaded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_path = dir.path().join("tls").join("cert.pem");
+    let ca_a = ca("trawl test CA A");
+    let mut upstream = Upstream::start(leaf(&ca_a, &["localhost", "127.0.0.1"])).await;
+    let web = WebConfig {
+        upstream_url: Some(format!("https://127.0.0.1:{}", upstream.port)),
+        upstream_ca_path: Some(ca_path.clone()),
+        public_origins: vec!["https://trawl.example.com".to_owned()],
+        ..WebConfig::default()
+    };
+    let resolved = ResolvedConfig::from_parsed(&web, None).expect("an absent pin still resolves");
+    assert!(
+        matches!(
+            resolved.upstream_tls,
+            UpstreamTls::PinnedCa { roots: None, .. }
+        ),
+        "{:?}",
+        resolved.upstream_tls
+    );
+    let state = AppState::from_config(resolved).expect("trawl-web starts without the file");
+    let _reread = state.spawn_upstream_ca_reread(Duration::from_secs(3600));
+
+    let health = routes::build(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("router answers");
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(body_text(health).await, "ok");
+
+    expect_unavailable(login_response(state.clone()).await).await;
+    expect_unavailable(forwarded(state.clone(), "/api/v1/whoami").await).await;
+    assert!(
+        upstream.saw_nothing(),
+        "trawl-web dialed trawld with no certificate to verify it"
+    );
+
+    std::fs::create_dir_all(ca_path.parent().expect("parent")).expect("create tls dir");
+    std::fs::write(&ca_path, ca_a.pem()).expect("write CA");
+    expect_accepted(&mut upstream, state.clone()).await;
+
+    let response = forwarded(state, "/api/v1/whoami").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_text(response).await, WHOAMI_BODY);
+}
+
+/// The next handshake outcome that is a success, skipping the refusals of
+/// earlier attempts.
+async fn next_good_handshake(upstream: &mut Upstream) {
+    while upstream.handshake().await.is_err() {}
+}
+
+/// An operator re-issues trawld's certificate from a new CA and replaces
+/// the pin file. Requests never trigger a read while a client exists, so
+/// the reload below is the interval task's.
+#[tokio::test]
+async fn rotated_ca_is_reloaded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_a = ca("trawl test CA A");
+    let ca_b = ca("trawl test CA B");
+    let mut upstream = Upstream::start(leaf(&ca_a, &["localhost", "127.0.0.1"])).await;
+    let state = pinned_state(
+        &dir,
+        format!("https://127.0.0.1:{}", upstream.port),
+        &ca_a.pem(),
+    );
+    let interval = Duration::from_millis(100);
+    let _reread = state
+        .spawn_upstream_ca_reread(interval)
+        .expect("a pin starts the re-read task");
+    expect_accepted(&mut upstream, state.clone()).await;
+
+    upstream.rotate(leaf(&ca_b, &["localhost", "127.0.0.1"]));
+    expect_refused(&mut upstream, state.clone()).await;
+
+    std::fs::write(dir.path().join(CA_FILE), ca_b.pem()).expect("write CA B");
+    // One interval is the promise; the bound is generous so a loaded test
+    // host cannot turn scheduling delay into a failure.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if login(state.clone()).await == StatusCode::OK {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the rotated CA was never loaded"
+        );
+        tokio::time::sleep(interval / 4).await;
+    }
+    next_good_handshake(&mut upstream).await;
+}
+
+/// A replacement that does not parse, and a file that disappears, keep
+/// the last good roots rather than returning to 503.
+#[tokio::test]
+async fn unparseable_ca_change_keeps_last_good() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ca_a = ca("trawl test CA A");
+    let mut upstream = Upstream::start(leaf(&ca_a, &["localhost", "127.0.0.1"])).await;
+    let state = pinned_state(
+        &dir,
+        format!("https://127.0.0.1:{}", upstream.port),
+        &ca_a.pem(),
+    );
+    expect_accepted(&mut upstream, state.clone()).await;
+
+    let ca_path = dir.path().join(CA_FILE);
+    std::fs::write(
+        &ca_path,
+        "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+    )
+    .expect("write garbage");
+    state.reread_upstream_ca().await;
+    state.reread_upstream_ca().await;
+    expect_accepted(&mut upstream, state.clone()).await;
+
+    std::fs::remove_file(&ca_path).expect("remove the pin");
+    state.reread_upstream_ca().await;
+    expect_accepted(&mut upstream, state).await;
 }

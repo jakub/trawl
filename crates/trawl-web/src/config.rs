@@ -102,8 +102,38 @@ pub enum UpstreamTls {
         /// The certificates the file held when it was read, or `None` when
         /// it did not exist yet: trawld writes its generated certificate
         /// only on its first start, which may come after trawl-web's.
-        roots: Option<Vec<reqwest::Certificate>>,
+        roots: Option<PinnedRoots>,
     },
+}
+
+/// A pin file's contents and the trust anchors they parsed to.
+///
+/// The bytes stay with the certificates so a later read of the file can
+/// tell whether it changed since the client was built from it. Only
+/// [`pinned_roots`] builds one.
+pub struct PinnedRoots {
+    pem: Vec<u8>,
+    certificates: Vec<reqwest::Certificate>,
+}
+
+impl PinnedRoots {
+    /// The trust anchors, in file order.
+    #[must_use]
+    pub fn certificates(&self) -> &[reqwest::Certificate] {
+        &self.certificates
+    }
+
+    /// The file contents the certificates came from.
+    pub(crate) fn pem(&self) -> &[u8] {
+        &self.pem
+    }
+}
+
+/// Shows the count only, like [`UpstreamTls`]'s `Debug`.
+impl std::fmt::Debug for PinnedRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} certificates>", self.certificates.len())
+    }
 }
 
 /// Hand-written so a pinned bundle shows its size, not its certificates.
@@ -115,9 +145,7 @@ impl std::fmt::Debug for UpstreamTls {
                 let mut pinned = f.debug_struct("PinnedCa");
                 pinned.field("path", path);
                 match roots {
-                    Some(roots) => {
-                        pinned.field("roots", &format_args!("<{} certificates>", roots.len()))
-                    }
+                    Some(roots) => pinned.field("roots", roots),
                     None => pinned.field("roots", &format_args!("<pending>")),
                 };
                 pinned.finish()
@@ -670,7 +698,7 @@ pub fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, Confi
 /// applies when the client is built, so a bundle that passes here cannot
 /// fail there with a bare "builder error". The one parser for a pin file,
 /// at startup and on any later read.
-pub(crate) fn pinned_roots(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, &'static str> {
+pub(crate) fn pinned_roots(pem: &[u8]) -> Result<PinnedRoots, &'static str> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject as _;
 
@@ -681,7 +709,8 @@ pub(crate) fn pinned_roots(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, &'st
         return Err("the file holds no PEM certificate");
     }
     let mut store = rustls::RootCertStore::empty();
-    ders.iter()
+    let certificates = ders
+        .iter()
         .map(|der| {
             store
                 .add(der.clone())
@@ -689,7 +718,11 @@ pub(crate) fn pinned_roots(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, &'st
             reqwest::Certificate::from_der(der)
                 .map_err(|_| "a certificate in the file does not parse")
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(PinnedRoots {
+        pem: pem.to_vec(),
+        certificates,
+    })
 }
 
 /// Build the default upstream URL from the trawld `[server].http_addr`.
@@ -802,6 +835,7 @@ fn load_key(web: &WebConfig) -> Result<SessionKey, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::captured_logs;
 
     /// The origin every fixture below states as the browser-visible one.
     const TEST_ORIGIN: &str = "https://trawl.example.com";
@@ -1173,7 +1207,7 @@ session_ttl_secs = 3600
         .unwrap();
 
         let (resolved, lines) =
-            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+            captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         let resolved = resolved.unwrap();
 
         // Replacement, not a merge: the configured origins are gone.
@@ -1233,7 +1267,7 @@ session_ttl_secs = 3600
         .unwrap();
 
         let (resolved, lines) =
-            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+            captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         assert!(resolved.is_ok());
         assert!(
             !lines
@@ -1269,7 +1303,7 @@ session_ttl_secs = 3600
         .unwrap();
 
         let (resolved, lines) =
-            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+            captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         assert!(
             resolved.is_ok(),
             "the environment's list is valid, so startup proceeds"
@@ -1300,7 +1334,7 @@ session_ttl_secs = 3600
         .unwrap();
 
         let (resolved, lines) =
-            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+            captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         assert!(resolved.is_ok());
         assert!(
             !lines
@@ -1334,74 +1368,6 @@ session_ttl_secs = 3600
             "got: {message}"
         );
         assert!(message.contains("entry 1"), "got: {message}");
-    }
-
-    /// Collects one formatted `field=value` line per event.
-    ///
-    /// Same shape as fleet-auth's guard-log capture: the warning is the
-    /// deliverable here, so the test reads what was recorded rather than
-    /// trusting that the code meant to record it.
-    #[derive(Clone, Default)]
-    struct CaptureLayer {
-        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    struct FieldWriter<'a>(&'a mut String);
-
-    impl tracing::field::Visit for FieldWriter<'_> {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            use std::fmt::Write as _;
-            let _ = write!(self.0, "{}={value} ", field.name());
-        }
-
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write as _;
-            let _ = write!(self.0, "{}={value:?} ", field.name());
-        }
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
-    where
-        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut line = format!("{} ", event.metadata().level());
-            event.record(&mut FieldWriter(&mut line));
-            self.lines.lock().expect("capture mutex").push(line);
-        }
-    }
-
-    /// Serializes the capture tests against each other.
-    ///
-    /// `tracing` caches each callsite's `Interest` process-wide and
-    /// rebuilds that cache when a subscriber registers or dies. Two
-    /// capture tests running at once can leave the warning's callsite
-    /// cached as "never interested" for the thread about to emit, so the
-    /// event vanishes and the test reads "it did not warn", the exact
-    /// failure it exists to catch, arriving at random. Poisoning is
-    /// ignored on purpose: one panicking test must not cascade into the
-    /// others.
-    static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Resolve configuration under a capturing subscriber, returning the
-    /// result and every line it logged.
-    fn captured_resolution<T>(resolve: impl FnOnce() -> T) -> (T, Vec<String>) {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let _serialized = CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let capture = CaptureLayer::default();
-        let lines = std::sync::Arc::clone(&capture.lines);
-        let subscriber = tracing_subscriber::registry().with(capture);
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let outcome = resolve();
-        let recorded = lines.lock().expect("capture mutex").clone();
-        (outcome, recorded)
     }
 
     #[test]
@@ -1621,7 +1587,7 @@ session_ttl_secs = 3600
                 upstream_url: Some(upstream.clone()),
                 ..configured_web()
             };
-            let (outcome, lines) = captured_resolution(|| resolve(&web));
+            let (outcome, lines) = captured_logs(|| resolve(&web));
             let error = outcome.expect_err("a URL with credentials must refuse");
             assert!(
                 matches!(error, ConfigError::UpstreamUrl(UpstreamUrlError::Userinfo)),
@@ -1800,7 +1766,7 @@ session_ttl_secs = 3600
             matches!(
                 &tls,
                 UpstreamTls::PinnedCa { path, roots: Some(roots) }
-                    if *path == ca_path && roots.len() == 2
+                    if *path == ca_path && roots.certificates().len() == 2
             ),
             "{tls:?}"
         );
@@ -1816,7 +1782,7 @@ session_ttl_secs = 3600
         // The parent does not exist either, as before trawld's first start
         // creates its `tls` directory.
         let missing = dir.path().join("tls").join("cert.pem");
-        let (tls, lines) = captured_resolution(|| resolve_upstream_tls(Some(&missing)));
+        let (tls, lines) = captured_logs(|| resolve_upstream_tls(Some(&missing)));
         let tls = tls.expect("a missing pin file is pending, not a refusal");
         assert!(
             matches!(&tls, UpstreamTls::PinnedCa { path, roots: None } if *path == missing),
@@ -1944,7 +1910,7 @@ session_ttl_secs = 3600
         assert!(
             matches!(
                 resolve_upstream_tls(Some(&generated)),
-                Ok(UpstreamTls::PinnedCa { roots: Some(roots), .. }) if roots.len() == 1
+                Ok(UpstreamTls::PinnedCa { roots: Some(roots), .. }) if roots.certificates().len() == 1
             ),
             "the Debian upstream {upstream} must accept a pin"
         );

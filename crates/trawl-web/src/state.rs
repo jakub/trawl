@@ -5,8 +5,8 @@
 //! Shared request-scoped state.
 //!
 //! `AppState` is cloned into every handler via axum's `State` extractor.
-//! Heavy values (reqwest client, session key) live behind `Arc` so clones
-//! are cheap.
+//! Heavy values (the upstream client, session key) live behind `Arc` so
+//! clones are cheap.
 //!
 //! `AppState` is also the single source of truth for session cookie
 //! headers: [`AppState::build_session_cookie`] (login) and
@@ -15,7 +15,8 @@
 //! set, because browsers ignore a clear directive whose
 //! `Domain`/`Path`/`SameSite` don't match issuance.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use axum::http::HeaderValue;
 use axum::http::header::InvalidHeaderValue;
@@ -23,9 +24,12 @@ use fleet_auth::{
     DEFAULT_COOKIE_NAME, PublicOrigins, SameSite, SessionKey, build_clear_cookie_header,
     build_session_cookie_header,
 };
-use reqwest::{Client, ClientBuilder};
+use reqwest::Client;
+use tokio::task::JoinHandle;
 
-use crate::config::{ResolvedConfig, UpstreamConnect, UpstreamTls};
+use crate::config::ResolvedConfig;
+use crate::error::ProxyError;
+use crate::upstream::Upstream;
 
 /// Handler-visible runtime state.
 #[derive(Clone)]
@@ -35,7 +39,7 @@ pub struct AppState {
 
 struct Inner {
     cookie_key: SessionKey,
-    http: Client,
+    upstream: Upstream,
     upstream_url: String,
     session_ttl_secs: u64,
     allow_insecure_cookies: bool,
@@ -44,31 +48,28 @@ struct Inner {
 }
 
 impl AppState {
-    /// Build state from resolved config. Constructs the reqwest client
-    /// once (connection pooling + keep-alive are implicit). Installs the
+    /// Build state from resolved config. Constructs the upstream client
+    /// (connection pooling + keep-alive are implicit). Installs the
     /// rustls `ring` crypto provider on first call (idempotent — ignored
     /// if another provider is already installed).
     ///
     /// The client's certificate trust comes from
     /// [`ResolvedConfig::upstream_tls`], already validated at resolution;
-    /// see `upstream_client` for what each mode sets.
+    /// see [`crate::upstream`] for how a pinned CA is read again. Starts no
+    /// task: the caller starts the re-read with
+    /// [`Self::spawn_upstream_ca_reread`].
     ///
     /// # Errors
     /// Propagates `reqwest::Error` if the client can't be built.
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let http = upstream_client(
-            Client::builder(),
-            cfg.upstream_tls,
-            cfg.upstream_connect.as_ref(),
-        )
-        .build()?;
+        let upstream = Upstream::new(cfg.upstream_tls, cfg.upstream_connect)?;
 
         Ok(Self {
             inner: Arc::new(Inner {
                 cookie_key: cfg.cookie_key,
-                http,
+                upstream,
                 upstream_url: cfg.upstream_url,
                 session_ttl_secs: cfg.session_ttl_secs,
                 allow_insecure_cookies: cfg.allow_insecure_cookies,
@@ -149,9 +150,43 @@ impl AppState {
         .parse()
     }
 
+    /// The client one request uses to reach trawld, from start to end,
+    /// streamed response bodies included. A handler takes it once, after
+    /// its local checks, so a request that fails those never waits on the
+    /// pin file.
+    ///
+    /// # Errors
+    /// [`ProxyError::UpstreamCertificateUnavailable`] while a pinned CA
+    /// file has never held a usable certificate.
+    pub async fn upstream_client(&self) -> Result<Client, ProxyError> {
+        self.inner.upstream.client().await
+    }
+
+    /// Start the task that reads a pinned CA file again every `interval`,
+    /// or `None` under the platform roots, where nothing can change.
+    ///
+    /// The task holds the state weakly and ends once the last `AppState`
+    /// clone is gone.
     #[must_use]
-    pub fn http(&self) -> &Client {
-        &self.inner.http
+    pub fn spawn_upstream_ca_reread(&self, interval: Duration) -> Option<JoinHandle<()>> {
+        if !self.inner.upstream.is_pinned() {
+            return None;
+        }
+        let state: Weak<Inner> = Arc::downgrade(&self.inner);
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(inner) = state.upgrade() else {
+                    break;
+                };
+                inner.upstream.reread().await;
+            }
+        }))
+    }
+
+    /// Read a pinned CA file again now, as the interval task does.
+    pub async fn reread_upstream_ca(&self) {
+        self.inner.upstream.reread().await;
     }
 
     #[must_use]
@@ -170,52 +205,10 @@ impl AppState {
     }
 }
 
-/// Set the upstream trust mode and dialing rules on `builder`.
-///
-/// In every mode the client:
-///
-/// - Speaks https only. Resolution already refuses a plain-http
-///   `upstream_url`; this also refuses any other cleartext hop.
-/// - Follows no redirect. trawld never sends one, and a followed 3xx would
-///   carry the signed-in user's key to whatever host the `Location` names
-///   and the trust mode accepts: under the platform roots, any host with a
-///   public certificate.
-/// - Ignores proxy settings, such as `HTTPS_PROXY`. trawl-web always dials
-///   trawld directly. A proxy would also resolve the host name on its own
-///   side, past any connect address.
-///
-/// With a connect address (`[web] upstream_connect_addr`), the client dials
-/// that address for the URL's host and never asks the resolver. TLS still
-/// verifies the host name from the URL.
-///
-/// A pinned CA replaces the platform roots, with host-name verification
-/// left on. A pin whose file did not exist at startup trusts no root at
-/// all, so every handshake fails.
-///
-/// Split from [`AppState::from_config`] so a test can pass a builder with
-/// its own resolver or proxy and see what the modes override.
-fn upstream_client(
-    builder: ClientBuilder,
-    tls: UpstreamTls,
-    connect: Option<&UpstreamConnect>,
-) -> ClientBuilder {
-    let builder = builder
-        .redirect(reqwest::redirect::Policy::none())
-        .https_only(true)
-        .no_proxy();
-    let builder = match connect {
-        Some(connect) => builder.resolve(&connect.host, connect.addr),
-        None => builder,
-    };
-    match tls {
-        UpstreamTls::System => builder,
-        UpstreamTls::PinnedCa { roots, .. } => builder.tls_certs_only(roots.unwrap_or_default()),
-    }
-}
-
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
+            .field("upstream", &self.inner.upstream)
             .field("upstream_url", &self.inner.upstream_url)
             .field("session_ttl_secs", &self.inner.session_ttl_secs)
             .field("allow_insecure_cookies", &self.inner.allow_insecure_cookies)
@@ -227,179 +220,39 @@ impl std::fmt::Debug for AppState {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    use reqwest::dns::{Name, Resolve, Resolving};
-    use tokio::net::TcpListener;
 
     use super::*;
-    use crate::test_support::TlsUpstream;
-
-    /// Both trust modes, the pin pending so no file is needed: the rules
-    /// under test do not depend on which roots are trusted.
-    fn every_mode() -> [UpstreamTls; 2] {
-        [
-            UpstreamTls::System,
-            UpstreamTls::PinnedCa {
-                path: PathBuf::from("/nonexistent/ca.pem"),
-                roots: None,
-            },
-        ]
-    }
-
-    /// Send one request to `url` with `client` and report whether
-    /// `listener` saw a connection. The TLS handshake then fails, since
-    /// the listener speaks no TLS; only the dial matters here.
-    async fn dials(client: &Client, url: String, listener: &TcpListener) -> bool {
-        let request = tokio::spawn(client.get(url).send());
-        let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-            .await
-            .is_ok_and(|accept| accept.is_ok());
-        request.abort();
-        accepted
-    }
-
-    /// A host resolver that answers nothing and counts how often it is
-    /// asked, standing in for one that would name another machine.
-    struct RefusingResolver(Arc<AtomicUsize>);
-
-    impl Resolve for RefusingResolver {
-        fn resolve(&self, _name: Name) -> Resolving {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(std::future::ready(
-                Err("the host resolver was asked".into()),
-            ))
-        }
-    }
+    use crate::config::UpstreamTls;
 
     #[tokio::test]
-    async fn a_connect_addr_is_dialed_without_asking_the_resolver() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        // Two copies of each mode: one for the control, one under test.
-        for (control, tls) in every_mode().into_iter().zip(every_mode()) {
-            let mode = format!("{tls:?}");
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let url = format!("https://trawl.test:{}/api/v1/whoami", addr.port());
-
-            // Control: without a connect address the name goes to the
-            // resolver, which refuses, so the injected resolver is in use.
-            let asked = Arc::new(AtomicUsize::new(0));
-            let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
-            let client = upstream_client(base, control, None).build().unwrap();
-            let err = client.get(&url).send().await.expect_err("nothing resolves");
-            assert!(err.is_connect(), "{mode}: {err:?}");
-            assert_eq!(asked.load(Ordering::SeqCst), 1, "{mode}");
-
-            let asked = Arc::new(AtomicUsize::new(0));
-            let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
-            let connect = UpstreamConnect {
-                host: "trawl.test".to_owned(),
-                addr,
-            };
-            let client = upstream_client(base, tls, Some(&connect)).build().unwrap();
-            assert!(
-                dials(&client, url, &listener).await,
-                "{mode}: the client did not dial the connect address"
-            );
-            assert_eq!(
-                asked.load(Ordering::SeqCst),
-                0,
-                "{mode}: the client asked the resolver for a name it has an address for"
-            );
-        }
+    async fn the_platform_roots_start_no_reread_task() {
+        assert!(
+            state(false)
+                .spawn_upstream_ca_reread(Duration::from_millis(1))
+                .is_none()
+        );
     }
 
+    /// The task holds no strong reference, so dropping the state ends it.
     #[tokio::test]
-    async fn every_mode_ignores_a_configured_proxy() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        for tls in every_mode() {
-            let mode = format!("{tls:?}");
-            let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let base = Client::builder().proxy(
-                reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap(),
-            );
-            let client = upstream_client(base, tls, None).build().unwrap();
-
-            let url = format!(
-                "https://127.0.0.1:{}/api/v1/whoami",
-                upstream.local_addr().unwrap().port()
-            );
-            assert!(
-                dials(&client, url, &upstream).await,
-                "{mode}: the client did not dial the upstream directly"
-            );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(200), proxy.accept())
-                    .await
-                    .is_err(),
-                "{mode}: the client went through the proxy"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn every_mode_refuses_a_plain_http_request() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        for tls in every_mode() {
-            let mode = format!("{tls:?}");
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let client = upstream_client(Client::builder(), tls, None)
-                .build()
-                .unwrap();
-            let url = format!(
-                "http://127.0.0.1:{}/api/v1/whoami",
-                listener.local_addr().unwrap().port()
-            );
-            // Bounded: a client that did dial would wait forever on the
-            // silent listener, and the test must fail rather than hang.
-            let err = tokio::time::timeout(Duration::from_secs(5), client.get(&url).send())
-                .await
-                .unwrap_or_else(|_| panic!("{mode}: the client dialed a plain-http upstream"))
-                .expect_err("a cleartext request must refuse");
-            assert!(err.is_builder(), "{mode}: {err:?}");
-            assert!(
-                tokio::time::timeout(Duration::from_millis(200), listener.accept())
-                    .await
-                    .is_err(),
-                "{mode}: the client dialed a plain-http upstream"
-            );
-        }
-    }
-
-    /// A pin whose file was absent at startup trusts nothing, not the
-    /// platform roots and not the upstream's own CA.
-    #[tokio::test]
-    async fn a_pending_pin_trusts_no_upstream() {
-        let upstream = TlsUpstream::start().await;
+    async fn the_reread_task_ends_with_its_state() {
+        let dir = tempfile::tempdir().unwrap();
         let state = AppState::from_config(ResolvedConfig {
-            upstream_url: upstream.url(),
             upstream_tls: UpstreamTls::PinnedCa {
-                path: upstream.ca_path().to_owned(),
+                path: dir.path().join("absent.pem"),
                 roots: None,
             },
             ..config(false)
         })
-        .expect("a pending pin still builds a client");
-        let err = state
-            .http()
-            .get(format!("{}/api/v1/whoami", upstream.url()))
-            .send()
+        .unwrap();
+        let task = state
+            .spawn_upstream_ca_reread(Duration::from_millis(10))
+            .expect("a pin starts a task");
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(10), task)
             .await
-            .expect_err("no root is trusted");
-        assert!(err.is_connect(), "{err:?}");
-        assert!(
-            upstream
-                .mock()
-                .received_requests()
-                .await
-                .expect("recording on")
-                .is_empty(),
-            "a request crossed a handshake that should have failed"
-        );
+            .expect("the task ended")
+            .expect("the task did not panic");
     }
 
     fn config(cookie_secure: bool) -> ResolvedConfig {
