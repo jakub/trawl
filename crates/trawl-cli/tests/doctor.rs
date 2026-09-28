@@ -1877,6 +1877,55 @@ fn doctor_oversized_bodies_are_too_large() {
     assert_eq!(identity["reason"], "response too large");
 }
 
+/// A valid error envelope with `code`, padded with whitespace to 64 KiB
+/// (the health and whoami cap) and followed by trailing garbage. Its first
+/// 64 KiB parse as the envelope, so only the cap can refuse it.
+fn envelope_past_the_cap(code: &str) -> String {
+    let mut body = format!(r#"{{"error":{{"code":"{code}","message":"slow down","details":[]}}}}"#);
+    let cap = 64 * 1024;
+    body.push_str(&" ".repeat(cap - body.len()));
+    body.push_str("trailing garbage");
+    body
+}
+
+/// A non-success health or whoami body past the cap is too large, whatever
+/// its status and whatever error envelope its first bytes hold: an
+/// oversized 429 is not `rate_limited`, and the run fails, exit 1.
+#[test]
+fn doctor_oversized_error_bodies_are_too_large() {
+    for (status, code) in [
+        (429, "rate_limited"),
+        (500, "internal_error"),
+        (502, "internal_error"),
+    ] {
+        let (output, stub) = doctor_against(vec![
+            (HEALTH_PATH, status, envelope_past_the_cap(code)),
+            whoami(r#""query""#),
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{status}: {}", text(&output));
+        let report = report(&output);
+        let health = check_by_id(&report, "api.health");
+        assert_eq!(health["outcome"], "failed", "{status}");
+        assert_eq!(health["reason"], "response too large", "{status}");
+        stub.assert_no_authorization("oversized health error");
+    }
+    for (status, code) in [
+        (401, "auth_error"),
+        (403, "forbidden"),
+        (429, "rate_limited"),
+    ] {
+        let (output, _stub) = doctor_against(vec![
+            healthy(),
+            (WHOAMI_PATH, status, envelope_past_the_cap(code)),
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{status}: {}", text(&output));
+        let report = report(&output);
+        let identity = check_by_id(&report, "api.identity");
+        assert_eq!(identity["outcome"], "failed", "{status}");
+        assert_eq!(identity["reason"], "response too large", "{status}");
+    }
+}
+
 /// The versioned JSON document for a pass, a fail, and an incomplete run,
 /// and the text form of the fail. Ports and the CLI's own version are
 /// replaced by placeholders, so the snapshots hold only the contract.

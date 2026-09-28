@@ -234,8 +234,8 @@ impl HttpClient {
     /// returned as `Ok` with `status: unavailable`. Any other failure status,
     /// or a 503 with a foreign body (a proxy's error page), stays a
     /// [`ClientError::Server`]. No body is read past [`HEALTH_BODY_CAP`]: a
-    /// success body past it, or a 503 body past it, is
-    /// [`ClientError::TooLarge`].
+    /// body past it is [`ClientError::TooLarge`] whatever the status, and
+    /// an error envelope in it is never judged.
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
         let url = self.endpoint("/api/v1/health");
 
@@ -248,19 +248,14 @@ impl HttpClient {
 
         let status = resp.status();
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-            let (body, truncated) = read_capped(resp, HEALTH_BODY_CAP).await?;
-            if truncated {
-                return Err(ClientError::TooLarge {
-                    cap: HEALTH_BODY_CAP,
-                });
-            }
+            let body = read_bounded(resp, HEALTH_BODY_CAP).await?;
             if let Ok(health) = serde_json::from_slice::<HealthResponse>(&body) {
                 return Ok(health);
             }
             return Err(server_error(503, &body));
         }
         if !status.is_success() {
-            let (body, _) = read_capped(resp, HEALTH_BODY_CAP).await?;
+            let body = read_bounded(resp, HEALTH_BODY_CAP).await?;
             return Err(server_error(status.as_u16(), &body));
         }
         read_json_capped(resp, HEALTH_BODY_CAP, "health").await
@@ -496,8 +491,8 @@ impl HttpClient {
     ///
     /// The daemon answers exactly `200`; any other status, another `2xx`
     /// included, is a [`ClientError::Server`]. No body is read past
-    /// [`WHOAMI_BODY_CAP`]: a success body past it is
-    /// [`ClientError::TooLarge`].
+    /// [`WHOAMI_BODY_CAP`]: a body past it is [`ClientError::TooLarge`]
+    /// whatever the status, and an error envelope in it is never judged.
     pub async fn whoami(&self) -> Result<WhoAmIResponse, ClientError> {
         let url = self.endpoint("/api/v1/whoami");
         let resp = self
@@ -509,7 +504,7 @@ impl HttpClient {
             .map_err(sanitize_reqwest_error)?;
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
-            let (body, _) = read_capped(resp, WHOAMI_BODY_CAP).await?;
+            let body = read_bounded(resp, WHOAMI_BODY_CAP).await?;
             return Err(server_error(status.as_u16(), &body));
         }
         read_json_capped(resp, WHOAMI_BODY_CAP, "whoami").await
@@ -1062,10 +1057,7 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
     cap: usize,
     what: &str,
 ) -> Result<T, ClientError> {
-    let (body, truncated) = read_capped(resp, cap).await?;
-    if truncated {
-        return Err(ClientError::TooLarge { cap });
-    }
+    let body = read_bounded(resp, cap).await?;
     serde_json::from_slice(&body)
         .map_err(|_| ClientError::Parse(format!("response is not valid JSON for {what}")))
 }
@@ -1080,12 +1072,14 @@ fn server_error(status: u16, body: &[u8]) -> ClientError {
     ClientError::Server { status, error }
 }
 
-/// Read at most `cap` bytes of a response body. The flag is true when the
-/// body held more; the rest is never read.
-async fn read_capped(
-    mut resp: reqwest::Response,
-    cap: usize,
-) -> Result<(Vec<u8>, bool), ClientError> {
+/// Read a whole response body of at most `cap` bytes. A body that holds
+/// more is [`ClientError::TooLarge`], and the rest is never read.
+///
+/// This is the only way the client reads a capped body, and it never hands
+/// back a prefix: whatever the status, a caller that judges the bytes (an
+/// error envelope, a health body, a probe answer) judges all of them or
+/// none.
+async fn read_bounded(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, ClientError> {
     // A chunk's error carries no URL; restore it so the sanitized message
     // names the origin as a failure before the headers does.
     let url = resp.url().clone();
@@ -1095,14 +1089,12 @@ async fn read_capped(
         .await
         .map_err(|e| body_chunk_error(e.with_url(url.clone())))?
     {
-        let room = cap - body.len();
-        if chunk.len() > room {
-            body.extend_from_slice(&chunk[..room]);
-            return Ok((body, true));
+        if chunk.len() > cap - body.len() {
+            return Err(ClientError::TooLarge { cap });
         }
         body.extend_from_slice(&chunk);
     }
-    Ok((body, false))
+    Ok(body)
 }
 
 /// Build the `reqwest` client for `trust`, with `timeout` bounding each
@@ -1245,12 +1237,7 @@ impl OriginProbe {
     async fn send(req: reqwest::RequestBuilder) -> Result<ProbeResponse, ClientError> {
         let resp = req.send().await.map_err(sanitize_reqwest_error)?;
         let status = resp.status().as_u16();
-        let (body, truncated) = read_capped(resp, Self::BODY_CAP).await?;
-        if truncated {
-            return Err(ClientError::TooLarge {
-                cap: Self::BODY_CAP,
-            });
-        }
+        let body = read_bounded(resp, Self::BODY_CAP).await?;
         Ok(ProbeResponse { status, body })
     }
 }
@@ -1800,6 +1787,63 @@ mod tests {
             matches!(err, ClientError::TooLarge { cap } if cap == HEALTH_BODY_CAP),
             "{err:?}"
         );
+    }
+
+    /// A valid error envelope with `code`, padded with whitespace to
+    /// exactly `cap` bytes and followed by trailing garbage. Its first `cap`
+    /// bytes parse as the envelope, so only the cap can refuse it.
+    fn envelope_past_the_cap(code: &str, cap: usize) -> Vec<u8> {
+        let mut body =
+            format!(r#"{{"error":{{"code":"{code}","message":"slow down","details":[]}}}}"#)
+                .into_bytes();
+        assert!(
+            serde_json::from_slice::<ErrorResponse>(&body).is_ok(),
+            "{code}"
+        );
+        body.resize(cap, b' ');
+        body.extend_from_slice(b"trailing garbage");
+        body
+    }
+
+    /// A non-success health body past the cap is too large, whatever its
+    /// status: the error envelope in its first bytes is never judged, so an
+    /// oversized 429 is not read as rate limiting.
+    #[tokio::test]
+    async fn health_error_past_the_cap_is_too_large() {
+        for (status, code) in [
+            ("429 Too Many Requests", "rate_limited"),
+            ("500 Internal Server Error", "internal_error"),
+            ("502 Bad Gateway", "internal_error"),
+        ] {
+            let body = envelope_past_the_cap(code, HEALTH_BODY_CAP);
+            let err = health_answered_with(http_response(status, "application/json", &body))
+                .await
+                .expect_err("a body past the cap is not an answer");
+            assert!(
+                matches!(err, ClientError::TooLarge { cap } if cap == HEALTH_BODY_CAP),
+                "{status}: {err:?}"
+            );
+        }
+    }
+
+    /// A non-200 whoami body past the cap is too large, whatever its
+    /// status, and its error envelope is never judged.
+    #[tokio::test]
+    async fn whoami_error_past_the_cap_is_too_large() {
+        for (status, code) in [
+            ("401 Unauthorized", "auth_error"),
+            ("403 Forbidden", "forbidden"),
+            ("429 Too Many Requests", "rate_limited"),
+        ] {
+            let body = envelope_past_the_cap(code, WHOAMI_BODY_CAP);
+            let err = whoami_answered_with(http_response(status, "application/json", &body))
+                .await
+                .expect_err("a body past the cap is not an answer");
+            assert!(
+                matches!(err, ClientError::TooLarge { cap } if cap == WHOAMI_BODY_CAP),
+                "{status}: {err:?}"
+            );
+        }
     }
 
     const WHOAMI: &[u8] =
