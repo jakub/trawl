@@ -1119,23 +1119,69 @@ fn collect_parquet_gauges(base: &Path) {
 }
 
 /// One Parquet attempt: the walk, bracketed by the repin authority
-/// (`repin_in_flight`, [`crate::repin::in_flight_evidence`] in production).
+/// (`repin_in_flight`, [`crate::repin::in_flight_evidence`] in production)
+/// and by the identity of every top-level env directory.
 ///
 /// Asking before and after the walk records a repin that overlaps either
 /// end of it. The projection withholds reach from a scan that saw one,
 /// because a repin holds two generations of stored bytes.
 ///
+/// The walk holds no cutover guard, so a whole repin can also start and
+/// finish inside it: a repin hardlinks unchanged files, so it can be fast,
+/// and both evidence reads then say no repin while the walk read some envs
+/// from each generation. The cutover renames each env directory, so the
+/// `(name, inode)` set of the root's env directories differs across such a
+/// walk, and the attempt fails. This catches a completed env swap during
+/// the walk. It does not make the scan a transactional snapshot: files
+/// written, compacted or deleted during the walk still land in it or not,
+/// as ADR-0033 already allows.
+///
 /// # Errors
-/// The walk's error, or either evidence read's: unreadable evidence fails
-/// the attempt, so the cache keeps the last complete scan (ADR-0033).
+/// The walk's error, either evidence read's or either env identity read's,
+/// or an env directory set that changed during the walk. Each fails the
+/// attempt, so the cache keeps the last complete scan (ADR-0033).
 fn scan_parquet(
     root: &Path,
     repin_in_flight: impl Fn(&Path) -> std::io::Result<bool>,
 ) -> std::io::Result<StorageScan> {
+    scan_parquet_with(root, repin_in_flight, &mut |_, _| Ok(()))
+}
+
+/// [`scan_parquet`] with the walk's test seam ([`scan_storage_with`]).
+fn scan_parquet_with(
+    root: &Path,
+    repin_in_flight: impl Fn(&Path) -> std::io::Result<bool>,
+    walk_op: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
+) -> std::io::Result<StorageScan> {
     let before = repin_in_flight(root)?;
-    let mut scan = scan_storage(root, StorageKind::Parquet)?;
+    let envs_before = env_dir_identities(root)?;
+    let mut scan = scan_storage_with(root, StorageKind::Parquet, walk_op)?;
+    let envs_after = env_dir_identities(root)?;
     scan.repin_in_flight = repin_in_flight(root)? || before;
+    if envs_before != envs_after {
+        return Err(std::io::Error::other(
+            "an environment directory was replaced during the storage scan",
+        ));
+    }
     Ok(scan)
+}
+
+/// The `(name, inode)` of every directory the Parquet walk treats as an
+/// env: the root's child directories, not following symlinks, less the
+/// excluded `scheduled/`. One `read_dir` and one metadata read per env.
+fn env_dir_identities(
+    root: &Path,
+) -> std::io::Result<std::collections::BTreeSet<(std::ffi::OsString, u64)>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut identities = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() && !StorageKind::Parquet.excluded_dir(&entry.path()) {
+            identities.insert((entry.file_name(), metadata.ino()));
+        }
+    }
+    Ok(identities)
 }
 
 /// Sample the data, WAL and spill filesystems with the shared attempt/cache
@@ -2070,6 +2116,99 @@ mod tests {
             );
             assert!(!scan.expect("retained").repin_in_flight);
         }
+    }
+
+    /// A whole repin can build, swap, sweep and clear its marker while the
+    /// scanning thread is descheduled, so both evidence reads say no repin
+    /// and the walk has read one env from each generation. The real cutover
+    /// (`swap_envs`) runs mid-walk here: the attempt fails and the cache
+    /// keeps the last complete scan (ADR-0033).
+    #[test]
+    fn storage_scan_fails_when_an_env_dir_is_swapped_during_the_walk() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let shadow = crate::repin::marker::shadow_root(&root);
+        let aside = crate::repin::marker::aside_root(&root);
+        let write = |base: &Path, env: &str, bytes: usize| {
+            let dir = base.join(env).join("2026-09-20");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("x.parquet"), vec![b'x'; bytes]).unwrap();
+        };
+        // The live generation holds 10 bytes per env, the shadow 1000.
+        let plant = || {
+            for env in ["lab", "prod"] {
+                write(&root, env, 10);
+                write(&shadow, env, 1000);
+            }
+        };
+        // The swap lands between envs: the first env is counted whole from
+        // the live generation, the second from the new one.
+        let swap_before_second_env = || {
+            let (root, shadow, aside) = (&root, &shadow, &aside);
+            let mut envs_opened = 0;
+            move |op: StorageWalkOp, path: &Path| {
+                if op == StorageWalkOp::ReadDir && path.parent() == Some(root.as_path()) {
+                    envs_opened += 1;
+                    if envs_opened == 2 {
+                        crate::repin::cutover::swap_envs(root, shadow, aside)
+                            .map_err(std::io::Error::other)?;
+                        std::fs::remove_dir_all(aside)?;
+                    }
+                }
+                Ok(())
+            }
+        };
+
+        // Control: the same walk seam with nothing moving is the plain scan.
+        plant();
+        let scan = scan_parquet_with(&root, |_| Ok(false), &mut |_, _| Ok(())).unwrap();
+        assert_eq!(
+            scan.totals,
+            StorageTotals {
+                files: 2,
+                bytes: 20
+            }
+        );
+        assert!(!scan.repin_in_flight);
+
+        // The swap mid-walk fails the attempt, with no repin evidence at
+        // either end.
+        let error = scan_parquet_with(&root, |_| Ok(false), &mut swap_before_second_env())
+            .expect_err("a torn walk is not a complete scan");
+        assert!(
+            error.to_string().contains("environment directory"),
+            "{error}"
+        );
+
+        // Through the cache: the torn attempt is failed and the complete
+        // scan taken before it is retained.
+        std::fs::remove_dir_all(&root).unwrap();
+        plant();
+        let cache = StorageCache::<Arc<StorageScan>>::default();
+        let now = Instant::now();
+        cache.collect(
+            || now,
+            || scan_parquet(&root, |_| Ok(false)).map(Arc::new),
+            |_| {},
+        );
+        cache.collect(
+            || now + Duration::from_secs(30),
+            || scan_parquet_with(&root, |_| Ok(false), &mut swap_before_second_env()).map(Arc::new),
+            |_| {},
+        );
+        let (measurement, scan) = cache.read(true, now + Duration::from_secs(30));
+        assert_eq!(
+            measurement.status,
+            trawl_api::StorageMeasurementStatus::Failed
+        );
+        assert_eq!(
+            scan.expect("retained").totals,
+            StorageTotals {
+                files: 2,
+                bytes: 20
+            }
+        );
     }
 
     /// An empty date directory holds no counted Parquet, so it gets no
