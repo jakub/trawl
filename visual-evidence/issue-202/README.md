@@ -42,16 +42,17 @@ assembled beside. The card reads the Parquet measurement to tell an
 unmeasured empty list from a measured one.
 
 Each fixture is producer output.
-[`capacity_fixtures.rs`](../../crates/trawl-server/tests/capacity_fixtures.rs)
-builds every scenario from fixed inputs: partition bytes per environment
-and date, a headroom attempt through the server's own sampling function,
-retention evidence recorded through the retention loop's own methods, and
-a retention config. The server's `capacity::assemble` turns them into the
+[`capacity_fixtures.rs`](../../crates/trawl-server/src/metrics/capacity_fixtures.rs)
+builds every scenario from fixed inputs. It plants each partition as a
+sparse Parquet file of the scenario's size and reads them through the
+server's own storage scan and cache. It also takes a headroom attempt
+through the server's own sampling function, retention evidence recorded
+through the retention loop's own methods, and a retention config. The server's `capacity::assemble` turns them into the
 capacity object on 2026-09-27, and the test fails with a line diff when a
 committed fixture differs from what it produces. The base snapshot's
 capacity slice in `health-dashboard.json` is checked the same way. After a
 deliberate change to the producer or a scenario, run
-`TRAWL_REGEN_CAPACITY_FIXTURES=1 cargo test -p trawl-server --test capacity_fixtures`
+`TRAWL_REGEN_CAPACITY_FIXTURES=1 cargo test -p trawl-server --lib capacity_fixtures`
 to rewrite the fixtures that differ, then rerun the spec and recapture.
 [`e2e_wire_fixture_contract.rs`](../../crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs)
 decodes every fixture as the snapshot's own wire types with no field left

@@ -948,7 +948,7 @@ test('the footer re-reads health every 30 s, one read at a time, and the chip cl
 // capacity object with the Parquet and WAL fields it was assembled beside.
 // The harness merges `dashboardSnapshot` shallowly, so each field rides
 // along whole. Each fixture is producer output: trawl-server's
-// tests/capacity_fixtures.rs fails when one differs from what
+// src/metrics/capacity_fixtures.rs fails when one differs from what
 // capacity::assemble emits, and tests/e2e_wire_fixture_contract.rs decodes
 // each one and pins it to the state its case asserts.
 const capacity = (name: string) => JSON.parse(readFileSync(`${__dirname}/../harness/wire/health-capacity-${name}.json`, 'utf8'));

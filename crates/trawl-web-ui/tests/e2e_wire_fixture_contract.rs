@@ -775,8 +775,8 @@ fn capacity_fixture(name: &str) -> CapacitySnapshotPart {
 /// Every capacity fixture, and the base snapshot's capacity slice, decodes
 /// as the snapshot fields of the same names with nothing left over, and a
 /// withheld reach carries its reason and no number. The fixtures are
-/// producer output (`tests/capacity_fixtures.rs` in trawl-server fails
-/// when one differs from what `capacity::assemble` emits), so the states
+/// producer output (`src/metrics/capacity_fixtures.rs` in trawl-server
+/// fails when one differs from what `capacity::assemble` emits), so the states
 /// themselves are not modelled here; this checks what the wire promises
 /// the page, and the pins below check the state each case relies on.
 #[test]

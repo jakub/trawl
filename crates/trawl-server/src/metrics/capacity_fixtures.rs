@@ -4,24 +4,29 @@
 
 //! The Health page's capacity fixtures are producer output (ADR-0042).
 //!
-//! Each scenario is built from fixed inputs: partition bytes per env and
-//! date, a headroom attempt through `capacity::sample_headroom` (its repin
-//! fence included) over a stat seam, retention evidence recorded through
-//! `retention::RetentionEvidence`, a retention config, and the measurement
-//! statuses and ages the caches would report. `capacity::assemble` turns
-//! them into the capacity object on 2026-09-27, the same call the
-//! dashboard snapshot makes. The test serializes each scenario's snapshot
-//! slice and compares it with the committed fixture the e2e harness loads,
-//! so a fixture is a state the server can emit by construction.
+//! Each scenario plants its partitions as sparse `.parquet` files of the
+//! scenario's byte sizes under a temporary data root, then reads them the
+//! way the dashboard does: the Parquet attempt ([`super::scan_parquet`],
+//! its repin fence included) through a [`super::StorageCache`] read back by
+//! [`super::read_parquet_scan`], the reader behind the dashboard's
+//! Parquet totals. A headroom attempt through `capacity::sample_headroom`
+//! runs over a stat seam on the same data root, retention evidence is
+//! recorded through `retention::RetentionEvidence`, and the headroom and
+//! WAL measurements are fixed inputs. `capacity::assemble` turns them into
+//! the capacity object on 2026-09-27, the same call the dashboard snapshot
+//! makes. The test serializes each scenario's snapshot slice and compares
+//! it with the committed fixture the e2e harness loads, so a fixture is a
+//! state the server can emit by construction, and a storage scan
+//! regression fails it.
 //!
-//! The scenarios hold no unattributed Parquet and one file per partition,
-//! so the slice's Parquet totals are the partition count and byte sum:
-//! the storage scan's own tests prove its partition bytes plus its
-//! unattributed bytes equal its total.
+//! A lib unit test rather than an integration test: as a child of
+//! `metrics`, it reaches the private scan and cache without widening
+//! their visibility.
 //!
 //! To regenerate the fixtures after a deliberate change to the producer or
-//! a scenario, run this test with `TRAWL_REGEN_CAPACITY_FIXTURES=1`: it
-//! rewrites each fixture that differs instead of failing, the base
+//! a scenario, run
+//! `TRAWL_REGEN_CAPACITY_FIXTURES=1 cargo test -p trawl-server --lib capacity_fixtures`:
+//! it rewrites each fixture that differs instead of failing, the base
 //! snapshot's slice into `health-dashboard.json` included, and leaves a
 //! matching one untouched. Review the diff, then rerun the health-page
 //! spec and recapture per `visual-evidence/issue-202/README.md`.
@@ -32,10 +37,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{Days, NaiveDate};
 use trawl_api::{Capacity, StorageMeasurement, StorageMeasurementStatus as Status, SweepOutcome};
-use trawl_server::capacity::{
-    CapacityReadings, EnvDateBytes, HeadroomSample, assemble, sample_headroom,
-};
-use trawl_server::retention::{RemovalTrigger, RetentionEvidence};
+
+use super::{StorageCache, StorageScan, read_parquet_scan, scan_parquet};
+use crate::capacity::{CapacityReadings, EnvDateBytes, HeadroomSample, assemble, sample_headroom};
+use crate::repin::JobGeneration;
+use crate::retention::{RemovalTrigger, RetentionEvidence};
 
 const M: u64 = 1_000_000;
 const G: u64 = 1_000_000_000;
@@ -74,7 +80,8 @@ struct CapacitySnapshotPart {
 type Stat = (u64, u64, u64);
 
 /// A headroom attempt: each role's filesystem, and whether a repin marker
-/// stands in the data root while the fence reads it.
+/// stands in the data root while the fence reads it. The marker is planted
+/// after the Parquet attempt, so only the headroom sample sees it.
 struct Headroom {
     data: Stat,
     /// `None` when ingest is off.
@@ -101,10 +108,23 @@ impl Evidence {
     };
 }
 
+/// What the Parquet cache holds when the snapshot reads it.
+#[derive(Clone, Copy)]
+enum Parquet {
+    /// No attempt yet.
+    NotSampled,
+    /// One attempt over the planted data root, `age` seconds before the
+    /// read.
+    Complete { age: u64 },
+    /// One attempt over a data root that does not exist, with no complete
+    /// scan before it.
+    FailedFirst,
+}
+
 struct Scenario {
-    /// `None` before a complete Parquet scan.
+    /// The partitions planted in the data root; `None` plants none.
     partitions: Option<EnvDateBytes>,
-    parquet: StorageMeasurement,
+    parquet: Parquet,
     headroom_measurement: StorageMeasurement,
     /// The complete sample the headroom cache holds; `None` before one.
     headroom: Option<Headroom>,
@@ -141,20 +161,61 @@ fn fill(
     }
 }
 
+/// Plant each partition as one sparse `.parquet` file of its bytes under
+/// `data_root/{env}/{date}/`. `set_len` writes no data, so a scenario's
+/// gigabytes cost no disk.
+fn plant(data_root: &Path, partitions: &EnvDateBytes) {
+    for ((env, date), bytes) in partitions {
+        let dir = data_root.join(env).join(date.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::File::create(dir.join("part.parquet"))
+            .unwrap()
+            .set_len(*bytes)
+            .unwrap();
+    }
+}
+
+/// The Parquet cache after the scenario's attempts, read back the way the
+/// dashboard reads it.
+fn parquet_reading(
+    parquet: Parquet,
+    data_root: &Path,
+    jobs: &JobGeneration,
+) -> (super::StorageSnapshot, Option<std::sync::Arc<StorageScan>>) {
+    let cache = StorageCache::<std::sync::Arc<StorageScan>>::default();
+    let attempted = Instant::now();
+    let mut read_at = attempted;
+    let root = match parquet {
+        Parquet::NotSampled => None,
+        Parquet::Complete { age } => {
+            read_at = attempted + Duration::from_secs(age);
+            Some(data_root.to_owned())
+        }
+        Parquet::FailedFirst => Some(data_root.join("missing")),
+    };
+    if let Some(root) = root {
+        cache.collect(
+            || attempted,
+            || scan_parquet(&root, jobs).map(std::sync::Arc::new),
+            |_| {},
+        );
+    }
+    read_parquet_scan(&cache, read_at)
+}
+
 /// One headroom attempt through the real sampling function and repin
-/// fence, on a data root holding the scenario's env directories.
-fn sample(headroom: &Headroom, partitions: Option<&EnvDateBytes>) -> HeadroomSample {
-    let tmp = tempfile::tempdir().unwrap();
-    let data_root = tmp.path().join("data");
-    std::fs::create_dir(&data_root).unwrap();
-    for (env, _) in partitions.into_iter().flat_map(|p| p.keys()) {
-        std::fs::create_dir_all(data_root.join(env)).unwrap();
-    }
+/// fence, on the scenario's data root.
+fn sample(
+    headroom: &Headroom,
+    tmp: &Path,
+    data_root: &Path,
+    jobs: &JobGeneration,
+) -> HeadroomSample {
     if headroom.repin {
-        std::fs::write(trawl_server::repin::marker::marker_path(&data_root), "{}").unwrap();
+        std::fs::write(crate::repin::marker::marker_path(data_root), "{}").unwrap();
     }
-    let wal_dir = tmp.path().join("wal");
-    let spill_dir = tmp.path().join("spill");
+    let wal_dir = tmp.join("wal");
+    let spill_dir = tmp.join("spill");
     let stat = |path: &Path| {
         Ok(if path == data_root {
             headroom.data
@@ -166,10 +227,10 @@ fn sample(headroom: &Headroom, partitions: Option<&EnvDateBytes>) -> HeadroomSam
         })
     };
     sample_headroom(
-        &data_root,
+        data_root,
         headroom.wal.map(|_| wal_dir.as_path()),
         &spill_dir,
-        &trawl_server::repin::JobGeneration::default(),
+        jobs,
         stat,
     )
     .unwrap()
@@ -216,14 +277,24 @@ fn retention(scenario: &Scenario) -> trawl_config::RetentionConfig {
 }
 
 fn produce(scenario: &Scenario) -> CapacitySnapshotPart {
-    let partitions = scenario.partitions.as_ref();
-    let sample = scenario.headroom.as_ref().map(|h| sample(h, partitions));
+    let tmp = tempfile::tempdir().unwrap();
+    let data_root = tmp.path().join("data");
+    std::fs::create_dir(&data_root).unwrap();
+    if let Some(partitions) = &scenario.partitions {
+        plant(&data_root, partitions);
+    }
+    let jobs = JobGeneration::default();
+    let (parquet, scan) = parquet_reading(scenario.parquet, &data_root, &jobs);
+    let sample = scenario
+        .headroom
+        .as_ref()
+        .map(|h| sample(h, tmp.path(), &data_root, &jobs));
     let capacity = assemble(
         today(),
         CapacityReadings {
-            parquet: &scenario.parquet,
-            env_dates: partitions,
-            parquet_repin_in_flight: false,
+            parquet: &parquet.measurement,
+            env_dates: scan.as_deref().map(|scan| &scan.env_dates),
+            parquet_repin_in_flight: scan.as_deref().is_some_and(|scan| scan.repin_in_flight),
             headroom: &scenario.headroom_measurement,
             sample: sample.as_ref(),
         },
@@ -232,9 +303,9 @@ fn produce(scenario: &Scenario) -> CapacitySnapshotPart {
     );
     let (wal_files, wal_bytes, wal_measurement) = scenario.wal;
     CapacitySnapshotPart {
-        parquet_files: partitions.map_or(0, |p| p.len() as u64),
-        parquet_bytes: partitions.map_or(0, |p| p.values().sum()),
-        parquet_measurement: scenario.parquet,
+        parquet_files: parquet.files,
+        parquet_bytes: parquet.bytes,
+        parquet_measurement: parquet.measurement,
         wal_files,
         wal_bytes,
         wal_measurement,
@@ -262,7 +333,7 @@ fn complete_scenario() -> Scenario {
     fill(&mut p, "staging", date(8, 28), today(), |_| 200 * M);
     Scenario {
         partitions: Some(p),
-        parquet: complete(2),
+        parquet: Parquet::Complete { age: 2 },
         headroom_measurement: complete(2),
         headroom: Some(Headroom {
             data: (1, 250 * G, 26 * G),
@@ -292,7 +363,7 @@ fn failed_retained_scenario() -> Scenario {
     fill(&mut p, "prod", date(8, 15), today(), |_| 2_500 * M);
     Scenario {
         partitions: Some(p),
-        parquet: complete(2),
+        parquet: Parquet::Complete { age: 2 },
         headroom_measurement: measurement(Status::Failed, Some(3600)),
         headroom: Some(Headroom {
             data: (1, 500 * G, 800 * M),
@@ -322,7 +393,7 @@ fn repin_suppressed_scenario() -> Scenario {
     let one = (1, 250 * G, 90 * G);
     Scenario {
         partitions: Some(p),
-        parquet: complete(3),
+        parquet: Parquet::Complete { age: 3 },
         headroom_measurement: complete(3),
         headroom: Some(Headroom {
             data: one,
@@ -359,7 +430,7 @@ fn floor_zero_scenario() -> Scenario {
     let one = (1, 200 * G, 20 * G);
     Scenario {
         partitions: Some(p),
-        parquet: complete(5),
+        parquet: Parquet::Complete { age: 5 },
         headroom_measurement: complete(5),
         headroom: Some(Headroom {
             data: one,
@@ -388,7 +459,7 @@ fn pressure_scenario() -> Scenario {
     let one = (1, 100 * G, 600 * M);
     Scenario {
         partitions: Some(p),
-        parquet: complete(1),
+        parquet: Parquet::Complete { age: 1 },
         headroom_measurement: complete(1),
         headroom: Some(Headroom {
             data: one,
@@ -413,7 +484,7 @@ fn awaiting_scenario() -> Scenario {
     let not_sampled = measurement(Status::NotSampled, None);
     Scenario {
         partitions: None,
-        parquet: not_sampled,
+        parquet: Parquet::NotSampled,
         headroom_measurement: not_sampled,
         headroom: None,
         wal: (0, 0, not_sampled),
@@ -428,7 +499,7 @@ fn scan_failed_scenario() -> Scenario {
     let one = (1, 250 * G, 180 * G);
     Scenario {
         partitions: None,
-        parquet: measurement(Status::Failed, None),
+        parquet: Parquet::FailedFirst,
         headroom_measurement: complete(4),
         headroom: Some(Headroom {
             data: one,
@@ -451,7 +522,7 @@ fn base_dashboard_scenario() -> Scenario {
     fill(&mut p, "prod", date(9, 9), today(), |_| 410);
     Scenario {
         partitions: Some(p),
-        parquet: complete(2),
+        parquet: Parquet::Complete { age: 2 },
         headroom_measurement: complete(2),
         headroom: Some(Headroom {
             data: (1, 536_870_912_000, 128_849_018_880),

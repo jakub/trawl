@@ -1454,7 +1454,15 @@ pub(crate) fn cached_wal_stats(configured: bool) -> StorageSnapshot {
 /// The fallback archive is configured even on a query-only cold start. An absent
 /// directory is a failed measurement, never a measured empty directory.
 pub(crate) fn cached_parquet_scan() -> (StorageSnapshot, Option<Arc<StorageScan>>) {
-    let (measurement, scan) = parquet_cache().read(true, Instant::now());
+    read_parquet_scan(parquet_cache(), Instant::now())
+}
+
+/// [`cached_parquet_scan`] over any Parquet cache, read at `now`.
+fn read_parquet_scan(
+    cache: &StorageCache<Arc<StorageScan>>,
+    now: Instant,
+) -> (StorageSnapshot, Option<Arc<StorageScan>>) {
+    let (measurement, scan) = cache.read(true, now);
     let totals = scan.as_ref().map(StorageSample::totals).unwrap_or_default();
     (
         StorageSnapshot {
@@ -1476,6 +1484,9 @@ pub(crate) fn cached_headroom() -> (
 ) {
     headroom_cache().read(true, Instant::now())
 }
+
+#[cfg(test)]
+mod capacity_fixtures;
 
 #[cfg(test)]
 pub(crate) mod test_support {
