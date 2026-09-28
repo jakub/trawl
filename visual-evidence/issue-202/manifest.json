@@ -1,15 +1,16 @@
 {
   "evidence": "Stub fixtures only; no daemon, database, or real ingest",
-  "head": "2f6b72ff9c1a8f0dfc3d8f2dd035710552b3eaf4",
-  "git_status": "?? visual-evidence/issue-202/\n",
+  "head": "661ec0f76d98d418355015376fe9b708aa76472d",
+  "git_status": "",
   "spec": "crates/trawl-web-ui/e2e/tests/health-page.spec.ts",
-  "spec_sha256": "bcf200ac0dad86e53c2a2d744f22ffe8dc4d3a9d6c82df8e3a2a4f97347aad14",
-  "spec_filter": "tests/health-page.spec.ts (whole file, 58 cases)",
-  "captured_at": "2026-09-28T03:10:17.436916Z",
+  "spec_sha256": "8df07cc41744d7b1e1c435c134d3415edd3005b5639f264d1a0920e8f16dc8fb",
+  "spec_filter": "tests/health-page.spec.ts (whole file, 60 cases)",
+  "captured_at": "2026-09-28T03:47:28.568748Z",
   "port": 8641,
   "color_scheme": "light",
   "dist": {
-    "sha256": "cd7bb8bf3c388c047cd4f8ca745fc0c2507cd70194e0bfd71e67bbd95e6ebb39",
+    "sha256": "a8d504a82429a77a246f7b4ab611e463733ced594b52f9426241009cf66c50fc",
+    "sha256_of": "the sha256sum listing of every file under crates/trawl-web-ui/dist, sorted by relative path",
     "files": [
       "fleet-ui-a30215ee41c73bb7.css",
       "fonts/AlbertSans-Variable.ttf",
@@ -19,13 +20,13 @@
       "fonts/README.md",
       "fonts/SHA256SUMS",
       "index.html",
-      "main-5c5c3d36f760b1fe.css",
+      "main-a63150e1c0a707f1.css",
       "snippets/fleet-ui-2165a24593f0a7f1/vendor/paper-shaders.js",
       "snippets/trawl-web-ui-f99d61b89517acef/vendor/codemirror.js",
       "snippets/trawl-web-ui-f99d61b89517acef/vendor/uplot.js",
       "theme-bootstrap-e7acc838d5582fa1.js",
-      "trawl-web-ui-3fce8c6163da5ef9.js",
-      "trawl-web-ui-3fce8c6163da5ef9_bg.wasm",
+      "trawl-web-ui-14c725b502d5c24e.js",
+      "trawl-web-ui-14c725b502d5c24e_bg.wasm",
       "uplot-5e0d12c918aed906.css",
       "vendor/codemirror.js",
       "vendor/uplot.js"
@@ -43,8 +44,8 @@
         "height": 1284
       },
       "theme": "light",
-      "sha256": "6b48fb2014cd3095bfdc43dcd34a75a550f076252c271adea20b333645fc07b7",
-      "bytes": 117084
+      "sha256": "da0312eb5d7a506a8b591f80cca0421122404d619b39acdb8c70b7aea4433653",
+      "bytes": 117118
     },
     {
       "file": "disk-retention-complete-390.png",
@@ -57,8 +58,8 @@
         "height": 1590
       },
       "theme": "light",
-      "sha256": "9f3d63a7a9c9be07caa6b5d6d2a9eb44b4be0849c0969f136c0ce23b2361ab17",
-      "bytes": 116287
+      "sha256": "08d6e9a9e32a90d88da8499a69962fc39649656e16d02810df7db77a5258d20f",
+      "bytes": 116688
     },
     {
       "file": "disk-retention-failed-retained-1440.png",
@@ -71,8 +72,8 @@
         "height": 1000
       },
       "theme": "light",
-      "sha256": "ec362c7cd66462a3823ffa307bf3198f8cbe5a703ce17fbb3ef419fe339e6e06",
-      "bytes": 81483
+      "sha256": "79004700047d07b793a62e87f090e23f5ac7ef2ae0801dede93c42d93d6b6525",
+      "bytes": 81356
     },
     {
       "file": "disk-retention-withheld-1440.png",
@@ -85,8 +86,8 @@
         "height": 1096
       },
       "theme": "light",
-      "sha256": "f95dfd24bb8c060d9e23f4990df86a4a7ac1395919c6fdaa43fe9685d7d45993",
-      "bytes": 96060
+      "sha256": "d0a55740abfc3b87fab715b44015262537d99e043931272827b7534a0bcc82ce",
+      "bytes": 96073
     },
     {
       "file": "disk-retention-pressure-1440.png",
@@ -99,8 +100,36 @@
         "height": 1000
       },
       "theme": "light",
-      "sha256": "42cf88e180a0460208d5a756a9cef859320c38de27a0f432a861433dfcc37ab0",
-      "bytes": 74865
+      "sha256": "6512962504f95bfb58ea8a957626b472b29976e0a89d9475516846785f568089",
+      "bytes": 75036
+    },
+    {
+      "file": "disk-retention-awaiting-1440.png",
+      "claim": "Before the first measurement: headroom and reach both read \"Awaiting measurement\", no sweep yet, and the empty environment list is not presented as measured",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-awaiting.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "theme": "light",
+      "sha256": "bdc7f9c96a3313f3d2303f8d2ba0dbec6cc75d012658f55862f43892f80168a8",
+      "bytes": 42139
+    },
+    {
+      "file": "disk-retention-scan-failed-1440.png",
+      "claim": "A Parquet scan that failed with nothing retained: headroom still reads its complete row, and reach reads \"Measurement unavailable; collection failed\" instead of a measured empty list",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-scan-failed.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "theme": "light",
+      "sha256": "94a84da3a97208a2a69c79095ed20d817ac2ab758c65cb2a0c1a22f47e8ba8ff",
+      "bytes": 50079
     }
   ]
 }
