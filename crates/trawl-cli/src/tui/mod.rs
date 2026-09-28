@@ -825,7 +825,17 @@ pub async fn run(
 
     let server_version = match health_result {
         Ok(h) => {
-            tracing::info!("health check ok, server version: {:?}", h.version);
+            match h.status {
+                trawl_api::HealthStatus::Ok | trawl_api::HealthStatus::Degraded => {
+                    tracing::info!("health check ok, server version: {:?}", h.version);
+                }
+                trawl_api::HealthStatus::Unavailable => {
+                    tracing::warn!(
+                        "server reports health status unavailable, server version: {:?}",
+                        h.version
+                    );
+                }
+            }
             h.version
         }
         Err(e) => {
