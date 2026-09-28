@@ -1054,6 +1054,13 @@ test.describe('Disk and retention', () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(reach(disk, 'prod')).toBeVisible();
     expect(await page.locator(SEL.healthPage).evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    // Every ISO date is one unbreakable run: it never wraps at its hyphen.
+    const isoDates = (await disk.textContent())!.match(/\d{4}-\d{2}-\d{2}/g) ?? [];
+    expect(isoDates.length).toBeGreaterThan(0);
+    const dates = disk.locator('.health-disk-date');
+    await expect(dates).toHaveCount(isoDates.length);
+    expect(await dates.allTextContents()).toEqual(isoDates);
+    expect(await dates.evaluateAll(els => els.map(el => el.getClientRects().length))).toEqual(isoDates.map(() => 1));
     await capture(page, testInfo, disk, 'disk-retention-complete-390.png', 'The same complete sample at a 390px phone width: every sentence wraps inside the card');
   });
 

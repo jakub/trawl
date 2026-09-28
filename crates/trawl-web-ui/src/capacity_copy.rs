@@ -217,6 +217,43 @@ pub fn empty_reach_line(parquet: StorageMeasurement) -> &'static str {
     }
 }
 
+/// Split `line` into runs, marking each ISO date (`YYYY-MM-DD`, not
+/// inside a longer digit run). The card sets each date in its own
+/// unbreakable run so a narrow screen never wraps one at its hyphen; the
+/// runs join back to `line` unchanged.
+pub fn date_runs(line: &str) -> Vec<(&str, bool)> {
+    const SHAPE: &[u8; 10] = b"dddd-dd-dd";
+    let bytes = line.as_bytes();
+    let digit_at = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+    let date_at = |start: usize| {
+        bytes.len() >= start + SHAPE.len()
+            && SHAPE.iter().enumerate().all(|(offset, want)| match want {
+                b'd' => digit_at(start + offset),
+                _ => bytes[start + offset] == *want,
+            })
+            && !(start > 0 && digit_at(start - 1))
+            && !digit_at(start + SHAPE.len())
+    };
+    let mut runs = Vec::new();
+    let (mut plain_from, mut at) = (0, 0);
+    while at < bytes.len() {
+        if date_at(at) {
+            if plain_from < at {
+                runs.push((&line[plain_from..at], false));
+            }
+            runs.push((&line[at..at + SHAPE.len()], true));
+            at += SHAPE.len();
+            plain_from = at;
+        } else {
+            at += 1;
+        }
+    }
+    if plain_from < bytes.len() {
+        runs.push((&line[plain_from..], false));
+    }
+    runs
+}
+
 /// The environments whose growth the projection left out (ADR-0042): a
 /// finite policy with too few observed days is reserved at its stored
 /// bytes. `None` when nothing was left out.
@@ -361,6 +398,52 @@ mod tests {
             ),
         ] {
             assert_eq!(empty_reach_line(measurement), line, "{measurement:?}");
+        }
+    }
+
+    /// The card sets each ISO date in its own unbreakable run, so the
+    /// split must find every date and keep the text byte for byte.
+    #[test]
+    fn date_runs_split_out_each_iso_date_and_keep_the_text() {
+        let joined =
+            |runs: Vec<(&str, bool)>| runs.into_iter().map(|(text, _)| text).collect::<String>();
+        let line = "Policy: 90 days. Oldest date: 2026-07-01. Stored: 9.0 GB.";
+        assert_eq!(
+            date_runs(line),
+            [
+                ("Policy: 90 days. Oldest date: ", false),
+                ("2026-07-01", true),
+                (". Stored: 9.0 GB.", false),
+            ]
+        );
+        let observed = "Observed: 7 days, 2026-09-19 to 2026-09-25.";
+        assert_eq!(
+            date_runs(observed),
+            [
+                ("Observed: 7 days, ", false),
+                ("2026-09-19", true),
+                (" to ", false),
+                ("2026-09-25", true),
+                (".", false),
+            ]
+        );
+        // A line that is one date, and lines with no date, including
+        // digit runs that only look like part of one.
+        assert_eq!(date_runs("2026-09-25"), [("2026-09-25", true)]);
+        for plain in [
+            "",
+            "Reach withheld: not enough observed days yet.",
+            "12026-09-25",
+            "2026-09-251",
+            "2026-9-25 and 2026/09/25",
+            "Deficit: 274 MB below the floor.",
+        ] {
+            let runs = date_runs(plain);
+            assert!(runs.iter().all(|(_, date)| !date), "{plain}: {runs:?}");
+            assert_eq!(joined(runs), plain);
+        }
+        for text in [line, observed] {
+            assert_eq!(joined(date_runs(text)), text);
         }
     }
 

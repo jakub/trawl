@@ -8,7 +8,7 @@ use crate::state::stats_stream::SharedDashboard;
 use crate::{
     api,
     capacity_copy::{
-        empty_reach_line, floor_line, growth_excluded_note, headroom_state, policy_line,
+        date_runs, empty_reach_line, floor_line, growth_excluded_note, headroom_state, policy_line,
         reach_line, roles_key, roles_label, sweep_line,
     },
     perms,
@@ -237,6 +237,22 @@ fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> S
     }
 }
 
+/// A card sentence with each ISO date in an unbreakable run, so a narrow
+/// screen never wraps a date at its hyphen. The text is unchanged.
+fn dated_text(line: &str) -> impl IntoView + use<> {
+    date_runs(line)
+        .into_iter()
+        .map(|(text, date)| {
+            let text = text.to_owned();
+            if date {
+                view! { <span class="health-disk-date">{text}</span> }.into_any()
+            } else {
+                text.into_any()
+            }
+        })
+        .collect_view()
+}
+
 /// The Disk and retention card (ADR-0042). It states measurements,
 /// evidence and a conditional projection, and never a verdict: no
 /// colour, no badge, no "safe". `parquet` is the snapshot's Parquet
@@ -294,8 +310,8 @@ fn HealthDiskRetention(capacity: Capacity, parquet: StorageMeasurement) -> impl 
                         <div data-env=env.env.clone()>
                             <dt><span class="mono">{env.env.clone()}</span></dt>
                             <dd>
-                                <p>{policy_line(&env)}</p>
-                                <p class="health-disk-reach">{reach_line(&env.reach, env.max_age_days)}</p>
+                                <p>{dated_text(&policy_line(&env))}</p>
+                                <p class="health-disk-reach">{dated_text(&reach_line(&env.reach, env.max_age_days))}</p>
                             </dd>
                         </div>
                     }).collect_view()}</dl>
