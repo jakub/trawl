@@ -21,6 +21,7 @@
 //! treating an empty list as "allow everything" installs the vulnerability
 //! this allowlist exists to close, silently.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -365,9 +366,9 @@ impl ResolvedConfig {
             .map_err(ConfigError::UpstreamConnectAddr)?;
         let upstream_tls = resolve_upstream_tls(
             resolve_upstream_ca_path(
-                std::env::var(ENV_UPSTREAM_CA_PATH).ok().as_deref(),
+                std::env::var_os(ENV_UPSTREAM_CA_PATH).as_deref(),
                 web.upstream_ca_path.as_deref(),
-            )
+            )?
             .as_deref(),
         )?;
         let allow_insecure_cookies = runtime
@@ -384,9 +385,9 @@ impl ResolvedConfig {
         };
         Ok(Self {
             bind_addr: resolve_bind_addr(
-                std::env::var(ENV_BIND_ADDR).ok().as_deref(),
+                std::env::var_os(ENV_BIND_ADDR).as_deref(),
                 web.bind_addr.as_deref(),
-            ),
+            )?,
             upstream_url,
             session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
             allow_insecure_cookies,
@@ -541,16 +542,36 @@ impl From<SessionRuntimeError> for ConfigError {
     }
 }
 
+/// The text of the environment override `name`, whose raw value is
+/// `value`. A value that is set but not UTF-8 is refused, naming the
+/// variable and never the value: read as unset, it would silently hand the
+/// choice back to the file.
+fn env_override<'a>(name: &str, value: Option<&'a OsStr>) -> Result<Option<&'a str>, ConfigError> {
+    value
+        .map(|value| {
+            value.to_str().ok_or_else(|| ConfigError::EnvUtf8 {
+                name: name.to_owned(),
+            })
+        })
+        .transpose()
+}
+
 /// Pick the listen address: [`ENV_BIND_ADDR`] first, then `[web] bind_addr`,
 /// then [`DEFAULT_BIND_ADDR`]. Empty values count as unset at both levels.
 ///
 /// Split from `from_parsed` so the precedence is testable without mutating
 /// process env (forbidden under `unsafe_code = "forbid"`).
-fn resolve_bind_addr(env_value: Option<&str>, configured: Option<&str>) -> String {
+///
+/// # Errors
+/// Returns [`ConfigError::EnvUtf8`] when the environment value is not UTF-8.
+fn resolve_bind_addr(
+    env_value: Option<&OsStr>,
+    configured: Option<&str>,
+) -> Result<String, ConfigError> {
     let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
-    pick(env_value)
+    Ok(pick(env_override(ENV_BIND_ADDR, env_value)?)
         .or_else(|| pick(configured))
-        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned())
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned()))
 }
 
 /// Pick the CA pin: [`ENV_UPSTREAM_CA_PATH`] first, then `[web]
@@ -561,11 +582,19 @@ fn resolve_bind_addr(env_value: Option<&str>, configured: Option<&str>) -> Strin
 ///
 /// Split from `from_parsed` so the precedence is testable without mutating
 /// process env (forbidden under `unsafe_code = "forbid"`).
-fn resolve_upstream_ca_path(env_value: Option<&str>, configured: Option<&Path>) -> Option<PathBuf> {
-    env_value
+///
+/// # Errors
+/// Returns [`ConfigError::EnvUtf8`] when the environment value is not
+/// UTF-8. Read as unset, it would fall back to the file's pin or to the
+/// platform roots.
+fn resolve_upstream_ca_path(
+    env_value: Option<&OsStr>,
+    configured: Option<&Path>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    Ok(env_override(ENV_UPSTREAM_CA_PATH, env_value)?
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| configured.map(Path::to_owned))
+        .or_else(|| configured.map(Path::to_owned)))
 }
 
 /// Check the rules every upstream URL follows, whatever the trust mode
@@ -895,6 +924,8 @@ fn load_key(web: &WebConfig) -> Result<SessionKey, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
     use crate::test_support::captured_logs;
 
@@ -1433,22 +1464,58 @@ session_ttl_secs = 3600
 
     #[test]
     fn bind_addr_precedence_env_then_config_then_default() {
+        let env = |value: &str| Some(OsString::from(value));
+        let resolve = |env_value: Option<OsString>, configured| {
+            resolve_bind_addr(env_value.as_deref(), configured).unwrap()
+        };
         assert_eq!(
-            resolve_bind_addr(Some("100.87.180.64:8090"), Some("127.0.0.1:9000")),
+            resolve(env("100.87.180.64:8090"), Some("127.0.0.1:9000")),
             "100.87.180.64:8090"
         );
-        assert_eq!(
-            resolve_bind_addr(None, Some("127.0.0.1:9000")),
-            "127.0.0.1:9000"
-        );
-        assert_eq!(resolve_bind_addr(None, None), DEFAULT_BIND_ADDR);
+        assert_eq!(resolve(None, Some("127.0.0.1:9000")), "127.0.0.1:9000");
+        assert_eq!(resolve(None, None), DEFAULT_BIND_ADDR);
         // Exported-but-blank is a shell accident, not a bind request — at
         // either level.
-        assert_eq!(
-            resolve_bind_addr(Some(""), Some("127.0.0.1:9000")),
-            "127.0.0.1:9000"
-        );
-        assert_eq!(resolve_bind_addr(Some(""), Some("")), DEFAULT_BIND_ADDR);
+        assert_eq!(resolve(env(""), Some("127.0.0.1:9000")), "127.0.0.1:9000");
+        assert_eq!(resolve(env(""), Some("")), DEFAULT_BIND_ADDR);
+    }
+
+    /// An override that is set but not UTF-8 is refused, naming the
+    /// variable and never its value. Read as unset, it would silently hand
+    /// the choice back to the file: for the CA pin, possibly to the
+    /// platform roots.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_override_is_refused_naming_the_variable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        const SENTINEL: &str = "s3ntinel";
+        let value = || {
+            let mut bytes = format!("/run/{SENTINEL}").into_bytes();
+            bytes.push(0xff);
+            OsString::from_vec(bytes)
+        };
+        let ca_error = resolve_upstream_ca_path(
+            Some(value().as_os_str()),
+            Some(Path::new("/etc/trawl/ca.pem")),
+        )
+        .expect_err("a non-UTF-8 CA path override must refuse");
+        let bind_error = resolve_bind_addr(Some(value().as_os_str()), Some("127.0.0.1:9000"))
+            .expect_err("a non-UTF-8 bind override must refuse");
+        for (error, name) in [
+            (ca_error, ENV_UPSTREAM_CA_PATH),
+            (bind_error, ENV_BIND_ADDR),
+        ] {
+            assert!(
+                matches!(&error, ConfigError::EnvUtf8 { name: n } if n == name),
+                "{error:?}"
+            );
+            let display = error.to_string();
+            assert!(display.contains(name), "got: {display}");
+            for rendered in [display, format!("{error:?}")] {
+                assert!(!rendered.contains(SENTINEL), "{rendered}");
+            }
+        }
     }
 
     #[test]
@@ -1796,25 +1863,26 @@ session_ttl_secs = 3600
     #[test]
     fn upstream_ca_path_precedence_env_then_config() {
         let configured = Path::new("/etc/trawl/ca.pem");
+        let env = |value: &str| Some(OsString::from(value));
+        let resolve = |env_value: Option<OsString>, configured| {
+            resolve_upstream_ca_path(env_value.as_deref(), configured).unwrap()
+        };
         assert_eq!(
-            resolve_upstream_ca_path(Some("/run/dev/cert.pem"), Some(configured)),
+            resolve(env("/run/dev/cert.pem"), Some(configured)),
             Some(PathBuf::from("/run/dev/cert.pem"))
         );
         assert_eq!(
-            resolve_upstream_ca_path(Some("/run/dev/cert.pem"), None),
+            resolve(env("/run/dev/cert.pem"), None),
             Some(PathBuf::from("/run/dev/cert.pem"))
         );
-        assert_eq!(
-            resolve_upstream_ca_path(None, Some(configured)),
-            Some(configured.to_owned())
-        );
-        assert_eq!(resolve_upstream_ca_path(None, None), None);
+        assert_eq!(resolve(None, Some(configured)), Some(configured.to_owned()));
+        assert_eq!(resolve(None, None), None);
         // Exported-but-blank is a shell accident: the file's setting holds.
         assert_eq!(
-            resolve_upstream_ca_path(Some(""), Some(configured)),
+            resolve(env(""), Some(configured)),
             Some(configured.to_owned())
         );
-        assert_eq!(resolve_upstream_ca_path(Some(""), None), None);
+        assert_eq!(resolve(env(""), None), None);
     }
 
     #[test]

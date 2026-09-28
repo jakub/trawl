@@ -451,8 +451,8 @@ variables log a line when they displace a configured value.
 | `FLEET_SESSION_COOKIE_DOMAIN` | Cookie `Domain=`. An empty value means a host-only cookie |
 | `FLEET_SESSION_COOKIE_SECURE` | `true` or `false`. `false` clears `Secure` on the session cookie |
 | `FLEET_SESSION_COOKIE_PATH` | Cookie `Path=`. The only accepted value is `/`. There is no `[web]` counterpart |
-| `TRAWL_WEB_BIND_ADDR` | Overrides `[web] bind_addr` |
-| `TRAWL_WEB_UPSTREAM_CA_PATH` | Overrides `[web] upstream_ca_path`. An empty value counts as unset, so the `[web]` key applies |
+| `TRAWL_WEB_BIND_ADDR` | Overrides `[web] bind_addr`. A value that is not UTF-8 is a startup error |
+| `TRAWL_WEB_UPSTREAM_CA_PATH` | Overrides `[web] upstream_ca_path`. An empty value counts as unset, so the `[web]` key applies. A value that is not UTF-8 is a startup error, not unset |
 
 The Helm chart passes `FLEET_SESSION_PUBLIC_ORIGINS` to the sidecar as well as
 rendering `public_origins` into the generated TOML.
