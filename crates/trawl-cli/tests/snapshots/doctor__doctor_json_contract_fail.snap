@@ -1,0 +1,81 @@
+---
+source: crates/trawl-cli/tests/doctor.rs
+expression: "normalize(&stub, &output.stdout)"
+---
+{
+  "version": 1,
+  "vantage": "client",
+  "target": {
+    "origin": "https://127.0.0.1:PORT",
+    "source": "CLI profile `prod` in ~/.config/trawl/config.toml"
+  },
+  "verdict": "fail",
+  "checks": [
+    {
+      "id": "connection.config",
+      "outcome": "complete",
+      "reason": null,
+      "detail": "trust: pinned CA from ca_cert in [profiles.prod]; key: token in [profiles.prod]",
+      "source": "CLI profile `prod` in ~/.config/trawl/config.toml",
+      "blocked_by": null,
+      "next_action": null
+    },
+    {
+      "id": "api.transport",
+      "outcome": "complete",
+      "reason": null,
+      "detail": null,
+      "source": null,
+      "blocked_by": null,
+      "next_action": null
+    },
+    {
+      "id": "api.tls",
+      "outcome": "complete",
+      "reason": null,
+      "detail": "verified under the pinned CA",
+      "source": null,
+      "blocked_by": null,
+      "next_action": null
+    },
+    {
+      "id": "api.health",
+      "outcome": "complete",
+      "reason": null,
+      "detail": "status: unavailable; server version 0.0.1-other",
+      "source": null,
+      "blocked_by": null,
+      "next_action": null
+    },
+    {
+      "id": "api.health.duckdb",
+      "outcome": "failed",
+      "reason": "reported error",
+      "detail": null,
+      "source": null,
+      "blocked_by": null,
+      "next_action": "read the server's log for why duckdb reports error"
+    },
+    {
+      "id": "api.health.ingest_capacity",
+      "outcome": "complete",
+      "reason": null,
+      "detail": "reported ok",
+      "source": null,
+      "blocked_by": null,
+      "next_action": null
+    },
+    {
+      "id": "api.identity",
+      "outcome": "failed",
+      "reason": "key rejected",
+      "detail": null,
+      "source": "token in [profiles.prod]",
+      "blocked_by": null,
+      "next_action": "check the key: it may be revoked, expired, or mistyped"
+    }
+  ],
+  "notes": [
+    "this CLI is version CLI_VERSION and the server reports version 0.0.1-other"
+  ]
+}

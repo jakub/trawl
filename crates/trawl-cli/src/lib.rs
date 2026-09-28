@@ -440,7 +440,7 @@ async fn run(mut args: Cli) -> Result<u8, CliError> {
     // target and key, and never reads config.toml the way other commands do.
     let command = match args.command.take() {
         Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await.map(|()| 0)?),
-        Some(Command::Doctor(doctor_args)) => return doctor::run(args.into(), doctor_args),
+        Some(Command::Doctor(doctor_args)) => return doctor::run(args.into(), doctor_args).await,
         command => command,
     };
     // The driver sends to whatever TUI holds the socket and never uses the

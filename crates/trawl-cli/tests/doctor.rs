@@ -12,13 +12,29 @@
 //!
 //! Where a case must not reach a server, a plain TCP listener stands where a
 //! wrong resolution would send the doctor, and records every connection and
-//! every `Authorization` header it sees.
+//! every `Authorization` header it sees. Where a case must reach one, a
+//! [`Stub`] answers over real TLS (rustls, certificates from an rcgen CA, as
+//! in `tests/ca_cert.rs`) or plain HTTP, and records every handshake and
+//! request. Every stub asserts that what it saw is within
+//! [`trawl_cli::doctor::REQUESTS`].
+//!
+//! Under `--url` the doctor trusts system roots only. On Linux those come
+//! from `rustls-native-certs`, which reads `SSL_CERT_FILE` when it is set,
+//! so a `--url` case that needs a verified connection sets that variable to
+//! the test CA on the subprocess alone. Every other run removes it.
 
-use std::io::Read as _;
-use std::net::TcpListener;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 const SAVED_TOKEN: &str = "flt_savedservertokenvalue";
 
@@ -119,12 +135,284 @@ impl Sandbox {
                 cmd.env_remove(key);
             }
         }
-        cmd.env("HOME", &self.home)
+        cmd.env_remove("SSL_CERT_FILE")
+            .env_remove("SSL_CERT_DIR")
+            .env("HOME", &self.home)
             .env("XDG_STATE_HOME", &self.state_home)
             .args(args)
             .envs(env.iter().copied());
         cmd.output().expect("spawn trawl")
     }
+}
+
+/// A port with nothing listening on it.
+fn closed_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.local_addr().expect("addr").port()
+}
+
+// ── TLS material ─────────────────────────────────────────────────────────
+
+/// A self-signed CA that can issue server certificates.
+fn ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    params.distinguished_name.push(DnType::CommonName, name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    CertifiedIssuer::self_signed(params, KeyPair::generate().expect("CA key")).expect("CA cert")
+}
+
+/// A server certificate for `127.0.0.1`, issued by `issuer`.
+fn leaf(issuer: &CertifiedIssuer<'static, KeyPair>) -> Identity {
+    let key = KeyPair::generate().expect("leaf key");
+    let mut params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("leaf params");
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let cert = params.signed_by(&key, issuer).expect("sign leaf");
+    Identity {
+        chain: vec![cert.der().clone()],
+        key: PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+    }
+}
+
+struct Identity {
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+// ── the recording stub ───────────────────────────────────────────────────
+
+/// One request a [`Stub`] received.
+#[derive(Debug, Clone)]
+struct Request {
+    method: String,
+    path: String,
+    /// The `Authorization` header's value, if one was sent.
+    authorization: Option<String>,
+}
+
+/// What a [`Stub`] saw.
+#[derive(Debug, Default)]
+struct StubSeen {
+    /// One entry per TLS connection: whether its handshake completed.
+    handshakes: Vec<bool>,
+    requests: Vec<Request>,
+}
+
+/// An answer: status and JSON body.
+type Route = (&'static str, u16, String);
+
+/// A listener on `127.0.0.1` that speaks TLS (or plain HTTP), answers each
+/// routed path with a fixed status and body, and records everything.
+struct Stub {
+    port: u16,
+    seen: Arc<Mutex<StubSeen>>,
+}
+
+impl Stub {
+    fn tls(identity: Identity, routes: Vec<Route>) -> Self {
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(identity.chain, identity.key)
+        .expect("server certificate");
+        Self::start(Some(Arc::new(config)), routes)
+    }
+
+    fn plain(routes: Vec<Route>) -> Self {
+        Self::start(None, routes)
+    }
+
+    fn start(tls: Option<Arc<rustls::ServerConfig>>, routes: Vec<Route>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(Mutex::new(StubSeen::default()));
+        let record = Arc::clone(&seen);
+        let routes = Arc::new(routes);
+        std::thread::spawn(move || {
+            for tcp in listener.incoming() {
+                let Ok(tcp) = tcp else { return };
+                let (tls, routes, record) = (tls.clone(), Arc::clone(&routes), Arc::clone(&record));
+                std::thread::spawn(move || serve(tcp, tls, &routes, &record));
+            }
+        });
+        Self { port, seen }
+    }
+
+    fn url(&self, scheme: &str) -> String {
+        format!("{scheme}://127.0.0.1:{}", self.port)
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.seen.lock().unwrap().requests.clone()
+    }
+
+    /// The handshake outcomes, once at least `count` have been recorded.
+    fn handshakes(&self, count: usize) -> Vec<bool> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = self.seen.lock().unwrap();
+            if seen.handshakes.len() >= count || Instant::now() > deadline {
+                return seen.handshakes.clone();
+            }
+            drop(seen);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn assert_no_authorization(&self, case: &str) {
+        for request in self.requests() {
+            assert!(
+                request.authorization.is_none(),
+                "{case}: {} {} carried an Authorization header",
+                request.method,
+                request.path
+            );
+        }
+    }
+}
+
+/// Every request a stub saw is one the doctor declares it may send.
+impl Drop for Stub {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            return;
+        }
+        for request in self.requests() {
+            assert!(
+                trawl_cli::doctor::REQUESTS
+                    .iter()
+                    .any(|(method, path)| request.method == *method && request.path == *path),
+                "{} {} is not in trawl_cli::doctor::REQUESTS",
+                request.method,
+                request.path
+            );
+        }
+    }
+}
+
+fn serve(
+    mut tcp: TcpStream,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    routes: &[Route],
+    seen: &Mutex<StubSeen>,
+) {
+    tcp.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let Some(config) = tls else {
+        answer(&mut tcp, routes, seen);
+        return;
+    };
+    let mut conn = rustls::ServerConnection::new(config).expect("server connection");
+    let mut completed = true;
+    while conn.is_handshaking() {
+        match conn.complete_io(&mut tcp) {
+            Ok((0, 0)) | Err(_) => {
+                completed = false;
+                break;
+            }
+            Ok(_) => {}
+        }
+    }
+    seen.lock().unwrap().handshakes.push(completed);
+    if completed {
+        let mut stream = rustls::StreamOwned::new(conn, tcp);
+        answer(&mut stream, routes, seen);
+        stream.conn.send_close_notify();
+        let _ = stream.flush();
+    }
+}
+
+/// Read one request, record it, and answer it from `routes`.
+fn answer<S: std::io::Read + std::io::Write>(
+    stream: &mut S,
+    routes: &[Route],
+    seen: &Mutex<StubSeen>,
+) {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let mut lines = head.split("\r\n");
+    let mut request_line = lines.next().unwrap_or_default().split(' ');
+    let method = request_line.next().unwrap_or_default().to_owned();
+    let path = request_line.next().unwrap_or_default().to_owned();
+    let authorization = lines.find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().to_owned())
+    });
+    seen.lock().unwrap().requests.push(Request {
+        method,
+        path: path.clone(),
+        authorization,
+    });
+    let (status, body) = routes.iter().find(|(route, _, _)| *route == path).map_or(
+        (404, r#"{"error":"not found"}"#.to_owned()),
+        |(_, status, body)| (*status, body.clone()),
+    );
+    let response = format!(
+        "HTTP/1.1 {status} Stub\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+const HEALTH_PATH: &str = "/api/v1/health";
+const WHOAMI_PATH: &str = "/api/v1/whoami";
+
+fn healthy() -> Route {
+    (
+        HEALTH_PATH,
+        200,
+        format!(
+            r#"{{"status":"ok","checks":{{"duckdb":"ok","ingest_capacity":"ok"}},"version":"{}"}}"#,
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+}
+
+fn whoami(permissions: &str) -> Route {
+    (
+        WHOAMI_PATH,
+        200,
+        format!(
+            r#"{{"prefix":"pfx12345","name":"ops-key","kind":"human","roles":["reader"],"permissions":[{permissions}]}}"#
+        ),
+    )
+}
+
+/// The checks of a report by id: `(outcome, reason, blocked_by)`.
+fn rows(report: &serde_json::Value) -> Vec<(String, String, Option<String>, Option<String>)> {
+    report["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .map(|check| {
+            (
+                check["id"].as_str().unwrap().to_owned(),
+                check["outcome"].as_str().unwrap().to_owned(),
+                check["reason"].as_str().map(str::to_owned),
+                check["blocked_by"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+fn check_by_id<'a>(report: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["id"] == id)
+        .unwrap_or_else(|| panic!("no {id} check in {report}"))
 }
 
 fn text(output: &Output) -> String {
@@ -368,22 +656,25 @@ fn doctor_profile_refuses_overrides() {
     recorder.assert_untouched("profile overrides");
 }
 
-/// `--url` never reads config.toml: a `[server].token` saved there is not
-/// selected, so the key is "none selected" and nothing carries it.
-///
-/// No check contacts the server yet, so the recorder asserts the absence of
-/// any `Authorization` header vacuously today; it becomes the end-to-end
-/// proof once the API checks send requests.
+/// `--url` never reads config.toml: neither the `[server].token` nor the
+/// `insecure` saved there is used. The server, trusted through system roots
+/// (`SSL_CERT_FILE` names the test CA), answers health, and sees no
+/// `Authorization` header: identity is `not_configured`, and the run passes.
 #[test]
 fn doctor_url_ignores_saved_token() {
     let home = Sandbox::new();
-    let recorder = Recorder::start();
-    let url = recorder.url("https");
+    let authority = ca("trawl doctor test CA");
+    let roots = home.file("roots.pem", &authority.pem());
+    let stub = Stub::tls(leaf(&authority), vec![healthy(), whoami(r#""query""#)]);
+    let url = stub.url("https");
     home.default_config(&format!(
         "[server]\nurl = \"{url}\"\ntoken = \"{SAVED_TOKEN}\"\ninsecure = true\n"
     ));
 
-    let output = home.trawl(&["doctor", "--url", &url, "--format", "json"], &[]);
+    let output = home.trawl(
+        &["doctor", "--url", &url, "--format", "json"],
+        &[("SSL_CERT_FILE", roots.to_str().unwrap())],
+    );
     assert!(!text(&output).contains(SAVED_TOKEN), "{}", text(&output));
     let report = report(&output);
     let check = connection_config(&report);
@@ -395,9 +686,17 @@ fn doctor_url_ignores_saved_token() {
     );
     assert_eq!(report["target"]["origin"], url);
     assert_eq!(report["vantage"], "client");
+    let tls = check_by_id(&report, "api.tls");
+    assert_eq!(tls["outcome"], "complete", "{report}");
+    assert_eq!(tls["detail"], "verified under system roots");
+    let identity = check_by_id(&report, "api.identity");
+    assert_eq!(identity["outcome"], "not_configured");
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
 
-    let seen = recorder.seen.lock().unwrap();
-    assert_eq!(seen.authorization_headers, 0, "the saved token was sent");
+    let requests = stub.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].path, HEALTH_PATH);
+    stub.assert_no_authorization("saved token");
 }
 
 /// Case name, extra flags, extra environment, expected reason suffix.
@@ -411,17 +710,21 @@ fn doctor_url_key_sources() {
     let home = Sandbox::new();
     let recorder = Recorder::start();
     let url = recorder.url("https");
+    // A run whose key resolves goes on to contact its target, so those runs
+    // aim at a port with nothing on it and the recorder sees only failures.
+    let closed = format!("https://127.0.0.1:{}", closed_port());
     let good = home.file("good.key", "flt_keyfilevalue\n");
     let empty = home.file("empty.key", "\n");
     let absent = home.home.join("absent.key");
 
-    let run = |extra: &[&str], env: &[(&str, &str)]| {
-        let mut args = vec!["doctor", "--url", url.as_str(), "--format", "json"];
+    let run_at = |target: &str, extra: &[&str], env: &[(&str, &str)]| {
+        let mut args = vec!["doctor", "--url", target, "--format", "json"];
         args.extend_from_slice(extra);
         home.trawl(&args, env)
     };
+    let run = |extra: &[&str], env: &[(&str, &str)]| run_at(&url, extra, env);
 
-    let output = run(&["--token-file", good.to_str().unwrap()], &[]);
+    let output = run_at(&closed, &["--token-file", good.to_str().unwrap()], &[]);
     let check = connection_config(&report(&output)).clone();
     assert_eq!(check["outcome"], "complete");
     assert!(
@@ -432,7 +735,8 @@ fn doctor_url_key_sources() {
     );
     assert!(!text(&output).contains("flt_keyfilevalue"));
 
-    let output = run(
+    let output = run_at(
+        &closed,
         &["--token-env", "DOCTOR_KEY"],
         &[("DOCTOR_KEY", "flt_envvalue")],
     );
@@ -543,9 +847,12 @@ fn doctor_missing_profile_fails_without_contact() {
     assert_eq!(check["reason"], "the config file does not exist");
     assert_eq!(check["source"], format!("config file {}", absent.display()));
 
+    // `lab` resolves and goes on to contact its own url, a closed port, so
+    // the recorder at `[server].url` still sees nothing.
+    let lab = format!("https://127.0.0.1:{}", closed_port());
     home.default_config(&format!(
         "[server]\nurl = \"{url}\"\ntoken = \"{SAVED_TOKEN}\"\n\n\
-         [profiles.lab]\nurl = \"{url}\"\n\n[profiles.nourl]\ninsecure = false\n"
+         [profiles.lab]\nurl = \"{lab}\"\n\n[profiles.nourl]\ninsecure = false\n"
     ));
     let cases = [
         ("prod", "the config file has no [profiles.prod]"),
@@ -586,13 +893,19 @@ fn doctor_missing_profile_fails_without_contact() {
 }
 
 /// `-p trial` resolves through the trial's reserved profile rules: the
-/// trial's recorded port, its operator key, and its pinned certificate.
+/// trial's recorded port, its operator key, and its pinned certificate. The
+/// trial's API is a TLS stub serving that certificate, so the pin verifies,
+/// and only then does the operator key reach `whoami`.
 #[test]
 fn doctor_trial_profile() {
     const TRIAL_TOKEN: &str = "flt_trialoperatortoken";
     let home = Sandbox::new();
-    let recorder = Recorder::start();
-    let trial_dir = write_trial(&home.state_home, recorder.port, TRIAL_TOKEN);
+    let (cert, identity) = trial_certificate();
+    let stub = Stub::tls(
+        identity,
+        vec![healthy(), whoami(r#""query","server_manage""#)],
+    );
+    let trial_dir = write_trial(&home.state_home, stub.port, TRIAL_TOKEN, &cert);
     home.default_config(&format!(
         "[server]\nurl = \"https://elsewhere.example:5514\"\ntoken = \"{SAVED_TOKEN}\"\ninsecure = true\n"
     ));
@@ -609,13 +922,30 @@ fn doctor_trial_profile() {
     assert_eq!(report_json["target"]["source"], "trial profile (-p trial)");
     assert_eq!(
         report_json["target"]["origin"],
-        format!("https://127.0.0.1:{}", recorder.port)
+        format!("https://127.0.0.1:{}", stub.port)
     );
+    assert_eq!(
+        check_by_id(&report_json, "api.tls")["detail"],
+        "verified under the pinned CA"
+    );
+    let identity = check_by_id(&report_json, "api.identity");
+    assert_eq!(identity["outcome"], "complete");
+    assert_eq!(identity["source"], "the trial's operator key");
     let all = text(&output);
     assert!(
-        !all.contains(TRIAL_TOKEN) && !all.contains(SAVED_TOKEN),
+        !all.contains(TRIAL_TOKEN) && !all.contains(SAVED_TOKEN) && !all.contains("pfx12345"),
         "{all}"
     );
+    let requests = stub.requests();
+    let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, [HEALTH_PATH, WHOAMI_PATH]);
+    assert_eq!(requests[0].authorization, None, "health carries no key");
+    assert_eq!(
+        requests[1].authorization.as_deref(),
+        Some(format!("Bearer {TRIAL_TOKEN}").as_str()),
+        "whoami carries the trial's operator key and nothing else"
+    );
+    let contacted = requests.len();
 
     // A user profile named `trial` is refused through the trial's own rule.
     let own = home.file("own.toml", "[profiles.trial]\nurl = \"https://x:1\"\n");
@@ -648,12 +978,29 @@ fn doctor_trial_profile() {
     assert_eq!(check["reason"], "there is no trial on this machine");
     assert_eq!(check["next_action"], "start one with `trawl trial up`");
 
-    recorder.assert_untouched("trial profile");
+    assert_eq!(
+        stub.requests().len(),
+        contacted,
+        "a refused or missing trial contacts nothing"
+    );
+}
+
+/// The shape of certificate `trawld` generates for a trial: self-signed,
+/// pinned as its own root.
+fn trial_certificate() -> (String, Identity) {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).expect("self-signed");
+    let identity = Identity {
+        chain: vec![cert.der().clone()],
+        key: PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+    };
+    (cert.pem(), identity)
 }
 
 /// A finished trial directory under `state_home`, in the shape
-/// `tests/trial_profile.rs` builds. Returns the trial directory.
-fn write_trial(state_home: &Path, api_port: u16, token: &str) -> PathBuf {
+/// `tests/trial_profile.rs` builds, pinning `ca_pem`. Returns the trial
+/// directory.
+fn write_trial(state_home: &Path, api_port: u16, token: &str, ca_pem: &str) -> PathBuf {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
     let dir = state_home.join("trawl/trial");
@@ -690,11 +1037,7 @@ fn write_trial(state_home: &Path, api_port: u16, token: &str) -> PathBuf {
     };
     write("state.json", state.to_string().as_bytes(), 0o600);
     write("operator.token", format!("{token}\n").as_bytes(), 0o600);
-    let pem = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
-        .expect("self-signed")
-        .cert
-        .pem();
-    write("ca.pem", pem.as_bytes(), 0o644);
+    write("ca.pem", ca_pem.as_bytes(), 0o644);
     dir
 }
 
@@ -708,4 +1051,381 @@ fn other_commands_keep_their_exit_status() {
     assert_eq!(bad.status.code(), Some(1), "{}", text(&bad));
     let refused = home.trawl(&["-p", "trial", "driver", "status"], &[]);
     assert_eq!(refused.status.code(), Some(1), "{}", text(&refused));
+}
+
+const PROFILE_TOKEN: &str = "flt_profiletokenvalue";
+
+/// Write `[profiles.NAME]` with `url`, `token`, and one trust line.
+fn profile(home: &Sandbox, name: &str, url: &str, trust: &str) {
+    home.default_config(&format!(
+        "[profiles.{name}]\nurl = \"{url}\"\ntoken = \"{PROFILE_TOKEN}\"\n{trust}\n"
+    ));
+}
+
+/// Wait out any late handshake, then return them all.
+fn settled_handshakes(stub: &Stub) -> Vec<bool> {
+    stub.handshakes(1);
+    std::thread::sleep(Duration::from_millis(200));
+    stub.handshakes(1)
+}
+
+/// A certificate the client does not trust fails `api.tls`, naming the
+/// trust mode and pointing at `ca_cert`; health and identity are blocked by
+/// it. From the server's end, the handshake failed and no request arrived,
+/// so no bearer header was ever sent. Checked under system roots (`--url`)
+/// and under a pin to another CA (a profile).
+#[test]
+fn doctor_untrusted_cert_sends_no_key() {
+    let home = Sandbox::new();
+    let server_ca = ca("trawl doctor server CA");
+    let other_ca = ca("trawl doctor other CA");
+    let key = home.file("key", &format!("{PROFILE_TOKEN}\n"));
+    let other_pem = home.file("other.pem", &other_ca.pem());
+
+    let cases = [
+        (
+            "--url under system roots",
+            "system roots",
+            "in a CLI profile",
+        ),
+        (
+            "profile pinned to another CA",
+            "the pinned CA",
+            "point ca_cert",
+        ),
+    ];
+    for (case, mode, next) in cases {
+        let stub = Stub::tls(leaf(&server_ca), vec![healthy(), whoami(r#""query""#)]);
+        let output = if mode == "system roots" {
+            home.trawl(
+                &[
+                    "doctor",
+                    "--url",
+                    &stub.url("https"),
+                    "--token-file",
+                    key.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+                &[],
+            )
+        } else {
+            profile(
+                &home,
+                "pinned",
+                &stub.url("https"),
+                &format!("ca_cert = \"{}\"", other_pem.display()),
+            );
+            home.trawl(&["doctor", "-p", "pinned", "--format", "json"], &[])
+        };
+        assert_eq!(output.status.code(), Some(1), "{case}: {}", text(&output));
+        let report = report(&output);
+        let tls = check_by_id(&report, "api.tls");
+        assert_eq!(tls["outcome"], "failed", "{case}");
+        assert_eq!(
+            tls["reason"],
+            format!("certificate not trusted under {mode}"),
+            "{case}"
+        );
+        let next_action = tls["next_action"].as_str().unwrap();
+        assert!(
+            next_action.contains("ca_cert") && next_action.contains(next),
+            "{case}: {next_action}"
+        );
+        assert_eq!(
+            rows(&report)[1..],
+            [
+                (
+                    "api.transport".to_owned(),
+                    "complete".to_owned(),
+                    None,
+                    None
+                ),
+                (
+                    "api.tls".to_owned(),
+                    "failed".to_owned(),
+                    Some(format!("certificate not trusted under {mode}")),
+                    None
+                ),
+                (
+                    "api.health".to_owned(),
+                    "not_sampled".to_owned(),
+                    Some("blocked".to_owned()),
+                    Some("api.tls".to_owned())
+                ),
+                (
+                    "api.identity".to_owned(),
+                    "not_sampled".to_owned(),
+                    Some("blocked".to_owned()),
+                    Some("api.tls".to_owned())
+                ),
+            ],
+            "{case}"
+        );
+        assert!(!text(&output).contains(PROFILE_TOKEN), "{case}");
+
+        assert_eq!(
+            settled_handshakes(&stub),
+            [false],
+            "{case}: one handshake, failed, and no retry"
+        );
+        assert!(
+            stub.requests().is_empty(),
+            "{case}: no request reached the server"
+        );
+    }
+}
+
+/// `insecure` and a plain `http` URL each fail `api.tls` and block health
+/// and identity. The one request the server sees is the unkeyed health
+/// probe that decided `api.transport`; no `Authorization` header arrives.
+#[test]
+fn doctor_insecure_never_sends_key() {
+    let home = Sandbox::new();
+    let server_ca = ca("trawl doctor server CA");
+    let key = home.file("key", &format!("{PROFILE_TOKEN}\n"));
+    let key = key.to_str().unwrap();
+
+    let cases = [
+        ("profile insecure = true", "certificate not verified"),
+        ("--url --insecure", "certificate not verified"),
+        ("--url over plain http", "connection is not TLS"),
+    ];
+    for (case, reason) in cases {
+        let routes = vec![healthy(), whoami(r#""query""#)];
+        let stub = if case.contains("plain http") {
+            Stub::plain(routes)
+        } else {
+            Stub::tls(leaf(&server_ca), routes)
+        };
+        let output = match case {
+            "profile insecure = true" => {
+                profile(&home, "lax", &stub.url("https"), "insecure = true");
+                home.trawl(&["doctor", "-p", "lax", "--format", "json"], &[])
+            }
+            "--url --insecure" => home.trawl(
+                &[
+                    "doctor",
+                    "--url",
+                    &stub.url("https"),
+                    "--insecure",
+                    "--token-file",
+                    key,
+                    "--format",
+                    "json",
+                ],
+                &[],
+            ),
+            _ => home.trawl(
+                &[
+                    "doctor",
+                    "--url",
+                    &stub.url("http"),
+                    "--token-file",
+                    key,
+                    "--format",
+                    "json",
+                ],
+                &[],
+            ),
+        };
+        assert_eq!(output.status.code(), Some(1), "{case}: {}", text(&output));
+        let report = report(&output);
+        assert_eq!(
+            rows(&report)[1..],
+            [
+                (
+                    "api.transport".to_owned(),
+                    "complete".to_owned(),
+                    None,
+                    None
+                ),
+                (
+                    "api.tls".to_owned(),
+                    "failed".to_owned(),
+                    Some(reason.to_owned()),
+                    None
+                ),
+                (
+                    "api.health".to_owned(),
+                    "not_sampled".to_owned(),
+                    Some("blocked".to_owned()),
+                    Some("api.tls".to_owned())
+                ),
+                (
+                    "api.identity".to_owned(),
+                    "not_sampled".to_owned(),
+                    Some("blocked".to_owned()),
+                    Some("api.tls".to_owned())
+                ),
+            ],
+            "{case}"
+        );
+        assert!(!text(&output).contains(PROFILE_TOKEN), "{case}");
+        let requests = stub.requests();
+        let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, [HEALTH_PATH], "{case}: only the unkeyed probe");
+        stub.assert_no_authorization(case);
+    }
+}
+
+/// A 503 keeps its per-check body. Rows are sorted by name: `ok` is
+/// complete (the unknown `corpus` included), `error` and `refusing` fail, an
+/// unrecognized value fails and is shown when it is a plain identifier, and
+/// a name that is not one becomes `api.health.invalid_key` without being
+/// echoed. The run exits 1.
+#[test]
+fn doctor_health_rows_map_values() {
+    let home = Sandbox::new();
+    let server_ca = ca("trawl doctor server CA");
+    let pem = home.file("ca.pem", &server_ca.pem());
+    let body = r#"{"status":"unavailable","checks":{"duckdb":"error","corpus":"ok","auth_db":"ok","data_path":"recovering","storage_db":"Weird Value!","ingest_capacity":"refusing","Bad-Key":"ok"},"version":"9.9.9"}"#;
+    let stub = Stub::tls(
+        leaf(&server_ca),
+        vec![(HEALTH_PATH, 503, body.to_owned()), whoami(r#""query""#)],
+    );
+    profile(
+        &home,
+        "prod",
+        &stub.url("https"),
+        &format!("ca_cert = \"{}\"", pem.display()),
+    );
+    let output = home.trawl(&["doctor", "-p", "prod", "--format", "json"], &[]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let report = report(&output);
+    let health: Vec<(String, String, Option<String>)> = rows(&report)
+        .into_iter()
+        .filter(|(id, ..)| id.starts_with("api.health"))
+        .map(|(id, outcome, reason, _)| (id, outcome, reason))
+        .collect();
+    let own = |id: &str, outcome: &str, reason: Option<&str>| {
+        (id.to_owned(), outcome.to_owned(), reason.map(str::to_owned))
+    };
+    assert_eq!(
+        health,
+        [
+            own("api.health", "complete", None),
+            own("api.health.auth_db", "complete", None),
+            own("api.health.corpus", "complete", None),
+            own(
+                "api.health.data_path",
+                "failed",
+                Some("reported recovering, a value this CLI does not know")
+            ),
+            own("api.health.duckdb", "failed", Some("reported error")),
+            own(
+                "api.health.ingest_capacity",
+                "failed",
+                Some("reported refusing")
+            ),
+            own(
+                "api.health.storage_db",
+                "failed",
+                Some("unrecognized value")
+            ),
+            own(
+                "api.health.invalid_key",
+                "failed",
+                Some("the server reported a check name that is not [a-z0-9_]{1,64}")
+            ),
+        ]
+    );
+    assert_eq!(
+        check_by_id(&report, "api.health")["detail"],
+        "status: unavailable; server version 9.9.9"
+    );
+    assert_eq!(check_by_id(&report, "api.identity")["outcome"], "complete");
+    assert_eq!(report["verdict"], "fail");
+    let all = text(&output);
+    assert!(!all.contains("Bad-Key") && !all.contains("Weird"), "{all}");
+    assert!(
+        report["notes"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("the server reports version 9.9.9"),
+        "{report}"
+    );
+}
+
+/// The versioned JSON document for a pass, a fail, and an incomplete run,
+/// and the text form of the fail. Ports and the CLI's own version are
+/// replaced by placeholders, so the snapshots hold only the contract.
+#[test]
+fn doctor_json_contract() {
+    let home = Sandbox::new();
+    let server_ca = ca("trawl doctor server CA");
+    let pem = home.file("ca.pem", &server_ca.pem());
+    let normalize = |stub: &Stub, output: &[u8]| {
+        String::from_utf8(output.to_vec())
+            .unwrap()
+            .replace(&format!("127.0.0.1:{}", stub.port), "127.0.0.1:PORT")
+            .replace(env!("CARGO_PKG_VERSION"), "CLI_VERSION")
+    };
+    let failing_health = r#"{"status":"unavailable","checks":{"duckdb":"error","ingest_capacity":"ok"},"version":"0.0.1-other"}"#;
+    let unauthorized =
+        r#"{"error":{"code":"unauthorized","message":"invalid API key","details":[]}}"#;
+    let cases: [(&str, Vec<Route>, i32); 3] = [
+        ("pass", vec![healthy(), whoami(r#""query""#)], 0),
+        (
+            "fail",
+            vec![
+                (HEALTH_PATH, 503, failing_health.to_owned()),
+                (WHOAMI_PATH, 401, unauthorized.to_owned()),
+            ],
+            1,
+        ),
+        (
+            "incomplete",
+            vec![
+                healthy(),
+                (
+                    WHOAMI_PATH,
+                    429,
+                    r#"{"error":{"code":"rate_limited","message":"slow down","details":[]}}"#
+                        .to_owned(),
+                ),
+            ],
+            3,
+        ),
+    ];
+    for (name, routes, exit) in cases {
+        let stub = Stub::tls(leaf(&server_ca), routes);
+        profile(
+            &home,
+            "prod",
+            &stub.url("https"),
+            &format!("ca_cert = \"{}\"", pem.display()),
+        );
+        let output = home.trawl(&["doctor", "-p", "prod", "--format", "json"], &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{name}: {}",
+            text(&output)
+        );
+        let all = text(&output);
+        assert!(
+            !all.contains(PROFILE_TOKEN) && !all.contains("pfx12345"),
+            "{name}: {all}"
+        );
+        insta::assert_snapshot!(
+            format!("doctor_json_contract_{name}"),
+            normalize(&stub, &output.stdout)
+        );
+        if name == "fail" {
+            let output = home.trawl(&["doctor", "-p", "prod", "--format", "table"], &[]);
+            assert_eq!(output.status.code(), Some(exit), "{}", text(&output));
+            insta::assert_snapshot!("doctor_text_fail", normalize(&stub, &output.stdout));
+        }
+        for request in stub.requests() {
+            match request.path.as_str() {
+                HEALTH_PATH => assert_eq!(request.authorization, None, "{name}"),
+                _ => assert_eq!(
+                    request.authorization.as_deref(),
+                    Some(format!("Bearer {PROFILE_TOKEN}").as_str()),
+                    "{name}"
+                ),
+            }
+        }
+    }
 }

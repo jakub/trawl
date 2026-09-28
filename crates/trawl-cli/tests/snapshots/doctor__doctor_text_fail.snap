@@ -1,0 +1,14 @@
+---
+source: crates/trawl-cli/tests/doctor.rs
+expression: "normalize(&stub, &output.stdout)"
+---
+target: https://127.0.0.1:PORT (CLI profile `prod` in ~/.config/trawl/config.toml)
+connection.config           complete        trust: pinned CA from ca_cert in [profiles.prod]; key: token in [profiles.prod]; source: CLI profile `prod` in ~/.config/trawl/config.toml
+api.transport               complete
+api.tls                     complete        verified under the pinned CA
+api.health                  complete        status: unavailable; server version 0.0.1-other
+api.health.duckdb           failed          reported error; next: read the server's log for why duckdb reports error
+api.health.ingest_capacity  complete        reported ok
+api.identity                failed          key rejected; source: token in [profiles.prod]; next: check the key: it may be revoked, expired, or mistyped
+note: this CLI is version CLI_VERSION and the server reports version 0.0.1-other
+verdict: fail (exit 1)
