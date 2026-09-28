@@ -124,7 +124,9 @@ crashDump:
 # or set config.raw to provide your own TOML verbatim.
 config:
   # Set to a complete trawld.toml string to bypass structured templating.
-  # Only supported with tls.mode=auto; raw TOML owns its TLS paths.
+  # Only supported with tls.mode=auto; raw TOML owns its TLS paths. With
+  # web.enabled it must set [data] path: the chart mounts trawld's generated
+  # certificate into trawl-web from <parent of that path>/tls.
   raw: ""
 
   server:

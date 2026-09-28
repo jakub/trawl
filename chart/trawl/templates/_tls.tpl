@@ -97,8 +97,9 @@ The sidecar always dials trawld over the pod's loopback and always verifies
 its certificate:
 
 - auto: trawld writes {state_dir}/tls/cert.pem, for localhost and 127.0.0.1,
-  where state_dir is the parent of [data] path. The sidecar mounts that
-  directory of the data volume read-only at the same path and pins the file.
+  where state_dir is the parent of [data] path (config.raw's own [data]
+  path when set). The sidecar mounts that directory of the data volume
+  read-only at the same path and pins the file.
   trawl-web derives its upstream, https://127.0.0.1:<port>, from [server].
 - secret, certManager: the certificate names a DNS host, so trawl-web asks
   for https://<tls.upstreamServerName>:<port> and connects to
@@ -131,14 +132,42 @@ is false, except that auto refuses the values it would contradict.
   {{- end -}}
   {{- if eq $tls.mode "auto" -}}
     {{- $data := include "trawl.dataMountPath" . -}}
+    {{- $field := "config.data.path" -}}
     {{- $path := toString .Values.config.data.path -}}
-    {{- $stateDir := dir (clean $path) -}}
-    {{- $onData := and (hasPrefix "/" $path) (or (eq $stateDir $data) (hasPrefix (printf "%s/" $data) $stateDir)) -}}
-    {{- if and .Values.crashDump.enabled (or (eq $stateDir .Values.crashDump.mountPath) (hasPrefix (printf "%s/" .Values.crashDump.mountPath) $stateDir)) -}}
-      {{- $onData = false -}}
+    {{- /* config.raw replaces the structured values, so config.data.path
+         says nothing about where trawld puts its state. Read the raw
+         TOML's own [data] path. The parse error is not echoed: it can
+         quote a line of the config, secrets included. */ -}}
+    {{- if .Values.config.raw -}}
+      {{- $field = "config.raw [data] path" -}}
+      {{- $raw := fromToml .Values.config.raw -}}
+      {{- if hasKey $raw "Error" -}}
+        {{- fail "config.raw is not valid TOML: when tls.mode=auto and web.enabled=true the chart reads its [data] path to mount trawld's generated certificate into trawl-web" -}}
+      {{- end -}}
+      {{- $table := get $raw "data" -}}
+      {{- if not (and (kindIs "map" $table) (hasKey $table "path") (kindIs "string" (get $table "path"))) -}}
+        {{- fail "config.raw must set [data] path when tls.mode=auto and web.enabled=true: trawld generates its certificate in the parent of that path, and the chart mounts it into trawl-web from there" -}}
+      {{- end -}}
+      {{- $path = get $table "path" -}}
     {{- end -}}
-    {{- if not $onData -}}
-      {{- fail (printf "config.data.path must be an absolute path whose parent is %s or a directory on the data volume below it when tls.mode=auto and web.enabled=true: trawld generates its certificate in <parent>/tls, and trawl-web pins it from the data volume; got %q" $data $path) -}}
+    {{- $stateDir := dir (clean $path) -}}
+    {{- if not (and (hasPrefix "/" $path) (or (eq $stateDir $data) (hasPrefix (printf "%s/" $data) $stateDir))) -}}
+      {{- fail (printf "%s must be an absolute path whose parent is %s or a directory on the data volume below it when tls.mode=auto and web.enabled=true: trawld generates its certificate in <parent>/tls, and trawl-web pins it from the data volume; got %q" $field $data $path) -}}
+    {{- end -}}
+    {{- /* Every other mount of the trawld container. One at, under, or
+         above <state_dir>/tls would put the certificate trawld writes on
+         another volume while trawl-web pins the data volume's copy. The
+         key directory beside it, <state_dir>/tls-key, is never pinned. */ -}}
+    {{- $tlsDir := printf "%s/tls" $stateDir -}}
+    {{- $mounts := list (dict "path" "/tmp" "field" "trawld's /tmp mount") (dict "path" "/etc/trawl/trawld.toml" "field" "trawld's config mount") -}}
+    {{- if .Values.crashDump.enabled -}}
+      {{- $mounts = append $mounts (dict "path" (toString .Values.crashDump.mountPath) "field" "crashDump.mountPath") -}}
+    {{- end -}}
+    {{- range $mounts -}}
+      {{- $mount := clean .path -}}
+      {{- if or (eq $mount $tlsDir) (hasPrefix (printf "%s/" $mount) $tlsDir) (hasPrefix (printf "%s/" $tlsDir) $mount) -}}
+        {{- fail (printf "%s %q must not be at, under, or above trawld's generated certificate directory %s when tls.mode=auto and web.enabled=true: trawld would write its certificate to that volume while trawl-web pins the data volume's %s" .field .path $tlsDir $tlsDir) -}}
+      {{- end -}}
     {{- end -}}
     {{- $subPath := "tls" -}}
     {{- if ne $stateDir $data -}}

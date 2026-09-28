@@ -251,15 +251,18 @@ assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
   "value: \"${web_origin},http://localhost:8090\"" "$origins_sts"
 
 # config.raw replaces the generated TOML wholesale, so the env var is the
-# only thing carrying the allowlist in that topology.
+# only thing carrying the allowlist in that topology. With the sidecar on,
+# the chart reads the raw [data] path to mount trawld's certificate.
+raw_toml="$work_dir/raw.toml"
+printf '[server]\n[data]\npath = "/var/lib/trawl/data"\n' >"$raw_toml"
 raw_sts="$work_dir/raw-sts.yaml"
-render "${web_enabled[@]}" --set-string 'config.raw=[server]' >"$raw_sts"
+render "${web_enabled[@]}" --set-file "config.raw=$raw_toml" >"$raw_sts"
 assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
   "value: \"${web_origin}\"" "$raw_sts"
 
 raw_config="$work_dir/raw-config.yaml"
 render_only configmap.yaml "${web_enabled[@]}" \
-  --set-string 'config.raw=[server]' >"$raw_config"
+  --set-file "config.raw=$raw_toml" >"$raw_config"
 if grep -Fq 'public_origins' "$raw_config"; then
   echo "config.raw must replace the generated TOML, allowlist included" >&2
   exit 1

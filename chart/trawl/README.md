@@ -77,7 +77,9 @@ absolute path pins a CA file that you mount with `web.extraVolumes` and
 Chart-managed TLS mounts require structured config values. `config.raw` is
 accepted only with `tls.mode: auto`, where the raw TOML controls TLS and the
 chart mounts no TLS Secret. Helm cannot validate arbitrary TOML certificate
-paths against its volume mounts.
+paths against its volume mounts. With `web.enabled`, the chart reads the raw
+TOML's `[data] path` and mounts the `tls` directory beside it, so the raw
+TOML must set `[data] path` and the matching `[web]` keys.
 
 Follow [configure the daemon API certificate](https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate)
 for complete values, issuance checks, and client verification. cert-manager's

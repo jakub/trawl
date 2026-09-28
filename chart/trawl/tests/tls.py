@@ -102,6 +102,22 @@ class TLS(unittest.TestCase):
         self.assertEqual(server["tls_key_path"], "/etc/trawl/tls/tls.key")
         self.assertEqual(server["tls_reload_interval_secs"], 300)
 
+    def assert_sidecar_sees_only_tls(self, objects, state_dir):
+        # trawld keeps its generated key in <state_dir>/tls-key, beside tls/.
+        # The sidecar gets the tls directory of the data volume and nothing
+        # that covers the state directory or the key directory.
+        mounts = container(objects, "trawl-web")["volumeMounts"]
+        data = [m for m in mounts if m["name"] == "data"]
+        self.assertEqual(len(data), 1, mounts)
+        self.assertEqual(data[0]["mountPath"], f"{state_dir}/tls")
+        self.assertEqual(f"/var/lib/trawl/{data[0]['subPath']}", f"{state_dir}/tls")
+        key_dir = f"{state_dir}/tls-key"
+        for mount in mounts:
+            path = mount["mountPath"].rstrip("/")
+            with self.subTest(mount=mount["name"]):
+                self.assertFalse(state_dir == path or state_dir.startswith(f"{path}/"), mount)
+                self.assertFalse(key_dir == path or key_dir.startswith(f"{path}/") or path.startswith(f"{key_dir}/"), mount)
+
     def test_default_creates_no_certificate_or_tls_mount(self):
         objects = self.objects()
         self.assertEqual(objects["certificate"], {})
@@ -213,6 +229,7 @@ class TLS(unittest.TestCase):
         self.assertEqual(pod(objects)["securityContext"]["runAsUser"], 1000)
         self.assertEqual(pod(objects)["securityContext"]["runAsGroup"], 1000)
         self.assertEqual(pod(objects)["securityContext"]["fsGroup"], 1000)
+        self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl")
 
         # The pin follows the state directory: the parent of [data] path.
         for path, sub_path, mount_path in [
@@ -224,15 +241,16 @@ class TLS(unittest.TestCase):
                 self.assertEqual(web_config(objects)["upstream_ca_path"], f"{mount_path}/cert.pem")
                 mount = next(m for m in container(objects, "trawl-web")["volumeMounts"] if m["name"] == "data")
                 self.assertEqual(mount, {"name": "data", "mountPath": mount_path, "subPath": sub_path, "readOnly": True})
+                self.assert_sidecar_sees_only_tls(objects, mount_path.removesuffix("/tls"))
         for path in ["/srv/trawl/data", "/var/lib/trawl", "/var/lib/trawler/data", "data"]:
             with self.subTest(path=path):
                 self.fails({"web": web(), "config": {"data": {"path": path}}}, "config.data.path")
 
         # config.raw owns its TOML, but the sidecar still mounts per mode.
-        raw = '[server]\nhttp_addr = "0.0.0.0:5514"\n'
+        raw = '[server]\nhttp_addr = "0.0.0.0:5514"\n[data]\npath = "/var/lib/trawl/data"\n'
         objects = self.objects({"web": web(), "config": {"raw": raw}})
         self.assertEqual(objects["configmap"]["data"]["trawld.toml"].strip(), raw.strip())
-        self.assertIn("data", [m["name"] for m in container(objects, "trawl-web")["volumeMounts"]])
+        self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl")
 
         # auto pins the generated certificate; the other modes' values contradict it.
         for field, value in [("upstreamServerName", "api.example.com"), ("upstreamCa", "system")]:
@@ -241,6 +259,60 @@ class TLS(unittest.TestCase):
                     self.fails({"web": web_values, "tls": {field: value}}, f"tls.{field}")
         self.fails({"web": web(runAsUser=1000)}, "web.runAsUser")
         self.fails({"web": web(runAsUser=1234), "securityContext": {"runAsUser": 1234}}, "web.runAsUser")
+
+    def test_auto_mode_generated_tls_dir_is_not_shadowed(self):
+        # A crash-dump mount at, under, or above <state_dir>/tls would put
+        # trawld's certificate on the cores volume while the sidecar pins
+        # the data volume's tls directory.
+        for mount_path, data_path in [
+            ("/var/lib/trawl/tls", "/var/lib/trawl/data"),
+            ("/var/lib/trawl/tls/", "/var/lib/trawl/data"),
+            ("/var/lib/trawl/tls/cores", "/var/lib/trawl/data"),
+            ("/var/lib/trawl/nested", "/var/lib/trawl/nested/data"),
+            ("/var/lib/trawl/nested/tls", "/var/lib/trawl/nested/data"),
+        ]:
+            with self.subTest(mount_path=mount_path, data_path=data_path):
+                self.fails({"web": web(), "config": {"data": {"path": data_path}},
+                            "crashDump": {"enabled": True, "mountPath": mount_path}}, "crashDump.mountPath")
+        # Siblings of the tls directory are fine, prefix look-alikes included.
+        for mount_path in ["/var/lib/trawl/cores", "/var/lib/trawl/tls-cores", "/var/lib/trawl/tlsx"]:
+            with self.subTest(mount_path=mount_path):
+                objects = self.objects({"web": web(), "crashDump": {"enabled": True, "mountPath": mount_path}})
+                self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl")
+        # Nothing pins the generated certificate without the sidecar or the dump volume.
+        self.objects({"crashDump": {"enabled": True, "mountPath": "/var/lib/trawl/tls"}})
+        self.objects({"web": web(), "crashDump": {"enabled": False, "mountPath": "/var/lib/trawl/tls"}})
+
+    def test_auto_mode_raw_config_derives_mount(self):
+        # config.raw replaces the structured values, so the state directory
+        # comes from the raw TOML's [data] path, not config.data.path.
+        raw = ('[data]\npath = "/var/lib/trawl/nested/data"\n'
+               '[web]\nupstream_ca_path = "/var/lib/trawl/nested/tls/cert.pem"\n')
+        objects = self.objects({"web": web(), "config": {"raw": raw}})
+        self.assertEqual(objects["configmap"]["data"]["trawld.toml"].strip(), raw.strip())
+        mount = next(m for m in container(objects, "trawl-web")["volumeMounts"] if m["name"] == "data")
+        self.assertEqual(mount, {"name": "data", "mountPath": "/var/lib/trawl/nested/tls",
+                                 "subPath": "nested/tls", "readOnly": True})
+        self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl/nested")
+
+        for raw, expected in [
+            ('[server]\nhttp_addr = "0.0.0.0:5514"\n', "config.raw must set [data] path"),
+            ('[data]\n', "config.raw must set [data] path"),
+            ('data = "/var/lib/trawl/data"\n', "config.raw must set [data] path"),
+            ('[data]\npath = 5\n', "config.raw must set [data] path"),
+            ('[data\npath = "/var/lib/trawl/data"\n', "config.raw is not valid TOML"),
+            ('[data]\npath = "/srv/trawl/data"\n', "config.raw [data] path"),
+            ('[data]\npath = "data"\n', "config.raw [data] path"),
+        ]:
+            with self.subTest(raw=raw):
+                self.fails({"web": web(), "config": {"raw": raw}}, expected)
+        # The raw path meets the same crash-dump check.
+        self.fails({"web": web(), "config": {"raw": '[data]\npath = "/var/lib/trawl/nested/data"\n'},
+                    "crashDump": {"enabled": True, "mountPath": "/var/lib/trawl/nested"}}, "crashDump.mountPath")
+        # Without the sidecar the chart never reads the raw TOML.
+        for raw in ['[server]\nhttp_addr = "0.0.0.0:5514"\n', '[data\n']:
+            with self.subTest(raw=raw):
+                self.objects({"config": {"raw": raw}})
 
     def test_upstream_trust_secret_modes(self):
         secret = {"mode": "secret", "secretName": "operator-api-tls", "upstreamServerName": "trawl.example.com"}
