@@ -234,7 +234,8 @@ impl HttpClient {
     /// returned as `Ok` with `status: unavailable`. Any other failure status,
     /// or a 503 with a foreign body (a proxy's error page), stays a
     /// [`ClientError::Server`]. No body is read past [`HEALTH_BODY_CAP`]: a
-    /// success body past it is [`ClientError::TooLarge`].
+    /// success body past it, or a 503 body past it, is
+    /// [`ClientError::TooLarge`].
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
         let url = self.endpoint("/api/v1/health");
 
@@ -248,7 +249,12 @@ impl HttpClient {
         let status = resp.status();
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             let (body, truncated) = read_capped(resp, HEALTH_BODY_CAP).await?;
-            if !truncated && let Ok(health) = serde_json::from_slice::<HealthResponse>(&body) {
+            if truncated {
+                return Err(ClientError::TooLarge {
+                    cap: HEALTH_BODY_CAP,
+                });
+            }
+            if let Ok(health) = serde_json::from_slice::<HealthResponse>(&body) {
                 return Ok(health);
             }
             return Err(server_error(503, &body));
@@ -1147,7 +1153,7 @@ fn reqwest_client(
 pub struct ProbeResponse {
     /// HTTP status code.
     pub status: u16,
-    /// At most [`OriginProbe::BODY_CAP`] bytes of the body.
+    /// The whole body, at most [`OriginProbe::BODY_CAP`] bytes.
     pub body: Vec<u8>,
 }
 
@@ -1232,10 +1238,19 @@ impl OriginProbe {
         Self::send(req).await
     }
 
+    /// Send `req` and read the whole body. A body past
+    /// [`Self::BODY_CAP`] is [`ClientError::TooLarge`], never a prefix:
+    /// a caller matches the body exactly, and a prefix of a foreign body
+    /// can be exactly what it looks for.
     async fn send(req: reqwest::RequestBuilder) -> Result<ProbeResponse, ClientError> {
         let resp = req.send().await.map_err(sanitize_reqwest_error)?;
         let status = resp.status().as_u16();
-        let (body, _) = read_capped(resp, Self::BODY_CAP).await?;
+        let (body, truncated) = read_capped(resp, Self::BODY_CAP).await?;
+        if truncated {
+            return Err(ClientError::TooLarge {
+                cap: Self::BODY_CAP,
+            });
+        }
         Ok(ProbeResponse { status, body })
     }
 }
@@ -1675,7 +1690,8 @@ mod tests {
 
     /// Only a 503 carrying a health body is kept. A 502 is an error whatever
     /// its body says, and a 503 from something else (a proxy's page, the
-    /// error envelope, a body past the cap) stays an error too.
+    /// error envelope) stays an error too. A 503 body past the cap is
+    /// too large: its status never decides, because none of it was judged.
     #[tokio::test]
     async fn health_foreign_bodies_still_error() {
         let health = br#"{"status":"ok","checks":{"duckdb":"ok"}}"#;
@@ -1739,7 +1755,7 @@ mod tests {
         .await
         .expect_err("a body past the cap is not a health answer");
         assert!(
-            matches!(err, ClientError::Server { status: 503, .. }),
+            matches!(err, ClientError::TooLarge { cap } if cap == HEALTH_BODY_CAP),
             "{err:?}"
         );
     }
@@ -2052,16 +2068,36 @@ mod tests {
         }
     }
 
-    /// A probe reads at most `BODY_CAP` bytes of a body.
+    /// A probe reads at most `BODY_CAP` bytes. A body past it is too
+    /// large, never its prefix: a prefix of a foreign body can be exactly
+    /// the answer a caller matches. A body of exactly `BODY_CAP` bytes is
+    /// whole.
     #[tokio::test]
     async fn origin_probe_caps_the_body() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let big = vec![b'a'; OriginProbe::BODY_CAP * 4];
         let web = probe(address);
+        let mut big = br#"{"error":"bad request"}"#.to_vec();
+        big.resize(OriginProbe::BODY_CAP, b' ');
+        big.extend_from_slice(b"trailing garbage");
+        let (result, _) = tokio::join!(
+            web.login_probe("http://example.test"),
+            serve_once(
+                listener,
+                http_response("400 Bad Request", "application/json", &big)
+            )
+        );
+        assert!(
+            matches!(result, Err(ClientError::TooLarge { cap }) if cap == OriginProbe::BODY_CAP),
+            "{result:?}"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let web = probe(listener.local_addr().unwrap());
+        let whole = vec![b'a'; OriginProbe::BODY_CAP];
         let (result, _) = tokio::join!(
             web.healthz(),
-            serve_once(listener, http_response("200 OK", "text/plain", &big))
+            serve_once(listener, http_response("200 OK", "text/plain", &whole))
         );
         let response = result.unwrap();
         assert_eq!(response.status, 200);

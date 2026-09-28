@@ -1756,7 +1756,8 @@ fn doctor_identity_requires_exactly_200() {
 /// A 200 health or whoami body past the client's cap is not read: the
 /// check fails with `response too large`, and the run finishes with a
 /// report rather than a crash. An oversized health body blocks identity,
-/// so no key goes out.
+/// so no key goes out. A 503 health body past the cap is too large as
+/// well, not an HTTP 503 answer: none of it was judged.
 #[test]
 fn doctor_oversized_bodies_are_too_large() {
     let pad = "x".repeat(70 * 1024);
@@ -1782,6 +1783,19 @@ fn doctor_oversized_bodies_are_too_large() {
         ]
     );
     stub.assert_no_authorization("oversized health");
+
+    let unavailable = format!(
+        r#"{{"status":"unavailable","checks":{{"duckdb":"error"}},"version":"{}","pad":"{pad}"}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    let (output, stub) =
+        doctor_against(vec![(HEALTH_PATH, 503, unavailable), whoami(r#""query""#)]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let unavailable_report = report(&output);
+    let health = check_by_id(&unavailable_report, "api.health");
+    assert_eq!(health["outcome"], "failed");
+    assert_eq!(health["reason"], "response too large");
+    stub.assert_no_authorization("oversized 503 health");
 
     let who = format!(
         r#"{{"prefix":"pfx12345","name":"ops-key","kind":"human","roles":[],"permissions":["query"],"pad":"{pad}"}}"#
