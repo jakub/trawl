@@ -196,6 +196,27 @@ pub fn reach_line(reach: &Reach, max_age_days: u64) -> String {
     }
 }
 
+/// The reach group's one line when it lists no environment, read from the
+/// snapshot's Parquet measurement. An empty list is a measured fact only
+/// when a scan completed (ADR-0033): before the first scan, or after a
+/// failed one that retained nothing, nothing was measured, and the words
+/// are the Storage card's. A failed scan that retained a sample still
+/// reports what its last complete scan found.
+pub fn empty_reach_line(parquet: StorageMeasurement) -> &'static str {
+    match (parquet.status, parquet.sample_age_secs) {
+        (StorageMeasurementStatus::Complete, Some(_)) => "No stored date partitions yet.",
+        (StorageMeasurementStatus::Failed, Some(_)) => {
+            "Collection failed; the last complete scan found no stored date partitions."
+        }
+        (StorageMeasurementStatus::NotSampled, _) => "Awaiting measurement",
+        (StorageMeasurementStatus::Failed, None) => "Measurement unavailable; collection failed",
+        (StorageMeasurementStatus::NotConfigured, _) => "Not configured",
+        // The producer requires an age on complete samples (see
+        // `headroom_state`).
+        (StorageMeasurementStatus::Complete, None) => "Measurement unavailable",
+    }
+}
+
 /// The environments whose growth the projection left out (ADR-0042): a
 /// finite policy with too few observed days is reserved at its stored
 /// bytes. `None` when nothing was left out.
@@ -297,6 +318,49 @@ mod tests {
                 format!("{sentence}{OBSERVED}"),
                 "{low:?} {high:?}"
             );
+        }
+    }
+
+    /// An empty environment list is a measured fact only when a complete
+    /// Parquet scan established it (ADR-0033): before the first scan, or
+    /// after a failed one with nothing retained, the list is unmeasured.
+    #[test]
+    fn empty_reach_says_measured_only_after_a_complete_scan() {
+        let parquet = |status, sample_age_secs| StorageMeasurement {
+            status,
+            sample_age_secs,
+        };
+        for (measurement, line) in [
+            (
+                parquet(StorageMeasurementStatus::Complete, Some(2)),
+                "No stored date partitions yet.",
+            ),
+            (
+                parquet(StorageMeasurementStatus::Complete, Some(0)),
+                "No stored date partitions yet.",
+            ),
+            (
+                parquet(StorageMeasurementStatus::NotSampled, None),
+                "Awaiting measurement",
+            ),
+            (
+                parquet(StorageMeasurementStatus::Failed, None),
+                "Measurement unavailable; collection failed",
+            ),
+            (
+                parquet(StorageMeasurementStatus::Failed, Some(3600)),
+                "Collection failed; the last complete scan found no stored date partitions.",
+            ),
+            (
+                parquet(StorageMeasurementStatus::NotConfigured, None),
+                "Not configured",
+            ),
+            (
+                parquet(StorageMeasurementStatus::Complete, None),
+                "Measurement unavailable",
+            ),
+        ] {
+            assert_eq!(empty_reach_line(measurement), line, "{measurement:?}");
         }
     }
 

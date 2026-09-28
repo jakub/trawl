@@ -952,8 +952,10 @@ const capacity = (name: string) => JSON.parse(readFileSync(`${__dirname}/../harn
 test.describe('Disk and retention', () => {
   const OBSERVED = 'Observed: 7 days, 2026-09-19 to 2026-09-25.';
 
-  async function open(page: Page, request: APIRequestContext, fixture: string) {
-    await setup(request, 'health-admin', { dashboardSnapshot: { capacity: capacity(fixture) } });
+  // `part` fixtures carry snapshot fields beside the capacity object and
+  // merge whole; the rest are a capacity object alone.
+  async function open(page: Page, request: APIRequestContext, fixture: string, part = false) {
+    await setup(request, 'health-admin', { dashboardSnapshot: part ? capacity(fixture) : { capacity: capacity(fixture) } });
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.goto('/settings/health');
     await diagnosticPhase(page, 'Live');
@@ -972,7 +974,7 @@ test.describe('Disk and retention', () => {
     await expect(disk.locator('[role="alert"], [role="status"], .badge, .health-check-error, [class*="danger"], [class*="warn"], [class*="success"], [class*="ok"]')).toHaveCount(0);
     await expect(disk).not.toContainText(/\b(safe|healthy|ok|fine|good)\b/i);
     const reading = await page.locator(`${SEL.healthStorage} [data-source="parquet"] > p`).first().evaluate(el => getComputedStyle(el).color);
-    const colors = await disk.locator('.health-disk-reach, .health-disk-list dd > p').evaluateAll(els => [...new Set(els.map(el => getComputedStyle(el).color))]);
+    const colors = await disk.locator('.health-disk-reach, .health-disk-list dd > p, .health-disk-group > p:not(.health-note)').evaluateAll(els => [...new Set(els.map(el => getComputedStyle(el).color))]);
     expect(colors).toEqual([reading]);
   }
 
@@ -1121,6 +1123,40 @@ test.describe('Disk and retention', () => {
     await capture(page, testInfo, disk, 'disk-retention-pressure-1440.png',
       'Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, a sweep that ran out of candidates below the floor, and a shortened prod range');
   });
+
+  // An empty environment list is measured only when a complete Parquet
+  // scan established it (ADR-0033). Before the first scan, or after one
+  // that failed with nothing retained, the reach group says so in the
+  // Storage card's own words, and never "No stored date partitions".
+  for (const { fixture, line, headroom, claim } of [
+    {
+      fixture: 'awaiting',
+      line: 'Awaiting measurement',
+      headroom: 'Awaiting measurement',
+      claim: 'Before the first measurement: headroom and reach both read "Awaiting measurement", no sweep yet, and the empty environment list is not presented as measured',
+    },
+    {
+      fixture: 'scan-failed',
+      line: 'Measurement unavailable; collection failed',
+      headroom: 'Complete measurement: 180.0 GB available of 250.0 GB. Sample age: 4s at this snapshot.',
+      claim: 'A Parquet scan that failed with nothing retained: headroom still reads its complete row, and reach reads "Measurement unavailable; collection failed" instead of a measured empty list',
+    },
+  ]) {
+    test(`an empty list without a complete scan reads as ${fixture}, not as measured`, async ({ page, request }, testInfo) => {
+      const disk = await open(page, request, fixture, true);
+      const parquet = page.locator(`${SEL.healthStorage} [data-source="parquet"] > p`).first();
+      await expect(parquet).toHaveText(line);
+      const reachGroup = group(disk, 'reach');
+      await expect(reachGroup.locator('dl')).toHaveCount(0);
+      await expect(reachGroup.locator('h3 + p')).toHaveText(line);
+      await expect(disk).not.toContainText('No stored date partitions');
+      await expect(disk.locator('.health-disk-excluded')).toHaveCount(0);
+      await expect(group(disk, 'headroom')).toContainText(headroom);
+      await fact(group(disk, 'pressure'), 'Last sweep', 'No sweep yet since process start');
+      await noVerdict(page, disk);
+      await capture(page, testInfo, disk, `disk-retention-${fixture}-1440.png`, claim);
+    });
+  }
 
   test('the card is admin-gated with the rest of the diagnostics', async ({ page, request }) => {
     await setup(request, 'health-viewer', { dashboardSnapshot: { capacity: capacity('pressure') } });

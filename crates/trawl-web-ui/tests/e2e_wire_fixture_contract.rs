@@ -945,6 +945,67 @@ fn health_capacity_pressure_fixture_carries_the_evidence() {
     ));
 }
 
+/// The unmeasured cases carry the snapshot's Parquet fields beside the
+/// capacity object, since the card reads the Parquet measurement to tell
+/// an unmeasured empty list from a measured one. Each field is the
+/// `DashboardSnapshot` field of the same name and type, and nothing else
+/// rides along.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnmeasuredSnapshotPart {
+    parquet_files: u64,
+    parquet_bytes: u64,
+    parquet_measurement: trawl_api::StorageMeasurement,
+    capacity: trawl_api::Capacity,
+}
+
+/// No environments, and no complete Parquet scan to establish that: one
+/// case before the first scan, one after a scan that failed with nothing
+/// retained. Neither may read as a measured empty list (ADR-0033).
+#[test]
+fn health_capacity_unmeasured_fixtures_carry_no_complete_scan() {
+    use trawl_api::StorageMeasurementStatus;
+
+    let awaiting: UnmeasuredSnapshotPart = decode(
+        "health-capacity-awaiting.json",
+        include_str!("../e2e/harness/wire/health-capacity-awaiting.json"),
+    );
+    let scan_failed: UnmeasuredSnapshotPart = decode(
+        "health-capacity-scan-failed.json",
+        include_str!("../e2e/harness/wire/health-capacity-scan-failed.json"),
+    );
+    for (name, part, status) in [
+        ("awaiting", &awaiting, StorageMeasurementStatus::NotSampled),
+        (
+            "scan-failed",
+            &scan_failed,
+            StorageMeasurementStatus::Failed,
+        ),
+    ] {
+        assert_eq!(part.parquet_measurement.status, status, "{name}");
+        assert_eq!(
+            part.parquet_measurement.sample_age_secs, None,
+            "{name}: no retained scan"
+        );
+        assert_eq!((part.parquet_files, part.parquet_bytes), (0, 0), "{name}");
+        assert!(part.capacity.environments.is_empty(), "{name}");
+        assert!(part.capacity.growth_excluded.is_empty(), "{name}");
+        assert_eq!(part.capacity.pressure.last_sweep, None, "{name}");
+    }
+    // Before the first attempt nothing is measured; after a failed scan
+    // the headroom attempt, a separate cache, can still be complete.
+    assert_eq!(
+        awaiting.capacity.headroom.measurement.status,
+        StorageMeasurementStatus::NotSampled
+    );
+    assert!(awaiting.capacity.headroom.filesystems.is_empty());
+    assert_eq!(
+        scan_failed.capacity.headroom.measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(scan_failed.capacity.headroom.filesystems.len(), 1);
+}
+
 #[test]
 fn history_export_and_error_fixtures_match_wire_types_and_test_cases() {
     let rows: trawl_api::HistoryResponse = decode(

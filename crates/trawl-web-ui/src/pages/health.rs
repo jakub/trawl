@@ -8,8 +8,8 @@ use crate::state::stats_stream::SharedDashboard;
 use crate::{
     api,
     capacity_copy::{
-        floor_line, growth_excluded_note, headroom_state, policy_line, reach_line, roles_key,
-        roles_label, sweep_line,
+        empty_reach_line, floor_line, growth_excluded_note, headroom_state, policy_line,
+        reach_line, roles_key, roles_label, sweep_line,
     },
     perms,
     service_card_fmt::{format_bytes, format_count, format_exact, format_uptime},
@@ -239,9 +239,10 @@ fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> S
 
 /// The Disk and retention card (ADR-0042). It states measurements,
 /// evidence and a conditional projection, and never a verdict: no
-/// colour, no badge, no "safe".
+/// colour, no badge, no "safe". `parquet` is the snapshot's Parquet
+/// measurement, which says whether an empty environment list was measured.
 #[component]
-fn HealthDiskRetention(capacity: Capacity) -> impl IntoView {
+fn HealthDiskRetention(capacity: Capacity, parquet: StorageMeasurement) -> impl IntoView {
     let Capacity {
         headroom,
         pressure,
@@ -286,7 +287,7 @@ fn HealthDiskRetention(capacity: Capacity) -> impl IntoView {
         <div class="health-disk-group" data-group="reach">
             <h3>"Retention reach"</h3>
             {if environments.is_empty() {
-                view! { <p>"No stored date partitions yet."</p> }.into_any()
+                view! { <p>{empty_reach_line(parquet)}</p> }.into_any()
             } else {
                 view! {
                     <dl class="health-disk-list">{environments.into_iter().map(|env| view! {
@@ -360,7 +361,7 @@ fn HealthDiagnostics() -> impl IntoView {
             <section class="health-disk" aria-labelledby="health-disk-title">
                 <h2 id="health-disk-title">"Disk and retention"</h2>
                 <p class="health-diagnostic-state" class:sr-only=move || dashboard.get().phase == DashboardPhase::Live>{move || dashboard.get().phase.label()}</p>
-                {move || dashboard.get().snapshot.map(|s| view! { <HealthDiskRetention capacity=s.capacity/> })}
+                {move || dashboard.get().snapshot.map(|s| view! { <HealthDiskRetention capacity=s.capacity parquet=s.parquet_measurement/> })}
                 <p class="health-note"><a href="https://trawl.sh/operate/health/" target="_blank" rel="noopener noreferrer">"How to read disk and retention"</a></p>
             </section>
         </div>
