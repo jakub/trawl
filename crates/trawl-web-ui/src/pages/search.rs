@@ -809,12 +809,18 @@ pub fn Search() -> impl IntoView {
     // derivations are pure (`search_status.rs`): the footer describes
     // the active result source, and nothing else on the page.
     let snapshot_failed = Signal::derive(move || rows.get().is_some_and(|r| r.is_err()));
+    let snapshot_recovering = Signal::derive(move || {
+        rows.with(
+            |result| matches!(result, Some(Err(failure)) if failure.error.recovering().is_some()),
+        )
+    });
     Effect::new(move |_| {
         shell_status.kind.set(search_status(StatusInputs {
             unreadable: unreadable.get(),
             live: live.get(),
             stream_failed: stream_failure.get().is_some(),
             snapshot_failed: snapshot_failed.get(),
+            snapshot_recovering: snapshot_recovering.get(),
             snapshot_pending: loading.get(),
         }));
     });

@@ -70,6 +70,8 @@ test.describe('recovering notice', () => {
     await expect(alert.locator(SEL.recoveringNoticeTitle)).toHaveText(COPY.recoveringTitle);
     await expect(alert.locator(SEL.recoveringNoticeText)).toHaveText(RECOVERING.error.message);
     await expectNoOtherState(page);
+    // The footer names the same state, never a fault.
+    await expect(page.locator(SEL.statusLabel)).toHaveText('Recovering');
     // The one control is the Retry: the same request can succeed once
     // the server catches up.
     const buttons = page.locator(SEL.resultsPane).getByRole('button');
@@ -85,17 +87,21 @@ test.describe('recovering notice', () => {
     await expect.poll(queries.count).toBe(1);
     await queries.answer(0, 503, RECOVERING);
     await expect(notice(page)).toBeVisible();
+    await expect(page.locator(SEL.statusLabel)).toHaveText('Recovering');
 
     await page.locator(SEL.resultsPane).getByRole('button', { name: 'Retry', exact: true }).click();
     await expect.poll(queries.count).toBe(2);
     // While the second request is out, the first refusal is not its
-    // verdict: no notice, and no load failure copy for it either.
+    // verdict: no notice, and no load failure copy for it either. The
+    // footer reports the request in flight, not the refusal it retries.
     await expect(notice(page)).toHaveCount(0);
     await expect(page.locator(SEL.loadHintError)).toHaveCount(0);
+    await expect(page.locator(SEL.statusLabel)).toHaveText('Hauling');
 
     await queries.answer(1, 200, wire('query-rows'));
     await expect(page.locator(SEL.resultsPane).locator('tbody tr').first()).toBeVisible();
     await expect(notice(page)).toHaveCount(0);
+    await expect(page.locator(SEL.statusLabel)).toContainText('Connected');
   });
 
   test('Visualization shows the same notice, not the snapshot failure copy', async ({ page }, testInfo) => {
@@ -129,5 +135,6 @@ test.describe('recovering notice', () => {
 
     await expect(page.locator(SEL.loadHintError)).toHaveText(/Couldn't load results: service unavailable/);
     await expect(notice(page)).toHaveCount(0);
+    await expect(page.locator(SEL.statusLabel)).toHaveText('Error');
   });
 });

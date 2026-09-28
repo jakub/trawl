@@ -55,7 +55,7 @@ A snapshot the server refused as a parse or validation failure. It renders in th
 _Avoid_: 400, bad request, syntax banner
 
 **Recovering notice**:
-What the results region shows on both results tabs when the server refuses a snapshot as `corpus_recovering`. The server is still loading data from before a restart, or finishing an interrupted storage rollup, and cannot yet count every stored event once. The notice has the title "Search is recovering", the server's own sentence and a Retry. It is never an empty result or a load error. Live mode reads the stream, which this refusal does not touch.
+What the results region shows on both results tabs when the server refuses a snapshot as `corpus_recovering`. The server is still loading data from before a restart, or finishing an interrupted storage rollup, and cannot yet count every stored event once. The notice has the title "Search is recovering", the server's own sentence and a Retry. The footer status beside it reads Recovering, and Hauling while the Retry runs. It is never an empty result or a load error. Live mode reads the stream, which this refusal does not touch.
 _Avoid_: outage, server error, no results
 
 **Draft diagnostic**:
