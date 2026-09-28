@@ -6,9 +6,9 @@
 //!
 //! The binary target (`src/main.rs`) is a one-line shim over [`main`]; the
 //! command implementations live here so integration tests can drive them
-//! directly against a real server instead of shelling out. [`cli`] and
-//! [`schema`] are public for exactly that reason — `config` and `tui` stay
-//! private.
+//! directly against a real server instead of shelling out. [`cli`],
+//! [`doctor`] and [`schema`] are public for exactly that reason — `config`
+//! and `tui` stay private.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 pub mod cli;
 mod config;
+pub mod doctor;
 pub mod schema;
 mod trial;
 mod tui;
@@ -101,6 +102,12 @@ enum Command {
         #[command(subcommand)]
         cmd: DriverSubcommand,
     },
+
+    /// Check one client connection: configuration, TLS, health, and key.
+    ///
+    /// Name the target with --url or --profile; the TRAWL_* environment is
+    /// refused. Exits 0 pass, 1 fail, 3 incomplete, 2 on a usage error.
+    Doctor(doctor::DoctorArgs),
 
     /// Run a disposable trial installation in Docker on this machine:
     /// loopback only, with sample data. `-p trial` connects to it.
@@ -394,6 +401,9 @@ pub enum CliError {
     Usage(String),
     #[error("{0}")]
     Trial(#[from] trial::TrialError),
+    /// A usage error found after parsing; it exits 2 as clap's own do.
+    #[error("{0}")]
+    Arg(Box<clap::Error>),
 }
 
 /// The binary's entry point: parse argv, run, and map errors to an exit code.
@@ -401,23 +411,36 @@ pub enum CliError {
 pub async fn main() {
     let args = Cli::parse();
 
-    if let Err(e) = run(args).await {
-        // Broken pipe is expected (e.g. `trawl query ... | head`), exit quietly.
-        if let CliError::Io(ref io_err) = e
-            && io_err.kind() == io::ErrorKind::BrokenPipe
-        {
-            process::exit(1);
-        }
-        eprintln!("trawl: {e}");
-        process::exit(1);
+    match run(args).await {
+        // Only `trawl doctor` returns a status other than 0.
+        Ok(0) => {}
+        Ok(status) => process::exit(i32::from(status)),
+        Err(CliError::Arg(e)) => e.exit(),
+        Err(e) => exit_on_error(&e),
     }
 }
 
-async fn run(mut args: Cli) -> Result<(), CliError> {
+/// Report `e` and exit 1.
+fn exit_on_error(e: &CliError) -> ! {
+    // Broken pipe is expected (e.g. `trawl query ... | head`), exit quietly.
+    if let CliError::Io(io_err) = e
+        && io_err.kind() == io::ErrorKind::BrokenPipe
+    {
+        process::exit(1);
+    }
+    eprintln!("trawl: {e}");
+    process::exit(1);
+}
+
+/// Run the command and return its exit status. Every command but `doctor`
+/// returns 0 on success and an error otherwise.
+async fn run(mut args: Cli) -> Result<u8, CliError> {
     // Trial verbs run before config.toml is read: a broken client config
-    // must not block `trawl trial up` or `down`.
+    // must not block `trawl trial up` or `down`. `doctor` selects its own
+    // target and key, and never reads config.toml the way other commands do.
     let command = match args.command.take() {
-        Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await?),
+        Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await.map(|()| 0)?),
+        Some(Command::Doctor(doctor_args)) => return doctor::run(args.into(), doctor_args),
         command => command,
     };
     // The driver sends to whatever TUI holds the socket and never uses the
@@ -524,10 +547,24 @@ async fn run(mut args: Cli) -> Result<(), CliError> {
             run_driver(&socket, cmd).await?;
         }
 
-        Some(Command::Trial { .. }) => unreachable!("trial verbs return before the config loads"),
+        Some(Command::Trial { .. } | Command::Doctor(_)) => {
+            unreachable!("trial and doctor return before the config loads")
+        }
     }
 
-    Ok(())
+    Ok(0)
+}
+
+impl From<Cli> for doctor::Globals {
+    fn from(args: Cli) -> Self {
+        Self {
+            url: args.url,
+            token: args.token.is_some(),
+            insecure: args.insecure,
+            profile: args.profile,
+            config: args.config,
+        }
+    }
 }
 
 /// The refusal for `trawl -p trial driver ...` (or `TRAWL_PROFILE=trial`).

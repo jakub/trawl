@@ -25,6 +25,8 @@ pub enum ConfigError {
         path: String,
         source: std::io::Error,
     },
+    #[error("{path} does not exist")]
+    Missing { path: String },
     #[error("failed to parse {path}: {source}")]
     Parse {
         path: String,
@@ -210,6 +212,35 @@ impl Config {
         Ok(config)
     }
 
+    /// Load config from a file that must exist.
+    ///
+    /// For a caller that names a profile it will bind to, where a missing
+    /// file must not quietly turn into the defaults. The file is opened
+    /// once, so there is no gap between an existence check and the read.
+    pub fn load_required(path: Option<&str>) -> Result<Self, ConfigError> {
+        let config_path = path.unwrap_or(DEFAULT_CONFIG_PATH);
+        let expanded = shellexpand::tilde(config_path);
+        let path = Path::new(expanded.as_ref());
+
+        let contents = std::fs::read_to_string(path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ConfigError::Missing {
+                    path: path.display().to_string(),
+                }
+            } else {
+                ConfigError::Io {
+                    path: path.display().to_string(),
+                    source: e,
+                }
+            }
+        })?;
+
+        toml::from_str(&contents).map_err(|e| ConfigError::Parse {
+            path: path.display().to_string(),
+            source: e,
+        })
+    }
+
     /// Apply a named profile's overrides to the server config.
     pub fn apply_profile(&mut self, name: &str) -> Result<(), ConfigError> {
         let profile = self.profiles.get(name).ok_or_else(|| {
@@ -369,6 +400,30 @@ mod tests {
         assert!(config.ui.auto_save_history);
         assert_eq!(config.ui.tab_width, 2);
         assert_eq!(config.tail.max_events, 1000);
+    }
+
+    #[test]
+    fn load_required_refuses_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("absent.toml");
+        let err = Config::load_required(absent.to_str()).unwrap_err();
+        assert!(matches!(err, ConfigError::Missing { .. }), "{err:?}");
+        // Config::load keeps its defaults-when-missing behavior.
+        assert_eq!(
+            Config::load(absent.to_str()).unwrap().server.url,
+            DEFAULT_URL
+        );
+
+        let present = dir.path().join("config.toml");
+        std::fs::write(&present, "[profiles.lab]\nurl = \"https://lab:5514\"\n").unwrap();
+        let cfg = Config::load_required(present.to_str()).unwrap();
+        assert_eq!(cfg.profiles["lab"].url.as_deref(), Some("https://lab:5514"));
+
+        std::fs::write(&present, "[profiles.lab\n").unwrap();
+        assert!(matches!(
+            Config::load_required(present.to_str()),
+            Err(ConfigError::Parse { .. })
+        ));
     }
 
     #[test]
