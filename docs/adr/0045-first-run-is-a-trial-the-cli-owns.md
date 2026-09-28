@@ -1,6 +1,6 @@
 # First run is a trial the CLI owns; an installation starts fresh
 
-status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, see the Amendments
+status: accepted (2026-09-25), prep record for #203; amended (2026-09-25, 2026-09-27) during the #203 run, and by ADR-0048 (2026-09-28), see the Amendments
 
 Before a first query, an evaluator needs five executables, PostgreSQL with two databases, two roles, two keys, a certificate, and a hand-written config. No install channel creates a key. A fresh `apt install` starts `trawld` against placeholder database URLs, and systemd restarts it every five seconds. This record adds a **trial**: a disposable installation that the `trawl` CLI creates, runs, and deletes on one Linux machine. It also makes the Debian package install without starting anything.
 
@@ -14,6 +14,7 @@ Before a first query, an evaluator needs five executables, PostgreSQL with two d
 
 **Clients verify the trial's certificate.** The trial generates its own certificate with a SAN for the in-network service name. The CLI and `trawl-web` pin it through a new CA setting: `ca_cert` on a CLI profile, and an upstream CA path on `trawl-web`. No insecure flag is part of the trial. With the CA setting in place, the CLI warns when `insecure` is on. `trawl-web` accepts `TRAWL_WEB_INSECURE_UPSTREAM` only for a loopback upstream, which is what the Debian package and the Helm chart use.
 *Amended 2026-09-25 ([the Debian package pins trawld's certificate](#amendment-the-debian-package-pins-trawlds-certificate-2026-09-25)): only the Helm chart uses the loopback switch. The Debian package pins trawld's generated certificate through `[web] upstream_ca_path`.*
+*Amended 2026-09-28 by [ADR-0048](0048-trawl-web-always-verifies-trawld.md): the loopback switch is removed. The Helm chart pins trawld's certificate too.*
 
 **Secrets travel as files, never as environment.** The CLI pipes each secret on stdin into a mode-0400 file in the volume of the container that reads it. The PostgreSQL superuser password never leaves the PostgreSQL volume. Separate `fleet` and `trawl` owner roles own the two databases, as in a durable installation. The host keeps only the two tokens, at mode 0600, and the public certificate.
 
@@ -60,3 +61,7 @@ The Helm chart keeps the loopback switch. There, `trawl-web` runs beside `trawld
 ## Amendment: the image tag drops build metadata, 2026-09-27
 
 The Decision names the image `ghcr.io/jakub/trawl:<CLI version>`. The release workflow publishes the version without its semver build metadata, because `docker/metadata-action` renders the tag from the semver version and a Docker tag cannot contain `+`. So `1.1.0-rc.1+build.7` is published, and pulled by the trial, as `1.1.0-rc.1`. The chart keeps the full version.
+
+## Amendment: the loopback switch is removed, 2026-09-28
+
+[ADR-0048](0048-trawl-web-always-verifies-trawld.md) removes `TRAWL_WEB_INSECURE_UPSTREAM`. The Helm chart pins trawld's certificate in every TLS mode, so no channel skips verification. `trawl-web` now starts before the pinned certificate exists and loads it when trawld writes it, so the Debian unit no longer restarts every 5 seconds before trawld's first start.

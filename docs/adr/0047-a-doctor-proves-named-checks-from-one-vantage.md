@@ -1,6 +1,6 @@
 # A doctor proves named checks from one vantage and never writes
 
-status: accepted (2026-09-27), prep record for #199
+status: accepted (2026-09-27), prep record for #199; amended (2026-09-28) for the server-host doctors, see the Amendments
 
 `trawld --check-config` proves that a configuration file parses and names every required setting. It never connects to anything. An installation can pass it while a database rejects the service's credentials, a client distrusts the certificate, or the browser address is not in `public_origins`. Today the operator finds these by working through a manual script in the deployment guide: curl the health endpoint, curl `whoami` with a key, run a query, sign in from a browser. This record adds a **doctor**: a command that runs those checks and reports each one.
 
@@ -50,3 +50,16 @@ A check that could not look is never reported as passed or as failed. The run's 
 ## Delivery
 
 Two slices, each end to end. The first, #199, ships `trawl doctor` with the shared report and exit contract, and it fixes the client so a 503 health response keeps its per-check body. The second ships `trawld --doctor` and `trawl-web --doctor`, including a read-only schema check for the app-state database beside the Fleet keystore's existing one. It gets its own prep, with this record as its settled design.
+
+## Amendment: the server-host doctors, 2026-09-28
+
+The prep of the second slice settled how the server-host doctors read an installation. The rules above still hold. These add to them:
+
+- **State that trawld's boot creates is checked for admission.** trawld creates or brings current some state on its own start: an empty or behind app-state schema, an absent or empty data root on an ingest node, and an absent generated certificate. A check on that state asserts that trawld's boot will accept it. The outcome is `complete` with the reason `will_initialize`. Every state the boot refuses stays `failed`: an empty or behind Fleet schema, which needs `fleet-admin migrate`; an unsupported epoch; an owned root without an epoch; a data root that belongs to another catalog; and a dirty, ahead, or foreign migration ledger. Trust checks keep their own assertions. A fresh installation before its first start therefore exits 3, because its listener cannot be sampled. It exits 1 only when something must be fixed before starting. Without this rule, every fresh installation and every upgrade before its restart would fail on state the operator can only fix by starting trawld.
+- **Root sees content, not access.** A doctor run as root reports what it read: a certificate parses, an epoch is current. A check that asserts the running user can read or write something is `not_sampled` with the reason `ran_as_root`. A root run cannot exit 0.
+- **Migration locks are observed, never taken.** The schema is read in one read-only snapshot. A current schema is `complete` even while a migrator holds its lock. A fresh or behind schema while the migrator's lock is held is `not_sampled` with the reason `migration_in_progress`. A dirty ledger is always `failed`. trawld's writer lock is reported as held or not observed. It does not prove that trawld is running on this host.
+- **The listener proves the certificate on disk.** trawld's doctor connects to its own listener and accepts only the exact certificate that its configuration names or generated. It makes no claim about host names; the client doctor proves those. A served certificate that differs from the file is `failed`. A file that changes while the doctor reads it gives `not_sampled`.
+- **Fewer values reach the output.** A report may name the configuration and credential files the user selected, and the running user and uid. It never shows certificate names, listener addresses, or catalog identifiers.
+- **trawl-web has no unverified mode.** ADR-0048 removes the loopback switch. A web doctor with no persistent session key reports `not_configured` and says that sessions end on every restart. An upstream URL that carries credentials is refused before any request.
+
+The shared report and exit contract lives in a crate that the CLI, trawld, and trawl-web all use. The second slice ships as three pull requests after #199 and #265: `trawld --doctor`; the trust change in ADR-0048; then `trawl-web --doctor`.
