@@ -257,7 +257,7 @@ fn device_of(path: &Path) -> Result<u64, String> {
     Ok(device_of_meta(&meta))
 }
 
-fn device_of_meta(meta: &std::fs::Metadata) -> u64 {
+pub(crate) fn device_of_meta(meta: &std::fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         std::os::unix::fs::MetadataExt::dev(meta)

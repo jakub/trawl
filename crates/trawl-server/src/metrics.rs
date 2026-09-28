@@ -104,6 +104,13 @@ pub const CATALOG_REPIN_ROWS_NULLED_TOTAL: &str = "trawl_catalog_repin_rows_null
 pub const CATALOG_REPIN_ROWS_RESURRECTED_TOTAL: &str = "trawl_catalog_repin_rows_resurrected_total";
 pub const CATALOG_REPIN_DURATION_SECONDS: &str = "trawl_catalog_repin_duration_seconds";
 pub const RETENTION_SUPPRESSED: &str = "trawl_retention_suppressed";
+/// Date directories retention confirmed removed since process start, by
+/// `trigger` ([`crate::retention::RemovalTrigger`]). Incremented only when
+/// the removal returned success, never inferred from a later absence.
+pub const RETENTION_DELETIONS_TOTAL: &str = "trawl_retention_deletions_total";
+/// Retention sweeps since process start whose first free-space check found
+/// the data filesystem below the deletion floor.
+pub const RETENTION_PRESSURE_ATTEMPTS_TOTAL: &str = "trawl_retention_pressure_attempts_total";
 pub const SCHEDULER_WINDOW_TRUNCATED_TOTAL: &str = "trawl_scheduler_window_truncated_total";
 pub const AUTH_FAILURES_TOTAL: &str = "trawl_auth_failures_total";
 pub const TELEMETRY_WAL_WRITE_FAILURES_TOTAL: &str = "trawl_telemetry_wal_write_failures_total";
@@ -765,25 +772,47 @@ struct StorageTotals {
 }
 
 #[derive(Clone, Copy)]
-struct CompleteStorageSample {
-    totals: StorageTotals,
+struct CompleteStorageSample<T> {
+    value: T,
     completed_at: Instant,
 }
 
-#[derive(Default)]
-struct StorageState {
-    complete: Option<CompleteStorageSample>,
+struct StorageState<T> {
+    complete: Option<CompleteStorageSample<T>>,
     /// Completion of any attempt throttles retries independently of sample age.
     attempt_finished_at: Option<Instant>,
     failed: bool,
 }
 
+impl<T> Default for StorageState<T> {
+    fn default() -> Self {
+        Self {
+            complete: None,
+            attempt_finished_at: None,
+            failed: false,
+        }
+    }
+}
+
 /// One source's attempts and gauge publication share ownership. Dashboard reads
 /// only lock `state`, which is never held over a scan or gauge publication.
-#[derive(Default)]
-struct StorageCache {
+///
+/// Generic over the sample so every measured source (WAL and Parquet totals,
+/// filesystem headroom) shares one implementation of the ADR-0033 contract:
+/// serialized attempts, the retry TTL, retain-last-complete on failure, and
+/// age measured from completion on the monotonic clock.
+struct StorageCache<T> {
     attempt: Mutex<()>,
-    state: Mutex<StorageState>,
+    state: Mutex<StorageState<T>>,
+}
+
+impl<T> Default for StorageCache<T> {
+    fn default() -> Self {
+        Self {
+            attempt: Mutex::default(),
+            state: Mutex::default(),
+        }
+    }
 }
 
 /// A coherent view assembled under one short cache lock.
@@ -793,29 +822,41 @@ pub(crate) struct StorageSnapshot {
     pub measurement: trawl_api::StorageMeasurement,
 }
 
-impl StorageCache {
+impl StorageCache<StorageTotals> {
     fn snapshot(&self, configured: bool, now: Instant) -> StorageSnapshot {
+        let (measurement, totals) = self.read(configured, now);
+        let totals = totals.unwrap_or_default();
+        StorageSnapshot {
+            files: totals.files,
+            bytes: totals.bytes,
+            measurement,
+        }
+    }
+}
+
+impl<T: Clone> StorageCache<T> {
+    /// The status, age, and retained sample, read under one short lock.
+    /// Without a complete sample there is no value to present.
+    fn read(&self, configured: bool, now: Instant) -> (trawl_api::StorageMeasurement, Option<T>) {
         use trawl_api::StorageMeasurementStatus as Status;
         let state = self.state.lock().expect("storage cache poisoned");
         let (status, sample) = if !configured {
             (Status::NotConfigured, None)
         } else if state.failed {
-            (Status::Failed, state.complete)
+            (Status::Failed, state.complete.as_ref())
         } else if state.complete.is_some() {
-            (Status::Complete, state.complete)
+            (Status::Complete, state.complete.as_ref())
         } else {
             (Status::NotSampled, None)
         };
-        let totals = sample.map_or_else(StorageTotals::default, |s| s.totals);
-        StorageSnapshot {
-            files: totals.files,
-            bytes: totals.bytes,
-            measurement: trawl_api::StorageMeasurement {
+        (
+            trawl_api::StorageMeasurement {
                 status,
                 sample_age_secs: sample
                     .map(|s| now.saturating_duration_since(s.completed_at).as_secs()),
             },
-        }
+            sample.map(|s| s.value.clone()),
+        )
     }
 
     /// `clock`, `scan`, and `publish` are instance-scoped seams: tests control
@@ -824,8 +865,8 @@ impl StorageCache {
     fn collect(
         &self,
         clock: impl Fn() -> Instant,
-        scan: impl FnOnce() -> std::io::Result<StorageTotals>,
-        mut publish: impl FnMut(StorageTotals),
+        scan: impl FnOnce() -> std::io::Result<T>,
+        mut publish: impl FnMut(T),
     ) {
         let _owner = self.attempt.lock().expect("storage attempt poisoned");
         // Recheck after ownership: another emitter or scrape may have finished
@@ -842,29 +883,40 @@ impl StorageCache {
             let mut state = self.state.lock().expect("storage cache poisoned");
             state.attempt_finished_at = Some(completed_at);
             state.failed = result.is_err();
-            if let Ok(totals) = result {
+            if let Ok(value) = result {
                 state.complete = Some(CompleteStorageSample {
-                    totals,
+                    value,
                     completed_at,
                 });
             }
         }
-        let sample = self.state.lock().expect("storage cache poisoned").complete;
+        let sample = self
+            .state
+            .lock()
+            .expect("storage cache poisoned")
+            .complete
+            .as_ref()
+            .map(|s| s.value.clone());
         if let Some(sample) = sample {
             // No first-success sample means no invented numeric gauge. A failed
             // attempt retains complete totals, including genuinely measured zero.
-            publish(sample.totals);
+            publish(sample);
         }
     }
 }
 
-fn parquet_cache() -> &'static StorageCache {
-    static CACHE: OnceLock<StorageCache> = OnceLock::new();
+fn parquet_cache() -> &'static StorageCache<StorageTotals> {
+    static CACHE: OnceLock<StorageCache<StorageTotals>> = OnceLock::new();
     CACHE.get_or_init(StorageCache::default)
 }
 
-fn wal_cache() -> &'static StorageCache {
-    static CACHE: OnceLock<StorageCache> = OnceLock::new();
+fn wal_cache() -> &'static StorageCache<StorageTotals> {
+    static CACHE: OnceLock<StorageCache<StorageTotals>> = OnceLock::new();
+    CACHE.get_or_init(StorageCache::default)
+}
+
+fn headroom_cache() -> &'static StorageCache<crate::capacity::HeadroomSample> {
+    static CACHE: OnceLock<StorageCache<crate::capacity::HeadroomSample>> = OnceLock::new();
     CACHE.get_or_init(StorageCache::default)
 }
 
@@ -897,30 +949,57 @@ pub fn collect_gauges(
     }
 
     // Parquet file gauges — walk the glob pattern's parent directory.
-    collect_parquet_gauges(fallback_glob);
+    let data_root = data_root(fallback_glob);
+    collect_parquet_gauges(data_root);
 
     if let Some(dir) = wal_dir {
         collect_wal_gauges(dir);
     }
+
+    collect_headroom(data_root, wal_dir);
 }
 
-/// Collect the ingested Parquet totals with the shared attempt/cache policy.
-fn collect_parquet_gauges(fallback_glob: &str) {
+/// The data root the fallback glob selects: the Parquet scan walks it and
+/// headroom stats its filesystem.
+fn data_root(fallback_glob: &str) -> &Path {
     // Preserve the fallback glob's existing root selection.
     let base = fallback_glob
         .find('*')
         .map_or(fallback_glob, |pos| &fallback_glob[..pos]);
     // Preserve `/` itself rather than turning an absolute root into an empty path.
     let trimmed = base.trim_end_matches('/');
-    let base = Path::new(if trimmed.is_empty() && base.starts_with('/') {
+    Path::new(if trimmed.is_empty() && base.starts_with('/') {
         "/"
     } else {
         trimmed
-    });
+    })
+}
+
+/// Collect the ingested Parquet totals with the shared attempt/cache policy.
+fn collect_parquet_gauges(base: &Path) {
     parquet_cache().collect(
         Instant::now,
         || scan_storage(base, StorageKind::Parquet),
         |totals| publish_storage_gauges(StorageKind::Parquet, totals),
+    );
+}
+
+/// Sample the data, WAL and spill filesystems with the shared attempt/cache
+/// policy (ADR-0042 headroom under ADR-0033 status and age). `wal_dir` is the
+/// live WAL writer's directory, so a query-only node stats no WAL role.
+fn collect_headroom(data_root: &Path, wal_dir: Option<&Path>) {
+    headroom_cache().collect(
+        Instant::now,
+        || {
+            crate::capacity::sample_headroom(
+                data_root,
+                wal_dir,
+                &trawl_engine::spill_dir(),
+                crate::capacity::stat_filesystem,
+                |root| crate::repin::in_flight_evidence(root).map(|evidence| evidence.is_some()),
+            )
+        },
+        |_| {},
     );
 }
 
@@ -1166,7 +1245,7 @@ mod tests {
     }
 
     fn assert_storage(
-        cache: &StorageCache,
+        cache: &StorageCache<StorageTotals>,
         now: Instant,
         status: trawl_api::StorageMeasurementStatus,
         totals: StorageTotals,
@@ -1764,6 +1843,149 @@ mod tests {
             init_publication_recovery_metrics();
             assert_eq!(test_support::sample(&handle, &series("contradictory")), 1);
         });
+    }
+
+    // -- headroom measurement (ADR-0042 under ADR-0033) ------------------
+
+    use crate::capacity::{DeviceHeadroom, HeadroomSample, sample_headroom};
+    use trawl_api::FilesystemRole;
+
+    /// One headroom attempt through the real sampling function, with the
+    /// filesystem behind a `stat` seam: every role on device 1 with
+    /// `available` bytes free, or a failure.
+    fn headroom_attempt(available: std::io::Result<u64>) -> std::io::Result<HeadroomSample> {
+        let available = available?;
+        sample_headroom(
+            Path::new("/data"),
+            Some(Path::new("/wal")),
+            Path::new("/tmp"),
+            |_| Ok((1, 1_000, available)),
+            |_| Ok(false),
+        )
+    }
+
+    fn one_device(available: u64) -> HeadroomSample {
+        HeadroomSample {
+            filesystems: vec![DeviceHeadroom {
+                roles: vec![
+                    FilesystemRole::Data,
+                    FilesystemRole::Wal,
+                    FilesystemRole::Spill,
+                ],
+                total_bytes: 1_000,
+                available_bytes: available,
+            }],
+            repin_in_flight: false,
+        }
+    }
+
+    #[test]
+    fn capacity_measurement_not_sampled_before_first_attempt() {
+        use trawl_api::StorageMeasurementStatus as Status;
+        let cache = StorageCache::<HeadroomSample>::default();
+        let start = Instant::now();
+        let (measurement, sample) = cache.read(true, start);
+        assert_eq!(measurement.status, Status::NotSampled);
+        assert_eq!(measurement.sample_age_secs, None);
+        assert_eq!(sample, None, "no rows before any attempt");
+        // A first attempt that fails is failed, still with nothing measured.
+        cache.collect(
+            || start,
+            || headroom_attempt(Err(io_failure())),
+            |_| panic!("no sample to publish"),
+        );
+        let (measurement, sample) = cache.read(true, start);
+        assert_eq!(measurement.status, Status::Failed);
+        assert_eq!(measurement.sample_age_secs, None);
+        assert_eq!(sample, None);
+    }
+
+    #[test]
+    fn capacity_measurement_failed_retains_last_complete_and_ages() {
+        use std::time::Duration;
+        use trawl_api::StorageMeasurementStatus as Status;
+        let cache = StorageCache::<HeadroomSample>::default();
+        let start = Instant::now();
+        cache.collect(|| start, || headroom_attempt(Ok(400)), |_| {});
+        assert_eq!(
+            cache.read(true, start),
+            (
+                trawl_api::StorageMeasurement {
+                    status: Status::Complete,
+                    sample_age_secs: Some(0),
+                },
+                Some(one_device(400)),
+            )
+        );
+        // A failed stat keeps the last complete rows, and their age keeps
+        // growing from that sample's completion.
+        let failed = start + Duration::from_secs(30);
+        cache.collect(|| failed, || headroom_attempt(Err(io_failure())), |_| {});
+        for (now, age) in [(failed, 30), (failed + Duration::from_secs(15), 45)] {
+            assert_eq!(
+                cache.read(true, now),
+                (
+                    trawl_api::StorageMeasurement {
+                        status: Status::Failed,
+                        sample_age_secs: Some(age),
+                    },
+                    Some(one_device(400)),
+                )
+            );
+        }
+        // The failed attempt, not the retained sample, sets the retry.
+        cache.collect(
+            || failed + Duration::from_secs(29),
+            || panic!("failure retry too soon"),
+            |_| {},
+        );
+        // A repin seam that cannot answer fails the attempt the same way.
+        let repin_unreadable = failed + Duration::from_secs(30);
+        cache.collect(
+            || repin_unreadable,
+            || {
+                sample_headroom(
+                    Path::new("/data"),
+                    None,
+                    Path::new("/tmp"),
+                    |_| Ok((1, 1_000, 10)),
+                    |_| Err(io_failure()),
+                )
+            },
+            |_| {},
+        );
+        let (measurement, sample) = cache.read(true, repin_unreadable);
+        assert_eq!(measurement.status, Status::Failed);
+        assert_eq!(measurement.sample_age_secs, Some(60));
+        assert_eq!(sample, Some(one_device(400)));
+        // Recovery replaces the sample and restarts its age.
+        let recovered = repin_unreadable + Duration::from_secs(30);
+        cache.collect(|| recovered, || headroom_attempt(Ok(300)), |_| {});
+        assert_eq!(
+            cache.read(true, recovered),
+            (
+                trawl_api::StorageMeasurement {
+                    status: Status::Complete,
+                    sample_age_secs: Some(0),
+                },
+                Some(one_device(300)),
+            )
+        );
+    }
+
+    #[test]
+    fn capacity_measurement_zero_is_measured() {
+        use trawl_api::StorageMeasurementStatus as Status;
+        let cache = StorageCache::<HeadroomSample>::default();
+        let start = Instant::now();
+        let unmeasured = cache.read(true, start);
+        cache.collect(|| start, || headroom_attempt(Ok(0)), |_| {});
+        let measured = cache.read(true, start);
+        assert_eq!(measured.0.status, Status::Complete);
+        assert_eq!(measured.0.sample_age_secs, Some(0));
+        assert_eq!(measured.1, Some(one_device(0)), "a full disk is a reading");
+        assert_ne!(measured, unmeasured, "zero free is not unmeasured");
+        assert_eq!(unmeasured.1, None);
     }
 
     #[test]

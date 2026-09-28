@@ -54,6 +54,10 @@ pub struct AppState {
     /// footer under the data root, and a query-only node owns none of
     /// them.
     pub gc: Option<Arc<crate::catalog::gc::PinGc>>,
+    /// The retention config and the evidence the retention loop records
+    /// (ADR-0042). The loop is handed this same `Arc`, so the dashboard
+    /// reads the counts the loop wrote.
+    pub retention: Arc<crate::retention::RetentionShared>,
 }
 
 /// Maximum concurrent admin dashboard-stats SSE streams. Hard-coded (no
@@ -743,6 +747,9 @@ impl AppState {
             dashboard_snapshot: Arc::new(Mutex::new(None)),
             repin: None,
             gc: None,
+            retention: Arc::new(crate::retention::RetentionShared::new(
+                config.retention.clone(),
+            )),
         };
         let state = {
             let mut state = state;

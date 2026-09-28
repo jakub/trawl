@@ -445,7 +445,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         let handle = trawl_server::retention::spawn_retention(
             config.data.base_dir(),
             config.wal_dir(),
-            config.retention.clone(),
+            Arc::clone(&state.retention),
             shutdown_rx,
         );
         (handle, shutdown_tx)

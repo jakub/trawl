@@ -274,6 +274,16 @@ impl Cancellable<'_> {
     }
 }
 
+/// The directory `DuckDB` spills query state into.
+///
+/// The one source of that path: [`Executor::new`] points every connection
+/// at it, and the server's headroom measurement stats the filesystem under
+/// it (ADR-0042), so the two can never name different directories.
+#[must_use]
+pub fn spill_dir() -> std::path::PathBuf {
+    std::env::temp_dir()
+}
+
 /// Query executor backed by an in-memory `DuckDB` connection.
 #[derive(Debug)]
 pub struct Executor {
@@ -283,13 +293,13 @@ pub struct Executor {
 impl Executor {
     /// Create a new executor with an in-memory `DuckDB` connection.
     ///
-    /// Sets `temp_directory` to the system temp dir so `DuckDB` can spill
-    /// to disk even when the process working directory is read-only (e.g.
-    /// container overlay filesystems), and pins the session time zone
-    /// ([`Self::configure`]).
+    /// Sets `temp_directory` to [`spill_dir`], the system temp dir, so
+    /// `DuckDB` can spill to disk even when the process working directory
+    /// is read-only (e.g. container overlay filesystems), and pins the
+    /// session time zone ([`Self::configure`]).
     pub fn new() -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
-        let tmp = std::env::temp_dir();
+        let tmp = spill_dir();
         conn.execute_batch(&format!(
             "SET temp_directory='{}'",
             tmp.to_string_lossy().replace('\'', "''")

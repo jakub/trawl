@@ -633,6 +633,177 @@ pub struct StorageMeasurement {
     pub sample_age_secs: Option<u64>,
 }
 
+/// Disk headroom, pressure-deletion evidence and per-environment retention
+/// reach (ADR-0042). Capacity reads as how much of each environment's
+/// policy the data disk is projected to hold, never as a countdown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    pub headroom: HeadroomReading,
+    pub pressure: PressureEvidence,
+    /// Environments with at least one stored date partition, sorted by name.
+    pub environments: Vec<EnvironmentCapacity>,
+    /// Finite-retention environments with too few observed days to project.
+    /// The projection reserves their stored bytes as it does keep-forever
+    /// bytes, and leaves their growth out. Sorted by name.
+    pub growth_excluded: Vec<String>,
+}
+
+/// One headroom measurement attempt stats every filesystem role, so the
+/// rows share its status and age.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadroomReading {
+    pub measurement: StorageMeasurement,
+    /// One row per device, from the last complete sample. Empty until a
+    /// complete sample exists: before one, which roles share a device is
+    /// unknown. A failed attempt retains the last complete rows.
+    pub filesystems: Vec<FilesystemHeadroom>,
+}
+
+/// One filesystem trawl writes to. Roles that share a device share a row;
+/// available bytes are never summed across devices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemHeadroom {
+    /// Non-empty, ordered data, wal, spill.
+    pub roles: Vec<FilesystemRole>,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    /// The deletion floor. Present only on the row holding
+    /// [`FilesystemRole::Data`]: nothing reclaims the other filesystems.
+    pub floor: Option<DeletionFloor>,
+}
+
+/// What trawl writes to a filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FilesystemRole {
+    /// The data root. Repin staging and compaction spill share it.
+    Data,
+    /// The live WAL directory, when ingest is enabled.
+    Wal,
+    /// The query engine's spill directory.
+    Spill,
+}
+
+/// The data filesystem's deletion floor (`min_free_disk_bytes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DeletionFloor {
+    /// A floor of 0: pressure deletion is off.
+    Off,
+    /// Pressure deletion runs while available bytes are strictly below
+    /// `floor_bytes`. `deficit_bytes` is `floor_bytes - available_bytes`
+    /// while below it and zero otherwise, including at equality.
+    Armed {
+        floor_bytes: u64,
+        deficit_bytes: u64,
+    },
+}
+
+/// Retention's record of what it deleted, stated as facts. The counters
+/// start at process start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PressureEvidence {
+    /// Date directories confirmed removed because they aged out.
+    pub removals_age: u64,
+    /// Date directories confirmed removed by pressure deletion.
+    pub removals_disk_pressure: u64,
+    /// Sweeps that found available bytes below the floor.
+    pub pressure_attempts: u64,
+    /// The last finished sweep, or `None` before the first one.
+    pub last_sweep: Option<LastSweep>,
+}
+
+/// The outcome of the last retention sweep and its age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastSweep {
+    pub outcome: SweepOutcome,
+    /// Monotonic seconds since the sweep finished, evaluated when the
+    /// snapshot was assembled.
+    pub age_secs: u64,
+}
+
+/// How a retention sweep ended. When several apply, the first listed
+/// here wins: failed, suppressed, exhausted below floor, completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepOutcome {
+    /// Every step ran and every deletion it attempted succeeded.
+    Completed,
+    /// A repin or unreadable publication markers stood the sweep down.
+    Suppressed,
+    /// The sweep errored, a deletion failed, or the sweep task panicked.
+    Failed,
+    /// Pressure deletion ran out of candidates with available bytes still
+    /// below the floor.
+    ExhaustedBelowFloor,
+}
+
+/// One environment's stored data and projected retention reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentCapacity {
+    pub env: String,
+    /// The effective `max_age_days`; 0 keeps the data forever.
+    pub max_age_days: u64,
+    /// The oldest surviving date partition, `YYYY-MM-DD`.
+    pub oldest_date: String,
+    /// Parquet bytes stored under the environment's date partitions.
+    pub stored_bytes: u64,
+    pub reach: Reach,
+}
+
+/// How many days of its policy an environment is projected to keep if
+/// the observed days repeat. A conditional projection, not a guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Reach {
+    /// A finite-retention environment's projected reach. `low` uses the
+    /// largest observed day and `high` the mean observed day.
+    Projected {
+        /// First observed date, `YYYY-MM-DD`.
+        observed_first: String,
+        /// Last observed date, `YYYY-MM-DD`.
+        observed_last: String,
+        observed_days: u8,
+        low: ReachEnd,
+        high: ReachEnd,
+    },
+    /// A keep-forever environment: its growth, with no time claim.
+    KeepForever {
+        /// First observed date, `YYYY-MM-DD`.
+        observed_first: String,
+        /// Last observed date, `YYYY-MM-DD`.
+        observed_last: String,
+        observed_days: u8,
+        mean_daily_bytes: u64,
+    },
+    /// No projection, and deliberately no number.
+    Withheld { reason: WithheldReason },
+}
+
+/// One end of a projected reach range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReachEnd {
+    /// About this many whole days of the policy.
+    Days { days: u64 },
+    /// The full policy fits.
+    FullPolicy,
+    /// With a floor of 0, the disk fills before the policy is reached.
+    DiskFillsFirst,
+}
+
+/// Why a reach projection was withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithheldReason {
+    /// Fewer than 3 observed days.
+    InsufficientHistory,
+    /// A repin is holding two generations, so stored bytes are inflated.
+    RetentionSuppressed,
+    /// The Parquet scan or the data filesystem sample is not complete.
+    MeasurementUnavailable,
+}
+
 /// Full dashboard snapshot returned by the admin-only dashboard endpoint.
 ///
 /// Contains all metrics displayed by the server's live monitor: executor pool,
@@ -1801,6 +1972,61 @@ mod tests {
     fn roundtrip<T: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug>(value: &T) -> T {
         let json = serde_json::to_string(value).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
+    }
+
+    /// The capacity enums' wire tokens are the contract the SPA and the
+    /// wire fixtures decode, so they are pinned here rather than inferred.
+    #[test]
+    fn capacity_enums_serialize_with_their_tags() {
+        use serde_json::json;
+        for (floor, wire) in [
+            (DeletionFloor::Off, json!({"state": "off"})),
+            (
+                DeletionFloor::Armed {
+                    floor_bytes: 10,
+                    deficit_bytes: 0,
+                },
+                json!({"state": "armed", "floor_bytes": 10, "deficit_bytes": 0}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(floor).unwrap(), wire);
+            assert_eq!(roundtrip(&floor), floor);
+        }
+        for (end, wire) in [
+            (
+                ReachEnd::Days { days: 38 },
+                json!({"kind": "days", "days": 38}),
+            ),
+            (ReachEnd::FullPolicy, json!({"kind": "full_policy"})),
+            (
+                ReachEnd::DiskFillsFirst,
+                json!({"kind": "disk_fills_first"}),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(end).unwrap(), wire);
+        }
+        let withheld = Reach::Withheld {
+            reason: WithheldReason::MeasurementUnavailable,
+        };
+        assert_eq!(
+            serde_json::to_value(&withheld).unwrap(),
+            json!({"state": "withheld", "reason": "measurement_unavailable"})
+        );
+        for (outcome, token) in [
+            (SweepOutcome::Completed, "completed"),
+            (SweepOutcome::Suppressed, "suppressed"),
+            (SweepOutcome::Failed, "failed"),
+            (SweepOutcome::ExhaustedBelowFloor, "exhausted_below_floor"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), token);
+        }
+        for (role, token) in [
+            (FilesystemRole::Data, "data"),
+            (FilesystemRole::Wal, "wal"),
+            (FilesystemRole::Spill, "spill"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), token);
+        }
     }
 
     #[test]

@@ -27,6 +27,11 @@
 //! A date directory that a pending publication marker claims (ADR-0041) is
 //! kept, and a WAL root whose markers cannot be read suppresses both sweeps.
 //!
+//! Each tick records its evidence in [`RetentionEvidence`] (ADR-0042):
+//! confirmed removals by trigger, pressure attempts, and the tick's
+//! [`SweepOutcome`]. The evidence states what happened; it never changes
+//! what a sweep deletes or in which order.
+//!
 //! The field catalog's `field_services` observations are ever-observed:
 //! retention deleting a partition deliberately never reconciles them, and
 //! nothing else removes a row either (ADR-0009 — "which services ever
@@ -37,34 +42,163 @@
 use std::cmp::Ordering;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
+use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use trawl_api::SweepOutcome;
 
 use crate::config::RetentionConfig;
+
+/// What made retention remove a date directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalTrigger {
+    /// The directory was older than its env's effective `max_age_days`.
+    Age,
+    /// Free space was below `min_free_disk_bytes`.
+    DiskPressure,
+}
+
+impl RemovalTrigger {
+    pub const ALL: [Self; 2] = [Self::Age, Self::DiskPressure];
+
+    /// The `trigger` label on [`crate::metrics::RETENTION_DELETIONS_TOTAL`].
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Age => "age",
+            Self::DiskPressure => "disk_pressure",
+        }
+    }
+}
+
+/// Retention's record of what it did since process start (ADR-0042).
+///
+/// Every record method bumps its `/metrics` counter in the same call as
+/// the in-process tally, so the dashboard and a scrape can never disagree
+/// about a count. Nothing here is a bytes-freed figure: the deletion size
+/// walk skips errors and sums logical lengths, so it cannot prove released
+/// blocks.
+#[derive(Debug, Default)]
+pub struct RetentionEvidence {
+    removals_age: AtomicU64,
+    removals_disk_pressure: AtomicU64,
+    pressure_attempts: AtomicU64,
+    last_sweep: Mutex<Option<(SweepOutcome, Instant)>>,
+}
+
+impl RetentionEvidence {
+    /// One date directory whose removal returned success.
+    pub fn record_removal(&self, trigger: RemovalTrigger) {
+        let tally = match trigger {
+            RemovalTrigger::Age => &self.removals_age,
+            RemovalTrigger::DiskPressure => &self.removals_disk_pressure,
+        };
+        tally.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics::counter!(crate::metrics::RETENTION_DELETIONS_TOTAL, "trigger" => trigger.label())
+            .increment(1);
+    }
+
+    /// One tick whose first free-space check found the data filesystem
+    /// below the floor.
+    pub fn record_pressure_attempt(&self) {
+        self.pressure_attempts.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics::counter!(crate::metrics::RETENTION_PRESSURE_ATTEMPTS_TOTAL).increment(1);
+    }
+
+    /// How the latest tick ended, stamped now on the monotonic clock.
+    pub fn record_sweep(&self, outcome: SweepOutcome) {
+        *self.last_sweep.lock() = Some((outcome, Instant::now()));
+    }
+
+    /// The evidence as the dashboard reports it, with the last sweep's age
+    /// evaluated at `now`.
+    #[must_use]
+    pub fn snapshot(&self, now: Instant) -> trawl_api::PressureEvidence {
+        trawl_api::PressureEvidence {
+            removals_age: self.removals_age.load(AtomicOrdering::Relaxed),
+            removals_disk_pressure: self.removals_disk_pressure.load(AtomicOrdering::Relaxed),
+            pressure_attempts: self.pressure_attempts.load(AtomicOrdering::Relaxed),
+            last_sweep: self
+                .last_sweep
+                .lock()
+                .map(|(outcome, at)| trawl_api::LastSweep {
+                    outcome,
+                    age_secs: now.saturating_duration_since(at).as_secs(),
+                }),
+        }
+    }
+}
+
+/// What the retention loop and the dashboard share: the process's fixed
+/// retention config and the evidence the loop records.
+#[derive(Debug)]
+pub struct RetentionShared {
+    pub config: RetentionConfig,
+    pub evidence: RetentionEvidence,
+}
+
+impl RetentionShared {
+    #[must_use]
+    pub fn new(config: RetentionConfig) -> Self {
+        Self {
+            config,
+            evidence: RetentionEvidence::default(),
+        }
+    }
+}
+
+/// What one tick saw that decides its [`SweepOutcome`].
+#[derive(Debug, Default)]
+struct TickRecord {
+    /// A deletion returned an error.
+    delete_failed: bool,
+    /// A repin or unreadable publication markers stood the sweep down.
+    suppressed: bool,
+    /// Pressure deletion ran out of candidates still below the floor.
+    exhausted_below_floor: bool,
+}
+
+impl TickRecord {
+    /// Failed, then suppressed, then exhausted below floor, then completed.
+    fn outcome(&self) -> SweepOutcome {
+        if self.delete_failed {
+            SweepOutcome::Failed
+        } else if self.suppressed {
+            SweepOutcome::Suppressed
+        } else if self.exhausted_below_floor {
+            SweepOutcome::ExhaustedBelowFloor
+        } else {
+            SweepOutcome::Completed
+        }
+    }
+}
 
 /// Spawn the retention background loop.
 ///
 /// Runs every `retention_interval_secs`, scanning `data_dir` for date
-/// directories eligible for deletion. Stops when `shutdown_rx` fires.
+/// directories eligible for deletion, and records each tick into the
+/// shared evidence. Stops when `shutdown_rx` fires.
 pub fn spawn_retention(
     data_dir: PathBuf,
     wal_dir: PathBuf,
-    config: RetentionConfig,
+    shared: Arc<RetentionShared>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
-    let interval = Duration::from_secs(config.retention_interval_secs);
+    let interval = Duration::from_secs(shared.config.retention_interval_secs);
 
     tokio::spawn(async move {
         tracing::info!(
             event_type = "lifecycle",
             action = "retention_start",
             data_dir = %data_dir.display(),
-            max_age_days = config.max_age_days,
-            min_free_disk_bytes = config.min_free_disk_bytes,
-            interval_secs = config.retention_interval_secs,
+            max_age_days = shared.config.max_age_days,
+            min_free_disk_bytes = shared.config.min_free_disk_bytes,
+            interval_secs = shared.config.retention_interval_secs,
             "retention task started"
         );
 
@@ -73,9 +207,15 @@ pub fn spawn_retention(
                 () = tokio::time::sleep(interval) => {
                     let dir = data_dir.clone();
                     let wal = wal_dir.clone();
-                    let cfg = config.clone();
+                    let tick_shared = Arc::clone(&shared);
                     let result = tokio::task::spawn_blocking(move || {
-                        retention_tick(&dir, &wal, &cfg, |p| fs4::available_space(p))
+                        retention_tick(
+                            &dir,
+                            &wal,
+                            &tick_shared.config,
+                            &tick_shared.evidence,
+                            |p| fs4::available_space(p),
+                        )
                     })
                     .await;
 
@@ -88,6 +228,8 @@ pub fn spawn_retention(
                             );
                         }
                         Err(e) => {
+                            // The tick never reached its own record.
+                            shared.evidence.record_sweep(SweepOutcome::Failed);
                             tracing::error!(
                                 event_type = "retention_error",
                                 error = %crate::error::join_failure_text("retention", e),
@@ -254,6 +396,7 @@ fn retention_tick(
     data_dir: &Path,
     wal_dir: &Path,
     config: &RetentionConfig,
+    evidence: &RetentionEvidence,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
 ) -> Result<(), String> {
     let today = chrono::Utc::now().date_naive();
@@ -261,13 +404,14 @@ fn retention_tick(
         data_dir,
         wal_dir,
         config,
+        evidence,
         today,
         free_space_fn,
         delete_date_dir,
     )
 }
 
-/// The tick body, with the clock and the deletion injected.
+/// One tick, with the clock and the deletion injected.
 ///
 /// `today` is threaded into both phases and never resampled: the age
 /// cutoff and the pressure rank must agree on how old every directory is,
@@ -277,10 +421,47 @@ fn retention_tick(
 /// or publication marker after a specific deletion, which no filesystem
 /// arrangement can do on its own (deleting a directory can only make
 /// evidence vanish).
+///
+/// Records the tick's [`SweepOutcome`] into `evidence` exactly once: an
+/// `Err` is `failed`, otherwise the precedence in [`TickRecord::outcome`].
 fn retention_tick_at(
     data_dir: &Path,
     wal_dir: &Path,
     config: &RetentionConfig,
+    evidence: &RetentionEvidence,
+    today: NaiveDate,
+    free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
+    delete_fn: impl Fn(&Path) -> Result<u64, String>,
+) -> Result<(), String> {
+    let mut tick = TickRecord::default();
+    let result = sweep(
+        data_dir,
+        wal_dir,
+        config,
+        evidence,
+        &mut tick,
+        today,
+        free_space_fn,
+        delete_fn,
+    );
+    evidence.record_sweep(match result {
+        Ok(()) => tick.outcome(),
+        Err(_) => SweepOutcome::Failed,
+    });
+    result
+}
+
+/// The tick body: both phases, recording removals, pressure attempts and
+/// what decides the outcome as they happen.
+// The tick's seams are threaded unchanged, and its gates read top to
+// bottom in the order they run.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn sweep(
+    data_dir: &Path,
+    wal_dir: &Path,
+    config: &RetentionConfig,
+    evidence: &RetentionEvidence,
+    tick: &mut TickRecord,
     today: NaiveDate,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
     delete_fn: impl Fn(&Path) -> Result<u64, String>,
@@ -306,6 +487,7 @@ fn retention_tick_at(
              staging exists; they resume when the job completes (or its \
              boot replay finishes)"
         );
+        tick.suppressed = true;
         return Ok(());
     }
 
@@ -345,6 +527,7 @@ fn retention_tick_at(
                  suppressing this sweep rather than deleting files a marker \
                  may claim"
             );
+            tick.suppressed = true;
             return Ok(());
         }
     };
@@ -378,15 +561,20 @@ fn retention_tick_at(
 
     for dir in &age_targets {
         if repin_claimed_mid_sweep(data_dir) {
+            tick.suppressed = true;
             return Ok(());
         }
         match publication_claimed_mid_sweep(wal_dir, dir) {
             MidSweepClaim::None => {}
             MidSweepClaim::Claimed => continue,
-            MidSweepClaim::Unreadable => return Ok(()),
+            MidSweepClaim::Unreadable => {
+                tick.suppressed = true;
+                return Ok(());
+            }
         }
         match delete_fn(&dir.path) {
             Ok(bytes) => {
+                evidence.record_removal(RemovalTrigger::Age);
                 tracing::info!(
                     event_type = "retention_delete",
                     retention_env = %dir.env,
@@ -406,6 +594,7 @@ fn retention_tick_at(
                     error = %e,
                     "failed to delete date directory"
                 );
+                tick.delete_failed = true;
             }
         }
     }
@@ -417,6 +606,8 @@ fn retention_tick_at(
             data_dir,
             wal_dir,
             config,
+            evidence,
+            tick,
             candidates,
             today,
             free_space_fn,
@@ -441,10 +632,17 @@ fn retention_tick_at(
 /// Delete by expiry ratio until free space clears `min_free_disk_bytes`
 /// or there is nothing left to delete. Returns `(bytes_freed,
 /// dirs_deleted)`.
+///
+/// The first free-space check that finds space below the floor records
+/// one pressure attempt for the tick; later checks in the same loop do
+/// not.
+#[allow(clippy::too_many_arguments)] // the tick's seams, threaded unchanged
 fn disk_pressure_sweep(
     data_dir: &Path,
     wal_dir: &Path,
     config: &RetentionConfig,
+    evidence: &RetentionEvidence,
+    tick: &mut TickRecord,
     mut candidates: Vec<DateDir>,
     today: NaiveDate,
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
@@ -464,12 +662,17 @@ fn disk_pressure_sweep(
             .then_with(|| a.path.cmp(&b.path))
     });
 
+    let mut attempted = false;
     loop {
         let available =
             free_space_fn(data_dir).map_err(|e| format!("failed to check free disk space: {e}"))?;
 
         if available >= config.min_free_disk_bytes {
             break;
+        }
+        if !attempted {
+            attempted = true;
+            evidence.record_pressure_attempt();
         }
 
         if candidates.is_empty() {
@@ -480,10 +683,12 @@ fn disk_pressure_sweep(
                 remaining_dirs = 0u64,
                 "disk pressure: no more directories to delete (only today remains)"
             );
+            tick.exhausted_below_floor = true;
             break;
         }
 
         if repin_claimed_mid_sweep(data_dir) {
+            tick.suppressed = true;
             break;
         }
 
@@ -493,10 +698,14 @@ fn disk_pressure_sweep(
         match publication_claimed_mid_sweep(wal_dir, &dir) {
             MidSweepClaim::None => {}
             MidSweepClaim::Claimed => continue,
-            MidSweepClaim::Unreadable => break,
+            MidSweepClaim::Unreadable => {
+                tick.suppressed = true;
+                break;
+            }
         }
         match delete_fn(&dir.path) {
             Ok(bytes) => {
+                evidence.record_removal(RemovalTrigger::DiskPressure);
                 tracing::info!(
                     event_type = "retention_delete",
                     retention_env = %dir.env,
@@ -517,6 +726,7 @@ fn disk_pressure_sweep(
                     error = %e,
                     "failed to delete date directory under disk pressure"
                 );
+                tick.delete_failed = true;
                 // Continue trying other dirs.
             }
         }
@@ -1014,7 +1224,14 @@ mod tests {
         // Both envs' old dates age out independently; deleting one is an
         // O(1) directory remove that never touches the sibling env root.
         let config = make_config(90, 0);
-        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(
+            tmp.path(),
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| Ok(u64::MAX),
+        )
+        .unwrap();
 
         assert!(!lab_old.exists());
         assert!(!prod_old.exists());
@@ -1063,7 +1280,14 @@ mod tests {
         let recent_dir = plant(tmp.path(), "prod", days_before(today, 30));
 
         let config = make_config(90, 0);
-        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(
+            tmp.path(),
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| Ok(u64::MAX),
+        )
+        .unwrap();
 
         assert!(!old_dir.exists(), "old dir should be deleted");
         assert!(recent_dir.exists(), "recent dir should survive");
@@ -1076,7 +1300,14 @@ mod tests {
         std::fs::create_dir_all(&old_dir).unwrap();
 
         let config = make_config(0, 0);
-        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(
+            tmp.path(),
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| Ok(u64::MAX),
+        )
+        .unwrap();
 
         assert!(old_dir.exists(), "nothing should be deleted when disabled");
     }
@@ -1103,6 +1334,7 @@ mod tests {
             &data_dir,
             &no_wal(),
             &config,
+            &RetentionEvidence::default(),
             today,
             |_| Ok(u64::MAX),
             delete_date_dir,
@@ -1135,6 +1367,7 @@ mod tests {
             &data_dir,
             &no_wal(),
             &config,
+            &RetentionEvidence::default(),
             today,
             |_| Ok(u64::MAX),
             delete_date_dir,
@@ -1164,6 +1397,7 @@ mod tests {
             &data_dir,
             &no_wal(),
             &config,
+            &RetentionEvidence::default(),
             today,
             |_| Ok(u64::MAX),
             delete_date_dir,
@@ -1199,6 +1433,7 @@ mod tests {
                 &data_dir,
                 &no_wal(),
                 &config,
+                &RetentionEvidence::default(),
                 today,
                 |_| Ok(u64::MAX),
                 delete_date_dir,
@@ -1217,6 +1452,7 @@ mod tests {
                 &data_dir,
                 &no_wal(),
                 &config,
+                &RetentionEvidence::default(),
                 today,
                 always_pressured(),
                 delete_date_dir,
@@ -1244,14 +1480,20 @@ mod tests {
         // reports enough space.
         let call_count = AtomicU32::new(0);
         let config = make_config(0, 1_000_000);
-        retention_tick(tmp.path(), &no_wal(), &config, |_| {
-            let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
-            if n == 0 {
-                Ok(500_000) // below threshold
-            } else {
-                Ok(2_000_000) // above threshold
-            }
-        })
+        retention_tick(
+            tmp.path(),
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| {
+                let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
+                if n == 0 {
+                    Ok(500_000) // below threshold
+                } else {
+                    Ok(2_000_000) // above threshold
+                }
+            },
+        )
         .unwrap();
 
         assert!(!oldest.exists(), "oldest should be deleted first");
@@ -1292,6 +1534,7 @@ mod tests {
             &data_dir,
             &no_wal(),
             &config,
+            &RetentionEvidence::default(),
             today,
             |_| {
                 let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1316,6 +1559,7 @@ mod tests {
             &data_dir,
             &no_wal(),
             &config,
+            &RetentionEvidence::default(),
             today,
             always_pressured(),
             delete_date_dir,
@@ -1339,6 +1583,7 @@ mod tests {
                 &data_dir,
                 &no_wal(),
                 &make_config(0, 1_000_000),
+                &RetentionEvidence::default(),
                 today,
                 always_pressured(),
                 delete_date_dir,
@@ -1390,6 +1635,7 @@ mod tests {
                 &data_dir,
                 &no_wal(),
                 &config,
+                &RetentionEvidence::default(),
                 today,
                 always_pressured(),
                 delete_date_dir,
@@ -1425,14 +1671,20 @@ mod tests {
         let call_count = AtomicU32::new(0);
         let marker = crate::repin::marker_path(&data_dir);
         let config = make_config(0, 1_000_000);
-        retention_tick(&data_dir, &no_wal(), &config, |_| {
-            let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
-            if n == 1 {
-                // A job claims the data root while the sweep is running.
-                std::fs::write(&marker, b"{}").unwrap();
-            }
-            Ok(500_000)
-        })
+        retention_tick(
+            &data_dir,
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| {
+                let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
+                if n == 1 {
+                    // A job claims the data root while the sweep is running.
+                    std::fs::write(&marker, b"{}").unwrap();
+                }
+                Ok(500_000)
+            },
+        )
         .unwrap();
 
         assert!(!oldest.exists(), "the pre-claim deletion stands");
@@ -1463,6 +1715,7 @@ mod tests {
             &data_dir,
             &no_wal(),
             &config,
+            &RetentionEvidence::default(),
             today,
             always_pressured(),
             |path| {
@@ -1500,7 +1753,14 @@ mod tests {
         metrics::with_local_recorder(&recorder, || {
             // No job owns this aside — no marker, nothing running.
             std::fs::create_dir_all(tmp.path().join("data.repin-aside")).unwrap();
-            retention_tick(&data_dir, &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
+            retention_tick(
+                &data_dir,
+                &no_wal(),
+                &config,
+                &RetentionEvidence::default(),
+                |_| Ok(u64::MAX),
+            )
+            .unwrap();
         });
         assert!(
             handle
@@ -1512,7 +1772,14 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             std::fs::remove_dir_all(tmp.path().join("data.repin-aside")).unwrap();
-            retention_tick(&data_dir, &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
+            retention_tick(
+                &data_dir,
+                &no_wal(),
+                &config,
+                &RetentionEvidence::default(),
+                |_| Ok(u64::MAX),
+            )
+            .unwrap();
         });
         assert!(
             handle
@@ -1547,6 +1814,7 @@ mod tests {
             &data_dir,
             &wal_dir,
             &config,
+            &RetentionEvidence::default(),
             today,
             always_pressured(),
             delete_date_dir,
@@ -1561,6 +1829,7 @@ mod tests {
             &data_dir,
             &wal_dir,
             &config,
+            &RetentionEvidence::default(),
             today,
             always_pressured(),
             delete_date_dir,
@@ -1590,6 +1859,7 @@ mod tests {
             &data_dir,
             &wal_dir,
             &config,
+            &RetentionEvidence::default(),
             today,
             always_pressured(),
             |path| {
@@ -1630,6 +1900,7 @@ mod tests {
             &data_dir,
             &wal_dir,
             &config,
+            &RetentionEvidence::default(),
             today,
             |_| {
                 if calls.fetch_add(1, AtomicOrdering::Relaxed) == 0 {
@@ -1670,6 +1941,7 @@ mod tests {
                 &data_dir,
                 &wal_dir,
                 &config,
+                &RetentionEvidence::default(),
                 today,
                 always_pressured(),
                 |path| {
@@ -1718,6 +1990,7 @@ mod tests {
                 &data_dir,
                 &wal_dir,
                 &config,
+                &RetentionEvidence::default(),
                 today,
                 always_pressured(),
                 delete_date_dir,
@@ -1743,7 +2016,14 @@ mod tests {
         let old_dir = plant(&data_dir, "prod", days_before(today, 200));
 
         let config = make_config(90, 0);
-        retention_tick(&data_dir, &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(
+            &data_dir,
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| Ok(u64::MAX),
+        )
+        .unwrap();
         assert!(!old_dir.exists(), "age sweep resumes");
     }
 
@@ -1755,7 +2035,14 @@ mod tests {
         std::fs::write(dir.join("data.parquet"), b"old").unwrap();
 
         let config = make_config(0, 0);
-        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(0)).unwrap();
+        retention_tick(
+            tmp.path(),
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| Ok(0),
+        )
+        .unwrap();
 
         assert!(dir.exists());
     }
@@ -1770,7 +2057,14 @@ mod tests {
 
         // Disk pressure with only today's dir — should warn but not delete.
         let config = make_config(0, 1_000_000);
-        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(100)).unwrap();
+        retention_tick(
+            tmp.path(),
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| Ok(100),
+        )
+        .unwrap();
 
         assert!(today_dir.exists(), "today's dir must never be deleted");
     }
@@ -1789,7 +2083,14 @@ mod tests {
         // empty dir, and a permission-denied dir needs setup the suite
         // cannot rely on.
         let config = make_config(30, 0);
-        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(
+            tmp.path(),
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| Ok(u64::MAX),
+        )
+        .unwrap();
 
         assert!(!dir_a.exists());
         assert!(!dir_b.exists());
@@ -1814,7 +2115,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(90, 1_000_000);
         // Should succeed with no dirs to process.
-        retention_tick(tmp.path(), &no_wal(), &config, |_| Ok(u64::MAX)).unwrap();
+        retention_tick(
+            tmp.path(),
+            &no_wal(),
+            &config,
+            &RetentionEvidence::default(),
+            |_| Ok(u64::MAX),
+        )
+        .unwrap();
     }
 
     /// One planted directory as the oracle sees it. `age` and `max` are
@@ -1959,6 +2267,7 @@ mod tests {
                 &data_dir,
                 &no_wal(),
                 &config,
+                &RetentionEvidence::default(),
                 today,
                 always_pressured(),
                 recording_delete(&log),
@@ -2003,5 +2312,418 @@ mod tests {
                 previous = Some(ratio);
             }
         }
+    }
+
+    // -- capacity evidence (ADR-0042) ---------------------------------------
+
+    /// The evidence one tick left behind, read at the instant it finished.
+    fn evidence_after(evidence: &RetentionEvidence) -> (u64, u64, u64, Option<SweepOutcome>) {
+        let snapshot = evidence.snapshot(Instant::now());
+        (
+            snapshot.removals_age,
+            snapshot.removals_disk_pressure,
+            snapshot.pressure_attempts,
+            snapshot.last_sweep.map(|sweep| sweep.outcome),
+        )
+    }
+
+    /// A free-space probe that is below a 1 MB floor for its first `below`
+    /// checks and clear after that.
+    fn pressured_for(below: u32) -> impl Fn(&Path) -> std::io::Result<u64> {
+        let checks = AtomicU32::new(0);
+        move |_| {
+            if checks.fetch_add(1, AtomicOrdering::Relaxed) < below {
+                Ok(500_000)
+            } else {
+                Ok(u64::MAX)
+            }
+        }
+    }
+
+    #[test]
+    fn retention_capacity_age_removals_count_confirmed_deletions() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let old_a = plant(tmp.path(), "prod", days_before(today, 40));
+        let old_b = plant(tmp.path(), "lab", days_before(today, 50));
+        let recent = plant(tmp.path(), "prod", days_before(today, 3));
+        let evidence = RetentionEvidence::default();
+        assert_eq!(evidence_after(&evidence), (0, 0, 0, None));
+        metrics::with_local_recorder(&recorder, || {
+            retention_tick_at(
+                tmp.path(),
+                &no_wal(),
+                &make_config(30, 0),
+                &evidence,
+                today,
+                |_| panic!("a floor of 0 never checks free space"),
+                delete_date_dir,
+            )
+            .unwrap();
+        });
+        assert!(!old_a.exists() && !old_b.exists() && recent.exists());
+        assert_eq!(
+            evidence_after(&evidence),
+            (2, 0, 0, Some(SweepOutcome::Completed))
+        );
+        // The scrape counts the same removals, under the same trigger.
+        let deletions = crate::metrics::RETENTION_DELETIONS_TOTAL;
+        assert_eq!(
+            crate::metrics::test_support::sample(
+                &handle,
+                &format!("{deletions}{{trigger=\"age\"}}")
+            ),
+            2
+        );
+        assert!(
+            !handle.render().contains("disk_pressure"),
+            "{}",
+            handle.render()
+        );
+    }
+
+    #[test]
+    fn retention_capacity_disk_pressure_removals_count_confirmed_deletions() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let oldest = plant(tmp.path(), "prod", days_before(today, 20));
+        let middle = plant(tmp.path(), "prod", days_before(today, 10));
+        let newest = plant(tmp.path(), "prod", days_before(today, 5));
+        let evidence = RetentionEvidence::default();
+        let config = RetentionConfig {
+            min_free_disk_bytes: 1_000_000,
+            ..make_config(90, 0)
+        };
+        // Below the floor for two checks: two pressure deletions, then clear.
+        metrics::with_local_recorder(&recorder, || {
+            retention_tick_at(
+                tmp.path(),
+                &no_wal(),
+                &config,
+                &evidence,
+                today,
+                pressured_for(2),
+                delete_date_dir,
+            )
+            .unwrap();
+        });
+        assert!(!oldest.exists() && !middle.exists() && newest.exists());
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 2, 1, Some(SweepOutcome::Completed)),
+            "two removals, and one attempt however many checks it took"
+        );
+        let deletions = crate::metrics::RETENTION_DELETIONS_TOTAL;
+        assert_eq!(
+            crate::metrics::test_support::sample(
+                &handle,
+                &format!("{deletions}{{trigger=\"disk_pressure\"}}")
+            ),
+            2
+        );
+        assert_eq!(
+            crate::metrics::test_support::sample(
+                &handle,
+                crate::metrics::RETENTION_PRESSURE_ATTEMPTS_TOTAL
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn retention_capacity_pressure_attempt_counts_once_per_tick() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        for days in [30, 20, 10, 5] {
+            plant(tmp.path(), "prod", days_before(today, days));
+        }
+        let evidence = RetentionEvidence::default();
+        let pressured = RetentionConfig {
+            min_free_disk_bytes: 1_000_000,
+            ..make_config(0, 0)
+        };
+        let tick = |config: &RetentionConfig, free: &dyn Fn(&Path) -> std::io::Result<u64>| {
+            retention_tick_at(
+                tmp.path(),
+                &no_wal(),
+                config,
+                &evidence,
+                today,
+                free,
+                delete_date_dir,
+            )
+            .unwrap();
+        };
+        // Clear at the first check: no attempt.
+        tick(&pressured, &|_| Ok(u64::MAX));
+        assert_eq!(evidence_after(&evidence).2, 0);
+        // Equality with the floor is not below it.
+        tick(&pressured, &|_| Ok(1_000_000));
+        assert_eq!(evidence_after(&evidence).2, 0);
+        // Two pressured ticks, one deletion each: one attempt per tick.
+        tick(&pressured, &pressured_for(1));
+        tick(&pressured, &pressured_for(1));
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 2, 2, Some(SweepOutcome::Completed))
+        );
+        // A floor of 0 is pressure deletion off: never an attempt.
+        tick(&make_config(0, 0), &|_| Ok(0));
+        assert_eq!(evidence_after(&evidence).2, 2);
+        // A suppressed tick stands down before the first check.
+        std::fs::write(tmp.path().join("REPIN"), b"{}").unwrap();
+        tick(&pressured, &|_| Ok(0));
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 2, 2, Some(SweepOutcome::Suppressed))
+        );
+    }
+
+    #[test]
+    fn retention_capacity_suppressed_outcome() {
+        let today = fixed_today();
+        let config = RetentionConfig {
+            min_free_disk_bytes: 1_000_000,
+            ..make_config(30, 0)
+        };
+
+        // A repin in flight at the tick's start.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let old = plant(&data_dir, "prod", days_before(today, 40));
+        std::fs::write(data_dir.join("REPIN"), b"{}").unwrap();
+        let evidence = RetentionEvidence::default();
+        retention_tick_at(
+            &data_dir,
+            &no_wal(),
+            &config,
+            &evidence,
+            today,
+            always_pressured(),
+            delete_date_dir,
+        )
+        .unwrap();
+        assert!(old.exists());
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 0, 0, Some(SweepOutcome::Suppressed))
+        );
+
+        // Publication markers that cannot be read.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let wal_dir = tmp.path().join("wal");
+        std::fs::write(&wal_dir, b"not a directory").unwrap();
+        plant(&data_dir, "prod", days_before(today, 40));
+        let evidence = RetentionEvidence::default();
+        retention_tick_at(
+            &data_dir,
+            &wal_dir,
+            &config,
+            &evidence,
+            today,
+            always_pressured(),
+            delete_date_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 0, 0, Some(SweepOutcome::Suppressed))
+        );
+
+        // A repin admitted mid-pressure-sweep: the removal before it still
+        // counts, and the stand-down outranks the pressure it left behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let first = plant(&data_dir, "prod", days_before(today, 20));
+        let second = plant(&data_dir, "prod", days_before(today, 10));
+        let evidence = RetentionEvidence::default();
+        retention_tick_at(
+            &data_dir,
+            &no_wal(),
+            &make_config(0, 1_000_000),
+            &evidence,
+            today,
+            always_pressured(),
+            |path| {
+                let freed = delete_date_dir(path)?;
+                std::fs::write(data_dir.join("REPIN"), b"{}").unwrap();
+                Ok(freed)
+            },
+        )
+        .unwrap();
+        assert!(!first.exists() && second.exists());
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 1, 1, Some(SweepOutcome::Suppressed))
+        );
+    }
+
+    #[test]
+    fn retention_capacity_exhausted_below_floor_outcome() {
+        let today = fixed_today();
+        let tmp = tempfile::tempdir().unwrap();
+        let only = plant(tmp.path(), "prod", days_before(today, 3));
+        let todays = plant(tmp.path(), "prod", today);
+        let evidence = RetentionEvidence::default();
+        retention_tick_at(
+            tmp.path(),
+            &no_wal(),
+            &make_config(90, 1_000_000),
+            &evidence,
+            today,
+            always_pressured(),
+            delete_date_dir,
+        )
+        .unwrap();
+        assert!(!only.exists() && todays.exists());
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 1, 1, Some(SweepOutcome::ExhaustedBelowFloor))
+        );
+        // Nothing left to delete at all is the same outcome.
+        retention_tick_at(
+            tmp.path(),
+            &no_wal(),
+            &make_config(90, 1_000_000),
+            &evidence,
+            today,
+            always_pressured(),
+            delete_date_dir,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 1, 2, Some(SweepOutcome::ExhaustedBelowFloor))
+        );
+    }
+
+    #[test]
+    fn retention_capacity_failed_outcome() {
+        let today = fixed_today();
+        let refuse = |refused: PathBuf| {
+            move |path: &Path| {
+                if path == refused {
+                    Err("injected removal failure".to_owned())
+                } else {
+                    delete_date_dir(path)
+                }
+            }
+        };
+
+        // An age deletion that errors: only the successful one counts, and
+        // the tick is failed, not completed.
+        let tmp = tempfile::tempdir().unwrap();
+        let refused = plant(tmp.path(), "prod", days_before(today, 40));
+        let removed = plant(tmp.path(), "prod", days_before(today, 50));
+        let evidence = RetentionEvidence::default();
+        retention_tick_at(
+            tmp.path(),
+            &no_wal(),
+            &make_config(30, 0),
+            &evidence,
+            today,
+            |_| Ok(u64::MAX),
+            refuse(refused.clone()),
+        )
+        .unwrap();
+        assert!(refused.exists() && !removed.exists());
+        assert_eq!(
+            evidence_after(&evidence),
+            (1, 0, 0, Some(SweepOutcome::Failed))
+        );
+
+        // A pressure deletion that errors outranks running out below the
+        // floor: failed beats exhausted_below_floor.
+        let tmp = tempfile::tempdir().unwrap();
+        let refused = plant(tmp.path(), "prod", days_before(today, 20));
+        let removed = plant(tmp.path(), "prod", days_before(today, 10));
+        let evidence = RetentionEvidence::default();
+        retention_tick_at(
+            tmp.path(),
+            &no_wal(),
+            &make_config(90, 1_000_000),
+            &evidence,
+            today,
+            always_pressured(),
+            refuse(refused.clone()),
+        )
+        .unwrap();
+        assert!(refused.exists() && !removed.exists());
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 1, 1, Some(SweepOutcome::Failed))
+        );
+
+        // A failed deletion followed by a mid-sweep repin: failed beats
+        // suppressed.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let refused = plant(&data_dir, "prod", days_before(today, 20));
+        plant(&data_dir, "prod", days_before(today, 10));
+        let evidence = RetentionEvidence::default();
+        retention_tick_at(
+            &data_dir,
+            &no_wal(),
+            &make_config(90, 1_000_000),
+            &evidence,
+            today,
+            always_pressured(),
+            |path: &Path| {
+                std::fs::write(data_dir.join("REPIN"), b"{}").unwrap();
+                if path == refused {
+                    Err("injected removal failure".to_owned())
+                } else {
+                    delete_date_dir(path)
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 0, 1, Some(SweepOutcome::Failed))
+        );
+
+        // A tick that errors outright (free space unreadable) is failed.
+        let tmp = tempfile::tempdir().unwrap();
+        plant(tmp.path(), "prod", days_before(today, 10));
+        let evidence = RetentionEvidence::default();
+        assert!(
+            retention_tick_at(
+                tmp.path(),
+                &no_wal(),
+                &make_config(90, 1_000_000),
+                &evidence,
+                today,
+                |_| Err(std::io::Error::other("statvfs failed")),
+                delete_date_dir,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            evidence_after(&evidence),
+            (0, 0, 0, Some(SweepOutcome::Failed))
+        );
+    }
+
+    /// The last sweep's age runs on the monotonic clock from the moment the
+    /// tick recorded it.
+    #[test]
+    fn retention_capacity_last_sweep_ages_from_its_record() {
+        let evidence = RetentionEvidence::default();
+        evidence.record_sweep(SweepOutcome::Completed);
+        let recorded = evidence.last_sweep.lock().unwrap().1;
+        let later = evidence.snapshot(recorded + Duration::from_secs(90));
+        assert_eq!(
+            later.last_sweep,
+            Some(trawl_api::LastSweep {
+                outcome: SweepOutcome::Completed,
+                age_secs: 90,
+            })
+        );
     }
 }

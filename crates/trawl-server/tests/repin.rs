@@ -2503,12 +2503,14 @@ impl Harness {
         let _retention = trawl_server::retention::spawn_retention(
             self.data_dir.clone(),
             self.wal_dir.clone(),
-            trawl_server::config::RetentionConfig {
-                max_age_days: 90,
-                min_free_disk_bytes: 0,
-                retention_interval_secs: 1,
-                env: std::collections::BTreeMap::new(),
-            },
+            std::sync::Arc::new(trawl_server::retention::RetentionShared::new(
+                trawl_server::config::RetentionConfig {
+                    max_age_days: 90,
+                    min_free_disk_bytes: 0,
+                    retention_interval_secs: 1,
+                    env: std::collections::BTreeMap::new(),
+                },
+            )),
             rx,
         );
         for _ in 0..200 {
