@@ -29,6 +29,8 @@
 //! the markers whose files are gone, then report the rest. A query that
 //! takes no guard while a writer holds the lock or waits for it forgets
 //! nothing and reads no file: it reports every marker that is not in flight.
+//! [`PublicationGate::pending_rollup_markers`] may run without a guard, so
+//! it neither forgets nor lists a marker in flight.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -434,10 +436,23 @@ impl PublicationGate {
 
     /// Recovery must finish these days before WAL compaction changes any
     /// hourly input named by a marker.
+    ///
+    /// Forgets the markers whose files are confirmed gone, except one in
+    /// flight: its writer may not have written its file yet, and a caller
+    /// may hold no guard. Lists every other marker. One in flight is a live
+    /// writer's own, not a marker to recover; if that rollup fails with the
+    /// marker on disk, the marker is listed once its registration drops.
     pub fn pending_rollup_markers(&self) -> Vec<PathBuf> {
         let mut corpus = self.corpus.lock();
-        corpus.markers.retain(|path| !is_missing(path));
-        corpus.markers.iter().cloned().collect()
+        let CorpusState {
+            markers, in_flight, ..
+        } = &mut *corpus;
+        markers.retain(|path| in_flight.contains(path) || !is_missing(path));
+        markers
+            .iter()
+            .filter(|path| !in_flight.contains(*path))
+            .cloned()
+            .collect()
     }
 
     /// Pause the next publication while its caller still holds the write guard.
@@ -998,6 +1013,46 @@ mod tests {
         assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RollupPending));
         std::fs::remove_file(&marker).unwrap();
         assert!(gate.read().await.is_ok());
+    }
+
+    /// A compaction pass lists the pending markers before it takes the
+    /// write guard. Inside a rollup's window, between its registration and
+    /// its marker file, that listing neither forgets the marker nor lists
+    /// it: the marker is a live writer's, not one to recover. If the rollup
+    /// then fails with its marker on disk, the marker refuses reads beside
+    /// its own writer and after it, and recovery lists it.
+    #[tokio::test]
+    async fn listing_pending_markers_inside_a_rollup_keeps_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-svc");
+        let gate = PublicationGate::new();
+        {
+            let _writer = gate.write().await;
+            let registration = gate.mark_rollup(&marker);
+            assert!(
+                gate.pending_rollup_markers().is_empty(),
+                "an in-flight marker is not pending"
+            );
+            assert!(
+                gate.corpus.lock().markers.contains(&marker),
+                "nor forgotten while its file does not exist yet"
+            );
+            std::fs::write(&marker, "hourly inputs").unwrap();
+            // The rollup fails before retiring its marker.
+            drop(registration);
+            assert_eq!(
+                gate.unsettled(),
+                Some(CorpusUnsettled::RollupPending),
+                "a failed rollup's marker, beside its own writer"
+            );
+        }
+        assert!(matches!(
+            gate.read().await,
+            Err(ServerError::CorpusRecovering(
+                CorpusUnsettled::RollupPending
+            ))
+        ));
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
     }
 
     /// A normal rollup, as health, `/metrics`, the scheduler and a manual
