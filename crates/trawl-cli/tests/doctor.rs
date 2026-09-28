@@ -688,6 +688,71 @@ fn doctor_refuses_url_credentials() {
     recorder.assert_untouched("credentials in a URL");
 }
 
+/// Request paths are appended to the target URL, so a query or fragment
+/// would carry every request, the keyed `whoami` included, to wherever the
+/// URL's path points. `--url` and `--web-url` refuse one as a usage error
+/// naming the flag; a profile's url fails `connection.config` naming the
+/// profile. Empty and percent-encoded forms are refused alike, the URL's
+/// text never appears in any output, and nothing reaches the listener the
+/// URLs name.
+#[test]
+fn doctor_refuses_url_query_and_fragment() {
+    let home = Sandbox::new();
+    let recorder = Recorder::start();
+    let base = recorder.url("https");
+    let key = home.file("key", &format!("{PROFILE_TOKEN}\n"));
+    let key = key.to_str().unwrap();
+    let forms = [
+        ("fragment", format!("{base}/x#fr4gment")),
+        ("bare fragment", format!("{base}#fr4gment")),
+        ("query", format!("{base}/x?qu3ry=1")),
+        ("bare query", format!("{base}?qu3ry=1")),
+        ("empty query", format!("{base}/x?")),
+        ("empty fragment", format!("{base}/x#")),
+        ("encoded fragment", format!("{base}/x%23fr4gment")),
+        ("encoded query", format!("{base}/x%3Fqu3ry=1")),
+    ];
+    let secrets = ["fr4gment", "qu3ry", "/x"];
+    for (form, raw) in &forms {
+        let output = home.trawl(
+            &[
+                "doctor",
+                "--url",
+                raw,
+                "--token-file",
+                key,
+                "--format",
+                "json",
+            ],
+            &[],
+        );
+        assert_usage_error(&output, "--url has a query or fragment", &secrets, form);
+
+        let output = home.trawl(&["doctor", "--url", &base, "--web-url", raw], &[]);
+        assert_usage_error(&output, "--web-url has a query or fragment", &secrets, form);
+
+        home.default_config(&format!(
+            "[profiles.odd]\nurl = \"{raw}\"\ntoken = \"{PROFILE_TOKEN}\"\n"
+        ));
+        let output = home.trawl(&["doctor", "-p", "odd", "--format", "json"], &[]);
+        assert_eq!(output.status.code(), Some(1), "{form}: {}", text(&output));
+        let report = report(&output);
+        let check = connection_config(&report);
+        assert_eq!(check["outcome"], "failed", "{form}");
+        assert_eq!(check["reason"], "URL has a query or fragment", "{form}");
+        assert!(
+            check["source"].as_str().unwrap().contains("[profiles.odd]"),
+            "{form}: names the profile"
+        );
+        assert!(report["target"]["origin"].is_null(), "{form}");
+        let all = text(&output);
+        for secret in secrets.iter().chain([&PROFILE_TOKEN]) {
+            assert!(!all.contains(secret), "{form}: {secret} leaked: {all}");
+        }
+    }
+    recorder.assert_untouched("a query or fragment in a URL");
+}
+
 /// Under a profile, every flag that would change its URL, key, or trust is
 /// refused by name.
 #[test]

@@ -30,6 +30,9 @@
 //! - `-p trial` resolves through the trial's own rules (ADR-0045).
 //! - A URL that carries userinfo is refused before anything is built: the
 //!   HTTP client would turn it into an `Authorization: Basic` header.
+//! - A URL with a query or a fragment is refused too. Request paths are
+//!   appended to the URL, so `https://h/x#frag` would send every request,
+//!   the keyed one included, to `/x`.
 //!
 //! Nothing here calls `Config::load_token`, which falls back to
 //! `[server].token`, and nothing renders the `Display` of a `ConfigError` or
@@ -161,7 +164,8 @@ impl Scheme {
 }
 
 /// A URL that passed the doctor's shape rules: `http` or `https`, a host,
-/// an optional port, and no userinfo.
+/// an optional port, an optional path prefix, and no userinfo, query, or
+/// fragment.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CheckedUrl {
     scheme: Scheme,
@@ -221,6 +225,9 @@ pub enum UrlProblem {
     Malformed,
     /// It carries userinfo (`user@` or `user:password@`).
     Credentials,
+    /// It has a query or a fragment (`?` or `#`, empty or not, or either
+    /// percent-encoded in the path).
+    QueryOrFragment,
 }
 
 /// Check a URL's shape.
@@ -228,6 +235,11 @@ pub enum UrlProblem {
 /// The authority ends where the WHATWG parser ends it, at the first `/`,
 /// `\`, `?` or `#`, and any `@` inside it is userinfo. That check comes
 /// first, so a URL with credentials is always reported as such.
+///
+/// Request paths are appended to what remains, so anything after it but a
+/// path prefix is refused: a `?` or `#` would carry every request path into
+/// a query or a fragment. `%3F` and `%23` are refused as well, because a
+/// proxy that decodes the path would read them as the same delimiters.
 pub fn check_url(raw: &str) -> Result<CheckedUrl, UrlProblem> {
     let (scheme, rest) = raw.split_once("://").ok_or(UrlProblem::Malformed)?;
     let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
@@ -237,6 +249,10 @@ pub fn check_url(raw: &str) -> Result<CheckedUrl, UrlProblem> {
     }
     if raw.chars().any(|c| c.is_control() || c.is_whitespace()) || tail.contains('\\') {
         return Err(UrlProblem::Malformed);
+    }
+    let encoded = tail.to_ascii_lowercase();
+    if tail.contains(['?', '#']) || encoded.contains("%3f") || encoded.contains("%23") {
+        return Err(UrlProblem::QueryOrFragment);
     }
     let scheme = match scheme.to_ascii_lowercase().as_str() {
         "https" => Scheme::Https,
@@ -348,6 +364,10 @@ fn select_url(invocation: &Invocation, url: &str) -> Result<TargetSelection, Ref
             "--url carries credentials (a user or password before the host), which would be \
              sent to the server. Remove them, and name the key with --token-env or --token-file",
         ),
+        UrlProblem::QueryOrFragment => Refusal::invalid(
+            "--url has a query or fragment (a ? or #), which would carry the doctor's requests \
+             somewhere other than the API. Give the API's base URL, such as https://HOST:PORT",
+        ),
         UrlProblem::Malformed => Refusal::invalid(
             "--url must be an http or https URL with a host, such as https://HOST:PORT",
         ),
@@ -401,6 +421,10 @@ fn check_web_url(raw: &str) -> Result<CheckedUrl, Refusal> {
         UrlProblem::Credentials => Refusal::invalid(
             "--web-url carries credentials (a user or password before the host), which would \
              be sent to that origin. Remove them",
+        ),
+        UrlProblem::QueryOrFragment => Refusal::invalid(
+            "--web-url has a query or fragment (a ? or #). Give an origin: a scheme, a host, \
+             and a port, such as https://HOST:PORT",
         ),
         UrlProblem::Malformed => Refusal::invalid(
             "--web-url must be an http or https origin with a host, such as https://HOST:PORT",
@@ -709,6 +733,11 @@ fn resolve_profile(name: &str, config: Option<&str>, path: &str) -> Resolved {
                 "remove the user and password from the url in {table}; keep the key in its token"
             ),
         ),
+        UrlProblem::QueryOrFragment => Failure::new(
+            format!("url in {table} in {path}"),
+            "URL has a query or fragment",
+            format!("remove everything from the first ? or # in the url in {table}"),
+        ),
         UrlProblem::Malformed => Failure::new(
             format!("url in {table} in {path}"),
             "the url is not an http or https URL with a host",
@@ -1014,6 +1043,58 @@ mod tests {
         assert!(check_url("https://h:1/a@b").is_ok());
     }
 
+    /// Request paths are appended to the URL, so a `?` or `#` anywhere past
+    /// the authority, empty or not, or percent-encoded in the path, is
+    /// refused. `--url` and `--web-url` name only the flag; the URL's text
+    /// never appears.
+    #[test]
+    fn urls_with_a_query_or_fragment_are_refused_without_echo() {
+        for raw in [
+            "https://h:1/x#s3cretfrag",
+            "https://h:1#s3cretfrag",
+            "https://h:1/x?s3cret=1",
+            "https://h:1?s3cret=1",
+            "https://h:1/x?",
+            "https://h:1/x#",
+            "https://h:1?",
+            "https://h:1#",
+            "https://h:1/?#",
+            "https://h:1/x%23s3cretfrag",
+            "https://h:1/x%3Fs3cret=1",
+            "https://h:1/x%3fs3cret=1",
+        ] {
+            assert_eq!(
+                check_url(raw).unwrap_err(),
+                UrlProblem::QueryOrFragment,
+                "{raw}"
+            );
+            let err = refused(&url(raw));
+            assert_eq!(err.kind, ErrorKind::InvalidValue, "{raw}");
+            assert!(
+                err.message.starts_with("--url has a query or fragment"),
+                "{raw}: {err:?}"
+            );
+            assert!(!err.message.contains("s3cret") && !err.message.contains("h:1"));
+
+            let mut web = url("https://h:1");
+            web.web_url = Some(raw.to_owned());
+            let err = refused(&web);
+            assert!(
+                err.message.starts_with("--web-url has a query or fragment"),
+                "{raw}: {err:?}"
+            );
+            assert!(!err.message.contains("s3cret") && !err.message.contains("h:1"));
+        }
+        // Credentials are still reported as such when a query follows.
+        assert_eq!(
+            check_url("https://alice@h:1/x?q").unwrap_err(),
+            UrlProblem::Credentials
+        );
+        // A path prefix stays supported, other percent-escapes included.
+        let prefixed = check_url("https://h:1/trawl/api%2Dv1/").unwrap();
+        assert_eq!(prefixed.base(), "https://h:1/trawl/api%2Dv1");
+    }
+
     #[test]
     fn url_shapes() {
         for bad in [
@@ -1157,6 +1238,8 @@ mod tests {
             "[server]\nurl = \"https://base:5514\"\n\n[profiles.nourl]\ntoken = \"flt_x\"\n\n\
              [profiles.creds]\nurl = \"https://alice:s3cret@h:1\"\n\n\
              [profiles.blank]\nurl = \"https://h:1\"\ntoken = \"  \"\n\n\
+             [profiles.frag]\nurl = \"https://h:1/x#s3cretfrag\"\n\n\
+             [profiles.query]\nurl = \"https://h:1/x?s3cret=1\"\n\n\
              [profiles.both]\nurl = \"https://h:1\"\nca_cert = \"/nope.pem\"\ninsecure = true\n",
         );
         let cases = [
@@ -1165,6 +1248,8 @@ mod tests {
             ("nourl", path.as_str(), "sets no url"),
             ("creds", path.as_str(), "URL carries credentials"),
             ("blank", path.as_str(), "token is empty"),
+            ("frag", path.as_str(), "URL has a query or fragment"),
+            ("query", path.as_str(), "URL has a query or fragment"),
             ("both", path.as_str(), "ca_cert and insecure"),
         ];
         for (name, path, fragment) in cases {
@@ -1176,7 +1261,7 @@ mod tests {
             let reason = check.reason.unwrap();
             assert!(reason.contains(fragment), "{name}: {reason}");
             let all = format!("{reason} {:?} {:?}", check.source, check.next_action);
-            for secret in ["alice", "s3cret", "flt_x"] {
+            for secret in ["alice", "s3cret", "flt_x", "h:1"] {
                 assert!(!all.contains(secret), "{name}: {all}");
             }
         }
