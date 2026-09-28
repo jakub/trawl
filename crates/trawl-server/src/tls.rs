@@ -49,6 +49,11 @@ pub enum TlsError {
 
     #[error("TLS configuration error: {0}")]
     Config(String),
+
+    /// A path inside trawld's generated TLS directories is not what trawld
+    /// made there. It is refused, never followed.
+    #[error("refusing {}: {reason}", path.display())]
+    Unsafe { path: PathBuf, reason: String },
 }
 
 /// Build a `rustls` [`ServerConfig`] from user-provided cert/key paths,
@@ -179,35 +184,49 @@ fn log_cert_details(pem_bytes: &[u8]) {
 /// on the volume group-readable to that sidecar, so only keeping the key out
 /// of the mount keeps it from the sidecar.
 ///
+/// Both directories are trawld's own: a symlink, a non-directory, or a
+/// directory another uid owns is refused with [`TlsError::Unsafe`] (see
+/// [`GeneratedDir`]), and so is a symlink at `cert.pem` or `key.pem`.
+///
 /// Returns `(cert_pem, key_pem, was_generated)`.
 fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
-    let tls_dir = state_dir.join(GENERATED_TLS_DIR);
-    let key_dir = state_dir.join(GENERATED_KEY_DIR);
-    let cert_path = tls_dir.join(GENERATED_CERT_FILE);
-    let key_path = key_dir.join(GENERATED_KEY_FILE);
+    fs::create_dir_all(state_dir).map_err(TlsError::Write)?;
+    let tls_dir = GeneratedDir::open(&state_dir.join(GENERATED_TLS_DIR), None)?;
+    let key_dir = GeneratedDir::open(&state_dir.join(GENERATED_KEY_DIR), Some(0o700))?;
+    let cert_path = tls_dir.path.join(GENERATED_CERT_FILE);
+    let key_path = key_dir.path.join(GENERATED_KEY_FILE);
 
     // An older trawld wrote its key beside the certificate. No private key
     // stays in the directory the sidecar mounts; an old-layout pair then has
     // no key in `key_dir` and is regenerated below.
-    let legacy_key = tls_dir.join(GENERATED_KEY_FILE);
-    match fs::remove_file(&legacy_key) {
-        Ok(()) => tracing::info!(
+    if tls_dir
+        .remove(GENERATED_KEY_FILE)
+        .map_err(TlsError::Write)?
+    {
+        tracing::info!(
             event_type = "lifecycle",
-            key = %legacy_key.display(),
+            key = %tls_dir.path.join(GENERATED_KEY_FILE).display(),
             "removed a private key left in the certificate directory"
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(TlsError::Write(e)),
+        );
     }
 
-    if cert_path.exists() && key_path.exists() {
+    // Both are read, so a symlink at either name is refused on every start,
+    // not only on the one that finds the pair complete.
+    let key = key_dir.read(GENERATED_KEY_FILE, |path, source| TlsError::ReadKey {
+        path,
+        source,
+    })?;
+    let cert = tls_dir.read(GENERATED_CERT_FILE, |path, source| TlsError::ReadCert {
+        path,
+        source,
+    })?;
+    if let (Some(c), Some(k)) = (cert, key) {
         tracing::info!(
             event_type = "lifecycle",
             cert = %cert_path.display(),
             key = %key_path.display(),
             "loading existing self-signed TLS certificate"
         );
-        let (c, k) = load_pem_files(&cert_path, &key_path)?;
         return Ok((c, k, false));
     }
 
@@ -229,10 +248,6 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
     let cert_pem = cert.pem();
     let key_pem = signing_key.serialize_pem();
 
-    // Persist so the cert is stable across daemon restarts.
-    fs::create_dir_all(&tls_dir).map_err(TlsError::Write)?;
-    create_key_dir(&key_dir).map_err(TlsError::Write)?;
-
     // A certificate whose key was lost must go before the new key lands:
     // an interruption between the key write and the publication below would
     // otherwise leave the old certificate beside an unrelated key, and every
@@ -240,36 +255,28 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
     // interrupted generation leaves at most a key with no certificate, which
     // the next start regenerates. The directory sync makes the removal
     // durable before the new key exists.
-    remove_if_present(&cert_path).map_err(TlsError::Write)?;
-    #[cfg(unix)]
-    fs::File::open(&tls_dir)
-        .and_then(|dir| dir.sync_all())
+    tls_dir
+        .remove(GENERATED_CERT_FILE)
         .map_err(TlsError::Write)?;
+    tls_dir.sync().map_err(TlsError::Write)?;
 
     // Write the private key with restricted permissions from the start
     // to avoid a TOCTOU window where the key is world-readable. A key left
     // by an interrupted generation is removed rather than truncated, so the
     // new key never inherits the old file's mode.
-    remove_if_present(&key_path).map_err(TlsError::Write)?;
-    #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&key_path)
+        key_dir
+            .remove(GENERATED_KEY_FILE)
+            .map_err(TlsError::Write)?;
+        let mut f = key_dir
+            .create_new(GENERATED_KEY_FILE, 0o600)
             .map_err(TlsError::Write)?;
         f.write_all(key_pem.as_bytes()).map_err(TlsError::Write)?;
         f.sync_all().map_err(TlsError::Write)?;
     }
-    #[cfg(not(unix))]
-    {
-        fs::write(&key_path, &key_pem).map_err(TlsError::Write)?;
-    }
 
-    publish_cert(&cert_path, cert_pem.as_bytes()).map_err(TlsError::Write)?;
+    publish_cert(&tls_dir, cert_pem.as_bytes()).map_err(TlsError::Write)?;
 
     tracing::info!(
         event_type = "lifecycle",
@@ -281,75 +288,225 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
 }
 
-/// Create the directory that holds the generated key, owner-only (`0700`).
+/// Why a symlink inside the generated TLS directories is refused.
+const SYMLINK_REFUSAL: &str = "it is a symbolic link; trawld does not follow one in the \
+                               directories it generates its certificate and key into";
+
+/// One of trawld's generated TLS directories, created if missing, opened
+/// once, and checked.
 ///
-/// `tls_dir` was created first, so the parent exists. The mode is set
-/// explicitly after creation, so neither the umask nor a directory left by
-/// an earlier start decides it.
-fn create_key_dir(key_dir: &Path) -> std::io::Result<()> {
-    let mut builder = fs::DirBuilder::new();
+/// On unix the directory is opened with `O_NOFOLLOW | O_DIRECTORY` and must
+/// be owned by trawld's effective uid. Anyone who can write the state
+/// directory could otherwise plant `tls-key -> tls` and have the private key
+/// written into the directory the Helm sidecar mounts, or have `tls/` re-moded
+/// `0700`. Every file operation after the check is relative to the open
+/// handle (`openat`, `unlinkat`, `renameat`), so replacing the path with a
+/// symlink after the check redirects nothing. A symlink at a file name inside
+/// the directory is refused on open (`O_NOFOLLOW`) and replaced, never
+/// followed, by unlink and rename.
+#[derive(Debug)]
+struct GeneratedDir {
+    path: PathBuf,
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    match builder.create(key_dir) {
-        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
-        _ => {}
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(key_dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    handle: fs::File,
 }
 
-/// Publish `pem` at `cert_path` so that a reader sees either no file or the
-/// whole certificate, never a partial one.
+impl GeneratedDir {
+    /// Create `path` if missing and open it. `mode`, when given, is set
+    /// through the checked handle, so neither the umask nor a directory left
+    /// by an earlier start decides it.
+    fn open(path: &Path, mode: Option<u32>) -> Result<Self, TlsError> {
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(mode);
+        }
+        match builder.create(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
+                return Err(TlsError::Write(e));
+            }
+            _ => {}
+        }
+
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            use rustix::io::Errno;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let handle = match rustix::fs::open(path, flags, Mode::empty()) {
+                Ok(fd) => fs::File::from(fd),
+                // Linux answers a symlink with ENOTDIR here, not ELOOP: the
+                // open has already refused it, and the lstat only names why.
+                Err(Errno::LOOP | Errno::NOTDIR) => {
+                    let reason = if fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
+                        SYMLINK_REFUSAL
+                    } else {
+                        "it is not a directory"
+                    };
+                    return Err(unsafe_path(path, reason.to_owned()));
+                }
+                Err(e) => return Err(TlsError::Write(e.into())),
+            };
+            let owner = handle.metadata().map_err(TlsError::Write)?.uid();
+            let euid = rustix::process::geteuid().as_raw();
+            if owner != euid {
+                return Err(unsafe_path(
+                    path,
+                    format!("it is owned by uid {owner}, not by trawld's uid {euid}"),
+                ));
+            }
+            if let Some(mode) = mode {
+                handle
+                    .set_permissions(fs::Permissions::from_mode(mode))
+                    .map_err(TlsError::Write)?;
+            }
+            Ok(Self {
+                path: path.to_owned(),
+                handle,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            Ok(Self {
+                path: path.to_owned(),
+            })
+        }
+    }
+
+    /// Read the file `name`, or `None` when there is none. A symlink is
+    /// refused; any other failure is reported through `err`.
+    fn read(
+        &self,
+        name: &str,
+        err: impl FnOnce(PathBuf, std::io::Error) -> TlsError,
+    ) -> Result<Option<Vec<u8>>, TlsError> {
+        let path = self.path.join(name);
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            use rustix::io::Errno;
+            use std::io::Read;
+
+            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let mut file = match rustix::fs::openat(&self.handle, name, flags, Mode::empty()) {
+                Ok(fd) => fs::File::from(fd),
+                Err(Errno::NOENT) => return Ok(None),
+                Err(Errno::LOOP) => return Err(unsafe_path(&path, SYMLINK_REFUSAL.to_owned())),
+                Err(e) => return Err(err(path, e.into())),
+            };
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|e| err(path, e))?;
+            Ok(Some(bytes))
+        }
+        #[cfg(not(unix))]
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(err(path, e)),
+        }
+    }
+
+    /// Remove the file `name`; returns whether there was one. A symlink is
+    /// removed itself, not its target.
+    fn remove(&self, name: &str) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        let removed = rustix::fs::unlinkat(&self.handle, name, rustix::fs::AtFlags::empty())
+            .map_err(std::io::Error::from);
+        #[cfg(not(unix))]
+        let removed = fs::remove_file(self.path.join(name));
+        match removed {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Create the file `name`, which must not exist, at `mode`. The file is
+    /// created with no permissions and then set to `mode` through its handle,
+    /// so the umask never decides the mode and no wider mode ever exists.
+    fn create_new(&self, name: &str, mode: u32) -> std::io::Result<fs::File> {
+        #[cfg(unix)]
+        {
+            use rustix::fs::{Mode, OFlags};
+            use std::os::unix::fs::PermissionsExt;
+
+            let flags =
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let file = fs::File::from(rustix::fs::openat(
+                &self.handle,
+                name,
+                flags,
+                Mode::empty(),
+            )?);
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+            Ok(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.path.join(name))
+        }
+    }
+
+    /// Rename `from` to `to` within the directory. An existing `to`, symlink
+    /// or not, is replaced rather than followed.
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            rustix::fs::renameat(&self.handle, from, &self.handle, to)?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        fs::rename(self.path.join(from), self.path.join(to))
+    }
+
+    /// Make earlier removals and renames in the directory durable.
+    fn sync(&self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            self.handle.sync_all()
+        }
+        #[cfg(not(unix))]
+        Ok(())
+    }
+}
+
+fn unsafe_path(path: &Path, reason: String) -> TlsError {
+    TlsError::Unsafe {
+        path: path.to_owned(),
+        reason,
+    }
+}
+
+/// Publish `pem` as `cert.pem` in `tls_dir` so that a reader sees either no
+/// file or the whole certificate, never a partial one.
 ///
 /// Writes a sibling `cert.pem.tmp`, syncs it, then renames it over
-/// `cert_path` (rename within one directory is atomic). On unix the
-/// temporary file is created exclusively and set to `0644` explicitly, so
-/// neither a leftover file from a crashed start nor a restrictive umask
-/// decides who can read the published certificate. The `tempfile` crate is
-/// not used because it creates files `0600`.
-fn publish_cert(cert_path: &Path, pem: &[u8]) -> std::io::Result<()> {
+/// `cert.pem` (rename within one directory is atomic). The temporary file is
+/// created exclusively and set to `0644` explicitly, so neither a leftover
+/// file from a crashed start nor a restrictive umask decides who can read
+/// the published certificate. The `tempfile` crate is not used because it
+/// creates files `0600`.
+fn publish_cert(tls_dir: &GeneratedDir, pem: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let mut tmp_name = cert_path.file_name().unwrap_or_default().to_owned();
-    tmp_name.push(".tmp");
-    let tmp_path = cert_path.with_file_name(tmp_name);
+    let tmp_name = format!("{GENERATED_CERT_FILE}.tmp");
 
     // A crash between create and rename leaves the temporary file behind.
-    remove_if_present(&tmp_path)?;
+    tls_dir.remove(&tmp_name)?;
 
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o644);
-    }
-    let mut f = options.open(&tmp_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // `mode` above is filtered through the umask; this is not.
-        f.set_permissions(fs::Permissions::from_mode(0o644))?;
-    }
+    let mut f = tls_dir.create_new(&tmp_name, 0o644)?;
     f.write_all(pem)?;
     f.sync_all()?;
     drop(f);
-    fs::rename(&tmp_path, cert_path)
-}
-
-/// Remove the file at `path`; a file that is already gone is not an error.
-fn remove_if_present(path: &Path) -> std::io::Result<()> {
-    match fs::remove_file(path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-        _ => Ok(()),
-    }
+    tls_dir.rename(&tmp_name, GENERATED_CERT_FILE)
 }
 
 /// Background task that polls cert/key files for changes and sends a new
@@ -606,6 +763,130 @@ mod tests {
             build_server_config(None, None, tmp.path()).expect("the current pair loads");
         assert!(!self_signed, "the current pair is kept");
         assert!(!legacy_key.exists(), "the stray legacy key is gone");
+    }
+
+    /// A `tls-key` symlink planted at the key directory must not steer the
+    /// private key anywhere: pointed at `tls/`, it would put the key in the
+    /// directory the proxy sidecar mounts. Generation refuses the link,
+    /// naming it, and writes nothing into its target.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_key_directory_is_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+        fs::create_dir_all(&tls_dir).unwrap();
+        fs::set_permissions(&tls_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let key_dir = tmp.path().join(GENERATED_KEY_DIR);
+        symlink(&tls_dir, &key_dir).unwrap();
+
+        let err = build_server_config(None, None, tmp.path())
+            .expect_err("a symlinked key directory is refused");
+        assert!(
+            matches!(&err, TlsError::Unsafe { path, .. } if *path == key_dir),
+            "the refusal names the key directory: {err}"
+        );
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(dir_entries(&tls_dir).is_empty(), "nothing lands in tls/");
+        let mode = fs::metadata(&tls_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the link target is not re-moded");
+    }
+
+    /// The same holds for the certificate directory: a `tls` symlink is
+    /// refused rather than followed, so no certificate or key is written
+    /// into the directory it points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_certificate_directory_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+        symlink(&elsewhere, &tls_dir).unwrap();
+
+        let err = build_server_config(None, None, tmp.path())
+            .expect_err("a symlinked certificate directory is refused");
+        assert!(
+            matches!(&err, TlsError::Unsafe { path, .. } if *path == tls_dir),
+            "the refusal names the certificate directory: {err}"
+        );
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(
+            dir_entries(&elsewhere).is_empty(),
+            "nothing lands in the target"
+        );
+    }
+
+    /// A key directory that is not a directory at all is refused too.
+    #[test]
+    fn a_key_directory_that_is_a_file_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_dir = tmp.path().join(GENERATED_KEY_DIR);
+        fs::write(&key_dir, b"not a directory").unwrap();
+
+        let err = build_server_config(None, None, tmp.path())
+            .expect_err("a key directory that is a file is refused");
+        assert!(
+            matches!(&err, TlsError::Unsafe { path, .. } if *path == key_dir),
+            "the refusal names the key directory: {err}"
+        );
+        assert!(err.to_string().contains("not a directory"), "{err}");
+    }
+
+    /// A symlink at `tls-key/key.pem` or `tls/cert.pem` is refused whether
+    /// or not a pair is already published, and its target is neither read
+    /// as the key nor replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_key_or_certificate_file_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        for with_cert in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+            let key_dir = tmp.path().join(GENERATED_KEY_DIR);
+            fs::create_dir_all(&tls_dir).unwrap();
+            fs::create_dir_all(&key_dir).unwrap();
+            if with_cert {
+                let rcgen::CertifiedKey { cert, .. } =
+                    rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+                fs::write(tls_dir.join(GENERATED_CERT_FILE), cert.pem()).unwrap();
+            }
+            let victim = tmp.path().join("victim");
+            fs::write(&victim, b"not yours").unwrap();
+            let key_path = key_dir.join(GENERATED_KEY_FILE);
+            symlink(&victim, &key_path).unwrap();
+
+            let err = build_server_config(None, None, tmp.path())
+                .expect_err("a symlinked key.pem is refused");
+            assert!(
+                matches!(&err, TlsError::Unsafe { path, .. } if *path == key_path),
+                "the refusal names key.pem (with_cert={with_cert}): {err}"
+            );
+            assert_eq!(fs::read(&victim).unwrap(), b"not yours");
+            assert!(
+                fs::symlink_metadata(&key_path).unwrap().is_symlink(),
+                "the link is left for the operator to inspect"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+        fs::create_dir_all(&tls_dir).unwrap();
+        let victim = tmp.path().join("victim");
+        fs::write(&victim, b"not yours").unwrap();
+        let cert_path = tls_dir.join(GENERATED_CERT_FILE);
+        symlink(&victim, &cert_path).unwrap();
+        let err = build_server_config(None, None, tmp.path())
+            .expect_err("a symlinked cert.pem is refused");
+        assert!(
+            matches!(&err, TlsError::Unsafe { path, .. } if *path == cert_path),
+            "the refusal names cert.pem: {err}"
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"not yours");
     }
 
     /// Names of the entries in `dir`, sorted.
