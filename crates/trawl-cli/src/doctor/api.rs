@@ -527,20 +527,7 @@ impl<'a> ApiRun<'a> {
 fn transport_row(probe: &witness::Probe) -> Check {
     let check = row(API_TRANSPORT, Outcome::Complete);
     if probe.not_built {
-        let reason = match probe.result {
-            Err(ClientError::InvalidCa(_)) => "the pinned CA holds no usable certificate",
-            _ => "the HTTP client could not be built",
-        };
-        return with_next(
-            with_reason(
-                Check {
-                    outcome: Outcome::Failed,
-                    ..check
-                },
-                reason,
-            ),
-            "point ca_cert at a PEM file that holds the server's CA certificate",
-        );
+        return not_built_row(check, probe.result.as_ref().err());
     }
     if probe.answered() {
         return check;
@@ -575,6 +562,32 @@ fn transport_row(probe: &witness::Probe) -> Check {
             "check that trawld is running and that the URL's host and port reach its API",
         ),
     }
+}
+
+/// `api.transport` when the probe client could not be built. Only a pinned
+/// CA that holds no usable certificate points at `ca_cert`; any other build
+/// failure, including every one under `--url`'s system trust, does not.
+fn not_built_row(check: Check, error: Option<&ClientError>) -> Check {
+    let (reason, next) = match error {
+        Some(ClientError::InvalidCa(_)) => (
+            "the pinned CA holds no usable certificate",
+            "point ca_cert at a PEM file that holds the server's CA certificate",
+        ),
+        _ => (
+            "the HTTP client could not be built",
+            "run trawl doctor again; if it fails the same way, report the TLS setup error",
+        ),
+    };
+    with_next(
+        with_reason(
+            Check {
+                outcome: Outcome::Failed,
+                ..check
+            },
+            reason,
+        ),
+        next,
+    )
 }
 
 /// The outcome of a request that got something other than the answer it
@@ -766,6 +779,39 @@ fn identity_detail(who: &WhoAmIResponse, secret: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_build_failure_names_ca_cert_only_for_a_bad_ca() {
+        let bad_ca = ClientError::InvalidCa("no certificate".to_owned());
+        let check = not_built_row(row(API_TRANSPORT, Outcome::Complete), Some(&bad_ca));
+        assert_eq!(check.outcome, Outcome::Failed);
+        assert_eq!(
+            check.reason.as_deref(),
+            Some("the pinned CA holds no usable certificate")
+        );
+        assert!(
+            check
+                .next_action
+                .as_deref()
+                .is_some_and(|n| n.contains("ca_cert")),
+            "{check:?}"
+        );
+
+        for other in [
+            ClientError::InvalidUrl("unsupported".to_owned()),
+            ClientError::Parse("tls backend".to_owned()),
+        ] {
+            let check = not_built_row(row(API_TRANSPORT, Outcome::Complete), Some(&other));
+            assert_eq!(check.outcome, Outcome::Failed, "{other:?}");
+            assert_eq!(
+                check.reason.as_deref(),
+                Some("the HTTP client could not be built"),
+                "{other:?}"
+            );
+            let next = check.next_action.as_deref().expect("a next action");
+            assert!(!next.contains("ca_cert"), "{other:?}: {next}");
+        }
+    }
 
     #[test]
     fn health_keys_and_values_follow_the_patterns() {
