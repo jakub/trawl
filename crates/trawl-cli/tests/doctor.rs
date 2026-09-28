@@ -1435,9 +1435,6 @@ fn doctor_insecure_never_sends_key() {
 /// no `whoami`, no `Authorization` header.
 #[test]
 fn doctor_sends_key_only_after_trawl_health() {
-    let home = Sandbox::new();
-    let server_ca = ca("trawl doctor server CA");
-    let pem = home.file("ca.pem", &server_ca.pem());
     let cases: [(&str, Option<Route>, String); 9] = [
         (
             "301",
@@ -1489,6 +1486,47 @@ fn doctor_sends_key_only_after_trawl_health() {
             "not a trawl health answer".to_owned(),
         ),
     ];
+    assert_health_withholds_key(cases);
+}
+
+/// trawld answers health with exactly 200 or 503, and pairs 200 with `ok`
+/// or `degraded` and 503 with `unavailable`. A valid, signed health body
+/// under another 2xx, or under the status it is not paired with, fails
+/// `api.health` and blocks `api.identity`: no `whoami`, no `Authorization`
+/// header.
+#[test]
+fn doctor_health_status_must_match_its_body() {
+    let signed = |status: &str| {
+        format!(r#"{{"status":"{status}","checks":{{"duckdb":"ok"}},"version":"0.9.0"}}"#)
+    };
+    let disagree = || "status and body disagree".to_owned();
+    assert_health_withholds_key([
+        (
+            "201 valid body",
+            Some((HEALTH_PATH, 201, signed("ok"))),
+            "HTTP 201 is not a health answer".to_owned(),
+        ),
+        ("503 ok", Some((HEALTH_PATH, 503, signed("ok"))), disagree()),
+        (
+            "503 degraded",
+            Some((HEALTH_PATH, 503, signed("degraded"))),
+            disagree(),
+        ),
+        (
+            "200 unavailable",
+            Some((HEALTH_PATH, 200, signed("unavailable"))),
+            disagree(),
+        ),
+    ]);
+}
+
+/// For each `(case, health route, reason)`: under verified TLS, the doctor
+/// fails `api.health` with `reason`, blocks `api.identity`, exits 1, and
+/// the stub sees only the unkeyed probe.
+fn assert_health_withholds_key<const N: usize>(cases: [(&str, Option<Route>, String); N]) {
+    let home = Sandbox::new();
+    let server_ca = ca("trawl doctor server CA");
+    let pem = home.file("ca.pem", &server_ca.pem());
     for (case, health, reason) in cases {
         let mut routes = vec![whoami(r#""query""#)];
         routes.extend(health);
@@ -1532,6 +1570,42 @@ fn doctor_sends_key_only_after_trawl_health() {
         let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths, [HEALTH_PATH], "{case}: only the unkeyed probe");
         stub.assert_no_authorization(case);
+    }
+}
+
+/// The three answers trawld sends, 200 with `ok` or `degraded` and 503
+/// with `unavailable`, each complete `api.health` and send the key to
+/// `whoami`.
+#[test]
+fn doctor_accepts_the_health_answers_trawld_sends() {
+    for (http, status) in [(200, "ok"), (200, "degraded"), (503, "unavailable")] {
+        let body = format!(
+            r#"{{"status":"{status}","checks":{{"duckdb":"ok"}},"version":"{}"}}"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        let (output, stub) = doctor_against(vec![(HEALTH_PATH, http, body), whoami(r#""query""#)]);
+        let case = format!("{http} {status}");
+        let report = report(&output);
+        let health = check_by_id(&report, "api.health");
+        assert_eq!(health["outcome"], "complete", "{case}: {health}");
+        assert_eq!(
+            health["detail"],
+            format!(
+                "status: {status}; server version {}",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "{case}"
+        );
+        assert_eq!(
+            check_by_id(&report, "api.identity")["outcome"],
+            "complete",
+            "{case}"
+        );
+        let requests = stub.requests();
+        let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, [HEALTH_PATH, WHOAMI_PATH], "{case}");
+        assert_eq!(requests[0].authorization, None, "{case}");
+        assert!(requests[1].authorization.is_some(), "{case}");
     }
 }
 

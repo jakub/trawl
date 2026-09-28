@@ -229,14 +229,22 @@ impl HttpClient {
 
     /// Check daemon health (unauthenticated).
     ///
-    /// A 503 whose body is a health body is an answer, not an error: an
-    /// unavailable daemon still reports its per-subsystem checks, so it is
-    /// returned as `Ok` with `status: unavailable`. Any other failure status,
-    /// or a 503 with a foreign body (a proxy's error page), stays a
-    /// [`ClientError::Server`]. No body is read past [`HEALTH_BODY_CAP`]: a
-    /// body past it is [`ClientError::TooLarge`] whatever the status, and
-    /// an error envelope in it is never judged.
+    /// trawld answers exactly 200 (`ok` or `degraded`) or 503
+    /// (`unavailable`). A 503 whose body is a health body is an answer, not
+    /// an error: an unavailable daemon still reports its per-subsystem
+    /// checks, so it is returned as `Ok` with `status: unavailable`. Any
+    /// other status, another 2xx included, or a 503 with a foreign body (a
+    /// proxy's error page), is a [`ClientError::Server`]. No body is read
+    /// past [`HEALTH_BODY_CAP`]: a body past it is [`ClientError::TooLarge`]
+    /// whatever the status, and an error envelope in it is never judged.
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
+        self.health_with_status().await.map(|(_, health)| health)
+    }
+
+    /// [`health`](Self::health), with the HTTP status the answer came
+    /// with: always 200 or 503. The caller can then hold the status and
+    /// the body's own `status` to trawld's pairing.
+    pub async fn health_with_status(&self) -> Result<(u16, HealthResponse), ClientError> {
         let url = self.endpoint("/api/v1/health");
 
         let resp = self
@@ -250,15 +258,17 @@ impl HttpClient {
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             let body = read_bounded(resp, HEALTH_BODY_CAP).await?;
             if let Ok(health) = serde_json::from_slice::<HealthResponse>(&body) {
-                return Ok(health);
+                return Ok((503, health));
             }
             return Err(server_error(503, &body));
         }
-        if !status.is_success() {
+        if status != reqwest::StatusCode::OK {
             let body = read_bounded(resp, HEALTH_BODY_CAP).await?;
             return Err(server_error(status.as_u16(), &body));
         }
-        read_json_capped(resp, HEALTH_BODY_CAP, "health").await
+        read_json_capped(resp, HEALTH_BODY_CAP, "health")
+            .await
+            .map(|health| (200, health))
     }
 
     /// Fetch schema introspection from the daemon.
@@ -1729,6 +1739,22 @@ mod tests {
             ]))
         );
         assert_eq!(health.version.as_deref(), Some("0.9.0"));
+    }
+
+    /// trawld answers health with exactly 200 or 503, so another 2xx is an
+    /// error even when its body is a valid health body.
+    #[tokio::test]
+    async fn health_other_2xx_is_an_error() {
+        let body = br#"{"status":"ok","checks":{"duckdb":"ok"},"version":"0.9.0"}"#;
+        for (line, code) in [("201 Created", 201), ("202 Accepted", 202)] {
+            let err = health_answered_with(http_response(line, "application/json", body))
+                .await
+                .expect_err("only 200 and 503 are health answers");
+            assert!(
+                matches!(err, ClientError::Server { status, .. } if status == code),
+                "{line}: {err:?}"
+            );
+        }
     }
 
     /// Only a 503 carrying a health body is kept. A 502 is an error whatever

@@ -12,9 +12,11 @@
 //! trust verifies, and an HTTP answer arrived under that trust; `api.health`
 //! turns it into a `VerifiedApi` only when that answer parsed as a trawl
 //! health body carrying trawl's signature: a `checks` map and a `version`,
-//! which trawld always sends. An untrusted certificate, an `insecure`
-//! trust, a plain `http` URL, a redirect, or any answer that is not trawl's
-//! health body therefore never sees a key.
+//! which trawld always sends, under the HTTP status trawld pairs with the
+//! body's `status` (200 with `ok` or `degraded`, 503 with `unavailable`).
+//! An untrusted certificate, an `insecure` trust, a plain `http` URL, a
+//! redirect, or any answer that is not trawl's health body therefore never
+//! sees a key.
 //!
 //! Every outcome is decided from [`ClientError::network_kind`] or a
 //! [`ClientError::Server`] status, never from an error's text, and no
@@ -95,7 +97,7 @@ pub(super) fn with_next(mut check: Check, next: impl Into<String>) -> Check {
 /// The private witness and the only two constructors of an HTTP client
 /// aimed at the API.
 mod witness {
-    use trawl_api::HealthResponse;
+    use trawl_api::{HealthResponse, HealthStatus};
     use trawl_client::{ClientError, HttpClient, TlsTrust};
 
     use super::super::resolve::{CheckedUrl, Connection, Key, Scheme};
@@ -107,8 +109,9 @@ mod witness {
         /// Whether the request went out under the connection's own trust.
         /// A plain `http` URL is probed without TLS, so it is false there.
         under_configured_trust: bool,
-        /// What the request returned. `Err` from building the client too.
-        pub(super) result: Result<HealthResponse, ClientError>,
+        /// What the request returned, with the HTTP status (200 or 503) of
+        /// an answer. `Err` from building the client too.
+        pub(super) result: Result<(u16, HealthResponse), ClientError>,
         /// The client could not be built; nothing was sent.
         pub(super) not_built: bool,
     }
@@ -146,7 +149,7 @@ mod witness {
         match client(&connection.url, "", trust) {
             Ok(api) => Probe {
                 under_configured_trust: !plain,
-                result: api.health().await,
+                result: api.health_with_status().await,
                 not_built: false,
             },
             Err(e) => Probe {
@@ -164,7 +167,7 @@ mod witness {
     pub(super) struct VerifiedTls<'a> {
         url: &'a CheckedUrl,
         trust: &'a TlsTrust,
-        answer: Result<HealthResponse, ClientError>,
+        answer: Result<(u16, HealthResponse), ClientError>,
     }
 
     /// Mint the TLS witness when, and only when, the URL is `https`, the
@@ -190,9 +193,9 @@ mod witness {
     }
 
     /// An API that answered as trawl under verified TLS: its health answer
-    /// parsed as a trawl health body (a 200, or a 503 carrying one) with
-    /// both a `checks` map and a `version`. Only [`VerifiedTls::into_api`]
-    /// mints one.
+    /// parsed as a trawl health body with both a `checks` map and a
+    /// `version`, under the HTTP status trawld sends with that body's
+    /// `status`. Only [`VerifiedTls::into_api`] mints one.
     pub(super) struct VerifiedApi<'a> {
         url: &'a CheckedUrl,
         trust: &'a TlsTrust,
@@ -205,17 +208,27 @@ mod witness {
         /// The body parsed, but lacks the `checks` map or the `version`
         /// that trawld always sends: a status alone is anyone's answer.
         Unsigned,
+        /// The HTTP status and the body's `status` are not a pair trawld
+        /// sends: 200 goes with `ok` or `degraded`, 503 with `unavailable`.
+        Disagrees,
     }
 
     impl<'a> VerifiedTls<'a> {
         /// The health answer, and with it the API witness when that answer
         /// is trawl's health body. A redirect, another status, a body that
-        /// does not parse, or one without both `checks` and `version` comes
-        /// back as the refusal, and no witness.
+        /// does not parse, one without both `checks` and `version`, or one
+        /// whose `status` disagrees with the HTTP status comes back as the
+        /// refusal, and no witness.
         pub(super) fn into_api(self) -> Result<(VerifiedApi<'a>, HealthResponse), NotTrawl> {
-            let health = self.answer.map_err(NotTrawl::Answer)?;
+            let (http_status, health) = self.answer.map_err(NotTrawl::Answer)?;
             if health.checks.is_none() || health.version.is_none() {
                 return Err(NotTrawl::Unsigned);
+            }
+            if !matches!(
+                (http_status, &health.status),
+                (200, HealthStatus::Ok | HealthStatus::Degraded) | (503, HealthStatus::Unavailable)
+            ) {
+                return Err(NotTrawl::Disagrees);
             }
             Ok((
                 VerifiedApi {
@@ -373,9 +386,10 @@ impl<'a> ApiRun<'a> {
 
     /// `api.health` and its `api.health.<key>` rows, from the probe's
     /// answer. The runner calls it only after `api.tls` completed. A trawl
-    /// health body, one that parses and carries both `checks` and
-    /// `version`, mints the API witness, the only way `api.identity` can
-    /// send the key; anything else fails here and blocks it.
+    /// health body, one that parses, carries both `checks` and `version`,
+    /// and came under the HTTP status trawld sends with its `status`, mints
+    /// the API witness, the only way `api.identity` can send the key;
+    /// anything else fails here and blocks it.
     pub fn health(&mut self) -> Vec<Check> {
         let tls = self
             .tls
@@ -392,6 +406,12 @@ impl<'a> ApiRun<'a> {
                 return vec![with_next(
                     with_reason(check, "not a trawl health answer"),
                     "check that the URL names trawld's API, not another service",
+                )];
+            }
+            Err(witness::NotTrawl::Disagrees) => {
+                return vec![with_next(
+                    with_reason(check, "status and body disagree"),
+                    "check that the URL names trawld's API, not a proxy or another service",
                 )];
             }
         };
