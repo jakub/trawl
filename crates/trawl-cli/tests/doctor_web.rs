@@ -72,7 +72,15 @@ async fn record(State(log): State<Log>, request: Request, next: Next) -> Respons
                 .and_then(|v| v.as_str())
                 .map(str::to_owned)
         });
+    // The full request target, query included: a key carried in the query
+    // must fail the exact `REQUESTS` match and show up in the canary check.
+    let target = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| parts.uri.path().to_owned(), ToString::to_string);
     let mut raw = String::new();
+    raw.push_str(&target);
+    raw.push('\n');
     for (name, value) in &parts.headers {
         raw.push_str(name.as_str());
         raw.push_str(": ");
@@ -82,7 +90,7 @@ async fn record(State(log): State<Log>, request: Request, next: Next) -> Respons
     raw.push_str(&String::from_utf8_lossy(&bytes));
     log.lock().unwrap().push(Seen {
         method: parts.method.to_string(),
-        path: parts.uri.path().to_owned(),
+        path: target,
         origin: parts
             .headers
             .get(header::ORIGIN)
