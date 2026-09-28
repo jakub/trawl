@@ -165,24 +165,24 @@ mod tests {
     use tower::ServiceExt;
     use trawl_config::WebConfig;
     use wiremock::matchers::{bearer_token, method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, ResponseTemplate};
 
     use crate::config::ResolvedConfig;
     use crate::routes;
+    use crate::test_support::TlsUpstream;
 
-    fn state_pointing_at(upstream: &MockServer) -> AppState {
+    fn state_pointing_at(upstream: &TlsUpstream) -> AppState {
         let web = WebConfig {
-            upstream_url: Some(upstream.uri()),
             allow_insecure_cookies: true,
             // Required since ADR-0016; these tests send no Origin header,
             // and a present-only guard lets those through.
             public_origins: vec!["https://trawl.fleet.test".to_owned()],
-            ..WebConfig::default()
+            ..upstream.web_config()
         };
         AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap()
     }
 
-    async fn login_cookie(app: axum::Router, upstream: &MockServer) -> String {
+    async fn login_cookie(app: axum::Router, upstream: &TlsUpstream) -> String {
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -192,7 +192,7 @@ mod tests {
                 "roles": ["trawl-analyst"],
                 "permissions": ["query", "schema_read", "validate", "saved_query", "export", "stream", "query_cancel"]
             })))
-            .mount(upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -216,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_forwards_upstream_body_with_sse_headers() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -232,7 +232,7 @@ mod tests {
                     .set_body_string(sse_body)
                     .insert_header("content-type", "text/event-stream"),
             )
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -260,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_rejects_missing_cookie() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -275,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_maps_upstream_401_to_401() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -284,7 +284,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/stream"))
             .respond_with(ResponseTemplate::new(401))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -301,7 +301,7 @@ mod tests {
     async fn stream_upstream_401_with_session_preserves_cookie() {
         // A stream 401 means the upstream key is dead. The stream proxy still
         // leaves cookie lifecycle to `auth::me`.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -310,7 +310,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/stream"))
             .respond_with(ResponseTemplate::new(401))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_upstream_403_preserves_cookie() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -338,7 +338,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/stream"))
             .respond_with(ResponseTemplate::new(403))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -359,7 +359,7 @@ mod tests {
     async fn stream_preserves_upstream_400_for_bad_query() {
         // Invalid DSL is a user error, not a proxy error — we must
         // preserve trawld's 400 so the client can render the real message.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -371,7 +371,7 @@ mod tests {
                 ResponseTemplate::new(400)
                     .set_body_json(serde_json::json!({"error": "invalid DSL"})),
             )
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -396,7 +396,7 @@ mod tests {
     async fn stream_preserves_upstream_429_for_rate_limit() {
         // Stream concurrency limit is an actionable 429 that the UI
         // should render with backoff messaging — not a generic 502.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -405,7 +405,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/stream"))
             .respond_with(ResponseTemplate::new(429))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -420,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_upstream_500_is_not_masked_as_502() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -429,7 +429,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/stream"))
             .respond_with(ResponseTemplate::new(500))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -477,7 +477,7 @@ mod tests {
         use fleet_auth::{SessionExpiry, SessionPayload, encrypt};
         use zeroize::Zeroizing;
 
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         // Upstream body can be short; the point is that take_until fires
         // regardless of whether the body is still arriving.
         Mock::given(method("GET"))
@@ -487,7 +487,7 @@ mod tests {
                     .set_body_string("event: data\ndata: first\n\n")
                     .insert_header("content-type", "text/event-stream"),
             )
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let state = state_pointing_at(&upstream);
@@ -525,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_stream_forwards_body_with_sse_headers() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -540,7 +540,7 @@ mod tests {
                     .set_body_string(sse_body)
                     .insert_header("content-type", "text/event-stream"),
             )
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -568,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_stream_rejects_missing_cookie() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -585,7 +585,7 @@ mod tests {
     async fn dashboard_stream_upstream_401_preserves_cookie() {
         // Model a dead upstream key on the admin stream. The proxy preserves
         // the shared cookie until `auth::me` performs its `/whoami` check.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -594,7 +594,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/dashboard/stream"))
             .respond_with(ResponseTemplate::new(401))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -613,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn stream_accepts_bearer_header() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
 
@@ -627,7 +627,7 @@ mod tests {
                     .set_body_string(sse_body)
                     .insert_header("content-type", "text/event-stream"),
             )
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()

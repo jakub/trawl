@@ -15,7 +15,10 @@
 //! upstream 3xx with the proxy's own 502 and no `Location`.
 //!
 //! Each test runs two real listeners: the upstream answers 307 to the
-//! other, and the other must see no request at all.
+//! other, and the other must see no request at all. In the pinned mode
+//! both listeners are TLS fronts whose certificates come from the pinned
+//! CA, so the second one is a target the client could reach, and only the
+//! redirect policy keeps it away.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -28,27 +31,149 @@ use trawl_web::state::AppState;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+
+use test_support::{TestCa, TlsUpstream};
+
 const ORIGIN: &str = "https://trawl.example.com";
 
-/// The trust modes a plain-http test upstream can exercise. A pinned CA
-/// refuses plain http before any request, so it cannot reach a 3xx here.
-fn modes() -> [UpstreamTls; 2] {
-    [UpstreamTls::System, UpstreamTls::InsecureLoopback]
+/// The trust modes the redirect rule is checked under.
+#[derive(Debug, Clone, Copy)]
+enum Mode {
+    /// `[web] upstream_ca_path`, over real TLS.
+    PinnedCa,
+    /// The insecure switch, over plain http: the test sets the mode on the
+    /// resolved config, since the resolver refuses http for it.
+    InsecureLoopback,
 }
 
-fn state(upstream: &MockServer, tls: UpstreamTls) -> AppState {
-    let web = WebConfig {
-        upstream_url: Some(upstream.uri()),
-        allow_insecure_cookies: true,
-        public_origins: vec![ORIGIN.to_owned()],
-        ..WebConfig::default()
-    };
-    let mut resolved = ResolvedConfig::from_parsed(&web, None).expect("resolve config");
-    // The insecure mode is chosen from the process environment, which a
-    // test may not mutate; the upstream is loopback, so it is a mode the
-    // resolver would pick.
-    resolved.upstream_tls = tls;
-    AppState::from_config(resolved).expect("build state")
+const MODES: [Mode; 2] = [Mode::PinnedCa, Mode::InsecureLoopback];
+
+/// One listener: a TLS front over wiremock, or wiremock itself.
+enum Listener {
+    Tls(TlsUpstream),
+    Plain(MockServer),
+}
+
+impl Listener {
+    fn mock(&self) -> &MockServer {
+        match self {
+            Self::Tls(upstream) => upstream.mock(),
+            Self::Plain(server) => server,
+        }
+    }
+
+    /// The URL a client dials to reach this listener.
+    fn url(&self) -> String {
+        match self {
+            Self::Tls(upstream) => upstream.url(),
+            Self::Plain(server) => server.uri(),
+        }
+    }
+}
+
+/// The two listeners of one test run, and the mode that connects them.
+struct Leg {
+    mode: Mode,
+    upstream: Listener,
+    elsewhere: Listener,
+}
+
+impl Leg {
+    async fn start(mode: Mode) -> Self {
+        let (upstream, elsewhere) = match mode {
+            Mode::PinnedCa => {
+                // One CA for both, so the pin trusts the redirect target.
+                let ca = TestCa::generate();
+                (
+                    Listener::Tls(TlsUpstream::issued_by(&ca).await),
+                    Listener::Tls(TlsUpstream::issued_by(&ca).await),
+                )
+            }
+            Mode::InsecureLoopback => (
+                Listener::Plain(MockServer::start().await),
+                Listener::Plain(MockServer::start().await),
+            ),
+        };
+        Self {
+            mode,
+            upstream,
+            elsewhere,
+        }
+    }
+
+    fn name(&self) -> String {
+        format!("{:?}", self.mode)
+    }
+
+    fn state(&self) -> AppState {
+        let web = WebConfig {
+            allow_insecure_cookies: true,
+            public_origins: vec![ORIGIN.to_owned()],
+            ..match &self.upstream {
+                Listener::Tls(upstream) => upstream.web_config(),
+                Listener::Plain(server) => WebConfig {
+                    upstream_url: Some(server.uri()),
+                    ..WebConfig::default()
+                },
+            }
+        };
+        let mut resolved = ResolvedConfig::from_parsed(&web, None).expect("resolve config");
+        match self.mode {
+            Mode::PinnedCa => assert!(
+                matches!(resolved.upstream_tls, UpstreamTls::PinnedCa(_)),
+                "{:?}",
+                resolved.upstream_tls
+            ),
+            // The insecure mode is chosen from the process environment,
+            // which a test may not mutate; the upstream is loopback, so it
+            // is a mode the resolver would pick.
+            Mode::InsecureLoopback => resolved.upstream_tls = UpstreamTls::InsecureLoopback,
+        }
+        AppState::from_config(resolved).expect("build state")
+    }
+
+    /// Answer `route` on the upstream with a 307 to the same path on the
+    /// second listener, and answer it there as if the redirect were
+    /// legitimate.
+    async fn redirect(&self, route: &str, ok: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                header::LOCATION.as_str(),
+                format!("{}{route}", self.elsewhere.url()),
+            ))
+            .mount(self.upstream.mock())
+            .await;
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ok)
+            .mount(self.elsewhere.mock())
+            .await;
+    }
+
+    /// The upstream answered `route` with its redirect after `before`
+    /// earlier requests (the positive control: the redirect path really
+    /// ran), and the proxy never contacted the second listener.
+    async fn assert_untouched(&self, route: &str, before: usize) {
+        let mode = self.name();
+        assert!(
+            requests_to(self.upstream.mock(), route).await > before,
+            "{mode}: the upstream never saw {route}, so no redirect was exercised"
+        );
+        let seen = self
+            .elsewhere
+            .mock()
+            .received_requests()
+            .await
+            .expect("recording on");
+        assert!(
+            seen.is_empty(),
+            "{mode}: the proxy followed the redirect to the second listener: {:?}",
+            seen.iter().map(|r| r.url.to_string()).collect::<Vec<_>>()
+        );
+    }
 }
 
 fn whoami_ok() -> ResponseTemplate {
@@ -57,29 +182,6 @@ fn whoami_ok() -> ResponseTemplate {
         "roles": ["operator"],
         "permissions": ["query"]
     }))
-}
-
-/// Answer `route` on `upstream` with a 307 to the same path on `elsewhere`,
-/// and answer it on `elsewhere` as if the redirect were legitimate.
-async fn redirect(
-    upstream: &MockServer,
-    elsewhere: &MockServer,
-    route: &str,
-    ok: ResponseTemplate,
-) {
-    Mock::given(method("GET"))
-        .and(path(route))
-        .respond_with(ResponseTemplate::new(307).insert_header(
-            header::LOCATION.as_str(),
-            format!("{}{route}", elsewhere.uri()),
-        ))
-        .mount(upstream)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(route))
-        .respond_with(ok)
-        .mount(elsewhere)
-        .await;
 }
 
 async fn login(state: AppState) -> axum::response::Response {
@@ -100,45 +202,22 @@ async fn requests_to(server: &MockServer, route: &str) -> usize {
     seen.iter().filter(|r| r.url.path() == route).count()
 }
 
-/// The upstream answered `route` with its redirect after `before` earlier
-/// requests (the positive control: the redirect path really ran), and the
-/// proxy never contacted `elsewhere`.
-async fn assert_untouched(
-    upstream: &MockServer,
-    elsewhere: &MockServer,
-    route: &str,
-    before: usize,
-    mode: &str,
-) {
-    assert!(
-        requests_to(upstream, route).await > before,
-        "{mode}: the upstream never saw {route}, so no redirect was exercised"
-    );
-    let seen = elsewhere.received_requests().await.expect("recording on");
-    assert!(
-        seen.is_empty(),
-        "{mode}: the proxy followed the redirect to the second listener: {:?}",
-        seen.iter().map(|r| r.url.to_string()).collect::<Vec<_>>()
-    );
-}
-
 /// Login asks the upstream `/whoami` with the key as a bearer token.
 #[tokio::test]
 async fn login_does_not_follow_an_upstream_redirect() {
-    for tls in modes() {
-        let mode = format!("{tls:?}");
-        let upstream = MockServer::start().await;
-        let elsewhere = MockServer::start().await;
-        redirect(&upstream, &elsewhere, "/api/v1/whoami", whoami_ok()).await;
+    for mode in MODES {
+        let leg = Leg::start(mode).await;
+        let mode = leg.name();
+        leg.redirect("/api/v1/whoami", whoami_ok()).await;
 
-        let before = requests_to(&upstream, "/api/v1/whoami").await;
-        let response = login(state(&upstream, tls)).await;
+        let before = requests_to(leg.upstream.mock(), "/api/v1/whoami").await;
+        let response = login(leg.state()).await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{mode}");
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
             "{mode}: a redirected login must not issue a session"
         );
-        assert_untouched(&upstream, &elsewhere, "/api/v1/whoami", before, &mode).await;
+        leg.assert_untouched("/api/v1/whoami", before).await;
     }
 }
 
@@ -194,40 +273,36 @@ async fn assert_redirect_refused(state: AppState, cookie: &str, uri: &str, mode:
 /// The generic `/api/v1/*` forwarder.
 #[tokio::test]
 async fn forwarding_does_not_follow_or_pass_on_an_upstream_redirect() {
-    for tls in modes() {
-        let mode = format!("{tls:?}");
-        let upstream = MockServer::start().await;
-        let elsewhere = MockServer::start().await;
-        let state = state(&upstream, tls);
-        let cookie = session_cookie(state.clone(), &upstream, &mode).await;
-        redirect(
-            &upstream,
-            &elsewhere,
+    for mode in MODES {
+        let leg = Leg::start(mode).await;
+        let mode = leg.name();
+        let state = leg.state();
+        let cookie = session_cookie(state.clone(), leg.upstream.mock(), &mode).await;
+        leg.redirect(
             "/api/v1/schema",
             ResponseTemplate::new(200).set_body_json(json!({"columns": []})),
         )
         .await;
 
-        let before = requests_to(&upstream, "/api/v1/schema").await;
+        let before = requests_to(leg.upstream.mock(), "/api/v1/schema").await;
         assert_redirect_refused(state, &cookie, "/api/v1/schema", &mode).await;
-        assert_untouched(&upstream, &elsewhere, "/api/v1/schema", before, &mode).await;
+        leg.assert_untouched("/api/v1/schema", before).await;
     }
 }
 
 /// `/api/auth/me` asks the upstream `/whoami` on every call.
 #[tokio::test]
 async fn me_does_not_follow_or_pass_on_an_upstream_redirect() {
-    for tls in modes() {
-        let mode = format!("{tls:?}");
-        let upstream = MockServer::start().await;
-        let elsewhere = MockServer::start().await;
-        let state = state(&upstream, tls);
-        let cookie = session_cookie(state.clone(), &upstream, &mode).await;
-        redirect(&upstream, &elsewhere, "/api/v1/whoami", whoami_ok()).await;
+    for mode in MODES {
+        let leg = Leg::start(mode).await;
+        let mode = leg.name();
+        let state = leg.state();
+        let cookie = session_cookie(state.clone(), leg.upstream.mock(), &mode).await;
+        leg.redirect("/api/v1/whoami", whoami_ok()).await;
 
-        let before = requests_to(&upstream, "/api/v1/whoami").await;
+        let before = requests_to(leg.upstream.mock(), "/api/v1/whoami").await;
         assert_redirect_refused(state, &cookie, "/api/auth/me", &mode).await;
-        assert_untouched(&upstream, &elsewhere, "/api/v1/whoami", before, &mode).await;
+        leg.assert_untouched("/api/v1/whoami", before).await;
     }
 }
 
@@ -238,15 +313,12 @@ async fn streams_do_not_follow_or_pass_on_an_upstream_redirect() {
         ("/api/v1/stream", "/api/v1/stream?query=_severity%3Derror"),
         ("/api/v1/dashboard/stream", "/api/v1/dashboard/stream"),
     ] {
-        for tls in modes() {
-            let mode = format!("{tls:?}");
-            let upstream = MockServer::start().await;
-            let elsewhere = MockServer::start().await;
-            let state = state(&upstream, tls);
-            let cookie = session_cookie(state.clone(), &upstream, &mode).await;
-            redirect(
-                &upstream,
-                &elsewhere,
+        for mode in MODES {
+            let leg = Leg::start(mode).await;
+            let mode = leg.name();
+            let state = leg.state();
+            let cookie = session_cookie(state.clone(), leg.upstream.mock(), &mode).await;
+            leg.redirect(
                 route,
                 ResponseTemplate::new(200)
                     .insert_header(header::CONTENT_TYPE.as_str(), "text/event-stream")
@@ -254,9 +326,9 @@ async fn streams_do_not_follow_or_pass_on_an_upstream_redirect() {
             )
             .await;
 
-            let before = requests_to(&upstream, route).await;
+            let before = requests_to(leg.upstream.mock(), route).await;
             assert_redirect_refused(state, &cookie, uri, &mode).await;
-            assert_untouched(&upstream, &elsewhere, route, before, &mode).await;
+            leg.assert_untouched(route, before).await;
         }
     }
 }

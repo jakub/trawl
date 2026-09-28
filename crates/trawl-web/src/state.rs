@@ -318,7 +318,7 @@ mod tests {
     fn state(cookie_secure: bool) -> AppState {
         AppState::from_config(ResolvedConfig {
             bind_addr: "127.0.0.1:8090".into(),
-            upstream_url: "http://127.0.0.1:5514".into(),
+            upstream_url: "https://127.0.0.1:5514".into(),
             session_ttl_secs: 3_600,
             allow_insecure_cookies: !cookie_secure,
             upstream_tls: UpstreamTls::System,
