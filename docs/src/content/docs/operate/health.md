@@ -1,6 +1,6 @@
 ---
 title: Check health and stalled work
-description: Confirm that a trawld server is serving, read what is degraded, and free capacity that a stalled query still holds.
+description: Confirm that a trawld server is serving, read what is degraded, read disk headroom and retention reach, and free capacity that a stalled query still holds.
 ---
 
 These commands address one server. `TRAWL_URL` names its HTTPS API,
@@ -154,6 +154,135 @@ If you use Prometheus, read the dashboard metadata when you need storage sample
 status or age. The four [storage gauges](/reference/api/#prometheus-metrics)
 retain last complete totals after collection failure and have no status or age
 signal. Flat values alone cannot confirm collector health.
+
+## Read disk and retention
+
+The **Disk and retention** section of **Health** answers one question: will
+the data disk hold the retention you configured if the recent days repeat? It
+needs a key with `server_manage`, like the storage readings. The same data is
+the `capacity` object of the [dashboard snapshot](/reference/api/#capacity).
+
+The section has three parts:
+
+- **Headroom**: the free space on each filesystem that trawld writes to, and
+  the deletion floor on the data filesystem.
+- **Pressure-deletion evidence**: removal counters, pressure attempts, the last
+  sweep, and each environment's oldest date.
+- **Retention reach**: for each environment, how many days of its
+  `max_age_days` the disk is projected to hold.
+
+[Manage retention](/operate/retention/#read-headroom) explains how to read
+headroom and the evidence. This section explains reach.
+
+The section colours no value as good or bad and shows no "safe" state. Reach
+is a projection from seven days of data, and a green badge would read as a
+guarantee. Compare the projected days with the policy you need.
+
+### Read retention reach
+
+A reach of "about 38–52 of 90 days" means: if the observed days repeat,
+pressure deletion is projected to leave this environment between 38 and 52
+days of its 90-day policy. It is a conditional projection, not a guarantee.
+
+trawld computes reach from the Parquet already on disk:
+
+- **Observed days** are the UTC dates from 8 days ago through 2 days ago.
+  Today and yesterday are left out while rollup and late events settle them.
+  The section shows the dates it used.
+- A date in that window with no Parquet counts as a quiet day of 0 bytes, if
+  it is newer than the environment's oldest date. A date older than the oldest
+  date is not an observed day.
+- The oldest date is the oldest date directory that holds Parquet. An empty
+  date directory does not count.
+- The **budget** is the Parquet bytes in every environment's date directories,
+  plus the available bytes on the data filesystem, minus the floor.
+- Pressure deletion removes the dates closest to their expiry first. Under
+  sustained pressure, every environment with a finite `max_age_days` keeps
+  the same fraction of its policy. trawld solves for that fraction.
+- The low end uses the environment's largest observed day. The high end uses
+  its mean observed day.
+
+Each end of the range reads in one of three ways:
+
+| Reading | Meaning |
+| --- | --- |
+| A number of days | The disk is projected to hold this many whole days of the policy. |
+| The full policy | The projected fraction is 1 or more. The environment keeps every day of its policy. |
+| The disk fills before retention is reached | `min_free_disk_bytes` is 0, so pressure deletion is off. The full policy does not fit in the stored bytes plus the available bytes. No date is given. |
+
+The two ends can read differently. For example, the full policy fits at the
+mean observed day but not at the largest.
+
+An environment with `max_age_days = 0` keeps its data forever. It shows its
+stored bytes and its mean observed daily growth, and makes no time claim.
+Pressure deletion removes its dates last, so the projection keeps all of its
+stored bytes. Its growth takes space from the other environments, so their
+reach shrinks over time even when their own volume stays the same.
+
+### Read an environment that is excluded from growth
+
+An environment with a finite `max_age_days` and fewer than 3 observed days has
+no daily rate. This happens to:
+
+- a new environment, until about four days after its first stored date;
+- an environment with `max_age_days` of 3 or less, which never has 3 observed
+  days;
+- an environment that pressure deletion has cut down to fewer than 3 observed
+  days.
+
+Its reach is withheld with the reason `insufficient_history`. The projection
+reserves its stored bytes, as it does for a keep-forever environment, and the
+section names it as excluded from growth. The other environments still get a
+projection. Their projection does not include the excluded environment's
+growth, so for a few days after a new environment appears, the others read
+higher than they will be.
+
+### Act on a withheld reach
+
+A withheld reach shows a reason and no number.
+
+| Reason | Meaning | What to do |
+| --- | --- | --- |
+| `insufficient_history` | The environment has fewer than 3 observed days. A keep-forever environment gets this reason too. | Wait for a new environment to collect observed days. For a short policy, read headroom instead. If pressure deletion cut the environment down, add space. |
+| `retention_suppressed` | A repin holds two generations of files, so the stored bytes are inflated and retention is paused. Every environment gets this reason. | Wait for the repin to finish. If it does not, follow [Clear suppressed retention](/operate/retention/#clear-suppressed-retention). |
+| `measurement_unavailable` | The Parquet measurement or the headroom measurement is not `complete`. Every environment gets this reason. A retained, failed sample never feeds a projection. The raw readings stay visible with their age. | After a start, wait for the first measurements. If a measurement failed, check the data path as described in [Read the checks](#read-the-checks). |
+
+When more than one reason applies, `measurement_unavailable` wins, then
+`retention_suppressed`, then `insufficient_history`.
+
+### Why there is no countdown
+
+With a floor set, the data disk does not fill. When free space falls below the
+floor, pressure deletion removes the dates closest to their expiry. The loss
+lands on retention: an environment set to 90 days keeps 40. A "days until
+full" countdown would count down to an event that does not happen.
+
+Free space also misleads under pressure. While pressure deletion removes data,
+free space stays flat near the floor, so a trend on it reads as stable while
+history is lost. Reach states the cost in the unit you configured: days kept.
+
+### Read the terminal summary line
+
+In the terminal's **DATA PIPELINE** panel, the third line summarizes the data
+filesystem and retention:
+
+```text
+free: age 2s 120.0 GB/500.0 GB  floor 1.0 GB  sweep: completed 12m 34s ago  pressure deletions: 3
+```
+
+- `free:` shows the headroom status and age, then the data filesystem's
+  available and total bytes. `failed age 45s` marks a retained sample.
+  `awaiting measurement`, `not configured`, and `failed; unavailable` carry no
+  bytes.
+- `floor 1.0 GB` reads `pressure deletion off` when `min_free_disk_bytes` is 0.
+- `sweep:` shows the last sweep's outcome and age, or `none yet`.
+- `pressure deletions:` counts `disk_pressure` removals since process start.
+
+At 80 columns only the `free:` part and the floor fit. The sweep and the count
+appear from about 140 columns. The line never shows an environment's reach,
+because one environment's reach is not the answer for the installation. The
+**Dashboard** tab of the `trawl` terminal UI shows the same line to a key with
+`server_manage`.
 
 ## Diagnose a 503 or 504 from a query
 

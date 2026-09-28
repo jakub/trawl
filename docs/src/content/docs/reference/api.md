@@ -1723,6 +1723,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/dashboard
   "last_compaction_secs": 4, "compaction_runs": 8640, "compaction_errors": 0,
   "parquet_files": 12, "parquet_bytes": 5242880,
   "parquet_measurement": { "status": "complete", "sample_age_secs": 5 },
+  "capacity": { "headroom": { "measurement": { "status": "complete", "sample_age_secs": 3 }, "filesystems": [] }, "pressure": { "removals_age": 0, "removals_disk_pressure": 0, "pressure_attempts": 0, "last_sweep": null }, "environments": [], "growth_excluded": [] },
   "sse_active": 0, "sse_max": 32,
   "scheduler_enabled": true, "scheduler_schedules": 1,
   "recent_queries": [], "active_queries": []
@@ -1741,6 +1742,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/dashboard
 | `wal_files`, `wal_bytes` | integer | Last complete count and byte total of WAL `.ndjson` files, including active files. These are not compaction-eligible totals. |
 | `parquet_files`, `parquet_bytes` | integer | Last complete count and byte total of ingested Parquet files. Excludes saved report files under `scheduled/` directories. |
 | `wal_measurement`, `parquet_measurement` | object | Required measurement metadata for the corresponding totals, as defined below |
+| `capacity` | object | Required. Disk headroom, pressure-deletion evidence, and retention reach, as defined in [Capacity](#capacity) |
 | `compaction_runs` | integer | Successful compaction cycles since process startup. A cycle can succeed with no eligible work. |
 | `compaction_errors` | integer | Error tally since process startup, including failed cycles and loss/error tallies. Can accompany successful cycles and exceed their count. |
 | `last_compaction_secs` | integer or null | Seconds since the last successful cycle. `0` is a reported success with zero elapsed seconds. `null` means no successful cycle reported since startup. |
@@ -1781,6 +1783,97 @@ an age alone does not imply `complete`.
 A live dashboard stream describes the connection, not the disk measurement.
 Clients display the snapshot's supplied age without a local age ticker.
 A retained snapshot keeps that age unchanged until a new snapshot arrives.
+
+#### Capacity
+
+The `capacity` object reports disk headroom, retention's pressure-deletion
+evidence, and each environment's retention reach. [Read disk and
+retention](/operate/health/#read-disk-and-retention) explains how to read it.
+
+```json
+{
+  "headroom": {
+    "measurement": { "status": "complete", "sample_age_secs": 3 },
+    "filesystems": [
+      { "roles": ["data", "spill"], "total_bytes": 500000000000, "available_bytes": 800000000,
+        "floor": { "state": "armed", "floor_bytes": 1073741824, "deficit_bytes": 273741824 } },
+      { "roles": ["wal"], "total_bytes": 64000000000, "available_bytes": 60000000000, "floor": null }
+    ]
+  },
+  "pressure": {
+    "removals_age": 14, "removals_disk_pressure": 3, "pressure_attempts": 2,
+    "last_sweep": { "outcome": "completed", "age_secs": 754 }
+  },
+  "environments": [
+    { "env": "archive", "max_age_days": 0, "oldest_date": "2026-06-01", "stored_bytes": 9000000000,
+      "reach": { "state": "keep_forever", "observed_first": "2026-09-19", "observed_last": "2026-09-25", "observed_days": 7, "mean_daily_bytes": 120000000 } },
+    { "env": "fresh", "max_age_days": 30, "oldest_date": "2026-09-24", "stored_bytes": 40000000,
+      "reach": { "state": "withheld", "reason": "insufficient_history" } },
+    { "env": "prod", "max_age_days": 90, "oldest_date": "2026-08-10", "stored_bytes": 9000000000,
+      "reach": { "state": "projected", "observed_first": "2026-09-19", "observed_last": "2026-09-25", "observed_days": 7,
+                 "low": { "kind": "days", "days": 38 }, "high": { "kind": "days", "days": 52 } } }
+  ],
+  "growth_excluded": ["fresh"]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `headroom.measurement` | object | Status and age of the headroom measurement, as defined for storage above. One measurement reads every role, so all rows share it. |
+| `headroom.filesystems` | array | One row per device, from the last complete measurement. Empty until a complete measurement exists. A failed measurement keeps the last complete rows. |
+| `headroom.filesystems[].roles` | array | The roles on this device, in the order `data`, `wal`, `spill`. Never empty. |
+| `headroom.filesystems[].total_bytes`, `available_bytes` | integer | The device's total and available bytes. Available bytes are never added across devices. |
+| `headroom.filesystems[].floor` | object or null | The deletion floor on the row that holds `data`, and `null` on every other row |
+| `pressure.removals_age`, `pressure.removals_disk_pressure` | integer | Date directories removed since process start, with a successful delete, by trigger |
+| `pressure.pressure_attempts` | integer | Sweeps since process start whose first free-space check found the data filesystem below the floor |
+| `pressure.last_sweep` | object or null | `outcome` and `age_secs` of the last finished sweep. `null` before the first sweep. |
+| `environments` | array | Environments with at least one date directory that holds Parquet, sorted by `env` |
+| `environments[].max_age_days` | integer | The effective age limit. `0` keeps the data forever. |
+| `environments[].oldest_date` | string | The oldest date directory that holds Parquet, `YYYY-MM-DD`. An empty date directory does not count. |
+| `environments[].stored_bytes` | integer | Parquet bytes in the environment's date directories |
+| `environments[].reach` | object | The retention reach, tagged by `state` |
+| `growth_excluded` | array | Environments with a finite `max_age_days` and fewer than 3 observed days, sorted. The projection reserves their stored bytes and leaves out their growth. Empty while every reach is withheld for `measurement_unavailable` or `retention_suppressed`. |
+
+`floor.state` is `off` when `min_free_disk_bytes` is 0, and `armed` otherwise.
+An `armed` floor carries `floor_bytes` and `deficit_bytes`. `deficit_bytes` is
+`floor_bytes - available_bytes` while available bytes are strictly below the
+floor, and 0 otherwise.
+
+`last_sweep.outcome` is one of the following. When more than one applies, the
+first one listed wins:
+
+| Outcome | Meaning |
+| --- | --- |
+| `failed` | The sweep returned an error, a deletion failed, or the sweep task panicked |
+| `suppressed` | A repin, or publication markers that cannot be read, stopped the sweep |
+| `exhausted_below_floor` | Pressure deletion ran out of candidates with available bytes still below the floor |
+| `completed` | Every step ran, and every deletion it tried succeeded |
+
+`last_sweep.age_secs` is monotonic seconds since the sweep finished,
+calculated when the server assembles the snapshot.
+
+`reach.state` is one of the following:
+
+| State | Fields | Meaning |
+| --- | --- | --- |
+| `projected` | `observed_first`, `observed_last`, `observed_days`, `low`, `high` | A finite `max_age_days`. `low` uses the largest observed day and `high` uses the mean observed day. |
+| `keep_forever` | `observed_first`, `observed_last`, `observed_days`, `mean_daily_bytes` | `max_age_days` is 0. No time claim. |
+| `withheld` | `reason` | No projection. The object carries no number. |
+
+`observed_first` and `observed_last` are UTC dates, `YYYY-MM-DD`, and
+`observed_days` counts the observed days, from 3 to 7.
+
+`low` and `high` are each tagged by `kind`:
+
+| `kind` | Meaning |
+| --- | --- |
+| `days` | `days` whole days of the policy, rounded down |
+| `full_policy` | The environment keeps its full policy |
+| `disk_fills_first` | `min_free_disk_bytes` is 0 and the full policy does not fit. No days are given. |
+
+`reason` is `insufficient_history`, `retention_suppressed`, or
+`measurement_unavailable`. See [Act on a withheld
+reach](/operate/health/#act-on-a-withheld-reach).
 
 **Errors**
 
@@ -1884,6 +1977,33 @@ retains the last complete totals.
 These gauges expose neither measurement status nor sample age. A flat gauge
 cannot establish collector health. Those facts are available in the
 [dashboard measurement metadata](#dashboard-snapshot).
+
+These series describe disk headroom and retention's pressure-deletion
+evidence. [Manage retention](/operate/retention/#read-headroom) explains how to
+read them.
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_disk_total_bytes{role}` | gauge | Total bytes of each filesystem trawld writes to. `role` is `data`, `wal`, or `spill` |
+| `trawl_disk_available_bytes{role}` | gauge | Bytes available to trawld on each filesystem it writes to. `role` is `data`, `wal`, or `spill` |
+| `trawl_retention_min_free_disk_bytes` | gauge | The deletion floor, `min_free_disk_bytes`, set at startup. `0` means pressure deletion is off |
+| `trawl_retention_deletions_total{trigger}` | counter | Date directories that retention removed with a successful delete. `trigger` is `age` or `disk_pressure`. Both series start at zero |
+| `trawl_retention_pressure_attempts_total` | counter | Retention sweeps whose first free-space check found the data filesystem below the floor. Starts at zero |
+
+The two disk gauges publish one series per device, labelled with the first
+role the device holds in the order `data`, `wal`, `spill`. A device that holds
+`data` and `spill` publishes only `role="data"`, so `sum()` over the series
+never counts a device twice. trawld groups the roles by device at each
+measurement. If a remount merges two devices while trawld runs, the series of
+the role that lost its own device keeps its last value until trawld restarts.
+Like the storage gauges, the disk gauges appear after the first complete
+measurement, and a failed measurement keeps the last complete values.
+
+The counters start at process start. No series carries a path, a device, or an
+environment name. No series exports retention reach: reach is derived from
+these readings and the stored Parquet, and a Prometheus gauge carries no
+measurement status (ADR-0033). Read reach from the
+[dashboard capacity object](#capacity).
 
 These series describe [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission).
 A node without a hot buffer publishes the refusal counter and the compaction

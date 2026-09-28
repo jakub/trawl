@@ -79,3 +79,13 @@ No bytes-freed figure is published. The existing deletion size walk skips errors
 ## Consequences
 
 The Parquet scan buckets bytes by environment and date in the walk it already performs, so no second walk is added. Retention gains counters and a last-sweep record. The docs pages `operate/retention.md` and `operate/health.md` explain how to read reach and why there is no countdown. They also state that a burst can cross the floor between sweeps.
+
+## Amendment: too little history reserves bytes instead of blocking the projection, 2026-09-27
+
+The Decision withholds a projection for an environment with fewer than 3 observed days. It does not say what the other environments' projection does with that environment. The human decided during the #202 run that a finite-retention environment with fewer than 3 observed days is left out of the shared fraction *f*. Its stored bytes are reserved like keep-forever bytes, and its own reach is withheld as `insufficient_history`. The capacity object names it in `growth_excluded`. The other environments still get a projection.
+
+Withholding every finite environment instead was rejected. An environment with a retention of 3 days or less never reaches 3 observed days, and neither does one that pressure deletion has cut short. On an installation with such an environment, the whole projection would stay blank. Heavy pressure would blank it too, because pressure cuts environments short. The cost is that the excluded environment's growth is in nobody's projection, so for a few days after a new environment appears the others read optimistic. The Health page states that exclusion.
+
+## Amendment: the oldest surviving date holds Parquet, 2026-09-27
+
+The Decision anchors the zero-fill on the environment's oldest surviving date. During the #202 run the human decided that this date is the oldest date directory holding Parquet. An empty date directory does not anchor the zero-fill. It is no evidence of a quiet ingest day, and anchoring on it would add days of zero bytes and overstate reach. The same date is the oldest date shown beside `max_age_days` as pressure-deletion evidence.
