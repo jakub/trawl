@@ -186,7 +186,9 @@ fn log_cert_details(pem_bytes: &[u8]) {
 ///
 /// Both directories are trawld's own: a symlink, a non-directory, or a
 /// directory another uid owns is refused with [`TlsError::Unsafe`] (see
-/// [`GeneratedDir`]), and so is a symlink at `cert.pem` or `key.pem`.
+/// [`GeneratedDir`]), and so is a symlink or non-regular file at `cert.pem`
+/// or `key.pem`. An existing key with extra hard links or another owner is
+/// discarded and the pair regenerated (see [`key_exposure`]).
 ///
 /// Returns `(cert_pem, key_pem, was_generated)`.
 fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
@@ -212,14 +214,30 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
 
     // Both are read, so a symlink at either name is refused on every start,
     // not only on the one that finds the pair complete.
-    let key = key_dir.read(GENERATED_KEY_FILE, |path, source| TlsError::ReadKey {
+    let key = match key_dir.read(GENERATED_KEY_FILE, |path, source| TlsError::ReadKey {
         path,
         source,
-    })?;
-    let cert = tls_dir.read(GENERATED_CERT_FILE, |path, source| TlsError::ReadCert {
-        path,
-        source,
-    })?;
+    })? {
+        Some((pem, meta)) => match key_exposure(&meta) {
+            None => Some(pem),
+            Some(reason) => {
+                tracing::warn!(
+                    event_type = "lifecycle",
+                    key = %key_path.display(),
+                    reason = %reason,
+                    "discarding a private key that may be readable outside trawld, generating a new pair"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+    let cert = tls_dir
+        .read(GENERATED_CERT_FILE, |path, source| TlsError::ReadCert {
+            path,
+            source,
+        })?
+        .map(|(pem, _)| pem);
     if let (Some(c), Some(k)) = (cert, key) {
         tracing::info!(
             event_type = "lifecycle",
@@ -286,6 +304,42 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
     );
 
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
+}
+
+/// Why the generated key read with `meta` may be readable through something
+/// other than `tls-key/key.pem`, or `None` when it is trawld's alone.
+///
+/// A second hard link, for one inside the `tls/` directory the sidecar
+/// mounts, exposes the same inode under that name; a key another uid owns
+/// was not written by this trawld. Either key is discarded rather than
+/// refused: the pair is regenerated, so whatever still holds the old key
+/// holds one whose certificate is no longer served, with no operator step.
+///
+/// The permission bits are not checked: Kubernetes' fsGroup walk adds group
+/// bits to the key, and `tls-key/` itself is `0700` and outside the mount.
+#[cfg(unix)]
+fn key_exposure(meta: &fs::Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let euid = rustix::process::geteuid().as_raw();
+    if meta.nlink() != 1 {
+        Some(format!(
+            "it has {} hard links; another name may expose it",
+            meta.nlink()
+        ))
+    } else if meta.uid() != euid {
+        Some(format!(
+            "it is owned by uid {}, not by trawld's uid {euid}",
+            meta.uid()
+        ))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(unix))]
+fn key_exposure(_meta: &fs::Metadata) -> Option<String> {
+    None
 }
 
 /// Why a symlink inside the generated TLS directories is refused.
@@ -377,13 +431,14 @@ impl GeneratedDir {
         }
     }
 
-    /// Read the file `name`, or `None` when there is none. A symlink is
+    /// Read the file `name` and the metadata of the file read, or `None`
+    /// when there is none. A symlink or anything but a regular file is
     /// refused; any other failure is reported through `err`.
     fn read(
         &self,
         name: &str,
         err: impl FnOnce(PathBuf, std::io::Error) -> TlsError,
-    ) -> Result<Option<Vec<u8>>, TlsError> {
+    ) -> Result<Option<(Vec<u8>, fs::Metadata)>, TlsError> {
         let path = self.path.join(name);
         #[cfg(unix)]
         {
@@ -391,22 +446,46 @@ impl GeneratedDir {
             use rustix::io::Errno;
             use std::io::Read;
 
-            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            // O_NONBLOCK keeps a FIFO at `name` from blocking the open before
+            // the file type below can refuse it; a regular file ignores it.
+            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
             let mut file = match rustix::fs::openat(&self.handle, name, flags, Mode::empty()) {
                 Ok(fd) => fs::File::from(fd),
                 Err(Errno::NOENT) => return Ok(None),
                 Err(Errno::LOOP) => return Err(unsafe_path(&path, SYMLINK_REFUSAL.to_owned())),
                 Err(e) => return Err(err(path, e.into())),
             };
+            // fstat of the open handle: the metadata is the file's that is read.
+            let meta = match file.metadata() {
+                Ok(meta) => meta,
+                Err(e) => return Err(err(path, e)),
+            };
+            if !meta.file_type().is_file() {
+                return Err(unsafe_path(&path, "it is not a regular file".to_owned()));
+            }
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(|e| err(path, e))?;
-            Ok(Some(bytes))
+            Ok(Some((bytes, meta)))
         }
         #[cfg(not(unix))]
-        match fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(err(path, e)),
+        {
+            use std::io::Read;
+
+            let mut file = match fs::File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(err(path, e)),
+            };
+            let meta = match file.metadata() {
+                Ok(meta) => meta,
+                Err(e) => return Err(err(path, e)),
+            };
+            if !meta.file_type().is_file() {
+                return Err(unsafe_path(&path, "it is not a regular file".to_owned()));
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|e| err(path, e))?;
+            Ok(Some((bytes, meta)))
         }
     }
 
@@ -887,6 +966,73 @@ mod tests {
             "the refusal names cert.pem: {err}"
         );
         assert_eq!(fs::read(&victim).unwrap(), b"not yours");
+    }
+
+    /// A second link to the generated key, here one inside the `tls/`
+    /// directory the proxy sidecar mounts, exposes the key through that
+    /// name. The next start discards the key and generates a new pair, so
+    /// the exposed inode holds only a key whose certificate is no longer
+    /// served, and the start after loads the new pair.
+    ///
+    /// A key owned by another uid is discarded the same way, but planting
+    /// one inside trawld's own `0700` key directory needs root, so no test
+    /// covers it.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_key_with_extra_links_is_regenerated() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        build_server_config(None, None, tmp.path()).unwrap();
+        let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+        let key_path = tmp.path().join(GENERATED_KEY_DIR).join(GENERATED_KEY_FILE);
+        let cert_path = tls_dir.join(GENERATED_CERT_FILE);
+        let old_key = fs::read(&key_path).unwrap();
+        let old_cert = fs::read(&cert_path).unwrap();
+        let exposed = tls_dir.join("exposed.pem");
+        fs::hard_link(&key_path, &exposed).unwrap();
+
+        let (_, self_signed) = build_server_config(None, None, tmp.path())
+            .expect("a linked key gives way to a new pair");
+        assert!(self_signed, "the linked key is not loaded");
+        let new_key = fs::read(&key_path).unwrap();
+        assert_ne!(new_key, old_key, "the key was regenerated");
+        assert_ne!(fs::read(&cert_path).unwrap(), old_cert, "so was the cert");
+        assert_eq!(fs::metadata(&key_path).unwrap().nlink(), 1);
+        for name in dir_entries(&tls_dir) {
+            assert_ne!(
+                fs::read(tls_dir.join(&name)).unwrap(),
+                new_key,
+                "tls/{name} does not hold the served key"
+            );
+        }
+
+        let (_, self_signed) =
+            build_server_config(None, None, tmp.path()).expect("the new pair loads");
+        assert!(!self_signed, "the start after loads the new pair");
+    }
+
+    /// Something at `key.pem` that is not a regular file is not a key trawld
+    /// wrote. It is refused by name, and a FIFO there does not hang the
+    /// start on open.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_that_is_not_a_regular_file_is_refused() {
+        use rustix::fs::{CWD, FileType, Mode};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let key_dir = tmp.path().join(GENERATED_KEY_DIR);
+        fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join(GENERATED_KEY_FILE);
+        rustix::fs::mknodat(CWD, &key_path, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
+
+        let err =
+            build_server_config(None, None, tmp.path()).expect_err("a FIFO at key.pem is refused");
+        assert!(
+            matches!(&err, TlsError::Unsafe { path, .. } if *path == key_path),
+            "the refusal names key.pem: {err}"
+        );
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     /// Names of the entries in `dir`, sorted.
