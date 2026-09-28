@@ -26,6 +26,7 @@ use crate::CliError;
 
 pub mod api;
 pub mod resolve;
+pub mod web;
 
 /// Every request `trawl doctor` may send, as method and path below the
 /// target's base URL. None of them queries, ingests, or signs in with a key.
@@ -37,7 +38,9 @@ pub const REQUESTS: &[(&str, &str)] = &[
 ];
 
 /// The named checks `trawl doctor` runs, in order. `api.health.<key>` rows
-/// are part of [`ClientCheck::ApiHealth`] and share its prerequisite.
+/// are part of [`ClientCheck::ApiHealth`] and share its prerequisite. The
+/// `web.*` checks run only when `--web-url` names an origin; without it they
+/// produce no rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientCheck {
     /// The selected profile or flags resolve.
@@ -50,16 +53,22 @@ pub enum ClientCheck {
     ApiHealth,
     /// `whoami` accepts the selected key.
     ApiIdentity,
+    /// `--web-url` answers `trawl-web`'s health endpoint.
+    WebTransport,
+    /// `trawl-web` accepts `--web-url` as a browser origin.
+    WebOrigin,
 }
 
 impl ClientCheck {
     /// Every check, in the order the runner visits them.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::ConnectionConfig,
         Self::ApiTransport,
         Self::ApiTls,
         Self::ApiHealth,
         Self::ApiIdentity,
+        Self::WebTransport,
+        Self::WebOrigin,
     ];
 
     /// The stable id the report carries.
@@ -71,21 +80,32 @@ impl ClientCheck {
             Self::ApiTls => api::API_TLS,
             Self::ApiHealth => api::API_HEALTH,
             Self::ApiIdentity => api::API_IDENTITY,
+            Self::WebTransport => web::WEB_TRANSPORT,
+            Self::WebOrigin => web::WEB_ORIGIN,
         }
     }
 
     /// The check that must be `complete` before this one looks.
     ///
     /// Health and identity both wait for `api.tls`: nothing is read from, or
-    /// sent to, a server whose certificate did not verify.
+    /// sent to, a server whose certificate did not verify. The `web.*`
+    /// checks do not depend on the API: `--web-url` was checked when the
+    /// command line was, and the probe sends no key.
     #[must_use]
     pub const fn prerequisite(self) -> Option<Self> {
         match self {
-            Self::ConnectionConfig => None,
+            Self::ConnectionConfig | Self::WebTransport => None,
             Self::ApiTransport => Some(Self::ConnectionConfig),
             Self::ApiTls => Some(Self::ApiTransport),
             Self::ApiHealth | Self::ApiIdentity => Some(Self::ApiTls),
+            Self::WebOrigin => Some(Self::WebTransport),
         }
+    }
+
+    /// Whether the check belongs to `--web-url`.
+    #[must_use]
+    pub const fn is_web(self) -> bool {
+        matches!(self, Self::WebTransport | Self::WebOrigin)
     }
 }
 
@@ -223,9 +243,13 @@ pub async fn check(selection: &resolve::Selection) -> Report {
     let resolution = resolve::resolve(&selection.target);
     let mut config = Some(resolution.check);
     let mut api = resolution.connection.as_ref().map(api::ApiRun::new);
+    let mut web = selection.web.as_ref().map(web::WebRun::new);
     let mut checks: Vec<Check> = Vec::new();
     let mut outcomes: Vec<(ClientCheck, Outcome)> = Vec::new();
     for step in ClientCheck::ALL {
+        if step.is_web() && web.is_none() {
+            continue;
+        }
         if let Some(prerequisite) = step.prerequisite() {
             let done = outcomes
                 .iter()
@@ -241,6 +265,11 @@ pub async fn check(selection: &resolve::Selection) -> Report {
             ClientCheck::ConnectionConfig => {
                 vec![config.take().expect("connection.config runs once")]
             }
+            // Skipped above when --web-url is absent.
+            ClientCheck::WebTransport => {
+                vec![web.as_mut().expect("--web-url").transport().await]
+            }
+            ClientCheck::WebOrigin => vec![web.as_mut().expect("--web-url").origin().await],
             other => {
                 // connection.config completed, so the connection resolved.
                 let api = api
@@ -251,14 +280,17 @@ pub async fn check(selection: &resolve::Selection) -> Report {
                     ClientCheck::ApiTls => vec![api.tls()],
                     ClientCheck::ApiHealth => api.health(),
                     ClientCheck::ApiIdentity => vec![api.identity().await],
-                    ClientCheck::ConnectionConfig => unreachable!("handled above"),
+                    ClientCheck::ConnectionConfig
+                    | ClientCheck::WebTransport
+                    | ClientCheck::WebOrigin => unreachable!("handled above"),
                 }
             }
         };
         outcomes.push((step, rows[0].outcome));
         checks.extend(rows);
     }
-    let notes = api.map(api::ApiRun::into_notes).unwrap_or_default();
+    let mut notes = api.map(api::ApiRun::into_notes).unwrap_or_default();
+    notes.extend(web.map(web::WebRun::into_notes).unwrap_or_default());
     Report::new(Vantage::Client, resolution.target, checks, notes)
 }
 
@@ -397,7 +429,9 @@ mod tests {
                 "api.transport",
                 "api.tls",
                 "api.health",
-                "api.identity"
+                "api.identity",
+                "web.transport",
+                "web.origin"
             ]
         );
         ids.sort_unstable();
@@ -408,7 +442,13 @@ mod tests {
                 let before = ClientCheck::ALL[..at].contains(&pre);
                 assert!(before, "{check:?} waits on a later check");
             } else {
-                assert_eq!(at, 0);
+                assert!(
+                    matches!(
+                        check,
+                        ClientCheck::ConnectionConfig | ClientCheck::WebTransport
+                    ),
+                    "{check:?} has no prerequisite"
+                );
             }
         }
         assert_eq!(
@@ -418,6 +458,10 @@ mod tests {
         assert_eq!(
             ClientCheck::ApiIdentity.prerequisite(),
             Some(ClientCheck::ApiTls)
+        );
+        assert_eq!(
+            ClientCheck::WebOrigin.prerequisite(),
+            Some(ClientCheck::WebTransport)
         );
     }
 

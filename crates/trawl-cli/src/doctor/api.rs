@@ -59,7 +59,7 @@ fn is_quotable_value(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-fn row(id: &str, outcome: Outcome) -> Check {
+pub(super) fn row(id: &str, outcome: Outcome) -> Check {
     Check {
         id: id.to_owned(),
         outcome,
@@ -71,12 +71,12 @@ fn row(id: &str, outcome: Outcome) -> Check {
     }
 }
 
-fn with_reason(mut check: Check, reason: impl Into<String>) -> Check {
+pub(super) fn with_reason(mut check: Check, reason: impl Into<String>) -> Check {
     check.reason = Some(reason.into());
     check
 }
 
-fn with_next(mut check: Check, next: impl Into<String>) -> Check {
+pub(super) fn with_next(mut check: Check, next: impl Into<String>) -> Check {
     check.next_action = Some(next.into());
     check
 }
