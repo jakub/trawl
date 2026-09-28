@@ -1,0 +1,106 @@
+{
+  "evidence": "Stub fixtures only; no daemon, database, or real ingest",
+  "head": "2f6b72ff9c1a8f0dfc3d8f2dd035710552b3eaf4",
+  "git_status": "?? visual-evidence/issue-202/\n",
+  "spec": "crates/trawl-web-ui/e2e/tests/health-page.spec.ts",
+  "spec_sha256": "bcf200ac0dad86e53c2a2d744f22ffe8dc4d3a9d6c82df8e3a2a4f97347aad14",
+  "spec_filter": "tests/health-page.spec.ts (whole file, 58 cases)",
+  "captured_at": "2026-09-28T03:10:17.436916Z",
+  "port": 8641,
+  "color_scheme": "light",
+  "dist": {
+    "sha256": "cd7bb8bf3c388c047cd4f8ca745fc0c2507cd70194e0bfd71e67bbd95e6ebb39",
+    "files": [
+      "fleet-ui-a30215ee41c73bb7.css",
+      "fonts/AlbertSans-Variable.ttf",
+      "fonts/ChivoMono-Variable.ttf",
+      "fonts/OFL-AlbertSans.txt",
+      "fonts/OFL-ChivoMono.txt",
+      "fonts/README.md",
+      "fonts/SHA256SUMS",
+      "index.html",
+      "main-5c5c3d36f760b1fe.css",
+      "snippets/fleet-ui-2165a24593f0a7f1/vendor/paper-shaders.js",
+      "snippets/trawl-web-ui-f99d61b89517acef/vendor/codemirror.js",
+      "snippets/trawl-web-ui-f99d61b89517acef/vendor/uplot.js",
+      "theme-bootstrap-e7acc838d5582fa1.js",
+      "trawl-web-ui-3fce8c6163da5ef9.js",
+      "trawl-web-ui-3fce8c6163da5ef9_bg.wasm",
+      "uplot-5e0d12c918aed906.css",
+      "vendor/codemirror.js",
+      "vendor/uplot.js"
+    ]
+  },
+  "captures": [
+    {
+      "file": "disk-retention-complete-1440.png",
+      "claim": "Complete sample: two headroom rows with a floor and no deficit, a completed sweep, and a projected range, a mixed range, a full policy, keep-forever growth, and one withheld env with the growth-excluded note",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-complete.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1284
+      },
+      "theme": "light",
+      "sha256": "6b48fb2014cd3095bfdc43dcd34a75a550f076252c271adea20b333645fc07b7",
+      "bytes": 117084
+    },
+    {
+      "file": "disk-retention-complete-390.png",
+      "claim": "The same complete sample at a 390px phone width: every sentence wraps inside the card",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-complete.json",
+      "viewport": {
+        "width": 390,
+        "height": 1590
+      },
+      "theme": "light",
+      "sha256": "9f3d63a7a9c9be07caa6b5d6d2a9eb44b4be0849c0969f136c0ce23b2361ab17",
+      "bytes": 116287
+    },
+    {
+      "file": "disk-retention-failed-retained-1440.png",
+      "claim": "Failed attempt with a retained sample: rows read \"Collection failed; last complete reading\" with a 3600s age and a deficit, and every reach is withheld as measurement unavailable with no digit",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-failed-retained.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "theme": "light",
+      "sha256": "ec362c7cd66462a3823ffa307bf3198f8cbe5a703ce17fbb3ef419fe339e6e06",
+      "bytes": 81483
+    },
+    {
+      "file": "disk-retention-withheld-1440.png",
+      "claim": "Floor of 0 reads as pressure deletion off with no sweep yet; three withheld reaches name their reason with no digit, and a floor-0 env reads as the disk filling first",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-withheld.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1096
+      },
+      "theme": "light",
+      "sha256": "f95dfd24bb8c060d9e23f4990df86a4a7ac1395919c6fdaa43fe9685d7d45993",
+      "bytes": 96060
+    },
+    {
+      "file": "disk-retention-pressure-1440.png",
+      "claim": "Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, a sweep that ran out of candidates below the floor, and a shortened prod range",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-pressure.json",
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "theme": "light",
+      "sha256": "42cf88e180a0460208d5a756a9cef859320c38de27a0f432a861433dfcc37ab0",
+      "bytes": 74865
+    }
+  ]
+}
