@@ -799,7 +799,9 @@ pub enum ReachEnd {
 pub enum WithheldReason {
     /// Fewer than 3 observed days.
     InsufficientHistory,
-    /// A repin is holding two generations, so stored bytes are inflated.
+    /// A repin job overlapped the Parquet scan or the headroom sample, or
+    /// repin staging was on the data root, so the samples may count files
+    /// twice or miss free space.
     RetentionSuppressed,
     /// The Parquet scan or the data filesystem sample is not complete.
     MeasurementUnavailable,

@@ -185,7 +185,7 @@ pub fn reach_line(reach: &Reach, max_age_days: u64) -> String {
                 "Reach withheld: not enough observed days yet.".into()
             }
             WithheldReason::RetentionSuppressed => {
-                "Reach withheld: a repin holds two generations, so stored bytes are inflated."
+                "Reach withheld: a repin ran during the latest samples, so they may count files twice or miss free space."
                     .into()
             }
             WithheldReason::MeasurementUnavailable => {
@@ -550,7 +550,7 @@ mod tests {
                 "repin-suppressed",
                 include_str!("../e2e/harness/wire/health-capacity-repin-suppressed.json"),
                 ["k8s", "prod", "staging"]
-                    .map(|env| (env, "Reach withheld: a repin holds two generations, so stored bytes are inflated.".to_owned()))
+                    .map(|env| (env, "Reach withheld: a repin ran during the latest samples, so they may count files twice or miss free space.".to_owned()))
                     .to_vec(),
                 None,
             ),
