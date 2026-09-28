@@ -33,6 +33,13 @@ use crate::repin::jobs::{JobGeneration, JobReading};
 /// as a crash before boot recovery ran, or staging a job in this process
 /// kept because its sweep failed. Unreadable evidence fails the attempt.
 ///
+/// A "job" here is a repin that enters the staged rewrite: marker, shadow,
+/// cutover or abandon, cleanup. The decision before it (the corpus scan, a
+/// dry run, a refusal at the scan gate) builds no second generation, so it
+/// is not a job. Scratch that scan spills to disk is transient headroom
+/// consumption like compaction or query spill, and the sample reports it
+/// as real free space.
+///
 /// Out of scope: writes to the data directory from outside this process.
 /// The data root is trusted storage that only this daemon rearranges.
 ///
