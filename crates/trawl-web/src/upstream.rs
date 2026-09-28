@@ -27,12 +27,15 @@
 //! that read's result instead of reading again. Routes that never reach
 //! trawld, `/healthz` among them, never wait on the file.
 //!
-//! A read compares the file's bytes with the bytes behind the client in
-//! use, never its modification time. Unchanged bytes do nothing. Bytes
-//! that parse become a new client. Bytes that do not parse, a file that
-//! disappears, and a file that cannot be read are refusals: the last good
-//! client stays in use, and each distinct refusal logs one warning. Before
-//! any good load there is no client to keep, so requests stay at 503.
+//! A read compares a BLAKE3 digest of the file's bytes with the digest of
+//! the bytes behind the client in use, never its modification time.
+//! Unchanged bytes do nothing. Bytes that parse become a new client. Bytes
+//! that do not parse, a file that disappears, a file that cannot be read,
+//! and a file larger than `config::MAX_PIN_FILE_BYTES` (1 MiB) are
+//! refusals: the last good client stays in use, and each distinct refusal
+//! logs one warning. Before any good load there is no client to keep, so
+//! requests stay at 503. Only digests are kept between reads, never a
+//! file's bytes.
 //!
 //! A request takes one client, a cheap clone, when it starts, and uses it
 //! until its response body ends. A swap changes what the next request
@@ -93,8 +96,9 @@ struct Pin {
 
 /// What earlier reads of the pin file found.
 struct Observed {
-    /// The contents behind the client in use; `None` while no client exists.
-    loaded: Option<Vec<u8>>,
+    /// The digest of the contents behind the client in use; `None` while no
+    /// client exists.
+    loaded: Option<blake3::Hash>,
     /// The refusal last logged, so the same refusal is not logged again.
     /// Cleared by a read that finds the loaded contents or loads new ones.
     refusal: Option<Refusal>,
@@ -102,12 +106,12 @@ struct Observed {
 
 /// Why a read of the pin file produced no client. Two refusals are the
 /// same when a re-read would log the same thing: the same kind, and for
-/// contents, the same bytes.
+/// contents, the same digest.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     Absent,
     Unreadable(std::io::ErrorKind),
-    Unusable(Vec<u8>),
+    Unusable(blake3::Hash),
 }
 
 impl Upstream {
@@ -135,7 +139,7 @@ impl Upstream {
                             .build()?,
                         ),
                         Observed {
-                            loaded: Some(roots.pem().to_vec()),
+                            loaded: Some(roots.digest()),
                             refusal: None,
                         },
                     ),
@@ -250,16 +254,20 @@ impl Pin {
     /// Read the file once and act on what it holds. Blocks; the caller
     /// holds the re-read mutex, whose contents `observed` is.
     fn observe_blocking(&self, observed: &mut Observed) {
-        let (refusal, reason) = match read_pin_file(&self.path) {
-            Ok(pem) if observed.loaded.as_deref() == Some(pem.as_slice()) => {
+        let read = read_pin_file(&self.path).map(|pem| {
+            let digest = blake3::hash(&pem);
+            (pem, digest)
+        });
+        let (refusal, reason) = match read {
+            Ok((_, digest)) if observed.loaded == Some(digest) => {
                 observed.refusal = None;
                 return;
             }
-            Ok(pem) => match self.build(&pem) {
+            Ok((pem, digest)) => match self.build(&pem) {
                 Ok(client) => {
                     let first = observed.loaded.is_none();
                     *self.client.write().unwrap_or_else(PoisonError::into_inner) = Some(client);
-                    observed.loaded = Some(pem);
+                    observed.loaded = Some(digest);
                     observed.refusal = None;
                     if first {
                         tracing::info!(
@@ -276,7 +284,7 @@ impl Pin {
                     }
                     return;
                 }
-                Err(reason) => (Refusal::Unusable(pem), reason.to_owned()),
+                Err(reason) => (Refusal::Unusable(digest), reason.to_owned()),
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 (Refusal::Absent, "the file does not exist".to_owned())
@@ -383,6 +391,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::config::MAX_PIN_FILE_BYTES;
     use crate::test_support::{TestCa, TlsUpstream, captured_logs};
 
     /// The platform roots and a pin to a fresh CA: the rules under test do
@@ -717,6 +726,46 @@ mod tests {
 
         // Throughout, the last good client stays in use.
         assert!(runtime.block_on(upstream.client()).is_ok());
+    }
+
+    /// A pin file that grows past [`MAX_PIN_FILE_BYTES`] after startup is a
+    /// refusal like any other: one warning, and the last good client stays.
+    /// The file is sparse, so the test allocates nothing.
+    #[test]
+    fn an_oversized_pin_file_is_refused_on_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, TestCa::generate().pem()).unwrap();
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let upstream = pinned(&path);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let ((), lines) = captured_logs(|| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(MAX_PIN_FILE_BYTES + 1)
+                .unwrap();
+            runtime.block_on(upstream.reread());
+            runtime.block_on(upstream.reread());
+        });
+        let warnings: Vec<_> = lines.iter().filter(|l| l.starts_with("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{lines:?}");
+        assert!(warnings[0].contains("larger than 1 MiB"), "{lines:?}");
+        assert!(warnings[0].contains("last loaded"), "{lines:?}");
+        assert!(runtime.block_on(upstream.client()).is_ok());
+        assert_eq!(
+            pin_of(&upstream)
+                .reread
+                .try_lock()
+                .expect("no read in flight")
+                .refusal,
+            Some(Refusal::Unreadable(std::io::ErrorKind::FileTooLarge))
+        );
     }
 
     /// A pin still waiting for its first good file: its absence was logged

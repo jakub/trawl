@@ -106,13 +106,13 @@ pub enum UpstreamTls {
     },
 }
 
-/// A pin file's contents and the trust anchors they parsed to.
+/// A digest of a pin file's contents and the trust anchors they parsed to.
 ///
-/// The bytes stay with the certificates so a later read of the file can
+/// The digest stays with the certificates so a later read of the file can
 /// tell whether it changed since the client was built from it. Only
 /// [`pinned_roots`] builds one.
 pub struct PinnedRoots {
-    pem: Vec<u8>,
+    digest: blake3::Hash,
     certificates: Vec<reqwest::Certificate>,
 }
 
@@ -123,9 +123,9 @@ impl PinnedRoots {
         &self.certificates
     }
 
-    /// The file contents the certificates came from.
-    pub(crate) fn pem(&self) -> &[u8] {
-        &self.pem
+    /// The BLAKE3 digest of the file contents the certificates came from.
+    pub(crate) fn digest(&self) -> blake3::Hash {
+        self.digest
     }
 }
 
@@ -657,9 +657,10 @@ pub fn resolve_upstream_connect(
 /// - Absent (`NotFound`): the pin is pending, and one `upstream_ca_pending`
 ///   warning says so. trawld writes its generated certificate on its first
 ///   start, which may come after trawl-web's.
-/// - Any other read error, a path that is not a regular file, or contents
-///   that do not parse as a certificate bundle: refused, so a broken pin
-///   stops startup instead of failing every request later.
+/// - Any other read error, a path that is not a regular file, a file larger
+///   than `MAX_PIN_FILE_BYTES` (1 MiB), or contents that do not parse as a
+///   certificate bundle: refused, so a broken pin stops startup instead of
+///   failing every request later.
 ///
 /// # Errors
 /// Returns [`ConfigError::UpstreamCa`] naming the file and the reason.
@@ -692,13 +693,26 @@ pub fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, Confi
     Ok(UpstreamTls::PinnedCa { path, roots })
 }
 
-/// Read the pin file at `path`, refusing anything but a regular file.
+/// The largest pin file trawl-web reads, in bytes: 1 MiB.
+///
+/// A pin names trawld's CA: its one generated certificate is under 1 KiB,
+/// and even a whole public root bundle is a few hundred KiB. A bigger file
+/// is not a CA bundle, and reading it whole, at startup or on every
+/// re-read, would let whoever can write the path make trawl-web allocate
+/// the file's size, past a container's memory limit.
+pub(crate) const MAX_PIN_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read the pin file at `path`, refusing anything but a regular file of at
+/// most [`MAX_PIN_FILE_BYTES`].
 ///
 /// The open never waits: on unix it passes `O_NONBLOCK`, so a FIFO with
 /// no writer opens at once instead of blocking until one appears. The
-/// type check runs on the opened handle, so the path cannot be swapped
-/// between check and read. A FIFO, directory or device is refused with
-/// `InvalidInput`. Reading a regular file can still stall, on a network
+/// type and size checks run on the opened handle, so the path cannot be
+/// swapped between check and read. A FIFO, directory or device is refused
+/// with `InvalidInput`. A file over the cap is refused with `FileTooLarge`
+/// before any of it is read, and the read itself stops one byte past the
+/// cap, so a file that grows after the size check is refused too and never
+/// read whole. Reading a regular file can still stall, on a network
 /// volume for one, so callers on the async runtime run this on the
 /// blocking pool. The one reader for a pin file, at startup and on any
 /// later read.
@@ -712,15 +726,31 @@ pub(crate) fn read_pin_file(path: &Path) -> std::io::Result<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let mut file = options.open(path)?;
-    if !file.metadata()?.is_file() {
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "the path is not a regular file",
         ));
     }
+    let too_large = || {
+        std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!(
+                "the file is larger than {} MiB, too large for a CA bundle",
+                MAX_PIN_FILE_BYTES / (1024 * 1024)
+            ),
+        )
+    };
+    if metadata.len() > MAX_PIN_FILE_BYTES {
+        return Err(too_large());
+    }
     let mut pem = Vec::new();
-    file.read_to_end(&mut pem)?;
+    file.take(MAX_PIN_FILE_BYTES + 1).read_to_end(&mut pem)?;
+    if pem.len() as u64 > MAX_PIN_FILE_BYTES {
+        return Err(too_large());
+    }
     Ok(pem)
 }
 
@@ -752,7 +782,7 @@ pub(crate) fn pinned_roots(pem: &[u8]) -> Result<PinnedRoots, &'static str> {
         })
         .collect::<Result<_, _>>()?;
     Ok(PinnedRoots {
-        pem: pem.to_vec(),
+        digest: blake3::hash(pem),
         certificates,
     })
 }
@@ -1887,6 +1917,37 @@ session_ttl_secs = 3600
                 "{unreadable:?} gave {error:?}"
             );
         }
+    }
+
+    /// A pin file over [`MAX_PIN_FILE_BYTES`] refuses before it is read,
+    /// whatever it holds. The file is sparse, so the test allocates nothing.
+    /// A file of exactly the cap still reads.
+    #[test]
+    fn an_oversized_pinned_ca_file_refuses_at_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, test_ca_pem()).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&ca_path)
+            .unwrap();
+
+        file.set_len(MAX_PIN_FILE_BYTES).unwrap();
+        let tls = resolve_upstream_tls(Some(&ca_path)).expect("a file at the cap reads");
+        assert!(
+            matches!(tls, UpstreamTls::PinnedCa { roots: Some(_), .. }),
+            "{tls:?}"
+        );
+
+        file.set_len(MAX_PIN_FILE_BYTES + 1).unwrap();
+        let error = resolve_upstream_tls(Some(&ca_path))
+            .expect_err("an oversized pin file must stop startup");
+        assert!(
+            matches!(&error, ConfigError::UpstreamCa { reason, .. } if reason.contains("larger than 1 MiB")),
+            "{error:?}"
+        );
+        let error = read_pin_file(&ca_path).expect_err("the read refuses");
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
     }
 
     #[test]
