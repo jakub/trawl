@@ -252,9 +252,7 @@ impl HttpClient {
             return Err(server_error(503, &body));
         }
         let resp = check_status(resp).await?;
-        resp.json()
-            .await
-            .map_err(|e| ClientError::Parse(e.to_string()))
+        resp.json().await.map_err(body_read_error)
     }
 
     /// Fetch schema introspection from the daemon.
@@ -660,10 +658,7 @@ impl HttpClient {
         if status == 409 {
             // Two 409 shapes: a refused-needs-force plan (a RepinResponse
             // body) and the already-running error envelope.
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| ClientError::Parse(e.to_string()))?;
+            let bytes = resp.bytes().await.map_err(body_read_error)?;
             if let Ok(refused) = serde_json::from_slice::<trawl_api::RepinResponse>(&bytes) {
                 return Ok(RepinStart::Refused(refused.job));
             }
@@ -679,10 +674,7 @@ impl HttpClient {
             return Err(ClientError::Server { status, error });
         }
         let resp = check_status(resp).await?;
-        let outcome: trawl_api::RepinResponse = resp
-            .json()
-            .await
-            .map_err(|e| ClientError::Parse(e.to_string()))?;
+        let outcome: trawl_api::RepinResponse = resp.json().await.map_err(body_read_error)?;
         decode_repin_start(status, outcome.job)
     }
 
@@ -714,10 +706,7 @@ impl HttpClient {
                 "repin cancel: unexpected HTTP {status}"
             )));
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ClientError::Parse(e.to_string()))?;
+        let bytes = resp.bytes().await.map_err(body_read_error)?;
         let Ok(body) = serde_json::from_slice::<trawl_api::RepinCancelResponse>(&bytes) else {
             // A 404 from a server that predates the route, or a 409 from
             // something else on the path: the error envelope, not a verdict.
@@ -814,9 +803,7 @@ impl HttpClient {
             .map_err(sanitize_reqwest_error)?;
 
         let resp = check_status(resp).await?;
-        resp.json()
-            .await
-            .map_err(|e| ClientError::Parse(e.to_string()))
+        resp.json().await.map_err(body_read_error)
     }
 
     /// Export query results in the specified format.
@@ -845,7 +832,7 @@ impl HttpClient {
         resp.bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(|e| ClientError::Parse(e.to_string()))
+            .map_err(body_read_error)
     }
 
     /// Stream live query results as typed events.
@@ -967,9 +954,23 @@ impl HttpClient {
             .map_err(sanitize_reqwest_error)?;
 
         let resp = check_status(resp).await?;
-        resp.json()
-            .await
-            .map_err(|e| ClientError::Parse(e.to_string()))
+        resp.json().await.map_err(body_read_error)
+    }
+}
+
+/// Classify a failure reading or decoding a response body.
+///
+/// reqwest reports every failure collecting a body as a decode error, a
+/// stall past the request's deadline included. A timeout is a transport
+/// failure, not a malformed answer, so it keeps its [`NetworkKind::Timeout`]
+/// and the same sanitized message as a timeout before the headers. Anything
+/// else stays [`ClientError::Parse`].
+#[allow(clippy::needless_pass_by_value)] // used as `.map_err(body_read_error)`
+fn body_read_error(e: reqwest::Error) -> ClientError {
+    if e.is_timeout() {
+        sanitize_reqwest_error(e)
+    } else {
+        ClientError::Parse(e.to_string())
     }
 }
 
@@ -1441,6 +1442,78 @@ mod tests {
             Some(NetworkKind::Timeout),
             "{error:?}"
         );
+    }
+
+    /// Accept one connection, read the request head, send `200` headers
+    /// promising a body plus its first byte, then hold the connection open
+    /// without sending the rest. Hands back the socket so it stays open
+    /// until the caller drops it.
+    async fn stall_after_headers(listener: tokio::net::TcpListener) -> tokio::net::TcpStream {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0, "connection closed mid-head");
+            request.extend_from_slice(&buf[..n]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{",
+            )
+            .await
+            .unwrap();
+        socket.flush().await.unwrap();
+        socket
+    }
+
+    /// A body that stalls after the headers is a timeout, the same kind and
+    /// message as a stall before them, not a malformed answer. Both body
+    /// readers the doctor uses are covered: the unkeyed health and the
+    /// keyed whoami.
+    #[tokio::test]
+    async fn body_stall_after_headers_is_a_timeout() {
+        init();
+        for keyed in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = HttpClient::with_trust_timeout(
+                format!("http://{address}"),
+                "tok",
+                &TlsTrust::System,
+                std::time::Duration::from_millis(300),
+            )
+            .unwrap();
+            let request = async {
+                if keyed {
+                    client.whoami().await.map(|_| ())
+                } else {
+                    client.health().await.map(|_| ())
+                }
+            };
+            let (result, _socket) = tokio::join!(request, stall_after_headers(listener));
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.network_kind(),
+                Some(NetworkKind::Timeout),
+                "keyed={keyed}: {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("network error: request timed out for API http://{address}"),
+                "keyed={keyed}"
+            );
+        }
+    }
+
+    /// A complete body that is not the expected JSON is still a parse error.
+    #[tokio::test]
+    async fn complete_foreign_body_stays_a_parse_error() {
+        let err = health_answered_with(http_response("200 OK", "text/html", b"<html>hi</html>"))
+            .await
+            .expect_err("html is not a health body");
+        assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
     }
 
     // ── real listeners ──────────────────────────────────────────────────
