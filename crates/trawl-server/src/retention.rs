@@ -2325,6 +2325,8 @@ mod tests {
         let evidence = RetentionEvidence::default();
         assert_eq!(evidence_after(&evidence), (0, 0, 0, None));
         metrics::with_local_recorder(&recorder, || {
+            // Startup publishes both triggers and the attempts at zero.
+            crate::metrics::init_retention_metrics();
             retention_tick_at(
                 tmp.path(),
                 &no_wal(),
@@ -2350,10 +2352,21 @@ mod tests {
             ),
             2
         );
-        assert!(
-            !handle.render().contains("disk_pressure"),
-            "{}",
-            handle.render()
+        // The idle trigger stays at its zero baseline: age removals never
+        // count as pressure deletions, and no attempt was made.
+        assert_eq!(
+            crate::metrics::test_support::sample(
+                &handle,
+                &format!("{deletions}{{trigger=\"disk_pressure\"}}")
+            ),
+            0
+        );
+        assert_eq!(
+            crate::metrics::test_support::sample(
+                &handle,
+                crate::metrics::RETENTION_PRESSURE_ATTEMPTS_TOTAL
+            ),
+            0
         );
     }
 

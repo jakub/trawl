@@ -111,6 +111,17 @@ pub const RETENTION_DELETIONS_TOTAL: &str = "trawl_retention_deletions_total";
 /// Retention sweeps since process start whose first free-space check found
 /// the data filesystem below the deletion floor.
 pub const RETENTION_PRESSURE_ATTEMPTS_TOTAL: &str = "trawl_retention_pressure_attempts_total";
+/// The configured deletion floor (`retention.min_free_disk_bytes`); 0 turns
+/// pressure deletion off.
+pub const RETENTION_MIN_FREE_DISK_BYTES: &str = "trawl_retention_min_free_disk_bytes";
+/// A filesystem trawl writes to, by `role` (ADR-0042). One series per
+/// device, labelled with the first role it holds (data, then wal, then
+/// spill), so a `sum()` never counts a device twice. No path, device or
+/// environment label.
+pub const DISK_TOTAL_BYTES: &str = "trawl_disk_total_bytes";
+/// Available bytes on the filesystem [`DISK_TOTAL_BYTES`] describes, with
+/// the same `role` label.
+pub const DISK_AVAILABLE_BYTES: &str = "trawl_disk_available_bytes";
 pub const SCHEDULER_WINDOW_TRUNCATED_TOTAL: &str = "trawl_scheduler_window_truncated_total";
 pub const AUTH_FAILURES_TOTAL: &str = "trawl_auth_failures_total";
 pub const TELEMETRY_WAL_WRITE_FAILURES_TOTAL: &str = "trawl_telemetry_wal_write_failures_total";
@@ -317,6 +328,25 @@ pub fn init_operational_alert_metrics() {
         metrics::counter!(FILES_QUARANTINED_TOTAL, "kind" => kind.label()).increment(0);
     }
     init_publication_recovery_metrics();
+    init_retention_metrics();
+}
+
+/// Publish retention's removal counters (both triggers) and its pressure
+/// attempts at zero, so a flat `disk_pressure` series reads as "no pressure
+/// deletion since start" rather than "never wired up". Repeated calls never
+/// reset counters.
+pub fn init_retention_metrics() {
+    for trigger in crate::retention::RemovalTrigger::ALL {
+        metrics::counter!(RETENTION_DELETIONS_TOTAL, "trigger" => trigger.label()).increment(0);
+    }
+    metrics::counter!(RETENTION_PRESSURE_ATTEMPTS_TOTAL).increment(0);
+}
+
+/// Publish the configured deletion floor. Call once at startup, after the
+/// recorder is installed; the config is fixed for the process.
+#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
+pub fn publish_retention_floor(min_free_disk_bytes: u64) {
+    gauge!(RETENTION_MIN_FREE_DISK_BYTES).set(min_free_disk_bytes as f64);
 }
 
 /// Publish the publication-recovery outcome matrix at zero, so a flat
@@ -613,6 +643,39 @@ pub fn describe_metrics() {
          trawl_catalog_repin_running this stays 1 for staging no job owns \
          — a boot replay whose sweep keeps failing — so alert on it held \
          high across ticks: the archive grows unbounded meanwhile"
+    );
+    describe_counter!(
+        RETENTION_DELETIONS_TOTAL,
+        "Date directories retention confirmed removed since process start, \
+         labelled by trigger (age = older than the env's max_age_days, \
+         disk_pressure = free space on the data filesystem was below \
+         retention.min_free_disk_bytes). Counted only when the removal \
+         returned success; no bytes-freed figure is kept"
+    );
+    describe_counter!(
+        RETENTION_PRESSURE_ATTEMPTS_TOTAL,
+        "Retention sweeps since process start whose first free-space check \
+         found the data filesystem below retention.min_free_disk_bytes"
+    );
+    describe_gauge!(
+        RETENTION_MIN_FREE_DISK_BYTES,
+        "Configured deletion floor (retention.min_free_disk_bytes): below \
+         this many free bytes on the data filesystem, retention deletes the \
+         date directories nearest their expiry; 0 = pressure deletion off"
+    );
+    describe_gauge!(
+        DISK_TOTAL_BYTES,
+        "Total bytes of each filesystem trawl writes to, one series per \
+         device labelled by the first role it holds (data, then wal, then \
+         spill), so sum() never counts a device twice. From the last \
+         complete measurement; retained after collection failure"
+    );
+    describe_gauge!(
+        DISK_AVAILABLE_BYTES,
+        "Bytes available to trawl on each filesystem it writes to, one \
+         series per device labelled by the first role it holds (data, then \
+         wal, then spill). From the last complete measurement; retained \
+         after collection failure"
     );
     describe_counter!(
         SCHEDULER_WINDOW_TRUNCATED_TOTAL,
@@ -1049,8 +1112,33 @@ fn collect_headroom(data_root: &Path, wal_dir: Option<&Path>) {
                 |root| crate::repin::in_flight_evidence(root).map(|evidence| evidence.is_some()),
             )
         },
-        |_| {},
+        |sample| publish_headroom_gauges(&sample),
     );
+}
+
+/// The `role` label for a headroom row: its first role, so each device has
+/// exactly one series.
+const fn role_label(role: trawl_api::FilesystemRole) -> &'static str {
+    match role {
+        trawl_api::FilesystemRole::Data => "data",
+        trawl_api::FilesystemRole::Wal => "wal",
+        trawl_api::FilesystemRole::Spill => "spill",
+    }
+}
+
+/// Called only while the headroom attempt owner is held, with the last
+/// complete sample: nothing is published before one exists, and a failed
+/// attempt republishes the retained sample, as for the storage totals.
+#[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
+fn publish_headroom_gauges(sample: &crate::capacity::HeadroomSample) {
+    for device in &sample.filesystems {
+        let Some(&first) = device.roles.first() else {
+            continue;
+        };
+        let role = role_label(first);
+        gauge!(DISK_TOTAL_BYTES, "role" => role).set(device.total_bytes as f64);
+        gauge!(DISK_AVAILABLE_BYTES, "role" => role).set(device.available_bytes as f64);
+    }
 }
 
 /// One walked `.parquet` file and its size on disk.
@@ -2083,6 +2171,9 @@ mod tests {
                 "trawl_files_quarantined_total{kind=\"rollup_temporary\"}",
                 "trawl_publication_recovery_total{outcome=\"contradictory\"}",
                 "trawl_publication_recovery_total{outcome=\"failed\"}",
+                "trawl_retention_deletions_total{trigger=\"age\"}",
+                "trawl_retention_deletions_total{trigger=\"disk_pressure\"}",
+                "trawl_retention_pressure_attempts_total",
             ];
             for series in selected {
                 assert_eq!(test_support::sample(&handle, series), 0);
@@ -2270,6 +2361,190 @@ mod tests {
         assert_eq!(measured.1, Some(one_device(0)), "a full disk is a reading");
         assert_ne!(measured, unmeasured, "zero free is not unmeasured");
         assert_eq!(unmeasured.1, None);
+    }
+
+    /// Every sample line's series name and label pairs.
+    fn rendered_series(rendered: &str) -> Vec<(String, Vec<(String, String)>)> {
+        rendered
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+            .map(|line| {
+                let (series, _value) = line.rsplit_once(' ').expect("a sample line");
+                let Some((name, labels)) = series.split_once('{') else {
+                    return (series.to_owned(), Vec::new());
+                };
+                let labels = labels
+                    .trim_end_matches('}')
+                    .split("\",")
+                    .filter(|pair| !pair.is_empty())
+                    .map(|pair| {
+                        let (key, value) = pair.split_once('=').expect("key=value");
+                        (key.to_owned(), value.trim_matches('"').to_owned())
+                    })
+                    .collect();
+                (name.to_owned(), labels)
+            })
+            .collect()
+    }
+
+    /// Publish the ADR-0042 series into a fresh recorder the way production
+    /// does: startup init, the floor, headroom attempts through the real
+    /// cache and stat seam (planted under an env named `plantedenv`), and
+    /// one pressure deletion. Returns the recorder's handle and the device
+    /// numbers the data and WAL rows carried.
+    fn capacity_metrics_fixture() -> (metrics_exporter_prometheus::PrometheusHandle, [u64; 2]) {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("data");
+        let planted_env = data_root.join("plantedenv/2026-09-20");
+        std::fs::create_dir_all(&planted_env).unwrap();
+        std::fs::write(planted_env.join("x.parquet"), "0123456789").unwrap();
+        let wal_dir = tmp.path().join("wal");
+        std::fs::create_dir_all(wal_dir.join("plantedenv")).unwrap();
+        // The real stat seam, so the device number is the one this host
+        // reports for the planted tree. The WAL is made to look like its
+        // own device, and spill shares the WAL's.
+        let (data_device, ..) = crate::capacity::stat_filesystem(&data_root).unwrap();
+        let wal_device = data_device ^ 0x5a5a;
+        let stat_seam = |path: &Path| {
+            let (device, total, available) = crate::capacity::stat_filesystem(path)?;
+            Ok((
+                if path == data_root {
+                    device
+                } else {
+                    wal_device
+                },
+                total,
+                available,
+            ))
+        };
+        let attempt = |fail: bool| {
+            if fail {
+                return Err(io_failure());
+            }
+            sample_headroom(&data_root, Some(&wal_dir), tmp.path(), stat_seam, |_| {
+                Ok(false)
+            })
+        };
+
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        let cache = StorageCache::<HeadroomSample>::default();
+        let first = Instant::now();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            init_operational_alert_metrics();
+            publish_retention_floor(1_073_741_824);
+            // A first attempt that fails publishes no headroom series.
+            cache.collect(|| first, || attempt(true), |s| publish_headroom_gauges(&s));
+            assert!(!handle.render().contains(&format!("{DISK_TOTAL_BYTES}{{")));
+            cache.collect(
+                || first + Duration::from_secs(30),
+                || attempt(false),
+                |s| publish_headroom_gauges(&s),
+            );
+            // A later failure keeps the complete sample's series.
+            cache.collect(
+                || first + Duration::from_secs(60),
+                || attempt(true),
+                |s| publish_headroom_gauges(&s),
+            );
+            let evidence = crate::retention::RetentionEvidence::default();
+            evidence.record_removal(crate::retention::RemovalTrigger::DiskPressure);
+            evidence.record_pressure_attempt();
+        });
+        (handle, [data_device, wal_device])
+    }
+
+    /// The ADR-0042 series: headroom per role, the floor, and retention's
+    /// two counters. Closed label sets, no path, device or env in a label,
+    /// and no projection series.
+    #[test]
+    fn capacity_metrics_labels_and_series() {
+        let (handle, devices) = capacity_metrics_fixture();
+        let rendered = handle.render();
+
+        let capacity_names: std::collections::BTreeSet<String> = rendered_series(&rendered)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| name.starts_with("trawl_disk_") || name.starts_with("trawl_retention_"))
+            .collect();
+        assert_eq!(
+            capacity_names,
+            [
+                DISK_AVAILABLE_BYTES,
+                DISK_TOTAL_BYTES,
+                RETENTION_DELETIONS_TOTAL,
+                RETENTION_MIN_FREE_DISK_BYTES,
+                RETENTION_PRESSURE_ATTEMPTS_TOTAL,
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            "{rendered}"
+        );
+        for name in &capacity_names {
+            assert!(
+                rendered.contains(&format!("# HELP {name} ")),
+                "{name} is described"
+            );
+        }
+        let mut roles = std::collections::BTreeSet::new();
+        let mut triggers = std::collections::BTreeSet::new();
+        let devices = devices.map(|device| device.to_string());
+        for (name, labels) in rendered_series(&rendered) {
+            assert!(
+                !(name.contains("reach") || name.contains("projection")),
+                "no projection series: {name}"
+            );
+            if !capacity_names.contains(&name) {
+                continue;
+            }
+            for (key, value) in labels {
+                assert!(
+                    !value.contains('/')
+                        && !value.contains("plantedenv")
+                        && !devices.contains(&value),
+                    "{name}{{{key}={value}}}"
+                );
+                match key.as_str() {
+                    "role" => roles.insert(value),
+                    "trigger" => triggers.insert(value),
+                    other => panic!("{name} carries label {other}"),
+                };
+            }
+        }
+        // Data alone on one device, wal and spill on another: two series
+        // per gauge, each under its first role. Spill has none of its own.
+        assert_eq!(roles, ["data", "wal"].map(str::to_owned).into());
+        assert_eq!(triggers, ["age", "disk_pressure"].map(str::to_owned).into());
+        for role in ["data", "wal"] {
+            let total = gauge_value(&rendered, &format!("{DISK_TOTAL_BYTES}{{role=\"{role}\"}}"));
+            let available = gauge_value(
+                &rendered,
+                &format!("{DISK_AVAILABLE_BYTES}{{role=\"{role}\"}}"),
+            );
+            assert!(total.parse::<f64>().unwrap() > 0.0, "{role}: {total}");
+            assert!(
+                available.parse::<f64>().unwrap() <= total.parse::<f64>().unwrap(),
+                "{role}"
+            );
+        }
+        assert_eq!(
+            gauge_value(&rendered, RETENTION_MIN_FREE_DISK_BYTES),
+            "1073741824"
+        );
+        let deletions = |trigger: &str| {
+            test_support::sample(
+                &handle,
+                &format!("{RETENTION_DELETIONS_TOTAL}{{trigger=\"{trigger}\"}}"),
+            )
+        };
+        assert_eq!((deletions("age"), deletions("disk_pressure")), (0, 1));
+        assert_eq!(
+            test_support::sample(&handle, RETENTION_PRESSURE_ATTEMPTS_TOTAL),
+            1
+        );
     }
 
     #[test]
