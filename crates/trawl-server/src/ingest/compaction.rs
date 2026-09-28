@@ -22,6 +22,7 @@ use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs_observed};
 use crate::hot_buffer::{AdmissionState, HotBuffer};
 use crate::ingest::coverage_proof;
+use crate::ingest::no_follow;
 use crate::ingest::publication_marker::{
     self, PublicationClaims, RecoveryOutcomeKind, ValidatedMarker,
 };
@@ -1494,6 +1495,54 @@ fn rollup_marker_path(day_dir: &Path, service: &str) -> PathBuf {
     day_dir.join(format!(".rollup-{service}"))
 }
 
+/// The most bytes a rollup marker can hold. It lists at most one hourly
+/// file per hour directory, and [`collect_hour_dirs`] takes only two-digit
+/// names, so at most 100 lines. Each line is a path of at most 4095 bytes
+/// (Linux `PATH_MAX` less its terminator) written lossily, which turns each
+/// byte that is not UTF-8 into three, plus its newline.
+const MAX_ROLLUP_MARKER_BYTES: u64 = 100 * (3 * 4095 + 1);
+
+/// Open `path` with [`no_follow::open`], and check with `fstat` on the
+/// descriptor that it is a regular file. The open never waits on a FIFO,
+/// and a symlink at the last component is refused, never followed. Boot
+/// awaits rollup recovery, so a file there that is not crash residue must
+/// fail the recovery, not hang the boot.
+fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
+    let file = no_follow::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, metadata.len()))
+}
+
+/// Read the rollup marker at `path`, opened with [`open_regular`]. A marker
+/// over [`MAX_ROLLUP_MARKER_BYTES`] is an error: one `fstat` reports is
+/// never read, and one that grows after the `fstat` is read only up to one
+/// byte past the bound. Off Linux no marker is opened, so a present one
+/// cannot be read.
+fn read_rollup_marker(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let (file, len) =
+        open_regular(path).map_err(|e| format!("failed to open rollup marker: {e}"))?;
+    let over_limit = || format!("rollup marker is over the {MAX_ROLLUP_MARKER_BYTES}-byte limit");
+    if len > MAX_ROLLUP_MARKER_BYTES {
+        return Err(over_limit());
+    }
+    let mut content = String::new();
+    file.take(MAX_ROLLUP_MARKER_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| format!("failed to read rollup marker: {e}"))?;
+    if content.len() as u64 > MAX_ROLLUP_MARKER_BYTES {
+        return Err(over_limit());
+    }
+    Ok(content)
+}
+
 /// Write a rollup marker listing the hourly files being merged.
 fn write_rollup_marker(
     day_dir: &Path,
@@ -1523,6 +1572,10 @@ fn delete_rollup_marker(day_dir: &Path, service: &str) {
 /// - If the tmp is corrupt, quarantine it and retain hourly inputs.
 /// - If only the canonical exists, retire the marker's hourly inputs.
 /// - If neither exists: stale marker, just remove it.
+///
+/// A marker or a `.parquet.tmp` that is not a regular file, and a marker
+/// over [`MAX_ROLLUP_MARKER_BYTES`], fail the recovery of the day with the
+/// marker left in place. Neither is opened in a way that can block.
 #[cfg(test)]
 fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
     recover_rollup_markers_coordinated(day_dir, None)
@@ -1571,8 +1624,7 @@ fn recover_rollup_markers_inner(
         }
         let canonical = day_dir.join(format!("{service}.parquet"));
         let tmp = day_dir.join(format!("{service}.parquet.tmp"));
-        let marker_content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read rollup marker: {e}"))?;
+        let marker_content = read_rollup_marker(&path)?;
         let hourly_files: Vec<PathBuf> = marker_content
             .lines()
             .filter(|line| !line.is_empty())
@@ -1581,13 +1633,15 @@ fn recover_rollup_markers_inner(
 
         // An existing daily file may precede this merge. A complete tmp
         // contains both that daily file and the new hourly inputs.
-        let tmp_exists = match std::fs::symlink_metadata(&tmp) {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(format!("failed to inspect rollup tmp: {e}")),
+        // A tmp that is not a regular file is no output of this merge, and
+        // is neither promoted nor quarantined.
+        let staged = match open_regular(&tmp) {
+            Ok(staged) => Some(staged),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("failed to open rollup tmp: {e}")),
         };
-        if tmp_exists {
-            if is_valid_parquet(&tmp) {
+        if let Some((staged, staged_len)) = staged {
+            if is_valid_parquet_file(staged, staged_len) {
                 tracing::info!(
                     event_type = "rollup_recovery",
                     compact_service = %service,
@@ -1675,17 +1729,23 @@ const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// "File ... too small to be a Parquet file" and wedge the rollup forever
 /// — no amount of retrying repairs a truncated file.
 pub(crate) fn is_valid_parquet(path: &Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
     let Ok(meta) = file.metadata() else {
         return false;
     };
+    is_valid_parquet_file(file, meta.len())
+}
+
+/// [`is_valid_parquet`] on an open `file` whose length `fstat` reported as
+/// `len`.
+fn is_valid_parquet_file(mut file: std::fs::File, len: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
     // Header magic (4) + a minimal footer + footer length (4) + trailer
     // magic (4). Anything below this cannot be a parquet file.
-    if meta.len() < 12 {
+    if len < 12 {
         return false;
     }
     let mut head = [0u8; 4];
@@ -5305,8 +5365,8 @@ mod tests {
         );
         assert!(!day.join("svc.parquet").exists());
 
-        // A directory cannot replace quarantine_target's reserved file. The
-        // failed rename retains the source and is one failed recovery attempt.
+        // A directory at the staged output is not a regular file. Recovery
+        // fails once, keeps the source and quarantines nothing.
         std::fs::create_dir(&temporary).unwrap();
         write_rollup_marker(&day, "svc", std::slice::from_ref(&hourly)).unwrap();
         assert!(
@@ -5335,7 +5395,7 @@ mod tests {
         assert!(temporary.is_dir());
         assert!(
             !day.join("svc.parquet.tmp.corrupt.1").exists(),
-            "failed rename removes its reservation"
+            "nothing is reserved for a quarantine"
         );
     }
 
@@ -6747,7 +6807,16 @@ mod tests {
         let canonical = day.join("nginx.parquet");
         std::fs::rename(first, &canonical).unwrap();
         let invalid_tmp = day.join("nginx.parquet.tmp");
-        std::fs::create_dir(&invalid_tmp).unwrap();
+        std::fs::write(&invalid_tmp, b"truncated").unwrap();
+        // Every quarantine name is taken, so the quarantine fails after
+        // recovery has removed the marker.
+        for n in 0..MAX_QUARANTINE_ATTEMPTS {
+            let name = match n {
+                0 => "nginx.parquet.tmp.corrupt".to_owned(),
+                n => format!("nginx.parquet.tmp.corrupt.{n}"),
+            };
+            std::fs::write(day.join(name), b"").unwrap();
+        }
         write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
         let gate = PublicationGate::new();
         gate.initialize(&root);
@@ -6755,7 +6824,7 @@ mod tests {
             let _writer = gate.write().await;
             assert!(recover_rollup_markers_coordinated(&day, Some(&gate)).is_err());
             assert!(!rollup_marker_path(&day, "nginx").exists());
-            assert!(invalid_tmp.is_dir());
+            assert!(invalid_tmp.is_file());
             recover_rollup_markers_coordinated(&day, Some(&gate)).unwrap();
         }
         assert_eq!(read_strings(&canonical, "msg"), vec!["old"]);
@@ -7219,6 +7288,124 @@ mod tests {
             !log.contains(&*tmp.path().to_string_lossy()),
             "no path is logged: {log}"
         );
+    }
+
+    /// Run boot rollup recovery over `data` on its own thread, failing the
+    /// test if it blocks, and return the gate it recovered through.
+    #[cfg(target_os = "linux")]
+    fn recover_at_boot_promptly(data: &Path) -> Arc<PublicationGate> {
+        let gate = Arc::new(PublicationGate::starting());
+        gate.initialize(data);
+        let recovering = Arc::clone(&gate);
+        crate::ingest::no_follow::test_support::returns_promptly(move || {
+            recover_rollups_at_boot(&recovering);
+        });
+        gate
+    }
+
+    /// Boot awaits rollup recovery before the listener binds, so a FIFO at
+    /// a rollup marker path must not block it waiting for a FIFO writer.
+    /// The boot goes on; the marker stays pending, and reads refuse
+    /// `rollup_pending`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollup_boot_recovery_leaves_a_fifo_marker_pending_without_blocking() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let day = data.join("prod/2026-01-15");
+        std::fs::create_dir_all(&day).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+        crate::ingest::no_follow::test_support::make_fifo(&marker);
+
+        let gate = recover_at_boot_promptly(&data);
+
+        assert!(
+            std::fs::symlink_metadata(&marker)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the FIFO marker stays in place"
+        );
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+    }
+
+    /// A FIFO at the staged rollup output does not block boot recovery
+    /// either, and is not taken for a truncated output: nothing is
+    /// quarantined or retired, and the marker stays pending.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollup_boot_recovery_leaves_a_fifo_staged_output_pending_without_blocking() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let row = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let hourly = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[row]);
+        let day = env.join("2026-01-15");
+        let staged = day.join("nginx.parquet.tmp");
+        crate::ingest::no_follow::test_support::make_fifo(&staged);
+        write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+
+        let gate = recover_at_boot_promptly(&data);
+
+        assert!(
+            std::fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the FIFO is neither promoted nor quarantined"
+        );
+        assert!(hourly.exists(), "the hourly input is kept");
+        assert!(marker.exists(), "the marker stays for a compaction pass");
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+    }
+
+    /// A rollup marker over [`MAX_ROLLUP_MARKER_BYTES`] is not read, so no
+    /// path it lists is retired, and it stays pending. One at the bound is
+    /// read and recovered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollup_boot_recovery_reads_no_marker_over_the_bound() {
+        for (len, recovered) in [
+            (MAX_ROLLUP_MARKER_BYTES, true),
+            (MAX_ROLLUP_MARKER_BYTES + 1, false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let env = data.join("prod");
+            let row = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+            let hourly = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[row]);
+            let day = env.join("2026-01-15");
+            std::fs::write(day.join("nginx.parquet"), b"daily").unwrap();
+            // The listed hourly, padded with the empty lines a marker read
+            // skips.
+            let mut body = hourly.to_string_lossy().into_owned().into_bytes();
+            body.resize(usize::try_from(len).unwrap(), b'\n');
+            let marker = rollup_marker_path(&day, "nginx");
+            std::fs::write(&marker, body).unwrap();
+
+            let gate = recover_at_boot_promptly(&data);
+
+            assert_eq!(!hourly.exists(), recovered, "{len}-byte marker");
+            assert_eq!(!marker.exists(), recovered, "{len}-byte marker");
+            assert_eq!(
+                gate.pending_rollup_markers().is_empty(),
+                recovered,
+                "{len}-byte marker"
+            );
+        }
     }
 
     /// The pass-through shortcut is a claim about the conform, not about
