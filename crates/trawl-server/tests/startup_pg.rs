@@ -1532,10 +1532,12 @@ async fn restart_publication_recovery_crash_in_unpublished_branch_reruns_exactly
 /// AC1 (#265): events acknowledged before the process stops, and still in
 /// the WAL, are counted exactly once by the first successful query after
 /// the restart, before any compaction pass could have published them. All
-/// of them arrive in ONE request, so one WAL file holds them. An hour
-/// between compaction ticks keeps any pass from publishing it before the
-/// stop. The restart holds its boot pass, the first pass, which would
-/// otherwise publish the file at once: the query then finds no parquet row
+/// of them arrive in ONE request, so one WAL file holds them. The first
+/// daemon holds its boot pass, which compacts WAL of any age, from before
+/// the ingest through the stop or kill, and an hour between compaction
+/// ticks keeps any later pass away: nothing can publish the file before the
+/// stop. The restart holds its boot pass too, which would otherwise publish
+/// the file at once: the query then finds no parquet row
 /// for the tag and counts every event from the hot buffer, which the boot
 /// hydrated before the listener bound. Released, the boot pass publishes
 /// the file and drains the hydrated batch under one guard, and the count
@@ -1552,14 +1554,10 @@ async fn restart_counts_every_acknowledged_event_once(kill: bool) {
         if kill { "kill9" } else { "graceful" }
     );
 
-    let mut daemon = fixture.spawn();
-    let acknowledged = ingest(
-        &client(&daemon.ready().await, &token),
-        &time,
-        &tag,
-        CRASH_EVENTS,
-    )
-    .await;
+    let mut daemon = fixture.spawn_holding_boot_pass();
+    let url = daemon.ready().await;
+    daemon.held_at_boot_pass().await;
+    let acknowledged = ingest(&client(&url, &token), &time, &tag, CRASH_EVENTS).await;
     let [wal_file] = <[PathBuf; 1]>::try_from(wal_files(&fixture))
         .unwrap_or_else(|files| panic!("one request, one WAL file: {files:?}"));
     if kill {
