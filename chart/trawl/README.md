@@ -62,8 +62,17 @@ Fleet/Trawl database Secret or browser-cookie Secret.
 The Certificate covers the daemon API. Browser ingress uses `ingress.tls`
 separately. If ingress deliberately reuses the generated Secret, its hosts
 must also be covered, and ingress-shim issuer annotations must be absent so
-two Certificates do not manage that Secret. The sidecar keeps its existing
-loopback-only HTTPS connection with certificate verification disabled.
+two Certificates do not manage that Secret.
+
+The `trawl-web` sidecar connects to trawld over the pod's loopback and always
+verifies trawld's certificate. With `tls.mode: auto`, it mounts the `tls`
+directory of the data volume read-only and pins the generated `cert.pem`. It
+runs as `web.runAsUser`, so it cannot read the `key.pem` beside it. With
+`secret` or `certManager`, the sidecar requests `https://<tls.upstreamServerName>:<port>`
+and connects to `127.0.0.1:<port>`. `tls.upstreamCa` is then required:
+`secret` pins the Secret's `ca.crt`, `system` uses the platform roots, and an
+absolute path pins a CA file that you mount with `web.extraVolumes` and
+`web.extraVolumeMounts`.
 
 Chart-managed TLS mounts require structured config values. `config.raw` is
 accepted only with `tls.mode: auto`, where the raw TOML controls TLS and the
@@ -275,6 +284,8 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `tls.certManager.issuerRef.kind` | string | `ClusterIssuer` | `Issuer` in the release namespace or `ClusterIssuer` |
 | `tls.certManager.issuerRef.group` | string | `cert-manager.io` | Issuer API group. No namespace field is supported |
 | `tls.certManager.dnsNames` | list | `[]` | Required DNS SANs for `certManager`. Must cover API ingress/HTTPRoute hostnames. Wildcards cover one label. IP-address certificates use `secret` mode |
+| `tls.upstreamServerName` | string | `""` | DNS name that trawl-web verifies in trawld's certificate while it connects over loopback. Required for `secret` with `web.enabled`. `certManager` defaults to the first `dnsNames` entry that is not a wildcard, and an explicit name must be covered by `dnsNames`. Wildcards and IP addresses are refused. Refused with `auto` |
+| `tls.upstreamCa` | string | `""` | CA that trawl-web trusts for trawld. Required for `secret` and `certManager` with `web.enabled`, with no default. `secret` pins `ca.crt` from the TLS Secret, `system` uses the platform roots, and an absolute path pins a CA file you mount. Refused with `auto` |
 | `auth.database.existingSecret` | string | `""` | Secret holding the Fleet DSN. Required |
 | `auth.database.existingSecretKey` | string | `DATABASE_URL` | Key in that Secret. Injected into `init-auth` as `DATABASE_URL` and into trawld as `FLEET_DATABASE_URL` |
 | `storage.database.existingSecret` | string | `""` | Secret holding the Trawl app-state DSN. Required |
@@ -291,6 +302,9 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `web.sharedDomain` | string | `""` | `[web] shared_domain`, the parent domain for a session shared with other Fleet applications. Empty scopes the cookie to the origin |
 | `web.resources` | object | cpu `50m`, memory `64Mi` to `256Mi` | Sidecar resources |
 | `web.extraEnv` | list | `[]` | Extra environment variables for the sidecar |
+| `web.runAsUser` | int | `1001` | The sidecar's uid. Must differ from trawld's uid so the sidecar cannot read trawld's private key |
+| `web.extraVolumes` | list | `[]` | Extra pod volumes, for example the CA file that `tls.upstreamCa` names by path |
+| `web.extraVolumeMounts` | list | `[]` | Extra sidecar volume mounts. Mount a directory, not a file `subPath`, so a replaced CA reaches trawl-web without a restart |
 | `web.logLevel` | string | `trawl_web=info,fleet_auth=info` | `RUST_LOG` for the sidecar. Keep both targets |
 | `web.cookieSecret.existingSecret` | string | `""` | Secret holding the 32-byte session key. Empty makes the chart generate one and keep it across upgrades |
 | `web.cookieSecret.existingSecretKey` | string | `cookie.key` | Key in that Secret |

@@ -50,6 +50,33 @@ def managed(**overrides):
     return {"tls": value}
 
 
+# The sidecar's whole environment. ADR-0048 removed the upstream trust
+# switch, so an exact list is the assertion that nothing brings it back.
+SIDECAR_ENV = ["HOME", "RUST_LOG", "FLEET_SESSION_PUBLIC_ORIGINS"]
+
+
+def web(**overrides):
+    value = {"enabled": True, "publicOrigins": ["https://browser.example.com"]}
+    value.update(overrides)
+    return value
+
+
+def pod(objects):
+    return objects["statefulset"]["spec"]["template"]["spec"]
+
+
+def container(objects, name):
+    return next(c for c in pod(objects)["containers"] if c["name"] == name)
+
+
+def web_config(objects):
+    return tomllib.loads(objects["configmap"]["data"]["trawld.toml"])["web"]
+
+
+def upstream(objects):
+    return {k: v for k, v in web_config(objects).items() if k.startswith("upstream_")}
+
+
 class TLS(unittest.TestCase):
     def objects(self, settings=None):
         result = render(settings)
@@ -143,17 +170,17 @@ class TLS(unittest.TestCase):
         self.fails(settings, "web.cookieSecret.existingSecret")
 
     def test_browser_tls_and_loopback_sidecar_are_separate(self):
-        settings = managed()
-        settings["web"] = {"enabled": True, "publicOrigins": ["https://browser.example.com"],
-                           "cookieSecret": {"existingSecret": "browser-cookie"}}
+        settings = managed(upstreamCa="secret")
+        settings["web"] = web(cookieSecret={"existingSecret": "browser-cookie"})
         settings["ingress"] = {"enabled": True, "backend": "web", "hosts": [{"host": "browser.example.com", "paths": []}],
                                "tls": [{"secretName": "browser-tls", "hosts": ["browser.example.com"]}]}
         objects = self.objects(settings)
         self.assertEqual(objects["ingress"]["spec"]["tls"][0]["secretName"], "browser-tls")
-        pod = objects["statefulset"]["spec"]["template"]["spec"]
-        sidecar = next(c for c in pod["containers"] if c["name"] == "trawl-web")
-        insecure = next(e for e in sidecar["env"] if e["name"] == "TRAWL_WEB_INSECURE_UPSTREAM")
-        self.assertEqual(insecure["value"], "1")
+        sidecar = container(objects, "trawl-web")
+        # trawl-web verifies trawld in every mode (ADR-0048): the environment
+        # carries no trust switch, and the sidecar never mounts the daemon's
+        # key-bearing Secret.
+        self.assertEqual([e["name"] for e in sidecar["env"]], SIDECAR_ENV)
         self.assertNotIn("tls", [m["name"] for m in sidecar["volumeMounts"]])
         # Sharing the generated certificate with browser ingress is valid
         # only when its requested SANs also cover that browser hostname.
@@ -163,6 +190,148 @@ class TLS(unittest.TestCase):
         self.objects(settings)
         settings["ingress"]["annotations"] = {"cert-manager.io/cluster-issuer": "other-ca"}
         self.fails(settings, "ingress cert-manager annotations")
+
+    def test_auto_mode_pins_generated_certificate(self):
+        objects = self.objects({"web": web()})
+        # The upstream stays trawl-web's derived https://127.0.0.1:<port>,
+        # which the generated certificate covers.
+        self.assertEqual(upstream(objects), {"upstream_ca_path": "/var/lib/trawl/tls/cert.pem"})
+        sidecar = container(objects, "trawl-web")
+        self.assertEqual([e["name"] for e in sidecar["env"]], SIDECAR_ENV)
+        # Only the tls/ directory of the data volume, read-only, and as a
+        # directory: a file subPath would pin the first certificate forever.
+        data = [m for m in sidecar["volumeMounts"] if m["name"] == "data"]
+        self.assertEqual(data, [{"name": "data", "mountPath": "/var/lib/trawl/tls", "subPath": "tls", "readOnly": True}])
+        self.assertNotIn("tls", [m["name"] for m in sidecar["volumeMounts"]])
+        self.assertNotIn("upstream-ca", [v["name"] for v in pod(objects)["volumes"]])
+        # A uid of its own: trawld's key.pem (0600) sits in that directory.
+        self.assertEqual(sidecar["securityContext"], {
+            "readOnlyRootFilesystem": True, "runAsNonRoot": True, "allowPrivilegeEscalation": False,
+            "capabilities": {"drop": ["ALL"]}, "runAsUser": 1001,
+        })
+        self.assertNotIn("runAsUser", container(objects, "trawld")["securityContext"])
+        self.assertEqual(pod(objects)["securityContext"]["runAsUser"], 1000)
+        self.assertEqual(pod(objects)["securityContext"]["runAsGroup"], 1000)
+        self.assertEqual(pod(objects)["securityContext"]["fsGroup"], 1000)
+
+        # The pin follows the state directory: the parent of [data] path.
+        for path, sub_path, mount_path in [
+            ("/var/lib/trawl/data/", "tls", "/var/lib/trawl/tls"),
+            ("/var/lib/trawl/nested/data", "nested/tls", "/var/lib/trawl/nested/tls"),
+        ]:
+            with self.subTest(path=path):
+                objects = self.objects({"web": web(), "config": {"data": {"path": path}}})
+                self.assertEqual(web_config(objects)["upstream_ca_path"], f"{mount_path}/cert.pem")
+                mount = next(m for m in container(objects, "trawl-web")["volumeMounts"] if m["name"] == "data")
+                self.assertEqual(mount, {"name": "data", "mountPath": mount_path, "subPath": sub_path, "readOnly": True})
+        for path in ["/srv/trawl/data", "/var/lib/trawl", "/var/lib/trawler/data", "data"]:
+            with self.subTest(path=path):
+                self.fails({"web": web(), "config": {"data": {"path": path}}}, "config.data.path")
+
+        # config.raw owns its TOML, but the sidecar still mounts per mode.
+        raw = '[server]\nhttp_addr = "0.0.0.0:5514"\n'
+        objects = self.objects({"web": web(), "config": {"raw": raw}})
+        self.assertEqual(objects["configmap"]["data"]["trawld.toml"].strip(), raw.strip())
+        self.assertIn("data", [m["name"] for m in container(objects, "trawl-web")["volumeMounts"]])
+
+        # auto pins the generated certificate; the other modes' values contradict it.
+        for field, value in [("upstreamServerName", "api.example.com"), ("upstreamCa", "system")]:
+            for web_values in [web(), {"enabled": False}]:
+                with self.subTest(field=field, web=web_values["enabled"]):
+                    self.fails({"web": web_values, "tls": {field: value}}, f"tls.{field}")
+        self.fails({"web": web(runAsUser=1000)}, "web.runAsUser")
+        self.fails({"web": web(runAsUser=1234), "securityContext": {"runAsUser": 1234}}, "web.runAsUser")
+
+    def test_upstream_trust_secret_modes(self):
+        secret = {"mode": "secret", "secretName": "operator-api-tls", "upstreamServerName": "trawl.example.com"}
+        objects = self.objects({"web": web(), "tls": {**secret, "upstreamCa": "secret"}})
+        self.assertEqual(upstream(objects), {
+            "upstream_url": "https://trawl.example.com:5514",
+            "upstream_connect_addr": "127.0.0.1:5514",
+            "upstream_ca_path": "/etc/trawl/upstream-ca/ca.crt",
+        })
+        volume = next(v for v in pod(objects)["volumes"] if v["name"] == "upstream-ca")
+        self.assertEqual(volume, {"name": "upstream-ca", "secret": {
+            "secretName": "operator-api-tls", "optional": True,
+            "items": [{"key": "ca.crt", "path": "ca.crt"}],
+        }})
+        sidecar = container(objects, "trawl-web")
+        mounts = {m["name"]: m for m in sidecar["volumeMounts"]}
+        self.assertEqual(mounts["upstream-ca"], {"name": "upstream-ca", "mountPath": "/etc/trawl/upstream-ca", "readOnly": True})
+        self.assertNotIn("tls", mounts)
+        self.assertNotIn("data", mounts)
+        self.assertEqual([e["name"] for e in sidecar["env"]], SIDECAR_ENV)
+        self.assert_mount(objects, "operator-api-tls")
+
+        # system: the platform roots, no pin and nothing mounted.
+        objects = self.objects({"web": web(), "tls": {**secret, "upstreamCa": "system"},
+                                "config": {"server": {"httpAddr": "0.0.0.0:7443"}}})
+        self.assertEqual(upstream(objects), {
+            "upstream_url": "https://trawl.example.com:7443",
+            "upstream_connect_addr": "127.0.0.1:7443",
+        })
+        self.assertNotIn("upstream-ca", [v["name"] for v in pod(objects)["volumes"]])
+        self.assertNotIn("upstream-ca", [m["name"] for m in container(objects, "trawl-web")["volumeMounts"]])
+
+        # An absolute path pins a CA the operator mounts through the pass-throughs.
+        extra = web(extraVolumes=[{"name": "operator-ca", "configMap": {"name": "operator-ca"}}],
+                    extraVolumeMounts=[{"name": "operator-ca", "mountPath": "/etc/trawl/operator-ca", "readOnly": True}])
+        objects = self.objects({"web": extra, "tls": {**secret, "upstreamCa": "/etc/trawl/operator-ca/ca.pem"}})
+        self.assertEqual(upstream(objects)["upstream_ca_path"], "/etc/trawl/operator-ca/ca.pem")
+        self.assertIn({"name": "operator-ca", "configMap": {"name": "operator-ca"}}, pod(objects)["volumes"])
+        self.assertIn(extra["extraVolumeMounts"][0], container(objects, "trawl-web")["volumeMounts"])
+        self.assertNotIn("upstream-ca", [v["name"] for v in pod(objects)["volumes"]])
+
+        # certManager defaults the name to the first dnsNames entry that is not
+        # a wildcard, and pins the generated Secret's ca.crt.
+        settings = managed(upstreamCa="secret",
+                           certManager={"issuerRef": {"name": "ca"}, "dnsNames": ["*.example.com", "api.example.com", "b.example.com"]})
+        objects = self.objects({**settings, "web": web()})
+        self.assertEqual(upstream(objects), {
+            "upstream_url": "https://api.example.com:5514",
+            "upstream_connect_addr": "127.0.0.1:5514",
+            "upstream_ca_path": "/etc/trawl/upstream-ca/ca.crt",
+        })
+        volume = next(v for v in pod(objects)["volumes"] if v["name"] == "upstream-ca")
+        self.assertEqual(volume["secret"]["secretName"], "launch-trawl-tls")
+        # An explicit name is accepted when dnsNames covers it, wildcards included.
+        settings["tls"]["upstreamServerName"] = "web.example.com"
+        self.assertEqual(upstream(self.objects({**settings, "web": web()}))["upstream_url"], "https://web.example.com:5514")
+
+        # Daemon-only installs render as before: no [web], no sidecar, no
+        # upstream-trust values required.
+        for tls in [{"mode": "secret", "secretName": "operator-api-tls"}, managed()["tls"]]:
+            with self.subTest(tls=tls["mode"]):
+                objects = self.objects({"tls": tls})
+                self.assertNotIn("web", tomllib.loads(objects["configmap"]["data"]["trawld.toml"]))
+                self.assertEqual([c["name"] for c in pod(objects)["containers"]], ["trawld"])
+                self.assertNotIn("upstream-ca", [v["name"] for v in pod(objects)["volumes"]])
+
+    def test_upstream_trust_required_values(self):
+        secret = {"mode": "secret", "secretName": "operator-api-tls"}
+        cases = [
+            ({**secret, "upstreamServerName": "trawl.example.com"}, "tls.upstreamCa is required"),
+            (managed()["tls"], "tls.upstreamCa is required"),
+            ({**secret, "upstreamCa": "secret"}, "tls.upstreamServerName is required"),
+            ({**secret, "upstreamCa": "secret", "upstreamServerName": "*.example.com"}, "tls.upstreamServerName must be one DNS name, not a wildcard"),
+            ({**secret, "upstreamCa": "secret", "upstreamServerName": "10.0.0.1"}, "tls.upstreamServerName must be a DNS name, not an IP address"),
+            ({**secret, "upstreamCa": "secret", "upstreamServerName": "::1"}, "tls.upstreamServerName must be a DNS name, not an IP address"),
+            ({**secret, "upstreamCa": "secret", "upstreamServerName": "Trawl Example"}, "tls.upstreamServerName must be a DNS name"),
+            ({**secret, "upstreamServerName": "trawl.example.com", "upstreamCa": "ca.crt"}, "tls.upstreamCa must be"),
+            ({**secret, "upstreamServerName": "trawl.example.com", "upstreamCa": "Secret"}, "tls.upstreamCa must be"),
+            (managed(upstreamCa="system", certManager={"issuerRef": {"name": "ca"}, "dnsNames": ["*.example.com"]})["tls"],
+             "tls.upstreamServerName is required"),
+            (managed(upstreamCa="system", upstreamServerName="other.example.org")["tls"],
+             "tls.certManager.dnsNames must cover tls.upstreamServerName host other.example.org"),
+            (managed(upstreamCa="system", upstreamServerName="*.example.com",
+                     certManager={"issuerRef": {"name": "ca"}, "dnsNames": ["*.example.com"]})["tls"],
+             "tls.upstreamServerName must be one DNS name, not a wildcard"),
+        ]
+        for tls, expected in cases:
+            with self.subTest(tls=tls, expected=expected):
+                self.fails({"web": web(), "tls": tls}, expected)
+        self.fails({"web": web(), "tls": {**secret, "upstreamCa": "system", "upstreamServerName": "trawl.example.com"},
+                    "config": {"server": {"httpAddr": "0.0.0.0"}}}, "config.server.httpAddr")
 
     def test_host_coverage_uses_one_label_wildcards(self):
         for host, accepted in [("api.example.com", True), ("deep.api.example.com", False), ("example.com", False)]:

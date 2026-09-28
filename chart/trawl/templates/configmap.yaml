@@ -158,5 +158,19 @@ data:
     {{- if .Values.web.sharedDomain }}
     shared_domain = {{ .Values.web.sharedDomain | quote }}
     {{- end }}
+    {{- /* How trawl-web verifies trawld (ADR-0048), resolved and validated
+         in _tls.tpl; the statefulset mounts what these keys name. auto
+         renders only the pin and leaves upstream_url to trawl-web, which
+         derives https://127.0.0.1:<port> from [server] http_addr. */}}
+    {{- $trust := include "trawl.upstreamTrust" . | fromJson }}
+    {{- with $trust.url }}
+    upstream_url = {{ . | toJson }}
+    {{- end }}
+    {{- with $trust.connectAddr }}
+    upstream_connect_addr = {{ . | toJson }}
+    {{- end }}
+    {{- with $trust.caPath }}
+    upstream_ca_path = {{ . | toJson }}
+    {{- end }}
     {{- end }}
     {{- end }}

@@ -259,6 +259,28 @@ tls:
     # Required: every DNS name clients use for the daemon API.
     # Include in-cluster Service names if clients connect through them.
     dnsNames: []
+  # How the trawl-web sidecar verifies trawld's certificate (ADR-0048).
+  # Read only when web.enabled and tls.mode is secret or certManager.
+  # tls.mode=auto pins the certificate trawld generates on the data volume,
+  # and setting either value below with auto fails the render.
+  #
+  # The DNS name trawl-web verifies in trawld's certificate. The sidecar
+  # requests https://<name>:<port> but connects to trawld over the pod's
+  # loopback, so the name does not need to resolve. Required for secret.
+  # certManager defaults it to the first dnsNames entry that is not a
+  # wildcard, and an explicit name must be covered by dnsNames. A wildcard
+  # or an IP address is refused.
+  upstreamServerName: ""
+  # The CA trawl-web trusts for trawld's certificate. Required when
+  # web.enabled and tls.mode is secret or certManager, with no default: the
+  # chart cannot see inside the Secret to know which applies.
+  #   secret  - pin ca.crt from the TLS Secret. A CA or self-signed issuer
+  #             writes it. Until the Secret holds ca.crt, trawl-web
+  #             answers 503.
+  #   system  - the platform roots, for a publicly trusted issuer.
+  #   /a/path - pin a CA file mounted into the sidecar through
+  #             web.extraVolumes and web.extraVolumeMounts.
+  upstreamCa: ""
 
 # -- Fleet-auth PostgreSQL keystore
 # API keys and roles live in an external database shared across Fleet apps.
@@ -374,6 +396,27 @@ web:
     limits:
       memory: 256Mi
   extraEnv: []
+  # The sidecar's own uid. In tls.mode=auto it mounts trawld's tls
+  # directory to pin cert.pem, and key.pem sits next to it, 0600 and owned
+  # by trawld's uid (podSecurityContext.runAsUser). A separate uid keeps the
+  # key unreadable; the render fails if the two are equal. The pod's
+  # runAsGroup and fsGroup still apply, so the sidecar reads its ConfigMap
+  # and cookie Secret through the group.
+  runAsUser: 1001
+  # Extra pod volumes and trawl-web mounts, for example the CA file that
+  # tls.upstreamCa names by path:
+  #   extraVolumes:
+  #     - name: trawl-api-ca
+  #       configMap:
+  #         name: trawl-api-ca
+  #   extraVolumeMounts:
+  #     - name: trawl-api-ca
+  #       mountPath: /etc/trawl/api-ca
+  #       readOnly: true
+  # Mount a directory, not a file subPath, so a replaced CA file reaches
+  # trawl-web without a restart.
+  extraVolumes: []
+  extraVolumeMounts: []
 
   # -- Log level (RUST_LOG) for the trawl-web sidecar ONLY. The proxy emits
   # its session, origin, upstream and startup diagnostics under trawl_web,

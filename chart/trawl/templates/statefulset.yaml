@@ -8,6 +8,9 @@
 {{- if and .Values.web.enabled (not .Values.web.publicOrigins) -}}
 {{- fail "web.enabled=true requires web.publicOrigins: list the browser-visible origins of this deployment (scheme, host and port, matched whole), e.g. --set-string 'web.publicOrigins[0]=https://trawl.example.com'. It is never derived from ingress hosts or httpRoute hostnames." -}}
 {{- end }}
+{{- /* How the sidecar verifies trawld (ADR-0048), resolved and validated in
+     _tls.tpl. The ConfigMap reads the same helper for its [web] keys. */ -}}
+{{- $trust := include "trawl.upstreamTrust" . | fromJson }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -138,7 +141,7 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - name: data
-              mountPath: /var/lib/trawl
+              mountPath: {{ include "trawl.dataMountPath" . }}
             - name: tmp
               mountPath: /tmp
             - name: config
@@ -167,11 +170,6 @@ spec:
           env:
             - name: HOME
               value: /var/lib/trawl
-            # trawld serves HTTPS with a self-signed cert by default;
-            # loopback-within-pod is the only traffic path, so TLS
-            # verification buys us nothing here.
-            - name: TRAWL_WEB_INSECURE_UPSTREAM
-              value: "1"
             # The proxy's own filter — trawld's logLevel names neither
             # trawl_web nor the proxy's fleet_auth events.
             - name: RUST_LOG
@@ -201,7 +199,7 @@ spec:
               scheme: HTTP
             periodSeconds: 10
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- include "trawl.webSecurityContext" . | nindent 12 }}
           resources:
             {{- toYaml .Values.web.resources | nindent 12 }}
           volumeMounts:
@@ -215,6 +213,29 @@ spec:
               mountPath: /etc/trawl/web.cookie
               subPath: cookie.key
               readOnly: true
+            {{- if $trust.dataSubPath }}
+            # tls.mode=auto: the directory holding trawld's generated
+            # certificate, pinned by [web] upstream_ca_path. Never a file
+            # subPath: that binds one inode at container start, so kubelet
+            # would create a directory where a not-yet-written cert.pem
+            # belongs, and a certificate replaced by rename would never
+            # reach the sidecar. Read-only, and web.runAsUser keeps the
+            # key.pem beside it unreadable.
+            - name: data
+              mountPath: {{ $trust.dataMountPath | quote }}
+              subPath: {{ $trust.dataSubPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if $trust.caSecretName }}
+            # tls.upstreamCa=secret: only ca.crt, as a directory mount so a
+            # renewed CA reaches trawl-web's re-read without a restart.
+            - name: upstream-ca
+              mountPath: {{ $trust.caMountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.web.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
         {{- end }}
       volumes:
         - name: tmp
@@ -236,6 +257,22 @@ spec:
             items:
               - key: {{ .Values.web.cookieSecret.existingSecretKey | default "cookie.key" }}
                 path: cookie.key
+        {{- if $trust.caSecretName }}
+        # The TLS Secret again, projecting ca.crt alone so tls.key never
+        # reaches the sidecar. Optional: an issuer that writes no ca.crt
+        # leaves the directory empty and trawl-web answers 503 rather than
+        # the pod failing to start.
+        - name: upstream-ca
+          secret:
+            secretName: {{ $trust.caSecretName }}
+            optional: true
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+        {{- with .Values.web.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
