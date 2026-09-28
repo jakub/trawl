@@ -87,8 +87,11 @@ impl ClientCheck {
 
     /// The check that must be `complete` before this one looks.
     ///
-    /// Health and identity both wait for `api.tls`: nothing is read from, or
-    /// sent to, a server whose certificate did not verify. The `web.*`
+    /// Health waits for `api.tls`: nothing is read from a server whose
+    /// certificate did not verify. Identity waits for `api.health`: the key
+    /// goes only to a server that answered with trawl's health body under
+    /// verified TLS, never to a redirect, a foreign service, or a server
+    /// whose answer could not be read. The `web.*`
     /// checks do not depend on the API: `--web-url` was checked when the
     /// command line was, and the probe sends no key.
     #[must_use]
@@ -97,7 +100,8 @@ impl ClientCheck {
             Self::ConnectionConfig | Self::WebTransport => None,
             Self::ApiTransport => Some(Self::ConnectionConfig),
             Self::ApiTls => Some(Self::ApiTransport),
-            Self::ApiHealth | Self::ApiIdentity => Some(Self::ApiTls),
+            Self::ApiHealth => Some(Self::ApiTls),
+            Self::ApiIdentity => Some(Self::ApiHealth),
             Self::WebOrigin => Some(Self::WebTransport),
         }
     }
@@ -418,7 +422,8 @@ mod tests {
     }
 
     /// The graph is data: every check but the first waits on an earlier
-    /// one, ids are unique, and health and identity wait on api.tls.
+    /// one, ids are unique, health waits on api.tls, and identity on
+    /// api.health.
     #[test]
     fn client_checks_form_an_ordered_graph() {
         let mut ids: Vec<&str> = ClientCheck::ALL.iter().map(|c| c.id()).collect();
@@ -457,7 +462,7 @@ mod tests {
         );
         assert_eq!(
             ClientCheck::ApiIdentity.prerequisite(),
-            Some(ClientCheck::ApiTls)
+            Some(ClientCheck::ApiHealth)
         );
         assert_eq!(
             ClientCheck::WebOrigin.prerequisite(),
@@ -521,7 +526,7 @@ mod tests {
                     "api.identity",
                     Outcome::NotSampled,
                     Some("blocked"),
-                    Some("api.tls")
+                    Some("api.health")
                 ),
             ]
         );

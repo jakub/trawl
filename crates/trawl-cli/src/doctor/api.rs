@@ -7,10 +7,13 @@
 //! One unkeyed `GET /api/v1/health` decides `api.transport`, `api.tls` and
 //! `api.health`. It is sent under the connection's own trust and carries no
 //! key. A key goes out only in `GET /api/v1/whoami`, and only through a
-//! client built from a [`witness::VerifiedApi`], which nothing but the
-//! `api.tls` step can mint: an `https` URL, a trust that verifies, and an
-//! HTTP answer observed under that trust. An untrusted certificate, an
-//! `insecure` trust, or a plain `http` URL therefore never sees a key.
+//! client built from a [`witness::VerifiedApi`]. That takes two steps:
+//! `api.tls` mints a [`witness::VerifiedTls`] when the URL is `https`, the
+//! trust verifies, and an HTTP answer arrived under that trust; `api.health`
+//! turns it into a `VerifiedApi` only when that answer parsed as a trawl
+//! health body. An untrusted certificate, an `insecure` trust, a plain
+//! `http` URL, a redirect, or any answer that is not trawl's health body
+//! therefore never sees a key.
 //!
 //! Every outcome is decided from [`ClientError::network_kind`] or a
 //! [`ClientError::Server`] status, never from an error's text, and no
@@ -146,27 +149,60 @@ mod witness {
         }
     }
 
-    /// An API whose certificate verified under the connection's trust.
-    /// Only [`verify`] mints one.
+    /// An API whose certificate verified under the connection's trust, and
+    /// the probe's answer observed under it. Only [`verify_tls`] mints one.
+    /// It cannot build a keyed client; [`VerifiedTls::into_api`] decides
+    /// whether the answer came from trawl.
+    pub(super) struct VerifiedTls<'a> {
+        url: &'a CheckedUrl,
+        trust: &'a TlsTrust,
+        answer: Result<HealthResponse, ClientError>,
+    }
+
+    /// Mint the TLS witness when, and only when, the URL is `https`, the
+    /// trust verifies certificates, and the probe got an HTTP answer under
+    /// that trust. The probe is consumed, so its answer is the one the
+    /// witness carries.
+    pub(super) fn verify_tls(connection: &Connection, probe: Probe) -> Option<VerifiedTls<'_>> {
+        let verifies = matches!(connection.trust, TlsTrust::System | TlsTrust::PinnedCa(_));
+        if connection.url.scheme() == Scheme::Https
+            && verifies
+            && probe.under_configured_trust
+            && !probe.not_built
+            && probe.answered()
+        {
+            Some(VerifiedTls {
+                url: &connection.url,
+                trust: &connection.trust,
+                answer: probe.result,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// An API that answered as trawl under verified TLS: its health answer
+    /// parsed as a trawl health body (a 200, or a 503 carrying one). Only
+    /// [`VerifiedTls::into_api`] mints one.
     pub(super) struct VerifiedApi<'a> {
         url: &'a CheckedUrl,
         trust: &'a TlsTrust,
     }
 
-    /// Mint the witness when, and only when, the URL is `https`, the trust
-    /// verifies certificates, and the probe got an HTTP answer under that
-    /// trust.
-    pub(super) fn verify<'a>(connection: &'a Connection, probe: &Probe) -> Option<VerifiedApi<'a>> {
-        let verifies = matches!(connection.trust, TlsTrust::System | TlsTrust::PinnedCa(_));
-        (connection.url.scheme() == Scheme::Https
-            && verifies
-            && probe.under_configured_trust
-            && !probe.not_built
-            && probe.answered())
-        .then_some(VerifiedApi {
-            url: &connection.url,
-            trust: &connection.trust,
-        })
+    impl<'a> VerifiedTls<'a> {
+        /// The health answer, and with it the API witness when that answer
+        /// is trawl's health body. A redirect, another status, or a body
+        /// that does not parse comes back as the error, and no witness.
+        pub(super) fn into_api(self) -> Result<(VerifiedApi<'a>, HealthResponse), ClientError> {
+            let health = self.answer?;
+            Ok((
+                VerifiedApi {
+                    url: self.url,
+                    trust: self.trust,
+                },
+                health,
+            ))
+        }
     }
 
     impl VerifiedApi<'_> {
@@ -198,6 +234,7 @@ const fn trust_name(trust: &TlsTrust) -> &'static str {
 pub struct ApiRun<'a> {
     connection: &'a Connection,
     probe: Option<witness::Probe>,
+    tls: Option<witness::VerifiedTls<'a>>,
     verified: Option<witness::VerifiedApi<'a>>,
     health: Option<HealthResponse>,
     identity: Option<WhoAmIResponse>,
@@ -211,6 +248,7 @@ impl std::fmt::Debug for ApiRun<'_> {
         f.debug_struct("ApiRun")
             .field("origin", &self.connection.url.origin())
             .field("probed", &self.probe.is_some())
+            .field("tls_verified", &self.tls.is_some())
             .field("verified", &self.verified.is_some())
             .finish_non_exhaustive()
     }
@@ -221,6 +259,7 @@ impl<'a> ApiRun<'a> {
         Self {
             connection,
             probe: None,
+            tls: None,
             verified: None,
             health: None,
             identity: None,
@@ -237,12 +276,12 @@ impl<'a> ApiRun<'a> {
         check
     }
 
-    /// `api.tls`: judge the certificate from the probe, and mint the
+    /// `api.tls`: judge the certificate from the probe, and mint the TLS
     /// witness when it verified.
     pub fn tls(&mut self) -> Check {
         let probe = self
             .probe
-            .as_ref()
+            .take()
             .expect("api.tls runs only after api.transport completed");
         let connection = self.connection;
         let mut check = row(API_TLS, Outcome::Failed);
@@ -281,9 +320,9 @@ impl<'a> ApiRun<'a> {
             };
             return with_next(check, next);
         }
-        match witness::verify(connection, probe) {
-            Some(verified) => {
-                self.verified = Some(verified);
+        match witness::verify_tls(connection, probe) {
+            Some(tls) => {
+                self.tls = Some(tls);
                 check.outcome = Outcome::Complete;
                 check.detail = Some(format!("verified under {}", trust_name(&connection.trust)));
                 check
@@ -295,19 +334,20 @@ impl<'a> ApiRun<'a> {
     }
 
     /// `api.health` and its `api.health.<key>` rows, from the probe's
-    /// answer. The runner calls it only after `api.tls` completed.
+    /// answer. The runner calls it only after `api.tls` completed. A health
+    /// body that parses mints the API witness, the only way `api.identity`
+    /// can send the key; anything else fails here and blocks it.
     pub fn health(&mut self) -> Vec<Check> {
-        assert!(
-            self.verified.is_some(),
-            "api.health reads only an answer observed under verified TLS"
-        );
-        let probe = self
-            .probe
+        let tls = self
+            .tls
             .take()
-            .expect("api.health runs only after api.transport completed");
+            .expect("api.health reads only an answer observed under verified TLS");
         let check = row(API_HEALTH, Outcome::Failed);
-        let health = match probe.result {
-            Ok(health) => health,
+        let health = match tls.into_api() {
+            Ok((verified, health)) => {
+                self.verified = Some(verified);
+                health
+            }
             Err(e) => return vec![answer_failure(check, &e, "health")],
         };
         let status = match health.status {
@@ -343,7 +383,8 @@ impl<'a> ApiRun<'a> {
     }
 
     /// `api.identity`: prove the key with `whoami`. The runner calls it
-    /// only after `api.tls` completed.
+    /// only after `api.health` completed, which is when the API witness
+    /// exists.
     pub async fn identity(&mut self) -> Check {
         let mut check = row(API_IDENTITY, Outcome::NotConfigured);
         let Some(key) = &self.connection.key else {
@@ -357,7 +398,7 @@ impl<'a> ApiRun<'a> {
         let verified = self
             .verified
             .as_ref()
-            .expect("api.identity runs only after api.tls completed");
+            .expect("api.identity runs only after api.health completed");
         let Ok(api) = verified.keyed_client(key) else {
             check.outcome = Outcome::Failed;
             return with_reason(check, "the HTTP client could not be built");

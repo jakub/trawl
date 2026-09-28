@@ -1203,10 +1203,10 @@ fn settled_handshakes(stub: &Stub) -> Vec<bool> {
 }
 
 /// A certificate the client does not trust fails `api.tls`, naming the
-/// trust mode and pointing at `ca_cert`; health and identity are blocked by
-/// it. From the server's end, the handshake failed and no request arrived,
-/// so no bearer header was ever sent. Checked under system roots (`--url`)
-/// and under a pin to another CA (a profile).
+/// trust mode and pointing at `ca_cert`; health is blocked by it, and
+/// identity by health. From the server's end, the handshake failed and no
+/// request arrived, so no bearer header was ever sent. Checked under system
+/// roots (`--url`) and under a pin to another CA (a profile).
 #[test]
 fn doctor_untrusted_cert_sends_no_key() {
     let home = Sandbox::new();
@@ -1290,7 +1290,7 @@ fn doctor_untrusted_cert_sends_no_key() {
                     "api.identity".to_owned(),
                     "not_sampled".to_owned(),
                     Some("blocked".to_owned()),
-                    Some("api.tls".to_owned())
+                    Some("api.health".to_owned())
                 ),
             ],
             "{case}"
@@ -1309,9 +1309,10 @@ fn doctor_untrusted_cert_sends_no_key() {
     }
 }
 
-/// `insecure` and a plain `http` URL each fail `api.tls` and block health
-/// and identity. The one request the server sees is the unkeyed health
-/// probe that decided `api.transport`; no `Authorization` header arrives.
+/// `insecure` and a plain `http` URL each fail `api.tls`, which blocks
+/// health and, through it, identity. The one request the server sees is
+/// the unkeyed health probe that decided `api.transport`; no
+/// `Authorization` header arrives.
 #[test]
 fn doctor_insecure_never_sends_key() {
     let home = Sandbox::new();
@@ -1389,7 +1390,91 @@ fn doctor_insecure_never_sends_key() {
                     "api.identity".to_owned(),
                     "not_sampled".to_owned(),
                     Some("blocked".to_owned()),
-                    Some("api.tls".to_owned())
+                    Some("api.health".to_owned())
+                ),
+            ],
+            "{case}"
+        );
+        assert!(!text(&output).contains(PROFILE_TOKEN), "{case}");
+        let requests = stub.requests();
+        let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, [HEALTH_PATH], "{case}: only the unkeyed probe");
+        stub.assert_no_authorization(case);
+    }
+}
+
+/// The key goes only to a server that answered the unkeyed probe with
+/// trawl's health body. Under verified TLS, a redirect, a 404, a 503 that
+/// is not a health body, and a 200 that is not one all fail `api.health`,
+/// and `api.identity` is blocked by it. The server sees the one unkeyed
+/// probe: no `whoami`, no `Authorization` header.
+#[test]
+fn doctor_sends_key_only_after_trawl_health() {
+    let home = Sandbox::new();
+    let server_ca = ca("trawl doctor server CA");
+    let pem = home.file("ca.pem", &server_ca.pem());
+    let cases: [(&str, Option<Route>, String); 6] = [
+        (
+            "301",
+            Some((HEALTH_PATH, 301, String::new())),
+            "redirect refused".to_owned(),
+        ),
+        (
+            "302",
+            Some((HEALTH_PATH, 302, String::new())),
+            "redirect refused".to_owned(),
+        ),
+        ("404", None, "HTTP 404 is not a health answer".to_owned()),
+        (
+            "503 foreign body",
+            Some((HEALTH_PATH, 503, "<html>maintenance</html>".to_owned())),
+            "HTTP 503 is not a health answer".to_owned(),
+        ),
+        (
+            "200 foreign JSON",
+            Some((HEALTH_PATH, 200, r#"{"hello":"world"}"#.to_owned())),
+            "the answer is not a trawl health response".to_owned(),
+        ),
+        (
+            "200 unknown status",
+            Some((HEALTH_PATH, 200, r#"{"status":"fine"}"#.to_owned())),
+            "the answer is not a trawl health response".to_owned(),
+        ),
+    ];
+    for (case, health, reason) in cases {
+        let mut routes = vec![whoami(r#""query""#)];
+        routes.extend(health);
+        let stub = Stub::tls(leaf(&server_ca), routes);
+        profile(
+            &home,
+            "prod",
+            &stub.url("https"),
+            &format!("ca_cert = \"{}\"", pem.display()),
+        );
+        let output = home.trawl(&["doctor", "-p", "prod", "--format", "json"], &[]);
+        assert_eq!(output.status.code(), Some(1), "{case}: {}", text(&output));
+        let report = report(&output);
+        assert_eq!(
+            rows(&report)[1..],
+            [
+                (
+                    "api.transport".to_owned(),
+                    "complete".to_owned(),
+                    None,
+                    None
+                ),
+                ("api.tls".to_owned(), "complete".to_owned(), None, None),
+                (
+                    "api.health".to_owned(),
+                    "failed".to_owned(),
+                    Some(reason),
+                    None
+                ),
+                (
+                    "api.identity".to_owned(),
+                    "not_sampled".to_owned(),
+                    Some("blocked".to_owned()),
+                    Some("api.health".to_owned())
                 ),
             ],
             "{case}"
