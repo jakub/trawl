@@ -1,15 +1,15 @@
 {
   "evidence": "Stub fixtures only; no daemon, database, or real ingest",
-  "head": "661ec0f76d98d418355015376fe9b708aa76472d",
+  "head": "24cc2b6e4968f5d54091b51fe411782b174c09d6",
   "git_status": "",
   "spec": "crates/trawl-web-ui/e2e/tests/health-page.spec.ts",
-  "spec_sha256": "8df07cc41744d7b1e1c435c134d3415edd3005b5639f264d1a0920e8f16dc8fb",
-  "spec_filter": "tests/health-page.spec.ts (whole file, 60 cases)",
-  "captured_at": "2026-09-28T03:47:28.568748Z",
+  "spec_sha256": "3b178630158a4bd58b52d150e78d6b889a51600ede28cd287a3d0f3aad5f65c4",
+  "spec_filter": "tests/health-page.spec.ts (whole file, 61 cases)",
+  "captured_at": "2026-09-28T04:12:40.622821Z",
   "port": 8641,
   "color_scheme": "light",
   "dist": {
-    "sha256": "a8d504a82429a77a246f7b4ab611e463733ced594b52f9426241009cf66c50fc",
+    "sha256": "25a88e6a61025b8c6642852d2c68b1e7522e5f140e9faa8f9422c3d7ec8d5075",
     "sha256_of": "the sha256sum listing of every file under crates/trawl-web-ui/dist, sorted by relative path",
     "files": [
       "fleet-ui-a30215ee41c73bb7.css",
@@ -35,7 +35,7 @@
   "captures": [
     {
       "file": "disk-retention-complete-1440.png",
-      "claim": "Complete sample: two headroom rows with a floor and no deficit, a completed sweep, and a projected range, a mixed range, a full policy, keep-forever growth, and one withheld env with the growth-excluded note",
+      "claim": "Complete sample with a floor: two headroom rows and no deficit, a completed sweep, three envs projected in whole days from one shared fraction per end, keep-forever growth, and one env withheld for history with the growth-excluded note",
       "scenario": "health-admin",
       "route": "/settings/health",
       "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-complete.json",
@@ -44,8 +44,8 @@
         "height": 1284
       },
       "theme": "light",
-      "sha256": "da0312eb5d7a506a8b591f80cca0421122404d619b39acdb8c70b7aea4433653",
-      "bytes": 117118
+      "sha256": "60def3f1c9b5fa6b05d391837a550e70b292df4f3c0a1d955741090a02754add",
+      "bytes": 117448
     },
     {
       "file": "disk-retention-complete-390.png",
@@ -58,40 +58,54 @@
         "height": 1590
       },
       "theme": "light",
-      "sha256": "08d6e9a9e32a90d88da8499a69962fc39649656e16d02810df7db77a5258d20f",
-      "bytes": 116688
+      "sha256": "e05e958790474723c647a8fb8a548609bfb3a622c93d6bb0f80ae230f974911d",
+      "bytes": 116955
     },
     {
       "file": "disk-retention-failed-retained-1440.png",
-      "claim": "Failed attempt with a retained sample: rows read \"Collection failed; last complete reading\" with a 3600s age and a deficit, and every reach is withheld as measurement unavailable with no digit",
+      "claim": "Failed headroom attempt with a retained sample: rows read \"Collection failed; last complete reading\" with a 3600s age and a deficit, and every reach is withheld as measurement unavailable with no digit and no growth-excluded note",
       "scenario": "health-admin",
       "route": "/settings/health",
       "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-failed-retained.json",
       "viewport": {
         "width": 1440,
+        "height": 1085
+      },
+      "theme": "light",
+      "sha256": "488d53f1ba7595b8181868087b8128ff5179e6bc49799d00ec63d95e3e3c2036",
+      "bytes": 93641
+    },
+    {
+      "file": "disk-retention-repin-suppressed-1440.png",
+      "claim": "A repin in flight with both samples complete: the last sweep was suppressed, and every reach is withheld as retention suppressed with no digit and no growth-excluded note",
+      "scenario": "health-admin",
+      "route": "/settings/health",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-repin-suppressed.json",
+      "viewport": {
+        "width": 1440,
         "height": 1000
       },
       "theme": "light",
-      "sha256": "79004700047d07b793a62e87f090e23f5ac7ef2ae0801dede93c42d93d6b6525",
-      "bytes": 81356
+      "sha256": "5fc41849a052528042bf2080c313e6f6598db276ee34a5579ec5291a69af575c",
+      "bytes": 77866
     },
     {
-      "file": "disk-retention-withheld-1440.png",
-      "claim": "Floor of 0 reads as pressure deletion off with no sweep yet; three withheld reaches name their reason with no digit, and a floor-0 env reads as the disk filling first",
+      "file": "disk-retention-floor-zero-1440.png",
+      "claim": "Floor of 0 reads as pressure deletion off with no pressure attempts; both projected envs read the disk filling first at the largest observed day and the full policy at the mean day, and a fresh env is withheld for history with the growth-excluded note",
       "scenario": "health-admin",
       "route": "/settings/health",
-      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-withheld.json",
+      "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-floor-zero.json",
       "viewport": {
         "width": 1440,
-        "height": 1096
+        "height": 1056
       },
       "theme": "light",
-      "sha256": "d0a55740abfc3b87fab715b44015262537d99e043931272827b7534a0bcc82ce",
-      "bytes": 96073
+      "sha256": "3908d783d70ea36ab2428a36d225be72417962093fadd02232a6da623289d4b4",
+      "bytes": 95525
     },
     {
       "file": "disk-retention-pressure-1440.png",
-      "claim": "Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, a sweep that ran out of candidates below the floor, and a shortened prod range",
+      "claim": "Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, and a sweep that ran out of candidates below the floor; each env holds today alone, so every reach is withheld for history and the finite envs are excluded",
       "scenario": "health-admin",
       "route": "/settings/health",
       "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-pressure.json",
@@ -100,8 +114,8 @@
         "height": 1000
       },
       "theme": "light",
-      "sha256": "6512962504f95bfb58ea8a957626b472b29976e0a89d9475516846785f568089",
-      "bytes": 75036
+      "sha256": "6ec1dbc7971c89e0b8f9465ce0b543c92e5de46d777b16d169d4bd763827af26",
+      "bytes": 80612
     },
     {
       "file": "disk-retention-awaiting-1440.png",

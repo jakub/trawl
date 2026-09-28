@@ -18,13 +18,14 @@ fit inside the page's own scroll container.
 
 | Capture | Fixture | What it shows |
 | --- | --- | --- |
-| [Complete, 1440](disk-retention-complete-1440.png) | `health-capacity-complete.json` | Two headroom rows (Data + WAL, Spill) with a floor and no deficit; a completed sweep; a projected range ("about 38–52 of 90 days"), a mixed range ("about 12 days to the full 30"), a full policy, keep-forever growth, and one env withheld for history, with the growth-excluded note |
-| [Complete, 390](disk-retention-complete-390.png) | `health-capacity-complete.json` | The same card at a phone width: the pressure facts wrap to two columns, every sentence stays inside the card with no horizontal scroll, and no date breaks at its hyphen |
-| [Failed, retained](disk-retention-failed-retained-1440.png) | `health-capacity-failed-retained.json` | Rows read "Collection failed; last complete reading" with a 3600 s age and a 274 MB deficit; the last sweep failed; both reaches are withheld as measurement unavailable, with no digit |
-| [Withheld](disk-retention-withheld-1440.png) | `health-capacity-withheld.json` | A floor of 0 reads as "Pressure deletion off (floor 0)." with no sweep yet; the three withheld reasons each in words with no digit; a floor-0 env reads "the disk fills before retention is reached" |
-| [Pressure](disk-retention-pressure-1440.png) | `health-capacity-pressure.json` | One row for all three roles with a 474 MB deficit; 12 pressure removals over 5 attempts; a sweep that "Ran out of candidates below the floor"; a shortened prod range |
-| [Awaiting](disk-retention-awaiting-1440.png) | `health-capacity-awaiting.json` | Before the first measurement: headroom and reach both read "Awaiting measurement", with no sweep yet. The empty environment list is not read as "No stored date partitions yet." |
-| [Scan failed](disk-retention-scan-failed-1440.png) | `health-capacity-scan-failed.json` | A Parquet scan that failed with nothing retained: headroom still shows its complete row, and reach reads "Measurement unavailable; collection failed" instead of a measured empty list |
+| [Complete, 1440](disk-retention-complete-1440.png) | `health-capacity-complete.json` | Two headroom rows (Data + WAL, Spill) with a floor and no deficit, and a completed sweep. Three envs are projected in whole days at both ends from one shared fraction per end: prod "about 38–52 of 90 days", staging "about 12–17 of 30 days", and lab "about 3–4 of 7 days" from its 6 observed days. Archive shows keep-forever growth, and k8s is withheld for history and named in the growth-excluded note |
+| [Complete, 390](disk-retention-complete-390.png) | `health-capacity-complete.json` | The same card at a phone width. The pressure facts wrap to two columns, every sentence stays inside the card with no horizontal scroll, and no date breaks at its hyphen |
+| [Failed, retained](disk-retention-failed-retained-1440.png) | `health-capacity-failed-retained.json` | The headroom attempt failed. Its rows read "Collection failed; last complete reading" with a 3600 s age and a 274 MB deficit, and the last sweep failed. All three reaches, the rate-less k8s included, are withheld as measurement unavailable with no digit, and no env is excluded from growth |
+| [Repin suppressed](disk-retention-repin-suppressed-1440.png) | `health-capacity-repin-suppressed.json` | Both measurements are complete, but a repin is in flight. The last sweep reads "Suppressed", every reach is withheld because a repin holds two generations, with no digit, and no env is excluded from growth |
+| [Floor zero](disk-retention-floor-zero-1440.png) | `health-capacity-floor-zero.json` | A floor of 0 reads as "Pressure deletion off (floor 0)." with no pressure attempts. Prod and lab each read that the disk fills first at the largest observed day and keeps the full policy at the mean day. A fresh env is withheld for history and named in the growth-excluded note |
+| [Pressure](disk-retention-pressure-1440.png) | `health-capacity-pressure.json` | One row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, and a sweep that "Ran out of candidates below the floor". That sweep left each env only today's partition, so every reach is withheld for history and the finite envs lab and prod are excluded from growth |
+| [Awaiting](disk-retention-awaiting-1440.png) | `health-capacity-awaiting.json` | Before the first measurement, headroom and reach both read "Awaiting measurement", with no sweep yet. The card does not read the empty environment list as "No stored date partitions yet." |
+| [Scan failed](disk-retention-scan-failed-1440.png) | `health-capacity-scan-failed.json` | A Parquet scan failed with nothing retained. Headroom still shows its complete row, and reach reads "Measurement unavailable; collection failed" instead of a measured empty list |
 
 None of the captures carries a badge, a tone class, or a reassurance
 word. The spec asserts that before each capture, and also that every
@@ -34,16 +35,24 @@ reach sentence is drawn in the same ink as the Storage card's reading.
 
 The `Disk and retention` cases in
 [`health-page.spec.ts`](../../crates/trawl-web-ui/e2e/tests/health-page.spec.ts)
-load one capacity object over the base dashboard snapshot, assert the
-exact sentences of each row, then capture the card. The awaiting and
-scan-failed fixtures also carry the snapshot's Parquet fields, because the
-card reads the Parquet measurement to tell an unmeasured empty list from a
-measured one. Each fixture is pinned
-to its state natively in
-[`e2e_wire_fixture_contract.rs`](../../crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs),
-so a drifted fixture cannot pass the wrong case. The spec writes a JSON
-sidecar per capture with its claim and SHA-256; the manifest here is
-assembled from those sidecars.
+load one fixture over the base dashboard snapshot, assert the exact
+sentences of each row, then capture the card. Each fixture is a slice of
+the snapshot: the capacity object with the Parquet and WAL fields it was
+assembled beside. The card reads the Parquet measurement to tell an
+unmeasured empty list from a measured one.
+
+The server's `capacity::assemble` produced each fixture's capacity object
+from chosen partition bytes, headroom samples and retention settings, on
+2026-09-27. [`e2e_wire_fixture_contract.rs`](../../crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs)
+checks every fixture against the producer's invariants. A reason of
+`measurement_unavailable` or `retention_suppressed` applies to every
+environment and excludes none from growth. Each env's observed days start
+at its oldest date or 8 days before 2026-09-27, whichever is later. At each
+end of the range, every projected env reads the full policy or none does.
+A withheld reach carries no number. The same test pins each fixture to the
+state its case asserts, so a drifted fixture cannot pass the wrong case.
+The spec writes a JSON sidecar per capture with its claim and SHA-256. The
+manifest here is assembled from those sidecars.
 
 ## Reproduce the captures
 
