@@ -1,15 +1,15 @@
 {
   "evidence": "Stub fixtures only; no daemon, database, or real ingest",
-  "head": "e9ec99fbc5ef226b78994cd1c92ad44f12a77908",
+  "head": "f70b556f3887bebeb44e93370b0458f29af561dc",
   "git_status": "",
   "spec": "crates/trawl-web-ui/e2e/tests/health-page.spec.ts",
-  "spec_sha256": "0139f09af184acb61008f3bc4c77a1a27b548048d94c3f3aedd3cac49d59e33e",
+  "spec_sha256": "d8b08ba71ec6580ba1aa408bd7ca745e1ab7010bcd53f5f38c3194f157426884",
   "spec_filter": "tests/health-page.spec.ts (whole file, 61 cases)",
-  "captured_at": "2026-09-28T05:42:24.901351Z",
+  "captured_at": "2026-09-28T05:46:47.733099Z",
   "port": 8641,
   "color_scheme": "light",
   "dist": {
-    "sha256": "bb428373f0eeda95954fa3d61fb421cf46e0589f8f65ed3724147a39f98bc0f1",
+    "sha256": "fd30fc188319a01eccc21df16ddb13a64172b74f05e882f695304b8cef93d6d3",
     "sha256_of": "the sha256sum listing of every file under crates/trawl-web-ui/dist, sorted by relative path",
     "files": [
       "fleet-ui-a30215ee41c73bb7.css",
@@ -25,8 +25,8 @@
       "snippets/trawl-web-ui-f99d61b89517acef/vendor/codemirror.js",
       "snippets/trawl-web-ui-f99d61b89517acef/vendor/uplot.js",
       "theme-bootstrap-e7acc838d5582fa1.js",
-      "trawl-web-ui-e23d939e15473702.js",
-      "trawl-web-ui-e23d939e15473702_bg.wasm",
+      "trawl-web-ui-5bc7c98c17df5238.js",
+      "trawl-web-ui-5bc7c98c17df5238_bg.wasm",
       "uplot-5e0d12c918aed906.css",
       "vendor/codemirror.js",
       "vendor/uplot.js"
@@ -86,8 +86,8 @@
         "height": 1000
       },
       "theme": "light",
-      "sha256": "0727b2107e7f3b4262bf80fbb19add9917a488bb90289353f50355238229b069",
-      "bytes": 84954
+      "sha256": "f1723969dbb93b190bcda8d1b99846d972f69c17a04300ecf1e4299319040a1a",
+      "bytes": 88590
     },
     {
       "file": "disk-retention-floor-zero-1440.png",
