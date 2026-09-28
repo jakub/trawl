@@ -1,11 +1,11 @@
 {
   "evidence": "Stub fixtures only; no daemon, database, or real ingest",
-  "head": "24cc2b6e4968f5d54091b51fe411782b174c09d6",
+  "head": "2b1ea66a0d95e32f1e29a4d9c02fe69337f1cd0b",
   "git_status": "",
   "spec": "crates/trawl-web-ui/e2e/tests/health-page.spec.ts",
-  "spec_sha256": "3b178630158a4bd58b52d150e78d6b889a51600ede28cd287a3d0f3aad5f65c4",
+  "spec_sha256": "e781fa6a5c29556c9d0fd7237ceea1b68512bb0a318e30afe19fe17ae4d21c2f",
   "spec_filter": "tests/health-page.spec.ts (whole file, 61 cases)",
-  "captured_at": "2026-09-28T04:12:40.622821Z",
+  "captured_at": "2026-09-28T04:44:05.745847Z",
   "port": 8641,
   "color_scheme": "light",
   "dist": {
@@ -63,17 +63,17 @@
     },
     {
       "file": "disk-retention-failed-retained-1440.png",
-      "claim": "Failed headroom attempt with a retained sample: rows read \"Collection failed; last complete reading\" with a 3600s age and a deficit, and every reach is withheld as measurement unavailable with no digit and no growth-excluded note",
+      "claim": "Failed headroom attempt with a retained sample: rows read \"Collection failed; last complete reading\" with a 3600s age and a deficit, and every reach, a future-dated env's included, is withheld as measurement unavailable with no digit and no growth-excluded note",
       "scenario": "health-admin",
       "route": "/settings/health",
       "fixture": "crates/trawl-web-ui/e2e/harness/wire/health-capacity-failed-retained.json",
       "viewport": {
         "width": 1440,
-        "height": 1085
+        "height": 1190
       },
       "theme": "light",
-      "sha256": "488d53f1ba7595b8181868087b8128ff5179e6bc49799d00ec63d95e3e3c2036",
-      "bytes": 93641
+      "sha256": "14faf441166327eea3d12d6b36c8bbb04315b2f9cb4afa2078133be9c881c20b",
+      "bytes": 104976
     },
     {
       "file": "disk-retention-repin-suppressed-1440.png",
