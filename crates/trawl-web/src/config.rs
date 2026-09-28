@@ -440,9 +440,8 @@ fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) 
     {
         // Both packaged deployments render one list into the config file
         // and hand the same list to the environment — the helm chart
-        // injects the variable whenever the sidecar runs, so the
-        // `config.raw` escape hatch stays covered — so warning on the
-        // variable's mere presence fires on every default install and
+        // injects the variable whenever the sidecar runs — so warning on
+        // the variable's mere presence fires on every default install and
         // teaches operators to scroll past the one line that says their
         // allowlist is not the one they wrote. Compare the two instead.
         // A configured list that does not parse counts as displaced: it

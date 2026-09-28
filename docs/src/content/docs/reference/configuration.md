@@ -129,9 +129,7 @@ defaults to `ClusterIssuer` and group to `cert-manager.io`. Namespaced `Issuer`
 resources must be in the release namespace.
 
 Both Secret modes mount `tls.crt` and `tls.key` at `/etc/trawl/tls/` and set the
-daemon paths accordingly. They require structured config values;
-`config.raw` is supported only with `tls.mode: auto`, without chart-managed
-TLS Secret mounts. See [configure the daemon API certificate](/operate/deployment/#configure-the-daemon-api-certificate)
+daemon paths accordingly. See [configure the daemon API certificate](/operate/deployment/#configure-the-daemon-api-certificate)
 for complete setup and verification instructions. Browser-ingress TLS remains
 a separate setting under `ingress.tls`.
 
@@ -146,9 +144,7 @@ trawld:
 
 `tls.upstreamCa` accepts `secret`, which pins `ca.crt` from the TLS Secret,
 `system`, which uses the platform roots, or the absolute path of a CA file
-that you mount with `web.extraVolumes` and `web.extraVolumeMounts`. A
-`config.raw` in `auto` mode must set `[data] path` and the matching
-`[web] upstream_ca_path` itself.
+that you mount with `web.extraVolumes` and `web.extraVolumeMounts`.
 
 ### `[data]`
 
@@ -459,8 +455,7 @@ variables log a line when they displace a configured value.
 | `TRAWL_WEB_UPSTREAM_CA_PATH` | Overrides `[web] upstream_ca_path`. An empty value counts as unset, so the `[web]` key applies |
 
 The Helm chart passes `FLEET_SESSION_PUBLIC_ORIGINS` to the sidecar as well as
-rendering `public_origins` into the generated TOML, so a `config.raw` that
-replaces that TOML still carries the allowlist.
+rendering `public_origins` into the generated TOML.
 
 ### `[storage]`
 

@@ -81,17 +81,6 @@ and connects to `127.0.0.1:<port>`. `tls.upstreamCa` is then required:
 absolute path pins a CA file that you mount with `web.extraVolumes` and
 `web.extraVolumeMounts`.
 
-Chart-managed TLS mounts require structured config values. `config.raw` is
-accepted only with `tls.mode: auto`, where the raw TOML controls TLS and the
-chart mounts no TLS Secret. Helm cannot validate arbitrary TOML certificate
-paths against its volume mounts. With `web.enabled`, the chart reads the raw
-TOML's `[data] path` and mounts the `tls` directory beside it, so the raw
-TOML must set `[data] path`, and `[web] upstream_ca_path` to exactly the
-`tls/cert.pem` in that path's parent directory. Without that key, trawl-web
-trusts the platform roots. The raw TOML must not set `[server] tls_cert_path`
-or `tls_key_path`, because the sidecar pins the generated certificate. The
-chart refuses to render a raw TOML that breaks any of these rules.
-
 Follow [configure the daemon API certificate](https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate)
 for complete values, issuance checks, and client verification. cert-manager's
 [Certificate documentation](https://cert-manager.io/docs/usage/certificate/)
@@ -236,7 +225,6 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `crashDump.storageClass` | string | `""` | Crash-dump StorageClass. Empty uses the cluster default |
 | `crashDump.mountPath` | string | `/var/lib/trawl/cores` | Crash-dump mount path, passed as `TRAWL_CRASH_DUMP_DIR` |
 | `crashDump.retain` | int | `10` | Dumps to keep, passed as `TRAWL_CRASH_DUMP_RETAIN` |
-| `config.raw` | string | `""` | Complete `trawld.toml` text. Replaces every `config.*` value below. Requires `tls.mode: auto`; raw TOML owns TLS configuration and the chart mounts no TLS Secret. The DSNs still arrive from the Secrets, and `web.publicOrigins` still reaches trawl-web |
 | `config.server.httpAddr` | string | `0.0.0.0:5514` | `[server] http_addr` |
 | `config.server.timeoutSecs` | int | `30` | `[server] timeout_secs` |
 | `config.server.maxConcurrentQueries` | string | `""` | `[server] max_concurrent_queries`. Empty uses the CPU count |

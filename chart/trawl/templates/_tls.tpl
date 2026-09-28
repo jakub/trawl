@@ -27,9 +27,6 @@
 {{- define "trawl.validateTLS" -}}
 {{- $tls := .Values.tls -}}
 {{- $cm := $tls.certManager -}}
-{{- if and .Values.config.raw (ne $tls.mode "auto") -}}
-  {{- fail "config.raw requires tls.mode=auto; use structured config values for chart-managed TLS Secret mounts" -}}
-{{- end -}}
 {{- if eq $tls.mode "secret" -}}
   {{- $_ := required "tls.secretName is required when tls.mode=secret" $tls.secretName -}}
 {{- else if $tls.secretName -}}
@@ -97,9 +94,9 @@ The sidecar always dials trawld over the pod's loopback and always verifies
 its certificate:
 
 - auto: trawld writes {state_dir}/tls/cert.pem, for localhost and 127.0.0.1,
-  where state_dir is the parent of [data] path (config.raw's own [data]
-  path when set). The sidecar mounts that directory of the data volume
-  read-only at the same path and pins the file.
+  where state_dir is the parent of config.data.path. The sidecar mounts
+  that directory of the data volume read-only at the same path and pins
+  the file.
   trawl-web derives its upstream, https://127.0.0.1:<port>, from [server].
 - secret, certManager: the certificate names a DNS host, so trawl-web asks
   for https://<tls.upstreamServerName>:<port> and connects to
@@ -134,35 +131,10 @@ is false, except that auto refuses the values it would contradict.
   {{- end -}}
   {{- if eq $tls.mode "auto" -}}
     {{- $data := include "trawl.dataMountPath" . -}}
-    {{- $field := "config.data.path" -}}
     {{- $path := toString .Values.config.data.path -}}
-    {{- $raw := dict -}}
-    {{- /* config.raw replaces the structured values, so config.data.path
-         says nothing about where trawld puts its state. Read the raw
-         TOML's own [data] path. The parse error is not echoed: it can
-         quote a line of the config, secrets included. */ -}}
-    {{- if .Values.config.raw -}}
-      {{- $field = "config.raw [data] path" -}}
-      {{- $raw = fromToml .Values.config.raw -}}
-      {{- if hasKey $raw "Error" -}}
-        {{- fail "config.raw is not valid TOML: when tls.mode=auto and web.enabled=true the chart reads its [data] path to mount trawld's generated certificate into trawl-web" -}}
-      {{- end -}}
-      {{- /* auto means trawld generates its certificate, and trawl-web pins
-           it. Either path turns generation off, and a key at or under
-           <state_dir>/tls would be in the directory trawl-web mounts. */ -}}
-      {{- $server := get $raw "server" -}}
-      {{- if and (kindIs "map" $server) (or (hasKey $server "tls_cert_path") (hasKey $server "tls_key_path")) -}}
-        {{- fail "config.raw must not set [server] tls_cert_path or tls_key_path when tls.mode=auto and web.enabled=true: trawl-web pins the certificate trawld generates, and mounts the directory it is in; to serve your own certificate, put it in a TLS Secret and use tls.mode=secret with structured config values" -}}
-      {{- end -}}
-      {{- $table := get $raw "data" -}}
-      {{- if not (and (kindIs "map" $table) (hasKey $table "path") (kindIs "string" (get $table "path"))) -}}
-        {{- fail "config.raw must set [data] path when tls.mode=auto and web.enabled=true: trawld generates its certificate in the parent of that path, and the chart mounts it into trawl-web from there" -}}
-      {{- end -}}
-      {{- $path = get $table "path" -}}
-    {{- end -}}
     {{- $stateDir := dir (clean $path) -}}
     {{- if not (and (hasPrefix "/" $path) (or (eq $stateDir $data) (hasPrefix (printf "%s/" $data) $stateDir))) -}}
-      {{- fail (printf "%s must be an absolute path whose parent is %s or a directory on the data volume below it when tls.mode=auto and web.enabled=true: trawld generates its certificate in <parent>/tls, and trawl-web pins it from the data volume; got %q" $field $data $path) -}}
+      {{- fail (printf "config.data.path must be an absolute path whose parent is %s or a directory on the data volume below it when tls.mode=auto and web.enabled=true: trawld generates its certificate in <parent>/tls, and trawl-web pins it from the data volume; got %q" $data $path) -}}
     {{- end -}}
     {{- /* Every other mount of the trawld container. One at, under, or
          above <state_dir>/tls would put the certificate trawld writes on
@@ -186,17 +158,6 @@ is false, except that auto refuses the values it would contradict.
     {{- $_ := set $trust "dataSubPath" $subPath -}}
     {{- $_ := set $trust "dataMountPath" (printf "%s/tls" $stateDir) -}}
     {{- $_ := set $trust "caPath" (printf "%s/tls/cert.pem" $stateDir) -}}
-    {{- /* trawl-web reads its trust anchor from the raw TOML, and an
-         absent upstream_ca_path means the platform roots: any publicly
-         trusted certificate would then receive users' bearer keys. The
-         raw TOML must pin exactly the file the chart mounts. A dotted
-         web.upstream_ca_path parses to the same table. */ -}}
-    {{- if .Values.config.raw -}}
-      {{- $rawWeb := get $raw "web" -}}
-      {{- if not (and (kindIs "map" $rawWeb) (kindIs "string" (get $rawWeb "upstream_ca_path")) (eq (get $rawWeb "upstream_ca_path") $trust.caPath)) -}}
-        {{- fail (printf "config.raw must set [web] upstream_ca_path = %q when tls.mode=auto and web.enabled=true: trawl-web pins the certificate trawld generates there; without the key it trusts the platform roots, and another value trusts another certificate" $trust.caPath) -}}
-      {{- end -}}
-    {{- end -}}
   {{- else -}}
     {{- $name := toString (default "" $tls.upstreamServerName) -}}
     {{- $explicit := ne $name "" -}}

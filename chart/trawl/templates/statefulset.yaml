@@ -245,12 +245,10 @@ spec:
             - name: RUST_LOG
               value: {{ .Values.web.logLevel | quote }}
             # The browser-origin allowlist. The same list the configmap
-            # renders into [web] public_origins, passed again here so a
-            # config.raw that replaces the generated TOML still carries it.
-            # The environment wins on read, and because the two lists are
-            # identical trawl-web logs one info line saying so; it warns
-            # only when they differ, which means something replaced one
-            # half and not the other.
+            # renders into [web] public_origins. The environment wins on
+            # read, and because the two lists are identical trawl-web logs
+            # one info line saying so; it warns only when they differ, which
+            # means something replaced one half and not the other.
             - name: FLEET_SESSION_PUBLIC_ORIGINS
               value: {{ join "," .Values.web.publicOrigins | quote }}
             {{- with .Values.web.extraEnv }}

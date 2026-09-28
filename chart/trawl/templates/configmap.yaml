@@ -6,9 +6,6 @@ metadata:
     {{- include "trawl.labels" . | nindent 4 }}
 data:
   trawld.toml: |
-    {{- if .Values.config.raw }}
-    {{ .Values.config.raw | nindent 4 }}
-    {{- else }}
     [server]
     http_addr = {{ .Values.config.server.httpAddr | quote }}
     timeout_secs = {{ .Values.config.server.timeoutSecs | int }}
@@ -171,6 +168,5 @@ data:
     {{- end }}
     {{- with $trust.caPath }}
     upstream_ca_path = {{ . | toJson }}
-    {{- end }}
     {{- end }}
     {{- end }}

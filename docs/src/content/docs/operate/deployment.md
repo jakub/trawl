@@ -256,9 +256,6 @@ cluster.
 The chart defaults to `tls.mode: auto`, which lets trawld generate a self-signed
 certificate. To use a certificate trusted by API clients and collectors, add
 one of the following `tls` blocks to `trawl-values.yaml` before installation.
-These settings require structured chart config values. They cannot be combined
-with `config.raw`, because Helm cannot verify arbitrary TOML TLS paths against
-its Secret mounts.
 
 The `trawl-web` sidecar connects to trawld over the pod's loopback and always
 verifies trawld's certificate. Each mode below also sets what the sidecar
@@ -279,14 +276,6 @@ data volume, and its key to `tls-key/`. The chart mounts only the `tls/`
 directory into the sidecar, read-only, and sets `[web] upstream_ca_path` to
 its `cert.pem`. On a first install, the sidecar answers 503 until trawld has
 written the certificate. It then loads the file with no restart.
-
-With `web.enabled`, a `config.raw` must set `[data] path`, because the chart
-mounts the `tls/` directory beside it. It must also set
-`upstream_ca_path` under `[web]` to `tls/cert.pem` in the parent directory of
-that path, or the chart refuses to render. It must not set `tls_cert_path` or
-`tls_key_path` under `[server]`: either one stops trawld generating the
-certificate the sidecar pins, so the chart refuses to render. To serve your
-own certificate, use `tls.mode=secret`.
 
 #### Mount an existing TLS Secret
 
@@ -417,6 +406,10 @@ directory the sidecar mounts. After the upgrade, the `init-tls-dir` container
 deletes the old `tls/key.pem` before trawld and the sidecar start, and trawld
 then generates a new certificate and key. A client that pinned the old
 certificate needs a copy of the new one.
+
+This chart has no `config.raw` value. The chart ignores a `config.raw` left in
+your values, so move its settings into the structured `config` values before
+`helm upgrade`.
 
 #### Verify the requested name and trust
 

@@ -119,20 +119,8 @@ crashDump:
   mountPath: /var/lib/trawl/cores
   retain: 10
 
-# -- trawld configuration
-# Either use the structured values below (templated into trawld.toml),
-# or set config.raw to provide your own TOML verbatim.
+# -- trawld configuration, templated into trawld.toml
 config:
-  # Set to a complete trawld.toml string to bypass structured templating.
-  # Only supported with tls.mode=auto; raw TOML owns its TLS paths. With
-  # web.enabled it must set [data] path: the chart mounts trawld's generated
-  # certificate into trawl-web from <parent of that path>/tls. It must also
-  # set [web] upstream_ca_path to exactly <parent of that path>/tls/cert.pem,
-  # or trawl-web would trust another certificate. It must not set [server]
-  # tls_cert_path or tls_key_path then, because trawl-web pins the generated
-  # certificate. The chart refuses to render otherwise.
-  raw: ""
-
   server:
     httpAddr: "0.0.0.0:5514"
     timeoutSecs: 30
@@ -292,7 +280,7 @@ tls:
 # API keys and roles live in an external database shared across Fleet apps.
 # An existing Secret supplies DATABASE_URL to fleet-admin in the init-auth
 # container and FLEET_DATABASE_URL to trawld. The chart never renders the
-# connection string into the ConfigMap or config.raw. Provision the database
+# connection string into the ConfigMap. Provision the database
 # using https://trawl.sh/operate/deployment/#provision-the-databases and create keys
 # using https://trawl.sh/operate/access/#create-roles-and-keys.
 # Size Vector disk buffers for deployment downtime, for example 1 GiB.
