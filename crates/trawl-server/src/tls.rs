@@ -184,6 +184,9 @@ fn log_cert_details(pem_bytes: &[u8]) {
 /// on the volume group-readable to that sidecar, so only keeping the key out
 /// of the mount keeps it from the sidecar.
 ///
+/// `tls/` is set to `0755` on every start: the proxy's uid must search it,
+/// and no uid but trawld's may write where the proxy reads its pin.
+///
 /// Both directories are trawld's own: a symlink, a non-directory, or a
 /// directory another uid owns is refused with [`TlsError::Unsafe`] (see
 /// [`GeneratedDir`]), and so is a symlink or non-regular file at `cert.pem`
@@ -193,7 +196,7 @@ fn log_cert_details(pem_bytes: &[u8]) {
 /// Returns `(cert_pem, key_pem, was_generated)`.
 fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
     fs::create_dir_all(state_dir).map_err(TlsError::Write)?;
-    let tls_dir = GeneratedDir::open(&state_dir.join(GENERATED_TLS_DIR), None)?;
+    let tls_dir = GeneratedDir::open(&state_dir.join(GENERATED_TLS_DIR), Some(0o755))?;
     let key_dir = GeneratedDir::open(&state_dir.join(GENERATED_KEY_DIR), Some(0o700))?;
     let cert_path = tls_dir.path.join(GENERATED_CERT_FILE);
     let key_path = key_dir.path.join(GENERATED_KEY_FILE);
@@ -769,6 +772,29 @@ mod tests {
         // The pair on disk is what a restart loads, so it must still serve.
         let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
         assert!(!self_signed, "the restart loads the published pair");
+    }
+
+    /// A proxy running as another uid pins `tls/cert.pem`, so it must be
+    /// able to search `tls/`, and only trawld may write it. Whatever mode an
+    /// earlier start, the umask, or a group ownership walk left, trawld sets
+    /// the directory to `0755`.
+    #[cfg(unix)]
+    #[test]
+    fn the_certificate_directory_is_0755_whatever_it_was() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for before in [None, Some(0o700), Some(0o775), Some(0o777), Some(0o2775)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+            if let Some(mode) = before {
+                fs::create_dir(&tls_dir).unwrap();
+                fs::set_permissions(&tls_dir, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            build_server_config(None, None, tmp.path()).unwrap();
+            let mode = fs::metadata(&tls_dir).unwrap().permissions().mode() & 0o7777;
+            let before = before.map_or_else(|| "absent".to_owned(), |m| format!("{m:o}"));
+            assert_eq!(mode, 0o755, "tls/ was {before}");
+        }
     }
 
     /// A certificate whose key is gone is regenerated, and a generation

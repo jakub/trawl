@@ -86,7 +86,7 @@ The HTTPS listener, query limits, TLS, and logging.
 
 Notes:
 
-- `tls_cert_path` and `tls_key_path` must both be set or both omitted. With both omitted, trawld generates a self-signed ECDSA P-256 certificate at startup, with SANs for `localhost`, `127.0.0.1`, and `::1`. The certificate is `{state_dir}/tls/cert.pem`, mode 0644, and the key is `{state_dir}/tls-key/key.pem`, in a 0700 directory. `state_dir` is the parent of `[data] path`.
+- `tls_cert_path` and `tls_key_path` must both be set or both omitted. With both omitted, trawld generates a self-signed ECDSA P-256 certificate at startup, with SANs for `localhost`, `127.0.0.1`, and `::1`. The certificate is `{state_dir}/tls/cert.pem`, mode 0644, in a 0755 directory, and the key is `{state_dir}/tls-key/key.pem`, in a 0700 directory. `state_dir` is the parent of `[data] path`.
 - `timeout_secs` covers queue waits, execution, and best-effort history writes, but not request-body reading or response delivery. Expiry before work starts is 503, and after work starts it is 504. A timed-out worker can hold its permit until it finishes. See [the query deadline](/operate/health/#diagnose-a-503-or-504-from-a-query).
 - `0` disables a limit only where the row says so.
 
