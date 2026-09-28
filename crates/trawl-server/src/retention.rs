@@ -117,19 +117,29 @@ impl RetentionEvidence {
 
     /// The evidence as the dashboard reports it, with the last sweep's age
     /// evaluated at `now`.
+    ///
+    /// The last sweep is read first, under its lock, and the counters after.
+    /// A tick bumps its counters before it records its outcome, and taking
+    /// the lock orders this read after that record, so the counters read
+    /// next include every removal and attempt of the sweep reported. They
+    /// only grow, so they may also include a later tick's, which is still
+    /// true. Reading the counters first could pair a new outcome, such as
+    /// `exhausted_below_floor`, with a pressure attempt count from before
+    /// its tick.
     #[must_use]
     pub fn snapshot(&self, now: Instant) -> trawl_api::PressureEvidence {
+        let last_sweep = self
+            .last_sweep
+            .lock()
+            .map(|(outcome, at)| trawl_api::LastSweep {
+                outcome,
+                age_secs: now.saturating_duration_since(at).as_secs(),
+            });
         trawl_api::PressureEvidence {
             removals_age: self.removals_age.load(AtomicOrdering::Relaxed),
             removals_disk_pressure: self.removals_disk_pressure.load(AtomicOrdering::Relaxed),
             pressure_attempts: self.pressure_attempts.load(AtomicOrdering::Relaxed),
-            last_sweep: self
-                .last_sweep
-                .lock()
-                .map(|(outcome, at)| trawl_api::LastSweep {
-                    outcome,
-                    age_secs: now.saturating_duration_since(at).as_secs(),
-                }),
+            last_sweep,
         }
     }
 }
@@ -2711,5 +2721,34 @@ mod tests {
                 age_secs: 90,
             })
         );
+    }
+
+    /// A snapshot never pairs a sweep outcome with counters older than the
+    /// tick that recorded it. The test holds the last-sweep lock while a
+    /// snapshot starts, then records a whole pressure tick (its attempt,
+    /// then its outcome) and releases the lock. A snapshot that read the
+    /// counters before waiting on the lock would report the tick's
+    /// `exhausted_below_floor` with no pressure attempt.
+    #[test]
+    fn retention_capacity_snapshot_counts_every_attempt_its_sweep_saw() {
+        let evidence = Arc::new(RetentionEvidence::default());
+        let mut held = evidence.last_sweep.lock();
+        let snapshot = std::thread::spawn({
+            let evidence = Arc::clone(&evidence);
+            move || evidence.snapshot(Instant::now())
+        });
+        // Give the snapshot time to reach the lock. The assertion holds
+        // however long this is: it only decides whether a snapshot that
+        // read the counters first would already have read them.
+        std::thread::sleep(Duration::from_millis(100));
+        evidence.record_pressure_attempt();
+        *held = Some((SweepOutcome::ExhaustedBelowFloor, Instant::now()));
+        drop(held);
+        let snapshot = snapshot.join().unwrap();
+        assert_eq!(
+            snapshot.last_sweep.map(|sweep| sweep.outcome),
+            Some(SweepOutcome::ExhaustedBelowFloor)
+        );
+        assert_eq!(snapshot.pressure_attempts, 1, "{snapshot:?}");
     }
 }
