@@ -109,7 +109,9 @@ fn unsettled(state: &AppState) -> Option<CorpusUnsettled> {
 /// Boot hydrates WAL that survived a restart: a query counts every planted
 /// event exactly once, before and after the compaction pass that drains
 /// it, the gate settles without a coverage proof, and nothing reaches the
-/// app's event bus, which was subscribed before the boot.
+/// app's event bus, which was subscribed before the boot. The same
+/// subscriber then receives an event ingested over HTTP, so its silence
+/// during the boot is no dead subscription.
 #[tokio::test(flavor = "multi_thread")]
 async fn boot_hydration_counts_planted_wal_once_and_publishes_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -134,8 +136,9 @@ async fn boot_hydration_counts_planted_wal_once_and_publishes_nothing() {
     let hot = server.state.query.hot_buffer.clone().unwrap();
     assert_eq!(hot.event_count(), 12);
     assert_eq!(count(&server, &format!("service={SERVICE}")).await, 12);
+    let mut subscriber = subscriber.unwrap();
     assert!(
-        tokio::time::timeout(Duration::ZERO, subscriber.unwrap().recv())
+        tokio::time::timeout(Duration::ZERO, subscriber.recv())
             .await
             .is_err(),
         "hydration publishes nothing to the event bus"
@@ -165,6 +168,25 @@ async fn boot_hydration_counts_planted_wal_once_and_publishes_nothing() {
     .unwrap();
     assert_eq!(hot.event_count(), 0, "the pass drained both batches");
     assert_eq!(count(&server, &format!("service={SERVICE}")).await, 12);
+
+    // The positive control: live ingest reaches the same subscriber.
+    let response = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .post(format!("{}/api/v1/ingest", server.url))
+        .bearer_auth(&server.ingest_token)
+        .header("content-type", "application/x-ndjson")
+        .body(r#"{"service":"busprobe","message":"live"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let batch = tokio::time::timeout(Duration::from_secs(10), subscriber.recv())
+        .await
+        .expect("the subscriber receives live ingest")
+        .expect("the bus is open and the subscriber has not lagged");
+    assert_eq!(&*batch.service, "busprobe");
+    assert_eq!(batch.events.len(), 1);
 }
 
 /// WAL the caps cannot hold is overhang: reads refuse `restart_backlog`
