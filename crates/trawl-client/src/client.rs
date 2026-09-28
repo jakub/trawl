@@ -1081,10 +1081,21 @@ pub struct ProbeResponse {
 /// It holds no key and has no way to send one: a doctor probes the browser
 /// origin precisely when that address may be wrong. Redirects are refused
 /// as [`NetworkKind::Redirect`], so a probe reaches only the origin named.
-#[derive(Debug, Clone)]
+/// An origin carrying userinfo is refused at construction, because the
+/// HTTP client would send it as an `Authorization: Basic` header.
+#[derive(Clone)]
 pub struct OriginProbe {
+    /// `scheme://host[:port]`, as the URL parser serializes the origin.
     origin: String,
     client: Client,
+}
+
+impl std::fmt::Debug for OriginProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OriginProbe")
+            .field("origin", &self.origin)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OriginProbe {
@@ -1092,16 +1103,37 @@ impl OriginProbe {
     /// probes are a few dozen bytes.
     pub const BODY_CAP: usize = 4096;
 
-    /// A probe of `origin` (`scheme://host:port`), verifying TLS under
-    /// `trust`, with `timeout` bounding each request.
+    /// A probe of `origin` (`scheme://host[:port]`, a trailing `/` allowed),
+    /// verifying TLS under `trust`, with `timeout` bounding each request.
+    ///
+    /// Refused with [`ClientError::InvalidUrl`], naming none of the input:
+    /// any userinfo (a user name alone included), a scheme other than
+    /// `http` or `https`, and a path, query or fragment.
     pub fn new(
-        origin: impl Into<String>,
+        origin: &str,
         trust: &TlsTrust,
         timeout: std::time::Duration,
     ) -> Result<Self, ClientError> {
+        let url = reqwest::Url::parse(origin)
+            .map_err(|_| ClientError::InvalidUrl("the origin is not a URL".into()))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(ClientError::InvalidUrl(
+                "the origin carries credentials".into(),
+            ));
+        }
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(ClientError::InvalidUrl(
+                "the origin is not http or https".into(),
+            ));
+        }
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return Err(ClientError::InvalidUrl(
+                "the origin has a path, query or fragment".into(),
+            ));
+        }
         let refuse = reqwest::redirect::Policy::custom(|attempt| attempt.error("redirect refused"));
         Ok(Self {
-            origin: normalize_base_url(origin.into()),
+            origin: url.origin().ascii_serialization(),
             client: reqwest_client(trust, timeout, refuse)?,
         })
     }
@@ -1567,7 +1599,7 @@ mod tests {
     fn probe(address: std::net::SocketAddr) -> OriginProbe {
         init();
         OriginProbe::new(
-            format!("http://{address}/"),
+            &format!("http://{address}/"),
             &TlsTrust::System,
             std::time::Duration::from_secs(10),
         )
@@ -1628,6 +1660,128 @@ mod tests {
         assert!(!lower.contains("\r\nauthorization:"), "{request}");
         assert!(!lower.contains("\r\ncookie:"), "{request}");
         assert!(request.ends_with("\r\n\r\n{\"api_key\":\"\"}"), "{request}");
+    }
+
+    /// Wait up to `wait` for a connection on `listener`, and return its
+    /// request head if one arrives.
+    async fn head_within(
+        listener: &tokio::net::TcpListener,
+        wait: std::time::Duration,
+    ) -> Option<String> {
+        use tokio::io::AsyncReadExt;
+        let (mut socket, _) = tokio::time::timeout(wait, listener.accept())
+            .await
+            .ok()?
+            .unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            head.extend_from_slice(&buf[..n]);
+        }
+        Some(String::from_utf8_lossy(&head).into_owned())
+    }
+
+    /// URL userinfo becomes an `Authorization: Basic` header, so a probe
+    /// refuses any: a user name alone as much as a user and password. The
+    /// refusal quotes none of it, the probe's `Debug` shows the origin at
+    /// most, and the listener never sees a request.
+    #[tokio::test]
+    async fn origin_probe_refuses_userinfo() {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        // The control: a plain reqwest client does send the userinfo, so the
+        // listener below can see the header it guards against.
+        let plain = reqwest::Client::new();
+        let send = plain
+            .get(format!("http://tr4wluser:pa55word@{address}/healthz"))
+            .send();
+        let (_, head) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), send),
+            head_within(&listener, std::time::Duration::from_secs(10))
+        );
+        let head = head
+            .expect("the control request arrives")
+            .to_ascii_lowercase();
+        assert!(head.contains("\r\nauthorization: basic "), "{head}");
+
+        for (form, origin) in [
+            ("user name only", format!("http://tr4wluser@{address}")),
+            (
+                "user name and password",
+                format!("http://tr4wluser:pa55word@{address}"),
+            ),
+            (
+                "empty user name, password",
+                format!("http://:pa55word@{address}/"),
+            ),
+        ] {
+            let error = OriginProbe::new(
+                &origin,
+                &TlsTrust::System,
+                std::time::Duration::from_secs(10),
+            )
+            .expect_err(form);
+            assert!(
+                matches!(error, ClientError::InvalidUrl(_)),
+                "{form}: {error:?}"
+            );
+            for shown in [error.to_string(), format!("{error:?}")] {
+                assert!(
+                    !shown.contains("tr4wluser") && !shown.contains("pa55word"),
+                    "{form}: {shown}"
+                );
+            }
+        }
+        assert!(
+            head_within(&listener, std::time::Duration::from_millis(300))
+                .await
+                .is_none(),
+            "a refused probe reached the listener"
+        );
+
+        // A probe of a clean origin shows only the origin in its Debug.
+        let web = OriginProbe::new(
+            &format!("http://{address}/"),
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let shown = format!("{web:?}");
+        assert_eq!(
+            shown,
+            format!("OriginProbe {{ origin: \"http://{address}\", .. }}")
+        );
+    }
+
+    /// Only an origin is accepted: another scheme, a path, a query or a
+    /// fragment is refused before anything is built.
+    #[test]
+    fn origin_probe_accepts_only_an_origin() {
+        init();
+        for origin in [
+            "not a url",
+            "ftp://127.0.0.1:21",
+            "http://127.0.0.1:1/prefix",
+            "http://127.0.0.1:1/?q=1",
+            "http://127.0.0.1:1/#f",
+        ] {
+            let error = OriginProbe::new(
+                origin,
+                &TlsTrust::System,
+                std::time::Duration::from_secs(10),
+            )
+            .expect_err(origin);
+            assert!(
+                matches!(error, ClientError::InvalidUrl(_)),
+                "{origin}: {error:?}"
+            );
+        }
     }
 
     /// A probe reads at most `BODY_CAP` bytes of a body.

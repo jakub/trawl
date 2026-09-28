@@ -32,6 +32,11 @@ pub enum ClientError {
     /// quotes the bundle's bytes.
     #[error("invalid CA certificate: {0}")]
     InvalidCa(String),
+
+    /// A URL the client refuses to build on. The reason never quotes the
+    /// URL.
+    #[error("invalid URL: {0}")]
+    InvalidUrl(String),
 }
 
 /// What kind of transport failure a [`NetworkError`] is.
