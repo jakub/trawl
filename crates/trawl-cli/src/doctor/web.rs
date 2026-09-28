@@ -39,6 +39,10 @@ const ACCEPTED_ERROR: &str = "bad request";
 /// What `trawl-web` answers an origin outside `public_origins`.
 const REJECTED_ERROR: &str = "cross-origin request rejected";
 
+/// The report note `web.origin` adds when `trawl-web` accepts the origin.
+pub const ORIGIN_ACCEPTED_NOTE: &str = "web.origin shows that trawl-web accepts its own origin; \
+                                        it does not show that trawl-web reaches trawld";
+
 /// The state the `web.*` steps share, in the order the runner calls them.
 pub struct WebRun<'a> {
     url: &'a CheckedUrl,
@@ -110,11 +114,7 @@ impl<'a> WebRun<'a> {
         };
         match answer.status {
             400 if is_error_body(&answer.body, ACCEPTED_ERROR) => {
-                self.notes.push(
-                    "web.origin shows that trawl-web accepts its own origin; it does not show \
-                     that trawl-web reaches trawld"
-                        .to_owned(),
-                );
+                self.notes.push(ORIGIN_ACCEPTED_NOTE.to_owned());
                 Check {
                     outcome: Outcome::Complete,
                     detail: Some(format!("accepts Origin {origin}")),

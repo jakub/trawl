@@ -35,6 +35,7 @@ use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
+use trawl_cli::doctor::web::ORIGIN_ACCEPTED_NOTE;
 use trawl_config::WebConfig;
 use trawl_web::config::ResolvedConfig;
 use trawl_web::state::AppState;
@@ -320,7 +321,7 @@ fn doctor_web_origin_accepted() {
     assert!(
         notes(&report)
             .iter()
-            .any(|note| note.contains("does not show that trawl-web reaches trawld")),
+            .any(|note| note == ORIGIN_ACCEPTED_NOTE),
         "{report}"
     );
     // Only the closed API port fails the run.
@@ -356,9 +357,10 @@ fn doctor_web_origin_rejected() {
         )
     );
     assert!(
-        notes(&report)
+        !notes(&report)
             .iter()
-            .all(|note| !note.contains("trawl-web"))
+            .any(|note| note == ORIGIN_ACCEPTED_NOTE),
+        "{report}"
     );
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(report["verdict"], "fail");
