@@ -198,8 +198,13 @@ struct StubSeen {
     requests: Vec<Request>,
 }
 
-/// An answer: status and JSON body.
+/// An answer: status and JSON body. The status [`STALL`] sends `200`
+/// headers and the body's first byte, then holds the connection open.
 type Route = (&'static str, u16, String);
+
+/// A route status that stalls after the headers, past the doctor's 10 s
+/// request deadline.
+const STALL: u16 = 0;
 
 /// A listener on `127.0.0.1` that speaks TLS (or plain HTTP), answers each
 /// routed path with a fixed status and body, and records everything.
@@ -357,6 +362,14 @@ fn answer<S: std::io::Read + std::io::Write>(
         (404, r#"{"error":"not found"}"#.to_owned()),
         |(_, status, body)| (*status, body.clone()),
     );
+    if status == STALL {
+        let head =
+            "HTTP/1.1 200 Stub\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{";
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.flush();
+        std::thread::sleep(Duration::from_secs(30));
+        return;
+    }
     let response = format!(
         "HTTP/1.1 {status} Stub\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
@@ -1514,14 +1527,15 @@ fn doctor_sends_key_only_after_trawl_health() {
 /// A 503 keeps its per-check body. Rows are sorted by name: `ok` is
 /// complete (the unknown `corpus` included), `error` and `refusing` fail, an
 /// unrecognized value fails and is shown when it is a plain identifier, and
-/// a name that is not one becomes `api.health.invalid_key` without being
-/// echoed. The run exits 1.
+/// a name that is not one becomes `api.health._invalid` without being
+/// echoed. A server check named `_invalid` is not one either, so it cannot
+/// collide with that row. The run exits 1.
 #[test]
 fn doctor_health_rows_map_values() {
     let home = Sandbox::new();
     let server_ca = ca("trawl doctor server CA");
     let pem = home.file("ca.pem", &server_ca.pem());
-    let body = r#"{"status":"unavailable","checks":{"duckdb":"error","corpus":"ok","auth_db":"ok","data_path":"recovering","storage_db":"Weird Value!","ingest_capacity":"refusing","Bad-Key":"ok"},"version":"9.9.9"}"#;
+    let body = r#"{"status":"unavailable","checks":{"duckdb":"error","corpus":"ok","auth_db":"ok","data_path":"recovering","storage_db":"Weird Value!","ingest_capacity":"refusing","Bad-Key":"ok","_invalid":"ok"},"version":"9.9.9"}"#;
     let stub = Stub::tls(
         leaf(&server_ca),
         vec![(HEALTH_PATH, 503, body.to_owned()), whoami(r#""query""#)],
@@ -1566,9 +1580,9 @@ fn doctor_health_rows_map_values() {
                 Some("unrecognized value")
             ),
             own(
-                "api.health.invalid_key",
+                "api.health._invalid",
                 "failed",
-                Some("the server reported a check name that is not [a-z0-9_]{1,64}")
+                Some("the server reported a check name that is not [a-z][a-z0-9_]{0,63}")
             ),
         ]
     );
@@ -1640,11 +1654,144 @@ fn doctor_redacts_the_key_from_remote_fields() {
                 "unrecognized value"
             );
             assert_eq!(
-                check_by_id(&report, "api.health.invalid_key")["outcome"],
+                check_by_id(&report, "api.health._invalid")["outcome"],
                 "failed"
             );
         }
     }
+}
+
+/// Run the doctor against a verified-TLS stub serving `routes`, through a
+/// profile that pins the stub's CA and holds [`PROFILE_TOKEN`].
+fn doctor_against(routes: Vec<Route>) -> (Output, Stub) {
+    let home = Sandbox::new();
+    let server_ca = ca("trawl doctor server CA");
+    let pem = home.file("ca.pem", &server_ca.pem());
+    let stub = Stub::tls(leaf(&server_ca), routes);
+    profile(
+        &home,
+        "prod",
+        &stub.url("https"),
+        &format!("ca_cert = \"{}\"", pem.display()),
+    );
+    let output = home.trawl(&["doctor", "-p", "prod", "--format", "json"], &[]);
+    (output, stub)
+}
+
+/// The `api.*` rows of a report, without the ones per health check.
+fn api_rows(report: &serde_json::Value) -> Vec<(String, String, Option<String>, Option<String>)> {
+    rows(report)
+        .into_iter()
+        .filter(|(id, ..)| id.starts_with("api.") && !id.starts_with("api.health."))
+        .collect()
+}
+
+fn own_row(
+    id: &str,
+    outcome: &str,
+    reason: Option<&str>,
+    blocked_by: Option<&str>,
+) -> (String, String, Option<String>, Option<String>) {
+    (
+        id.to_owned(),
+        outcome.to_owned(),
+        reason.map(str::to_owned),
+        blocked_by.map(str::to_owned),
+    )
+}
+
+/// A health answer whose headers arrived under verified TLS and whose body
+/// then stalled proves the transport and the certificate; only the health
+/// answer went unread. So `api.transport` and `api.tls` are complete,
+/// `api.health` is `not_sampled` with `timed_out`, identity is blocked,
+/// and no key is sent. The run is incomplete, exit 3.
+#[test]
+fn doctor_body_stall_is_not_a_transport_timeout() {
+    let (output, stub) = doctor_against(vec![
+        (HEALTH_PATH, STALL, String::new()),
+        whoami(r#""query""#),
+    ]);
+    assert_eq!(output.status.code(), Some(3), "{}", text(&output));
+    let report = report(&output);
+    assert_eq!(
+        api_rows(&report),
+        [
+            own_row("api.transport", "complete", None, None),
+            own_row("api.tls", "complete", None, None),
+            own_row("api.health", "not_sampled", Some("timed_out"), None),
+            own_row(
+                "api.identity",
+                "not_sampled",
+                Some("blocked"),
+                Some("api.health")
+            ),
+        ]
+    );
+    let paths: Vec<String> = stub.requests().into_iter().map(|r| r.path).collect();
+    assert_eq!(paths, [HEALTH_PATH]);
+    stub.assert_no_authorization("body stall");
+}
+
+/// trawld's whoami answers exactly 200. Another 2xx with a valid body is
+/// not an identity: `api.identity` fails with `unexpected status` and
+/// names the status.
+#[test]
+fn doctor_identity_requires_exactly_200() {
+    let body = r#"{"prefix":"pfx12345","name":"ops-key","kind":"human","roles":[],"permissions":["query"]}"#;
+    for status in [201, 202] {
+        let (output, _stub) =
+            doctor_against(vec![healthy(), (WHOAMI_PATH, status, body.to_owned())]);
+        assert_eq!(output.status.code(), Some(1), "{status}: {}", text(&output));
+        let report = report(&output);
+        let identity = check_by_id(&report, "api.identity");
+        assert_eq!(identity["outcome"], "failed", "{status}");
+        assert_eq!(identity["reason"], "unexpected status", "{status}");
+        assert_eq!(
+            identity["detail"],
+            format!("GET /api/v1/whoami answered HTTP {status}")
+        );
+    }
+}
+
+/// A 200 health or whoami body past the client's cap is not read: the
+/// check fails with `response too large`, and the run finishes with a
+/// report rather than a crash. An oversized health body blocks identity,
+/// so no key goes out.
+#[test]
+fn doctor_oversized_bodies_are_too_large() {
+    let pad = "x".repeat(70 * 1024);
+    let health = format!(
+        r#"{{"status":"ok","checks":{{"duckdb":"ok"}},"version":"{}","pad":"{pad}"}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    let (output, stub) = doctor_against(vec![(HEALTH_PATH, 200, health), whoami(r#""query""#)]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let health_report = report(&output);
+    assert_eq!(
+        api_rows(&health_report),
+        [
+            own_row("api.transport", "complete", None, None),
+            own_row("api.tls", "complete", None, None),
+            own_row("api.health", "failed", Some("response too large"), None),
+            own_row(
+                "api.identity",
+                "not_sampled",
+                Some("blocked"),
+                Some("api.health")
+            ),
+        ]
+    );
+    stub.assert_no_authorization("oversized health");
+
+    let who = format!(
+        r#"{{"prefix":"pfx12345","name":"ops-key","kind":"human","roles":[],"permissions":["query"],"pad":"{pad}"}}"#
+    );
+    let (output, _stub) = doctor_against(vec![healthy(), (WHOAMI_PATH, 200, who)]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let report = report(&output);
+    let identity = check_by_id(&report, "api.identity");
+    assert_eq!(identity["outcome"], "failed");
+    assert_eq!(identity["reason"], "response too large");
 }
 
 /// The versioned JSON document for a pass, a fail, and an incomplete run,

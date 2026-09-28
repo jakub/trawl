@@ -421,8 +421,8 @@ The doctor runs the checks in this order. When a check's prerequisite is not
 | `api.tls` | The API's certificate verifies under the trust mode that the report names: system roots or the pinned CA. An `http` URL fails with `connection is not TLS`. `insecure` fails with `certificate not verified` | `api.transport` |
 | `api.health` | The health answer parses as a Trawl health response with the status `ok`, `degraded`, or `unavailable`, a `checks` map, and a `version`. `trawld` always sends all three. An answer without the map or the version fails with `not a trawl health answer`. A 503 answer counts | `api.tls` |
 | `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `error`, `refusing`, and every other value are `failed` | `api.health` |
-| `api.health.invalid_key` | The server reported a check name that is not `[a-z0-9_]{1,64}`. This row is always `failed`, and the report does not show the names | `api.health` |
-| `api.identity` | `GET /api/v1/whoami` accepts the key. `detail` shows the key's name, kind, and permissions, never the key or its prefix. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail | `api.health`, and a key selected |
+| `api.health._invalid` | The server reported a check name that is not `[a-z][a-z0-9_]{0,63}`. This row is always `failed`, and the report does not show the names. No check name starts with `_`, so this ID cannot match a server's check | `api.health` |
+| `api.identity` | `GET /api/v1/whoami` answers HTTP 200 and accepts the key. `detail` shows the key's name, kind, and permissions, never the key or its prefix. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail. Any other 2xx status fails with `unexpected status` | `api.health`, and a key selected |
 | `web.transport` | `GET /healthz` on `--web-url` answers HTTP 200 with the body `ok` | `--web-url` given |
 | `web.origin` | `trawl-web` accepts `--web-url` as a browser origin. The doctor sends `POST /api/auth/login` with `Origin: <web-url>` and an empty `api_key`. Only `400 {"error":"bad request"}` is `complete`. `403 {"error":"cross-origin request rejected"}` fails with `origin not in public_origins`. Any other answer fails with `not a trawl-web login endpoint` | `web.transport` |
 
@@ -441,9 +441,14 @@ The `web.*` checks do not depend on the `api.*` checks, and they send no key.
 Without `--web-url`, the report has no `web.*` rows.
 
 Each request waits up to 10 seconds. A request with no answer in that time
-gives `not_sampled` with the reason `timed_out`. An HTTP 429 answer gives
+gives `not_sampled` with the reason `timed_out`. When the answer starts but its
+body does not finish in that time, the connection and the certificate are
+proved: `api.transport` and `api.tls` are `complete`, and only the check that
+reads the body is `not_sampled` with `timed_out`. An HTTP 429 answer gives
 `not_sampled` with the reason `rate_limited`. The doctor does not follow a
-redirect: the check fails with `redirect refused`.
+redirect: the check fails with `redirect refused`. The doctor reads at most
+64 KiB of a health or `whoami` answer. A larger answer fails the check with
+`response too large`.
 
 ### Outcomes and verdict
 

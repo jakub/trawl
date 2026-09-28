@@ -45,14 +45,17 @@ pub const API_IDENTITY: &str = "api.identity";
 /// Prefix of the one row per check name the health answer reports.
 pub const API_HEALTH_KEY_PREFIX: &str = "api.health.";
 /// The one row that stands for every check name that is not an identifier.
-pub const API_HEALTH_INVALID_KEY: &str = "api.health.invalid_key";
+/// Its last part starts with `_`, which no check name may, so it cannot
+/// collide with a server's check.
+pub const API_HEALTH_INVALID_KEY: &str = "api.health._invalid";
 
 /// The deadline for each request the doctor sends.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A check name the report may show: `[a-z0-9_]{1,64}`.
+/// A check name the report may show: `[a-z][a-z0-9_]{0,63}`.
 fn is_health_key(name: &str) -> bool {
     (1..=64).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_lowercase()
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
@@ -231,11 +234,19 @@ mod witness {
     }
 }
 
-/// Whether `result` holds an HTTP answer, whatever its status.
+/// Whether `result` holds an HTTP answer, whatever its status. A body too
+/// large to read, or one that stalled after the headers, still followed
+/// an answer's status line.
 fn answered<T>(result: &Result<T, ClientError>) -> bool {
     match result {
-        Ok(_) | Err(ClientError::Server { .. } | ClientError::Parse(_)) => true,
-        Err(e) => e.network_kind() == Some(NetworkKind::Redirect),
+        Ok(_)
+        | Err(ClientError::Server { .. } | ClientError::Parse(_) | ClientError::TooLarge { .. }) => {
+            true
+        }
+        Err(e) => matches!(
+            e.network_kind(),
+            Some(NetworkKind::Redirect | NetworkKind::BodyTimeout)
+        ),
     }
 }
 
@@ -457,6 +468,15 @@ impl<'a> ApiRun<'a> {
                     "give the key a role that grants trawl permissions",
                 )
             }
+            // trawld's whoami answers exactly 200.
+            Err(ClientError::Server { status, .. }) if (200..300).contains(&status) => {
+                check.outcome = Outcome::Failed;
+                check.detail = Some(format!("GET /api/v1/whoami answered HTTP {status}"));
+                with_next(
+                    with_reason(check, "unexpected status"),
+                    "check that the URL names trawld's API, not a proxy or another service",
+                )
+            }
             Err(e) => answer_failure(check, &e, "whoami"),
         }
     }
@@ -561,6 +581,10 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
             with_reason(check, format!("the answer is not a trawl {what} response")),
             "check that the URL names trawld's API, not another service",
         ),
+        ClientError::TooLarge { .. } => with_next(
+            with_reason(check, "response too large"),
+            "check that the URL names trawld's API, not another service",
+        ),
         _ => match e.network_kind() {
             Some(NetworkKind::Redirect) => with_next(
                 with_reason(check, "redirect refused"),
@@ -571,6 +595,15 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
                 with_next(
                     with_reason(check, reason::TIMED_OUT),
                     "run trawl doctor again; no answer came within 10 s",
+                )
+            }
+            // The server answered, so transport and TLS stand; only this
+            // answer could not be read.
+            Some(NetworkKind::BodyTimeout) => {
+                check.outcome = Outcome::NotSampled;
+                with_next(
+                    with_reason(check, reason::TIMED_OUT),
+                    "run trawl doctor again; the answer began but did not finish within 10 s",
                 )
             }
             Some(NetworkKind::UntrustedCertificate) => with_next(
@@ -587,7 +620,7 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
 
 /// One row per check name the server reports, sorted by name. Names that
 /// are not identifiers, or that hold a run of the key, become one
-/// `api.health.invalid_key` row, and none of them is echoed.
+/// `api.health._invalid` row, and none of them is echoed.
 fn health_rows(checks: &HashMap<String, String>, secret: Option<&str>) -> Vec<Check> {
     let mut named = BTreeMap::new();
     let mut invalid = 0usize;
@@ -608,7 +641,7 @@ fn health_rows(checks: &HashMap<String, String>, secret: Option<&str>) -> Vec<Ch
                 detail: Some(format!("{invalid} such name(s), not shown")),
                 ..with_reason(
                     row(API_HEALTH_INVALID_KEY, Outcome::Failed),
-                    "the server reported a check name that is not [a-z0-9_]{1,64}",
+                    "the server reported a check name that is not [a-z][a-z0-9_]{0,63}",
                 )
             },
             "check that the URL names trawld's API; its check names are plain identifiers",
@@ -674,6 +707,9 @@ mod tests {
         assert!(!is_health_key(""));
         assert!(!is_health_key("Bad-Key"));
         assert!(!is_health_key("x\u{1b}[31m"));
+        assert!(!is_health_key("_invalid"));
+        assert!(!is_health_key("0day"));
+        assert!(is_health_key("a0_"));
         assert!(is_quotable_value("recovering"));
         assert!(!is_quotable_value(&"a".repeat(33)));
         assert!(!is_quotable_value("Weird Value!"));
@@ -689,6 +725,7 @@ mod tests {
             ("data_path".to_owned(), "Weird\u{1b}Value".to_owned()),
             ("Bad-Key".to_owned(), "ok".to_owned()),
             ("x\u{202e}y".to_owned(), "ok".to_owned()),
+            ("_invalid".to_owned(), "ok".to_owned()),
         ]);
         let rows = health_rows(&checks, None);
         let summary: Vec<(&str, Outcome, Option<&str>)> = rows
@@ -718,7 +755,7 @@ mod tests {
                 (
                     API_HEALTH_INVALID_KEY,
                     Outcome::Failed,
-                    Some("the server reported a check name that is not [a-z0-9_]{1,64}")
+                    Some("the server reported a check name that is not [a-z][a-z0-9_]{0,63}")
                 ),
             ]
         );

@@ -159,8 +159,8 @@ fn is_error_body(body: &[u8], expected: &str) -> bool {
     })
 }
 
-/// The outcome of a probe that got no HTTP answer, from the error's kind
-/// alone.
+/// The outcome of a probe that got no complete HTTP answer, from the
+/// error's kind alone.
 fn network_failure(check: Check, e: &ClientError) -> Check {
     match e.network_kind() {
         Some(NetworkKind::UntrustedCertificate) => with_next(
@@ -172,7 +172,7 @@ fn network_failure(check: Check, e: &ClientError) -> Check {
             with_reason(check, "connection failed"),
             "check that trawl-web is running and that --web-url's host and port reach it",
         ),
-        Some(NetworkKind::Timeout) => with_next(
+        Some(NetworkKind::Timeout | NetworkKind::BodyTimeout) => with_next(
             with_reason(
                 Check {
                     outcome: Outcome::NotSampled,
