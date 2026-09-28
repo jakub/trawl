@@ -268,7 +268,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
     {
         let _writer = publication.write().await;
         std::fs::write(&marker, format!("{}\n", hourly.display())).unwrap();
-        publication.mark_rollup(&marker);
+        drop(publication.mark_rollup(&marker));
     }
     let originals: Vec<_> = [&canonical, &hourly, &tmp, &marker]
         .into_iter()

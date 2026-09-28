@@ -4181,11 +4181,11 @@ mod tests {
         let rollup = dir.path().join(".rollup-normal");
         {
             let _writer = gate.blocking_write();
-            gate.mark_rollup(&rollup);
+            let registration = gate.mark_rollup(&rollup);
             std::fs::write(&rollup, "").unwrap();
             assert_eq!(corpus_check(&gate), "restart_backlog", "during a rollup");
             std::fs::remove_file(&rollup).unwrap();
-            gate.finish_rollup(&rollup);
+            registration.finish();
         }
         assert_eq!(corpus_check(&gate), "restart_backlog", "after the rollup");
 
@@ -4193,7 +4193,7 @@ mod tests {
         std::fs::write(&marker, "").unwrap();
         {
             let _writer = gate.blocking_write();
-            gate.mark_rollup(&marker);
+            drop(gate.mark_rollup(&marker));
         }
         assert_eq!(corpus_check(&gate), "rollup_pending", "precedence");
         gate.settle_overhang(&gate.blocking_write());

@@ -416,7 +416,7 @@ async fn pending_rollup_does_not_reject_ingest() {
     std::fs::write(&marker, "unfinished").unwrap();
     {
         let _writer = publication.write().await;
-        publication.mark_rollup(&marker);
+        drop(publication.mark_rollup(&marker));
     }
     assert!(publication.read().await.is_err());
     let pipeline = PipelineWriter::new(

@@ -1018,7 +1018,7 @@ async fn recover_pending_rollups(
             // release either guard while recovery still relocates files.
             let _corpus_guard = corpus_guard;
             let _publication_guard = publication_guard;
-            relocate_pending_rollups(&publication, &markers)
+            relocate_pending_rollups(&publication)
         })
         .await
         .map_err(|e| {
@@ -1038,18 +1038,13 @@ async fn recover_pending_rollups(
 }
 
 /// The relocation half of rollup recovery, shared by boot and each
-/// compaction pass: forget `markers` already confirmed gone, then recover
-/// every day directory that still holds one. The caller holds the
-/// publication write guard.
-fn relocate_pending_rollups(
-    publication: &PublicationGate,
-    markers: &[PathBuf],
-) -> Result<(), String> {
+/// compaction pass: forget the registered markers already confirmed gone,
+/// then recover every day directory that still holds one. The caller holds
+/// the publication write guard.
+fn relocate_pending_rollups(publication: &PublicationGate) -> Result<(), String> {
     // A previous cleanup or retention pass may already have removed a
-    // marker. Clear only confirmed missing paths before selecting days.
-    for marker in markers {
-        publication.finish_rollup(marker);
-    }
+    // marker. Listing the pending markers forgets the confirmed missing
+    // ones before the days are selected.
     let days: std::collections::BTreeSet<PathBuf> = publication
         .pending_rollup_markers()
         .iter()
@@ -1079,7 +1074,7 @@ pub(crate) fn recover_rollups_at_boot(publication: &PublicationGate) {
     let _publication_guard = publication.blocking_write();
     // The error names hourly paths, so it is not logged; the failure
     // counter has recorded it.
-    let recovered = relocate_pending_rollups(publication, &markers).is_ok();
+    let recovered = relocate_pending_rollups(publication).is_ok();
     if publication.marker_scan_failed() {
         tracing::error!(
             event_type = "rollup_boot_recovery",
@@ -1617,9 +1612,11 @@ fn recover_rollup_markers_inner(
         else {
             continue;
         };
+        // Registers a marker the gate did not know of, so a failed recovery
+        // leaves it refusing reads. Finished once the marker file is gone.
+        let registration = publication.map(|gate| gate.mark_rollup(&path));
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(gate) = publication {
-            gate.mark_rollup(&path);
-            #[cfg(any(test, feature = "test-support"))]
             gate.hold_after_publish_for_test();
         }
         let canonical = day_dir.join(format!("{service}.parquet"));
@@ -1670,8 +1667,8 @@ fn recover_rollup_markers_inner(
                 std::fs::File::open(day_dir)
                     .and_then(|dir| dir.sync_all())
                     .map_err(|e| format!("failed to sync rollup marker removal: {e}"))?;
-                if let Some(gate) = publication {
-                    gate.finish_rollup(&path);
+                if let Some(registration) = registration {
+                    registration.finish();
                 }
                 quarantine_file(
                     &tmp,
@@ -1709,8 +1706,8 @@ fn recover_rollup_markers_inner(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("failed to remove rollup marker: {e}")),
         }
-        if let Some(gate) = publication {
-            gate.finish_rollup(&path);
+        if let Some(registration) = registration {
+            registration.finish();
         }
     }
     Ok(())
@@ -2148,9 +2145,10 @@ fn rollup_day_inner(
     // invisible to readers until the complete generation is ready.
     let publication_guard = publication.map(PublicationGate::blocking_write);
     let marker = rollup_marker_path(day_dir, service);
-    if let Some(gate) = publication {
-        gate.mark_rollup(&marker);
-    }
+    // Declared after the guard, so an early return drops it first: a
+    // failure leaves the marker registered, and no longer in flight, before
+    // the next writer can take the lock.
+    let registration = publication.map(|gate| gate.mark_rollup(&marker));
     write_rollup_marker(day_dir, service, &merged_hourly)?;
 
     // Atomic rename.
@@ -2172,8 +2170,8 @@ fn rollup_day_inner(
 
     // Remove marker — rollup fully complete.
     delete_rollup_marker(day_dir, service);
-    if let Some(gate) = publication {
-        gate.finish_rollup(&marker);
+    if let Some(registration) = registration {
+        registration.finish();
     }
     drop(publication_guard);
 
@@ -5479,7 +5477,7 @@ mod tests {
         );
         let marker = day.join(".rollup-svc");
         std::fs::write(&marker, input.to_string_lossy().as_bytes()).unwrap();
-        hot.publication().mark_rollup(&marker);
+        drop(hot.publication().mark_rollup(&marker));
         assert!(
             compact_once_coordinated(
                 &tmp.path().join("no-wal"),
@@ -5632,6 +5630,14 @@ mod tests {
         assert_eq!(
             operation_count(&handle, CompactionOperation::PendingRollupRecovery),
             0
+        );
+        // The panic dropped the rollup's registration without finishing it:
+        // the marker stays registered and is no longer in flight, so a
+        // lock-free query reports it beside the next writer too.
+        let _next_writer = gate.write().await;
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
         );
     }
 
@@ -7000,6 +7006,12 @@ mod tests {
         entered.recv_timeout(Duration::from_secs(30)).unwrap();
         assert!(hourly.exists());
         assert_eq!(read_strings(&daily, "msg"), vec!["old", "new"]);
+        assert!(rollup_marker_path(&day, "nginx").exists());
+        assert_eq!(
+            gate.unsettled(),
+            None,
+            "the rollup's own marker is in flight, so a lock-free query does not flap"
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -7078,7 +7090,7 @@ mod tests {
         let gate = Arc::new(PublicationGate::new());
         {
             let _writer = gate.write().await;
-            gate.mark_rollup(&rollup_marker_path(day, "nginx"));
+            drop(gate.mark_rollup(&rollup_marker_path(day, "nginx")));
         }
         assert!(recover_pending_rollups(&gate, None).await.is_err());
         assert!(gate.read().await.is_err());

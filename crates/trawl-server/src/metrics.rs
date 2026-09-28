@@ -2042,16 +2042,16 @@ mod tests {
             let rollup = dir.path().join(".rollup-normal");
             {
                 let _writer = gate.blocking_write();
-                gate.mark_rollup(&rollup);
+                let registration = gate.mark_rollup(&rollup);
                 std::fs::write(&rollup, "").unwrap();
                 assert_eq!(collected(&gate), (0, 1), "during a rollup");
                 std::fs::remove_file(&rollup).unwrap();
-                gate.finish_rollup(&rollup);
+                registration.finish();
             }
             assert_eq!(collected(&gate), (0, 1), "after the rollup");
             {
                 let _writer = gate.blocking_write();
-                gate.mark_rollup(&marker);
+                drop(gate.mark_rollup(&marker));
             }
             assert_eq!(collected(&gate), (1, 1), "each reason on its own series");
             gate.settle_overhang(&gate.blocking_write());

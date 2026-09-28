@@ -2461,7 +2461,7 @@ mod tests {
             let _writer = publication.write().await;
             let marker = root.path().join(".rollup-api");
             std::fs::write(&marker, "unfinished").unwrap();
-            publication.mark_rollup(&marker);
+            drop(publication.mark_rollup(&marker));
         }
         drop(active);
         let result = tokio::time::timeout(Duration::from_secs(1), admission)
@@ -2541,7 +2541,7 @@ mod tests {
             };
             {
                 let _writer = gate.write().await;
-                gate.mark_rollup(&marker);
+                drop(gate.mark_rollup(&marker));
             }
             assert_eq!(admit(gate).await, rollup, "starting: {starting}");
         }

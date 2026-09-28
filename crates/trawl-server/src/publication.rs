@@ -4,6 +4,31 @@
 
 //! Coordinates canonical Parquet publication with readers in this process.
 //! External writers and exactly-once ingestion require separate guarantees.
+//!
+//! # Rollup markers
+//!
+//! The gate holds every rollup marker it knows of until the marker's file is
+//! confirmed gone, and reads refuse `rollup_pending` while any remains. The
+//! boot scan and a complete rescan add the markers they find. A rollup or a
+//! recovery adds its marker with [`PublicationGate::mark_rollup`], under the
+//! publication write guard, before it writes or reads the marker file.
+//!
+//! The writer owns the [`RollupRegistration`] that call returns, and keeps it
+//! until it has removed the marker file. When the call added the marker, the
+//! marker is in flight for as long as the registration lives: it is that
+//! writer's own, and its file may not exist yet. Dropping the registration
+//! ends the flight on every exit path, an early return or a panic included,
+//! and leaves the marker registered. [`RollupRegistration::finish`], after
+//! the writer removed the file, forgets it; so does a later evaluation under
+//! a guard that finds the file gone. A rollup that fails with its marker on
+//! disk therefore leaves the marker registered and refusing reads. A marker
+//! the gate already held when the call came, such as one that recovery
+//! retries, was established before this writer and never goes in flight.
+//!
+//! [`PublicationGate::read`] and every query that gets a read guard forget
+//! the markers whose files are gone, then report the rest. A query that
+//! takes no guard while a writer holds the lock or waits for it forgets
+//! nothing and reads no file: it reports every marker that is not in flight.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -98,13 +123,14 @@ enum Restart {
 struct CorpusState {
     /// Rollup markers registered and not yet confirmed gone.
     markers: HashSet<PathBuf>,
-    /// Whether any marker survived the last guarded evaluation: its file
-    /// existed, or its metadata could not be read, and either way reads
-    /// refused for it. No writer's marker is in flight under a guard, so
-    /// such a marker is established, not a publication's own. Only
-    /// [`evaluate`](Self::evaluate) sets or clears it; registering a
-    /// marker never does.
-    established_rollup: bool,
+    /// The markers that a live [`RollupRegistration`] added to `markers`.
+    /// Each registration removes only the entry it added, when it drops.
+    /// The write guard admits one writer, and each writer registers one
+    /// marker at a time, so at most one entry is present in practice. It is
+    /// a set because `mark_rollup` cannot check that its caller holds the
+    /// guard, and a set keeps each registration's entry its own however
+    /// registrations overlap.
+    in_flight: HashSet<PathBuf>,
     /// The marker scan failed, so an unknown marker may exist. Only a later
     /// complete scan clears it.
     scan_failed: bool,
@@ -121,21 +147,26 @@ impl CorpusState {
     /// could forget a marker that a failed rollup then leaves on disk.
     fn evaluate(&mut self) -> UnsettledReasons {
         self.markers.retain(|path| !is_missing(path));
-        self.established_rollup = !self.markers.is_empty();
         UnsettledReasons {
-            rollup_pending: self.scan_failed || self.established_rollup,
+            rollup_pending: self.scan_failed || !self.markers.is_empty(),
             restart_backlog: self.restart != Restart::Settled,
         }
     }
 
     /// What holds while a writer holds or waits for the publication lock.
-    /// Its markers may be in flight, so the registered markers are neither
-    /// pruned nor reported. A marker the last guarded evaluation kept is
-    /// established rather than in flight, so it still counts, as do a
-    /// failed marker scan and the restart state.
+    /// No marker is pruned, because the writer's own may not have its file
+    /// yet. Every registered marker that is not in flight counts, whether
+    /// or not its file still exists, as do a failed marker scan and the
+    /// restart state. A marker whose file is gone therefore reads as
+    /// pending until the next guarded evaluation forgets it: the stale
+    /// answer refuses, never admits.
     fn beside_a_writer(&self) -> UnsettledReasons {
         UnsettledReasons {
-            rollup_pending: self.scan_failed || self.established_rollup,
+            rollup_pending: self.scan_failed
+                || self
+                    .markers
+                    .iter()
+                    .any(|path| !self.in_flight.contains(path)),
             restart_backlog: self.restart != Restart::Settled,
         }
     }
@@ -275,13 +306,13 @@ impl PublicationGate {
 
     /// Every reason that holds now, each on its own. Never waits: when the
     /// publication lock is free, it evaluates under a read guard taken
-    /// without waiting. While a writer holds the lock or waits for it, the
-    /// writer's rollup marker may be in flight, so no registered marker is
-    /// pruned, and only a marker the last guarded evaluation kept is
-    /// reported; a failed marker scan and the restart state still are. A
-    /// normal rollup therefore never moves the answer, a marker that a
-    /// failed rollup leaves is reported from the first evaluation after the
-    /// writer is gone, and a later publication does not hide it again.
+    /// without waiting. While a writer holds the lock or waits for it, no
+    /// registered marker is pruned, and every marker is reported except
+    /// one in flight (see the [module documentation](self)); a failed
+    /// marker scan and the restart state are reported too. A normal rollup
+    /// therefore never moves the answer. A marker that a failed rollup
+    /// leaves is reported from the moment its registration drops, beside
+    /// the next writer as well, before any guarded evaluation.
     /// [`read`](Self::read) always waits for the writer and evaluates
     /// everything.
     #[must_use]
@@ -378,16 +409,26 @@ impl PublicationGate {
         self.lock.blocking_write()
     }
 
-    /// The caller must hold the publication write guard until retirement ends.
-    pub fn mark_rollup(&self, marker: &Path) {
-        self.corpus.lock().markers.insert(marker.to_path_buf());
-    }
-
-    /// The caller must hold the publication write guard. A surviving marker or
-    /// metadata error still refuses readers. This method never changes files.
-    pub fn finish_rollup(&self, marker: &Path) {
-        if is_missing(marker) {
-            self.corpus.lock().markers.remove(marker);
+    /// Register `marker` before writing or recovering it. The caller holds
+    /// the publication write guard, and keeps the returned registration
+    /// until it has removed the marker file, then
+    /// [`finish`](RollupRegistration::finish)es it. When the gate did not
+    /// hold `marker` yet, it is in flight until the registration drops; see
+    /// the [module documentation](self).
+    pub fn mark_rollup(&self, marker: &Path) -> RollupRegistration<'_> {
+        let path = marker.to_path_buf();
+        let in_flight = {
+            let mut corpus = self.corpus.lock();
+            let added = corpus.markers.insert(path.clone());
+            if added {
+                corpus.in_flight.insert(path.clone());
+            }
+            added
+        };
+        RollupRegistration {
+            gate: self,
+            path,
+            in_flight,
         }
     }
 
@@ -435,6 +476,42 @@ impl PublicationGate {
     pub(crate) fn panic_next_publication_for_test(&self) {
         self.panic_next_publication
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A writer's claim on one rollup marker, from
+/// [`PublicationGate::mark_rollup`] until [`finish`](Self::finish) or drop.
+/// It holds no lock: it takes the gate's state mutex only when it is made,
+/// finished and dropped.
+#[must_use = "a rollup marker stays in flight only while its registration lives"]
+#[derive(Debug)]
+pub struct RollupRegistration<'a> {
+    gate: &'a PublicationGate,
+    path: PathBuf,
+    /// Whether this registration added the marker, and so put it in flight.
+    in_flight: bool,
+}
+
+impl RollupRegistration<'_> {
+    /// End the rollup or recovery after removing the marker file. The gate
+    /// forgets the marker only when its file is confirmed gone: a surviving
+    /// file, or one whose metadata cannot be read, still refuses readers.
+    /// The caller still holds the publication write guard. Never changes
+    /// files.
+    pub fn finish(self) {
+        if is_missing(&self.path) {
+            // Forgotten before the drop ends its flight, so no query reads
+            // it as a marker that is registered and not in flight.
+            self.gate.corpus.lock().markers.remove(&self.path);
+        }
+    }
+}
+
+impl Drop for RollupRegistration<'_> {
+    fn drop(&mut self) {
+        if self.in_flight {
+            self.gate.corpus.lock().in_flight.remove(&self.path);
+        }
     }
 }
 
@@ -517,8 +594,7 @@ mod tests {
         let gate = PublicationGate::new();
         {
             let _writer = gate.write().await;
-            gate.mark_rollup(&marker);
-            gate.finish_rollup(&marker);
+            gate.mark_rollup(&marker).finish();
         }
         assert!(matches!(
             gate.read().await,
@@ -825,7 +901,7 @@ mod tests {
         gate.finish_hydration(true).unwrap();
         {
             let _writer = gate.write().await;
-            gate.mark_rollup(&marker);
+            drop(gate.mark_rollup(&marker));
         }
 
         let reasons = gate.unsettled_reasons();
@@ -881,8 +957,9 @@ mod tests {
     /// A rollup registers its marker before it writes the marker file. A
     /// query that takes no guard, inside that window, neither forgets the
     /// marker nor reports it. If the rollup then fails with its marker on
-    /// disk, reads refuse `rollup_pending` once the writer is gone
-    /// (ADR-0026, ADR-0041).
+    /// disk, the marker is reported from the moment its registration
+    /// drops, while the writer still holds the lock, and reads refuse
+    /// `rollup_pending` (ADR-0026, ADR-0041).
     #[tokio::test]
     async fn a_lock_free_query_inside_a_rollup_keeps_its_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -890,7 +967,7 @@ mod tests {
         let gate = PublicationGate::new();
         {
             let _writer = gate.write().await;
-            gate.mark_rollup(&marker);
+            let registration = gate.mark_rollup(&marker);
             assert_eq!(
                 gate.unsettled(),
                 None,
@@ -902,9 +979,15 @@ mod tests {
                 gate.corpus.lock().markers.contains(&marker),
                 "nor forgotten while its file does not exist yet"
             );
-            // The rollup writes its marker, then fails before retiring it.
             std::fs::write(&marker, "hourly inputs").unwrap();
             assert_eq!(gate.unsettled(), None);
+            // The rollup fails before retiring its marker.
+            drop(registration);
+            assert_eq!(
+                gate.unsettled(),
+                Some(CorpusUnsettled::RollupPending),
+                "a failed rollup's marker, beside its own writer"
+            );
         }
         assert!(matches!(
             gate.read().await,
@@ -939,60 +1022,84 @@ mod tests {
             // No query between the registration and the marker file: one
             // there is the other test's window.
             let writer = gate.blocking_write();
-            gate.mark_rollup(&marker);
+            let registration = gate.mark_rollup(&marker);
             std::fs::write(&marker, "hourly inputs").unwrap();
             assert_eq!(gate.unsettled(), expected, "marker written");
             assert_eq!(gate.overhang(), overhang);
             std::fs::remove_file(&marker).unwrap();
-            gate.finish_rollup(&marker);
+            registration.finish();
             assert_eq!(gate.unsettled(), expected, "marker removed");
             drop(writer);
             assert_eq!(gate.unsettled(), expected, "after");
         }
     }
 
-    /// A marker that a guarded evaluation found on disk is no writer's
-    /// in-flight marker: a lock-free query keeps reporting it while a
-    /// writer holds the lock, so a later publication does not hide a
-    /// stuck rollup from health and `/metrics`. A writer's new marker
-    /// beside it is still not what makes the report, and once the stuck
-    /// marker resolves, the next guarded evaluation clears it.
+    /// Consecutive writers with no evaluation between them. Writer A's
+    /// rollup fails with its marker on disk, and writer B takes the lock
+    /// before any query takes a guard. A lock-free query beside B reports
+    /// A's marker, so the scheduler does not claim a run that `read` would
+    /// refuse. B retrying the marker does not hide it, because the gate
+    /// held it before B registered it. Once B has removed it and a guarded
+    /// evaluation runs, the corpus is settled, and the next normal
+    /// rollup's in-flight marker is not reported.
     #[test]
-    fn an_established_marker_is_reported_while_a_writer_holds() {
+    fn a_failed_rollups_marker_is_reported_beside_the_next_writer() {
         let dir = tempfile::tempdir().unwrap();
         let stuck = dir.path().join(".rollup-stuck");
         let gate = PublicationGate::new();
         {
-            // An earlier rollup failed and left its marker on disk.
-            let _writer = gate.blocking_write();
-            gate.mark_rollup(&stuck);
+            let _a = gate.blocking_write();
+            let _failed = gate.mark_rollup(&stuck);
             std::fs::write(&stuck, "hourly inputs").unwrap();
         }
-        assert_eq!(
-            gate.unsettled(),
-            Some(CorpusUnsettled::RollupPending),
-            "a guarded evaluation establishes it"
-        );
         {
-            let _writer = gate.blocking_write();
+            let _b = gate.blocking_write();
             assert_eq!(
                 gate.unsettled(),
                 Some(CorpusUnsettled::RollupPending),
-                "beside a later publication"
+                "beside the next writer"
             );
-            // Recovery resolves the stuck marker under the write guard.
+            // B recovers the stuck marker under its write guard.
+            let recovery = gate.mark_rollup(&stuck);
+            assert_eq!(
+                gate.unsettled(),
+                Some(CorpusUnsettled::RollupPending),
+                "a retried marker is not in flight"
+            );
             std::fs::remove_file(&stuck).unwrap();
-            gate.finish_rollup(&stuck);
+            recovery.finish();
+            assert_eq!(gate.unsettled(), None, "recovered, beside its writer");
         }
-        assert_eq!(gate.unsettled(), None, "a guarded evaluation clears it");
+        assert_eq!(gate.unsettled(), None, "a guarded evaluation");
 
-        // A normal rollup after that: its in-flight marker is not reported.
         let normal = dir.path().join(".rollup-normal");
-        let _writer = gate.blocking_write();
-        gate.mark_rollup(&normal);
+        let _c = gate.blocking_write();
+        let _registration = gate.mark_rollup(&normal);
         assert_eq!(gate.unsettled(), None, "registered, file not yet written");
         std::fs::write(&normal, "hourly inputs").unwrap();
         assert_eq!(gate.unsettled(), None, "file written");
+    }
+
+    /// A rollup that fails before it writes its marker file leaves a
+    /// registered marker with no file. A query without a guard reads no
+    /// file, so beside the next writer the marker still reads as pending:
+    /// the stale answer refuses rather than admits. The next guarded
+    /// evaluation forgets it.
+    #[test]
+    fn a_marker_without_a_file_reads_pending_until_a_guarded_evaluation() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-svc");
+        let gate = PublicationGate::new();
+        {
+            let _a = gate.blocking_write();
+            drop(gate.mark_rollup(&marker));
+        }
+        {
+            let _b = gate.blocking_write();
+            assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RollupPending));
+        }
+        assert_eq!(gate.unsettled(), None);
+        assert!(gate.corpus.lock().markers.is_empty());
     }
 
     /// A failed marker scan is no writer's marker: a lock-free query
@@ -1021,7 +1128,7 @@ mod tests {
         std::fs::write(&marker, "").unwrap();
         {
             let _writer = gate.write().await;
-            gate.mark_rollup(&marker);
+            drop(gate.mark_rollup(&marker));
         }
         assert!(matches!(
             gate.read_rollups_only().await,
@@ -1064,7 +1171,7 @@ mod tests {
         std::fs::write(&registered, "").unwrap();
         {
             let _writer = gate.write().await;
-            gate.mark_rollup(&registered);
+            drop(gate.mark_rollup(&registered));
         }
 
         std::fs::remove_file(&root).unwrap();
