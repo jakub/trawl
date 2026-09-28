@@ -28,6 +28,10 @@ _Avoid_: instance, deployment, server (when the whole is meant)
 A disposable installation that one person's CLI creates, owns, and deletes on one machine, reachable only through loopback. A trial is never promoted. A durable installation always starts fresh.
 _Avoid_: demo, sandbox, quickstart, dev stack (that is fleet-dev's)
 
+**Doctor**:
+A read-only diagnosis run from one vantage: the server host, the web proxy's host, or a client holding a key. It reports each named check as proven, disproven, not configured, or not sampled, and it never repairs, initializes, or writes what it inspects. Distinct from `fleet-dev doctor`, which checks a developer's machine.
+_Avoid_: health check (that is the endpoint), preflight, self-test
+
 ### Ingest
 
 **Envelope**:
