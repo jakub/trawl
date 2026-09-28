@@ -701,7 +701,7 @@ fn fold_field_names(obj: &Map<String, Value>) -> FoldedNames {
     let mut out = Map::new();
     // Pass 1: exact (already-folded) spellings — the collision winners.
     for (key, value) in obj {
-        if !key.bytes().any(|b| b.is_ascii_uppercase()) {
+        if is_folded_name(key) {
             out.insert(key.clone(), value.clone());
         }
     }
@@ -709,7 +709,7 @@ fn fold_field_names(obj: &Map<String, Value>) -> FoldedNames {
     let mut folded = false;
     let mut collided = false;
     for (key, value) in obj {
-        if !key.bytes().any(|b| b.is_ascii_uppercase()) {
+        if is_folded_name(key) {
             continue;
         }
         let lower = key.to_ascii_lowercase();
@@ -725,6 +725,14 @@ fn fold_field_names(obj: &Map<String, Value>) -> FoldedNames {
         folded,
         collided,
     }
+}
+
+/// Whether `name` is already in its folded spelling: it carries no ASCII
+/// uppercase letter, so [`fold_field_names`] keeps it as it is. Every
+/// field name a canonical event carries passes; boot hydration (ADR-0041)
+/// accepts a WAL line only if all of its names do.
+pub(crate) fn is_folded_name(name: &str) -> bool {
+    !name.bytes().any(|b| b.is_ascii_uppercase())
 }
 
 /// Drop every field whose name cannot be a field-catalog key, returning

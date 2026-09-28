@@ -656,7 +656,8 @@ async fn ac5_health_and_envelope_pg_down_without_backend_detail() {
                 "auth_db": "ok",
                 "storage_db": "ok",
                 "data_path": "ok",
-                "ingest_capacity": "ok"
+                "ingest_capacity": "ok",
+                "corpus": "ok"
             },
             "version": version
         })
@@ -682,7 +683,8 @@ async fn ac5_health_and_envelope_pg_down_without_backend_detail() {
                 "auth_db": "error",
                 "storage_db": "ok",
                 "data_path": "ok",
-                "ingest_capacity": "ok"
+                "ingest_capacity": "ok",
+                "corpus": "ok"
             },
             "version": version
         }),
@@ -1112,7 +1114,8 @@ async fn storage_loss_degrades_health_and_503s_store_endpoints() {
                     "auth_db": "ok",
                     "storage_db": "error",
                     "data_path": "ok",
-                    "ingest_capacity": "ok"
+                    "ingest_capacity": "ok",
+                    "corpus": "ok"
                 }),
                 "got: {body}"
             );

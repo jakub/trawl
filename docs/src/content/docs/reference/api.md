@@ -85,6 +85,18 @@ Every error that trawld itself produces has this body:
 | `timeout` | 504 | The query started but did not finish within `timeout_secs` |
 | `service_unavailable` | 503 | A dependency is down, the server is at capacity, or the node cannot serve the route |
 | `hot_buffer_full` | 503 | The hot buffer has no room for an ingest request. Sent with `Retry-After` |
+| `corpus_recovering` | 503 | The server cannot yet count every stored event exactly once, so it refuses the read. No `Retry-After`. See [corpus recovering](#corpus-recovering) |
+
+#### Corpus recovering
+
+A read answers 503 `corpus_recovering` while the corpus is unsettled: after a restart, until compaction proves that the WAL from before the restart is covered, or while a daily rollup marker is unfinished. It applies to [queries](#run-a-query), [exports](#export-query-results), uncached [field values](#field-values), [manual runs](#run-a-saved-query-now), and [repins](#repin-a-field). The message is fixed for each reason and names no count, path, or marker:
+
+| Reason | Message |
+|--------|---------|
+| `restart_backlog` | `Search is unavailable while the server finishes loading data from before its restart.` |
+| `rollup_pending` | `Search is unavailable while the server finishes an interrupted storage rollup.` |
+
+When both reasons hold, the response names `rollup_pending`. The reason is the `cause_kind` of the [`http_failure` event](/operate/health/#trace-a-server-failure), and `checks.corpus` in [server health](#server-health) names it too. The envelope carries no reason field. Live tail, `| from saved` queries, `/api/v1/schema`, `/api/v1/schema/services`, health, metrics, and a cached field-values hit answer as usual. See [reads while the corpus is unsettled](/architecture/data-flow/#reads-while-the-corpus-is-unsettled).
 
 Four refusals come from the HTTP framework before a handler runs, with an empty or plain-text body instead of the envelope: 413 when the body exceeds the size limit, 415 when a JSON route receives no `Content-Type: application/json`, 400 when the body is not valid JSON, and 422 when the JSON does not match the request shape.
 
@@ -147,20 +159,22 @@ curl --fail-with-body "$TRAWL_URL/api/v1/health"
 ```json
 {
   "status": "ok",
-  "checks": { "duckdb": "ok", "auth_db": "ok", "storage_db": "ok", "data_path": "ok", "ingest_capacity": "ok" },
+  "checks": { "duckdb": "ok", "auth_db": "ok", "storage_db": "ok", "data_path": "ok", "ingest_capacity": "ok", "corpus": "ok" },
   "version": "<installed-version>"
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | `ok` when every check passes. `degraded` when `auth_db`, `storage_db`, or `data_path` reads `error`, or `ingest_capacity` reads `refusing`. `unavailable` when `duckdb` fails. |
-| `checks` | object | Exactly five keys. `duckdb`, `auth_db`, `storage_db`, and `data_path` are each `ok` or `error`. `ingest_capacity` is `ok` or `refusing`. No diagnostics or paths. |
+| `status` | string | `ok` when every check passes. `degraded` when `auth_db`, `storage_db`, or `data_path` reads `error`, `ingest_capacity` reads `refusing`, or `corpus` reads anything but `ok`. `unavailable` when `duckdb` fails. |
+| `checks` | object | Exactly six keys. `duckdb`, `auth_db`, `storage_db`, and `data_path` are each `ok` or `error`. `ingest_capacity` is `ok` or `refusing`. `corpus` is `ok`, `rollup_pending`, or `restart_backlog`. No diagnostics or paths. |
 | `version` | string | The trawld package version |
 
 `degraded` does not prove that authenticated requests can run. An `auth_db` failure turns every authenticated route into a 503.
 
 `ingest_capacity` reads `refusing` while the hot buffer refuses ingest for lack of space, and `ok` otherwise, including on a node with ingest disabled. Reads keep working while it refuses, so the response stays 200 and probes do not restart the server. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission).
+
+`corpus` names why corpus reads answer 503 [`corpus_recovering`](#corpus-recovering), and reads `ok` when they do not. `rollup_pending` wins when both reasons hold. The state clears without a restart, so the response stays 200. A query-only node never reads `restart_backlog`. See [reads while the corpus is unsettled](/architecture/data-flow/#reads-while-the-corpus-is-unsettled).
 
 **Errors**
 
@@ -234,6 +248,8 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 | 409 | `bad_request` | A `from saved` stage selects a run that has rows but no Parquet file. The message names the run route. |
 | 500 | `execution_error` | DuckDB failed or the query was cancelled |
 | 503 | `service_unavailable` | The deadline passed before the query started, or a cold file moved during the read. Retry. |
+| 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
+| 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the query started |
 
 ## Validate
@@ -326,6 +342,8 @@ The body is the file. The headers name its type:
 | 400 | none | `format` is not `csv`, `json`, or `parquet`. Plain-text body from the framework. |
 | 500 | `execution_error` | DuckDB failed |
 | 503 | `service_unavailable` | The deadline passed before the export started |
+| 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
+| 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the export started |
 
 ## Stream
@@ -757,6 +775,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" \
 | 400 | `bad_request` | `service` contains a character outside the allowed set |
 | 500 | `execution_error` | DuckDB failed |
 | 503 | `service_unavailable` | The deadline passed before the sample started |
+| 503 | `corpus_recovering` | The corpus is unsettled and the values are not cached. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the sample started |
 
 ### Acknowledge a degraded pin
@@ -901,6 +920,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | 409 | `bad_request` | A repin job is already running |
 | 400 | `bad_request` | `field` is an envelope field or not pinned, `to` is not a catalog type, `to` equals the current pin without `force`, `dialect` is unknown or given with a target other than `SEVERITY`, a ceiling is given without `force`, the pin changed between lookup and claim, the staging directory is on a different filesystem from the data root, or free disk is below the affected bytes plus the retention floor |
 | 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, or the job could not claim the corpus before its scan and ended `blocked` |
+| 503 | `corpus_recovering` | The corpus is unsettled. The job ends `blocked`, and its `error` names the reason. See [corpus recovering](#corpus-recovering). |
 
 ### Repin status
 
@@ -1490,6 +1510,7 @@ The shape is the [report run](#report-runs) summary. `started_at` is `t`, and th
 | 400 | `bad_request` | The saved query has no schedule |
 | 404 | `not_found` | No saved query with this id belongs to the key |
 | 409 | `bad_request` | A run is already in progress, `max_runs` is reached, or a `since_last` window would be empty: `nothing new to read: coverage already reaches 2026-09-11T08:25:00.000000Z, and a run now would end at 2026-09-11T08:24:10.000000Z`. Nothing is recorded. |
+| 503 | `corpus_recovering` | The corpus is unsettled. No run is created and the schedule does not move. See [corpus recovering](#corpus-recovering). |
 
 ## Report runs
 
@@ -2013,11 +2034,34 @@ interval but none of the hot-buffer gauges.
 | --- | --- | --- |
 | `trawl_hot_buffer_events`, `trawl_hot_buffer_bytes` | gauge | Events and serialized ndjson bytes resident in the hot buffer |
 | `trawl_hot_buffer_max_events`, `trawl_hot_buffer_max_bytes` | gauge | The full caps, `hot_buffer_max_events` and `hot_buffer_max_bytes`. HTTP and syslog may fill 15/16 of each |
-| `trawl_hot_buffer_oldest_batch_age_seconds` | gauge | Seconds since the oldest resident batch was inserted. `0` when the buffer is empty |
+| `trawl_hot_buffer_oldest_batch_age_seconds` | gauge | Seconds since the oldest resident batch was inserted. A batch that boot hydration loaded counts from the time in its WAL file name. `0` when the buffer is empty |
 | `trawl_hot_buffer_admission_state` | gauge | `0` open, `1` pressure (at or above half of either cap), `2` refusing (a reservation was refused for lack of space). Pressure and refusing clear only below a quarter of both caps |
 | `trawl_hot_buffer_admission_refusals_total{producer,kind}` | counter | Refused reservations. `producer` is `http`, `syslog`, or `trawld`. `kind` is `full`, no free space now, or `oversized`, larger than the producer's share and never admissible. All six series start at zero |
 | `trawl_compaction_interval_seconds` | gauge | `[ingest] compaction_interval_secs` |
 | `trawl_syslog_events_dropped_total{reason}` | counter | Syslog events dropped before a WAL write. `backpressure` means the batcher was holding a group that hot-buffer admission refused. `queue_full` means the listener queue was full while the batcher was not blocked, or the batcher was gone |
+| `trawl_hot_buffer_duplicate_batches_total` | counter | Batches dropped because a batch with the same identity was already resident. The resident batch stays. Any increment is a writer bug. Starts at zero |
+
+#### Restart visibility metrics
+
+These series describe [restart visibility](/architecture/data-flow/#restart-visibility). `trawl_corpus_unsettled` and `trawl_hydration_files_total` start at zero after recorder installation. `trawl_health_check{subsystem="corpus"}` is set each time `/api/v1/health` answers.
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_corpus_unsettled{reason}` | gauge | `1` while corpus reads refuse for `reason`, else `0`. `reason` is `restart_backlog` or `rollup_pending`. Each series is set on its own, so both can read `1` |
+| `trawl_hydration_files_total{outcome}` | counter | WAL files that boot hydration looked at, by outcome. Every outcome except `hydrated` leaves overhang |
+| `trawl_health_check{subsystem="corpus"}` | gauge | `1` when `checks.corpus` reads `ok`, else `0` |
+
+| `outcome` | Meaning |
+| --- | --- |
+| `hydrated` | Loaded into the hot buffer |
+| `capacity` | Did not fit in the capacity or the read budget left, so it was skipped |
+| `oversized` | Larger than a full cap, so it can never fit |
+| `undecodable` | Not exactly what the WAL writer produces, including a file name that is not a writer name. Compaction's decoder takes it |
+| `unreadable` | Not a regular file, a symlink, a read that failed, or a file whose length changed during the read |
+| `claimed` | In an environment and service that a pending publication marker blocks |
+| `unlisted` | A scope that could not be listed: the WAL root, an entry in it, or an environment directory. Counts once per scope, not per file |
+
+Files past the examine bound of `hot_buffer_max_events` + 1 count under no outcome. `boot_hydration` logs `examine_bound_hit=true` for them.
 
 **Request**
 
@@ -2065,6 +2109,7 @@ Prometheus scrape-target labels are separate and remain on every alert.
 | `TrawlPublicationRecoveryBlocked` | `trawl_publication_recovery_total{outcome=~"contradictory\|failed"}` | Publication markers that recovery left blocking their service, counted once per marker per recovery pass |
 | `TrawlIngestAdmissionRefusing` | `trawl_hot_buffer_admission_refusals_total{kind="full"}`, summed over `producer` | Reservations refused for lack of space; `oversized` refusals are excluded |
 | `TrawlHotBufferDrainStalled` | `trawl_hot_buffer_oldest_batch_age_seconds` compared with `trawl_compaction_interval_seconds` | Gauges, not counters: seconds since the oldest resident batch was inserted, against ten compaction intervals with a 60-second floor |
+| `TrawlCorpusUnsettled` | `trawl_corpus_unsettled`, the maximum over `reason` | A gauge, not a counter: `1` while corpus reads refuse, held for ten minutes. A change of reason does not restart the delay |
 
 The telemetry drop counter's closed `reason` set is `preinit_cap`,
 `buffer_cap`, `write_crashed`, and `unmetered_cap`. The capacity and
@@ -2083,6 +2128,8 @@ Initialization preserves accumulated values. The exporter has no idle expiry
 for these baselines. Counters reset when the process restarts. The two gauges
 that `TrawlHotBufferDrainStalled` selects are set at startup and on every
 scrape. The age gauge exists only on a node with a hot buffer.
+`trawl_corpus_unsettled` starts at zero for both reasons and is read from
+the publication gate on every scrape.
 
 The eleven counter rules use a fixed ten-minute `increase` window with no `for` delay,
 aggregation, current-value guard, or ingest-enable gate. The window describes

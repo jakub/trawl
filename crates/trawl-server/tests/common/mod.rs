@@ -1305,6 +1305,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         RowCaps::DEFAULT,
         SchedulerConfig::default(),
         None,
+        None,
     )
     .await
 }
@@ -1337,6 +1338,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         caps,
         SchedulerConfig::default(),
         None,
+        None,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1356,6 +1358,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         RowCaps::DEFAULT,
         SchedulerConfig::default(),
         None,
+        None,
     )
     .await
 }
@@ -1373,6 +1376,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         true,
         RowCaps::DEFAULT,
         scheduler,
+        None,
         None,
     )
     .await;
@@ -1416,6 +1420,32 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         RowCaps::DEFAULT,
         SchedulerConfig::default(),
         Some(knobs),
+        None,
+    )
+    .await
+}
+
+/// A fixture over a caller-owned `dir` (WAL in `dir/wal`) and data root
+/// that hands the built state to `before_boot` before
+/// `boot::prepare_corpus` runs, for tests of the boot itself: plant WAL or
+/// markers first, observe the state before the boot (subscribe to the
+/// event bus, read the gate), then what the boot did.
+pub async fn setup_observing_boot(
+    dir: &std::path::Path,
+    data_path: String,
+    knobs: Option<HotBufferKnobs>,
+    before_boot: &mut dyn FnMut(&AppState),
+) -> TestServer {
+    setup_with_ingest_config(
+        dir,
+        data_path,
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        RowCaps::DEFAULT,
+        SchedulerConfig::default(),
+        knobs,
+        Some(before_boot),
     )
     .await
 }
@@ -1431,6 +1461,7 @@ async fn setup_with_ingest_config(
     row_caps: RowCaps,
     scheduler: SchedulerConfig,
     hot_buffer: Option<HotBufferKnobs>,
+    before_boot: Option<&mut dyn FnMut(&AppState)>,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1548,7 +1579,10 @@ async fn setup_with_ingest_config(
     .await
     .expect("failed to create app state");
 
-    boot_conformance_pass(&state, &config).await;
+    if let Some(observe) = before_boot {
+        observe(&state);
+    }
+    prepare_corpus(&state, &config).await;
 
     // Snapshot collector: makes GET /api/v1/dashboard live in tests, same
     // as trawld's `main()` does in production.
@@ -1611,20 +1645,15 @@ async fn serve_and_wait(
     task
 }
 
-/// Boot conformance pass, same as trawld's `main()` does in production
-/// (ingest is enabled in the test config default).
-async fn boot_conformance_pass(state: &trawl_server::state::AppState, config: &Config) {
-    if config.ingest.enabled {
-        trawl_server::catalog::conform::ensure_conformance(
-            &state.storage.catalog,
-            &state.query.field_catalog,
-            &config.data.base_dir(),
-            &config.wal_dir(),
-            &config.ingest.compaction_memory_limit,
-        )
+/// The boot steps trawld's `main()` runs between state construction and
+/// the listener (`boot::prepare_corpus`): on an ingest node, rollup-marker
+/// recovery, boot conformance and WAL hydration; on a query-only node, the
+/// archive identity gate. The fixture never spawns compaction, so overhang
+/// the boot leaves stays until the test drives compaction itself.
+async fn prepare_corpus(state: &AppState, config: &Config) {
+    trawl_server::boot::prepare_corpus(state, config)
         .await
-        .expect("boot conformance pass must succeed");
-    }
+        .expect("the boot corpus preparation must succeed");
 }
 
 /// Set up a test server whose queries time out after `timeout_secs`.

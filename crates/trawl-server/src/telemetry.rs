@@ -65,10 +65,11 @@
 //! `trawl_telemetry_wal_write_failures_total`), so a transient storage error
 //! delays events instead of losing them. A failed directory fsync is a
 //! failed write: `WalWriter::write` withdraws the file, and the batch is
-//! retained. If that withdrawal also fails, the file stays where compaction
-//! will merge it, so the batch is released instead of retried (a retry
-//! would duplicate it) and is not published to the hot buffer or bus,
-//! because the write was never acknowledged. If the blocking write task itself
+//! retained. If that withdrawal or its own directory fsync also fails, the
+//! file stays where compaction will merge it, or a power loss may restore
+//! it, so the batch is released instead of retried (a retry would
+//! duplicate it) and is not published to the hot buffer or bus, because
+//! the write was never acknowledged. If the blocking write task itself
 //! panics or is cancelled, its consumed in-memory batch cannot be requeued
 //! and is counted once under drop reason `write_crashed`, in addition to
 //! that one write-failure count. The WAL may already be durable: the batch
@@ -140,9 +141,9 @@
 //! because `on_event` only buffers (it takes the active-buffer lock,
 //! which the flush path never holds while emitting): the
 //! `telemetry_dropped` recovery event after a successful write, and
-//! `WalWriter::write`'s own dir-fsync failure warning. The invariant
-//! is: **no locks are held across `writer.write`, and flush-path tracing
-//! may only buffer.**
+//! `WalWriter::write`'s own dir-fsync and staging-unlink failure warnings.
+//! The invariant is: **no locks are held across `writer.write`, and
+//! flush-path tracing may only buffer.**
 //!
 //! `on_event` calls `envelope::canonicalize`, so the guard extends to the
 //! door: `ingest/envelope.rs` and `ingest/producer.rs` never call
@@ -1361,9 +1362,9 @@ impl WalLayerInner {
 
     /// Handle a WAL write that returned an error. A batch with no file
     /// left behind goes back to the queue front for retry. A batch whose
-    /// file stayed visible after a failed withdrawal is released from the
-    /// accounting instead: compaction will merge that file, so a retry
-    /// would write the same events twice.
+    /// file may stay visible, after a withdrawal that failed or was not
+    /// made durable, is released from the accounting instead: compaction
+    /// may merge that file, so a retry could write the same events twice.
     fn retain_or_release_failed(&self, e: &crate::ingest::wal::WalWriteError, batch: Batch) {
         if e.left_visible() {
             self.staged
@@ -1781,10 +1782,10 @@ where
         // Serialize, then push bytes and map under one lock so the two
         // representations of the active buffer can never skew (a stage
         // between the two pushes would publish a map whose bytes never
-        // reached the WAL). serde_json::to_vec on a Map cannot fail.
-        let mut line =
-            serde_json::to_vec(&record).expect("JSON serialization of a Map is infallible");
-        line.push(b'\n');
+        // reached the WAL). Encoding a Map into a Vec cannot fail.
+        let mut line = Vec::new();
+        crate::ingest::wal::encode_line(&record, &mut line)
+            .expect("JSON serialization of a Map is infallible");
 
         // The shared budget is enforced here, over the active buffer, the
         // retry queue and any in-flight batch together — the only point
@@ -4179,7 +4180,7 @@ mod tests {
 
     /// Events of `event_type` in the hot buffer's current snapshot.
     fn hot_events_of(hot: &crate::hot_buffer::HotBuffer, event_type: &str) -> usize {
-        let Some(snapshot) = hot.snapshot() else {
+        let Some(snapshot) = hot.snapshot().unwrap() else {
             return 0;
         };
         std::fs::read_to_string(snapshot.path())

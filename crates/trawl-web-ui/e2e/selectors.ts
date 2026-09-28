@@ -129,6 +129,16 @@ export const SEL = {
   queryErrorText: 'pre.query-error-text',
   queryErrorCaret: '.query-error-caret',
   queryErrorCaretPad: '.query-error-caret .query-error-caret-pad',
+  /// crates/trawl-web-ui/src/components/recovering_notice.rs — the
+  /// recovering notice, which search.rs mounts in the results region in
+  /// place of the table or chart when a snapshot is refused as
+  /// `corpus_recovering`. Its parts are chained off the notice.
+  recoveringNotice: '#search-results .recovering-notice[role="alert"]',
+  recoveringNoticeTitle: '.recovering-notice-title',
+  recoveringNoticeText: '.recovering-notice-text',
+  /// crates/trawl-web-ui/src/components/results_table.rs — the one cell
+  /// an empty snapshot page renders.
+  resultsEmptyCell: '.results-empty-cell',
   /// crates/fleet-ui/src/range_dialog.rs RangePanel —
   /// the Segmented tab strip's "Absolute" option.
   absoluteTab: '.dr-pop >> text=Absolute',
@@ -594,6 +604,9 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/query_error_notice.rs — the label
   /// over each excerpt.
   queryErrorCaption: 'Query sent to server',
+  /// crates/trawl-web-ui/src/components/recovering_notice.rs — the
+  /// recovering notice's title.
+  recoveringTitle: 'Search is recovering',
   /// crates/trawl-web-ui/src/state/stream_session.rs STREAM_UNAVAILABLE.
   streamUnavailable: 'Live stream unavailable. Retry or switch to Snapshot.',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible

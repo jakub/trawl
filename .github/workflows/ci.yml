@@ -223,6 +223,52 @@ jobs:
           cargo build -p trawl-server --no-default-features
           bin/trawld-dev --version
 
+  server-mutations:
+    # Each crates/trawl-server/mutations/*.patch removes one guard. The
+    # script runs every patch's tests on the pristine tree first (the
+    # control), then applies each patch, requires nextest exit 100 (a
+    # kill), and reverts it. A build failure or a filter that matches no
+    # test fails the job; it never counts as a kill. The nets patch boots
+    # real servers, hence the same postgres service and DATABASE_URL as
+    # the test job. The workflow-level RUSTFLAGS makes every mutant compile
+    # under -D warnings.
+    name: Server guard mutations
+    runs-on: k8s-big
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=2s
+          --health-timeout=3s
+          --health-retries=15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: server-mutations
+      # Same pinned nextest as the test job, for the same filterset reason.
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
+        with:
+          tool: nextest@0.9.143
+      - name: Kill the server guard mutations
+        run: crates/trawl-server/mutations/mutation-check.sh
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
   msrv:
     name: msrv check
     runs-on: k8s-small

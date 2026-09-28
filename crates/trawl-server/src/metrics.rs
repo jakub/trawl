@@ -13,6 +13,7 @@ use std::time::Instant;
 use metrics::{describe_counter, describe_gauge, describe_histogram, gauge};
 
 use crate::hot_buffer::HotBuffer;
+use crate::publication::PublicationGate;
 
 // -- metric name constants ---------------------------------------------------
 
@@ -46,7 +47,8 @@ pub const HOT_BUFFER_BYTES: &str = "trawl_hot_buffer_bytes";
 pub const HOT_BUFFER_MAX_EVENTS: &str = "trawl_hot_buffer_max_events";
 /// The full byte cap (`ingest.hot_buffer_max_bytes`).
 pub const HOT_BUFFER_MAX_BYTES: &str = "trawl_hot_buffer_max_bytes";
-/// Seconds since the oldest resident batch was inserted; 0 when empty.
+/// Age in seconds of the oldest resident batch, 0 when empty. A batch
+/// hydrated at boot counts from the time in its WAL file name.
 pub const HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS: &str = "trawl_hot_buffer_oldest_batch_age_seconds";
 /// [`crate::hot_buffer::AdmissionState`] as 0 (open), 1 (pressure) or
 /// 2 (refusing).
@@ -55,6 +57,9 @@ pub const HOT_BUFFER_ADMISSION_STATE: &str = "trawl_hot_buffer_admission_state";
 /// ([`crate::ingest::producer::ProducerKind`] ×
 /// [`crate::hot_buffer::Refusal`]); the full matrix is zero-initialized.
 pub const HOT_BUFFER_ADMISSION_REFUSALS_TOTAL: &str = "trawl_hot_buffer_admission_refusals_total";
+/// Batches dropped because their id was already resident; the resident
+/// stays. A writer bug, so any increment is worth an operator's look.
+pub const HOT_BUFFER_DUPLICATE_BATCHES_TOTAL: &str = "trawl_hot_buffer_duplicate_batches_total";
 /// The configured compaction interval, so an alert can scale the drain
 /// stall threshold to it.
 pub const COMPACTION_INTERVAL_SECONDS: &str = "trawl_compaction_interval_seconds";
@@ -68,6 +73,11 @@ pub const QUERY_PERMITS_RETAINED: &str = "trawl_query_permits_retained";
 pub const PARQUET_FILES: &str = "trawl_parquet_files_total";
 pub const PARQUET_BYTES: &str = "trawl_parquet_size_bytes";
 pub const HEALTH_CHECK: &str = "trawl_health_check";
+/// 1 while corpus reads refuse for `reason`
+/// ([`crate::publication::CorpusUnsettled`]), else 0. One series per
+/// reason, each set on its own; computed from the publication gate at
+/// every collection.
+pub const CORPUS_UNSETTLED: &str = "trawl_corpus_unsettled";
 pub const SYSLOG_EVENTS_TOTAL: &str = "trawl_syslog_events_total";
 pub const SYSLOG_PARSE_ERRORS_TOTAL: &str = "trawl_syslog_parse_errors_total";
 pub const SYSLOG_EVENTS_DROPPED_TOTAL: &str = "trawl_syslog_events_dropped_total";
@@ -142,6 +152,11 @@ pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
 /// `contradictory` or `failed` outcome leaves the marker blocking its
 /// service's compaction until a later pass or an operator resolves it.
 pub const PUBLICATION_RECOVERY_TOTAL: &str = "trawl_publication_recovery_total";
+/// WAL files boot hydration looked at, by `outcome`
+/// ([`crate::ingest::hydration::HydrationOutcome`]); `unlisted` counts
+/// scopes that could not be listed. Any outcome but `hydrated` leaves
+/// overhang, so corpus reads stay refused until compaction proves coverage.
+pub const HYDRATION_FILES_TOTAL: &str = "trawl_hydration_files_total";
 
 /// Failed durability operations on an already-published WAL file. Each
 /// failure rejects the write it belonged to.
@@ -292,6 +307,7 @@ pub fn init_operational_alert_metrics() {
         SYSLOG_WAL_EVENTS_DISCARDED_TOTAL,
         SYSLOG_WRITE_TASKS_FAILED_TOTAL,
         TELEMETRY_WAL_WRITE_FAILURES_TOTAL,
+        HOT_BUFFER_DUPLICATE_BATCHES_TOTAL,
     ] {
         metrics::counter!(name).increment(0);
     }
@@ -326,6 +342,14 @@ pub fn init_operational_alert_metrics() {
     }
     for kind in QuarantineKind::ALL {
         metrics::counter!(FILES_QUARANTINED_TOTAL, "kind" => kind.label()).increment(0);
+    }
+    // A gauge, so this sets rather than adds: collection recomputes it
+    // from the publication gate at every scrape.
+    for reason in crate::publication::CorpusUnsettled::ALL {
+        metrics::gauge!(CORPUS_UNSETTLED, "reason" => reason.label()).set(0.0);
+    }
+    for outcome in crate::ingest::hydration::HydrationOutcome::ALL {
+        metrics::counter!(HYDRATION_FILES_TOTAL, "outcome" => outcome.label()).increment(0);
     }
     init_publication_recovery_metrics();
 }
@@ -441,7 +465,8 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         HOT_BUFFER_OLDEST_BATCH_AGE_SECONDS,
-        "Seconds since the oldest resident hot-buffer batch was inserted, \
+        "Age in seconds of the oldest resident hot-buffer batch (a batch \
+         reloaded from the WAL at boot counts from its file's timestamp), \
          0 when the buffer is empty; rising past a few compaction intervals \
          means compaction is not draining"
     );
@@ -458,6 +483,11 @@ pub fn describe_metrics() {
          syslog, trawld) and kind (full = no free space, retry after \
          compaction drains; oversized = larger than the producer's ceiling, \
          can never fit)"
+    );
+    describe_counter!(
+        HOT_BUFFER_DUPLICATE_BATCHES_TOTAL,
+        "Hot-buffer batches dropped because their batch id was already \
+         resident; the resident batch is kept. Nonzero means a WAL writer bug"
     );
     describe_gauge!(
         COMPACTION_INTERVAL_SECONDS,
@@ -480,6 +510,13 @@ pub fn describe_metrics() {
     describe_gauge!(
         HEALTH_CHECK,
         "Subsystem health (1 = ok, 0 = failed), labeled by subsystem"
+    );
+    describe_gauge!(
+        CORPUS_UNSETTLED,
+        "1 while corpus reads answer 503 corpus_recovering for this reason \
+         (rollup_pending = a rollup is unresolved or the rollup scan failed; \
+         restart_backlog = WAL from before the restart is not yet proven \
+         loaded or compacted), else 0"
     );
     describe_counter!(
         SYSLOG_EVENTS_TOTAL,
@@ -515,6 +552,10 @@ pub fn describe_metrics() {
     describe_counter!(
         PUBLICATION_RECOVERY_TOTAL,
         "Compaction publication markers examined by recovery, labelled by outcome (published, unpublished, contradictory, failed); contradictory and failed markers keep their service's compaction blocked"
+    );
+    describe_counter!(
+        HYDRATION_FILES_TOTAL,
+        "WAL files boot hydration looked at, labelled by outcome (hydrated, capacity, oversized, undecodable, unreadable, claimed, unlisted; unlisted counts scopes); any outcome but hydrated keeps corpus reads refused until compaction proves coverage"
     );
     describe_counter!(
         FILES_QUARANTINED_TOTAL,
@@ -1049,7 +1090,8 @@ fn headroom_cache() -> &'static StorageCache<crate::capacity::HeadroomSample> {
     CACHE.get_or_init(StorageCache::default)
 }
 
-/// Update gauges that require periodic polling (hot buffer + parquet + WAL files).
+/// Update gauges that require periodic polling (hot buffer + corpus state +
+/// parquet + WAL files).
 ///
 /// Called by Prometheus scrapes and the stats emitter. Filesystem scans and
 /// competing attempts may block; dashboard readers only read the short cache.
@@ -1059,6 +1101,7 @@ fn headroom_cache() -> &'static StorageCache<crate::capacity::HeadroomSample> {
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
 pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
+    publication: &PublicationGate,
     fallback_glob: &str,
     wal_dir: Option<&Path>,
     retained_permits: usize,
@@ -1067,6 +1110,14 @@ pub fn collect_gauges(
     // Callers snapshot the pool count before collection. No pool registry lock
     // travels with this number through a storage scan or attempt-owner wait.
     metrics::gauge!(QUERY_PERMITS_RETAINED).set(retained_permits as f64);
+
+    // Read from the gate now, never cached: each reason's series is its own
+    // 0/1, so a switch from one reason to the other shows in both.
+    let unsettled = publication.unsettled_reasons();
+    for reason in crate::publication::CorpusUnsettled::ALL {
+        metrics::gauge!(CORPUS_UNSETTLED, "reason" => reason.label())
+            .set(if unsettled.contains(reason) { 1.0 } else { 0.0 });
+    }
 
     if let Some(buf) = hot_buffer {
         metrics::gauge!(HOT_BUFFER_EVENTS).set(buf.event_count() as f64);
@@ -2550,6 +2601,7 @@ mod tests {
                 "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"oversized\"}",
                 "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"full\"}",
                 "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"oversized\"}",
+                "trawl_hot_buffer_duplicate_batches_total",
                 "trawl_syslog_wal_events_discarded_total",
                 "trawl_syslog_write_tasks_failed_total",
                 "trawl_telemetry_wal_write_failures_total",
@@ -2577,6 +2629,15 @@ mod tests {
                 "trawl_retention_deletions_total{trigger=\"age\"}",
                 "trawl_retention_deletions_total{trigger=\"disk_pressure\"}",
                 "trawl_retention_pressure_attempts_total",
+                "trawl_corpus_unsettled{reason=\"rollup_pending\"}",
+                "trawl_corpus_unsettled{reason=\"restart_backlog\"}",
+                "trawl_hydration_files_total{outcome=\"hydrated\"}",
+                "trawl_hydration_files_total{outcome=\"capacity\"}",
+                "trawl_hydration_files_total{outcome=\"oversized\"}",
+                "trawl_hydration_files_total{outcome=\"undecodable\"}",
+                "trawl_hydration_files_total{outcome=\"unreadable\"}",
+                "trawl_hydration_files_total{outcome=\"claimed\"}",
+                "trawl_hydration_files_total{outcome=\"unlisted\"}",
             ];
             for series in selected {
                 assert_eq!(test_support::sample(&handle, series), 0);
@@ -3035,6 +3096,7 @@ mod tests {
         // With no recorder installed and no hot buffer, should be a no-op.
         collect_gauges(
             None,
+            &PublicationGate::new(),
             "/nonexistent/path/**/*.parquet",
             None,
             0,
@@ -3070,6 +3132,7 @@ mod tests {
             }));
             collect_gauges(
                 Some(&buf),
+                &buf.publication(),
                 "/nonexistent/path/**/*.parquet",
                 None,
                 0,
@@ -3094,6 +3157,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
             collect_gauges(
                 Some(&buf),
+                &buf.publication(),
                 "/nonexistent/path/**/*.parquet",
                 None,
                 0,
@@ -3121,6 +3185,7 @@ mod tests {
             );
             collect_gauges(
                 Some(&buf),
+                &buf.publication(),
                 "/nonexistent/path/**/*.parquet",
                 None,
                 0,
@@ -3135,6 +3200,74 @@ mod tests {
                 ),
                 1
             );
+        });
+    }
+
+    /// `trawl_corpus_unsettled` is computed from the gate at collection,
+    /// one 0/1 series per reason, each set on its own: precedence belongs
+    /// to health and refusals, not to the gauge (ADR-0041).
+    #[test]
+    fn corpus_unsettled_gauges_follow_the_gate_one_series_per_reason() {
+        use crate::publication::CorpusUnsettled::{RestartBacklog, RollupPending};
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-svc");
+        std::fs::write(&marker, "").unwrap();
+        let recorder = prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            describe_metrics();
+            init_operational_alert_metrics();
+            let series = |reason: crate::publication::CorpusUnsettled| {
+                test_support::sample(
+                    &handle,
+                    &format!("{CORPUS_UNSETTLED}{{reason=\"{}\"}}", reason.label()),
+                )
+            };
+            let collected = |gate: &PublicationGate| {
+                collect_gauges(
+                    None,
+                    gate,
+                    "/nonexistent/path/**/*.parquet",
+                    None,
+                    0,
+                    &crate::repin::JobGeneration::default(),
+                );
+                (series(RollupPending), series(RestartBacklog))
+            };
+            assert_eq!(
+                (series(RollupPending), series(RestartBacklog)),
+                (0, 0),
+                "zero-initialized"
+            );
+            assert_eq!(collected(&PublicationGate::new()), (0, 0));
+
+            let gate = PublicationGate::starting();
+            assert_eq!(collected(&gate), (0, 1), "starting");
+            gate.finish_hydration(true).unwrap();
+            assert_eq!(collected(&gate), (0, 1), "overhang");
+
+            // A scrape during a normal rollup: the rollup's own marker is
+            // in flight and moves no series.
+            let rollup = dir.path().join(".rollup-normal");
+            {
+                let _writer = gate.blocking_write();
+                let registration = gate.mark_rollup(&rollup);
+                std::fs::write(&rollup, "").unwrap();
+                assert_eq!(collected(&gate), (0, 1), "during a rollup");
+                std::fs::remove_file(&rollup).unwrap();
+                registration.finish();
+            }
+            assert_eq!(collected(&gate), (0, 1), "after the rollup");
+            {
+                let _writer = gate.blocking_write();
+                drop(gate.mark_rollup(&marker));
+            }
+            assert_eq!(collected(&gate), (1, 1), "each reason on its own series");
+            gate.settle_overhang(&gate.blocking_write());
+            assert_eq!(collected(&gate), (1, 0));
+            std::fs::remove_file(&marker).unwrap();
+            assert_eq!(collected(&gate), (0, 0), "settled");
         });
     }
 
@@ -3189,6 +3322,7 @@ mod tests {
             }));
             collect_gauges(
                 Some(&buf),
+                &buf.publication(),
                 "/nonexistent/path/**/*.parquet",
                 None,
                 0,

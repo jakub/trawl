@@ -133,6 +133,11 @@ pub enum ErrorCode {
     /// request (413, no `Retry-After`): it can never fit, so the sender
     /// must split it (ADR-0043).
     IngestBatchTooLarge,
+    /// The server refuses corpus reads until it can prove the corpus
+    /// complete again (503, no `Retry-After`): it is still loading data
+    /// written before a restart, or an interrupted storage rollup is
+    /// unresolved (ADR-0041). The failure record's cause kind says which.
+    CorpusRecovering,
 }
 
 /// Source location within a query string.
@@ -269,7 +274,10 @@ pub struct HealthResponse {
     /// Per-subsystem check results: `"ok"` or `"error"` for `duckdb`,
     /// `auth_db`, `storage_db` and `data_path`; `"ok"` or `"refusing"` for
     /// `ingest_capacity`, which reads `"refusing"` while hot-buffer
-    /// admission is refusing ingest (non-critical, so `Degraded`).
+    /// admission is refusing ingest; `"ok"`, `"rollup_pending"` or
+    /// `"restart_backlog"` for `corpus`, which names why corpus reads
+    /// answer `corpus_recovering`. The last two are non-critical, so
+    /// `Degraded`.
     ///
     /// The daemon always fills this; optional so a body that omits it parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2498,6 +2506,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::IngestBatchTooLarge).unwrap(),
             "\"ingest_batch_too_large\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::CorpusRecovering).unwrap(),
+            "\"corpus_recovering\""
         );
     }
 

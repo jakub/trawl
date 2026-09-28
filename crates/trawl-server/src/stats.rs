@@ -57,6 +57,7 @@ pub fn spawn_stats_emitter(
                         hot_buffer.as_ref(),
                     );
                     let hot_buffer = hot_buffer.clone();
+                    let publication = pool.publication();
                     let fallback_glob = fallback_glob.clone();
                     let wal_dir = wal_dir.clone();
                     let repin_jobs = Arc::clone(&repin_jobs);
@@ -67,6 +68,7 @@ pub fn spawn_stats_emitter(
                     tokio::task::spawn_blocking(move || {
                         crate::metrics::collect_gauges(
                             hot_buffer.as_ref(),
+                            &publication,
                             &fallback_glob,
                             wal_dir.as_deref(),
                             retained_permits,

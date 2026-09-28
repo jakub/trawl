@@ -30,6 +30,7 @@ use trawl_api::{
 /// has not met.
 const CHECK_NAMES: &[(&str, &str)] = &[
     ("auth_db", "Authentication database"),
+    ("corpus", "Corpus"),
     ("data_path", "Data path"),
     ("duckdb", "Query engine"),
     ("ingest_capacity", "Ingest capacity"),
@@ -46,11 +47,16 @@ fn check_name(key: &str) -> Option<&'static str> {
 
 /// The badge for one check result: `ok` is healthy, `ingest_capacity`'s
 /// `refusing` is a warning (ingest is pushed back while queries still
-/// serve, ADR-0043), and any other value is a failure shown verbatim.
+/// serve, ADR-0043), and so are `corpus`'s `rollup_pending` and
+/// `restart_backlog` (corpus reads are refused until the corpus settles,
+/// which needs no restart, ADR-0041). Any other value is a failure shown
+/// verbatim.
 fn check_badge(key: &str, result: &str) -> (Tone, String) {
     match (key, result) {
         (_, "ok") => (Tone::Success, "Healthy".to_owned()),
         ("ingest_capacity", "refusing") => (Tone::Warn, "Refusing".to_owned()),
+        ("corpus", "rollup_pending") => (Tone::Warn, "Rollup pending".to_owned()),
+        ("corpus", "restart_backlog") => (Tone::Warn, "Restart backlog".to_owned()),
         _ => (Tone::Danger, result.to_owned()),
     }
 }

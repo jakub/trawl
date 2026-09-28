@@ -442,6 +442,7 @@ async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgP
     // The hot snapshot carries the folded key and no unfolded spelling.
     let snap = hot_buffer
         .snapshot()
+        .unwrap()
         .expect("event must be in the hot buffer");
     let content = std::fs::read_to_string(snap.path()).unwrap();
     assert!(

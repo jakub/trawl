@@ -42,7 +42,7 @@ use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues};
 use crate::store::{
     HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus, SavedQuery, Schedule,
-    ScheduleWithStats, format_interval, parse_duration_secs, parse_interval,
+    ScheduleWithStats, StoreError, format_interval, parse_duration_secs, parse_interval,
 };
 use crate::transport::http::RequestId;
 use trawl_engine::timing::QueryPhase;
@@ -557,6 +557,7 @@ pub async fn query(
 /// to avoid stalling the async executor.
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let hot_buffer = state.query.hot_buffer.clone();
+    let publication = state.query.pool.publication();
     let fallback_glob = state.query.pool.fallback_glob().to_owned();
     // Read here, on the reactor: the closure below deliberately holds no
     // pool state, so the registry lock never travels onto the blocking
@@ -573,6 +574,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         metrics_process::Collector::default().collect();
         crate::metrics::collect_gauges(
             hot_buffer.as_ref(),
+            &publication,
             &fallback_glob,
             wal_dir.as_deref(),
             retained_permits,
@@ -636,12 +638,14 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         crate::transport::failure::record_error(err);
     }
 
-    let mut checks = HashMap::with_capacity(5);
+    let mut checks = HashMap::with_capacity(6);
     let duckdb_healthy = duckdb_result.is_ok();
     let auth_healthy = auth_result.is_ok();
     let storage_healthy = storage_result.is_ok();
     let data_healthy = data_result.is_ok();
     let ingest_admitting = ingest_capacity_admitting(state.query.hot_buffer.as_deref());
+    let corpus = corpus_check(&state.query.pool.publication());
+    let corpus_settled = corpus == "ok";
     let check_value = |healthy| String::from(if healthy { "ok" } else { "error" });
 
     checks.insert("duckdb".into(), check_value(duckdb_healthy));
@@ -652,6 +656,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         "ingest_capacity".into(),
         String::from(ingest_capacity_check(ingest_admitting)),
     );
+    checks.insert("corpus".into(), String::from(corpus));
 
     metrics::gauge!("trawl_health_check", "subsystem" => "duckdb").set(if duckdb_healthy {
         1.0
@@ -675,6 +680,11 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     });
     metrics::gauge!("trawl_health_check", "subsystem" => "ingest_capacity")
         .set(if ingest_admitting { 1.0 } else { 0.0 });
+    metrics::gauge!("trawl_health_check", "subsystem" => "corpus").set(if corpus_settled {
+        1.0
+    } else {
+        0.0
+    });
 
     let status = derive_health_status(
         duckdb_healthy,
@@ -682,6 +692,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         storage_healthy,
         data_healthy,
         ingest_admitting,
+        corpus_settled,
     );
     let http_status = match status {
         HealthStatus::Ok | HealthStatus::Degraded => StatusCode::OK,
@@ -715,12 +726,22 @@ const fn ingest_capacity_check(admitting: bool) -> &'static str {
     if admitting { "ok" } else { "refusing" }
 }
 
+/// The `corpus` check's wire value: `"ok"`, or the reason corpus reads
+/// refuse, by the same precedence the refusal uses (ADR-0041). Takes no
+/// publication guard, so a long publication never stalls the probe.
+fn corpus_check(publication: &crate::publication::PublicationGate) -> &'static str {
+    publication
+        .unsettled()
+        .map_or("ok", crate::publication::CorpusUnsettled::label)
+}
+
 /// Derive overall health status from individual subsystem results.
 ///
 /// - All green → `Ok`
 /// - Any non-critical (`auth_db`, `storage_db`, `data_path`,
-///   `ingest_capacity`) fails → `Degraded` (HTTP 200 — the query path can
-///   still serve)
+///   `ingest_capacity`, `corpus`) fails → `Degraded` (HTTP 200 — the query
+///   path can still serve, or for `corpus` serves again once compaction
+///   settles it, so no probe may restart the server)
 /// - Any critical (duckdb) fails → `Unavailable`
 #[allow(clippy::fn_params_excessive_bools)] // subsystem flags, call sites are named
 fn derive_health_status(
@@ -729,11 +750,12 @@ fn derive_health_status(
     storage_ok: bool,
     data_ok: bool,
     ingest_admitting: bool,
+    corpus_settled: bool,
 ) -> HealthStatus {
     if !duckdb_ok {
         return HealthStatus::Unavailable;
     }
-    if !auth_ok || !storage_ok || !data_ok || !ingest_admitting {
+    if !auth_ok || !storage_ok || !data_ok || !ingest_admitting || !corpus_settled {
         return HealthStatus::Degraded;
     }
     HealthStatus::Ok
@@ -2851,7 +2873,10 @@ pub async fn runs_stats(
 ///
 /// No schedule is a 400: there is nothing to record a run under. A run in
 /// progress, a reached `max_runs` and an empty `since_last` window are 409s:
-/// the request is well formed, and the schedule's state refuses it.
+/// the request is well formed, and the schedule's state refuses it. A saved
+/// query that does not exist or that another key owns is a 404, whatever
+/// the corpus state. An unsettled corpus is then a 503
+/// `corpus_recovering`, answered before the claim, so it creates no run.
 pub async fn trigger_run(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2862,6 +2887,25 @@ pub async fn trigger_run(
     }
 
     let key_id = verified.id;
+
+    // A missing or foreign id is a 404 even while the corpus is unsettled.
+    // The lookup locks and claims nothing; the claim below checks
+    // ownership again under its own lock, and that check decides.
+    if state.storage.saved.get(saved_id, key_id).await?.is_none() {
+        return Err(StoreError::NotFound {
+            id: saved_id,
+            resource: "saved query",
+        }
+        .into());
+    }
+
+    // Before the claim, which creates the run and plans its window from
+    // the schedule: a run the corpus gate refused afterwards would record a
+    // failure for a window nothing read (ADR-0041). No guard is held; the
+    // run's own read is still the door.
+    if let Some(reason) = state.query.pool.publication().unsettled() {
+        return Err(ServerError::CorpusRecovering(reason));
+    }
 
     // One transaction: lock the saved query and read the DSL from it, lock
     // the schedule, refuse or plan, claim the run. The ownership check
@@ -4090,7 +4134,7 @@ mod tests {
     #[test]
     fn health_all_ok() {
         assert_eq!(
-            derive_health_status(true, true, true, true, true),
+            derive_health_status(true, true, true, true, true, true),
             HealthStatus::Ok
         );
     }
@@ -4098,7 +4142,7 @@ mod tests {
     #[test]
     fn health_auth_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, false, true, true, true),
+            derive_health_status(true, false, true, true, true, true),
             HealthStatus::Degraded
         );
     }
@@ -4108,7 +4152,7 @@ mod tests {
         // App-state store loss is non-critical: queries still serve, so the
         // wire contract is Degraded + HTTP 200 (never a liveness failure).
         assert_eq!(
-            derive_health_status(true, true, false, true, true),
+            derive_health_status(true, true, false, true, true, true),
             HealthStatus::Degraded
         );
     }
@@ -4116,7 +4160,7 @@ mod tests {
     #[test]
     fn health_data_path_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, true, true, false, true),
+            derive_health_status(true, true, true, false, true, true),
             HealthStatus::Degraded
         );
     }
@@ -4124,7 +4168,7 @@ mod tests {
     #[test]
     fn health_all_noncritical_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, false, false, false, true),
+            derive_health_status(true, false, false, false, true, true),
             HealthStatus::Degraded
         );
     }
@@ -4134,7 +4178,7 @@ mod tests {
         // A refusing ledger is back-pressure: queries still serve, so the
         // wire contract is Degraded + HTTP 200.
         assert_eq!(
-            derive_health_status(true, true, true, true, false),
+            derive_health_status(true, true, true, true, false, true),
             HealthStatus::Degraded
         );
     }
@@ -4142,7 +4186,7 @@ mod tests {
     #[test]
     fn health_duckdb_down_while_ingest_refusing_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, true, true, true, false),
+            derive_health_status(false, true, true, true, false, true),
             HealthStatus::Unavailable
         );
     }
@@ -4209,9 +4253,71 @@ mod tests {
     }
 
     #[test]
+    fn health_corpus_unsettled_alone_is_degraded() {
+        // An unsettled corpus refuses reads but clears without a restart:
+        // Degraded + HTTP 200, so no probe restarts the server (ADR-0041).
+        assert_eq!(
+            derive_health_status(true, true, true, true, true, false),
+            HealthStatus::Degraded
+        );
+    }
+
+    #[test]
+    fn health_duckdb_down_while_corpus_unsettled_is_unavailable() {
+        assert_eq!(
+            derive_health_status(false, true, true, true, true, false),
+            HealthStatus::Unavailable
+        );
+    }
+
+    /// `checks.corpus` reads `ok`, `restart_backlog` or `rollup_pending`,
+    /// the pending rollup first when both hold (ADR-0041).
+    #[test]
+    fn corpus_check_reads_ok_restart_backlog_or_rollup_pending() {
+        use crate::publication::PublicationGate;
+
+        assert_eq!(corpus_check(&PublicationGate::new()), "ok");
+
+        let gate = PublicationGate::starting();
+        assert_eq!(corpus_check(&gate), "restart_backlog");
+        gate.finish_hydration(true).unwrap();
+        assert_eq!(corpus_check(&gate), "restart_backlog");
+
+        let dir = tempfile::tempdir().unwrap();
+        // A probe during a normal rollup: the rollup's own marker is in
+        // flight, so the check does not flap to `rollup_pending`.
+        let rollup = dir.path().join(".rollup-normal");
+        {
+            let _writer = gate.blocking_write();
+            let registration = gate.mark_rollup(&rollup);
+            std::fs::write(&rollup, "").unwrap();
+            assert_eq!(corpus_check(&gate), "restart_backlog", "during a rollup");
+            std::fs::remove_file(&rollup).unwrap();
+            registration.finish();
+        }
+        assert_eq!(corpus_check(&gate), "restart_backlog", "after the rollup");
+
+        let marker = dir.path().join(".rollup-svc");
+        std::fs::write(&marker, "").unwrap();
+        {
+            let _writer = gate.blocking_write();
+            drop(gate.mark_rollup(&marker));
+        }
+        assert_eq!(corpus_check(&gate), "rollup_pending", "precedence");
+        gate.settle_overhang(&gate.blocking_write());
+        assert_eq!(corpus_check(&gate), "rollup_pending");
+        std::fs::remove_file(&marker).unwrap();
+        assert_eq!(corpus_check(&gate), "ok");
+
+        // The probe takes no publication guard: a held writer cannot stall it.
+        let _writer = gate.blocking_write();
+        assert_eq!(corpus_check(&gate), "ok");
+    }
+
+    #[test]
     fn health_duckdb_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, true, true, true, true),
+            derive_health_status(false, true, true, true, true, true),
             HealthStatus::Unavailable
         );
     }
@@ -4219,7 +4325,7 @@ mod tests {
     #[test]
     fn health_all_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, false, false, false, true),
+            derive_health_status(false, false, false, false, true, true),
             HealthStatus::Unavailable
         );
     }
@@ -4227,7 +4333,7 @@ mod tests {
     #[test]
     fn health_duckdb_and_noncritical_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, false, true, true, true),
+            derive_health_status(false, false, true, true, true, true),
             HealthStatus::Unavailable
         );
     }

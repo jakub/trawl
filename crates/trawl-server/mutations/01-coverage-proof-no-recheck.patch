@@ -1,0 +1,22 @@
+diff --git a/crates/trawl-server/src/ingest/coverage_proof.rs b/crates/trawl-server/src/ingest/coverage_proof.rs
+index 56002c4..72caabc 100644
+--- a/crates/trawl-server/src/ingest/coverage_proof.rs
++++ b/crates/trawl-server/src/ingest/coverage_proof.rs
+@@ -136,15 +136,8 @@ fn prove(
+     // releases its read guard, so under the write guard a candidate is
+     // resident, gone, or really left over. Only `NotFound` proves it gone.
+     let publication = gate.blocking_write();
+-    for (batch_id, path) in &candidates {
+-        let resident = batch_id.as_deref().is_some_and(|id| hot.is_resident(id));
+-        let gone = matches!(
+-            std::fs::symlink_metadata(path),
+-            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+-        );
+-        if !resident && !gone {
+-            return ProofOutcome::NotResident;
+-        }
++    if !candidates.is_empty() {
++        return ProofOutcome::NotResident;
+     }
+     gate.settle_overhang(&publication);
+     ProofOutcome::Settled

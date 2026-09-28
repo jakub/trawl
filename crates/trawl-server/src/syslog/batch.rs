@@ -498,7 +498,7 @@ impl SyslogBatcher {
 
     /// Write admitted groups through the pipeline in a blocking task.
     ///
-    /// WAL writes (`std::fs::write` + `std::fs::rename`) are synchronous
+    /// WAL writes (staged write, fsyncs, `std::fs::hard_link`) are synchronous
     /// I/O, and the pipeline takes the publication gate per group, so we
     /// run them on the blocking thread pool to avoid stalling the tokio
     /// runtime.

@@ -39,6 +39,10 @@ pub enum StatusKind {
     Hauling,
     /// Live SSE stream open.
     Live,
+    /// The server refused the snapshot as `corpus_recovering`: it cannot
+    /// yet count every stored event once. The results region shows the
+    /// recovering notice, which names a passing state, not a fault.
+    Recovering,
     /// The active result source is showing an alert; the label reports Error.
     Error,
 }
@@ -46,7 +50,7 @@ pub enum StatusKind {
 /// Everything [`search_status`] reads, in one struct so the precedence
 /// table below is one expression rather than a nest of conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Five independent predicates read off the page, not a state machine
+// Six independent predicates read off the page, not a state machine
 // hiding in a struct: the precedence between them IS `search_status`.
 #[allow(clippy::struct_excessive_bools)]
 pub struct StatusInputs {
@@ -59,6 +63,8 @@ pub struct StatusInputs {
     pub stream_failed: bool,
     /// The last snapshot request errored.
     pub snapshot_failed: bool,
+    /// That error is the server's `corpus_recovering` refusal.
+    pub snapshot_recovering: bool,
     /// A snapshot request is in flight.
     pub snapshot_pending: bool,
 }
@@ -68,15 +74,26 @@ pub struct StatusInputs {
 /// Precedence, highest first:
 /// 1. An unreadable link ran nothing, so there is no source to describe:
 ///    `Connected` even when a stale failure is still on the page.
-/// 2. The alert wins: the active source is showing one. Note that a
+/// 2. A snapshot refused as `corpus_recovering` is `Recovering`, or
+///    `Hauling` while a request is in flight: the recovering notice
+///    leaves the region while its Retry runs, so the refusal the
+///    resource still holds must not hide that request.
+/// 3. The alert wins: the active source is showing one. Note that a
 ///    resource keeps its previous `Some(Err)` while a refetch is
 ///    pending, so failed-and-pending reads `Error`, not `Hauling`.
-/// 3. A snapshot request in flight is `Hauling`.
-/// 4. Live streaming is `Live`; anything else is `Connected`.
+/// 4. A snapshot request in flight is `Hauling`.
+/// 5. Live streaming is `Live`; anything else is `Connected`.
 #[must_use]
 pub fn search_status(i: StatusInputs) -> StatusKind {
     if i.unreadable {
         return StatusKind::Connected;
+    }
+    if !i.live && i.snapshot_recovering {
+        return if i.snapshot_pending {
+            StatusKind::Hauling
+        } else {
+            StatusKind::Recovering
+        };
     }
     if (i.live && i.stream_failed) || (!i.live && i.snapshot_failed) {
         return StatusKind::Error;
@@ -166,8 +183,53 @@ mod tests {
         live: false,
         stream_failed: false,
         snapshot_failed: false,
+        snapshot_recovering: false,
         snapshot_pending: false,
     };
+
+    /// The snapshot the server refused as `corpus_recovering`.
+    const RECOVERING: StatusInputs = StatusInputs {
+        snapshot_failed: true,
+        snapshot_recovering: true,
+        ..IDLE
+    };
+
+    #[test]
+    fn a_recovering_refusal_reads_recovering_not_error() {
+        // The recovering notice names a state the server is passing
+        // through, not a fault, so the footer beside it must not say
+        // Error.
+        assert_eq!(search_status(RECOVERING), StatusKind::Recovering);
+    }
+
+    #[test]
+    fn a_recovering_refusal_pending_its_retry_is_hauling() {
+        // The notice leaves the region while the Retry runs, so the
+        // retained refusal must not hide the request in flight.
+        let inputs = StatusInputs {
+            snapshot_pending: true,
+            ..RECOVERING
+        };
+        assert_eq!(search_status(inputs), StatusKind::Hauling);
+    }
+
+    #[test]
+    fn a_stale_recovering_refusal_does_not_reach_the_live_footer() {
+        let inputs = StatusInputs {
+            live: true,
+            ..RECOVERING
+        };
+        assert_eq!(search_status(inputs), StatusKind::Live);
+    }
+
+    #[test]
+    fn an_unreadable_link_is_connected_over_a_recovering_refusal() {
+        let inputs = StatusInputs {
+            unreadable: true,
+            ..RECOVERING
+        };
+        assert_eq!(search_status(inputs), StatusKind::Connected);
+    }
 
     #[test]
     fn an_idle_readable_snapshot_page_is_connected() {
@@ -183,6 +245,7 @@ mod tests {
             live: true,
             stream_failed: true,
             snapshot_failed: true,
+            snapshot_recovering: false,
             snapshot_pending: true,
         };
         assert_eq!(search_status(inputs), StatusKind::Connected);

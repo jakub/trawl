@@ -887,6 +887,31 @@ test('ingest refusal shows an amber chip and keeps the session connected', async
   await expect(page.locator(SEL.statusLabel)).toHaveText(`Connected (${host} vhealth-fixture-163)`);
 });
 
+for (const [reason, label] of [['rollup_pending', 'Rollup pending'], ['restart_backlog', 'Restart backlog']]) {
+  test(`an unsettled corpus (${reason}) is a named warning, not a failure`, async ({ page, request }) => {
+    await setup(request, 'health-viewer');
+    await page.route('**/api/v1/health', async route => {
+      const response = await route.fetch();
+      const body = await response.json();
+      // ADR-0041: corpus reads are refused until the corpus settles,
+      // which needs no restart, so the server reports degraded at 200.
+      body.status = 'degraded';
+      body.checks.corpus = reason;
+      await route.fulfill({ response, json: body });
+    });
+    await page.goto('/settings/health');
+    const health = page.locator(SEL.healthSection);
+    await expect(health.getByRole('heading')).toHaveText('Server is degraded');
+    const corpus = health.locator(SEL.healthCheck).filter({ hasText: 'Corpus' });
+    await expect(corpus.locator('.health-check-name')).toHaveText('Corpus');
+    await expect(corpus.locator('.health-check-key')).toHaveText('corpus');
+    const badge = corpus.locator('dd .bdg');
+    await expect(badge).toHaveText(label);
+    await expect(badge).toHaveClass(/\bwarn\b/);
+    await expect(corpus.locator('dd')).not.toHaveClass(/health-check-error/);
+  });
+}
+
 test('the footer re-reads health every 30 s, one read at a time, and the chip clears', async ({ page, request }) => {
   await setup(request, 'health-ingest-refusing');
   await page.clock.install();

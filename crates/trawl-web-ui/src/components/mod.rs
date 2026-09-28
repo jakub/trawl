@@ -32,6 +32,7 @@ pub mod malformed_notice;
 pub mod meta_strip;
 pub mod net_drawer;
 pub mod query_error_notice;
+pub mod recovering_notice;
 pub mod repin_modal;
 pub mod results_table;
 pub mod save_as_net_modal;

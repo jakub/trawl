@@ -58,9 +58,15 @@ could hide an unfinished rollup marker. This also stops WAL compaction and
 repin admission. Ingestion can still write durable WAL, so disk usage can
 grow until the filesystem problem is repaired and the daemon restarts.
 Repairing a known pending rollup lets the next read proceed without restart.
+_Amended 2026-09-27:_ on an ingest node, each compaction pass scans again,
+and a later complete scan clears the failure without a restart. A query-only
+node has no compaction, so it still needs a restart (ADR-0041 slice 2).
 
 The guarantee covers compaction and rollup in one daemon. It does not
 deduplicate accepted payloads, client retries, or WAL replay after a crash.
+_Amended 2026-09-27:_ ADR-0041 closes the WAL replay exclusion. Boot loads
+the surviving WAL into the hot buffer under its batch identities, and corpus
+reads refuse until compaction proves that the rest is covered.
 Two identical accepted events remain two events. Another process modifying
 the archive does not share this lock. Retention can still expire files,
 and corrupt files retain their existing error and quarantine policy.

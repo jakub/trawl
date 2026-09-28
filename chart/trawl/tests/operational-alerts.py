@@ -124,7 +124,7 @@ class OperationalAlerts(unittest.TestCase):
             self.assertEqual(len(pack["groups"]), 1)
             self.assertEqual(pack["groups"][0]["name"], "trawl.operational")
             rules = pack["groups"][0]["rules"]
-            self.assertEqual(len(rules), 13)
+            self.assertEqual(len(rules), 14)
             for actual, expected in zip(rules, EXPECTED, strict=True):
                 self.assertEqual(actual, expected_rule(expected, selector))
         normalized = copy.deepcopy(self.helm["spec"])

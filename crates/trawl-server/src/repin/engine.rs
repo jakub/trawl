@@ -36,6 +36,7 @@ use crate::catalog::conform::open_bounded_connection;
 use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
+use crate::publication::CorpusUnsettled;
 use crate::repin::cancel::{
     CancelActor, CancelHandle, CancelRegistry, CancelVerdict, Commit, PassStop, STAGE_BUILD,
     STAGE_FINAL_GATE, STAGE_SCAN, Settlement, audit_cancel_refused, audit_cancel_requested,
@@ -75,6 +76,45 @@ const FLIP_ATTEMPTS: u32 = 3;
 /// in [`RepinEngine::finish`] are exhausted (a real store outage).
 const FINISH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Why repin admission stops while the corpus is unsettled (ADR-0041).
+/// Fixed text per reason: the job row carries it, so it names no path,
+/// marker or count.
+const fn repin_blocked(reason: CorpusUnsettled) -> &'static str {
+    match reason {
+        CorpusUnsettled::RollupPending => {
+            "repin is blocked while rollup publication is incomplete; retry after recovery"
+        }
+        CorpusUnsettled::RestartBacklog => {
+            "repin is blocked while the server finishes loading data from before its restart; \
+             retry once it settles"
+        }
+    }
+}
+
+/// Why [`claim_rollup_pause`] admitted no job.
+#[derive(Debug)]
+enum AdmissionStop {
+    /// A boundary observed a cancel request.
+    Cancelled { stage: &'static str },
+    /// The job ends `blocked`. `row` is the text its job row carries, and
+    /// `refusal` is what the request answers. An unsettled corpus keeps its
+    /// typed refusal, so the request answers 503 `corpus_recovering` as
+    /// every other corpus read does (ADR-0041).
+    Blocked { row: String, refusal: ServerError },
+}
+
+impl From<PassStop> for AdmissionStop {
+    fn from(stop: PassStop) -> Self {
+        match stop {
+            PassStop::Cancelled { stage } => Self::Cancelled { stage },
+            PassStop::Failed(row) => Self::Blocked {
+                refusal: ServerError::ServiceUnavailable(row.clone()),
+                row,
+            },
+        }
+    }
+}
+
 /// Wait out an active rollup, validate its completed publication, then claim
 /// the pause before another unit can start. The corpus guard comes first,
 /// matching the rollup's lock order. Neither lock survives this admission.
@@ -82,18 +122,19 @@ async fn claim_rollup_pause(
     coordinator: &Arc<RepinCoordinator>,
     publication: &crate::publication::PublicationGate,
     cancel: &CancelHandle,
-) -> Result<RollupPause, PassStop> {
+) -> Result<RollupPause, AdmissionStop> {
     cancel.check(STAGE_SCAN)?;
     let admission = async {
         let _corpus = coordinator.cutover_guard().await;
-        let _publication = publication.read().await.map_err(|_| {
-            PassStop::Failed(
-                "repin is blocked while rollup publication is incomplete; retry after recovery"
-                    .to_owned(),
-            )
+        let _publication = publication.read().await.map_err(|error| match error {
+            ServerError::CorpusRecovering(reason) => AdmissionStop::Blocked {
+                row: repin_blocked(reason).to_owned(),
+                refusal: ServerError::CorpusRecovering(reason),
+            },
+            other => PassStop::Failed(other.safe_message()).into(),
         })?;
         cancel.check(STAGE_SCAN)?;
-        Ok(coordinator.pause_rollup())
+        Ok::<_, AdmissionStop>(coordinator.pause_rollup())
     };
     tokio::pin!(admission);
     let deadline = tokio::time::sleep(CUTOVER_DRAIN_TIMEOUT);
@@ -106,7 +147,7 @@ async fn claim_rollup_pause(
             () = &mut deadline => return Err(PassStop::Failed(
                 "repin could not wait out active rollup publication within 30 seconds; retry after it finishes"
                     .to_owned(),
-            )),
+            ).into()),
         }
     }
 }
@@ -645,19 +686,19 @@ impl RepinEngine {
         let rollup_pause = match claim_rollup_pause(&self.coordinator, &publication, &cancel).await
         {
             Ok(pause) => pause,
-            Err(PassStop::Cancelled { stage }) => {
+            Err(AdmissionStop::Cancelled { stage }) => {
                 let actor = self.settle_cancel(job_id, stage);
                 self.finish_cancelled(job_id, stage, actor).await;
                 return self.cancelled_outcome(job_id).await;
             }
-            Err(PassStop::Failed(msg)) => {
+            Err(AdmissionStop::Blocked { row, refusal }) => {
                 if self
-                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Blocked, Some(&msg))
+                    .settle_pre_cutover(job_id, STAGE_SCAN, RepinJobStatus::Blocked, Some(&row))
                     .await
                 {
                     return self.cancelled_outcome(job_id).await;
                 }
-                return Err(ServerError::ServiceUnavailable(msg));
+                return Err(refusal);
             }
         };
 
@@ -2438,14 +2479,20 @@ mod tests {
             let _writer = publication.write().await;
             let marker = root.path().join(".rollup-api");
             std::fs::write(&marker, "unfinished").unwrap();
-            publication.mark_rollup(&marker);
+            drop(publication.mark_rollup(&marker));
         }
         drop(active);
         let result = tokio::time::timeout(Duration::from_secs(1), admission)
             .await
             .expect("admission must observe the completed unit");
         if failed {
-            assert!(matches!(result, Err(PassStop::Failed(_))));
+            assert!(matches!(
+                result,
+                Err(AdmissionStop::Blocked {
+                    refusal: ServerError::CorpusRecovering(CorpusUnsettled::RollupPending),
+                    ..
+                })
+            ));
             assert!(!coordinator.rollup_paused());
         } else {
             let pause = result.unwrap();
@@ -2463,6 +2510,59 @@ mod tests {
     #[tokio::test]
     async fn repin_admission_observes_rollup_failure_before_pausing() {
         assert_rollup_admission_waits_for_unit(true).await;
+    }
+
+    /// An unsettled corpus refuses repin admission with the typed
+    /// `corpus_recovering` refusal, and the job row's fixed message names
+    /// the reason, the pending rollup first (ADR-0041).
+    #[tokio::test]
+    async fn repin_admission_names_why_the_corpus_is_unsettled() {
+        let admit = |publication: crate::publication::PublicationGate| async move {
+            let coordinator = Arc::new(RepinCoordinator::new());
+            let registry = Arc::new(CancelRegistry::default());
+            let cancel = registry.arm(1);
+            let result = claim_rollup_pause(&coordinator, &publication, &cancel).await;
+            assert!(!coordinator.rollup_paused());
+            match result {
+                Err(AdmissionStop::Blocked {
+                    row,
+                    refusal: ServerError::CorpusRecovering(reason),
+                }) => {
+                    assert_eq!(row, repin_blocked(reason));
+                    row
+                }
+                Err(other) => panic!("expected the corpus refusal, got {other:?}"),
+                Ok(_) => panic!("an unsettled corpus admitted a repin"),
+            }
+        };
+        let restart = "repin is blocked while the server finishes loading data from before its \
+                       restart; retry once it settles";
+        let rollup =
+            "repin is blocked while rollup publication is incomplete; retry after recovery";
+
+        assert_eq!(
+            admit(crate::publication::PublicationGate::starting()).await,
+            restart
+        );
+        let overhang = crate::publication::PublicationGate::starting();
+        overhang.finish_hydration(true).unwrap();
+        assert_eq!(admit(overhang).await, restart);
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join(".rollup-api");
+        std::fs::write(&marker, "unfinished").unwrap();
+        for starting in [false, true] {
+            let gate = if starting {
+                crate::publication::PublicationGate::starting()
+            } else {
+                crate::publication::PublicationGate::new()
+            };
+            {
+                let _writer = gate.write().await;
+                drop(gate.mark_rollup(&marker));
+            }
+            assert_eq!(admit(gate).await, rollup, "starting: {starting}");
+        }
     }
 
     #[tokio::test]
@@ -2483,7 +2583,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), admission)
                 .await
                 .unwrap(),
-            Err(PassStop::Cancelled { stage: STAGE_SCAN })
+            Err(AdmissionStop::Cancelled { stage: STAGE_SCAN })
         ));
         assert!(!coordinator.rollup_paused());
         let _corpus = tokio::time::timeout(Duration::from_secs(1), coordinator.compaction_guard())
@@ -2501,7 +2601,10 @@ mod tests {
         let started = tokio::time::Instant::now();
         assert!(matches!(
             claim_rollup_pause(&coordinator, &publication, &cancel).await,
-            Err(PassStop::Failed(_))
+            Err(AdmissionStop::Blocked {
+                refusal: ServerError::ServiceUnavailable(_),
+                ..
+            })
         ));
         assert_eq!(started.elapsed(), CUTOVER_DRAIN_TIMEOUT);
         assert!(!coordinator.rollup_paused());

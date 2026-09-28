@@ -21,6 +21,8 @@ use trawl_core::severity::Dialect;
 use crate::catalog::CatalogContext;
 use crate::env_dirs::{list_env_dirs, try_list_env_dirs_observed};
 use crate::hot_buffer::{AdmissionState, HotBuffer};
+use crate::ingest::coverage_proof;
+use crate::ingest::no_follow;
 use crate::ingest::publication_marker::{
     self, PublicationClaims, RecoveryOutcomeKind, ValidatedMarker,
 };
@@ -35,15 +37,27 @@ use crate::store::{FieldConflict, MAX_CONFLICT_SAMPLE_BYTES, MAX_CONFLICT_SAMPLE
 #[cfg(test)]
 const DEFAULT_CHUNK_SIZE: usize = 500;
 
-/// Why a compaction pass runs (ADR-0043).
+/// Why a compaction pass runs (ADR-0043, ADR-0041).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassKind {
+    /// The first pass, at once when the loop starts. Compacts every WAL
+    /// file whatever its age and starts no daily rollup, which keeps its
+    /// normal deadline, so WAL that boot hydration left out drains without
+    /// waiting an interval.
+    Boot,
     /// The interval deadline fired. Runs the daily rollup.
     Normal,
-    /// The hot buffer is not `Open`, or its pressure generation advanced.
-    /// Compacts every WAL file whatever its age, and skips the rollup so the
-    /// pass spends its time on draining.
+    /// The pass is [`urgent`], or the hot buffer's pressure generation
+    /// advanced. Compacts every WAL file whatever its age, and skips the
+    /// rollup so the pass spends its time on draining.
     Pressure,
+}
+
+/// Whether draining cannot wait for WAL to age: the hot buffer is not
+/// `Open` (ADR-0043), or WAL from before the restart is not yet proven
+/// covered, so corpus reads are refused (overhang, ADR-0041 slice 2).
+fn urgent(admission: AdmissionState, overhang: bool) -> bool {
+    admission != AdmissionState::Open || overhang
 }
 
 /// What one pass does: which WAL files it may take, and whether it rolls up.
@@ -54,19 +68,19 @@ struct PassPlan {
 }
 
 impl PassPlan {
-    /// A normal pass under pressure still rolls up, but takes young WAL too:
-    /// the buffer needs every drain it can get.
-    fn new(kind: PassKind, admission: AdmissionState, interval: Duration, rollup: bool) -> Self {
-        match (kind, admission) {
-            (PassKind::Normal, AdmissionState::Open) => Self {
+    /// A normal pass that is [`urgent`] still rolls up, but takes young WAL
+    /// too: the buffer, or the overhang, needs every drain it can get.
+    fn new(kind: PassKind, urgent: bool, interval: Duration, rollup: bool) -> Self {
+        match (kind, urgent) {
+            (PassKind::Normal, false) => Self {
                 wal_min_age: interval,
                 daily_rollup: rollup,
             },
-            (PassKind::Normal, _) => Self {
+            (PassKind::Normal, true) => Self {
                 wal_min_age: Duration::ZERO,
                 daily_rollup: rollup,
             },
-            (PassKind::Pressure, _) => Self {
+            (PassKind::Boot | PassKind::Pressure, _) => Self {
                 wal_min_age: Duration::ZERO,
                 daily_rollup: false,
             },
@@ -76,26 +90,37 @@ impl PassPlan {
 
 /// When the compaction loop runs its next pass.
 ///
+/// The first pass runs at once ([`PassKind::Boot`]), whatever the admission
+/// state. It takes WAL of every age and starts no daily rollup; the normal
+/// deadline stays one interval after the start (ADR-0041 slice 2).
+///
 /// The normal deadline is independent of pressure: only a normal pass moves
 /// it, so continuous pressure can never postpone the rollup.
 ///
-/// Pressure passes follow what the last pass reported ([`PassOutcome`]):
-/// `eligible`, the WAL files its scan selected; `drained`, the batches it
-/// compacted and drained; and `persistent_failures`, its failed chunks,
-/// blocking publication markers and failed or incomplete WAL scans. The
-/// first rule that matches decides:
+/// A pass is [`urgent`] while the hot buffer is not `Open` or overhang
+/// holds. Pressure passes follow what the last pass reported
+/// ([`PassOutcome`]): `eligible`, the WAL files its scan selected;
+/// `drained`, the batches it compacted and drained plus the interrupted
+/// publishes recovery finished; `persistent_failures`, its failed chunks,
+/// blocking publication markers and failed or incomplete WAL scans; and
+/// `overhang`, whether overhang still held when it ended. The first rule
+/// that matches decides:
 ///
-/// 1. **Cooldown** when `persistent_failures > 0`, or when `eligible > 0`
-///    and `drained == 0`. The WAL is stuck, and a rerun would fail or skip
-///    it the same way. Pressure is ignored until the next normal pass, at
-///    most one interval away: no refusal, insert or pressure wake starts a
-///    pass, and only the normal deadline or shutdown ends the wait. The
+/// 1. **Cooldown** when `persistent_failures > 0`, or when `drained == 0`
+///    and either `eligible > 0` or `overhang`. The WAL is stuck, or the
+///    coverage proof failed with nothing drained, and a rerun would fail or
+///    skip it the same way. Pressure is ignored until the next normal pass,
+///    at most one interval away: no refusal, insert or pressure wake starts
+///    a pass, and only the normal deadline or shutdown ends the wait. The
 ///    admission state after the pass plays no part.
-/// 2. **Rerun** at once when `drained > 0` and the buffer is not `Open`.
+/// 2. **Rerun** at once when `drained > 0` and the pass after it is urgent.
 /// 3. **Wait** otherwise, for a pressure wake or the normal deadline. When
 ///    the pass took WAL of every age and still found none, only a wake
 ///    after a new insert starts a pass (see below). After a pass that took
 ///    only WAL older than the interval, any wake does.
+///
+/// While overhang holds, no pass waits for an insert: a pass that ends
+/// with overhang either drained something and reruns, or cools down.
 ///
 /// The cooldown ignores the admission state and the drained batches because
 /// a stall feeds itself. Its error lines reach self-telemetry, and those
@@ -126,10 +151,10 @@ impl PassPlan {
 ///
 /// Bounds between two normal passes: at most one pass that fails or skips
 /// its WAL, since each starts a cooldown. Every other pressure pass follows
-/// a normal pass, a pass that drained at least one batch, or an insert
-/// since the last empty pass. Each batch drains once, so the pass count is
-/// bounded by the batches inserted, never by the refusals. Without a hot
-/// buffer, the loop runs normal passes only.
+/// the boot pass, a normal pass, a pass that drained at least one batch, or
+/// an insert since the last empty pass. Each batch drains once, so the pass
+/// count is bounded by the batches inserted, never by the refusals. Without
+/// a hot buffer, the loop runs the boot pass and then normal passes only.
 #[derive(Debug)]
 struct Cadence {
     interval: Duration,
@@ -137,12 +162,12 @@ struct Cadence {
     next: Next,
 }
 
-/// What starts the next pressure pass ([`Cadence`]).
+/// What starts the next pass before the normal deadline ([`Cadence`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Next {
-    /// A pass at once while the buffer is not `Open`, or any pressure wake.
-    /// The state at startup, so a loop that starts under pressure drains
-    /// without waiting for a wake.
+    /// The boot pass, at once: the state at startup.
+    Boot,
+    /// A pass at once while the pass is [`urgent`], or any pressure wake.
     Rerun,
     /// Any pressure wake.
     Wake,
@@ -158,16 +183,19 @@ impl Cadence {
         Self {
             interval,
             next_normal: deadline_after(start, interval),
-            next: Next::Rerun,
+            next: Next::Boot,
         }
     }
 
-    /// The pass due at `now` without waiting, if any. The normal deadline
-    /// comes first, so back-to-back pressure passes cannot starve it.
-    fn due(&self, now: Instant, admission: AdmissionState) -> Option<PassKind> {
-        if now >= self.next_normal {
+    /// The pass due at `now` without waiting, if any. The boot pass comes
+    /// first, so the first pass never rolls up. The normal deadline comes
+    /// next, so back-to-back pressure passes cannot starve it.
+    fn due(&self, now: Instant, urgent: bool) -> Option<PassKind> {
+        if self.next == Next::Boot {
+            Some(PassKind::Boot)
+        } else if now >= self.next_normal {
             Some(PassKind::Normal)
-        } else if self.next == Next::Rerun && admission != AdmissionState::Open {
+        } else if self.next == Next::Rerun && urgent {
             Some(PassKind::Pressure)
         } else {
             None
@@ -183,32 +211,32 @@ impl Cadence {
     /// [`HotBuffer::inserted_batches`] read after the wake.
     fn wake_starts_pass(&self, inserted: u64) -> bool {
         match self.next {
-            Next::Rerun | Next::Wake => true,
+            Next::Boot | Next::Rerun | Next::Wake => true,
             Next::Insert(before) => inserted != before,
             Next::Cooldown => false,
         }
     }
 
-    /// Record a finished pass: its kind and plan, what it reported, the
-    /// admission state after it, and [`HotBuffer::inserted_batches`] as read
-    /// before it scanned the WAL.
+    /// Record a finished pass: its kind and plan, what it reported, whether
+    /// a pass is [`urgent`] after it, and [`HotBuffer::inserted_batches`]
+    /// as read before it scanned the WAL.
     fn finished(
         &mut self,
         kind: PassKind,
         plan: PassPlan,
         now: Instant,
         outcome: &PassOutcome,
-        admission: AdmissionState,
+        urgent: bool,
         inserted_before: u64,
     ) {
         if kind == PassKind::Normal {
             self.next_normal = deadline_after(now, self.interval);
         }
-        let stuck =
-            outcome.persistent_failures > 0 || (outcome.eligible > 0 && outcome.drained == 0);
+        let stuck = outcome.persistent_failures > 0
+            || (outcome.drained == 0 && (outcome.eligible > 0 || outcome.overhang));
         self.next = if stuck {
             Next::Cooldown
-        } else if outcome.drained > 0 && admission != AdmissionState::Open {
+        } else if outcome.drained > 0 && urgent {
             Next::Rerun
         } else if outcome.eligible == 0 && plan.wal_min_age.is_zero() {
             Next::Insert(inserted_before)
@@ -246,11 +274,15 @@ async fn pressure_changed(
 /// Groups by service and writes parquet to
 /// `data_dir/{env}/{date}/{HH}/{service}.parquet`.
 ///
-/// Between normal passes, hot-buffer pressure (ADR-0043) starts extra
-/// passes: when the buffer is not `Open` or its pressure generation
-/// advances, a pass compacts every WAL file whatever its age and skips the
-/// rollup. A normal pass that fires while the buffer is not `Open` also
-/// takes young WAL. See [`Cadence`] for how pressure passes stay bounded.
+/// The first pass runs at once: it compacts every WAL file whatever its age
+/// and skips the rollup. Between normal passes, hot-buffer pressure
+/// (ADR-0043) starts extra passes: when the buffer is not `Open` or its
+/// pressure generation advances, a pass compacts every WAL file whatever
+/// its age and skips the rollup. Overhang (ADR-0041 slice 2) makes every
+/// pass as urgent as pressure does, and each pass ends its WAL phase with
+/// a coverage proof ([`coverage_proof`]) until one clears it. A normal pass
+/// that fires while urgent also takes young WAL. See [`Cadence`] for how
+/// the extra passes stay bounded.
 ///
 /// Stops when `shutdown_rx` receives a signal.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // internal API, config struct is overkill here
@@ -280,10 +312,14 @@ pub fn spawn_compaction(
             "compaction task started"
         );
 
-        let admission = || {
-            hot_buffer
-                .as_ref()
-                .map_or(AdmissionState::Open, |buf| buf.admission_state())
+        let publication = hot_buffer.as_ref().map(|buf| buf.publication());
+        let is_urgent = || {
+            urgent(
+                hot_buffer
+                    .as_ref()
+                    .map_or(AdmissionState::Open, |buf| buf.admission_state()),
+                publication.as_ref().is_some_and(|gate| gate.overhang()),
+            )
         };
         let inserted = || hot_buffer.as_ref().map_or(0, |buf| buf.inserted_batches());
         let mut pressure = hot_buffer.as_ref().map(|buf| buf.subscribe_pressure());
@@ -300,7 +336,7 @@ pub fn spawn_compaction(
                 );
                 break;
             }
-            let kind = if let Some(kind) = cadence.due(Instant::now(), admission()) {
+            let kind = if let Some(kind) = cadence.due(Instant::now(), is_urgent()) {
                 kind
             } else {
                 let next_normal = cadence.next_normal;
@@ -331,6 +367,15 @@ pub fn spawn_compaction(
                     }
                 }
             };
+            #[cfg(any(test, feature = "test-support"))]
+            if kind == PassKind::Boot && !hold_boot_pass_for_test(&mut shutdown_rx).await {
+                tracing::info!(
+                    event_type = "lifecycle",
+                    action = "compaction_stop",
+                    "compaction task shutting down"
+                );
+                break;
+            }
 
             // Generations up to here are answered by this pass; one that
             // advances during it wakes the loop again.
@@ -340,12 +385,17 @@ pub fn spawn_compaction(
             // Read before the scan: a batch inserted after this has a WAL
             // file the scan may miss, and moves the count.
             let inserted_before = inserted();
-            let plan = PassPlan::new(kind, admission(), interval, daily_rollup);
-            if kind == PassKind::Pressure {
-                tracing::debug!(
+            let plan = PassPlan::new(kind, is_urgent(), interval, daily_rollup);
+            match kind {
+                PassKind::Boot => tracing::debug!(
+                    event_type = "compaction_boot_pass",
+                    "first pass since boot; compacting all WAL now"
+                ),
+                PassKind::Pressure => tracing::debug!(
                     event_type = "compaction_pressure_pass",
-                    "hot buffer under pressure; compacting all WAL now"
-                );
+                    "hot buffer under pressure or overhang; compacting all WAL now"
+                ),
+                PassKind::Normal => {}
             }
             let outcome = match compact_pass(
                 &wal_dir,
@@ -401,11 +451,43 @@ pub fn spawn_compaction(
                 plan,
                 Instant::now(),
                 &outcome,
-                admission(),
+                is_urgent(),
                 inserted_before,
             );
         }
     })
+}
+
+/// Hold the boot pass until a test harness releases it. Only builds with
+/// `test-support` (and unit tests) carry the hold; release builds never
+/// reach it.
+///
+/// `TRAWL_TEST_HOLD_BOOT_PASS` names a release file. When it is set, the
+/// boot pass logs `event_type = "test_hold_point"` before it reads the WAL
+/// or the corpus, then waits until that file exists. A real-process test
+/// uses the hold to read the corpus after a restart while no pass can have
+/// published anything yet (ADR-0041 slice 2). Returns `false` when shutdown
+/// arrives first, so a held daemon still stops.
+#[cfg(any(test, feature = "test-support"))]
+async fn hold_boot_pass_for_test(shutdown_rx: &mut watch::Receiver<bool>) -> bool {
+    let Some(release) = std::env::var_os("TRAWL_TEST_HOLD_BOOT_PASS").map(PathBuf::from) else {
+        return true;
+    };
+    tracing::warn!(
+        event_type = "test_hold_point",
+        point = "compaction:boot_pass",
+        "holding the boot pass until its release file exists"
+    );
+    let released = async {
+        while !tokio::fs::try_exists(&release).await.unwrap_or(false) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = shutdown_rx.changed() => false,
+        () = released => true,
+    }
 }
 
 /// Run one compaction cycle.
@@ -462,7 +544,9 @@ pub async fn compact_once(
 /// Each tick first recovers interrupted compaction publishes from their
 /// publication markers (ADR-0041) under the corpus gate, and skips every
 /// `(env, service)` a marker still claims. Each chunk then publishes under
-/// its own marker: see [`publish_output`].
+/// its own marker: see [`publish_output`]. While hydration's overhang
+/// awaits a proof, the WAL phase ends with a coverage proof
+/// ([`coverage_proof`]), before the rollup.
 ///
 /// `min_age` is the compaction interval: orphaned `.parquet.tmp` files
 /// older than twice it are removed. `wal_min_age` selects the WAL files the
@@ -509,9 +593,10 @@ struct PassOutcome {
     eligible: u64,
     /// Batches this pass compacted and drained: the WAL files of every chunk
     /// that published or was quarantined whole, whether or not the hot
-    /// buffer held their batch. The buffer starts empty on boot, so a
-    /// buffer delta would read a healthy first pass over surviving WAL as
-    /// stuck.
+    /// buffer held their batch, plus each interrupted publish that marker
+    /// recovery finished at the pass's start, which retired its WAL. WAL
+    /// that boot hydration left out (overhang, ADR-0041) is not resident, so
+    /// a buffer delta would read a healthy pass over it as stuck.
     drained: u64,
     /// What will stop the next pass the same way: failed chunks (an error,
     /// or a publish that did not finish), blocking publication markers,
@@ -520,6 +605,9 @@ struct PassOutcome {
     /// a quarantined file leaves the WAL, and a failed rollup does not
     /// stop the WAL from draining. See [`Cadence`].
     persistent_failures: u64,
+    /// Overhang still held when the pass ended: its coverage proof failed,
+    /// or hydration had not finished. See [`Cadence`].
+    overhang: bool,
 }
 
 /// [`compact_once_coordinated`], with the counts the loop's cadence needs.
@@ -542,6 +630,9 @@ async fn compact_pass(
     let publication =
         hot_buffer.map_or_else(|| Arc::new(PublicationGate::new()), |buf| buf.publication());
     publication.initialize(data_dir);
+    // A failed marker scan refuses every read until a complete scan
+    // replaces it, and compaction is what retries it (ADR-0041 slice 2).
+    publication.rescan_if_failed(data_dir);
     recover_pending_rollups(&publication, repin).await?;
 
     // Tally of corrupt WAL files quarantined this cycle. Folded into the
@@ -590,8 +681,13 @@ async fn compact_pass(
     // tick can merge a WAL file a marker names or clean up a claimed tmp.
     // Markers recovery could not resolve count as errors and keep their
     // service out of this tick.
-    let (recovery_blocked, claims) =
-        recover_publications(wal_dir, data_dir, hot_buffer, repin).await?;
+    let PublicationRecovery {
+        blocked: recovery_blocked,
+        retired,
+        claims,
+    } = recover_publications(wal_dir, data_dir, hot_buffer, repin).await?;
+    // A finished publish retired its WAL: progress, as a drained chunk is.
+    drained += retired;
 
     // Remove orphaned .parquet.tmp files from interrupted compaction runs,
     // except any a pending marker still claims: recovery needs that tmp to
@@ -730,6 +826,21 @@ async fn compact_pass(
         }
     }
 
+    // Prove the WAL from before the restart covered (ADR-0041 slice 2) now
+    // that this pass has drained what it could, before the rollup. Only the
+    // overhang a finished hydration left awaits a proof: a gate still
+    // starting has nothing to prove yet.
+    if let Some(buf) = hot_buffer
+        && publication.awaits_coverage_proof()
+    {
+        let proof = prove_coverage_blocking(wal_dir, buf).await?;
+        tracing::info!(
+            event_type = "coverage_proof",
+            outcome = proof.label(),
+            "coverage proof after the WAL phase"
+        );
+    }
+
     // After WAL compaction, consolidate older days' hourly files into
     // per-service daily files. This dramatically reduces file count for
     // long lookback queries. Rollup is best-effort: a failure for one
@@ -786,7 +897,34 @@ async fn compact_pass(
             + recovery_blocked
             + scan_failures
             + root_scan_incomplete,
+        overhang: publication.overhang(),
     })
+}
+
+/// [`coverage_proof::prove_coverage`] on a blocking thread, against the
+/// buffer's own publication gate: the one its producers hold.
+async fn prove_coverage_blocking(
+    wal_dir: &Path,
+    hot_buffer: &Arc<HotBuffer>,
+) -> Result<coverage_proof::ProofOutcome, String> {
+    let wal_dir = wal_dir.to_path_buf();
+    let hot_buffer = Arc::clone(hot_buffer);
+    tokio::task::spawn_blocking(move || {
+        coverage_proof::prove_coverage(&wal_dir, &hot_buffer, &hot_buffer.publication())
+    })
+    .await
+    .map_err(|e| crate::error::join_failure_text("coverage proof", e))
+}
+
+/// What [`recover_publications`] resolved and what it left.
+struct PublicationRecovery {
+    /// Markers that stay blocking: contradictions and failed recoveries.
+    blocked: u64,
+    /// Markers whose publish recovery finished, retiring their WAL
+    /// ([`publication_marker::RecoveryReport::retired`]).
+    retired: u64,
+    /// What the markers left behind still claim.
+    claims: PublicationClaims,
 }
 
 /// Finish or roll back every interrupted compaction publish (ADR-0041), then
@@ -799,14 +937,15 @@ async fn compact_pass(
 /// order: corpus, then publication).
 ///
 /// Returns how many markers stay blocking (contradictions and failed
-/// recoveries, each also counted on `trawl_publication_recovery_total`) and
-/// the claims compaction must skip. An unreadable WAL root is an error.
+/// recoveries, each also counted on `trawl_publication_recovery_total`),
+/// how many finished their publish, and the claims compaction must skip.
+/// An unreadable WAL root is an error.
 async fn recover_publications(
     wal_dir: &Path,
     data_dir: &Path,
     hot_buffer: Option<&Arc<HotBuffer>>,
     repin: Option<&Arc<RepinCoordinator>>,
-) -> Result<(u64, PublicationClaims), String> {
+) -> Result<PublicationRecovery, String> {
     let corpus_guard = match repin {
         Some(c) => Some(c.compaction_guard_owned().await),
         None => None,
@@ -826,8 +965,8 @@ async fn recover_publications(
             }
             Ok(())
         });
-        let blocked = match report {
-            Ok(report) => report.record(),
+        let (blocked, retired) = match report {
+            Ok(report) => (report.record(), report.retired()),
             Err(error) => {
                 RecoveryOutcomeKind::Failed.record();
                 tracing::error!(
@@ -839,7 +978,11 @@ async fn recover_publications(
             }
         };
         let claims = publication_marker::scan_claims(&wal_dir)?;
-        Ok((blocked, claims))
+        Ok(PublicationRecovery {
+            blocked,
+            retired,
+            claims,
+        })
     })
     .await
     .map_err(|e| {
@@ -875,20 +1018,7 @@ async fn recover_pending_rollups(
             // release either guard while recovery still relocates files.
             let _corpus_guard = corpus_guard;
             let _publication_guard = publication_guard;
-            // A previous cleanup or retention pass may already have removed a
-            // marker. Clear only confirmed missing paths before selecting days.
-            for marker in &markers {
-                publication.finish_rollup(marker);
-            }
-            let days: std::collections::BTreeSet<PathBuf> = publication
-                .pending_rollup_markers()
-                .iter()
-                .filter_map(|marker| marker.parent().map(Path::to_path_buf))
-                .collect();
-            for day in days {
-                recover_rollup_markers_coordinated(&day, Some(&publication))?;
-            }
-            Ok(())
+            relocate_pending_rollups(&publication)
         })
         .await
         .map_err(|e| {
@@ -898,11 +1028,76 @@ async fn recover_pending_rollups(
     }
     // An incomplete bootstrap scan must also stop WAL publication, even if
     // the failed scan did not discover a marker before encountering an error.
+    // Only rollups count here: the restart backlog is this pass's to drain,
+    // and waiting for it would stop the drain that clears it.
     let _reader = publication
-        .read()
+        .read_rollups_only()
         .await
         .map_err(|_| "pending rollup recovery is incomplete".to_owned())?;
     Ok(())
+}
+
+/// The relocation half of rollup recovery, shared by boot and each
+/// compaction pass: forget the registered markers already confirmed gone,
+/// then recover every day directory that still holds one. The caller holds
+/// the publication write guard.
+fn relocate_pending_rollups(publication: &PublicationGate) -> Result<(), String> {
+    // A previous cleanup or retention pass may already have removed a
+    // marker. Listing the pending markers forgets the confirmed missing
+    // ones before the days are selected.
+    let days: std::collections::BTreeSet<PathBuf> = publication
+        .pending_rollup_markers()
+        .iter()
+        .filter_map(|marker| marker.parent().map(Path::to_path_buf))
+        .collect();
+    for day in days {
+        recover_rollup_markers_coordinated(&day, Some(publication))?;
+    }
+    Ok(())
+}
+
+/// Recover the rollup markers the gate's boot scan registered, before boot
+/// conformance and hydration (ADR-0041 slice 2). Blocking file I/O: call it
+/// from a blocking thread, before any reader, producer or compaction pass
+/// exists. No repin job can hold the corpus gate yet, so the publication
+/// write guard alone excludes every other relocator.
+///
+/// Recovery only renames or retires files and reads parquet footers. A
+/// failure does not stop the boot: it logs one `rollup_boot_recovery`
+/// ERROR, naming no path, and leaves the marker pending, so reads refuse
+/// `rollup_pending` until a compaction pass recovers it. A marker scan that
+/// failed at boot stays latched until a compaction pass rescans, and is
+/// logged the same way: recovery of the markers the scan did find is no
+/// finished recovery.
+pub(crate) fn recover_rollups_at_boot(publication: &PublicationGate) {
+    let markers = publication.pending_rollup_markers();
+    let _publication_guard = publication.blocking_write();
+    // The error names hourly paths, so it is not logged; the failure
+    // counter has recorded it.
+    let recovered = relocate_pending_rollups(publication).is_ok();
+    if publication.marker_scan_failed() {
+        tracing::error!(
+            event_type = "rollup_boot_recovery",
+            markers = markers.len(),
+            pending = publication.pending_rollup_markers().len(),
+            "boot rollup marker scan failed; corpus reads are refused as \
+             rollup_pending until a compaction pass completes a rescan"
+        );
+    } else if recovered {
+        tracing::info!(
+            event_type = "rollup_boot_recovery",
+            markers = markers.len(),
+            "boot rollup recovery finished"
+        );
+    } else {
+        tracing::error!(
+            event_type = "rollup_boot_recovery",
+            markers = markers.len(),
+            pending = publication.pending_rollup_markers().len(),
+            "boot rollup recovery failed; corpus reads are refused as \
+             rollup_pending until a compaction pass recovers the marker"
+        );
+    }
 }
 
 /// Consolidate hourly per-service parquet files into daily files.
@@ -1295,6 +1490,54 @@ fn rollup_marker_path(day_dir: &Path, service: &str) -> PathBuf {
     day_dir.join(format!(".rollup-{service}"))
 }
 
+/// The most bytes a rollup marker can hold. It lists at most one hourly
+/// file per hour directory, and [`collect_hour_dirs`] takes only two-digit
+/// names, so at most 100 lines. Each line is a path of at most 4095 bytes
+/// (Linux `PATH_MAX` less its terminator) written lossily, which turns each
+/// byte that is not UTF-8 into three, plus its newline.
+const MAX_ROLLUP_MARKER_BYTES: u64 = 100 * (3 * 4095 + 1);
+
+/// Open `path` with [`no_follow::open`], and check with `fstat` on the
+/// descriptor that it is a regular file. The open never waits on a FIFO,
+/// and a symlink at the last component is refused, never followed. Boot
+/// awaits rollup recovery, so a file there that is not crash residue must
+/// fail the recovery, not hang the boot.
+fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
+    let file = no_follow::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, metadata.len()))
+}
+
+/// Read the rollup marker at `path`, opened with [`open_regular`]. A marker
+/// over [`MAX_ROLLUP_MARKER_BYTES`] is an error: one `fstat` reports is
+/// never read, and one that grows after the `fstat` is read only up to one
+/// byte past the bound. Off Unix no marker is opened, so a present one
+/// cannot be read.
+fn read_rollup_marker(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let (file, len) =
+        open_regular(path).map_err(|e| format!("failed to open rollup marker: {e}"))?;
+    let over_limit = || format!("rollup marker is over the {MAX_ROLLUP_MARKER_BYTES}-byte limit");
+    if len > MAX_ROLLUP_MARKER_BYTES {
+        return Err(over_limit());
+    }
+    let mut content = String::new();
+    file.take(MAX_ROLLUP_MARKER_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| format!("failed to read rollup marker: {e}"))?;
+    if content.len() as u64 > MAX_ROLLUP_MARKER_BYTES {
+        return Err(over_limit());
+    }
+    Ok(content)
+}
+
 /// Write a rollup marker listing the hourly files being merged.
 fn write_rollup_marker(
     day_dir: &Path,
@@ -1324,6 +1567,10 @@ fn delete_rollup_marker(day_dir: &Path, service: &str) {
 /// - If the tmp is corrupt, quarantine it and retain hourly inputs.
 /// - If only the canonical exists, retire the marker's hourly inputs.
 /// - If neither exists: stale marker, just remove it.
+///
+/// A marker or a `.parquet.tmp` that is not a regular file, and a marker
+/// over [`MAX_ROLLUP_MARKER_BYTES`], fail the recovery of the day with the
+/// marker left in place. Neither is opened in a way that can block.
 #[cfg(test)]
 fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
     recover_rollup_markers_coordinated(day_dir, None)
@@ -1365,15 +1612,16 @@ fn recover_rollup_markers_inner(
         else {
             continue;
         };
+        // Registers a marker the gate did not know of, so a failed recovery
+        // leaves it refusing reads. Finished once the marker file is gone.
+        let registration = publication.map(|gate| gate.mark_rollup(&path));
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(gate) = publication {
-            gate.mark_rollup(&path);
-            #[cfg(any(test, feature = "test-support"))]
             gate.hold_after_publish_for_test();
         }
         let canonical = day_dir.join(format!("{service}.parquet"));
         let tmp = day_dir.join(format!("{service}.parquet.tmp"));
-        let marker_content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read rollup marker: {e}"))?;
+        let marker_content = read_rollup_marker(&path)?;
         let hourly_files: Vec<PathBuf> = marker_content
             .lines()
             .filter(|line| !line.is_empty())
@@ -1382,13 +1630,15 @@ fn recover_rollup_markers_inner(
 
         // An existing daily file may precede this merge. A complete tmp
         // contains both that daily file and the new hourly inputs.
-        let tmp_exists = match std::fs::symlink_metadata(&tmp) {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(format!("failed to inspect rollup tmp: {e}")),
+        // A tmp that is not a regular file is no output of this merge, and
+        // is neither promoted nor quarantined.
+        let staged = match open_regular(&tmp) {
+            Ok(staged) => Some(staged),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("failed to open rollup tmp: {e}")),
         };
-        if tmp_exists {
-            if is_valid_parquet(&tmp) {
+        if let Some((staged, staged_len)) = staged {
+            if is_valid_parquet_file(staged, staged_len) {
                 tracing::info!(
                     event_type = "rollup_recovery",
                     compact_service = %service,
@@ -1417,8 +1667,8 @@ fn recover_rollup_markers_inner(
                 std::fs::File::open(day_dir)
                     .and_then(|dir| dir.sync_all())
                     .map_err(|e| format!("failed to sync rollup marker removal: {e}"))?;
-                if let Some(gate) = publication {
-                    gate.finish_rollup(&path);
+                if let Some(registration) = registration {
+                    registration.finish();
                 }
                 quarantine_file(
                     &tmp,
@@ -1456,8 +1706,8 @@ fn recover_rollup_markers_inner(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("failed to remove rollup marker: {e}")),
         }
-        if let Some(gate) = publication {
-            gate.finish_rollup(&path);
+        if let Some(registration) = registration {
+            registration.finish();
         }
     }
     Ok(())
@@ -1476,17 +1726,23 @@ const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 /// "File ... too small to be a Parquet file" and wedge the rollup forever
 /// — no amount of retrying repairs a truncated file.
 pub(crate) fn is_valid_parquet(path: &Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
     let Ok(meta) = file.metadata() else {
         return false;
     };
+    is_valid_parquet_file(file, meta.len())
+}
+
+/// [`is_valid_parquet`] on an open `file` whose length `fstat` reported as
+/// `len`.
+fn is_valid_parquet_file(mut file: std::fs::File, len: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
     // Header magic (4) + a minimal footer + footer length (4) + trailer
     // magic (4). Anything below this cannot be a parquet file.
-    if meta.len() < 12 {
+    if len < 12 {
         return false;
     }
     let mut head = [0u8; 4];
@@ -1889,9 +2145,10 @@ fn rollup_day_inner(
     // invisible to readers until the complete generation is ready.
     let publication_guard = publication.map(PublicationGate::blocking_write);
     let marker = rollup_marker_path(day_dir, service);
-    if let Some(gate) = publication {
-        gate.mark_rollup(&marker);
-    }
+    // Declared after the guard, so an early return drops it first: a
+    // failure leaves the marker registered, and no longer in flight, before
+    // the next writer can take the lock.
+    let registration = publication.map(|gate| gate.mark_rollup(&marker));
     write_rollup_marker(day_dir, service, &merged_hourly)?;
 
     // Atomic rename.
@@ -1913,8 +2170,8 @@ fn rollup_day_inner(
 
     // Remove marker — rollup fully complete.
     delete_rollup_marker(day_dir, service);
-    if let Some(gate) = publication {
-        gate.finish_rollup(&marker);
+    if let Some(registration) = registration {
+        registration.finish();
     }
     drop(publication_guard);
 
@@ -2137,7 +2394,9 @@ async fn compact_service_batch(
 }
 
 /// The hot batch id of a WAL file: `{env}/{file stem}`, as ingest names it.
-fn wal_batch_id(env: &str, wal_file: &Path) -> Option<String> {
+/// Boot hydration (ADR-0041) installs WAL under this identity, so the drain
+/// that follows a publish finds it.
+pub(crate) fn wal_batch_id(env: &str, wal_file: &Path) -> Option<String> {
     Some(format!("{env}/{}", wal_file.file_stem()?.to_str()?))
 }
 
@@ -2542,6 +2801,49 @@ fn timestamp_repair_list(prov_col: &str) -> String {
         .map(|column| repair_expr(prov_col, column))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Whether [`timestamp_repair_list`] leaves `row` as it is. Boot hydration
+/// (ADR-0041) loads a WAL row into the hot buffer only if this holds, so the
+/// row reads the same hot as it will cold.
+///
+/// The hot read casts each envelope TIMESTAMP column with a bare `TRY_CAST`
+/// (`trawl_core`'s hot `REPLACE` list), where the repair falls back to the
+/// file name's instant, then the compaction instant, when that cast fails.
+/// A row is left as it is only if the cast succeeds for every column in
+/// [`trawl_core::schema::TIMESTAMP_COLUMNS`], the list the repair walks.
+/// Rust cannot run `DuckDB`'s cast, so the check is stricter than the cast:
+/// each column must hold a string spelled exactly as ingest spells an
+/// instant, chrono's RFC 3339 UTC at microsecond precision
+/// (`SecondsFormat::Micros`). The cast refuses two such spellings, so the
+/// check does too: a year after 9999, which chrono writes with a leading
+/// `+`, and a leap second. A year before 1 is written `0000` or with a
+/// leading `-`, and the cast reads it as the same year BC on both sides.
+/// `repair_leaves_unchanged_agrees_with_repair_expr` runs [`repair_expr`]
+/// itself over values on both sides of the check, and ingest's
+/// canonicalizer over each, so the check refuses nothing the canonicalizer
+/// writes and the repair keeps.
+pub(crate) fn repair_leaves_unchanged(row: &serde_json::Map<String, serde_json::Value>) -> bool {
+    trawl_core::schema::TIMESTAMP_COLUMNS.iter().all(|column| {
+        row.get(*column)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(is_ingest_instant)
+    })
+}
+
+/// Whether `text` is an instant exactly as ingest writes one (see
+/// [`repair_leaves_unchanged`]).
+fn is_ingest_instant(text: &str) -> bool {
+    use chrono::{Datelike as _, Timelike as _};
+    // `%Y` also reads the signed year chrono writes outside 0 to 9999. The
+    // round trip below refuses every spelling ingest does not write.
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.fZ").is_ok_and(|parsed| {
+        let instant = parsed.and_utc();
+        // chrono keeps a leap second as a nanosecond count past one second.
+        instant.year() <= 9999
+            && instant.nanosecond() < 1_000_000_000
+            && instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true) == text
+    })
 }
 
 /// The nested-key collision shape: keys inside a nested object that
@@ -4075,7 +4377,7 @@ fn publish_output(
     {
         let publication = hot_buffer.map(HotBuffer::publication);
         let publication_guard = publication.as_ref().map(|gate| gate.blocking_write());
-        // A WAL writer holds the ingest side of this gate from its rename
+        // A WAL writer holds the ingest side of this gate from its link
         // until it has fsynced or withdrawn the file, so under the write
         // guard a consumed file that is gone was withdrawn: its write was
         // rejected and its sender may retry. Publishing its rows would
@@ -4460,7 +4762,9 @@ pub(crate) fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Resu
 }
 
 /// Group WAL file paths by service name (extracted from filename prefix).
-fn group_by_service(files: Vec<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
+/// Boot hydration groups the same way, so a publication marker blocks the
+/// same files for both.
+pub(crate) fn group_by_service(files: Vec<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
     for path in files {
@@ -5066,8 +5370,8 @@ mod tests {
         );
         assert!(!day.join("svc.parquet").exists());
 
-        // A directory cannot replace quarantine_target's reserved file. The
-        // failed rename retains the source and is one failed recovery attempt.
+        // A directory at the staged output is not a regular file. Recovery
+        // fails once, keeps the source and quarantines nothing.
         std::fs::create_dir(&temporary).unwrap();
         write_rollup_marker(&day, "svc", std::slice::from_ref(&hourly)).unwrap();
         assert!(
@@ -5096,7 +5400,7 @@ mod tests {
         assert!(temporary.is_dir());
         assert!(
             !day.join("svc.parquet.tmp.corrupt.1").exists(),
-            "failed rename removes its reservation"
+            "nothing is reserved for a quarantine"
         );
     }
 
@@ -5180,7 +5484,7 @@ mod tests {
         );
         let marker = day.join(".rollup-svc");
         std::fs::write(&marker, input.to_string_lossy().as_bytes()).unwrap();
-        hot.publication().mark_rollup(&marker);
+        drop(hot.publication().mark_rollup(&marker));
         assert!(
             compact_once_coordinated(
                 &tmp.path().join("no-wal"),
@@ -5333,6 +5637,14 @@ mod tests {
         assert_eq!(
             operation_count(&handle, CompactionOperation::PendingRollupRecovery),
             0
+        );
+        // The panic dropped the rollup's registration without finishing it:
+        // the marker stays registered and is no longer in flight, so a
+        // lock-free query reports it beside the next writer too.
+        let _next_writer = gate.write().await;
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
         );
     }
 
@@ -6508,7 +6820,16 @@ mod tests {
         let canonical = day.join("nginx.parquet");
         std::fs::rename(first, &canonical).unwrap();
         let invalid_tmp = day.join("nginx.parquet.tmp");
-        std::fs::create_dir(&invalid_tmp).unwrap();
+        std::fs::write(&invalid_tmp, b"truncated").unwrap();
+        // Every quarantine name is taken, so the quarantine fails after
+        // recovery has removed the marker.
+        for n in 0..MAX_QUARANTINE_ATTEMPTS {
+            let name = match n {
+                0 => "nginx.parquet.tmp.corrupt".to_owned(),
+                n => format!("nginx.parquet.tmp.corrupt.{n}"),
+            };
+            std::fs::write(day.join(name), b"").unwrap();
+        }
         write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
         let gate = PublicationGate::new();
         gate.initialize(&root);
@@ -6516,7 +6837,7 @@ mod tests {
             let _writer = gate.write().await;
             assert!(recover_rollup_markers_coordinated(&day, Some(&gate)).is_err());
             assert!(!rollup_marker_path(&day, "nginx").exists());
-            assert!(invalid_tmp.is_dir());
+            assert!(invalid_tmp.is_file());
             recover_rollup_markers_coordinated(&day, Some(&gate)).unwrap();
         }
         assert_eq!(read_strings(&canonical, "msg"), vec!["old"]);
@@ -6692,6 +7013,12 @@ mod tests {
         entered.recv_timeout(Duration::from_secs(30)).unwrap();
         assert!(hourly.exists());
         assert_eq!(read_strings(&daily, "msg"), vec!["old", "new"]);
+        assert!(rollup_marker_path(&day, "nginx").exists());
+        assert_eq!(
+            gate.unsettled(),
+            None,
+            "the rollup's own marker is in flight, so a lock-free query does not flap"
+        );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -6770,11 +7097,334 @@ mod tests {
         let gate = Arc::new(PublicationGate::new());
         {
             let _writer = gate.write().await;
-            gate.mark_rollup(&rollup_marker_path(day, "nginx"));
+            drop(gate.mark_rollup(&rollup_marker_path(day, "nginx")));
         }
         assert!(recover_pending_rollups(&gate, None).await.is_err());
         assert!(gate.read().await.is_err());
         assert!(rollup_marker_path(day, "nginx").exists());
+    }
+
+    /// Rollup recovery admits compaction on rollup state alone: the restart
+    /// backlog is what compaction drains, so it must not stop the pass
+    /// (ADR-0041 slice 2). A failed marker scan still does.
+    #[tokio::test]
+    async fn rollup_boot_recovery_does_not_wait_for_the_restart_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        for overhang in [None, Some(false), Some(true)] {
+            let gate = Arc::new(PublicationGate::starting());
+            if let Some(overhang) = overhang {
+                gate.finish_hydration(overhang).unwrap();
+            }
+            gate.initialize(dir.path());
+            assert!(
+                recover_pending_rollups(&gate, None).await.is_ok(),
+                "hydration finished: {overhang:?}"
+            );
+        }
+
+        let root = dir.path().join("file");
+        std::fs::write(&root, "").unwrap();
+        let gate = Arc::new(PublicationGate::starting());
+        gate.finish_hydration(true).unwrap();
+        gate.initialize(&root);
+        assert_eq!(
+            recover_pending_rollups(&gate, None).await,
+            Err("pending rollup recovery is incomplete".to_owned())
+        );
+    }
+
+    /// Each compaction pass retries a failed marker scan, and a complete
+    /// one lets the pass drain WAL again (ADR-0041 slice 2).
+    #[tokio::test]
+    async fn rollup_boot_recovery_rescan_runs_on_each_compaction_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(wal.join("prod")).unwrap();
+        let record = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"one"}"#;
+        let file = write_wal_file(&wal.join("prod"), "nginx", &[record]);
+        let hot = Arc::new(HotBuffer::new(crate::hot_buffer::HotBufferConfig {
+            max_events: 100,
+            max_bytes: 100_000,
+        }));
+        let gate = hot.publication();
+        // The data root cannot be listed, so the boot scan fails.
+        std::fs::write(&data, "").unwrap();
+        gate.initialize(&data);
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+
+        let pass = || {
+            compact_once(
+                &wal,
+                &data,
+                Duration::ZERO,
+                false,
+                Some(&hot),
+                DEFAULT_CHUNK_SIZE,
+                "2GB",
+                None,
+            )
+        };
+        assert!(
+            pass().await.is_err(),
+            "a pass whose rescan fails stays stopped"
+        );
+        assert!(file.exists());
+
+        std::fs::remove_file(&data).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        assert_eq!(pass().await, Ok(0));
+        assert!(!file.exists(), "the pass drained the WAL");
+        assert_eq!(gate.unsettled(), None);
+        assert!(gate.read().await.is_ok());
+    }
+
+    /// Boot recovers every rollup marker the gate's scan registered, on a
+    /// gate born starting, and leaves the restart state to hydration
+    /// (ADR-0041 slice 2).
+    #[test]
+    fn rollup_boot_recovery_recovers_the_scanned_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let old = r#"{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"nginx","msg":"old"}"#;
+        let new = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"new"}"#;
+        let first = write_hourly_parquet(&env, "2026-01-15", "00", "nginx", &[old]);
+        let second = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[new]);
+        let merged = write_hourly_parquet(&env, "2026-01-15", "02", "nginx", &[old, new]);
+        let day = env.join("2026-01-15");
+        let daily = day.join("nginx.parquet");
+        std::fs::rename(merged, &daily).unwrap();
+        write_rollup_marker(&day, "nginx", &[first.clone(), second.clone()]).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+        let gate = PublicationGate::starting();
+        gate.initialize(&data);
+        assert_eq!(gate.pending_rollup_markers(), vec![marker.clone()]);
+
+        recover_rollups_at_boot(&gate);
+
+        assert!(!marker.exists());
+        assert!(!first.exists() && !second.exists(), "hourlies retired");
+        assert_eq!(read_strings(&daily, "msg"), vec!["old", "new"]);
+        assert!(gate.pending_rollup_markers().is_empty());
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RestartBacklog),
+            "only hydration settles the restart"
+        );
+    }
+
+    /// A boot whose rollup marker scan failed logs that at ERROR, naming no
+    /// path, and never as a finished recovery: reads refuse
+    /// `rollup_pending` until a compaction pass completes a rescan.
+    #[test]
+    fn rollup_boot_recovery_logs_a_failed_marker_scan_at_error() {
+        let logs = captured_logs();
+        let tmp = tempfile::tempdir().unwrap();
+        // The data root cannot be listed, so the gate's boot scan fails.
+        let data = tmp.path().join("data");
+        std::fs::write(&data, "").unwrap();
+        let gate = PublicationGate::starting();
+        gate.initialize(&data);
+
+        recover_rollups_at_boot(&gate);
+
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+        let log = logged(&logs);
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("event_type=\"rollup_boot_recovery\""))
+            .collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        assert!(lines[0].contains("ERROR"), "{log}");
+        assert!(lines[0].contains("marker scan failed"), "{log}");
+        assert!(
+            !log.contains(&*tmp.path().to_string_lossy()),
+            "no path is logged: {log}"
+        );
+    }
+
+    /// A boot recovery that fails does not stop the boot: it logs one
+    /// ERROR naming no path and leaves the marker pending, so reads refuse
+    /// `rollup_pending` until a compaction pass recovers it.
+    #[test]
+    fn rollup_boot_recovery_failure_leaves_the_marker_pending() {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let day = data.join("prod/2026-01-15");
+        // The hourly input can be neither removed nor set aside.
+        let hourly = day.join("01/nginx.parquet");
+        for dir in [hourly.clone(), day.join("01/nginx.parquet.merged")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("child"), b"occupied").unwrap();
+        }
+        std::fs::write(day.join("nginx.parquet"), b"daily").unwrap();
+        write_rollup_marker(&day, "nginx", &[hourly]).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+        let gate = PublicationGate::starting();
+        gate.initialize(&data);
+
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || recover_rollups_at_boot(&gate));
+
+        assert!(marker.exists(), "the marker stays for a compaction pass");
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+        let log = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let failures: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("event_type=\"rollup_boot_recovery\""))
+            .collect();
+        assert_eq!(failures.len(), 1, "{log}");
+        assert!(failures[0].contains("ERROR"), "{log}");
+        assert!(
+            !log.contains(&*tmp.path().to_string_lossy()),
+            "no path is logged: {log}"
+        );
+    }
+
+    /// Run boot rollup recovery over `data` on its own thread, failing the
+    /// test if it blocks, and return the gate it recovered through.
+    #[cfg(unix)]
+    fn recover_at_boot_promptly(data: &Path) -> Arc<PublicationGate> {
+        let gate = Arc::new(PublicationGate::starting());
+        gate.initialize(data);
+        let recovering = Arc::clone(&gate);
+        crate::ingest::no_follow::test_support::returns_promptly(move || {
+            recover_rollups_at_boot(&recovering);
+        });
+        gate
+    }
+
+    /// Boot awaits rollup recovery before the listener binds, so a FIFO at
+    /// a rollup marker path must not block it waiting for a FIFO writer.
+    /// The boot goes on; the marker stays pending, and reads refuse
+    /// `rollup_pending`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollup_boot_recovery_leaves_a_fifo_marker_pending_without_blocking() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let day = data.join("prod/2026-01-15");
+        std::fs::create_dir_all(&day).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+        crate::ingest::no_follow::test_support::make_fifo(&marker);
+
+        let gate = recover_at_boot_promptly(&data);
+
+        assert!(
+            std::fs::symlink_metadata(&marker)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the FIFO marker stays in place"
+        );
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+    }
+
+    /// A FIFO at the staged rollup output does not block boot recovery
+    /// either, and is not taken for a truncated output: nothing is
+    /// quarantined or retired, and the marker stays pending.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollup_boot_recovery_leaves_a_fifo_staged_output_pending_without_blocking() {
+        use std::os::unix::fs::FileTypeExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let env = data.join("prod");
+        let row = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let hourly = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[row]);
+        let day = env.join("2026-01-15");
+        let staged = day.join("nginx.parquet.tmp");
+        crate::ingest::no_follow::test_support::make_fifo(&staged);
+        write_rollup_marker(&day, "nginx", std::slice::from_ref(&hourly)).unwrap();
+        let marker = rollup_marker_path(&day, "nginx");
+
+        let gate = recover_at_boot_promptly(&data);
+
+        assert!(
+            std::fs::symlink_metadata(&staged)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the FIFO is neither promoted nor quarantined"
+        );
+        assert!(hourly.exists(), "the hourly input is kept");
+        assert!(marker.exists(), "the marker stays for a compaction pass");
+        assert_eq!(gate.pending_rollup_markers(), vec![marker]);
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RollupPending)
+        );
+    }
+
+    /// A rollup marker over [`MAX_ROLLUP_MARKER_BYTES`] is not read, so no
+    /// path it lists is retired, and it stays pending. One at the bound is
+    /// read and recovered.
+    #[cfg(unix)]
+    #[test]
+    fn rollup_boot_recovery_reads_no_marker_over_the_bound() {
+        for (len, recovered) in [
+            (MAX_ROLLUP_MARKER_BYTES, true),
+            (MAX_ROLLUP_MARKER_BYTES + 1, false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("data");
+            let env = data.join("prod");
+            let row = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+            let hourly = write_hourly_parquet(&env, "2026-01-15", "01", "nginx", &[row]);
+            let day = env.join("2026-01-15");
+            std::fs::write(day.join("nginx.parquet"), b"daily").unwrap();
+            // The listed hourly, padded with the empty lines a marker read
+            // skips.
+            let mut body = hourly.to_string_lossy().into_owned().into_bytes();
+            body.resize(usize::try_from(len).unwrap(), b'\n');
+            let marker = rollup_marker_path(&day, "nginx");
+            std::fs::write(&marker, body).unwrap();
+
+            let gate = recover_at_boot_promptly(&data);
+
+            assert_eq!(!hourly.exists(), recovered, "{len}-byte marker");
+            assert_eq!(!marker.exists(), recovered, "{len}-byte marker");
+            assert_eq!(
+                gate.pending_rollup_markers().is_empty(),
+                recovered,
+                "{len}-byte marker"
+            );
+        }
     }
 
     /// The pass-through shortcut is a claim about the conform, not about
@@ -10269,6 +10919,232 @@ mod tests {
         }
     }
 
+    /// The instant every probe row starts from, spelled as ingest spells it.
+    const PROBE_INSTANT: &str = "2026-09-27T12:00:00.123456Z";
+
+    /// WAL rows for [`repair_leaves_unchanged_agrees_with_repair_expr`]: for
+    /// each envelope TIMESTAMP column, one row per probe value in that column
+    /// with [`PROBE_INSTANT`] in the others, then one row per missing column.
+    fn repair_probe_rows() -> Vec<serde_json::Map<String, serde_json::Value>> {
+        use serde_json::json;
+        use trawl_core::schema::TIMESTAMP_COLUMNS;
+
+        let micros = |instant: chrono::DateTime<chrono::Utc>| {
+            json!(instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        };
+        let values = [
+            // Accepted.
+            json!(PROBE_INSTANT),
+            json!("0001-01-01T00:00:00.000000Z"),
+            json!("9999-12-31T23:59:59.999999Z"),
+            json!("1970-01-01T00:00:00.000000Z"),
+            json!("2024-02-29T23:59:59.000001Z"),
+            // Years before 1, as the canonicalizer writes them.
+            json!("0000-01-01T00:00:00.000000Z"),
+            json!("0000-02-29T12:00:00.000000Z"),
+            json!("0000-12-31T23:59:59.999999Z"),
+            json!("-0001-01-01T00:00:00.000000Z"),
+            json!("-10000-06-15T08:30:00.250000Z"),
+            micros(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+            // Refused.
+            json!(null),
+            json!(true),
+            json!(1_790_000_000_000_i64),
+            json!(""),
+            json!("not-a-date"),
+            json!("2026-02-30T00:00:00.000000Z"),
+            // Instants the repair may keep, spelled as ingest never spells
+            // them: refused, because the check is stricter than the cast.
+            json!("2026-09-27T12:00:00Z"),
+            json!("2026-09-27T12:00:00.123456789Z"),
+            json!("2026-09-27T14:00:00.123456+02:00"),
+            json!("2026-09-27 12:00:00.123456Z"),
+            json!("2026-09-27t12:00:00.123456z"),
+            // Instants the canonicalizer writes as they are, but the
+            // repair changes.
+            json!("2026-06-30T23:59:60.000000Z"),
+            json!("+10000-01-01T00:00:00.000000Z"),
+            micros(chrono::DateTime::<chrono::Utc>::MAX_UTC),
+        ];
+        let stamped = || -> serde_json::Map<String, serde_json::Value> {
+            TIMESTAMP_COLUMNS
+                .iter()
+                .map(|column| ((*column).to_owned(), json!(PROBE_INSTANT)))
+                .collect()
+        };
+        let mut rows = Vec::new();
+        for value in values {
+            for column in TIMESTAMP_COLUMNS {
+                let mut row = stamped();
+                row.insert((*column).to_owned(), value.clone());
+                rows.push(row);
+            }
+        }
+        for column in TIMESTAMP_COLUMNS {
+            let mut row = stamped();
+            row.remove(*column);
+            rows.push(row);
+        }
+        rows
+    }
+
+    /// Whether ingest's canonicalizer writes `row`'s envelope instants as
+    /// they are: each one, sent as a client's `_time`, comes out of
+    /// [`crate::ingest::envelope::canonicalize`] unchanged. The
+    /// canonicalizer spells `_ingested` the same way, from the arrival
+    /// clock.
+    fn canonicalizer_emits(row: &serde_json::Map<String, serde_json::Value>) -> bool {
+        use crate::ingest::envelope::{EnvelopeContext, canonicalize};
+        use crate::ingest::producer::{Derivation, Producer};
+
+        let arrival_instant = chrono::DateTime::parse_from_rfc3339(PROBE_INSTANT)
+            .unwrap()
+            .to_utc();
+        let envs = ["prod".to_owned()];
+        let derivation = Derivation::defaults();
+        let ctx = EnvelopeContext {
+            arrival: PROBE_INSTANT,
+            arrival_instant,
+            envs: &envs,
+            default_env: "prod",
+            producer: Producer::Http {
+                peer_host: "10.0.4.55",
+                peer_is_trusted_relay: false,
+            },
+            derivation: &derivation,
+        };
+        trawl_core::schema::TIMESTAMP_COLUMNS.iter().all(|column| {
+            row.get(*column).is_some_and(|value| {
+                let client = serde_json::json!({"service": "svc", "_time": value});
+                let canonical = canonicalize(client.as_object().unwrap(), &ctx).unwrap();
+                canonical.obj.get(trawl_core::schema::TIME) == Some(value)
+            })
+        })
+    }
+
+    /// Write the indexed rows as `dir/svc_1000_abcd.ndjson`, each carrying
+    /// its `idx`. The file name gives the repair's second arm an instant no
+    /// probe row holds: 1970-01-01 00:00:01.
+    fn write_probe_wal(
+        dir: &Path,
+        rows: &[(usize, &serde_json::Map<String, serde_json::Value>)],
+    ) -> PathBuf {
+        let path = dir.join("svc_1000_abcd.ndjson");
+        let mut ndjson = Vec::new();
+        for (idx, row) in rows {
+            let mut row = (*row).clone();
+            row.insert("idx".into(), serde_json::json!(idx));
+            row.insert("service".into(), serde_json::json!("svc"));
+            crate::ingest::wal::encode_line(&row, &mut ndjson).unwrap();
+        }
+        std::fs::write(&path, ndjson).unwrap();
+        path
+    }
+
+    /// `(idx, one instant per envelope TIMESTAMP column)` from `from`, ordered
+    /// by `idx`. With `hot_cast`, each column goes through the hot read's
+    /// bare `TRY_CAST` first.
+    fn probe_instants(
+        conn: &duckdb::Connection,
+        from: &str,
+        hot_cast: bool,
+    ) -> Vec<(usize, Vec<Option<String>>)> {
+        use trawl_core::schema::TIMESTAMP_COLUMNS;
+
+        let columns: Vec<String> = TIMESTAMP_COLUMNS
+            .iter()
+            .map(|column| {
+                if hot_cast {
+                    format!("CAST(TRY_CAST(\"{column}\" AS TIMESTAMP) AS VARCHAR)")
+                } else {
+                    format!("CAST(\"{column}\" AS VARCHAR)")
+                }
+            })
+            .collect();
+        let sql = format!(
+            "SELECT idx::BIGINT, {} FROM {from} ORDER BY idx",
+            columns.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql).unwrap();
+        stmt.query_map([], |row| {
+            let values = (1..=TIMESTAMP_COLUMNS.len())
+                .map(|i| row.get(i))
+                .collect::<Result<_, _>>()?;
+            Ok((row.get::<_, i64>(0)?, values))
+        })
+        .unwrap()
+        .map(|row| {
+            let (idx, values) = row.unwrap();
+            (usize::try_from(idx).unwrap(), values)
+        })
+        .collect()
+    }
+
+    /// [`repair_leaves_unchanged`] is the Rust reading of [`repair_expr`]
+    /// that boot hydration trusts. Run the repair itself, through
+    /// [`build_wal_batch`], over rows whose instants fall on both sides of
+    /// the check, and read the same rows as the hot side does: the hot
+    /// reader and a bare `TRY_CAST` per envelope TIMESTAMP column. Every
+    /// row the check accepts must leave the repair with the instants the
+    /// hot read gives it, and every row the repair changes must be refused.
+    /// A row the canonicalizer writes as it is, and that the repair leaves
+    /// as the hot read gives it, must be accepted: refusing it would leave
+    /// real writer output for compaction, as overhang.
+    #[test]
+    fn repair_leaves_unchanged_agrees_with_repair_expr() {
+        let rows = repair_probe_rows();
+        let verdicts: Vec<bool> = rows.iter().map(repair_leaves_unchanged).collect();
+        assert!(verdicts.iter().any(|v| *v) && verdicts.iter().any(|v| !*v));
+        let emitted: Vec<bool> = rows.iter().map(canonicalizer_emits).collect();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let all: Vec<_> = rows.iter().enumerate().collect();
+        let path = write_probe_wal(tmp.path(), &all);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let hot_reader = trawl_core::emitter::hot_source_reader(path.to_str().unwrap()).unwrap();
+        let hot = probe_instants(&conn, &hot_reader, true);
+        build_wal_batch(&conn, std::slice::from_ref(&path), "svc").unwrap();
+        let repaired = probe_instants(&conn, "wal_batch", false);
+        assert_eq!(hot.len(), rows.len());
+        assert_eq!(repaired.len(), rows.len());
+        for ((idx, hot), (_, cold)) in hot.iter().zip(&repaired) {
+            let row = &rows[*idx];
+            if verdicts[*idx] {
+                assert!(hot.iter().all(Option::is_some), "{row:?}: {hot:?}");
+                assert_eq!(hot, cold, "an accepted row changed: {row:?}");
+            }
+            if hot != cold {
+                assert!(!verdicts[*idx], "a repaired row was accepted: {row:?}");
+            } else if emitted[*idx] {
+                assert!(
+                    verdicts[*idx],
+                    "canonicalizer output the repair leaves unchanged was refused: {row:?}"
+                );
+            }
+        }
+        let changed = hot.iter().zip(&repaired).filter(|(h, c)| h != c).count();
+        assert!(
+            changed > 0,
+            "the refused values include some the repair changes"
+        );
+
+        // A batch of accepted rows alone can be typed differently by
+        // `read_json`'s detection; the repair still leaves every instant as
+        // the hot read gave it above.
+        let tmp = tempfile::tempdir().unwrap();
+        let accepted: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| verdicts[*idx])
+            .collect();
+        let path = write_probe_wal(tmp.path(), &accepted);
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        build_wal_batch(&conn, std::slice::from_ref(&path), "svc").unwrap();
+        for (idx, cold) in probe_instants(&conn, "wal_batch", false) {
+            assert_eq!(hot[idx].1, cold, "{:?}", rows[idx]);
+        }
+    }
+
     /// A repaired event past `DuckDB`'s default JSON sample window still
     /// reaches parquet with its `_repairs` intact.
     ///
@@ -11174,10 +12050,10 @@ mod tests {
     /// the test, and the WAL files are seconds old. Only a pressure pass
     /// (zero WAL age) can publish them and drain the buffer.
     ///
-    /// The loop must be waiting before the reservation enters pressure.
-    /// Otherwise its startup check can see `Pressure` before the WAL file
-    /// exists and run a pass that finds nothing, and the test would
-    /// exercise startup detection instead of the insert's pressure wake.
+    /// The loop must be waiting, its boot pass done, before the reservation
+    /// enters pressure. Otherwise the boot pass could run before the WAL
+    /// file exists and find nothing, or drain it itself, and the test would
+    /// exercise the boot pass instead of the insert's pressure wake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pressure_wakes_compaction_and_drains_young_wal() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11196,8 +12072,8 @@ mod tests {
         assert!(waiting, "the loop reaches its first wait");
         assert_eq!(
             stats.total_runs.load(Ordering::Relaxed),
-            0,
-            "an Open start runs no pass before it waits"
+            1,
+            "the boot pass runs before the first wait"
         );
 
         let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 60);
@@ -11233,8 +12109,9 @@ mod tests {
         assert!(waiting_again, "the loop waits again after its pass");
         assert_eq!(
             stats.total_runs.load(Ordering::Relaxed),
-            1,
-            "one pass, woken from the first wait, drained the young WAL"
+            2,
+            "after the boot pass, one pass, woken from the first wait, drained \
+             the young WAL"
         );
         let published = find_files_by_ext(&tmp.path().join("data").join("prod"), "parquet");
         assert_eq!(published.len(), 1, "one hourly parquet: {published:?}");
@@ -11544,6 +12421,9 @@ mod tests {
     /// drain. The pass fails `prod`, drains the trickle and ends `Open`. The
     /// failure alone must start the cooldown: with a one-hour interval, the
     /// retries get one pass, not one each.
+    ///
+    /// The stuck env is written after the boot pass, which would otherwise
+    /// fail `prod` itself and cool down before any retry.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_failing_pass_that_ends_open_still_cools_down() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11555,10 +12435,6 @@ mod tests {
             Some(Arc::clone(&hot)),
             None,
         ));
-        let stuck = admitted_env_group(&pipeline, ProducerKind::Http, "prod", "stuck", 10);
-        assert_eq!(write_groups(&pipeline, vec![stuck]).await, 10);
-        assert_eq!(hot.admission_state(), AdmissionState::Open);
-
         let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
         let stats = Arc::clone(&compaction.stats);
         let waiting = eventually(Duration::from_secs(30), || {
@@ -11566,6 +12442,12 @@ mod tests {
         })
         .await;
         assert!(waiting, "the loop reaches its first wait");
+        let booted = stats.total_runs.load(Ordering::Relaxed);
+        assert_eq!(booted, 1, "the boot pass found nothing");
+
+        let stuck = admitted_env_group(&pipeline, ProducerKind::Http, "prod", "stuck", 10);
+        assert_eq!(write_groups(&pipeline, vec![stuck]).await, 10);
+        assert_eq!(hot.admission_state(), AdmissionState::Open);
 
         let window = Duration::from_secs(5);
         let start = Instant::now();
@@ -11584,7 +12466,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        let runs = stats.total_runs.load(Ordering::Relaxed);
+        let runs = stats.total_runs.load(Ordering::Relaxed) - booted;
         let drained = hot.drained_batches();
         compaction.stop().await;
 
@@ -11597,11 +12479,12 @@ mod tests {
         );
     }
 
-    /// A burst on an empty buffer: two groups reserve, and a third does not
-    /// fit, so its refusal wakes the loop before either group's WAL exists.
-    /// That pass finds no WAL at all. The in-flight groups then land, and
-    /// their inserts must start the pass that drains them, well inside the
-    /// one-hour interval.
+    /// A burst on an empty buffer, after a boot pass that found no WAL at
+    /// all: two groups reserve, and a third does not fit, so its refusal
+    /// wakes the loop before either group's WAL exists. With no insert since
+    /// the empty pass, that wake starts no pass. The in-flight groups then
+    /// land, and their inserts must start the pass that drains them, well
+    /// inside the one-hour interval.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refusal_before_the_wal_exists_does_not_strand_the_burst() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11631,14 +12514,18 @@ mod tests {
         assert!(matches!(refused, Err(crate::hot_buffer::Refusal::Full)));
         assert_eq!(hot.admission_state(), AdmissionState::Refusing);
 
-        // The refusal's pass runs and the loop waits again, all before
-        // either group has written its WAL.
+        // The refusal wakes the loop and it waits again, all before either
+        // group has written its WAL.
         let waiting_again = eventually(Duration::from_secs(30), || {
             stats.waits.load(Ordering::Acquire) == 2
         })
         .await;
-        assert!(waiting_again, "the refusal woke a pass");
-        assert_eq!(stats.total_runs.load(Ordering::Relaxed), 1);
+        assert!(waiting_again, "the refusal woke the loop");
+        assert_eq!(
+            stats.total_runs.load(Ordering::Relaxed),
+            1,
+            "only the boot pass ran"
+        );
         assert_eq!(hot.drained_batches(), 0, "that pass found no WAL");
 
         assert_eq!(write_groups(&pipeline, vec![a, b]).await, 90);
@@ -11752,7 +12639,11 @@ mod tests {
         let cutover = repin.cutover_guard().await;
         // The normal deadline fires about now and blocks in recovery.
         tokio::time::sleep(interval + Duration::from_millis(300)).await;
-        assert_eq!(stats.total_runs.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stats.total_runs.load(Ordering::Relaxed),
+            1,
+            "only the boot pass has finished"
+        );
 
         let group = admitted_group(&pipeline, ProducerKind::Syslog, "svc", 60);
         assert_eq!(write_groups(&pipeline, vec![group]).await, 60);
@@ -11780,7 +12671,7 @@ mod tests {
 
     /// A reservation holds 90 of 100 events and has not written its WAL, so
     /// a pass can find nothing to drain. `Full` refusals every 5 ms wake the
-    /// loop; after the first pass finds nothing, they must not start a pass
+    /// loop; after the boot pass found nothing, they must not start a pass
     /// each. The reservation's insert does start one, and it drains the
     /// batch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11828,8 +12719,10 @@ mod tests {
         let runs = stats.total_runs.load(Ordering::Relaxed);
         assert!(refused > 100, "refusals kept coming: {refused}");
         assert_eq!(
-            runs, 1,
-            "{refused} refusals with nothing on disk started {runs} passes"
+            runs,
+            1,
+            "{refused} refusals with nothing on disk started {} passes after the boot pass",
+            runs.saturating_sub(1)
         );
 
         assert_eq!(write_groups(&pipeline, vec![held]).await, 90);
@@ -11942,7 +12835,7 @@ mod tests {
     }
 
     /// A [`PassOutcome`] with the three counts the cadence reads, plus a
-    /// data-loss tally it must ignore.
+    /// data-loss tally it must ignore, and no overhang.
     fn outcome(
         eligible: u64,
         drained: u64,
@@ -11954,12 +12847,18 @@ mod tests {
             eligible,
             drained,
             persistent_failures,
+            overhang: false,
         }
     }
 
-    /// The plan a pass of `kind` gets under `admission`.
+    /// Whether a pass is urgent under `admission` with no overhang.
+    fn pressed(admission: AdmissionState) -> bool {
+        urgent(admission, false)
+    }
+
+    /// The plan a pass of `kind` gets under `admission`, with no overhang.
     fn plan_for(kind: PassKind, admission: AdmissionState, interval: Duration) -> PassPlan {
-        PassPlan::new(kind, admission, interval, true)
+        PassPlan::new(kind, pressed(admission), interval, true)
     }
 
     /// The cadence alone, on a synthetic clock, with a pressure wake at
@@ -11977,15 +12876,24 @@ mod tests {
             for ms in (0..100_000).step_by(100) {
                 let now = t0 + Duration::from_millis(ms);
                 inserted += inserts_per_step;
-                let kind = cadence.due(now, AdmissionState::Refusing).or_else(|| {
-                    (cadence.listens() && cadence.wake_starts_pass(inserted))
-                        .then_some(PassKind::Pressure)
-                });
+                let kind = cadence
+                    .due(now, pressed(AdmissionState::Refusing))
+                    .or_else(|| {
+                        (cadence.listens() && cadence.wake_starts_pass(inserted))
+                            .then_some(PassKind::Pressure)
+                    });
                 if let Some(kind) = kind {
                     passes += 1;
                     normals += u32::from(kind == PassKind::Normal);
                     let plan = plan_for(kind, AdmissionState::Refusing, interval);
-                    cadence.finished(kind, plan, now, &report, AdmissionState::Refusing, inserted);
+                    cadence.finished(
+                        kind,
+                        plan,
+                        now,
+                        &report,
+                        pressed(AdmissionState::Refusing),
+                        inserted,
+                    );
                 }
             }
             (passes, normals)
@@ -12018,11 +12926,11 @@ mod tests {
             plan,
             now,
             &outcome(1, 1, 0, 0),
-            AdmissionState::Pressure,
+            pressed(AdmissionState::Pressure),
             0,
         );
         assert_eq!(
-            cadence.due(now, AdmissionState::Pressure),
+            cadence.due(now, pressed(AdmissionState::Pressure)),
             Some(PassKind::Pressure)
         );
         assert_eq!(cadence.next_normal, t0 + interval);
@@ -12037,23 +12945,19 @@ mod tests {
         let t0 = Instant::now();
         let mut cadence = Cadence::new(t0, interval);
         assert!(cadence.next_normal > t0, "new: deadline is in the future");
-        assert_eq!(cadence.due(t0, AdmissionState::Open), None);
+        assert_eq!(cadence.due(t0, false), Some(PassKind::Boot));
+        let plan = plan_for(PassKind::Boot, AdmissionState::Open, interval);
+        cadence.finished(PassKind::Boot, plan, t0, &outcome(0, 0, 0, 0), false, 0);
+        assert_eq!(cadence.due(t0, false), None);
 
         let now = t0 + Duration::from_secs(1);
         let plan = plan_for(PassKind::Normal, AdmissionState::Open, interval);
-        cadence.finished(
-            PassKind::Normal,
-            plan,
-            now,
-            &outcome(0, 0, 0, 0),
-            AdmissionState::Open,
-            0,
-        );
+        cadence.finished(PassKind::Normal, plan, now, &outcome(0, 0, 0, 0), false, 0);
         assert!(
             cadence.next_normal > now,
             "finished: deadline is in the future"
         );
-        assert_eq!(cadence.due(now, AdmissionState::Open), None);
+        assert_eq!(cadence.due(now, false), None);
     }
 
     /// A pressure pass under the same huge interval cleans stale tmp files
@@ -12220,24 +13124,24 @@ mod tests {
         for (name, kind, planned, report, after, next) in cases {
             let mut cadence = Cadence::new(t0, interval);
             let plan = plan_for(kind, planned, interval);
-            cadence.finished(kind, plan, now, &report, after, before);
+            cadence.finished(kind, plan, now, &report, pressed(after), before);
             assert_eq!(cadence.next, next, "{name}");
 
             let deadline = match kind {
                 PassKind::Normal => now + interval,
-                PassKind::Pressure => t0 + interval,
+                PassKind::Boot | PassKind::Pressure => t0 + interval,
             };
             assert_eq!(
                 cadence.next_normal, deadline,
                 "{name}: only a normal pass moves the deadline"
             );
             assert_eq!(
-                cadence.due(deadline, after),
+                cadence.due(deadline, pressed(after)),
                 Some(PassKind::Normal),
                 "{name}: the normal deadline always fires"
             );
 
-            let at_once = cadence.due(later, after);
+            let at_once = cadence.due(later, pressed(after));
             let on_wake = cadence.listens() && cadence.wake_starts_pass(before);
             let on_insert = cadence.listens() && cadence.wake_starts_pass(before + 1);
             let expect = match next {
@@ -12246,6 +13150,7 @@ mod tests {
                 Next::Wake => (None, true, true),
                 Next::Rerun if after == Open => (None, true, true),
                 Next::Rerun => (Some(PassKind::Pressure), true, true),
+                Next::Boot => unreachable!("{name}: no pass leaves the boot state"),
             };
             assert_eq!((at_once, on_wake, on_insert), expect, "{name}");
         }
@@ -12254,7 +13159,7 @@ mod tests {
     #[test]
     fn pass_plans_split_wal_age_from_rollup() {
         let interval = Duration::from_secs(60);
-        let plan = |kind, state| PassPlan::new(kind, state, interval, true);
+        let plan = |kind, state| PassPlan::new(kind, pressed(state), interval, true);
         assert_eq!(
             plan(PassKind::Normal, AdmissionState::Open),
             PassPlan {
@@ -12284,6 +13189,395 @@ mod tests {
                 }
             );
         }
+    }
+
+    // -- restart overhang (ADR-0041 slice 2) ----------------------------------
+
+    /// A hot buffer whose gate hydration left in overhang.
+    fn overhang_buffer() -> (Arc<HotBuffer>, Arc<PublicationGate>) {
+        let gate = Arc::new(PublicationGate::starting());
+        gate.finish_hydration(true).unwrap();
+        let hot = HotBuffer::new(HotBufferConfig {
+            max_events: 100,
+            max_bytes: 1024 * 1024,
+        })
+        .with_publication_for_test(Arc::clone(&gate));
+        (Arc::new(hot), gate)
+    }
+
+    /// `outcome`, with overhang still held when the pass ended.
+    fn unproven(eligible: u64, drained: u64, persistent_failures: u64) -> PassOutcome {
+        PassOutcome {
+            overhang: true,
+            ..outcome(eligible, drained, persistent_failures, 0)
+        }
+    }
+
+    /// The first pass is due at once, before the normal deadline and
+    /// whatever the admission state. It takes WAL of every age and starts
+    /// no daily rollup, and the rollup keeps its deadline, one interval
+    /// after the start.
+    #[test]
+    fn cadence_first_pass_is_due_at_boot_and_starts_no_daily_rollup() {
+        let interval = Duration::from_secs(3600);
+        let t0 = Instant::now();
+        for urgent in [false, true] {
+            let cadence = Cadence::new(t0, interval);
+            assert_eq!(cadence.due(t0, urgent), Some(PassKind::Boot));
+            assert_eq!(
+                cadence.due(t0 + interval * 2, urgent),
+                Some(PassKind::Boot),
+                "the first pass never rolls up, even past the normal deadline"
+            );
+            assert!(cadence.listens() && cadence.wake_starts_pass(0));
+            assert_eq!(
+                PassPlan::new(PassKind::Boot, urgent, interval, true),
+                PassPlan {
+                    wal_min_age: Duration::ZERO,
+                    daily_rollup: false
+                }
+            );
+        }
+
+        let mut cadence = Cadence::new(t0, interval);
+        let now = t0 + Duration::from_secs(1);
+        let plan = PassPlan::new(PassKind::Boot, false, interval, true);
+        cadence.finished(PassKind::Boot, plan, now, &outcome(2, 2, 0, 0), false, 0);
+        assert_eq!(
+            cadence.next_normal,
+            t0 + interval,
+            "the boot pass leaves the rollup's deadline where it was"
+        );
+        assert_eq!(cadence.due(now, false), None);
+        assert_eq!(cadence.due(t0 + interval, false), Some(PassKind::Normal));
+        assert!(PassPlan::new(PassKind::Normal, false, interval, true).daily_rollup);
+    }
+
+    /// Overhang makes a pass urgent with admission `Open`: a normal pass
+    /// takes WAL of every age, and a pass that drained reruns at once and
+    /// takes every age too. Once a proof settles, `Open` is not urgent.
+    #[test]
+    fn cadence_overhang_with_open_admission_takes_any_age_and_reruns_after_a_drain() {
+        let interval = Duration::from_secs(3600);
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let open = AdmissionState::Open;
+        assert!(urgent(open, true));
+        assert!(!urgent(open, false));
+        assert_eq!(
+            PassPlan::new(PassKind::Normal, urgent(open, true), interval, true),
+            PassPlan {
+                wal_min_age: Duration::ZERO,
+                daily_rollup: true
+            }
+        );
+
+        let mut cadence = Cadence::new(t0, interval);
+        let boot = PassPlan::new(PassKind::Boot, urgent(open, true), interval, true);
+        cadence.finished(
+            PassKind::Boot,
+            boot,
+            now,
+            &unproven(3, 3, 0),
+            urgent(open, true),
+            0,
+        );
+        assert_eq!(cadence.next, Next::Rerun);
+        assert_eq!(
+            cadence.due(now, urgent(open, true)),
+            Some(PassKind::Pressure)
+        );
+        let rerun = PassPlan::new(PassKind::Pressure, urgent(open, true), interval, true);
+        assert_eq!(rerun.wal_min_age, Duration::ZERO);
+
+        // The rerun drains more and still cannot prove coverage: again.
+        cadence.finished(
+            PassKind::Pressure,
+            rerun,
+            now,
+            &unproven(1, 1, 0),
+            urgent(open, true),
+            0,
+        );
+        assert_eq!(cadence.next, Next::Rerun);
+
+        // Its proof settles: `Open` alone waits for the normal deadline.
+        cadence.finished(
+            PassKind::Pressure,
+            rerun,
+            now,
+            &outcome(1, 1, 0, 0),
+            urgent(open, false),
+            0,
+        );
+        assert_eq!(cadence.next, Next::Wake);
+        assert_eq!(cadence.due(now, urgent(open, false)), None);
+        assert_eq!(cadence.next_normal, t0 + interval);
+    }
+
+    /// While overhang holds, a persistent failure cools down however much
+    /// the pass drained, and so does a failed proof with nothing drained:
+    /// neither loops at once, and wakes after inserts start nothing.
+    #[test]
+    fn cadence_overhang_persistent_failure_cools_down() {
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let cases = [
+            ("persistent failure after a drain", unproven(4, 3, 1)),
+            ("persistent failure, nothing eligible", unproven(0, 0, 1)),
+            ("stuck WAL", unproven(2, 0, 0)),
+            ("failed proof, nothing drained", unproven(0, 0, 0)),
+        ];
+        for (name, report) in cases {
+            for kind in [PassKind::Boot, PassKind::Normal, PassKind::Pressure] {
+                let mut cadence = Cadence::new(t0, interval);
+                let plan = PassPlan::new(kind, true, interval, true);
+                cadence.finished(kind, plan, now, &report, true, 0);
+                assert_eq!(cadence.next, Next::Cooldown, "{name}, {kind:?}");
+                assert_eq!(cadence.due(now, true), None, "{name}, {kind:?}");
+                assert!(!cadence.listens(), "{name}, {kind:?}");
+            }
+
+            // A standing fault with an insert and a wake at every 100 ms
+            // step, as its own log lines would give: about one pass per
+            // interval.
+            let mut cadence = Cadence::new(t0, interval);
+            let (mut passes, mut inserted) = (0_u32, 0_u64);
+            for ms in (0..100_000).step_by(100) {
+                let now = t0 + Duration::from_millis(ms);
+                inserted += 1;
+                let kind = cadence.due(now, true).or_else(|| {
+                    (cadence.listens() && cadence.wake_starts_pass(inserted))
+                        .then_some(PassKind::Pressure)
+                });
+                if let Some(kind) = kind {
+                    passes += 1;
+                    let plan = PassPlan::new(kind, true, interval, true);
+                    cadence.finished(kind, plan, now, &report, true, inserted);
+                }
+            }
+            assert!(passes <= 100 / 10 + 2, "{name}: {passes} passes in 100 s");
+        }
+    }
+
+    /// A pass that takes WAL of every age and finds none waits for an
+    /// insert, unless overhang holds. Then its proof failed with nothing
+    /// drained, and the loop cools down instead of waiting on inserts.
+    #[test]
+    fn cadence_no_insert_wait_while_overhang() {
+        let interval = Duration::from_secs(3600);
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(1);
+        let before = 7;
+        for admission in [
+            AdmissionState::Open,
+            AdmissionState::Pressure,
+            AdmissionState::Refusing,
+        ] {
+            for kind in [PassKind::Boot, PassKind::Normal, PassKind::Pressure] {
+                let plan = PassPlan::new(kind, true, interval, true);
+                assert!(plan.wal_min_age.is_zero());
+                let mut cadence = Cadence::new(t0, interval);
+                cadence.finished(
+                    kind,
+                    plan,
+                    now,
+                    &unproven(0, 0, 0),
+                    urgent(admission, true),
+                    before,
+                );
+                assert_eq!(cadence.next, Next::Cooldown, "{admission:?}, {kind:?}");
+
+                // The same pass once the overhang is proven covered.
+                let mut cadence = Cadence::new(t0, interval);
+                cadence.finished(
+                    kind,
+                    plan,
+                    now,
+                    &outcome(0, 0, 0, 0),
+                    urgent(admission, false),
+                    before,
+                );
+                assert_eq!(
+                    cadence.next,
+                    Next::Insert(before),
+                    "{admission:?}, {kind:?}"
+                );
+            }
+        }
+    }
+
+    /// A publish that finished before a crash: the canonical output carries
+    /// the marker's identity and the WAL it consumed is still in place. The
+    /// pass's recovery retires that WAL, the pass's only progress. It counts
+    /// as drained, so an urgent pass reruns instead of cooling down.
+    #[tokio::test]
+    async fn cadence_marker_recovery_retirement_counts_as_drained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let canonical = write_hourly_parquet(
+            &data.join("prod"),
+            "2026-01-15",
+            "07",
+            "svc",
+            &[OPERATIONAL_ROW],
+        );
+        let consumed = tagged_wal(&env_wal, "svc", &["published before the crash"]);
+        let marker = ValidatedMarker::new(
+            "prod",
+            "svc",
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap(),
+            7,
+            vec![consumed.file_name().unwrap().to_str().unwrap().to_owned()],
+            publication_marker::identity_of(&canonical).unwrap(),
+        )
+        .unwrap();
+        publication_marker::write_marker(&wal, &marker).unwrap();
+        let hot = hot_buffer();
+        insert_hot(&hot, "prod", &consumed, "svc");
+
+        let report = compact_pass(
+            &wal,
+            &data,
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            false,
+            Some(&hot),
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!consumed.exists(), "recovery retired the consumed WAL");
+        assert!(!marker_file(&wal, "prod", "svc").exists());
+        assert_eq!(hot.event_count(), 0, "recovery drained its batch");
+        assert_eq!(
+            (
+                report.eligible,
+                report.drained,
+                report.persistent_failures,
+                report.overhang
+            ),
+            (0, 1, 0, false)
+        );
+
+        let interval = Duration::from_secs(3600);
+        let t0 = Instant::now();
+        let plan = PassPlan::new(PassKind::Pressure, true, interval, true);
+        let mut cadence = Cadence::new(t0, interval);
+        cadence.finished(PassKind::Pressure, plan, t0, &report, true, 0);
+        assert_eq!(cadence.next, Next::Rerun);
+        cadence.finished(PassKind::Pressure, plan, t0, &unproven(0, 1, 0), true, 0);
+        assert_eq!(cadence.next, Next::Rerun, "not stuck while overhang holds");
+    }
+
+    /// A full pass while hydration's overhang holds and no rollup marker is
+    /// pending: rollup recovery admits the WAL phase, the pass drains the
+    /// WAL that never became resident with the resident batch, and its
+    /// coverage proof settles the gate before the pass returns.
+    #[tokio::test]
+    async fn rollup_boot_recovery_overhang_pass_drains_the_wal_and_settles() {
+        let logs = captured_logs();
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let data = tmp.path().join("data");
+        let env_wal = wal.join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let (hot, gate) = overhang_buffer();
+        let resident = tagged_wal(&env_wal, "api", &["resident"]);
+        insert_hot(&hot, "prod", &resident, "api");
+        let left_over = [
+            tagged_wal(&env_wal, "api", &["left over one"]),
+            tagged_wal(&env_wal, "web", &["left over two"]),
+        ];
+        assert_eq!(
+            gate.unsettled(),
+            Some(crate::publication::CorpusUnsettled::RestartBacklog)
+        );
+
+        let report = compact_pass(
+            &wal,
+            &data,
+            Duration::from_secs(3600),
+            Duration::ZERO,
+            false,
+            Some(&hot),
+            DEFAULT_CHUNK_SIZE,
+            "2GB",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                report.eligible,
+                report.drained,
+                report.persistent_failures,
+                report.overhang
+            ),
+            (3, 3, 0, false)
+        );
+        assert!(left_over.iter().all(|path| !path.exists()));
+        assert_eq!(hot.event_count(), 0);
+        assert_eq!(
+            published_messages(&data),
+            sorted(&["left over one", "left over two", "resident"])
+        );
+        assert_eq!(gate.unsettled(), None);
+        assert!(gate.read().await.is_ok());
+        let log = logged(&logs);
+        assert!(
+            log.contains("event_type=\"coverage_proof\"") && log.contains("outcome=\"settled\""),
+            "{log}"
+        );
+        assert_eq!(log.matches("corpus_settled").count(), 1, "{log}");
+    }
+
+    /// The loop's first pass runs at once on an `Open` buffer and drains
+    /// the overhang: WAL seconds old that never became resident, an hour
+    /// before the normal deadline, and it leaves the historical hourly
+    /// files for the rollup's own deadline. Its proof settles the gate, so
+    /// the loop then waits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cadence_boot_pass_drains_overhang_at_once_and_starts_no_rollup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_data = tmp.path().join("data").join("prod");
+        let row = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
+        let hourly = [
+            write_hourly_parquet(&env_data, "2026-01-15", "01", "nginx", &[row]),
+            write_hourly_parquet(&env_data, "2026-01-15", "02", "nginx", &[row]),
+        ];
+        let daily = env_data.join("2026-01-15").join("nginx.parquet");
+        let env_wal = tmp.path().join("wal").join("prod");
+        std::fs::create_dir_all(&env_wal).unwrap();
+        let left_over = tagged_wal(&env_wal, "svc", &["left over"]);
+        let (hot, gate) = overhang_buffer();
+        assert_eq!(hot.admission_state(), AdmissionState::Open);
+
+        let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), true, &hot);
+        let stats = Arc::clone(&compaction.stats);
+        let waiting = eventually(Duration::from_secs(30), || {
+            stats.waits.load(Ordering::Acquire) == 1
+        })
+        .await;
+        let runs = stats.total_runs.load(Ordering::Relaxed);
+        compaction.stop().await;
+
+        assert!(waiting, "the loop reaches its first wait");
+        assert_eq!(runs, 1, "the boot pass ran before the first wait");
+        assert!(!left_over.exists(), "the boot pass drained the overhang");
+        assert_eq!(gate.unsettled(), None, "and its proof settled the gate");
+        assert!(
+            hourly.iter().all(|path| path.exists()) && !daily.exists(),
+            "the boot pass starts no rollup"
+        );
     }
 }
 

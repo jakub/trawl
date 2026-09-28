@@ -691,7 +691,7 @@ mod tests {
         let wal = test_support::wal_lines(tmp.path(), "prod");
         assert_eq!(wal.len(), N, "{wal:?}");
         assert_eq!(count_frames(&wal), vec![1; N], "each frame once in the WAL");
-        let snapshot = hot.snapshot().expect("resident events");
+        let snapshot = hot.snapshot().unwrap().expect("resident events");
         let hot_lines: Vec<String> = std::fs::read_to_string(snapshot.path())
             .unwrap()
             .lines()

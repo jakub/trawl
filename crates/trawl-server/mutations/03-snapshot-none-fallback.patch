@@ -1,0 +1,21 @@
+diff --git a/crates/trawl-server/src/pool.rs b/crates/trawl-server/src/pool.rs
+index 31d92885..a06be1e3 100644
+--- a/crates/trawl-server/src/pool.rs
++++ b/crates/trawl-server/src/pool.rs
+@@ -996,14 +996,9 @@ fn hot_source(
+     snapshot: std::io::Result<Option<HotSnapshot>>,
+ ) -> Result<Option<HotSnapshot>, ServerError> {
+     match snapshot {
+-        Ok(Some(snapshot)) if snapshot.path().to_str().is_none() => {
+-            Err(ServerError::HotSnapshot(std::io::Error::new(
+-                std::io::ErrorKind::InvalidData,
+-                "hot snapshot path is not valid UTF-8",
+-            )))
+-        }
++        Ok(Some(snapshot)) if snapshot.path().to_str().is_none() => Ok(None),
+         Ok(snapshot) => Ok(snapshot),
+-        Err(error) => Err(ServerError::HotSnapshot(error)),
++        Err(_) => Ok(None),
+     }
+ }
+ 

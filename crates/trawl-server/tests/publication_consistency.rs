@@ -14,6 +14,7 @@ use trawl_server::error::ServerError;
 use trawl_server::hot_buffer::{HotBuffer, HotBufferConfig};
 use trawl_server::ingest::{compaction::compact_once, wal::WalWriter};
 use trawl_server::pool::{ExecutorPool, WorkContext, WorkKind, seam};
+use trawl_server::publication::CorpusUnsettled;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // one controlled publication, checked through both readers
@@ -174,7 +175,9 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
         .await;
     assert!(matches!(
         result.result,
-        Err(ServerError::ServiceUnavailable(_))
+        Err(ServerError::CorpusRecovering(
+            CorpusUnsettled::RollupPending
+        ))
     ));
     let export = pool
         .export_parquet(
@@ -185,7 +188,12 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
             WorkContext::system(WorkKind::Export),
         )
         .await;
-    assert!(matches!(export, Err(ServerError::ServiceUnavailable(_))));
+    assert!(matches!(
+        export,
+        Err(ServerError::CorpusRecovering(
+            CorpusUnsettled::RollupPending
+        ))
+    ));
     assert!(matches!(
         pool.sample_field_values(
             "message",
@@ -195,7 +203,9 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
             WorkContext::system(WorkKind::Sample),
         )
         .await,
-        Err(ServerError::ServiceUnavailable(_))
+        Err(ServerError::CorpusRecovering(
+            CorpusUnsettled::RollupPending
+        ))
     ));
     assert_eq!(pool.available_permits(), 1);
     std::fs::remove_file(marker).unwrap();
