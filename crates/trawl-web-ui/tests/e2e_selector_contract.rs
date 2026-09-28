@@ -399,6 +399,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"health-storage\"",
     },
     Contract {
+        assignment: "healthDisk: '.health-disk',",
+        source_path: "src/pages/health.rs",
+        source: HEALTH_RS,
+        hook: "class=\"health-disk\"",
+    },
+    Contract {
         assignment: "healthDiagnostics: '.health-diagnostics',",
         source_path: "src/pages/health.rs",
         source: HEALTH_RS,
