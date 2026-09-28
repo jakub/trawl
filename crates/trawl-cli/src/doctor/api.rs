@@ -11,9 +11,10 @@
 //! `api.tls` mints a [`witness::VerifiedTls`] when the URL is `https`, the
 //! trust verifies, and an HTTP answer arrived under that trust; `api.health`
 //! turns it into a `VerifiedApi` only when that answer parsed as a trawl
-//! health body. An untrusted certificate, an `insecure` trust, a plain
-//! `http` URL, a redirect, or any answer that is not trawl's health body
-//! therefore never sees a key.
+//! health body carrying trawl's signature: a `checks` map and a `version`,
+//! which trawld always sends. An untrusted certificate, an `insecure`
+//! trust, a plain `http` URL, a redirect, or any answer that is not trawl's
+//! health body therefore never sees a key.
 //!
 //! Every outcome is decided from [`ClientError::network_kind`] or a
 //! [`ClientError::Server`] status, never from an error's text, and no
@@ -182,19 +183,33 @@ mod witness {
     }
 
     /// An API that answered as trawl under verified TLS: its health answer
-    /// parsed as a trawl health body (a 200, or a 503 carrying one). Only
-    /// [`VerifiedTls::into_api`] mints one.
+    /// parsed as a trawl health body (a 200, or a 503 carrying one) with
+    /// both a `checks` map and a `version`. Only [`VerifiedTls::into_api`]
+    /// mints one.
     pub(super) struct VerifiedApi<'a> {
         url: &'a CheckedUrl,
         trust: &'a TlsTrust,
     }
 
+    /// Why a health answer minted no [`VerifiedApi`].
+    pub(super) enum NotTrawl {
+        /// The request failed or its answer did not parse.
+        Answer(ClientError),
+        /// The body parsed, but lacks the `checks` map or the `version`
+        /// that trawld always sends: a status alone is anyone's answer.
+        Unsigned,
+    }
+
     impl<'a> VerifiedTls<'a> {
         /// The health answer, and with it the API witness when that answer
-        /// is trawl's health body. A redirect, another status, or a body
-        /// that does not parse comes back as the error, and no witness.
-        pub(super) fn into_api(self) -> Result<(VerifiedApi<'a>, HealthResponse), ClientError> {
-            let health = self.answer?;
+        /// is trawl's health body. A redirect, another status, a body that
+        /// does not parse, or one without both `checks` and `version` comes
+        /// back as the refusal, and no witness.
+        pub(super) fn into_api(self) -> Result<(VerifiedApi<'a>, HealthResponse), NotTrawl> {
+            let health = self.answer.map_err(NotTrawl::Answer)?;
+            if health.checks.is_none() || health.version.is_none() {
+                return Err(NotTrawl::Unsigned);
+            }
             Ok((
                 VerifiedApi {
                     url: self.url,
@@ -334,9 +349,10 @@ impl<'a> ApiRun<'a> {
     }
 
     /// `api.health` and its `api.health.<key>` rows, from the probe's
-    /// answer. The runner calls it only after `api.tls` completed. A health
-    /// body that parses mints the API witness, the only way `api.identity`
-    /// can send the key; anything else fails here and blocks it.
+    /// answer. The runner calls it only after `api.tls` completed. A trawl
+    /// health body, one that parses and carries both `checks` and
+    /// `version`, mints the API witness, the only way `api.identity` can
+    /// send the key; anything else fails here and blocks it.
     pub fn health(&mut self) -> Vec<Check> {
         let tls = self
             .tls
@@ -348,7 +364,13 @@ impl<'a> ApiRun<'a> {
                 self.verified = Some(verified);
                 health
             }
-            Err(e) => return vec![answer_failure(check, &e, "health")],
+            Err(witness::NotTrawl::Answer(e)) => return vec![answer_failure(check, &e, "health")],
+            Err(witness::NotTrawl::Unsigned) => {
+                return vec![with_next(
+                    with_reason(check, "not a trawl health answer"),
+                    "check that the URL names trawld's API, not another service",
+                )];
+            }
         };
         let status = match health.status {
             HealthStatus::Ok => "ok",
@@ -372,11 +394,9 @@ impl<'a> ApiRun<'a> {
             detail: Some(detail),
             ..check
         }];
-        match &health.checks {
-            Some(checks) => rows.extend(health_rows(checks)),
-            None => self
-                .notes
-                .push("the server's health answer lists no per-subsystem checks".to_owned()),
+        // The witness exists, so the answer carried a checks map.
+        if let Some(checks) = &health.checks {
+            rows.extend(health_rows(checks));
         }
         self.health = Some(health);
         rows

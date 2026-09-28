@@ -1405,15 +1405,16 @@ fn doctor_insecure_never_sends_key() {
 
 /// The key goes only to a server that answered the unkeyed probe with
 /// trawl's health body. Under verified TLS, a redirect, a 404, a 503 that
-/// is not a health body, and a 200 that is not one all fail `api.health`,
-/// and `api.identity` is blocked by it. The server sees the one unkeyed
-/// probe: no `whoami`, no `Authorization` header.
+/// is not a health body, a 200 that is not one, and a 200 health body
+/// without trawl's `checks` map or `version` all fail `api.health`, and
+/// `api.identity` is blocked by it. The server sees the one unkeyed probe:
+/// no `whoami`, no `Authorization` header.
 #[test]
 fn doctor_sends_key_only_after_trawl_health() {
     let home = Sandbox::new();
     let server_ca = ca("trawl doctor server CA");
     let pem = home.file("ca.pem", &server_ca.pem());
-    let cases: [(&str, Option<Route>, String); 6] = [
+    let cases: [(&str, Option<Route>, String); 9] = [
         (
             "301",
             Some((HEALTH_PATH, 301, String::new())),
@@ -1439,6 +1440,29 @@ fn doctor_sends_key_only_after_trawl_health() {
             "200 unknown status",
             Some((HEALTH_PATH, 200, r#"{"status":"fine"}"#.to_owned())),
             "the answer is not a trawl health response".to_owned(),
+        ),
+        (
+            "200 status alone",
+            Some((HEALTH_PATH, 200, r#"{"status":"ok"}"#.to_owned())),
+            "not a trawl health answer".to_owned(),
+        ),
+        (
+            "200 without version",
+            Some((
+                HEALTH_PATH,
+                200,
+                r#"{"status":"ok","checks":{"duckdb":"ok"}}"#.to_owned(),
+            )),
+            "not a trawl health answer".to_owned(),
+        ),
+        (
+            "200 without checks",
+            Some((
+                HEALTH_PATH,
+                200,
+                r#"{"status":"ok","version":"0.9.0"}"#.to_owned(),
+            )),
+            "not a trawl health answer".to_owned(),
         ),
     ];
     for (case, health, reason) in cases {

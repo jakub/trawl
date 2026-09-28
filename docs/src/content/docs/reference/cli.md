@@ -419,7 +419,7 @@ The doctor runs the checks in this order. When a check's prerequisite is not
 | `connection.config` | The flags or the profile resolve to a URL, a trust mode, and a key source. `source` names where they came from, such as ``CLI profile `prod` in ~/.config/trawl/config.toml`` | None |
 | `api.transport` | A connection to the API origin opens. The doctor sends one `GET /api/v1/health` with no key | `connection.config` |
 | `api.tls` | The API's certificate verifies under the trust mode that the report names: system roots or the pinned CA. An `http` URL fails with `connection is not TLS`. `insecure` fails with `certificate not verified` | `api.transport` |
-| `api.health` | The health answer parses as a Trawl health response with the status `ok`, `degraded`, or `unavailable`. A 503 answer counts | `api.tls` |
+| `api.health` | The health answer parses as a Trawl health response with the status `ok`, `degraded`, or `unavailable`, a `checks` map, and a `version`. `trawld` always sends all three. An answer without the map or the version fails with `not a trawl health answer`. A 503 answer counts | `api.tls` |
 | `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `error`, `refusing`, and every other value are `failed` | `api.health` |
 | `api.health.invalid_key` | The server reported a check name that is not `[a-z0-9_]{1,64}`. This row is always `failed`, and the report does not show the names | `api.health` |
 | `api.identity` | `GET /api/v1/whoami` accepts the key. `detail` shows the key's name, kind, and permissions, never the key or its prefix. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail | `api.health`, and a key selected |
