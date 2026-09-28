@@ -95,6 +95,22 @@ Fleet auth, and creates the `fleet-developer` role and an API key. It then runs
 `trawld`, `trawl-web`, and `trunk serve`. The `trawl-login` pane prints the key.
 Open `http://localhost:8081/login` and paste it.
 
+`trawl-web` verifies the certificate that the development trawld generates. The
+`TRAWL_WEB_UPSTREAM_CA_PATH` line in `fleet-dev.toml` pins
+`~/.trawl/tls/cert.pem`, and it overrides `[web] upstream_ca_path`. trawld writes
+its certificate to `tls/cert.pem` in the parent directory of `[data] path`. The
+pin is correct only while `~/.trawl/trawld.toml` keeps the starter
+`[data] path = "~/.trawl/data"` and sets no `tls_cert_path`.
+
+If you move `[data] path` or supply your own certificate, `trawl-web` pins a file
+that trawld does not serve. While that file is missing, every request that
+`trawl-web` forwards to trawld gets a 503 with
+`upstream certificate not available`, and the error does not clear. An old
+certificate left at that path gives a 502 instead. To fix the pin, edit the
+`TRAWL_WEB_UPSTREAM_CA_PATH` line in `fleet-dev.toml`. Set it to `tls/cert.pem`
+in the parent directory of your `[data] path`, or to the file of the CA that
+issued your certificate.
+
 Native development needs the pinned Rust toolchain, a C toolchain, Python 3.11
 or newer, and curl. Ordinary `cargo build`, `cargo test`, `cargo run`, and
 `bin/dev` verify the official DuckDB archive against
