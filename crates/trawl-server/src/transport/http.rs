@@ -37,7 +37,7 @@ use ulid::Ulid;
 
 /// ULID-based request ID stored in request extensions for tracing and response headers.
 #[derive(Clone, Debug)]
-pub(crate) struct RequestId(pub(crate) String);
+pub struct RequestId(pub(crate) String);
 
 use super::failure;
 use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};

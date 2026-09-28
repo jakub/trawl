@@ -60,3 +60,19 @@ A phase entered more than once adds to the same field. `duckdb_attempts` counts 
 **Numeric contract pins for the phase names**, rejected: it widens the envelope and retypes other senders' fields. A telemetry sender also cannot refuse its own events, so a conflict would have no refusal point.
 
 **Per-phase Prometheus histograms**, rejected for now: a DSL `stats` over the timing events answers the same question behind authentication.
+
+## Amendment (2026-09-27): what the implementation settled
+
+Building slice A settled six points that the decision above left loose or stated too narrowly. The decision stands. These rulings refine it.
+
+**Timing covers every query attempt that reaches `dsl_check`, not only work the pool runs.** trawld opens the account after it validates the request and before `dsl_check`, and allocates `query_id` there. A query that fails `dsl_check` reports `outcome=error` with only `query_dsl_check_us`. A capacity refusal reports `outcome=capacity_refused`, `work_started=false`, and the wait that ran out. A request abandoned before the pool took over reports a complete `outcome=abandoned` with `work_started=false`, because no work is left running to report later. Live tail, the pool ping, and field sampling still open no account.
+
+**A timeout whose worker already released its slot writes one complete account.** The registry lock arbitrates, as the decision says. If the request stamps the work retained first, it writes the partial account, and `query_permit_reclaimed` carries the final totals. If the worker already finished and its slot was released when the deadline fires, no reclaim is coming. The request then writes one complete account, with `outcome=timeout` and `timing_complete=true`. This is the one case where a timeout is not partial. The response is still the 504.
+
+**A partial account has its own sum identity.** On a partial event, `query_observed_us` equals the completed phases plus `active_elapsed_us` plus `query_other_us`. The clock reads the cutoff instant under its own lock, and both the window end and `active_elapsed_us` use that instant. A worker that finishes a phase while the request decides cannot book time past the end of the window. `query_other_us` is computed from the emitted integers, so the identity is exact.
+
+**An export's window starts before `dsl_check`.** The export account takes its own origin before `dsl_check`, so `query_observed_us` covers the check. The legacy start instant is unchanged, and `export_complete.duration_ms` keeps its meaning.
+
+**`run_id` is the `report_runs` row ID, not a ULID.** It is the BIGSERIAL key of the run record. It survives a restart, which is the property the decision needs. The sentence above that calls the key beside `query_id` a ULID holds for `request_id` only.
+
+**The worker's totals do not travel back in `ExecuteOutcome`.** The issue asked for the phase record to cross `spawn_blocking` as a plain value, the way `debug` does. That wording is superseded. The `Arc`-shared phase clock is the single accumulator. The worker closes it before its slot drops, and whoever writes the account reads it after the join. No second record exists, so no second record can drift from the first.

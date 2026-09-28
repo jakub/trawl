@@ -120,6 +120,7 @@ async fn query_rejects_bad_dsl() {
 
 mod lifecycle_capture {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// One captured tracing event: level plus stringified fields.
@@ -129,13 +130,21 @@ mod lifecycle_capture {
         pub fields: BTreeMap<String, String>,
     }
 
-    /// Capture layer recording every event's fields as strings.
+    /// Capture layer recording every event's fields as strings, once
+    /// [`Capture::start`] is called: the subscriber outlives any one
+    /// test, and a capture that recorded from install would hold every
+    /// sibling test's events.
     #[derive(Clone, Default)]
     pub struct Capture {
         events: Arc<Mutex<Vec<Captured>>>,
+        recording: Arc<AtomicBool>,
     }
 
     impl Capture {
+        pub fn start(&self) {
+            self.recording.store(true, Ordering::SeqCst);
+        }
+
         pub fn events(&self) -> Vec<Captured> {
             self.events.lock().unwrap().clone()
         }
@@ -158,6 +167,9 @@ mod lifecycle_capture {
             event: &tracing::Event<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
+            if !self.recording.load(Ordering::SeqCst) {
+                return;
+            }
             let mut fields = BTreeMap::new();
             event.record(&mut Visitor(&mut fields));
             self.events.lock().unwrap().push(Captured {
@@ -168,37 +180,175 @@ mod lifecycle_capture {
     }
 }
 
+/// The one global subscriber of this test binary.
+///
+/// The server logs from its tokio workers and blocking threads, which a
+/// thread-local `set_default` never reaches, so the capture has to be the
+/// global subscriber, and a process has one. Under nextest each test is a
+/// process of its own; under `cargo test` the binary's tests share one, so
+/// every capturing test installs through here and filters on an id only
+/// its own requests carry.
+mod telemetry {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use super::lifecycle_capture::Capture;
+
+    /// The event types the timing capture keeps: everything else the
+    /// server logs would only grow its buffer.
+    const TIMING_EVENTS: [&str; 3] = ["query_timing", "query_permit_reclaimed", "export_complete"];
+
+    /// One kept event, its fields as JSON values: an integer field is a
+    /// JSON number, so a test can tell "recorded as an integer" apart
+    /// from a stringified number.
+    pub type Fields = BTreeMap<String, serde_json::Value>;
+
+    /// Keeps [`TIMING_EVENTS`], recorded by their own value types.
+    #[derive(Clone, Default)]
+    pub struct TimingCapture {
+        events: Arc<Mutex<Vec<Fields>>>,
+    }
+
+    impl TimingCapture {
+        /// Every kept `event_type` event whose `key` field is `value`.
+        pub fn of(&self, event_type: &str, key: &str, value: &serde_json::Value) -> Vec<Fields> {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e.get("event_type").and_then(serde_json::Value::as_str) == Some(event_type)
+                        && e.get(key) == Some(value)
+                })
+                .cloned()
+                .collect()
+        }
+
+        /// Every `query_timing` of one HTTP request.
+        pub fn timing_of(&self, request_id: &str) -> Vec<Fields> {
+            self.of("query_timing", "request_id", &request_id.into())
+        }
+    }
+
+    struct Visitor<'a>(&'a mut Fields);
+
+    impl tracing::field::Visit for Visitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_owned(), format!("{value:?}").into());
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.into());
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_owned(), value.into());
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.insert(field.name().to_owned(), value.into());
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().to_owned(), value.into());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for TimingCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Fields::new();
+            event.record(&mut Visitor(&mut fields));
+            let kept = fields
+                .get("event_type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| TIMING_EVENTS.contains(&t));
+            if kept {
+                self.events.lock().unwrap().push(fields);
+            }
+        }
+    }
+
+    pub struct Installed {
+        /// Everything that passes the default filter, from the moment a
+        /// test starts it.
+        pub info: Capture,
+        /// Everything `trawl_server` logs at DEBUG, likewise.
+        pub debug: Capture,
+        pub timing: TimingCapture,
+    }
+
+    /// Held shared by the timing tests and exclusively by the lifecycle
+    /// test, whose captures keep every event and pair them by first
+    /// match: under `cargo test` it must not see the timing tests'
+    /// queries, which it cannot tell from its own.
+    pub static LIFECYCLE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+    /// The timing capture, held apart from the lifecycle test.
+    pub async fn timing() -> (
+        &'static TimingCapture,
+        tokio::sync::RwLockReadGuard<'static, ()>,
+    ) {
+        let turn = LIFECYCLE.read().await;
+        (&installed().timing, turn)
+    }
+
+    /// The process's subscriber, installed on first use.
+    pub fn installed() -> &'static Installed {
+        use tracing_subscriber::prelude::*;
+
+        static INSTALLED: OnceLock<Installed> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let installed = Installed {
+                info: Capture::default(),
+                debug: Capture::default(),
+                timing: TimingCapture::default(),
+            };
+            let subscriber = tracing_subscriber::registry()
+                .with(
+                    installed
+                        .info
+                        .clone()
+                        .with_filter(tracing_subscriber::EnvFilter::new(
+                            trawl_server::telemetry::DEFAULT_LOG_FILTER,
+                        )),
+                )
+                .with(
+                    installed
+                        .debug
+                        .clone()
+                        .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=debug")),
+                )
+                .with(installed.timing.clone());
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("this module installs the binary's only global subscriber");
+            installed
+        })
+    }
+}
+
 /// Default-filter lifecycle events for `/query`, `/export` and `/stream`
 /// share a `query_id` and contain no user-supplied content — not the raw
 /// DSL, and not an error message either (parser/emitter text quotes the
 /// user's own tokens). The details survive only as DEBUG-level
 /// `query_text` / `query_error_text` events `trawl_server=info` never stores.
 ///
-/// One test, four sentinels: the capture layer is a global subscriber, and
-/// only the first installer in a process wins.
+/// One test, four sentinels: the capture layers belong to the binary's
+/// one global subscriber ([`telemetry`]), and this is the test that
+/// starts them.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
 async fn query_export_and_stream_telemetry_carry_no_user_content() {
-    use lifecycle_capture::Capture;
-    use tracing_subscriber::prelude::*;
-
-    let info_capture = Capture::default();
-    let debug_capture = Capture::default();
-    let subscriber = tracing_subscriber::registry()
-        .with(
-            info_capture
-                .clone()
-                .with_filter(tracing_subscriber::EnvFilter::new(
-                    trawl_server::telemetry::DEFAULT_LOG_FILTER,
-                )),
-        )
-        .with(
-            debug_capture
-                .clone()
-                .with_filter(tracing_subscriber::EnvFilter::new("trawl_server=debug")),
-        );
     // Global (not thread-local) — the server runs on other tokio workers.
-    tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
+    let _alone = telemetry::LIFECYCLE.write().await;
+    let installed = telemetry::installed();
+    let info_capture = &installed.info;
+    let debug_capture = &installed.debug;
+    info_capture.start();
+    debug_capture.start();
 
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -394,6 +544,470 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
             found.fields.contains_key("query_id"),
             "{event_type} is keyed on query_id: {found:?}"
         );
+    }
+}
+
+// -- query timing (ADR-0046) --------------------------------------------------
+
+mod timing {
+    use std::collections::BTreeMap;
+
+    use trawl_engine::timing::QueryPhase;
+
+    use super::telemetry::{Fields, TimingCapture};
+
+    /// A string field's value.
+    pub fn text<'a>(event: &'a Fields, name: &str) -> Option<&'a str> {
+        event.get(name).map(|v| {
+            v.as_str()
+                .unwrap_or_else(|| panic!("{name} is a string: {event:?}"))
+        })
+    }
+
+    /// An integer field's value; a field that is present and not
+    /// recorded as an integer fails the test.
+    pub fn int(event: &Fields, name: &str) -> Option<u64> {
+        event.get(name).map(|v| {
+            v.as_u64()
+                .unwrap_or_else(|| panic!("{name} is an integer: {event:?}"))
+        })
+    }
+
+    pub fn flag(event: &Fields, name: &str) -> Option<bool> {
+        event.get(name).map(|v| {
+            v.as_bool()
+                .unwrap_or_else(|| panic!("{name} is a bool: {event:?}"))
+        })
+    }
+
+    /// The phases the event carries, by name, with their microseconds.
+    pub fn phases(event: &Fields) -> BTreeMap<&'static str, u64> {
+        QueryPhase::ALL
+            .into_iter()
+            .filter_map(|phase| int(event, phase.field()).map(|us| (phase.as_str(), us)))
+            .collect()
+    }
+
+    /// The one `query_timing` of `request_id`.
+    pub fn only(capture: &TimingCapture, request_id: &str) -> Fields {
+        let events = capture.timing_of(request_id);
+        assert_eq!(events.len(), 1, "one account for {request_id}: {events:?}");
+        events.into_iter().next().expect("one")
+    }
+
+    /// The account sums exactly to its window: the present phases plus
+    /// the residual are the observed time.
+    pub fn assert_sums(event: &Fields) {
+        let observed = int(event, "query_observed_us").expect("observed");
+        let other = int(event, "query_other_us").expect("other");
+        let booked: u64 = phases(event).values().sum();
+        assert_eq!(booked + other, observed, "{event:?}");
+    }
+}
+
+/// POST `dsl` to `/query`: the status, the request's id and the body.
+async fn post_query(
+    server: &common::TestServer,
+    dsl: &str,
+) -> (reqwest::StatusCode, String, serde_json::Value) {
+    let response = raw_client()
+        .post(format!("{}/api/v1/query", server.url))
+        .bearer_auth(&server.analyst_token)
+        .json(&serde_json::json!({ "query": dsl }))
+        .send()
+        .await
+        .expect("query request");
+    let status = response.status();
+    let request_id = request_id_of(&response);
+    let body = response.json().await.expect("a JSON body");
+    (status, request_id, body)
+}
+
+fn request_id_of(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get("x-request-id")
+        .expect("every response carries its request id")
+        .to_str()
+        .expect("a ULID is ASCII")
+        .to_owned()
+}
+
+/// An ordinary interactive query reports every phase it entered, as an
+/// integer, and none it did not.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_reports_entered_phases() {
+    use timing::{flag, int, phases, text};
+
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup().await;
+    let (status, request_id, _) = post_query(&server, "service=nginx").await;
+    assert!(status.is_success(), "{status}");
+
+    let event = timing::only(capture, &request_id);
+    assert_eq!(text(&event, "kind"), Some("query"));
+    assert_eq!(text(&event, "outcome"), Some("success"));
+    assert_eq!(text(&event, "request_id"), Some(request_id.as_str()));
+    assert!(int(&event, "query_id").is_some(), "{event:?}");
+    assert_eq!(flag(&event, "timing_complete"), Some(true));
+    assert_eq!(flag(&event, "work_started"), Some(true));
+    assert_eq!(int(&event, "duckdb_attempts"), Some(1));
+    assert_eq!(text(&event, "fallback"), Some("none"));
+    for absent in [
+        "error_class",
+        "format",
+        "run_id",
+        "active_query_phase",
+        "active_elapsed_us",
+    ] {
+        assert!(!event.contains_key(absent), "{absent}: {event:?}");
+    }
+
+    let present = phases(&event);
+    for phase in [
+        "dsl_check",
+        "pool_wait",
+        "publication_wait",
+        "startup",
+        "source",
+        "emit",
+        "bind",
+        "execute",
+        "post",
+    ] {
+        assert!(present.contains_key(phase), "{phase} entered: {event:?}");
+    }
+    for phase in ["saved_lookup", "probe", "copy", "render"] {
+        assert!(
+            !present.contains_key(phase),
+            "{phase} not entered: {event:?}"
+        );
+    }
+    timing::assert_sums(&event);
+}
+
+/// The account's window is the execution record's: one instant ends
+/// both, so the observed microseconds floor to the response's
+/// milliseconds.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_window_matches_execution_record() {
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup().await;
+    let (status, request_id, body) = post_query(&server, "* | stats count() by service").await;
+    assert!(status.is_success(), "{status}: {body}");
+    let duration_ms = body["execution"]["duration_ms"]
+        .as_u64()
+        .expect("the execution record's duration");
+
+    let event = timing::only(capture, &request_id);
+    let observed = timing::int(&event, "query_observed_us").expect("observed");
+    assert!(
+        duration_ms * 1_000 <= observed && observed < (duration_ms + 1) * 1_000,
+        "observed {observed}us is the {duration_ms}ms window"
+    );
+    timing::assert_sums(&event);
+}
+
+/// A `from saved` read looks up its run and takes no publication guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_from_saved_skips_publication() {
+    use timing::{phases, text};
+
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup().await;
+    let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+    let saved = client
+        .create_saved("timing_saved_report", "service=nginx | table service")
+        .await
+        .unwrap();
+    client
+        .set_schedule(saved.id, "1h", None, true, None, None)
+        .await
+        .unwrap();
+    client.trigger_run(saved.id).await.unwrap();
+    let runs = wait_for_finished_runs(&client, saved.id, 1).await;
+    assert_eq!(runs[0].status, "success", "{:?}", runs[0]);
+
+    let (status, request_id, body) = post_query(
+        &server,
+        "| from saved timing_saved_report run=latest | stats count()",
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {body}");
+
+    let event = timing::only(capture, &request_id);
+    assert_eq!(text(&event, "kind"), Some("from_saved"));
+    assert_eq!(text(&event, "outcome"), Some("success"));
+    let present = phases(&event);
+    assert!(present.contains_key("saved_lookup"), "{event:?}");
+    assert!(present.contains_key("pool_wait"), "{event:?}");
+    assert!(!present.contains_key("publication_wait"), "{event:?}");
+    timing::assert_sums(&event);
+}
+
+/// A `from saved` lookup the deadline cuts is a capacity refusal that
+/// books the lookup: the refusal shows where its time went. The lookup
+/// reads postgres, so a lock held on `saved_queries` parks it until the
+/// one-second budget runs out.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_books_an_expired_saved_lookup() {
+    use sqlx::{Connection as _, Executor as _};
+    use timing::{flag, int, phases, text};
+
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup_with_query_timeout(RateLimitConfig::default(), 1).await;
+    let mut lock = sqlx::PgConnection::connect(&server.app_db_url)
+        .await
+        .expect("connect to the app database");
+    lock.execute("BEGIN; LOCK TABLE saved_queries IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock saved_queries");
+
+    let (status, request_id, body) = post_query(
+        &server,
+        "| from saved timing_parked run=latest | stats count()",
+    )
+    .await;
+    lock.execute("ROLLBACK").await.expect("release the lock");
+    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE, "{body}");
+
+    let event = timing::only(capture, &request_id);
+    assert_eq!(text(&event, "outcome"), Some("capacity_refused"));
+    assert_eq!(text(&event, "kind"), Some("query"), "never resolved");
+    assert_eq!(flag(&event, "work_started"), Some(false));
+    assert_eq!(flag(&event, "timing_complete"), Some(true));
+    assert_eq!(
+        phases(&event).into_keys().collect::<Vec<_>>(),
+        ["dsl_check", "saved_lookup"],
+        "{event:?}"
+    );
+    assert!(
+        int(&event, "query_saved_lookup_us").is_some_and(|us| us >= 500_000),
+        "the lookup holds most of the one-second budget: {event:?}"
+    );
+    timing::assert_sums(&event);
+}
+
+/// A `from saved` lookup that fails is booked like one that resolved: the
+/// name was read from postgres before it was found missing, so the error
+/// shows where its time went. The account stays a `query` one, never
+/// resolved, and carries the class without the name.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_books_a_failed_saved_lookup() {
+    use timing::{flag, int, phases, text};
+
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup().await;
+    let (status, request_id, body) = post_query(
+        &server,
+        "| from saved zz_timing_missing_report run=latest | stats count()",
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND, "{body}");
+
+    let event = timing::only(capture, &request_id);
+    assert_eq!(text(&event, "outcome"), Some("error"));
+    assert_eq!(text(&event, "error_class"), Some("not_found"));
+    assert_eq!(text(&event, "kind"), Some("query"), "never resolved");
+    assert_eq!(flag(&event, "work_started"), Some(false));
+    assert_eq!(flag(&event, "timing_complete"), Some(true));
+    assert_eq!(
+        phases(&event).into_keys().collect::<Vec<_>>(),
+        ["dsl_check", "saved_lookup"],
+        "{event:?}"
+    );
+    assert!(int(&event, "query_saved_lookup_us").is_some(), "{event:?}");
+    assert!(!event.contains_key("error"), "{event:?}");
+    assert!(
+        !serde_json::to_string(&event)
+            .unwrap()
+            .contains("zz_timing_missing_report"),
+        "no error text: {event:?}"
+    );
+    timing::assert_sums(&event);
+}
+
+/// A query refused at its admission check reports that check alone, with
+/// its class and without its text.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_refused_at_dsl_check() {
+    use timing::{flag, phases, text};
+
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup().await;
+    let (status, request_id, _) = post_query(&server, "| | | zz_timing_needle {{{").await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+
+    let event = timing::only(capture, &request_id);
+    assert_eq!(text(&event, "outcome"), Some("error"));
+    assert_eq!(text(&event, "error_class"), Some("parse"));
+    assert_eq!(flag(&event, "work_started"), Some(false));
+    assert_eq!(flag(&event, "timing_complete"), Some(true));
+    assert_eq!(
+        phases(&event).into_keys().collect::<Vec<_>>(),
+        ["dsl_check"],
+        "{event:?}"
+    );
+    assert!(!event.contains_key("error"), "{event:?}");
+    assert!(
+        !serde_json::to_string(&event)
+            .unwrap()
+            .contains("zz_timing_needle"),
+        "no error text: {event:?}"
+    );
+    timing::assert_sums(&event);
+}
+
+/// Every export format reports its render, parquet its `COPY` too, and
+/// `export_complete.duration_ms` keeps its own narrower window: it starts
+/// after the admission check, for CSV and JSON it ends before render, and
+/// it holds every phase from the permit wait on.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_timing_export_formats() {
+    use timing::{int, phases, text};
+
+    // `export_complete` carries no request id, and every test server's
+    // query ids start at zero, so under `cargo test` a sibling's export can
+    // share this one's id: the pair is matched on the id, the format and
+    // the length of a query no other test sends.
+    const DSL: &str = "service=nginx | head 7707";
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup().await;
+    for format in ["csv", "json", "parquet"] {
+        let response = raw_client()
+            .post(format!("{}/api/v1/export?format={format}", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": DSL }))
+            .send()
+            .await
+            .expect("export request");
+        assert!(response.status().is_success(), "{format}: {response:?}");
+        let request_id = request_id_of(&response);
+        let body = response.bytes().await.expect("export body");
+        assert!(!body.is_empty(), "{format}");
+
+        let event = timing::only(capture, &request_id);
+        assert_eq!(text(&event, "kind"), Some("export"), "{format}");
+        assert_eq!(text(&event, "format"), Some(format));
+        assert_eq!(text(&event, "outcome"), Some("success"), "{format}");
+        let present = phases(&event);
+        assert!(present.contains_key("render"), "{format}: {event:?}");
+        assert!(present.contains_key("dsl_check"), "{format}: {event:?}");
+        assert_eq!(
+            present.contains_key("copy"),
+            format == "parquet",
+            "{format}: {event:?}"
+        );
+        timing::assert_sums(&event);
+
+        let query_id = event["query_id"].clone();
+        let completes: Vec<_> = capture
+            .of("export_complete", "query_id", &query_id)
+            .into_iter()
+            .filter(|e| {
+                timing::text(e, "format") == Some(format)
+                    && int(e, "query_len") == Some(DSL.len() as u64)
+            })
+            .collect();
+        assert_eq!(completes.len(), 1, "{format}: {completes:?}");
+        let duration_ms = int(&completes[0], "duration_ms").expect("duration_ms");
+        let observed = int(&event, "query_observed_us").expect("observed");
+        let parquet = format == "parquet";
+        // Pinned from both sides. Parquet's readback is its render and
+        // runs inside the worker, so that format's legacy window holds it.
+        let (outside_legacy, inside_legacy): (Vec<&str>, Vec<&str>) =
+            trawl_engine::timing::QueryPhase::ALL
+                .iter()
+                .map(|p| p.as_str())
+                .partition(|p| {
+                    matches!(*p, "dsl_check" | "saved_lookup") || (*p == "render" && !parquet)
+                });
+        let outside: u64 = outside_legacy.iter().filter_map(|p| present.get(p)).sum();
+        let inside: u64 = inside_legacy.iter().filter_map(|p| present.get(p)).sum();
+        // Excluded: the legacy window lies inside the account's, after
+        // the check and (CSV, JSON) before the render. `duration_ms`
+        // floors, and flooring the subtracted phases only loosens the
+        // bound, so the inequality holds exactly; the one microsecond is
+        // defensive slack, not a flooring allowance.
+        assert!(
+            duration_ms * 1_000 <= observed - outside + 1,
+            "{format}: export_complete's {duration_ms}ms excludes {outside_legacy:?} \
+             ({event:?})"
+        );
+        // Included: every phase from the permit wait on ran inside the
+        // legacy window. The millisecond is `duration_ms` flooring.
+        assert!(
+            duration_ms * 1_000 + 1_000 > inside,
+            "{format}: export_complete's {duration_ms}ms includes {inside_legacy:?} \
+             ({event:?})"
+        );
+    }
+}
+
+/// Live tail, the health probe's pool ping and field sampling are not
+/// DSL queries, and open no timing account.
+#[tokio::test(flavor = "multi_thread")]
+async fn non_dsl_work_emits_no_query_timing() {
+    let (capture, _turn) = telemetry::timing().await;
+    let server = setup().await;
+    let raw = raw_client();
+
+    // The control: a DSL query on the same server is accounted for.
+    let (status, control, _) = post_query(&server, "service=nginx").await;
+    assert!(status.is_success(), "{status}");
+    timing::only(capture, &control);
+
+    let stream = raw
+        .get(format!("{}/api/v1/stream", server.url))
+        .query(&[("query", "service=nginx")])
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .expect("stream request");
+    assert!(stream.status().is_success(), "{stream:?}");
+    let stream_id = request_id_of(&stream);
+    drop(stream);
+
+    let health = raw
+        .get(format!("{}/api/v1/health", server.url))
+        .send()
+        .await
+        .expect("health request");
+    assert!(health.status().is_success(), "{health:?}");
+    let health_id = request_id_of(&health);
+    let health: trawl_api::HealthResponse = health.json().await.expect("health body");
+    assert_eq!(
+        health
+            .checks
+            .as_ref()
+            .and_then(|c| c.get("duckdb"))
+            .map(String::as_str),
+        Some("ok"),
+        "the probe pinged the pool: {health:?}"
+    );
+
+    let sampled = raw
+        .get(format!("{}/api/v1/schema/values/service", server.url))
+        .query(&[("limit", "5")])
+        .bearer_auth(&server.analyst_token)
+        .send()
+        .await
+        .expect("field values request");
+    assert!(sampled.status().is_success(), "{sampled:?}");
+    let sampled_id = request_id_of(&sampled);
+    let sampled: trawl_api::FieldValuesResponse = sampled.json().await.expect("values body");
+    assert!(
+        !sampled.cached && !sampled.values.is_empty(),
+        "the pool sampled: {sampled:?}"
+    );
+
+    for (what, request_id) in [
+        ("live tail", stream_id),
+        ("pool ping", health_id),
+        ("field sampling", sampled_id),
+    ] {
+        let events = capture.timing_of(&request_id);
+        assert!(events.is_empty(), "{what} opened an account: {events:?}");
     }
 }
 

@@ -29,6 +29,7 @@ pub mod policy;
 pub mod pool;
 pub mod publication;
 pub mod query_log;
+pub mod query_timing;
 pub mod rate_limit;
 pub mod repin;
 pub mod report_window;

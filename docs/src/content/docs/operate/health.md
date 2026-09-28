@@ -8,6 +8,12 @@ These commands address one server. `TRAWL_URL` names its HTTPS API,
 an owner-only curl config file that holds the bearer header. Keep the token in
 that file, not on the command line, and do not print the file.
 
+The recipes on this page that search trawld's own telemetry filter on
+`service=trawld _producer=trawld`, not on `service=trawld` alone. Any HTTP
+sender can set `service=trawld` on the events it sends. Only trawld stamps
+`_producer=trawld`, so that filter keeps a forged event out of the answer. See
+the [event reference](/reference/events/#declared-fields).
+
 ## Check the server
 
 For warnings about reported discards, persistence failures, compaction
@@ -169,6 +175,123 @@ that arrives during the bind and checks it again before execution. A bind
 already inside DuckDB cannot be interrupted, so its permit returns only when the
 bind returns.
 
+## Find the slow phase of a query
+
+Symptom: a query is slow or timed out, and you need to know where its time went.
+
+trawld writes one `query_timing` event for each DSL query that reaches its DSL
+check. That covers interactive queries, `from saved` queries, exports, and
+scheduled and manual report runs, including the ones refused at the DSL check
+or for capacity. Live tail, the pool ping, and field sampling write none. The
+event splits the query's time into phases. Each phase is an integer number of
+microseconds in a field named `query_<phase>_us`, such as `query_bind_us`.
+[Query timing](/architecture/reports-telemetry/#query-timing) lists the phases
+and the other fields.
+
+1. Read the `X-Request-Id` header of the slow response, and find its timing
+   event.
+
+   ```bash
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld event_type=query_timing request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, query_id, kind, outcome, timing_complete, query_observed_us, query_pool_wait_us, query_source_us, query_bind_us, query_execute_us, query_other_us'
+   ```
+
+   If you know the query ID instead, from `/api/v1/queries` or an
+   `http_failure` event, filter on it. Keep the time bound, because query IDs
+   restart at 0 each time trawld starts.
+
+   ```bash
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld event_type=query_timing query_id=4182 last=1h | table query_bind_us, query_execute_us, query_pool_wait_us'
+   ```
+
+   A scheduled or manual run has no request. Its events carry `run_id`, the
+   `id` of its [report run](/reference/api/#report-runs), instead of
+   `request_id`.
+
+2. Compare the phases. The largest one is where the query spent its time.
+
+   - An absent field means the query never entered that phase. A query without
+     `from saved` has no `query_saved_lookup_us`, and only a `timechart` query
+     has `query_probe_us`.
+   - A present `0` is a measurement: the phase ran for less than one
+     microsecond.
+   - `query_observed_us` is the whole window. It starts at the same instant as
+     the response's `execution.duration_ms`. An export has no
+     `execution.duration_ms`: its window starts before `dsl_check`, earlier
+     than `export_complete.duration_ms` starts, and runs through `render`.
+   - `query_other_us` is the observed time that no phase measured. On a
+     complete event, the present phases plus `query_other_us` add up exactly to
+     `query_observed_us`. A large `query_other_us` is a gap in trawld's
+     measurement, so report it.
+   - `duckdb_attempts` counts how many times DuckDB bound the main statement.
+     When it is more than 1, `fallback` says why: `raw_retry`, `hot_only`, or
+     `both`. `query_bind_us` and `query_execute_us` add up every attempt.
+
+3. To see which phase is slow across many queries, aggregate the phases.
+
+   ```bash
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld event_type=query_timing outcome=success last=24h | stats count(), p95(query_observed_us), p95(query_pool_wait_us), p95(query_source_us), p95(query_hot_snapshot_us), p95(query_bind_us), p95(query_execute_us), p95(query_other_us) by kind'
+   ```
+
+   A high `query_pool_wait_us` means queries waited for an executor permit.
+   See [Inspect capacity](#inspect-capacity). A high `query_bind_us` or
+   `query_execute_us` means DuckDB itself was slow for that query shape.
+
+`outcome` is `success`, `error`, `capacity_refused`, `timeout`, or `abandoned`.
+An `error` event carries `error_class`, never the error text. A
+`capacity_refused` event has `work_started=false` and no worker phase. It
+carries the wait that ran out: `query_pool_wait_us` or
+`query_publication_wait_us`, or `query_saved_lookup_us` when the deadline cut a
+`from saved` lookup before the pool was reached. It is the 503 in
+[Diagnose a 503 or 504 from a query](#diagnose-a-503-or-504-from-a-query).
+`abandoned` with `work_started=false` means the client went away before any
+work started, and nothing is left to report.
+
+### Join a timed-out query to its final totals
+
+When a query times out, or its client goes away while its work runs, trawld
+writes `query_timing` at once. It does not wait for the worker. That event
+carries `timing_complete=false`, and it is partial:
+
+- It carries the phases that finished. The time of the unfinished iteration is
+  not booked. A phase with no earlier completed iteration has no
+  `query_<phase>_us` field. A phase that also ran to completion earlier keeps
+  those earlier iterations in its field. For example, on the second bind of a
+  `raw_retry`, `query_bind_us` holds the first bind only.
+- `active_query_phase` names the phase still running, and `active_elapsed_us`
+  says how long its current iteration had run.
+- `query_observed_us` equals the finished phases, plus `active_elapsed_us`,
+  plus `query_other_us`.
+
+When the worker finishes and returns its permit, trawld writes
+`query_permit_reclaimed` with the same `query_id`, and the same `request_id` or
+`run_id`. That event carries the worker's final phase totals,
+`duckdb_attempts`, `fallback`, and `physical_outcome`: `completed`, `failed`,
+`cancelled`, `panicked`, or `not_started`. A `not_started` reclaim follows a
+capacity refusal where trawld had handed the work to a worker, but the deadline
+expired before the work started. It carries no phases, because no work ran. A worker that never finishes writes no reclaim event.
+
+If the worker had already finished and released its permit when the deadline
+expired, no work is left running. trawld then writes one complete event with `outcome=timeout` and
+`timing_complete=true`, and no reclaim follows.
+
+Join the two events on `request_id`, or on `run_id` for a report run. A
+`query_id` alone can match a query from before a restart.
+
+```bash
+trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld event_type=query_timing,query_permit_reclaimed request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, event_type, query_id, outcome, timing_complete, active_query_phase, active_elapsed_us, physical_outcome, retained_ms, query_bind_us, query_execute_us'
+```
+
+To see which phase timeouts stop in, count the partial events.
+
+```bash
+trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld event_type=query_timing timing_complete=false last=24h | stats count() by outcome, active_query_phase'
+```
+
+Timing events are best-effort telemetry. When the telemetry buffer is full,
+trawld drops them and counts the loss in
+`trawl_telemetry_events_dropped_total`. A missing `query_timing` event does not
+prove that the query did not run.
+
 ## Trace a server failure
 
 Symptom: a client received a 5xx, and you need to know which request failed,
@@ -214,14 +337,14 @@ To trace one failure:
 2. Find the failure event and the events logged inside the same request.
 
    ```bash
-   trawl -p "$TRAWL_PROFILE" query 'service=trawld request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, event_type, _severity, route, stage, reached, error_class, cause_kind, query_id'
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, event_type, _severity, route, stage, reached, error_class, cause_kind, query_id'
    ```
 
 3. If the failure event carries a `query_id`, find the query lifecycle events
    for that ID. `query_failed` names the query ID and its own `error_class`.
 
    ```bash
-   trawl -p "$TRAWL_PROFILE" query 'service=trawld query_id=4182 last=24h | table _time, event_type, _severity, error_class, duration_ms'
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld query_id=4182 last=24h | table _time, event_type, _severity, error_class, duration_ms'
    ```
 
 4. For a failure with `stage=unrecorded`, read `reached`. The producer that
@@ -309,8 +432,8 @@ stderr with the resolved config path and never in stored telemetry.
 
 ## Find authentication failures
 
-Symptom: a client reports 401 or 403, and a query for `service=trawld` shows no
-rejection event.
+Symptom: a client reports 401 or 403, and a query for `service=trawld _producer=trawld`
+shows no rejection event.
 
 Check: events from the targets `fleet_auth`, `auth.backend`,
 `preauth.transport`, `trawl_server::policy::unmetered`, and

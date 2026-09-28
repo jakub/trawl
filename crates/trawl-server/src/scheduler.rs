@@ -20,6 +20,7 @@ use fleet_auth::KeyStore;
 use crate::config::SchedulerConfig;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::ExecutorPool;
+use crate::query_timing::{Outcome, TimingGuard};
 use crate::report_window::{ReportWindow, format_window_bound, truncate_to_micros};
 use crate::store::{ClaimedRun, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
 
@@ -326,31 +327,53 @@ pub(crate) async fn execute_scheduled_query(
     // does not then get another one to execute in.
     let deadline = crate::deadline::Deadline::after(Duration::from_secs(timeout_secs));
 
+    // The run's timing account (ADR-0046), keyed by an id allocated before
+    // the admission check so a refused run is accounted for too. Manual
+    // runs take this same path.
+    let query_id = pool.allocate_query_id();
+    let timing = TimingGuard::for_run(query_id, run_id, start);
+
     // The same admission door the HTTP entry points use (ADR-0024). A
     // query stored before that door existed can be over a cap, and this
     // is where it stops: THIS attempt fails with the diagnostic, recorded
     // as the run's error. The schedule keeps its row and its cursor, so
     // the operator repairs the saved DSL rather than re-enabling a
     // schedule the server disabled behind their back.
-    let result = match crate::admission::check_dsl(query) {
+    let checked = timing
+        .clock()
+        .time(trawl_engine::timing::QueryPhase::DslCheck, || {
+            crate::admission::check_dsl(query)
+        });
+    let result = match checked {
         Err(refusal) => Err(refusal),
         // Execute the query on the pool (no debug capture, UTC timestamps).
         Ok(()) => {
             pool.execute(
-                pool.allocate_query_id(),
+                query_id,
                 query,
                 deadline,
                 false,
                 0,
-                crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled),
+                crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
+                    .with_timing(timing.timing().clone()),
             )
             .await
             .result
         }
     };
 
+    // The account closes here, before the result is persisted: the window
+    // is the query's, and the run's duration is measured to the same
+    // instant.
+    let end = std::time::Instant::now();
+    timing.emit_complete(
+        result
+            .as_ref()
+            .map_or_else(Outcome::of_error, |_| Outcome::Success),
+        end,
+    );
     #[allow(clippy::cast_possible_truncation)]
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = end.saturating_duration_since(start).as_millis() as u64;
 
     match result {
         Ok(query_result) => {
@@ -373,6 +396,7 @@ pub(crate) async fn execute_scheduled_query(
             tracing::info!(
                 event_type = "scheduled_query_completed",
                 run_id,
+                query_id,
                 duration_ms,
                 row_count,
                 result_path = result_path.as_deref().unwrap_or("(blob)"),
@@ -406,12 +430,15 @@ pub(crate) async fn execute_scheduled_query(
                 );
             }
 
+            // The class only: the error's text can quote the saved query
+            // (ADR-0040). The run record keeps the text for its owner.
             tracing::warn!(
                 event_type = "scheduled_query_failed",
                 run_id,
+                query_id,
                 duration_ms,
                 status = status.as_str(),
-                error = %e,
+                error_class = e.error_class(),
                 "scheduled query failed"
             );
         }
@@ -724,7 +751,7 @@ mod pg_tests {
 
     /// Seed a saved query + schedule + started (`running`) run, returning the
     /// schedule store, the owning saved-query id, and the run id.
-    async fn seed_run(pool: &PgPool, name: &str) -> (ScheduleStore, i64, i64) {
+    pub(super) async fn seed_run(pool: &PgPool, name: &str) -> (ScheduleStore, i64, i64) {
         let saved_store = SavedQueryStore::new(pool.clone());
         let sched_store = ScheduleStore::new(pool.clone());
         let saved = saved_store.create(1, name, "q").await.unwrap();
@@ -882,6 +909,138 @@ mod tests {
         assert!(
             !remove_result_file(base, "scheduled/foo/does_not_exist.parquet"),
             "missing file must report false"
+        );
+    }
+
+    /// A scheduled run times itself: one `query_timing` of kind
+    /// `scheduled` per run, keyed by its `query_id` and `run_id`, whose
+    /// id the lifecycle events carry too. A failed run's event says its
+    /// class and never its text, which only the run record keeps.
+    #[sqlx::test]
+    async fn scheduled_run_emits_query_timing_and_no_error_text(pool: sqlx::PgPool) {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::prelude::*;
+
+        type Events = Arc<Mutex<Vec<HashMap<String, String>>>>;
+
+        struct Fields<'a>(&'a mut HashMap<String, String>);
+
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().to_owned(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_owned(), value.to_owned());
+            }
+        }
+
+        struct Capture(Events);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = HashMap::new();
+                event.record(&mut Fields(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let executors =
+            crate::pool::ExecutorPool::new(data.path().to_str().unwrap().into(), 1, 100_000, None);
+        let (store, _, succeeded) = super::pg_tests::seed_run(&pool, "timed_ok").await;
+        let (_, _, failed) = super::pg_tests::seed_run(&pool, "timed_failure").await;
+
+        // The events this test cares about are written on its own thread,
+        // where the run's future is polled; the blocking worker's are not
+        // needed.
+        let events = Events::default();
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        let capturing = tracing::subscriber::set_default(subscriber);
+
+        super::execute_scheduled_query(
+            store.clone(),
+            executors.clone(),
+            succeeded,
+            "* | head 1",
+            "timed_ok",
+            0,
+            30,
+        )
+        .await;
+        super::execute_scheduled_query(
+            store.clone(),
+            executors.clone(),
+            failed,
+            "* | stats zz_sched_needle()",
+            "timed_failure",
+            0,
+            30,
+        )
+        .await;
+        drop(capturing);
+
+        let events = events.lock().unwrap().clone();
+        let of = |event_type: &str, run_id: i64| -> Vec<HashMap<String, String>> {
+            events
+                .iter()
+                .filter(|e| {
+                    e.get("event_type").map(String::as_str) == Some(event_type)
+                        && e.get("run_id") == Some(&run_id.to_string())
+                })
+                .cloned()
+                .collect()
+        };
+        let field = |e: &HashMap<String, String>, name: &str| e.get(name).cloned();
+
+        for (run_id, outcome, lifecycle) in [
+            (succeeded, "success", "scheduled_query_completed"),
+            (failed, "error", "scheduled_query_failed"),
+        ] {
+            let timings = of("query_timing", run_id);
+            assert_eq!(timings.len(), 1, "one account per run: {events:?}");
+            let timing = &timings[0];
+            assert_eq!(field(timing, "kind").as_deref(), Some("scheduled"));
+            assert_eq!(field(timing, "outcome").as_deref(), Some(outcome));
+            assert_eq!(field(timing, "request_id"), None, "{timing:?}");
+            assert!(
+                timing.contains_key("query_dsl_check_us"),
+                "the admission check is timed: {timing:?}"
+            );
+            let query_id = field(timing, "query_id").expect("query_id");
+
+            let ended = of(lifecycle, run_id);
+            assert_eq!(ended.len(), 1, "{lifecycle}: {events:?}");
+            assert_eq!(
+                field(&ended[0], "query_id"),
+                Some(query_id),
+                "{lifecycle} joins its timing on query_id"
+            );
+        }
+
+        let failure = &of("scheduled_query_failed", failed)[0];
+        assert_eq!(field(failure, "error_class").as_deref(), Some("emit"));
+        assert!(!failure.contains_key("error"), "{failure:?}");
+        let timing = &of("query_timing", failed)[0];
+        assert_eq!(field(timing, "error_class").as_deref(), Some("emit"));
+        for event in &events {
+            assert!(
+                !event.values().any(|v| v.contains("zz_sched_needle")),
+                "no event carries the error's text: {event:?}"
+            );
+        }
+
+        let run = store.get_run(failed, 1).await.unwrap().unwrap();
+        assert!(
+            run.error_message
+                .as_deref()
+                .is_some_and(|m| m.contains("zz_sched_needle")),
+            "the run record keeps the text: {run:?}"
         );
     }
 }

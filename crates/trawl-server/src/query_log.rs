@@ -31,7 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::Serialize;
+use serde::ser::SerializeMap as _;
 use serde_json::Value as JsonValue;
+use trawl_engine::timing::{PhaseTotals, QueryPhase};
 
 /// Append-only ndjson query debug log with owner-only permissions and
 /// single-file rollover.
@@ -341,13 +343,42 @@ pub struct ResultDebug {
     pub sample: Vec<BTreeMap<String, JsonValue>>,
 }
 
-/// Execution timing breakdown.
-#[derive(Debug, Serialize)]
+/// Execution timing breakdown: the query's phase map (ADR-0046), the
+/// same totals its `query_timing` event carried, and the legacy total.
+///
+/// Serialized flat, `{"<phase>": ms, ..., "total": ms}`: one key per phase
+/// the query entered, named as `active_query_phase` names it, in the
+/// ADR's order, as fractional milliseconds from the event's whole
+/// microseconds. A phase never entered has no key. `total` is the
+/// execution record's whole-millisecond duration, as it always was.
+#[derive(Debug)]
 pub struct TimingDebug {
-    /// Time spent waiting for a pool permit (ms).
-    pub pool_wait: u64,
-    /// Total query execution time (ms).
-    pub total: u64,
+    phases: Vec<(QueryPhase, u64)>,
+    total: u64,
+}
+
+impl TimingDebug {
+    /// The phase map of `totals` (none when the query kept no account),
+    /// beside the legacy `total_ms`.
+    #[must_use]
+    pub fn new(totals: Option<&PhaseTotals>, total_ms: u64) -> Self {
+        Self {
+            phases: totals.map(|t| t.present().collect()).unwrap_or_default(),
+            total: total_ms,
+        }
+    }
+}
+
+impl Serialize for TimingDebug {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.phases.len() + 1))?;
+        for (phase, us) in &self.phases {
+            #[allow(clippy::cast_precision_loss)] // exact below 2^53 µs, 285 years
+            map.serialize_entry(phase.as_str(), &(*us as f64 / 1_000.0))?;
+        }
+        map.serialize_entry("total", &self.total)?;
+        map.end()
+    }
 }
 
 #[cfg(test)]
@@ -386,10 +417,7 @@ mod tests {
                 row_count: 0,
                 sample: vec![],
             },
-            timing_ms: TimingDebug {
-                pool_wait: 0,
-                total: 0,
-            },
+            timing_ms: TimingDebug::new(None, 0),
             error: None,
         }
     }
@@ -660,5 +688,44 @@ mod tests {
         assert!(!tmp.path().join("query.log.1").exists());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("entry_0") && content.contains("entry_49"));
+    }
+
+    /// `timing_ms` is the phase map `query_timing` carried, in
+    /// milliseconds, with absent phases absent and the legacy `total`
+    /// beside it; the file it lands in stays owner-only.
+    #[test]
+    fn timing_uses_phase_map() {
+        let mut totals = PhaseTotals::default();
+        totals.set(QueryPhase::PoolWait, Some(250));
+        totals.set(QueryPhase::Bind, Some(1_500));
+        totals.set(QueryPhase::Execute, Some(0));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let log = QueryLog::open(&path, 0).unwrap();
+        let mut logged = entry("phase-map");
+        logged.timing_ms = TimingDebug::new(Some(&totals), 7);
+        log.write(&logged);
+        drop(log);
+
+        let line = std::fs::read_to_string(&path).unwrap();
+        let written: JsonValue = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(
+            written["timing_ms"],
+            serde_json::json!({ "pool_wait": 0.25, "bind": 1.5, "execute": 0.0, "total": 7 })
+        );
+        assert!(
+            line.contains(r#""timing_ms":{"pool_wait":0.25,"bind":1.5,"execute":0.0,"total":7}"#),
+            "phases in the ADR's order, then the total: {line}"
+        );
+
+        assert_eq!(
+            serde_json::to_value(TimingDebug::new(None, 3)).unwrap(),
+            serde_json::json!({ "total": 3 }),
+            "no account, no phases"
+        );
+
+        #[cfg(unix)]
+        assert_eq!(mode_of(&path), 0o600, "query log must stay owner-only");
     }
 }
