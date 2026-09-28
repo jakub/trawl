@@ -471,13 +471,14 @@ fn doctor_web_truncated_body_is_too_large() {
 /// A plain loopback origin that answers `GET /healthz` with `200 ok`
 /// unless `cut_healthz`, and cuts every other answer short: headers that
 /// declare 100 bytes of body, 10 of them, then a closed connection. It
-/// returns the origin and the `METHOD path` of each request it read.
-fn cut_short_origin(cut_healthz: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+/// records each request it read as [`record`] does, headers and body
+/// included, so [`Origin::keyless_requests`] applies to it.
+fn cut_short_origin(cut_healthz: bool) -> Origin {
     use std::io::{Read as _, Write as _};
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let record = Arc::clone(&seen);
+    let log = Log::default();
+    let record = Arc::clone(&log);
     std::thread::spawn(move || {
         for tcp in listener.incoming() {
             let Ok(mut tcp) = tcp else { return };
@@ -494,34 +495,64 @@ fn cut_short_origin(cut_healthz: bool) -> (String, Arc<Mutex<Vec<String>>>) {
                     Ok(n) => request.extend_from_slice(&buf[..n]),
                 }
             };
-            let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
-            let length = head
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+            let head = String::from_utf8_lossy(&request[..head_end]).into_owned();
+            let mut lines = head.lines();
+            let mut parts = lines.next().unwrap_or_default().split(' ');
+            let (method, path) = (
+                parts.next().unwrap_or_default().to_owned(),
+                parts.next().unwrap_or_default().to_owned(),
+            );
+            let headers: Vec<(String, String)> = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+                .collect();
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+            };
+            let length = header("content-length").map_or(0, |v| v.parse::<usize>().unwrap());
             while request.len() < head_end + length {
                 match tcp.read(&mut buf) {
                     Ok(0) | Err(_) => return,
                     Ok(n) => request.extend_from_slice(&buf[..n]),
                 }
             }
-            let line = head.lines().next().unwrap_or_default().to_owned();
-            let mut parts = line.split(' ');
-            let (method, path) = (
-                parts.next().unwrap_or_default().to_ascii_uppercase(),
-                parts.next().unwrap_or_default().to_owned(),
-            );
+            let body = &request[head_end..head_end + length];
+            let mut raw = String::new();
+            for (name, value) in &headers {
+                raw.push_str(name);
+                raw.push_str(": ");
+                raw.push_str(value);
+                raw.push('\n');
+            }
+            raw.push_str(&String::from_utf8_lossy(body));
             let response: &[u8] = if path == "/healthz" && !cut_healthz {
                 b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
             } else {
                 b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{\"error\":"
             };
-            record.lock().unwrap().push(format!("{method} {path}"));
+            record.lock().unwrap().push(Seen {
+                api_key: serde_json::from_slice::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|json| {
+                        json.get("api_key")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    }),
+                origin: header("origin"),
+                authorization: header("authorization").is_some(),
+                cookie: header("cookie").is_some(),
+                method,
+                path,
+                raw,
+            });
             let _ = tcp.write_all(response);
             let _ = tcp.flush();
         }
     });
-    (url, seen)
+    Origin { url, log }
 }
 
 /// A web answer the origin cuts short after its headers is an observed
@@ -531,8 +562,8 @@ fn cut_short_origin(cut_healthz: bool) -> (String, Arc<Mutex<Vec<String>>>) {
 /// good `/healthz` fails `web.origin` alone.
 #[test]
 fn doctor_web_body_cut_short_is_broken() {
-    let (url, seen) = cut_short_origin(true);
-    let (output, report) = doctor(&url);
+    let web = cut_short_origin(true);
+    let (output, report) = doctor(&web.url);
     assert_api_failed_independently(&report, "healthz cut short");
     assert_eq!(
         outcome(&report, "web.transport"),
@@ -551,10 +582,10 @@ fn doctor_web_body_cut_short_is_broken() {
         )
     );
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(*seen.lock().unwrap(), ["GET /healthz"]);
+    assert_eq!(web.keyless_requests("healthz cut short"), ["GET /healthz"]);
 
-    let (url, seen) = cut_short_origin(false);
-    let (output, report) = doctor(&url);
+    let web = cut_short_origin(false);
+    let (output, report) = doctor(&web.url);
     assert_api_failed_independently(&report, "login cut short");
     assert_eq!(
         outcome(&report, "web.transport"),
@@ -569,7 +600,7 @@ fn doctor_web_body_cut_short_is_broken() {
         )
     );
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(*seen.lock().unwrap(), PROBES);
+    assert_eq!(web.keyless_requests("login cut short"), PROBES);
 }
 
 /// `GET /healthz` answering 429 samples nothing: `web.transport` is
