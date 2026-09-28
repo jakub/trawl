@@ -223,7 +223,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `crashDump.enabled` | bool | `false` | Capture minidumps on a fatal signal. Adds `CAP_SYS_PTRACE` to the trawld container only, and needs `persistence.enabled`. See [Crash dumps](https://trawl.sh/reference/crash-dumps/) |
 | `crashDump.size` | string | `2Gi` | Crash-dump PVC size |
 | `crashDump.storageClass` | string | `""` | Crash-dump StorageClass. Empty uses the cluster default |
-| `crashDump.mountPath` | string | `/var/lib/trawl/cores` | Crash-dump mount path, passed as `TRAWL_CRASH_DUMP_DIR` |
+| `crashDump.mountPath` | string | `/var/lib/trawl/cores` | Crash-dump mount path, passed as `TRAWL_CRASH_DUMP_DIR`. With `tls.mode: auto` and `web.enabled`, it must not be at, under, or above the `tls` or `tls-key` directory beside `config.data.path` |
 | `crashDump.retain` | int | `10` | Dumps to keep, passed as `TRAWL_CRASH_DUMP_RETAIN` |
 | `config.server.httpAddr` | string | `0.0.0.0:5514` | `[server] http_addr` |
 | `config.server.timeoutSecs` | int | `30` | `[server] timeout_secs` |
@@ -240,7 +240,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.server.maxQueryHistory` | int | `1000` | `[server] max_query_history` |
 | `config.server.rateLimit.defaultRpm` | int | `100` | `[server.rate_limit] default_rpm`, requests per minute per key on the API routes. `0` disables |
 | `config.server.rateLimit.ingestRpm` | int | `1000` | `[server.rate_limit] ingest_rpm`, requests per minute per key on `/api/v1/ingest`. `0` disables |
-| `config.data.path` | string | `/var/lib/trawl/data` | `[data] path` |
+| `config.data.path` | string | `/var/lib/trawl/data` | `[data] path`. With `tls.mode: auto` and `web.enabled`, an absolute path whose parent is on the data volume, with no `.` or `..` components |
 | `config.auth.auditIntervalSecs` | int | `30` | `[auth] audit_interval_secs` |
 | `config.ingest.enabled` | bool | `true` | `[ingest] enabled` |
 | `config.ingest.maxBodyBytes` | string | `16M` | `[ingest] max_body_bytes` |

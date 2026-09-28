@@ -261,6 +261,18 @@ class TLS(unittest.TestCase):
         for path in ["/srv/trawl/data", "/var/lib/trawl", "/var/lib/trawler/data", "data"]:
             with self.subTest(path=path):
                 self.fails({"web": web(), "config": {"data": {"path": path}}}, "config.data.path")
+        # trawld takes the lexical parent of [data] path, and Helm's clean
+        # resolves "..", so a dot component makes them disagree:
+        # /var/lib/trawl/nested/data/.. is /var/lib/trawl to Helm and
+        # /var/lib/trawl/nested/data to trawld. The chart refuses both dots.
+        for path in ["/var/lib/trawl/nested/data/..", "/var/lib/trawl/nested/../data",
+                     "/var/lib/trawl/./data", "/var/lib/trawl/data/."]:
+            with self.subTest(path=path):
+                self.fails({"web": web(), "config": {"data": {"path": path}}},
+                           "config.data.path must be an absolute path without . or .. components")
+        # Repeated slashes collapse the same way in both, so they render.
+        objects = self.objects({"web": web(), "config": {"data": {"path": "/var/lib//trawl/data"}}})
+        self.assertEqual(web_config(objects)["upstream_ca_path"], "/var/lib/trawl/tls/cert.pem")
 
         # auto pins the generated certificate; the other modes' values contradict it.
         for field, value in [("upstreamServerName", "api.example.com"), ("upstreamCa", "system")]:
@@ -284,8 +296,22 @@ class TLS(unittest.TestCase):
             with self.subTest(mount_path=mount_path, data_path=data_path):
                 self.fails({"web": web(), "config": {"data": {"path": data_path}},
                             "crashDump": {"enabled": True, "mountPath": mount_path}}, "crashDump.mountPath")
-        # Siblings of the tls directory are fine, prefix look-alikes included.
-        for mount_path in ["/var/lib/trawl/cores", "/var/lib/trawl/tls-cores", "/var/lib/trawl/tlsx"]:
+        # trawld keeps its key in <state_dir>/tls-key and refuses one that is
+        # not a directory it owns, so no other mount may sit at, under, or
+        # above it either.
+        for mount_path, data_path in [
+            ("/var/lib/trawl/tls-key", "/var/lib/trawl/data"),
+            ("/var/lib/trawl/tls-key/", "/var/lib/trawl/data"),
+            ("/var/lib/trawl/tls-key/cores", "/var/lib/trawl/data"),
+            ("/var/lib/trawl/nested/tls-key", "/var/lib/trawl/nested/data"),
+        ]:
+            with self.subTest(mount_path=mount_path, data_path=data_path):
+                self.fails({"web": web(), "config": {"data": {"path": data_path}},
+                            "crashDump": {"enabled": True, "mountPath": mount_path}},
+                           f'crashDump.mountPath "{mount_path}" must not be at, under, or above')
+        # Siblings of the tls directories are fine, prefix look-alikes included.
+        for mount_path in ["/var/lib/trawl/cores", "/var/lib/trawl/tls-cores", "/var/lib/trawl/tlsx",
+                           "/var/lib/trawl/tls-keys"]:
             with self.subTest(mount_path=mount_path):
                 objects = self.objects({"web": web(), "crashDump": {"enabled": True, "mountPath": mount_path}})
                 self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl")

@@ -132,6 +132,16 @@ is false, except that auto refuses the values it would contradict.
   {{- if eq $tls.mode "auto" -}}
     {{- $data := include "trawl.dataMountPath" . -}}
     {{- $path := toString .Values.config.data.path -}}
+    {{- /* trawld's state_dir is the lexical parent of [data] path, and
+         clean resolves "..": /var/lib/trawl/nested/data/.. is
+         /var/lib/trawl here and /var/lib/trawl/nested/data to trawld.
+         Refuse dot components so the two cannot disagree. Repeated and
+         trailing slashes collapse the same way in both. */ -}}
+    {{- range splitList "/" $path -}}
+      {{- if or (eq . ".") (eq . "..") -}}
+        {{- fail (printf "config.data.path must be an absolute path without . or .. components when tls.mode=auto and web.enabled=true: trawld takes its parent without resolving .., so the chart could mount a certificate directory that trawld never writes; got %q" $path) -}}
+      {{- end -}}
+    {{- end -}}
     {{- $stateDir := dir (clean $path) -}}
     {{- if not (and (hasPrefix "/" $path) (or (eq $stateDir $data) (hasPrefix (printf "%s/" $data) $stateDir))) -}}
       {{- fail (printf "config.data.path must be an absolute path whose parent is %s or a directory on the data volume below it when tls.mode=auto and web.enabled=true: trawld generates its certificate in <parent>/tls, and trawl-web pins it from the data volume; got %q" $data $path) -}}
@@ -139,16 +149,25 @@ is false, except that auto refuses the values it would contradict.
     {{- /* Every other mount of the trawld container. One at, under, or
          above <state_dir>/tls would put the certificate trawld writes on
          another volume while trawl-web pins the data volume's copy. The
-         key directory beside it, <state_dir>/tls-key, is never pinned. */ -}}
+         key directory beside it, <state_dir>/tls-key, is never pinned, but
+         trawld refuses a tls-key that is not a directory it owns, so no
+         other volume may cover it either. */ -}}
     {{- $tlsDir := printf "%s/tls" $stateDir -}}
+    {{- $keyDir := printf "%s/tls-key" $stateDir -}}
+    {{- $guarded := list
+          (dict "dir" $tlsDir "reason" (printf "trawld would write its certificate to that volume while trawl-web pins the data volume's %s" $tlsDir))
+          (dict "dir" $keyDir "reason" "trawld keeps its generated key there, in a directory on the data volume that it owns") -}}
     {{- $mounts := list (dict "path" "/tmp" "field" "trawld's /tmp mount") (dict "path" "/etc/trawl/trawld.toml" "field" "trawld's config mount") -}}
     {{- if .Values.crashDump.enabled -}}
       {{- $mounts = append $mounts (dict "path" (toString .Values.crashDump.mountPath) "field" "crashDump.mountPath") -}}
     {{- end -}}
     {{- range $mounts -}}
       {{- $mount := clean .path -}}
-      {{- if or (eq $mount $tlsDir) (hasPrefix (printf "%s/" $mount) $tlsDir) (hasPrefix (printf "%s/" $tlsDir) $mount) -}}
-        {{- fail (printf "%s %q must not be at, under, or above trawld's generated certificate directory %s when tls.mode=auto and web.enabled=true: trawld would write its certificate to that volume while trawl-web pins the data volume's %s" .field .path $tlsDir $tlsDir) -}}
+      {{- $m := . -}}
+      {{- range $guarded -}}
+        {{- if or (eq $mount .dir) (hasPrefix (printf "%s/" $mount) .dir) (hasPrefix (printf "%s/" .dir) $mount) -}}
+          {{- fail (printf "%s %q must not be at, under, or above %s when tls.mode=auto and web.enabled=true: %s" $m.field $m.path .dir .reason) -}}
+        {{- end -}}
       {{- end -}}
     {{- end -}}
     {{- $subPath := "tls" -}}
