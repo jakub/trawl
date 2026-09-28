@@ -168,6 +168,10 @@ class TLS(unittest.TestCase):
         self.assertEqual(issuer, settings["tls"]["certManager"]["issuerRef"])
         self.assertNotIn("namespace", issuer)
 
+    def test_removed_config_raw_fails_the_render(self):
+        # A leftover would otherwise drop every setting it carried, silently.
+        self.fails({"config": {"raw": "[server]\n"}}, "config.raw was removed")
+
     def test_required_and_typed_fields(self):
         cases = [
             ({"tls": {"mode": "invalid"}}, "tls.mode"),

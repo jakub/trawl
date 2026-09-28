@@ -416,8 +416,8 @@ deletes the old `tls/key.pem` before trawld and the sidecar start, and trawld
 then generates a new certificate and key. A client that pinned the old
 certificate needs a copy of the new one.
 
-This chart has no `config.raw` value. The chart ignores a `config.raw` left in
-your values, so move its settings into the structured `config` values before
+This chart has no `config.raw` value. A `config.raw` left in your values fails
+the render, so move its settings into the structured `config` values before
 `helm upgrade`.
 
 #### Verify the requested name and trust
