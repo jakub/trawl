@@ -175,14 +175,43 @@ pub fn holds_key(raw: &str, key: Option<&str>) -> bool {
     (0..clean.len()).any(|at| key_run(&clean[at..], &key) > 0)
 }
 
-/// Whether the report may show `c`: not a control or bidirectional
-/// formatting character.
+/// Characters a remote string may not bring into the report: every
+/// character whose Unicode bidirectional class is an explicit formatting
+/// class (LRE, RLE, LRO, RLO, PDF, LRI, RLI, FSI, PDI) or one of the
+/// implicit marks (ALM, LRM, RLM), which can reorder what a terminal
+/// shows, and the invisible characters that can hide or split text.
+const HIDDEN: [char; 21] = [
+    // Bidirectional classes ALM, LRM, and RLM.
+    '\u{061c}', // ARABIC LETTER MARK
+    '\u{200e}', // LEFT-TO-RIGHT MARK
+    '\u{200f}', // RIGHT-TO-LEFT MARK
+    // Bidirectional classes LRE, RLE, PDF, LRO, and RLO.
+    '\u{202a}', // LEFT-TO-RIGHT EMBEDDING
+    '\u{202b}', // RIGHT-TO-LEFT EMBEDDING
+    '\u{202c}', // POP DIRECTIONAL FORMATTING
+    '\u{202d}', // LEFT-TO-RIGHT OVERRIDE
+    '\u{202e}', // RIGHT-TO-LEFT OVERRIDE
+    // Bidirectional classes LRI, RLI, FSI, and PDI.
+    '\u{2066}', // LEFT-TO-RIGHT ISOLATE
+    '\u{2067}', // RIGHT-TO-LEFT ISOLATE
+    '\u{2068}', // FIRST STRONG ISOLATE
+    '\u{2069}', // POP DIRECTIONAL ISOLATE
+    // Zero-width and invisible characters.
+    '\u{200b}', // ZERO WIDTH SPACE
+    '\u{200c}', // ZERO WIDTH NON-JOINER
+    '\u{200d}', // ZERO WIDTH JOINER
+    '\u{2060}', // WORD JOINER
+    '\u{2061}', // FUNCTION APPLICATION
+    '\u{2062}', // INVISIBLE TIMES
+    '\u{2063}', // INVISIBLE SEPARATOR
+    '\u{2064}', // INVISIBLE PLUS
+    '\u{feff}', // ZERO WIDTH NO-BREAK SPACE
+];
+
+/// Whether the report may show `c`: not a control character and not one
+/// of [`HIDDEN`].
 fn is_shown(c: char) -> bool {
-    !c.is_control()
-        && !matches!(
-            c,
-            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
-        )
+    !c.is_control() && !HIDDEN.contains(&c)
 }
 
 /// The length of the longest start of `text` that appears somewhere in
@@ -609,6 +638,27 @@ mod tests {
         assert_eq!(shown.chars().count(), 65);
         assert!(shown.ends_with('…'));
         assert_eq!(display_safe(&"x".repeat(64), None), "x".repeat(64));
+    }
+
+    /// Every bidirectional control and invisible character is dropped,
+    /// wherever it sits, and the text around it stays.
+    #[test]
+    fn display_safe_strips_every_bidi_control() {
+        let bidi = [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ];
+        let invisible = [
+            '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}',
+            '\u{2064}', '\u{feff}',
+        ];
+        for c in bidi.into_iter().chain(invisible) {
+            let raw = format!("{c}ab{c}c{c}");
+            assert_eq!(display_safe(&raw, None), "abc", "U+{:04X}", u32::from(c));
+        }
+        assert_eq!(HIDDEN.len(), bidi.len() + invisible.len());
+        // Letters of right-to-left scripts are text, not controls.
+        assert_eq!(display_safe("\u{05d0}\u{0627}", None), "\u{05d0}\u{0627}");
     }
 
     /// The key, its `fleet-auth` prefix, and any piece of 8 or more of its
