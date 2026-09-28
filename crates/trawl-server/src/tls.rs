@@ -18,7 +18,7 @@ use rustls::ServerConfig;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
-use trawl_config::{GENERATED_CERT_FILE, GENERATED_KEY_FILE, GENERATED_TLS_DIR};
+use trawl_config::{GENERATED_CERT_FILE, GENERATED_KEY_DIR, GENERATED_KEY_FILE, GENERATED_TLS_DIR};
 
 /// TLS configuration errors.
 #[derive(Debug, thiserror::Error)]
@@ -54,8 +54,9 @@ pub enum TlsError {
 /// Build a `rustls` [`ServerConfig`] from user-provided cert/key paths,
 /// or auto-generate a self-signed certificate if neither is set.
 ///
-/// `state_dir` is the base directory for auto-generated certs (used as
-/// `{state_dir}/tls/`). Only consulted when both cert/key paths are `None`.
+/// `state_dir` is the base directory for the auto-generated pair (the
+/// certificate in `{state_dir}/tls/`, the key in `{state_dir}/tls-key/`).
+/// Only consulted when both cert/key paths are `None`.
 ///
 /// Returns `Err` if only one of cert/key is provided.
 pub fn build_server_config(
@@ -69,8 +70,7 @@ pub fn build_server_config(
             (c, k, false)
         }
         (None, None) => {
-            let tls_dir = state_dir.join(GENERATED_TLS_DIR);
-            let (c, k, generated) = load_or_generate_default(&tls_dir)?;
+            let (c, k, generated) = load_or_generate_default(state_dir)?;
             (c, k, generated)
         }
         _ => {
@@ -171,12 +171,34 @@ fn log_cert_details(pem_bytes: &[u8]) {
 /// another user pins it (ADR-0048), so it is world-readable and appears
 /// only once complete. Generation removes any old `cert.pem` first, then
 /// writes the key, and publishes `cert.pem` last, so a visible certificate
-/// always has its own key beside it.
+/// always has its own key.
+///
+/// The key lives in its own directory, `{state_dir}/tls-key/`, not beside
+/// the certificate: the Helm chart's `trawl-web` sidecar mounts `tls/` to
+/// pin `cert.pem`, and Kubernetes' fsGroup ownership walk makes every file
+/// on the volume group-readable to that sidecar, so only keeping the key out
+/// of the mount keeps it from the sidecar.
 ///
 /// Returns `(cert_pem, key_pem, was_generated)`.
-fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
+fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
+    let tls_dir = state_dir.join(GENERATED_TLS_DIR);
+    let key_dir = state_dir.join(GENERATED_KEY_DIR);
     let cert_path = tls_dir.join(GENERATED_CERT_FILE);
-    let key_path = tls_dir.join(GENERATED_KEY_FILE);
+    let key_path = key_dir.join(GENERATED_KEY_FILE);
+
+    // An older trawld wrote its key beside the certificate. No private key
+    // stays in the directory the sidecar mounts; an old-layout pair then has
+    // no key in `key_dir` and is regenerated below.
+    let legacy_key = tls_dir.join(GENERATED_KEY_FILE);
+    match fs::remove_file(&legacy_key) {
+        Ok(()) => tracing::info!(
+            event_type = "lifecycle",
+            key = %legacy_key.display(),
+            "removed a private key left in the certificate directory"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(TlsError::Write(e)),
+    }
 
     if cert_path.exists() && key_path.exists() {
         tracing::info!(
@@ -185,12 +207,8 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
             key = %key_path.display(),
             "loading existing self-signed TLS certificate"
         );
-        let cert = fs::read(&cert_path).map_err(|source| TlsError::ReadCert {
-            path: cert_path.clone(),
-            source,
-        })?;
-        let key = read_generated_key(&key_path)?;
-        return Ok((cert, key, false));
+        let (c, k) = load_pem_files(&cert_path, &key_path)?;
+        return Ok((c, k, false));
     }
 
     tracing::info!(
@@ -212,7 +230,8 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
     let key_pem = signing_key.serialize_pem();
 
     // Persist so the cert is stable across daemon restarts.
-    fs::create_dir_all(tls_dir).map_err(TlsError::Write)?;
+    fs::create_dir_all(&tls_dir).map_err(TlsError::Write)?;
+    create_key_dir(&key_dir).map_err(TlsError::Write)?;
 
     // A certificate whose key was lost must go before the new key lands:
     // an interruption between the key write and the publication below would
@@ -223,7 +242,7 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
     // durable before the new key exists.
     remove_if_present(&cert_path).map_err(TlsError::Write)?;
     #[cfg(unix)]
-    fs::File::open(tls_dir)
+    fs::File::open(&tls_dir)
         .and_then(|dir| dir.sync_all())
         .map_err(TlsError::Write)?;
 
@@ -262,40 +281,28 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
 }
 
-/// Read the generated private key, first putting it back to owner-only if
-/// its mode grants any group or other access.
+/// Create the directory that holds the generated key, owner-only (`0700`).
 ///
-/// Kubernetes' fsGroup ownership walk adds group bits to files on the data
-/// volume (`0600` becomes `0660`), and the Helm chart's trawl-web sidecar
-/// runs as another uid in that group, so it could read the key. The mode is
-/// checked and changed through the open handle, so the file changed is the
-/// file read.
-fn read_generated_key(key_path: &Path) -> Result<Vec<u8>, TlsError> {
-    use std::io::Read;
-
-    let read_error = |source: std::io::Error| TlsError::ReadKey {
-        path: key_path.to_owned(),
-        source,
-    };
-    let mut f = fs::File::open(key_path).map_err(read_error)?;
+/// `tls_dir` was created first, so the parent exists. The mode is set
+/// explicitly after creation, so neither the umask nor a directory left by
+/// an earlier start decides it.
+fn create_key_dir(key_dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(key_dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = f.metadata().map_err(read_error)?.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            f.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(TlsError::Write)?;
-            tracing::info!(
-                event_type = "lifecycle",
-                key = %key_path.display(),
-                previous_mode = %format_args!("{mode:03o}"),
-                "restored the generated TLS key to owner-only"
-            );
-        }
+        fs::set_permissions(key_dir, fs::Permissions::from_mode(0o700))?;
     }
-    let mut key = Vec::new();
-    f.read_to_end(&mut key).map_err(read_error)?;
-    Ok(key)
+    Ok(())
 }
 
 /// Publish `pem` at `cert_path` so that a reader sees either no file or the
@@ -471,10 +478,10 @@ mod tests {
         let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
         assert!(self_signed);
 
-        // Verify certs were written to {state_dir}/tls/.
-        let tls_dir = tmp.path().join("tls");
-        assert!(tls_dir.join("cert.pem").exists());
-        assert!(tls_dir.join("key.pem").exists());
+        // Verify the cert was written to {state_dir}/tls/ and the key to
+        // {state_dir}/tls-key/.
+        assert!(tmp.path().join("tls").join("cert.pem").exists());
+        assert!(tmp.path().join("tls-key").join("key.pem").exists());
     }
 
     /// The generated certificate is published for a proxy running as another
@@ -505,11 +512,18 @@ mod tests {
         assert!(self_signed);
 
         let cert_path = tls_dir.join(GENERATED_CERT_FILE);
-        let key_path = tls_dir.join(GENERATED_KEY_FILE);
+        let key_dir = tmp.path().join(GENERATED_KEY_DIR);
+        let key_path = key_dir.join(GENERATED_KEY_FILE);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&cert_path), 0o644, "cert.pem is world-readable");
+        assert_eq!(mode(&key_dir), 0o700, "the key directory is owner-only");
         assert_eq!(mode(&key_path), 0o600, "key.pem is owner-only");
         assert!(!leftover.exists(), "the temporary file was renamed away");
+        assert_eq!(
+            dir_entries(&tls_dir),
+            [GENERATED_CERT_FILE],
+            "a proxy mounting tls/ sees the certificate and nothing else"
+        );
 
         let certs = CertificateDer::pem_slice_iter(&fs::read(&cert_path).unwrap())
             .collect::<Result<Vec<_>, _>>()
@@ -532,7 +546,7 @@ mod tests {
         let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
         fs::create_dir_all(&tls_dir).unwrap();
         let cert_path = tls_dir.join(GENERATED_CERT_FILE);
-        let key_path = tls_dir.join(GENERATED_KEY_FILE);
+        let key_path = tmp.path().join(GENERATED_KEY_DIR).join(GENERATED_KEY_FILE);
 
         // Only a certificate from some other keypair survives.
         let rcgen::CertifiedKey { cert: stale, .. } =
@@ -562,30 +576,46 @@ mod tests {
         assert!(!self_signed, "the start after loads the published pair");
     }
 
-    /// Kubernetes' fsGroup ownership walk adds group bits to files on the
-    /// data volume, and the Helm trawl-web sidecar runs as another uid in
-    /// that group. Loading the generated pair puts the key back to owner-only.
-    #[cfg(unix)]
+    /// An older trawld kept its key at `tls/key.pem`, inside the directory a
+    /// proxy mounts to pin the certificate. Any start that owns the
+    /// generated pair deletes it: an old-layout pair has no key in the key
+    /// directory, so it is regenerated, and a stray legacy key beside a
+    /// current pair is removed without regenerating.
     #[test]
-    fn loading_the_generated_pair_restores_an_owner_only_key() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn a_legacy_key_in_the_certificate_directory_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
-        build_server_config(None, None, tmp.path()).unwrap();
         let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
-        let key_path = tls_dir.join(GENERATED_KEY_FILE);
-        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o660)).unwrap();
+        fs::create_dir_all(&tls_dir).unwrap();
+        let legacy_key = tls_dir.join(GENERATED_KEY_FILE);
 
-        let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
-        assert!(!self_signed, "the existing pair is loaded, not replaced");
-        let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "key.pem is owner-only again");
-        let cert_mode = fs::metadata(tls_dir.join(GENERATED_CERT_FILE))
+        // The old layout: a matching pair, both inside tls/.
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        fs::write(tls_dir.join(GENERATED_CERT_FILE), cert.pem()).unwrap();
+        fs::write(&legacy_key, signing_key.serialize_pem()).unwrap();
+
+        let (_, self_signed) = build_server_config(None, None, tmp.path())
+            .expect("an old-layout pair gives way to a new one");
+        assert!(self_signed, "the old-layout pair is regenerated");
+        assert!(!legacy_key.exists(), "the legacy key is gone");
+        assert_eq!(dir_entries(&tls_dir), [GENERATED_CERT_FILE]);
+
+        // A legacy key beside a current pair.
+        fs::write(&legacy_key, signing_key.serialize_pem()).unwrap();
+        let (_, self_signed) =
+            build_server_config(None, None, tmp.path()).expect("the current pair loads");
+        assert!(!self_signed, "the current pair is kept");
+        assert!(!legacy_key.exists(), "the stray legacy key is gone");
+    }
+
+    /// Names of the entries in `dir`, sorted.
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(cert_mode, 0o644, "cert.pem stays world-readable");
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     /// The Debian package's trawl-web pins the certificate this module

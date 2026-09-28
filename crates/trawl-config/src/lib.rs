@@ -1060,7 +1060,14 @@ pub const GENERATED_TLS_DIR: &str = "tls";
 /// trawld publishes it world-readable (`0644`) so a proxy running as another
 /// user can pin it.
 pub const GENERATED_CERT_FILE: &str = "cert.pem";
-/// File name of trawld's generated private key inside [`GENERATED_TLS_DIR`].
+/// Directory under [`Config::state_dir`] where trawld keeps the private key
+/// of its generated certificate. Owner-only (`0700`). It is a sibling of
+/// [`GENERATED_TLS_DIR`], not inside it, so a proxy that mounts the
+/// certificate directory to pin `cert.pem` never has the key in its mount.
+/// Permission bits alone cannot keep it out: Kubernetes' fsGroup ownership
+/// walk makes every file on the volume group-readable.
+pub const GENERATED_KEY_DIR: &str = "tls-key";
+/// File name of trawld's generated private key inside [`GENERATED_KEY_DIR`].
 /// Owner-only (`0600`).
 pub const GENERATED_KEY_FILE: &str = "key.pem";
 /// Default schema cache TTL (seconds).
