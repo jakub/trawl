@@ -13,7 +13,8 @@ clustering, no multi-tenancy.
 
 - [Connect to a server](https://trawl.sh/start/connect/) someone already runs. About 2 minutes.
 - [Query local Parquet files](https://trawl.sh/start/local-parquet/) with the CLI alone. About 5 minutes.
-- [Install Trawl](https://trawl.sh/getting-started/) and [run your first query](https://trawl.sh/getting-started/first-query/). About 20 minutes.
+- [Run your first query](https://trawl.sh/getting-started/first-query/) in a disposable trial: `trawl trial up` on a Linux machine with Docker. About 5 minutes after the CLI is installed.
+- [Install Trawl](https://trawl.sh/getting-started/) as a server and [deploy it](https://trawl.sh/operate/deployment/).
 
 ## Ask a question
 

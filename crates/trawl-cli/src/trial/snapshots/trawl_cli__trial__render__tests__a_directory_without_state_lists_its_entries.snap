@@ -1,0 +1,9 @@
+---
+source: crates/trawl-cli/src/trial/render.rs
+expression: "text(|out| render_leftover(out, Path::new(\"/state/trawl/trial\"), &entries))"
+---
+The trial directory holds no trial state. `trawl trial down` deletes it and what it holds:
+
+  /state/trawl/trial
+    notes/
+    operator.token

@@ -1,0 +1,14 @@
+---
+source: crates/trawl-cli/src/trial/render.rs
+expression: "text(|out| render_inventory(out, &inventory, Path::new(\"/state/trawl/trial\")))"
+---
+`trawl trial down` deletes these Docker resources:
+
+  container trawl-trial-postgres-1  running
+  network   trawl-trial_default
+  volume    trawl-trial_postgres
+  container trawl-trial-claim       created
+
+and the trial directory, with its state and token files:
+
+  /state/trawl/trial

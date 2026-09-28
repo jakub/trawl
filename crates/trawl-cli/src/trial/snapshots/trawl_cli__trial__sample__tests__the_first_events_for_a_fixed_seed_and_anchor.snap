@@ -1,0 +1,46 @@
+---
+source: crates/trawl-cli/src/trial/sample.rs
+expression: "serde_json::to_string_pretty(&set.events[..5]).unwrap()"
+---
+[
+  {
+    "duration": 14,
+    "host": "api-1",
+    "level": "debug",
+    "message": "cache hit",
+    "service": "api",
+    "timestamp": "2026-09-24T12:01:36.576Z"
+  },
+  {
+    "duration": 179,
+    "host": "auth-2",
+    "level": "info",
+    "message": "session renewed",
+    "service": "auth",
+    "timestamp": "2026-09-24T12:02:06.230Z"
+  },
+  {
+    "duration": 246,
+    "host": "web-1",
+    "level": "info",
+    "message": "POST /cart",
+    "service": "web",
+    "timestamp": "2026-09-24T12:03:08.495Z"
+  },
+  {
+    "duration": 102,
+    "host": "worker-1",
+    "level": "info",
+    "message": "job finished",
+    "service": "worker",
+    "timestamp": "2026-09-24T12:03:34.192Z"
+  },
+  {
+    "duration": 187,
+    "host": "api-2",
+    "level": "info",
+    "message": "request handled",
+    "service": "api",
+    "timestamp": "2026-09-24T12:04:59.157Z"
+  }
+]

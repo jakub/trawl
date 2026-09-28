@@ -14,6 +14,7 @@ pub mod executor;
 pub mod parquet_stats;
 pub mod post_process;
 pub mod timezone;
+pub mod timing;
 
 pub use trawl_api::value;
 

@@ -1,0 +1,363 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! `ca_cert` pinning against a real rustls listener.
+//!
+//! Each test starts a TLS server on `127.0.0.1` that answers
+//! `GET /api/v1/health`, then connects through
+//! [`ConnectionParams::client`], the one constructor every command and the
+//! TUI use. A refusal is checked from both ends: the client call fails, and
+//! the server sees its handshake fail. A plain connection error would pass
+//! the first check but not the second.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio_rustls::TlsAcceptor;
+use trawl_cli::cli::ConnectionParams;
+use trawl_client::{ClientError, HealthStatus, TlsTrust};
+
+const HEALTH_BODY: &str = r#"{"status":"ok"}"#;
+
+/// A self-signed CA that can issue server certificates.
+fn ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+    params.distinguished_name.push(DnType::CommonName, name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    CertifiedIssuer::self_signed(params, KeyPair::generate().expect("CA key")).expect("CA cert")
+}
+
+/// A server certificate for `sans`, issued by `issuer`.
+fn leaf(issuer: &CertifiedIssuer<'static, KeyPair>, sans: &[&str]) -> Identity {
+    let key = KeyPair::generate().expect("leaf key");
+    let mut params =
+        CertificateParams::new(sans.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+            .expect("leaf params");
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let cert = params.signed_by(&key, issuer).expect("sign leaf");
+    Identity {
+        chain: vec![cert.der().clone()],
+        key: PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+    }
+}
+
+struct Identity {
+    chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+}
+
+/// A TLS listener on `127.0.0.1` that reports every handshake outcome.
+struct Server {
+    port: u16,
+    handshakes: mpsc::UnboundedReceiver<Result<(), String>>,
+}
+
+impl Server {
+    async fn start(identity: Identity) -> Self {
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(identity.chain, identity.key)
+        .expect("server certificate");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local addr").port();
+        let (tx, handshakes) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match acceptor.accept(tcp).await {
+                        Ok(mut tls) => {
+                            let _ = tx.send(Ok(()));
+                            answer_health(&mut tls).await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e.to_string()));
+                        }
+                    }
+                });
+            }
+        });
+        Self { port, handshakes }
+    }
+
+    /// The next handshake outcome the server saw.
+    async fn handshake(&mut self) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(10), self.handshakes.recv())
+            .await
+            .expect("the server saw no handshake")
+            .expect("listener task ended")
+    }
+}
+
+/// Read one request head and answer it with a healthy status.
+async fn answer_health<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: &mut S) {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => head.extend_from_slice(&buf[..n]),
+        }
+    }
+    assert!(
+        head.starts_with(b"GET /api/v1/health "),
+        "unexpected request: {}",
+        String::from_utf8_lossy(&head)
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{HEALTH_BODY}",
+        HEALTH_BODY.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+fn pinned(url: String, pem: &str) -> ConnectionParams {
+    ConnectionParams {
+        url,
+        token: "flt_test_not_real".into(),
+        trust: TlsTrust::PinnedCa(pem.as_bytes().to_vec()),
+    }
+}
+
+async fn expect_accepted(server: &mut Server, conn: &ConnectionParams) {
+    let health = conn
+        .client()
+        .expect("build client")
+        .health()
+        .await
+        .expect("pinned CA must be accepted");
+    assert_eq!(health.status, HealthStatus::Ok);
+    server
+        .handshake()
+        .await
+        .expect("server saw a good handshake");
+}
+
+async fn expect_refused(server: &mut Server, conn: &ConnectionParams) {
+    let err = conn
+        .client()
+        .expect("build client")
+        .health()
+        .await
+        .expect_err("the certificate must be refused");
+    assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+    let message = err.to_string();
+    assert_eq!(
+        message,
+        format!(
+            "network error: TLS: the server certificate of API https://127.0.0.1:{} \
+             is not trusted (check ca_cert or the trial's CA)",
+            server.port
+        )
+    );
+    assert!(!message.contains("connection failed"), "{message}");
+    let seen = server.handshake().await;
+    assert!(
+        seen.is_err(),
+        "the server completed a handshake the client should have refused"
+    );
+}
+
+#[tokio::test]
+async fn pinned_ca_accepts_its_own_server() {
+    let ca_a = ca("trawl test CA A");
+    let mut server = Server::start(leaf(&ca_a, &["localhost", "127.0.0.1"])).await;
+
+    let by_ip = pinned(format!("https://127.0.0.1:{}", server.port), &ca_a.pem());
+    expect_accepted(&mut server, &by_ip).await;
+
+    let by_name = pinned(format!("https://localhost:{}", server.port), &ca_a.pem());
+    expect_accepted(&mut server, &by_name).await;
+}
+
+#[tokio::test]
+async fn pinned_ca_refuses_a_server_from_another_ca() {
+    let ca_a = ca("trawl test CA A");
+    let ca_b = ca("trawl test CA B");
+    let mut server = Server::start(leaf(&ca_a, &["localhost", "127.0.0.1"])).await;
+
+    let conn = pinned(format!("https://127.0.0.1:{}", server.port), &ca_b.pem());
+    expect_refused(&mut server, &conn).await;
+}
+
+/// The pin replaces the chain check only: the hostname is still verified.
+#[tokio::test]
+async fn pinned_ca_still_verifies_the_hostname() {
+    let ca_a = ca("trawl test CA A");
+    let mut server = Server::start(leaf(&ca_a, &["other.example"])).await;
+    let conn = pinned(format!("https://127.0.0.1:{}", server.port), &ca_a.pem());
+    expect_refused(&mut server, &conn).await;
+
+    // A name SAN does not cover the IP literal, and the reverse.
+    let mut server = Server::start(leaf(&ca_a, &["localhost"])).await;
+    let conn = pinned(format!("https://127.0.0.1:{}", server.port), &ca_a.pem());
+    expect_refused(&mut server, &conn).await;
+}
+
+/// A bundle with several roots trusts each of them.
+#[tokio::test]
+async fn pinned_bundle_trusts_every_root_in_it() {
+    let ca_a = ca("trawl test CA A");
+    let ca_b = ca("trawl test CA B");
+    let bundle = format!("{}{}", ca_b.pem(), ca_a.pem());
+    let mut server = Server::start(leaf(&ca_a, &["127.0.0.1"])).await;
+    let conn = pinned(format!("https://127.0.0.1:{}", server.port), &bundle);
+    expect_accepted(&mut server, &conn).await;
+}
+
+/// The shape `trawld` generates for itself: a self-signed end-entity
+/// certificate, pinned as its own root.
+#[tokio::test]
+async fn pinned_self_signed_server_certificate() {
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .expect("self-signed pair");
+    let identity = Identity {
+        chain: vec![cert.der().clone()],
+        key: PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+    };
+    let mut server = Server::start(identity).await;
+    let conn = pinned(format!("https://127.0.0.1:{}", server.port), &cert.pem());
+    expect_accepted(&mut server, &conn).await;
+
+    let other = ca("trawl test CA B");
+    let conn = pinned(format!("https://127.0.0.1:{}", server.port), &other.pem());
+    expect_refused(&mut server, &conn).await;
+}
+
+/// Nothing listening is a connection failure, not a certificate one.
+#[tokio::test]
+async fn a_refused_connection_still_says_connection_failed() {
+    let ca_a = ca("trawl test CA A");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    let err = pinned(format!("https://127.0.0.1:{port}"), &ca_a.pem())
+        .client()
+        .expect("build client")
+        .health()
+        .await
+        .expect_err("nothing listens on the port");
+    assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+    let message = err.to_string();
+    assert!(message.contains("connection failed"), "{message}");
+    assert!(!message.contains("certificate"), "{message}");
+}
+
+/// A plain `http://` URL would skip the pin, so a pinned client refuses it
+/// before connecting.
+#[tokio::test]
+async fn pinned_ca_refuses_plain_http() {
+    let ca_a = ca("trawl test CA A");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local addr").port();
+    let conn = pinned(format!("http://127.0.0.1:{port}"), &ca_a.pem());
+    let client = conn.client().expect("build client");
+    tokio::select! {
+        result = client.health() => {
+            let err = result.expect_err("plain HTTP must be refused under a pin");
+            assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+        }
+        _ = listener.accept() => panic!("a pinned client opened a plain connection"),
+    }
+}
+
+/// A pin replaces the platform roots; it does not add to them.
+///
+/// Every other test here uses a CA no platform store trusts, so a pin that
+/// merged its roots into the platform store would pass them all. This one
+/// makes the server's issuer a platform root. Under the workspace's reqwest
+/// features the platform store is `rustls-platform-verifier`, which on Linux
+/// loads `rustls-native-certs`, and that reads only `SSL_CERT_FILE` when the
+/// variable is set. The process environment must not be mutated, so the
+/// clients run in a re-executed copy of this test with the variable set on
+/// its `Command`, and the server stays here to see both handshakes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pinned_ca_excludes_the_platform_roots() {
+    const CHILD_URL: &str = "TRAWL_TEST_PLATFORM_ROOTS_URL";
+    const CHILD_PIN: &str = "TRAWL_TEST_PLATFORM_ROOTS_PIN";
+    if let Some(url) = std::env::var_os(CHILD_URL) {
+        let url = url.into_string().expect("UTF-8 URL");
+        let pin = std::fs::read_to_string(std::env::var_os(CHILD_PIN).expect("pin path"))
+            .expect("read the pin");
+        // The platform path trusts the server: the variable took effect.
+        let system = ConnectionParams {
+            url: url.clone(),
+            token: "flt_test_not_real".into(),
+            trust: TlsTrust::System,
+        };
+        let health = system
+            .client()
+            .expect("build client")
+            .health()
+            .await
+            .expect("the platform roots must trust the server");
+        assert_eq!(health.status, HealthStatus::Ok);
+        // A pin to another CA refuses the same server.
+        let err = pinned(url, &pin)
+            .client()
+            .expect("build client")
+            .health()
+            .await
+            .expect_err("a pin must not fall back to the platform roots");
+        assert!(matches!(err, ClientError::Network(_)), "got {err:?}");
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let platform = ca("trawl test platform CA");
+    let other = ca("trawl test CA B");
+    let platform_file = dir.path().join("platform-roots.pem");
+    let pin_file = dir.path().join("pin.pem");
+    std::fs::write(&platform_file, platform.pem()).expect("write platform roots");
+    std::fs::write(&pin_file, other.pem()).expect("write pin");
+    let mut server = Server::start(leaf(&platform, &["127.0.0.1"])).await;
+
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"));
+    child
+        .args([
+            "--exact",
+            "pinned_ca_excludes_the_platform_roots",
+            "--nocapture",
+        ])
+        .env(CHILD_URL, format!("https://127.0.0.1:{}", server.port))
+        .env(CHILD_PIN, &pin_file)
+        .env("SSL_CERT_FILE", &platform_file)
+        .env_remove("SSL_CERT_DIR");
+    let output = tokio::task::spawn_blocking(move || child.output())
+        .await
+        .expect("join the child")
+        .expect("re-execute the test binary");
+    assert!(
+        output.status.success(),
+        "child failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server
+        .handshake()
+        .await
+        .expect("the server saw the platform client's handshake");
+    assert!(
+        server.handshake().await.is_err(),
+        "the server completed a handshake the pinned client should have refused"
+    );
+}

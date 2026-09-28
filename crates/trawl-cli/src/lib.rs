@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 pub mod cli;
 mod config;
 pub mod schema;
+mod trial;
 mod tui;
 
 /// trawl — search your logs with a pipeline DSL.
@@ -33,7 +34,8 @@ struct Cli {
     url: Option<String>,
 
     /// API token (direct value).
-    #[arg(long, env = "TRAWL_TOKEN", global = true)]
+    // Help names the variable but never prints its value.
+    #[arg(long, env = "TRAWL_TOKEN", hide_env_values = true, global = true)]
     token: Option<String>,
 
     /// Accept self-signed TLS certificates.
@@ -41,6 +43,7 @@ struct Cli {
     insecure: bool,
 
     /// Named profile from config file (overrides [server] settings).
+    /// `trial` is reserved: it connects to the `trawl trial` installation.
     #[arg(long, short = 'p', env = "TRAWL_PROFILE", global = true)]
     profile: Option<String>,
 
@@ -97,6 +100,13 @@ enum Command {
 
         #[command(subcommand)]
         cmd: DriverSubcommand,
+    },
+
+    /// Run a disposable trial installation in Docker on this machine:
+    /// loopback only, with sample data. `-p trial` connects to it.
+    Trial {
+        #[command(subcommand)]
+        cmd: trial::TrialCommand,
     },
 }
 
@@ -382,6 +392,8 @@ pub enum CliError {
     Config(#[from] config::ConfigError),
     #[error("{0}")]
     Usage(String),
+    #[error("{0}")]
+    Trial(#[from] trial::TrialError),
 }
 
 /// The binary's entry point: parse argv, run, and map errors to an exit code.
@@ -401,15 +413,48 @@ pub async fn main() {
     }
 }
 
-async fn run(args: Cli) -> Result<(), CliError> {
+async fn run(mut args: Cli) -> Result<(), CliError> {
+    // Trial verbs run before config.toml is read: a broken client config
+    // must not block `trawl trial up` or `down`.
+    let command = match args.command.take() {
+        Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await?),
+        command => command,
+    };
+    // The driver sends to whatever TUI holds the socket and never uses the
+    // resolved connection, so under -p trial it could drive a TUI that is
+    // connected elsewhere. Refused before the socket is touched.
+    if matches!(command, Some(Command::Driver { .. }))
+        && args.profile.as_deref() == Some(trial::PROFILE)
+    {
+        return Err(CliError::Usage(DRIVER_UNDER_TRIAL.to_owned()));
+    }
+
     // Load config file and apply overrides.
     let mut cfg = config::Config::load(args.config.as_deref())?;
-    if let Some(ref profile) = args.profile {
+    let trial_profile = args.profile.as_deref() == Some(trial::PROFILE);
+    if trial_profile {
+        let overrides =
+            trial::profile::Overrides::observe(args.url.is_some(), args.token.is_some());
+        let config_path = args
+            .config
+            .as_deref()
+            .unwrap_or(config::DEFAULT_CONFIG_PATH);
+        let paths = trial::paths::TrialPaths::from_env()?;
+        trial::profile::apply(&mut cfg, overrides, config_path, &paths)?;
+    } else if let Some(ref profile) = args.profile {
         cfg.apply_profile(profile)?;
     }
     cfg.apply_overrides(args.url, args.insecure);
+    if trial_profile {
+        // The trial is only ever reached through its pinned certificate:
+        // --insecure or TRAWL_INSECURE fails here, through the
+        // ca_cert-with-insecure rule, before any command runs.
+        cfg.tls_trust()?;
+    }
+    // Before any output, and before the TUI takes the terminal.
+    warn_if_insecure(&cfg, &mut io::stderr().lock())?;
 
-    match args.command {
+    match command {
         None => {
             // TUI mode — tracing goes to a log file, not stderr (which corrupts the UI).
             let log_dir = shellexpand::tilde("~/.config/trawl");
@@ -446,12 +491,7 @@ async fn run(args: Cli) -> Result<(), CliError> {
             let conn = if data.is_some() {
                 None
             } else {
-                let token = cfg.load_token(args.token.as_deref())?;
-                Some(cli::ConnectionParams {
-                    url: cfg.server.url.clone(),
-                    token,
-                    insecure: cfg.server.insecure,
-                })
+                Some(connection(&cfg, args.token.as_deref())?)
             };
 
             cli::run_query(
@@ -465,15 +505,12 @@ async fn run(args: Cli) -> Result<(), CliError> {
             .await?;
         }
         Some(Command::Validate { query }) => {
-            // Validate supports both daemon and local-only mode.
-            let conn = if let Ok(token) = cfg.load_token(args.token.as_deref()) {
-                Some(cli::ConnectionParams {
-                    url: cfg.server.url.clone(),
-                    token,
-                    insecure: cfg.server.insecure,
-                })
-            } else {
-                None
+            // Validate supports both daemon and local-only mode: no token
+            // means local. Any other resolution failure is still an error.
+            let conn = match connection(&cfg, args.token.as_deref()) {
+                Ok(conn) => Some(conn),
+                Err(CliError::Config(config::ConfigError::TokenNotFound)) => None,
+                Err(e) => return Err(e),
             };
 
             cli::run_validate(&query, conn).await?;
@@ -486,8 +523,42 @@ async fn run(args: Cli) -> Result<(), CliError> {
         Some(Command::Driver { socket, cmd }) => {
             run_driver(&socket, cmd).await?;
         }
+
+        Some(Command::Trial { .. }) => unreachable!("trial verbs return before the config loads"),
     }
 
+    Ok(())
+}
+
+/// The refusal for `trawl -p trial driver ...` (or `TRAWL_PROFILE=trial`).
+const DRIVER_UNDER_TRIAL: &str = "-p trial cannot select the trial for `trawl driver`: the driver \
+     controls a TUI that is already running, whichever server that TUI is connected to. \
+     Start the TUI with `trawl -p trial --driver`, then run `trawl driver` without -p trial \
+     or TRAWL_PROFILE=trial";
+
+/// Resolve the connection every server-bound command and the TUI use:
+/// the token first, then the certificate trust.
+pub(crate) fn connection(
+    cfg: &config::Config,
+    direct_token: Option<&str>,
+) -> Result<cli::ConnectionParams, CliError> {
+    let token = cfg.load_token(direct_token)?;
+    Ok(cli::ConnectionParams {
+        url: cfg.server.url.clone(),
+        token,
+        trust: cfg.tls_trust()?,
+    })
+}
+
+/// The one line `trawl` writes when certificate verification is off,
+/// whichever of `--insecure`, `TRAWL_INSECURE`, `[server]`, or the profile
+/// turned it on. It goes to stderr so stdout stays byte-identical.
+const INSECURE_WARNING: &str = "trawl: warning: insecure is on, so the server's TLS certificate is not verified; pin it with ca_cert instead";
+
+fn warn_if_insecure(cfg: &config::Config, stderr: &mut impl Write) -> io::Result<()> {
+    if cfg.server.insecure {
+        writeln!(stderr, "{INSECURE_WARNING}")?;
+    }
     Ok(())
 }
 
@@ -505,14 +576,7 @@ async fn run_schema(
     cfg: &config::Config,
     token: Option<&str>,
 ) -> Result<(), CliError> {
-    let conn = |token: Option<&str>| -> Result<cli::ConnectionParams, CliError> {
-        let token = cfg.load_token(token)?;
-        Ok(cli::ConnectionParams {
-            url: cfg.server.url.clone(),
-            token,
-            insecure: cfg.server.insecure,
-        })
-    };
+    let conn = |token: Option<&str>| connection(cfg, token);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     match cmd {

@@ -43,11 +43,13 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::executor::{Executor, RowCap};
+use trawl_engine::timing::{PhaseClock, QueryPhase};
 use trawl_engine::value::QueryResult;
 
 use crate::deadline::Deadline;
 use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::hot_buffer::{HotBuffer, HotSnapshot};
+use crate::query_timing::{Outcome, PhysicalOutcome, QueryTiming, Reclaim, emit_reclaimed};
 use crate::source::compute_source;
 
 /// Test-only delay injected into the blocking query task so timeout and
@@ -134,7 +136,7 @@ pub enum WorkOwner {
 /// the retained listing shows a reader entitled to see it. A lane that
 /// needs the kind past the point it hands this over keeps a copy of
 /// [`WorkKind`], which is Copy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct WorkContext {
     pub kind: WorkKind,
     pub owner: WorkOwner,
@@ -142,6 +144,11 @@ pub struct WorkContext {
     /// the anchor for an authorization decision, which is
     /// [`WorkOwner::Key`]'s id, because names are mutable and non-unique.
     user: Option<Arc<str>>,
+    /// The query's timing account (ADR-0046), for the DSL lanes whose
+    /// caller keeps one. The pool books its waits, the startup and the
+    /// worker's phases on its clock, and settles who writes the account
+    /// when the request stops waiting before the work stops running.
+    timing: Option<QueryTiming>,
 }
 
 impl WorkContext {
@@ -152,6 +159,7 @@ impl WorkContext {
             kind,
             owner: WorkOwner::Key(key_id),
             user: None,
+            timing: None,
         }
     }
 
@@ -162,6 +170,7 @@ impl WorkContext {
             kind,
             owner: WorkOwner::System,
             user: None,
+            timing: None,
         }
     }
 
@@ -169,6 +178,13 @@ impl WorkContext {
     #[must_use]
     pub fn with_user(mut self, name: &str) -> Self {
         self.user = Some(Arc::from(name));
+        self
+    }
+
+    /// Time this work on `timing`'s account (ADR-0046).
+    #[must_use]
+    pub fn with_timing(mut self, timing: QueryTiming) -> Self {
+        self.timing = Some(timing);
         self
     }
 }
@@ -316,9 +332,62 @@ struct WorkSlot {
     executor: Option<Executor>,
     publication: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     permit: Option<OwnedSemaphorePermit>,
+    /// The query's timing account, when its lane keeps one.
+    timing: Option<QueryTiming>,
+    /// How the physical work ended, written by the worker in
+    /// [`WorkSlot::finish`] before this slot drops, for the reclaim event.
+    physical: PhysicalOutcome,
 }
 
+/// The clock a slot without a timing account books on: records nothing.
+static CLOCK_OFF: PhaseClock = PhaseClock::off();
+
 impl WorkSlot {
+    /// The clock this work books its phases on.
+    fn clock(&self) -> &PhaseClock {
+        self.timing.as_ref().map_or(&CLOCK_OFF, QueryTiming::clock)
+    }
+
+    /// The worker passed its work-start transition: `startup` ends, and
+    /// the account says the work started.
+    ///
+    /// Outside [`Self::begin_work`] because that runs under the registry
+    /// lock, and the account's lock is never taken inside it.
+    fn started_timing(&self) {
+        if let Some(timing) = &self.timing {
+            timing.clock().exit(QueryPhase::Startup);
+            timing.mark_work_started();
+        }
+    }
+
+    /// The worker's last word, before this slot drops: record how the
+    /// physical work ended and close the clock, so its final totals are
+    /// on the shared clock before [`Drop`] takes the registry lock. The
+    /// clock is the one accumulator (ADR-0046): the handler's complete
+    /// account and the reclaim both read it, and no copy of it travels.
+    ///
+    /// Work that never started discards its `startup`: nothing ran, so
+    /// the refusal reports no worker phase. The request may have
+    /// discarded it already, which is a no-op here.
+    fn finish<T>(&mut self, result: &Result<T, ServerError>) {
+        let started = self.started.load(Ordering::SeqCst);
+        self.physical = if started {
+            PhysicalOutcome::of_result(result)
+        } else {
+            PhysicalOutcome::NotStarted
+        };
+        let Some(timing) = &self.timing else {
+            return;
+        };
+        let clock = timing.clock();
+        if !started {
+            clock.discard(QueryPhase::Startup);
+        }
+        // Closing books any phase still active; the totals it returns are
+        // read from the clock by whoever writes the account.
+        let _ = clock.close_at(Instant::now());
+    }
+
     /// The executor this work runs on. It never leaves the slot, so no
     /// panic anywhere in the worker can lose it from the pool.
     fn executor(&self) -> &Executor {
@@ -396,15 +465,22 @@ impl Drop for WorkSlot {
         // (a) Stop being interruptible, return the executor, and stop
         // being retained — one critical section, because an interrupt
         // that fired here would land on the next query to take this
-        // executor.
-        let retained_for = {
+        // executor. Whether the work was retained, and whether it had
+        // started, are read in the same section the request's
+        // `mark_request_finished` stamps the retention in: that lock is
+        // what decides which side writes the final timing account.
+        let retained = {
             let mut registry = self.registry.lock();
             registry.interrupts.remove(&self.id);
             let entry = registry.retained.remove(&self.id);
             if let Some(executor) = self.executor.take() {
                 registry.idle.push(executor);
             }
-            entry.and_then(|entry| entry.retained_since.map(|since| since.elapsed()))
+            entry.and_then(|entry| {
+                entry
+                    .retained_since
+                    .map(|since| (since.elapsed(), entry.started_work))
+            })
         };
         // (b) then the publication guard, (c) then the permit: a
         // compaction publisher or a cutover waiting on either must not
@@ -412,18 +488,44 @@ impl Drop for WorkSlot {
         drop(self.publication.take());
         drop(self.permit.take());
         // (d) Content-free: which work, what kind, how long it outlived
-        // its request. Only work that was actually retained logs — the
-        // pair with `query_permit_retained`.
-        if let Some(retained_for) = retained_for {
-            tracing::info!(
-                event_type = "query_permit_reclaimed",
-                query_id = self.id,
-                kind = self.kind.as_str(),
-                retained_ms = u64::try_from(retained_for.as_millis()).unwrap_or(u64::MAX),
-                "retained query permit reclaimed"
-            );
+        // its request, how it ended. Only work that was actually retained
+        // logs — the pair with `query_permit_retained`. The request wrote
+        // a partial account when it stopped waiting on started work, so
+        // this event carries the final totals the worker closed its clock
+        // with; work that never started carries no phases.
+        if let Some((retained_for, started)) = retained {
+            let totals = if started {
+                self.timing
+                    .as_ref()
+                    .and_then(|timing| timing.clock().close_at(Instant::now()))
+            } else {
+                None
+            };
+            emit_reclaimed(&Reclaim {
+                query_id: self.id,
+                kind: self.kind,
+                retained_for,
+                correlation: self.timing.as_ref().map(QueryTiming::correlation),
+                physical: if started {
+                    self.physical
+                } else {
+                    PhysicalOutcome::NotStarted
+                },
+                totals: totals.as_ref(),
+            });
         }
     }
+}
+
+/// What the request learned, under the registry lock, when it stopped
+/// waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestEnd {
+    /// This call stamped the work retained: its slot was still
+    /// registered, so its cleanup has yet to run.
+    retained: bool,
+    /// The work passed its work-start transition.
+    started: bool,
 }
 
 /// The request side of one unit of work, which may stop waiting before
@@ -434,36 +536,89 @@ impl Drop for WorkSlot {
 /// its permit is booked as retained, exactly as a timeout does, because
 /// nothing else will run on that path — the request future is already
 /// gone.
+///
+/// While armed it also owns the query's timing account (ADR-0046): a
+/// request that stops waiting is the one side that can write the account
+/// at once. Disarming hands it back to the handler, which has the result.
 struct RequestGuard<'a> {
     pool: &'a ExecutorPool,
     id: u64,
     kind: WorkKind,
     started: Arc<AtomicBool>,
+    timing: Option<QueryTiming>,
     armed: bool,
 }
 
 impl<'a> RequestGuard<'a> {
-    fn new(pool: &'a ExecutorPool, id: u64, kind: WorkKind, started: &Arc<AtomicBool>) -> Self {
+    fn new(
+        pool: &'a ExecutorPool,
+        id: u64,
+        kind: WorkKind,
+        started: &Arc<AtomicBool>,
+        timing: Option<&QueryTiming>,
+    ) -> Self {
+        if let Some(timing) = timing {
+            timing.hand_emit_to_pool();
+        }
         Self {
             pool,
             id,
             kind,
             started: Arc::clone(started),
+            timing: timing.cloned(),
             armed: true,
         }
     }
 
-    /// The work finished first: there is nothing to retain.
+    /// The work finished first: there is nothing to retain, and the
+    /// handler writes the account from the result.
     fn disarm(&mut self) {
         self.armed = false;
+        if let Some(timing) = &self.timing {
+            timing.hand_emit_back();
+        }
     }
 
-    /// Stop waiting on purpose. Returns whether the work had started,
-    /// which is the caller's 503-vs-504 classification.
+    /// Stop waiting on purpose, at the deadline. Returns whether the work
+    /// had started, which is the caller's 503-vs-504 classification.
     fn abandon(&mut self) -> bool {
         self.armed = false;
         self.pool.cancel_by_id(self.id);
-        self.pool.mark_request_finished(self.id, &self.started)
+        let end = self.pool.mark_request_finished(self.id, &self.started);
+        self.settle(end, Outcome::Timeout, Outcome::CapacityRefused);
+        end.started
+    }
+
+    /// Write the timing account for a request that stopped waiting.
+    ///
+    /// The registry lock already decided it ([`RequestEnd`]), and this
+    /// runs after that lock is released:
+    ///
+    /// - Started and retained: the work is still running, so the account
+    ///   is partial — the completed totals and the phase in flight. The
+    ///   slot's cleanup reports the final totals on the reclaim.
+    /// - Started and not retained: the worker finished and its slot is
+    ///   gone, so there is no reclaim coming and the account is complete.
+    /// - Never started: nothing ran. The account is complete, with no
+    ///   worker phase and `startup` discarded.
+    fn settle(&self, end: RequestEnd, if_started: Outcome, if_not_started: Outcome) {
+        let Some(timing) = &self.timing else {
+            return;
+        };
+        let now = Instant::now();
+        if end.started {
+            // The worker marks the account itself, after its transition
+            // and outside the registry lock, so it may not have yet.
+            timing.mark_work_started();
+            if end.retained {
+                timing.emit_partial(if_started);
+            } else {
+                timing.emit_complete(if_started, now);
+            }
+        } else {
+            timing.clock().discard(QueryPhase::Startup);
+            timing.emit_complete(if_not_started, now);
+        }
     }
 }
 
@@ -479,7 +634,20 @@ impl Drop for RequestGuard<'_> {
             "the caller stopped waiting; its work keeps its permit until cleanup"
         );
         self.pool.cancel_by_id(self.id);
-        self.pool.mark_request_finished(self.id, &self.started);
+        let end = self.pool.mark_request_finished(self.id, &self.started);
+        // A caller that walked away before the work started was not
+        // refused anything: it is abandoned either way.
+        self.settle(end, Outcome::Abandoned, Outcome::Abandoned);
+    }
+}
+
+/// Write the account of work refused before it was dispatched: the
+/// permit or the publication wait ran out the budget (ADR-0046). The
+/// pool names the refusal where it makes it, so nobody reads it back out
+/// of the 503's text.
+fn account_refused(timing: Option<&QueryTiming>) {
+    if let Some(timing) = timing {
+        timing.emit_complete(Outcome::CapacityRefused, Instant::now());
     }
 }
 
@@ -536,6 +704,12 @@ impl RefusalOnce {
             severity_columns: Vec::new(),
         }
     }
+
+    /// Whether this work was refused. Read by a request whose worker
+    /// answered first: only a refusal of the start sets it.
+    fn refused(&self) -> bool {
+        self.logged.load(Ordering::SeqCst)
+    }
 }
 
 /// Deterministic control over the blocking worker, for tests only.
@@ -572,6 +746,10 @@ pub mod seam {
         Started,
         /// After the work produced its answer, before cleanup.
         Finished,
+        /// After cleanup released everything the work held, before the
+        /// worker hands its answer back: the slot is gone and the request
+        /// has not heard. The query lanes only.
+        Released,
     }
 
     /// A held (or merely watched) worker seam.
@@ -775,8 +953,6 @@ pub struct PoolDebugInfo {
     pub sql: String,
     /// SQL parameter values (Display form).
     pub params: Vec<String>,
-    /// Time spent waiting for pool permit (ms).
-    pub pool_wait_ms: u64,
 }
 
 /// Exclusive hold over the whole executor pool (see
@@ -916,6 +1092,7 @@ impl std::fmt::Debug for ExecutorPool {
 fn run_query_blocking(
     executor: &Executor,
     cancel: &CancelLatch,
+    clock: &PhaseClock,
     dsl: &str,
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
@@ -923,24 +1100,22 @@ fn run_query_blocking(
     cap: RowCap,
     utc_offset_secs: i32,
     capture_debug: bool,
-    pool_wait_ms: u64,
 ) -> (Result<QueryResult, ServerError>, Option<PoolDebugInfo>) {
     // Snapshot hot buffer to a temp ndjson file so fresh events
     // are visible to this query via UNION ALL BY NAME. Returns a
     // cached file when the buffer hasn't changed since the last snapshot;
     // the snapshot also carries the catalog pins (∩ observed keys) the
     // executor conforms the hot branch with.
-    let hot_snapshot = hot_source(hot_buffer.map_or(Ok(None), |hb| hb.snapshot()));
+    let hot_snapshot = hot_source(hot_buffer.map_or(Ok(None), |hb| {
+        clock.time(QueryPhase::HotSnapshot, || hb.snapshot())
+    }));
 
-    // Capture debug info if requested (query log is active).
+    // Capture debug info if requested (query log is active). Its
+    // re-parse and re-emit are the preview's own emission, booked as such.
     let debug = if capture_debug {
-        Some(capture_pool_debug(
-            dsl,
-            source,
-            hot_buffer,
-            pins,
-            pool_wait_ms,
-        ))
+        Some(clock.time(QueryPhase::Emit, || {
+            capture_pool_debug(dsl, source, hot_buffer, pins)
+        }))
     } else {
         None
     };
@@ -957,6 +1132,7 @@ fn run_query_blocking(
             let hot_path = hot.path().to_str().unwrap_or_default();
             executor
                 .cancellable(cancel)
+                .timed(clock)
                 .run_query_with_hot(
                     dsl,
                     source,
@@ -970,6 +1146,7 @@ fn run_query_blocking(
         } else {
             executor
                 .cancellable(cancel)
+                .timed(clock)
                 .run_query(dsl, source, pins, cap, utc_offset_secs)
                 .map_err(ServerError::from)
         }
@@ -1015,7 +1192,6 @@ fn capture_pool_debug(
     source: &str,
     hot_buffer: Option<&Arc<HotBuffer>>,
     pins: &trawl_core::schema::FieldTypes,
-    pool_wait_ms: u64,
 ) -> PoolDebugInfo {
     let glob_count = if source.starts_with('[') {
         source.matches(',').count() + 1
@@ -1091,7 +1267,6 @@ fn capture_pool_debug(
         hot_bytes,
         sql,
         params,
-        pool_wait_ms,
     }
 }
 
@@ -1231,6 +1406,8 @@ impl ExecutorPool {
             executor: Some(executor),
             publication,
             permit: Some(permit),
+            timing: work.timing.clone(),
+            physical: PhysicalOutcome::NotStarted,
         })
     }
 
@@ -1241,10 +1418,15 @@ impl ExecutorPool {
     /// started, which is the request's 503-vs-504 classification. Reading
     /// the flag the work-start transition wrote is what keeps that answer
     /// out of the hands of `select!`'s polling order.
-    fn mark_request_finished(&self, id: u64, started: &AtomicBool) -> bool {
-        let entry = {
+    ///
+    /// Also answers whether this call retained the work — its slot was
+    /// still registered — which, with `started`, decides who writes the
+    /// timing account: both are read in the critical section
+    /// [`WorkSlot::drop`] reads them in.
+    fn mark_request_finished(&self, id: u64, started: &AtomicBool) -> RequestEnd {
+        let (entry, started) = {
             let mut registry = self.registry.lock();
-            match registry.retained.get_mut(&id) {
+            let entry = match registry.retained.get_mut(&id) {
                 Some(entry) if entry.retained_since.is_none() => {
                     entry.retained_since = Some(Instant::now());
                     Some((
@@ -1254,8 +1436,10 @@ impl ExecutorPool {
                     ))
                 }
                 _ => None,
-            }
+            };
+            (entry, started.load(Ordering::SeqCst))
         };
+        let retained = entry.is_some();
         if let Some((kind, started_work, held_for)) = entry {
             tracing::info!(
                 event_type = "query_permit_retained",
@@ -1266,7 +1450,7 @@ impl ExecutorPool {
                 "query permit retained past its request"
             );
         }
-        started.load(Ordering::SeqCst)
+        RequestEnd { retained, started }
     }
 
     /// Whose work this is, while it is registered.
@@ -1388,6 +1572,10 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> ExecuteOutcome {
         let kind = work.kind;
+        let timing = work.timing.clone();
+        let clock = timing
+            .as_ref()
+            .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
         // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
@@ -1404,10 +1592,14 @@ impl ExecutorPool {
         // The queue wait spends the caller's budget like every other wait
         // (ADR-0024): it used to be measured for the log line only, so a
         // query could sit here for minutes and still be handed a whole
-        // fresh timeout to run in.
-        let wait_start = std::time::Instant::now();
+        // fresh timeout to run in. The phase guard books the wait however
+        // it ends, the deadline and a dropped caller included.
         let semaphore = Arc::clone(&self.semaphore);
-        let permit = match deadline.run(semaphore.acquire_owned()).await {
+        let acquired = {
+            let _wait = clock.guard(QueryPhase::PoolWait);
+            deadline.run(semaphore.acquire_owned()).await
+        };
+        let permit = match acquired {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
                 return ExecuteOutcome {
@@ -1417,21 +1609,17 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+                let refused = refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+                account_refused(timing.as_ref());
+                return refused;
             }
         };
 
-        let wait_ms = wait_start.elapsed().as_millis();
-        #[allow(clippy::cast_possible_truncation)]
-        let pool_wait_ms = wait_ms as u64;
-        tracing::info!(
-            event_type = "pool_acquired",
-            wait_ms,
-            available = self.semaphore.available_permits(),
-            "semaphore permit acquired"
-        );
-
-        let publication = match deadline.run(self.publication.read()).await {
+        let published = {
+            let _wait = clock.guard(QueryPhase::PublicationWait);
+            deadline.run(self.publication.read()).await
+        };
+        let publication = match published {
             Ok(Ok(guard)) => guard,
             Ok(Err(error)) => {
                 return ExecuteOutcome {
@@ -1441,14 +1629,17 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+                let refused = refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+                account_refused(timing.as_ref());
+                return refused;
             }
         };
 
         // Everything this work holds, in one guard, moved into the
         // blocking task below: from here on the request future cannot be
         // the thing that releases a permit or returns an executor.
-        let slot = match self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication)) {
+        let mut slot = match self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication))
+        {
             Ok(slot) => slot,
             Err(error) => {
                 return ExecuteOutcome {
@@ -1465,6 +1656,8 @@ impl ExecutorPool {
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
+        // Dispatch to the work-start transition; the worker ends it.
+        clock.enter(QueryPhase::Startup);
         let mut task = tokio::task::spawn_blocking({
             let refusal_log = refusal_log.clone();
             #[cfg(any(test, feature = "test-support"))]
@@ -1485,6 +1678,7 @@ impl ExecutorPool {
                     if let Err(refusal) = slot.begin_work(deadline) {
                         return refusal_log.refuse_outcome(query_id, kind, refusal);
                     }
+                    slot.started_timing();
                     worker_seam!(seams, Started);
 
                     // Test-only: sleep before the query so timeout/cancellation tests
@@ -1497,7 +1691,8 @@ impl ExecutorPool {
                         }
                     }
 
-                    let source = compute_source(&base_dir, &dsl);
+                    let clock = slot.clock();
+                    let source = clock.time(QueryPhase::Source, || compute_source(&base_dir, &dsl));
                     let file_globs: usize = if source.starts_with('[') {
                         source.matches(',').count() + 1
                     } else {
@@ -1514,10 +1709,11 @@ impl ExecutorPool {
                     // executor sees the same comparison pins, and the presentation
                     // metadata computed beside the rows is rooted in that same
                     // snapshot.
-                    let pins = field_catalog.all();
+                    let pins = clock.time(QueryPhase::Source, || field_catalog.all());
                     let (result, debug) = run_query_blocking(
                         slot.executor(),
                         &slot.cancel_latch(),
+                        clock,
                         &dsl,
                         &source,
                         hot_buffer.as_ref(),
@@ -1525,13 +1721,12 @@ impl ExecutorPool {
                         cap,
                         utc_offset_secs,
                         capture_debug,
-                        pool_wait_ms,
                     );
                     // Inside the permit, on the blocking pool: the walk compiles a
                     // regex per `extract` stage, so it may not run on a reactor
                     // thread (see `severity_columns_for`).
                     let severity_columns = if result.is_ok() {
-                        severity_columns_for(&pins, &dsl)
+                        clock.time(QueryPhase::Post, || severity_columns_for(&pins, &dsl))
                     } else {
                         Vec::new()
                     };
@@ -1542,25 +1737,37 @@ impl ExecutorPool {
                         severity_columns,
                     }
                 }));
-                outcome.unwrap_or_else(|_payload| ExecuteOutcome {
+                let outcome = outcome.unwrap_or_else(|_payload| ExecuteOutcome {
                     result: Err(ServerError::Panicked("query worker")),
                     debug: None,
                     severity_columns: Vec::new(),
-                })
-                // `slot` drops here, on this thread: interrupt deregistered,
-                // executor re-idled, publication and permit released.
+                });
+                slot.finish(&outcome.result);
+                // Interrupt deregistered, executor re-idled, publication and
+                // permit released — on this thread, before the answer goes
+                // back.
+                drop(slot);
+                worker_seam!(seams, Released);
+                outcome
             }
         });
 
         // A caller that walks away (client gone, task aborted) is not a
         // reason to abandon the work: the guard latches cancellation and
         // records the retention on the way out.
-        let mut request = RequestGuard::new(self, query_id, kind, &started);
+        let mut request = RequestGuard::new(self, query_id, kind, &started, timing.as_ref());
         tokio::select! {
             join_result = &mut task => {
                 request.disarm();
                 match join_result {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        // The worker refused to start: a capacity refusal,
+                        // named here because the pool made it.
+                        if refusal_log.refused() {
+                            account_refused(timing.as_ref());
+                        }
+                        outcome
+                    }
                     Err(e) => ExecuteOutcome {
                         result: Err(ServerError::from_join("query", e)),
                         debug: None,
@@ -1603,6 +1810,10 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> ExecuteOutcome {
         let kind = work.kind;
+        let timing = work.timing.clone();
+        let clock = timing
+            .as_ref()
+            .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
         // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
@@ -1619,9 +1830,12 @@ impl ExecutorPool {
         // Same budget rule as the ordinary lane. This one takes no
         // publication guard (ADR-0024 keeps per-lane gate membership as
         // it is), so the queue and execution are the whole of its wait.
-        let wait_start = std::time::Instant::now();
         let semaphore = Arc::clone(&self.semaphore);
-        let permit = match deadline.run(semaphore.acquire_owned()).await {
+        let acquired = {
+            let _wait = clock.guard(QueryPhase::PoolWait);
+            deadline.run(semaphore.acquire_owned()).await
+        };
+        let permit = match acquired {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
                 return ExecuteOutcome {
@@ -1631,21 +1845,13 @@ impl ExecutorPool {
                 };
             }
             Err(crate::deadline::Expired) => {
-                return refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+                let refused = refusal_log.refuse_outcome(query_id, kind, StartRefusal::Expired);
+                account_refused(timing.as_ref());
+                return refused;
             }
         };
 
-        let wait_ms = wait_start.elapsed().as_millis();
-        #[allow(clippy::cast_possible_truncation)]
-        let pool_wait_ms = wait_ms as u64;
-        tracing::info!(
-            event_type = "pool_acquired",
-            wait_ms,
-            available = self.semaphore.available_permits(),
-            "semaphore permit acquired (from saved)"
-        );
-
-        let slot = match self.begin_slot(query_id, &work, Some(dsl), permit, None) {
+        let mut slot = match self.begin_slot(query_id, &work, Some(dsl), permit, None) {
             Ok(slot) => slot,
             Err(error) => {
                 return ExecuteOutcome {
@@ -1662,6 +1868,8 @@ impl ExecutorPool {
         let cap = RowCap::Refuse(self.max_result_rows);
         let field_catalog = Arc::clone(&self.field_catalog);
 
+        // Dispatch to the work-start transition; the worker ends it.
+        clock.enter(QueryPhase::Startup);
         let mut task = tokio::task::spawn_blocking({
             let refusal_log = refusal_log.clone();
             #[cfg(any(test, feature = "test-support"))]
@@ -1675,6 +1883,7 @@ impl ExecutorPool {
                     if let Err(refusal) = slot.begin_work(deadline) {
                         return refusal_log.refuse_outcome(query_id, kind, refusal);
                     }
+                    slot.started_timing();
                     worker_seam!(seams, Started);
 
                     #[cfg(any(test, feature = "test-support"))]
@@ -1692,10 +1901,12 @@ impl ExecutorPool {
                     );
 
                     // No hot buffer — saved query results are self-contained.
-                    let pins = field_catalog.all();
+                    let clock = slot.clock();
+                    let pins = clock.time(QueryPhase::Source, || field_catalog.all());
                     let (result, debug) = run_query_blocking(
                         slot.executor(),
                         &slot.cancel_latch(),
+                        clock,
                         &dsl,
                         &source,
                         None,
@@ -1703,7 +1914,6 @@ impl ExecutorPool {
                         cap,
                         utc_offset_secs,
                         capture_debug,
-                        pool_wait_ms,
                     );
                     // `dsl` here is what follows `| from saved`, whose `PinScope`
                     // rule clears the scope, so the presentation walk roots in an
@@ -1711,7 +1921,9 @@ impl ExecutorPool {
                     // what this corpus happens to pin now. The comparison pins above
                     // are a separate question and keep the live snapshot.
                     let severity_columns = if result.is_ok() {
-                        severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
+                        clock.time(QueryPhase::Post, || {
+                            severity_columns_for(&trawl_core::schema::FieldTypes::new(), &dsl)
+                        })
                     } else {
                         Vec::new()
                     };
@@ -1722,20 +1934,29 @@ impl ExecutorPool {
                         severity_columns,
                     }
                 }));
-                outcome.unwrap_or_else(|_payload| ExecuteOutcome {
+                let outcome = outcome.unwrap_or_else(|_payload| ExecuteOutcome {
                     result: Err(ServerError::Panicked("query worker")),
                     debug: None,
                     severity_columns: Vec::new(),
-                })
+                });
+                slot.finish(&outcome.result);
+                drop(slot);
+                worker_seam!(seams, Released);
+                outcome
             }
         });
 
-        let mut request = RequestGuard::new(self, query_id, kind, &started);
+        let mut request = RequestGuard::new(self, query_id, kind, &started, timing.as_ref());
         tokio::select! {
             join_result = &mut task => {
                 request.disarm();
                 match join_result {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        if refusal_log.refused() {
+                            account_refused(timing.as_ref());
+                        }
+                        outcome
+                    }
                     Err(e) => ExecuteOutcome {
                         result: Err(ServerError::from_join("query", e)),
                         debug: None,
@@ -1881,7 +2102,7 @@ impl ExecutorPool {
             }
         };
 
-        let slot = self.begin_slot(id, &work, None, permit, None)?;
+        let mut slot = self.begin_slot(id, &work, None, permit, None)?;
         let started = Arc::clone(&slot.started);
 
         let mut task = tokio::task::spawn_blocking({
@@ -1902,11 +2123,13 @@ impl ExecutorPool {
                     worker_seam!(seams, Finished);
                     result
                 }));
-                outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("ping")))
+                let result = outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("ping")));
+                slot.finish(&result);
+                result
             }
         });
 
-        let mut request = RequestGuard::new(self, id, kind, &started);
+        let mut request = RequestGuard::new(self, id, kind, &started, None);
         tokio::select! {
             joined = &mut task => {
                 request.disarm();
@@ -1967,7 +2190,7 @@ impl ExecutorPool {
             .map_err(|_| refusal_log.refuse(id, kind, StartRefusal::Expired))??;
 
         // Past acquisition the caller's overall deadline governs again.
-        let slot = self.begin_slot(id, &work, None, permit, Some(publication))?;
+        let mut slot = self.begin_slot(id, &work, None, permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let fallback_glob = Arc::clone(&self.fallback_glob);
         let field = field.to_owned();
@@ -2002,7 +2225,10 @@ impl ExecutorPool {
                     worker_seam!(seams, Finished);
                     result
                 }));
-                outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("field values sample")))
+                let result = outcome
+                    .unwrap_or_else(|_payload| Err(ServerError::Panicked("field values sample")));
+                slot.finish(&result);
+                result
             }
         });
 
@@ -2011,7 +2237,7 @@ impl ExecutorPool {
         // just as a query can. Same handover as the query lanes: interrupt,
         // leave the work to its own cleanup, and answer with what the
         // work-start transition recorded.
-        let mut request = RequestGuard::new(self, id, kind, &started);
+        let mut request = RequestGuard::new(self, id, kind, &started, None);
         tokio::select! {
             joined = &mut task => {
                 request.disarm();
@@ -2047,29 +2273,46 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> Result<Vec<u8>, ServerError> {
         let kind = work.kind;
+        let timing = work.timing.clone();
+        let clock = timing
+            .as_ref()
+            .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
         // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let semaphore = Arc::clone(&self.semaphore);
-        let permit = deadline
-            .run(semaphore.acquire_owned())
-            .await
-            .map_err(|_| refusal_log.refuse(query_id, kind, StartRefusal::Expired))?
+        let acquired = {
+            let _wait = clock.guard(QueryPhase::PoolWait);
+            deadline.run(semaphore.acquire_owned()).await
+        };
+        let permit = acquired
+            .map_err(|_| {
+                let refused = refusal_log.refuse(query_id, kind, StartRefusal::Expired);
+                account_refused(timing.as_ref());
+                refused
+            })?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
-        let publication = deadline
-            .run(self.publication.read())
-            .await
-            .map_err(|_| refusal_log.refuse(query_id, kind, StartRefusal::Expired))??;
+        let published = {
+            let _wait = clock.guard(QueryPhase::PublicationWait);
+            deadline.run(self.publication.read()).await
+        };
+        let publication = published.map_err(|_| {
+            let refused = refusal_log.refuse(query_id, kind, StartRefusal::Expired);
+            account_refused(timing.as_ref());
+            refused
+        })??;
 
-        let slot = self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication))?;
+        let mut slot = self.begin_slot(query_id, &work, Some(dsl), permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
         let hot_buffer = self.hot_buffer.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
+        // Dispatch to the work-start transition; the worker ends it.
+        clock.enter(QueryPhase::Startup);
         let mut task = tokio::task::spawn_blocking({
             let refusal_log = refusal_log.clone();
             #[cfg(any(test, feature = "test-support"))]
@@ -2083,9 +2326,11 @@ impl ExecutorPool {
                     if let Err(refusal) = slot.begin_work(deadline) {
                         return Err(refusal_log.refuse(query_id, kind, refusal));
                     }
+                    slot.started_timing();
                     worker_seam!(seams, Started);
 
-                    let source = compute_source(&base_dir, &dsl);
+                    let clock = slot.clock();
+                    let source = clock.time(QueryPhase::Source, || compute_source(&base_dir, &dsl));
 
                     // Write to a temp file, then read it back as bytes.
                     let tmp = tempfile::NamedTempFile::new().map_err(|e| {
@@ -2094,12 +2339,13 @@ impl ExecutorPool {
                     let tmp_path = tmp.path().to_owned();
 
                     // Snapshot hot buffer for fresh events.
-                    let hot_snapshot =
-                        hot_source(hot_buffer.as_ref().map_or(Ok(None), |hb| hb.snapshot()))?;
+                    let hot_snapshot = hot_source(hot_buffer.as_ref().map_or(Ok(None), |hb| {
+                        clock.time(QueryPhase::HotSnapshot, || hb.snapshot())
+                    }))?;
 
-                    let pins = field_catalog.all();
+                    let pins = clock.time(QueryPhase::Source, || field_catalog.all());
                     let cancel = slot.cancel_latch();
-                    let executor = slot.executor().cancellable(&cancel);
+                    let executor = slot.executor().cancellable(&cancel).timed(clock);
                     let written = if let Some(ref hot) = hot_snapshot {
                         // `hot_source` refused a path that is not UTF-8.
                         let hot_path = hot.path().to_str().unwrap_or_default();
@@ -2117,22 +2363,35 @@ impl ExecutorPool {
                     }
                     .map_err(ServerError::from);
 
+                    // Reading the written file back is this format's render.
                     let bytes = written.and_then(|()| {
-                        std::fs::read(&tmp_path).map_err(|e| {
-                            ServerError::Internal(format!("failed to read parquet temp file: {e}"))
-                        })
+                        clock
+                            .time(QueryPhase::Render, || std::fs::read(&tmp_path))
+                            .map_err(|e| {
+                                ServerError::Internal(format!(
+                                    "failed to read parquet temp file: {e}"
+                                ))
+                            })
                     });
                     worker_seam!(seams, Finished);
                     bytes
                 }));
-                outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("export")))
+                let result =
+                    outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("export")));
+                slot.finish(&result);
+                drop(slot);
+                worker_seam!(seams, Released);
+                result
             }
         });
 
-        let mut request = RequestGuard::new(self, query_id, kind, &started);
+        let mut request = RequestGuard::new(self, query_id, kind, &started, timing.as_ref());
         tokio::select! {
             join_result = &mut task => {
                 request.disarm();
+                if refusal_log.refused() {
+                    account_refused(timing.as_ref());
+                }
                 match join_result {
                     Ok(result) => result,
                     Err(e) => Err(ServerError::from_join("export", e)),
@@ -2159,11 +2418,13 @@ mod tests {
         kind: WorkKind::Query,
         owner: WorkOwner::Key(7),
         user: None,
+        timing: None,
     };
     const TEST_SAMPLE_WORK: WorkContext = WorkContext {
         kind: WorkKind::Sample,
         owner: WorkOwner::System,
         user: None,
+        timing: None,
     };
 
     fn idle_len(pool: &ExecutorPool) -> usize {
@@ -2230,16 +2491,50 @@ mod tests {
     /// threads, filtering on the id alone let a sibling test's refusal of its own
     /// query 0 land in this test's count, and "exactly one refusal" is a
     /// count.
+    ///
+    /// The timing events carry no pool: they are kept by the test's own
+    /// `request_id`, which no sibling shares ([`of_timed`]).
     mod capture {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
         type Events = Arc<StdMutex<Vec<HashMap<String, String>>>>;
 
+        /// Which events a sink keeps.
+        enum Keep {
+            /// This pool's `query_id`, or this `request_id`.
+            Work {
+                pool: u64,
+                query_id: u64,
+                request_id: Option<String>,
+            },
+            /// Every event in the process: for asserting that an event
+            /// type is emitted by nothing at all.
+            Everything,
+        }
+
         struct Sink {
-            pool: u64,
-            query_id: u64,
+            keep: Keep,
             events: Events,
+        }
+
+        impl Keep {
+            fn keeps(&self, fields: &HashMap<String, String>) -> bool {
+                match self {
+                    Self::Everything => true,
+                    Self::Work {
+                        pool,
+                        query_id,
+                        request_id,
+                    } => {
+                        let field = |name: &str| fields.get(name).map(String::as_str);
+                        (field("pool") == Some(pool.to_string().as_str())
+                            && field("query_id") == Some(query_id.to_string().as_str()))
+                            || (request_id.is_some()
+                                && field("request_id") == request_id.as_deref())
+                    }
+                }
+            }
         }
 
         static SINK: StdMutex<Option<Sink>> = StdMutex::new(None);
@@ -2275,10 +2570,7 @@ mod tests {
                 event.record(&mut Fields(&mut fields));
                 let sink = SINK.lock().expect("capture sink poisoned");
                 if let Some(sink) = sink.as_ref()
-                    && fields.get("pool").map(String::as_str)
-                        == Some(sink.pool.to_string().as_str())
-                    && fields.get("query_id").map(String::as_str)
-                        == Some(sink.query_id.to_string().as_str())
+                    && sink.keep.keeps(&fields)
                 {
                     sink.events.lock().expect("capture poisoned").push(fields);
                 }
@@ -2312,6 +2604,34 @@ mod tests {
 
         /// Capture what `pool`'s `query_id` logs until the guard drops.
         pub(super) async fn of_query(pool: &super::ExecutorPool, query_id: u64) -> Capture {
+            install(Keep::Work {
+                pool: pool.instance,
+                query_id,
+                request_id: None,
+            })
+            .await
+        }
+
+        /// [`of_query`], plus the timing events of `request_id`.
+        pub(super) async fn of_timed(
+            pool: &super::ExecutorPool,
+            query_id: u64,
+            request_id: &str,
+        ) -> Capture {
+            install(Keep::Work {
+                pool: pool.instance,
+                query_id,
+                request_id: Some(request_id.to_owned()),
+            })
+            .await
+        }
+
+        /// Capture every event in the process until the guard drops.
+        pub(super) async fn everything() -> Capture {
+            install(Keep::Everything).await
+        }
+
+        async fn install(keep: Keep) -> Capture {
             use tracing_subscriber::prelude::*;
 
             static INSTALLED: OnceLock<()> = OnceLock::new();
@@ -2327,8 +2647,7 @@ mod tests {
             let turn = TURN.lock().await;
             let events: Events = Arc::default();
             *SINK.lock().expect("capture sink poisoned") = Some(Sink {
-                pool: pool.instance,
-                query_id,
+                keep,
                 events: Arc::clone(&events),
             });
             Capture {
@@ -4274,5 +4593,444 @@ mod tests {
         // No active queries — cancel_all should be a no-op.
         pool.cancel_all();
         assert!(pool.registry.lock().interrupts.is_empty());
+    }
+
+    /// A timing account for one test query, correlated by a request id
+    /// no sibling test shares, so a capture can keep its events.
+    fn timed(pool: &ExecutorPool, id: u64) -> (QueryTiming, String) {
+        let request_id = format!("req-{}-{id}", pool.instance);
+        let timing = QueryTiming::new(
+            Instant::now(),
+            id,
+            crate::query_timing::Correlation::Request(request_id.clone()),
+            crate::query_timing::TimingKind::Query,
+        );
+        (timing, request_id)
+    }
+
+    /// Park whoever enters `phase` on `timing`'s clock, at a gate of its
+    /// own. The session releases it on drop, as a pool's seams do, so a
+    /// failed assertion cannot leave the worker parked.
+    fn hold_phase(timing: &QueryTiming, phase: QueryPhase) -> (seam::Session, Arc<seam::Gate>) {
+        let table = Arc::new(seam::Table::default());
+        // The seam name is only this private table's key.
+        let gate = table.hold(Seam::Entry);
+        let hook = Arc::clone(&table);
+        timing
+            .clock()
+            .hold_on_enter(phase, move || hook.reach(Seam::Entry));
+        (seam::Session(table), gate)
+    }
+
+    /// The phases only a worker that started books.
+    const WORKER_PHASES: [QueryPhase; 10] = [
+        QueryPhase::Startup,
+        QueryPhase::Source,
+        QueryPhase::HotSnapshot,
+        QueryPhase::Emit,
+        QueryPhase::Probe,
+        QueryPhase::Bind,
+        QueryPhase::Execute,
+        QueryPhase::Copy,
+        QueryPhase::Post,
+        QueryPhase::Render,
+    ];
+
+    type Fields = std::collections::HashMap<String, String>;
+
+    fn value<'a>(event: &'a Fields, name: &str) -> Option<&'a str> {
+        event.get(name).map(String::as_str)
+    }
+
+    fn micros(event: &Fields, name: &str) -> u64 {
+        value(event, name)
+            .unwrap_or_else(|| panic!("{name} present: {event:?}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} is an integer: {event:?}"))
+    }
+
+    /// The accounts one query wrote: complete `query_timing` events,
+    /// partial ones, and reclaims carrying the worker's totals.
+    fn accounts(capture: &capture::Capture) -> (usize, usize, usize) {
+        let timings = capture.of_type("query_timing");
+        let complete = timings
+            .iter()
+            .filter(|e| value(e, "timing_complete") == Some("true"))
+            .count();
+        let reclaims = capture
+            .of_type("query_permit_reclaimed")
+            .iter()
+            .filter(|e| e.contains_key("duckdb_attempts"))
+            .count();
+        (complete, timings.len() - complete, reclaims)
+    }
+
+    /// A capacity refusal writes one complete account with the wait that
+    /// ran out and no worker phase: nothing started (ADR-0046).
+    #[tokio::test(start_paused = true)]
+    async fn capacity_refusal_reports_wait_phases() {
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+
+        // Refused in the queue: the pool's one permit is held elsewhere.
+        let held = pool
+            .exclusive(Duration::from_secs(1))
+            .await
+            .expect("the idle pool grants exclusivity at once");
+        let id = pool.allocate_query_id();
+        let (timing, request_id) = timed(&pool, id);
+        let capture = capture::of_timed(&pool, id, &request_id).await;
+        let outcome = pool
+            .execute(
+                id,
+                "*",
+                Deadline::after(Duration::from_secs(5)),
+                false,
+                0,
+                TEST_WORK.with_timing(timing),
+            )
+            .await;
+        assert!(
+            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            "{:?}",
+            outcome.result
+        );
+        let queued = capture.of_type("query_timing");
+        drop(capture);
+        drop(held);
+
+        // Refused at the publication gate: the permit came, the gate
+        // did not.
+        let writer = pool.publication.write().await;
+        let id = pool.allocate_query_id();
+        let (timing, request_id) = timed(&pool, id);
+        let capture = capture::of_timed(&pool, id, &request_id).await;
+        let outcome = pool
+            .execute(
+                id,
+                "*",
+                Deadline::after(Duration::from_secs(5)),
+                false,
+                0,
+                TEST_WORK.with_timing(timing),
+            )
+            .await;
+        assert!(
+            matches!(&outcome.result, Err(ServerError::ServiceUnavailable(msg)) if msg == CAPACITY_NOT_STARTED),
+            "{:?}",
+            outcome.result
+        );
+        let gated = capture.of_type("query_timing");
+        drop(capture);
+        drop(writer);
+
+        for (label, events, waits) in [
+            ("queue", queued, &[QueryPhase::PoolWait][..]),
+            (
+                "publication",
+                gated,
+                &[QueryPhase::PoolWait, QueryPhase::PublicationWait][..],
+            ),
+        ] {
+            assert_eq!(events.len(), 1, "{label}: one account: {events:?}");
+            let event = &events[0];
+            assert_eq!(value(event, "outcome"), Some("capacity_refused"), "{label}");
+            assert_eq!(value(event, "work_started"), Some("false"), "{label}");
+            assert_eq!(value(event, "timing_complete"), Some("true"), "{label}");
+            assert_eq!(value(event, "error_class"), None, "{label}");
+            for phase in waits {
+                micros(event, phase.field());
+            }
+            for phase in WORKER_PHASES {
+                assert!(
+                    !event.contains_key(phase.field()),
+                    "{label}: no worker phase {}: {event:?}",
+                    phase.field()
+                );
+            }
+            if label == "queue" {
+                assert!(
+                    !event.contains_key("query_publication_wait_us"),
+                    "{event:?}"
+                );
+            }
+        }
+    }
+
+    /// A timeout while the worker is parked in bind writes the partial
+    /// account at once, naming bind as the phase in flight and booking
+    /// none of it. The reclaim, when the work finally stops, carries the
+    /// worker's final totals under the same ids (ADR-0046).
+    #[tokio::test(start_paused = true)]
+    async fn timeout_in_bind_reports_active_phase_then_reclaim_totals() {
+        let pool = hot_pool(1);
+        let id = pool.allocate_query_id();
+        let (timing, request_id) = timed(&pool, id);
+        let (_bind_session, bind) = hold_phase(&timing, QueryPhase::Bind);
+        let capture = capture::of_timed(&pool, id, &request_id).await;
+
+        let submitted = pool.clone();
+        let work = TEST_WORK.with_timing(timing);
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    work,
+                )
+                .await
+        });
+        until("the worker binds", || bind.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        assert!(
+            matches!(outcome.result, Err(ServerError::Timeout)),
+            "{:?}",
+            outcome.result
+        );
+
+        let timings = capture.of_type("query_timing");
+        assert_eq!(timings.len(), 1, "{timings:?}");
+        let partial = &timings[0];
+        assert_eq!(value(partial, "query_id"), Some(id.to_string().as_str()));
+        assert_eq!(value(partial, "request_id"), Some(request_id.as_str()));
+        assert_eq!(value(partial, "outcome"), Some("timeout"));
+        assert_eq!(value(partial, "work_started"), Some("true"));
+        assert_eq!(value(partial, "timing_complete"), Some("false"));
+        assert_eq!(value(partial, "active_query_phase"), Some("bind"));
+        assert!(micros(partial, "active_elapsed_us") > 0, "{partial:?}");
+        assert!(
+            !partial.contains_key("query_bind_us"),
+            "unfinished: {partial:?}"
+        );
+        for phase in [
+            QueryPhase::PoolWait,
+            QueryPhase::PublicationWait,
+            QueryPhase::Startup,
+            QueryPhase::Source,
+        ] {
+            micros(partial, phase.field());
+        }
+        assert!(
+            capture.of_type("query_permit_reclaimed").is_empty(),
+            "the work is still running"
+        );
+
+        bind.release();
+        until("the work is reclaimed", || {
+            capture.of_type("query_permit_reclaimed").len() == 1
+        })
+        .await;
+        let reclaims = capture.of_type("query_permit_reclaimed");
+        let reclaim = &reclaims[0];
+        assert_eq!(value(reclaim, "query_id"), Some(id.to_string().as_str()));
+        assert_eq!(value(reclaim, "request_id"), Some(request_id.as_str()));
+        assert_eq!(
+            value(reclaim, "physical_outcome"),
+            Some("cancelled"),
+            "the latched cancellation stops it after the bind: {reclaim:?}"
+        );
+        micros(reclaim, "query_bind_us");
+        micros(reclaim, "query_startup_us");
+        assert!(micros(reclaim, "duckdb_attempts") >= 1, "{reclaim:?}");
+        // No parquet under the base dir: the engine answers hot-only.
+        assert_eq!(value(reclaim, "fallback"), Some("hot_only"));
+        assert_eq!(
+            capture.of_type("query_timing").len(),
+            1,
+            "the reclaim finishes the account; it does not write a second"
+        );
+    }
+
+    /// The worker finishing at the deadline writes exactly one final
+    /// account, in either order (ADR-0046): the registry lock decides.
+    ///
+    /// Deadline first: the request stamps the work retained while its
+    /// answer waits for cleanup, writes the partial account, and the
+    /// reclaim carries the totals. Worker first: cleanup already ran and
+    /// deregistered the work before the request heard, so there is no
+    /// reclaim coming and the request's account is complete.
+    #[tokio::test(start_paused = true)]
+    async fn deadline_finish_race_writes_one_final_account() {
+        let pool = hot_pool(1);
+
+        // Deadline, then release.
+        let seams = pool.seams();
+        let finished = seams.hold(Seam::Finished);
+        let id = pool.allocate_query_id();
+        let (timing, request_id) = timed(&pool, id);
+        let capture = capture::of_timed(&pool, id, &request_id).await;
+        let submitted = pool.clone();
+        let work = TEST_WORK.with_timing(timing);
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    work,
+                )
+                .await
+        });
+        until("the answer is in hand", || finished.arrivals() == 1).await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        assert!(matches!(outcome.result, Err(ServerError::Timeout)));
+        assert_eq!(accounts(&capture), (0, 1, 0), "partial, reclaim pending");
+        finished.release();
+        until("the work is reclaimed", || {
+            capture.of_type("query_permit_reclaimed").len() == 1
+        })
+        .await;
+        let deadline_first = accounts(&capture);
+        drop(capture);
+        drop(seams);
+
+        // The worker finished and its slot dropped, then the deadline.
+        let seams = pool.seams();
+        let released = seams.hold(Seam::Released);
+        let id = pool.allocate_query_id();
+        let (timing, request_id) = timed(&pool, id);
+        let capture = capture::of_timed(&pool, id, &request_id).await;
+        let submitted = pool.clone();
+        let work = TEST_WORK.with_timing(timing);
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    work,
+                )
+                .await
+        });
+        until("cleanup ran", || released.arrivals() == 1).await;
+        assert!(
+            pool.owner_of(id).is_none(),
+            "the slot is gone before the request hears"
+        );
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let outcome = request.await.expect("the request joins");
+        assert!(matches!(outcome.result, Err(ServerError::Timeout)));
+        released.release();
+        until("the worker hands back", || pool.available_permits() == 1).await;
+        let worker_first = accounts(&capture);
+        let timings = capture.of_type("query_timing");
+        drop(capture);
+
+        assert_eq!(deadline_first, (0, 1, 1), "partial + one reclaim");
+        assert_eq!(worker_first, (1, 0, 0), "one complete account");
+        for (complete, partial, reclaims) in [deadline_first, worker_first] {
+            assert_eq!(complete + reclaims, 1, "never both, never neither");
+            assert_eq!(
+                partial, reclaims,
+                "a partial account is finished by its reclaim"
+            );
+        }
+        assert_eq!(value(&timings[0], "outcome"), Some("timeout"));
+        assert_eq!(value(&timings[0], "active_query_phase"), None);
+    }
+
+    /// A caller that walks away while the worker binds gets the same
+    /// contract as a timeout, as `abandoned`: the partial account now,
+    /// the final totals on the reclaim (ADR-0046).
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_request_reports_partial_timing() {
+        let pool = hot_pool(1);
+        let id = pool.allocate_query_id();
+        let (timing, request_id) = timed(&pool, id);
+        let (_bind_session, bind) = hold_phase(&timing, QueryPhase::Bind);
+        let capture = capture::of_timed(&pool, id, &request_id).await;
+
+        let submitted = pool.clone();
+        let work = TEST_WORK.with_timing(timing);
+        let request = tokio::spawn(async move {
+            submitted
+                .execute(
+                    id,
+                    "*",
+                    Deadline::after(Duration::from_secs(600)),
+                    false,
+                    0,
+                    work,
+                )
+                .await
+        });
+        until("the worker binds", || bind.arrivals() == 1).await;
+        request.abort();
+        assert!(
+            request.await.unwrap_err().is_cancelled(),
+            "the requesting task is gone"
+        );
+
+        let timings = capture.of_type("query_timing");
+        assert_eq!(timings.len(), 1, "{timings:?}");
+        let partial = &timings[0];
+        assert_eq!(value(partial, "outcome"), Some("abandoned"));
+        assert_eq!(value(partial, "work_started"), Some("true"));
+        assert_eq!(value(partial, "timing_complete"), Some("false"));
+        assert_eq!(value(partial, "active_query_phase"), Some("bind"));
+        assert!(!partial.contains_key("query_bind_us"), "{partial:?}");
+        assert!(capture.of_type("query_permit_reclaimed").is_empty());
+
+        bind.release();
+        until("the work is reclaimed", || {
+            capture.of_type("query_permit_reclaimed").len() == 1
+        })
+        .await;
+        let reclaims = capture.of_type("query_permit_reclaimed");
+        let reclaim = &reclaims[0];
+        assert_eq!(value(reclaim, "query_id"), Some(id.to_string().as_str()));
+        assert_eq!(value(reclaim, "request_id"), Some(request_id.as_str()));
+        assert_eq!(value(reclaim, "physical_outcome"), Some("cancelled"));
+        micros(reclaim, "query_bind_us");
+        assert_eq!(accounts(&capture), (0, 1, 1));
+    }
+
+    /// `pool_acquired` is gone from both lanes that wrote it: its one
+    /// datum is `query_pool_wait_us` now. The capture keeps every event
+    /// in the process, the worker thread's included, so an absence here
+    /// is an absence everywhere.
+    #[tokio::test]
+    async fn pool_acquired_is_gone() {
+        let pool = hot_pool(1);
+        let capture = capture::everything().await;
+        let outcome = pool
+            .execute(
+                pool.allocate_query_id(),
+                "*",
+                Deadline::after(Duration::from_secs(30)),
+                false,
+                0,
+                TEST_WORK,
+            )
+            .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        let _ = pool
+            .execute_with_source(
+                pool.allocate_query_id(),
+                "*",
+                "'/nonexistent/saved.parquet'",
+                Deadline::after(Duration::from_secs(30)),
+                false,
+                0,
+                TEST_WORK,
+            )
+            .await;
+        assert!(
+            !capture.of_type("query_source").is_empty(),
+            "the capture sees the blocking worker's events"
+        );
+        assert!(
+            capture.of_type("pool_acquired").is_empty(),
+            "{:?}",
+            capture.of_type("pool_acquired")
+        );
     }
 }

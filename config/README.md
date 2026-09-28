@@ -10,10 +10,11 @@ The server and browser proxy share a file. The CLI uses a different schema.
 | [Helm values](../chart/trawl/values.yaml) | Kubernetes deployment settings; the chart generates the shared server/proxy configuration |
 | [Vector fragments](vector/debian/) | Collector configuration, read by Vector; see the [collector guide](https://trawl.sh/getting-started/vector-integration/) |
 
-For a first trial, follow [Your first query](https://trawl.sh/getting-started/first-query/).
-It creates disposable databases, TLS and session keys, sends three events,
-and opens the browser UI. The standalone starter is for an installation
-whose storage, databases, and browser origin you select.
+For a first look, `trawl trial up` runs a disposable trial in Docker on Linux
+and writes its own configuration. Follow
+[Your first query](https://trawl.sh/getting-started/first-query/). The
+standalone starter is for an installation whose storage, databases, and
+browser origin you select.
 
 Before starting the standalone daemons:
 

@@ -23,6 +23,7 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
 use crate::error::EngineError;
+use crate::timing::{Fallback, PhaseClock, QueryPhase};
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64};
 
 /// Names of the result columns `DuckDB` returned as TIMESTAMP.
@@ -155,13 +156,29 @@ impl RowCap {
 /// ([`Executor::cancellable`]). The lanes behind both doors are the same
 /// code, so the `_raw`-free retry and the hot-only fallback inherit the
 /// latch rather than each remembering to carry it.
+///
+/// Phase timing rides the same door ([`Self::timed`]): without it the
+/// lanes run on [`PhaseClock::off`] and record nothing.
 #[derive(Debug)]
 pub struct Cancellable<'a> {
     executor: &'a Executor,
     cancel: &'a CancelLatch,
+    clock: PhaseClock,
 }
 
 impl Cancellable<'_> {
+    /// Record the lanes' phases on `clock` (ADR-0046).
+    ///
+    /// The engine books source resolution, emit, probe, bind, execute,
+    /// copy and post, counts main-statement binds, and records which
+    /// fallback ran. The clock is shared, so the caller reads it back
+    /// once the lane returns, or while it runs for a partial account.
+    #[must_use]
+    pub fn timed(mut self, clock: &PhaseClock) -> Self {
+        self.clock = clock.clone();
+        self
+    }
+
     /// [`Executor::run_query`], stopping at the bind-to-execute boundary
     /// once the latch is set, under the caller's [`RowCap`].
     pub fn run_query(
@@ -172,8 +189,15 @@ impl Cancellable<'_> {
         cap: RowCap,
         utc_offset_secs: i32,
     ) -> Result<QueryResult, EngineError> {
-        self.executor
-            .run_query_latched(dsl, source, pins, cap, utc_offset_secs, self.cancel)
+        self.executor.run_query_latched(
+            dsl,
+            source,
+            pins,
+            cap,
+            utc_offset_secs,
+            self.cancel,
+            &self.clock,
+        )
     }
 
     /// [`Executor::run_query_with_hot`], stopping at the bind-to-execute
@@ -198,6 +222,7 @@ impl Cancellable<'_> {
             cap,
             utc_offset_secs,
             self.cancel,
+            &self.clock,
         )
     }
 
@@ -211,8 +236,15 @@ impl Cancellable<'_> {
         output_path: &Path,
         max_rows: usize,
     ) -> Result<(), EngineError> {
-        self.executor
-            .export_parquet_latched(dsl, source, pins, output_path, max_rows, self.cancel)
+        self.executor.export_parquet_latched(
+            dsl,
+            source,
+            pins,
+            output_path,
+            max_rows,
+            self.cancel,
+            &self.clock,
+        )
     }
 
     /// [`Executor::export_parquet_with_hot`], stopping at the
@@ -237,6 +269,7 @@ impl Cancellable<'_> {
             output_path,
             max_rows,
             self.cancel,
+            &self.clock,
         )
     }
 }
@@ -315,6 +348,7 @@ impl Executor {
         Cancellable {
             executor: self,
             cancel,
+            clock: PhaseClock::off(),
         }
     }
 
@@ -353,6 +387,7 @@ impl Executor {
             RowCap::Refuse(max_rows),
             utc_offset_secs,
             &CancelLatch::never(),
+            &PhaseClock::off(),
         )
     }
 
@@ -365,41 +400,41 @@ impl Executor {
         cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
+        clock: &PhaseClock,
     ) -> Result<QueryResult, EngineError> {
-        let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let resolved = self.resolve_source(source);
-        let emitted = resolved.emit_cold(&ast, pins, EvalContext::capture())?;
+        let ast = clock
+            .time(QueryPhase::Emit, || parser::parse(dsl))
+            .map_err(EngineError::Parse)?;
+        let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        let emitted = clock.time(QueryPhase::Emit, || {
+            resolved.emit_cold(&ast, pins, EvalContext::capture())
+        })?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
         let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
-        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel);
+        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel, clock);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
         // "no files" answer over a source that still reaches files is the
         // silent cold-data drop either way (ADR-0008).
-        let (mut result, timestamp_columns) = match self.cold_action_for(
+        let (result, timestamp_columns) = match self.cold_action_for(
             classify_query_outcome(&outcome),
             &resolved,
             HotLane::Absent,
+            clock,
         ) {
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome?,
         };
-        if !emitted.rust_stages.is_empty() {
-            result = crate::post_process::apply_rust_stages(
+        clock.time(QueryPhase::Post, || {
+            finish_result(
                 result,
-                &emitted.rust_stages,
-                &emitted.rust_stage_pins,
-                emitted.anchor,
-                ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
-            )?;
-            let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
-            shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
-        }
-        cap.trim(&mut result);
-        if emitted.needs_column_reorder {
-            result.reorder_log_columns();
-        }
-        Ok(result)
+                &timestamp_columns,
+                &emitted,
+                &ast,
+                cap,
+                utc_offset_secs,
+            )
+        })
     }
 
     /// Full pipeline with hot buffer: parse DSL, emit composite SQL, execute.
@@ -437,6 +472,7 @@ impl Executor {
             RowCap::Refuse(max_rows),
             utc_offset_secs,
             &CancelLatch::never(),
+            &PhaseClock::off(),
         )
     }
 
@@ -451,14 +487,18 @@ impl Executor {
         cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
+        clock: &PhaseClock,
     ) -> Result<QueryResult, EngineError> {
-        let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let resolved = self.resolve_source(source);
-        let emitted =
-            resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())?;
+        let ast = clock
+            .time(QueryPhase::Emit, || parser::parse(dsl))
+            .map_err(EngineError::Parse)?;
+        let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        let emitted = clock.time(QueryPhase::Emit, || {
+            resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())
+        })?;
         let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
         let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
-        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel);
+        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel, clock);
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
@@ -471,12 +511,14 @@ impl Executor {
         // Classify the outcome, then route on the pure `cold_action`
         // decision so the outcome policy stays unit-testable and identical
         // across the four lanes.
-        let (mut result, timestamp_columns) = match self.cold_action_for(
+        let (result, timestamp_columns) = match self.cold_action_for(
             classify_query_outcome(&outcome),
             &resolved,
             HotLane::Present,
+            clock,
         ) {
             ColdAction::HotOnly => {
+                clock.fallback(Fallback::HotOnly);
                 // Hot-only keeps both halves of the interpretation: the same
                 // comparison pins, and the same hot-column conformance the
                 // union's hot branch applies. Reading the raw ndjson would
@@ -489,9 +531,11 @@ impl Executor {
                 // clock read would let the fallback answer a `now()`
                 // comparison differently from the union attempt it replaces
                 // (ADR-0017 §3).
-                let hot_emitted =
-                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
-                match self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_offset, cancel) {
+                let hot_emitted = clock.time(QueryPhase::Emit, || {
+                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)
+                })?;
+                match self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_offset, cancel, clock)
+                {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
                     Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
@@ -501,22 +545,16 @@ impl Executor {
             ColdAction::ColdDataUnread => return Err(EngineError::ColdDataUnread),
             ColdAction::ReturnOutcome => outcome?,
         };
-        if !emitted.rust_stages.is_empty() {
-            result = crate::post_process::apply_rust_stages(
+        clock.time(QueryPhase::Post, || {
+            finish_result(
                 result,
-                &emitted.rust_stages,
-                &emitted.rust_stage_pins,
-                emitted.anchor,
-                ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
-            )?;
-            let tracked = tail_timestamp_scope(&timestamp_columns, &emitted.rust_stages);
-            shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
-        }
-        cap.trim(&mut result);
-        if emitted.needs_column_reorder {
-            result.reorder_log_columns();
-        }
-        Ok(result)
+                &timestamp_columns,
+                &emitted,
+                &ast,
+                cap,
+                utc_offset_secs,
+            )
+        })
     }
 
     /// Execute a pre-emitted query (SQL + params) against `DuckDB`.
@@ -536,6 +574,7 @@ impl Executor {
             RowCap::Refuse(max_rows),
             utc_offset_secs,
             &CancelLatch::never(),
+            &PhaseClock::off(),
         )
         .map(|(result, _)| result)
     }
@@ -552,9 +591,10 @@ impl Executor {
         cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
+        clock: &PhaseClock,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
-        with_raw_fallback(query, |q| {
-            self.execute_emitted_once(q, cap, utc_offset_secs, cancel)
+        with_raw_fallback(query, clock, |q| {
+            self.execute_emitted_once(q, cap, utc_offset_secs, cancel, clock)
         })
     }
 
@@ -564,19 +604,25 @@ impl Executor {
         cap: RowCap,
         utc_offset_secs: i32,
         cancel: &CancelLatch,
+        clock: &PhaseClock,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
         // Before the bind, so a cancellation that landed during the first
         // attempt's bind stops the `_raw`-free retry and the hot-only
         // fallback from starting a second one.
         cancel.check()?;
-        validate_timechart_inputs(&self.conn, &query.timechart_input_checks, cancel)?;
+        run_timechart_probes(&self.conn, &query.timechart_input_checks, cancel, clock)?;
         // Re-read after the probes: each one is a bind of its own, and
         // this is the last moment before the statement's.
         cancel.check()?;
         // Every lane's SQL read reaches `DuckDB` here — cold, hot union,
         // hot-only, and each one's `_raw`-free retry — so this is the one
         // place a `Truncate` becomes a `LIMIT`.
-        let mut stmt = match prepare_statement(&self.conn, &cap.statement(&query.sql)) {
+        let statement = cap.statement(&query.sql);
+        clock.bind_attempt();
+        let prepared = clock.time(QueryPhase::Bind, || {
+            prepare_statement(&self.conn, &statement)
+        });
+        let mut stmt = match prepared {
             Ok(s) => s,
             Err(e) if is_no_files_error(&e) => {
                 return Ok((QueryResult::empty(), TimestampColumns::new()));
@@ -593,6 +639,10 @@ impl Executor {
         // here rather than trusting that one to have survived every
         // `DuckDB` API phase.
         cancel.check()?;
+
+        // From here to the last row materialized is `execute`; the guard
+        // books it on every return below.
+        let _execute = clock.guard(QueryPhase::Execute);
 
         // start query execution — column metadata is only available
         // after DuckDB resolves table-valued functions like read_parquet()
@@ -717,9 +767,12 @@ impl Executor {
         outcome: HotColdOutcome,
         resolved: &ResolvedSource,
         hot: HotLane,
+        clock: &PhaseClock,
     ) -> ColdAction {
         let cold = if outcome.consults_cold_presence(hot) {
-            self.cold_presence(resolved)
+            // A plain glob is globbed here, lazily: file discovery, so
+            // `source` (ADR-0046).
+            clock.time(QueryPhase::Source, || self.cold_presence(resolved))
         } else {
             // The table answers the same for both values here, so the
             // argument is inert — and the happy path never globs.
@@ -864,6 +917,7 @@ impl Executor {
             output_path,
             max_rows,
             &CancelLatch::never(),
+            &PhaseClock::off(),
         )
     }
 
@@ -876,11 +930,17 @@ impl Executor {
         output_path: &Path,
         max_rows: usize,
         cancel: &CancelLatch,
+        clock: &PhaseClock,
     ) -> Result<(), EngineError> {
-        let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let resolved = self.resolve_source(source);
-        let emitted = resolved.emit_cold(&ast, pins, EvalContext::capture())?;
-        let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel);
+        let ast = clock
+            .time(QueryPhase::Emit, || parser::parse(dsl))
+            .map_err(EngineError::Parse)?;
+        let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        let emitted = clock.time(QueryPhase::Emit, || {
+            resolved.emit_cold(&ast, pins, EvalContext::capture())
+        })?;
+        let outcome =
+            self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel, clock);
         // The same gate the query lanes run, on the same classification. An
         // all-missing source keeps surfacing DuckDB's own "no files" error
         // here — deliberately loud, since there is no empty answer an export
@@ -890,6 +950,7 @@ impl Executor {
             classify_export_outcome(&outcome),
             &resolved,
             HotLane::Absent,
+            clock,
         ) {
             // Discarding `outcome`'s error text is safe by construction:
             // `classify_export_outcome` maps only `is_no_files_error` errors
@@ -938,6 +999,7 @@ impl Executor {
             output_path,
             max_rows,
             &CancelLatch::never(),
+            &PhaseClock::off(),
         )
     }
 
@@ -952,19 +1014,26 @@ impl Executor {
         output_path: &Path,
         max_rows: usize,
         cancel: &CancelLatch,
+        clock: &PhaseClock,
     ) -> Result<(), EngineError> {
-        let ast = parser::parse(dsl).map_err(EngineError::Parse)?;
-        let resolved = self.resolve_source(source);
-        let emitted =
-            resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())?;
-        let outcome = self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel);
+        let ast = clock
+            .time(QueryPhase::Emit, || parser::parse(dsl))
+            .map_err(EngineError::Parse)?;
+        let resolved = clock.time(QueryPhase::Source, || self.resolve_source(source));
+        let emitted = clock.time(QueryPhase::Emit, || {
+            resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())
+        })?;
+        let outcome =
+            self.export_parquet_from_emitted(&emitted, output_path, max_rows, cancel, clock);
 
         match self.cold_action_for(
             classify_export_outcome(&outcome),
             &resolved,
             HotLane::Present,
+            clock,
         ) {
             ColdAction::HotOnly => {
+                clock.fallback(Fallback::HotOnly);
                 // Hot-only, conformed like the union's hot branch — an
                 // export must not write JSON-inferred types where the
                 // hot+cold lane would have written the catalog's.
@@ -973,9 +1042,10 @@ impl Executor {
                 // second clock read would let the fallback answer a
                 // `now()` comparison differently from the union attempt
                 // it replaces (ADR-0017 §3).
-                let hot_emitted =
-                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)?;
-                self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows, cancel)
+                let hot_emitted = clock.time(QueryPhase::Emit, || {
+                    emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)
+                })?;
+                self.export_parquet_from_emitted(&hot_emitted, output_path, max_rows, cancel, clock)
             }
             // Same invariant as `export_parquet`: only an `is_no_files_error`
             // reaches `NoColumns`, so the discarded error text is always that
@@ -992,9 +1062,10 @@ impl Executor {
         output_path: &Path,
         max_rows: usize,
         cancel: &CancelLatch,
+        clock: &PhaseClock,
     ) -> Result<(), EngineError> {
-        with_raw_fallback(emitted, |q| {
-            self.export_parquet_from_emitted_once(q, output_path, max_rows, cancel)
+        with_raw_fallback(emitted, clock, |q| {
+            self.export_parquet_from_emitted_once(q, output_path, max_rows, cancel, clock)
         })
     }
 
@@ -1004,6 +1075,7 @@ impl Executor {
         output_path: &Path,
         max_rows: usize,
         cancel: &CancelLatch,
+        clock: &PhaseClock,
     ) -> Result<(), EngineError> {
         // Same rule as the query lane: no second bind starts once the
         // caller has asked for this work to stop.
@@ -1011,7 +1083,7 @@ impl Executor {
         // And the same bucket-source refusal, for the same reason: an
         // export writes its answer to a file, where a wrong bucket is
         // harder to notice than on screen, not easier.
-        validate_timechart_inputs(&self.conn, &emitted.timechart_input_checks, cancel)?;
+        run_timechart_probes(&self.conn, &emitted.timechart_input_checks, cancel, clock)?;
         if !emitted.rust_stages.is_empty() {
             return Err(EngineError::Emit(
                 trawl_core::emitter::EmitError::UnsupportedOperation {
@@ -1051,7 +1123,11 @@ impl Executor {
         // probes above each bound a statement, and the staging SELECT
         // is about to bind another.
         cancel.check()?;
-        match prepare_statement(&self.conn, &create_sql) {
+        clock.bind_attempt();
+        let prepared = clock.time(QueryPhase::Bind, || {
+            prepare_statement(&self.conn, &create_sql)
+        });
+        match prepared {
             Ok(mut stmt) => {
                 // The export's bind-to-execute boundary: the staging
                 // SELECT is the whole query, so this is the same bind the
@@ -1060,7 +1136,10 @@ impl Executor {
                     cleanup(&self.conn);
                     return Err(EngineError::Cancelled);
                 }
-                if let Err(e) = stmt.execute(param_refs.as_slice()) {
+                // Staging is the export's `execute` (ADR-0046).
+                let staged =
+                    clock.time(QueryPhase::Execute, || stmt.execute(param_refs.as_slice()));
+                if let Err(e) = staged {
                     cleanup(&self.conn);
                     return Err(e.into());
                 }
@@ -1083,14 +1162,17 @@ impl Executor {
         let safe_path = path_str.replace('\'', "''");
         let copy_sql =
             format!("COPY __trawl_export TO '{safe_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)");
-        if let Err(e) = self.conn.execute_batch(&copy_sql) {
+        // The COPY binds its own statement, opaquely, so the whole of it
+        // and its cleanup is `copy` and never `bind` (ADR-0046).
+        clock.time(QueryPhase::Copy, || {
+            if let Err(e) = self.conn.execute_batch(&copy_sql) {
+                cleanup(&self.conn);
+                let _ = std::fs::remove_file(output_path);
+                return Err(e.into());
+            }
             cleanup(&self.conn);
-            let _ = std::fs::remove_file(output_path);
-            return Err(e.into());
-        }
-
-        cleanup(&self.conn);
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Write an in-memory [`QueryResult`] to a Parquet file.
@@ -1205,6 +1287,35 @@ impl Executor {
     }
 }
 
+/// The query lanes' tail after the SQL read: the Rust stages and their
+/// display shift, the cap's cut, and the column reorder — the engine's
+/// share of `post` (ADR-0046).
+fn finish_result(
+    mut result: QueryResult,
+    timestamp_columns: &[String],
+    emitted: &EmittedQuery,
+    ast: &Query,
+    cap: RowCap,
+    utc_offset_secs: i32,
+) -> Result<QueryResult, EngineError> {
+    if !emitted.rust_stages.is_empty() {
+        result = crate::post_process::apply_rust_stages(
+            result,
+            &emitted.rust_stages,
+            &emitted.rust_stage_pins,
+            emitted.anchor,
+            ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
+        )?;
+        let tracked = tail_timestamp_scope(timestamp_columns, &emitted.rust_stages);
+        shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
+    }
+    cap.trim(&mut result);
+    if emitted.needs_column_reorder {
+        result.reorder_log_columns();
+    }
+    Ok(result)
+}
+
 /// Convert a [`Value`] to a [`serde_json::Value`] for ndjson serialization.
 fn value_to_json(v: &Value) -> serde_json::Value {
     match v {
@@ -1274,6 +1385,27 @@ fn duckdb_type_name(id: LogicalTypeId) -> String {
         LogicalTypeId::IntegerLiteral => "INTEGER".to_string(),
         other => format!("{other:?}").to_uppercase(),
     }
+}
+
+/// [`validate_timechart_inputs`], booked as `probe` when there is a probe
+/// to run (ADR-0046).
+///
+/// The probes' binds and executions are theirs alone: they never count
+/// as a main-statement bind attempt and never land in `bind` or
+/// `execute`. A query with no timechart never enters the phase, so its
+/// `query_probe_us` stays absent.
+fn run_timechart_probes(
+    conn: &Connection,
+    checks: &[TimechartInputCheck],
+    cancel: &CancelLatch,
+    clock: &PhaseClock,
+) -> Result<(), EngineError> {
+    if checks.is_empty() {
+        return validate_timechart_inputs(conn, checks, cancel);
+    }
+    clock.time(QueryPhase::Probe, || {
+        validate_timechart_inputs(conn, checks, cancel)
+    })
 }
 
 /// Refuse a `timechart on <column>` whose bucket source is not a
@@ -1372,6 +1504,7 @@ fn validate_timechart_inputs(
 /// search — `raw_free_sql` is `None` there.
 fn with_raw_fallback<T>(
     query: &EmittedQuery,
+    clock: &PhaseClock,
     attempt: impl Fn(&EmittedQuery) -> Result<T, EngineError>,
 ) -> Result<T, EngineError> {
     let err = match attempt(query) {
@@ -1381,6 +1514,7 @@ fn with_raw_fallback<T>(
     let Some(raw_free) = &query.raw_free_sql else {
         return Err(err);
     };
+    clock.fallback(Fallback::RawRetry);
     let fallback = EmittedQuery {
         sql: raw_free.clone(),
         raw_free_sql: None,
@@ -2627,7 +2761,7 @@ fn refusal_survives_raw_free_retry() {
 fn raw_free_retry_still_reports_the_original_missing_column() {
     let emitted = raw_fallback_query();
     let attempts = std::cell::Cell::new(0_u32);
-    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, |_| {
+    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, &PhaseClock::off(), |_| {
         attempts.set(attempts.get() + 1);
         Err(EngineError::Emit(
             trawl_core::emitter::EmitError::UnsupportedOperation {
@@ -2659,7 +2793,7 @@ fn raw_free_retry_still_reports_the_original_missing_column() {
 fn refusal_never_triggers_the_raw_free_retry() {
     let emitted = raw_fallback_query();
     let attempts = std::cell::Cell::new(0_u32);
-    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, |_| {
+    let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, &PhaseClock::off(), |_| {
         attempts.set(attempts.get() + 1);
         Err(EngineError::Refused {
             message: "timechart on 'hostname' is not a timestamp: VARCHAR".to_string(),
@@ -2821,6 +2955,8 @@ mod tests {
         glob_list_items, has_glob_meta, is_conversion_error, is_no_files_error,
         literal_path_is_file, resolve_list_source, with_raw_fallback,
     };
+    use crate::cancel::CancelLatch;
+    use crate::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase, Transition};
 
     /// Write a one-row parquet file whose `meta` column has the given SQL
     /// type/value expression (e.g. `{'a': 1}` for a `STRUCT`, `'plain'` for a
@@ -3115,14 +3251,15 @@ mod tests {
         );
 
         let seen = std::cell::RefCell::new(Vec::new());
-        let outcome: Result<(), EngineError> = with_raw_fallback(&emitted, |attempt| {
-            seen.borrow_mut().push(attempt.anchor);
-            Err(EngineError::Emit(
-                trawl_core::emitter::EmitError::UnsupportedOperation {
-                    message: "column not found".to_string(),
-                },
-            ))
-        });
+        let outcome: Result<(), EngineError> =
+            with_raw_fallback(&emitted, &PhaseClock::off(), |attempt| {
+                seen.borrow_mut().push(attempt.anchor);
+                Err(EngineError::Emit(
+                    trawl_core::emitter::EmitError::UnsupportedOperation {
+                        message: "column not found".to_string(),
+                    },
+                ))
+            });
         assert!(outcome.is_err());
         let seen = seen.into_inner();
         assert_eq!(seen.len(), 2, "both passes must have been attempted");
@@ -4089,5 +4226,227 @@ mod tests {
         }
         .statement(sql);
         assert_eq!(wrapped.matches('?').count(), sql.matches('?').count());
+    }
+
+    /// Enter-then-exit pairs for `phases`, the transition log of
+    /// a lane that booked each of them in turn.
+    fn booked(phases: &[QueryPhase]) -> Vec<Transition> {
+        phases
+            .iter()
+            .flat_map(|&p| [Transition::Enter(p), Transition::Exit(p)])
+            .collect()
+    }
+
+    fn close(clock: &PhaseClock) -> PhaseTotals {
+        clock
+            .close_at(std::time::Instant::now())
+            .expect("the clock records")
+    }
+
+    /// The `_raw`-free retry is a second main-statement bind against a
+    /// real source: the first attempt's bind fails on the `_raw` column
+    /// the fixture lacks, the retry's binds and runs. Both binds land in
+    /// one `bind` total, and the account says why there were two.
+    ///
+    /// Each bind is held for 5ms on entry, so a total of at least 10ms
+    /// is only reachable with both attempts booked.
+    #[test]
+    fn raw_retry_counts_two_attempts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = super::raw_free_fixture(&dir);
+        let clock = PhaseClock::new();
+        clock.hold_on_enter(QueryPhase::Bind, || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        });
+
+        let result = Executor::new()
+            .expect("executor")
+            .cancellable(&CancelLatch::never())
+            .timed(&clock)
+            .run_query(
+                "needle",
+                &source,
+                &FieldTypes::new(),
+                RowCap::Refuse(usize::MAX),
+                0,
+            )
+            .expect("the retry answers");
+        assert_eq!(result.rows.len(), 1, "the retry found the needle");
+
+        let totals = close(&clock);
+        assert_eq!(totals.attempts, 2);
+        assert_eq!(totals.fallback, Fallback::RawRetry);
+        let bind = totals.get(QueryPhase::Bind).expect("bind booked");
+        assert!(bind >= 10_000, "both binds summed into one total: {bind}us");
+        assert_eq!(
+            clock.transitions(),
+            booked(&[
+                QueryPhase::Emit,
+                QueryPhase::Source,
+                QueryPhase::Emit,
+                // The first attempt fails in its bind and never executes.
+                QueryPhase::Bind,
+                QueryPhase::Bind,
+                QueryPhase::Execute,
+                QueryPhase::Post,
+            ])
+        );
+        assert_eq!(totals.get(QueryPhase::Probe), None);
+    }
+
+    /// A cold start reads the hot buffer alone, and the account names
+    /// that fallback: two main-statement binds, the second one hot-only,
+    /// with the cold-presence glob booked as `source` and the hot-only
+    /// re-emission as `emit`.
+    #[test]
+    fn hot_only_fallback_reports_its_kind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"_time\":\"2024-01-15T10:00:00Z\",\"_ingested\":\"2024-01-15T10:00:00Z\",\
+             \"service\":\"svc\",\"message\":\"hi\"}\n",
+        )
+        .expect("hot buffer writes");
+        let cold = format!("{}/nonexistent/*.parquet", dir.path().display());
+        let clock = PhaseClock::new();
+
+        let result = Executor::new()
+            .expect("executor")
+            .cancellable(&CancelLatch::never())
+            .timed(&clock)
+            .run_query_with_hot(
+                "*",
+                &cold,
+                hot.to_str().expect("temp path is valid UTF-8"),
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                RowCap::Refuse(usize::MAX),
+                0,
+            )
+            .expect("cold start answers from the hot buffer");
+        assert_eq!(result.rows.len(), 1);
+
+        let totals = close(&clock);
+        assert_eq!(totals.fallback, Fallback::HotOnly);
+        assert_eq!(totals.fallback.as_str(), "hot_only");
+        assert_eq!(
+            totals.attempts, 2,
+            "the union's bind, then the hot-only one"
+        );
+        assert_eq!(
+            clock.transitions(),
+            booked(&[
+                QueryPhase::Emit,
+                QueryPhase::Source,
+                QueryPhase::Emit,
+                // The union matches no files at its bind.
+                QueryPhase::Bind,
+                // The presence check globs the cold side: nothing there.
+                QueryPhase::Source,
+                QueryPhase::Emit,
+                QueryPhase::Bind,
+                QueryPhase::Execute,
+                QueryPhase::Post,
+            ])
+        );
+    }
+
+    /// Timechart probes bind and run statements of their own, and all of
+    /// it is `probe`: the probe phase closes before the main statement's
+    /// bind opens, no probe counts as a bind attempt, and the statement
+    /// `DuckDB` last prepared when `bind` opens is the probe's — so the
+    /// probe's prepare ran before `bind` began, and the main statement's
+    /// ran inside it.
+    #[test]
+    fn timechart_probes_count_only_in_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = super::timechart_fixture(&dir);
+        let dsl = "* | timechart on good span=1d count()";
+        let clock = PhaseClock::new();
+        let at_bind = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let at_bind = std::sync::Arc::clone(&at_bind);
+            clock.hold_on_enter(QueryPhase::Bind, move || {
+                *at_bind.lock().expect("unpoisoned") = super::prepare_probe::last_statement();
+            });
+        }
+
+        Executor::new()
+            .expect("executor")
+            .cancellable(&CancelLatch::never())
+            .timed(&clock)
+            .run_query(
+                dsl,
+                &source,
+                &FieldTypes::new(),
+                RowCap::Refuse(usize::MAX),
+                0,
+            )
+            .expect("a TIMESTAMP bucket source charts");
+
+        let totals = close(&clock);
+        assert!(totals.get(QueryPhase::Probe).is_some(), "{totals:?}");
+        assert_eq!(totals.attempts, 1, "probes are not bind attempts");
+        assert_eq!(totals.fallback, Fallback::None);
+        assert_eq!(
+            clock.transitions(),
+            booked(&[
+                QueryPhase::Emit,
+                QueryPhase::Source,
+                QueryPhase::Emit,
+                QueryPhase::Probe,
+                QueryPhase::Bind,
+                QueryPhase::Execute,
+                QueryPhase::Post,
+            ])
+        );
+
+        let query = trawl_core::parser::parse(dsl).expect("dsl parses");
+        let emitted =
+            emitter::emit_with_pins(&query, &source, &FieldTypes::new(), EvalContext::capture())
+                .expect("the query emits");
+        let [probe] = emitted.timechart_input_checks.as_slice() else {
+            panic!("one timechart, one probe");
+        };
+        assert_eq!(
+            at_bind.lock().expect("unpoisoned").as_deref(),
+            Some(probe.sql.as_str()),
+            "the probe was prepared before bind opened"
+        );
+        assert_eq!(
+            super::prepare_probe::last_statement().as_deref(),
+            Some(emitted.sql.as_str()),
+            "the main statement was prepared inside bind"
+        );
+    }
+
+    /// A parquet export books its staging as `execute` and its `COPY` as
+    /// `copy`, and binds once.
+    #[test]
+    fn parquet_export_books_copy_apart_from_bind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = super::timechart_fixture(&dir);
+        let out = dir.path().join("out.parquet");
+        let clock = PhaseClock::new();
+        Executor::new()
+            .expect("executor")
+            .cancellable(&CancelLatch::never())
+            .timed(&clock)
+            .export_parquet("*", &source, &FieldTypes::new(), &out, 100)
+            .expect("exports");
+        let totals = close(&clock);
+        assert_eq!(totals.attempts, 1);
+        assert_eq!(
+            clock.transitions(),
+            booked(&[
+                QueryPhase::Emit,
+                QueryPhase::Source,
+                QueryPhase::Emit,
+                QueryPhase::Bind,
+                QueryPhase::Execute,
+                QueryPhase::Copy,
+            ])
+        );
     }
 }

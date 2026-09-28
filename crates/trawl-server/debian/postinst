@@ -66,6 +66,23 @@ if [ "$1" = "configure" ]; then
   if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create trawl.conf
   fi
+
+  # trawld and trawl-web install disabled and stopped (systemd-units in
+  # Cargo.toml): the shipped trawld.toml holds CHANGE_ME database URLs. On a
+  # fresh install ($2 is empty) tell the operator the two steps that start
+  # them. Upgrades keep whatever the operator already enabled.
+  if [ -z "$2" ]; then
+    cat >&2 <<'EOF'
+
+trawld and trawl-web are installed but not enabled or started.
+1. Set the two database URLs: FLEET_DATABASE_URL and TRAWL_DATABASE_URL in
+   /etc/default/trawld, or [auth] and [storage] database_url in
+   /etc/trawl/trawld.toml. See https://trawl.sh/operate/deployment/
+2. Start both services:
+     systemctl enable --now trawld trawl-web
+
+EOF
+  fi
 fi
 
 #DEBHELPER#

@@ -69,9 +69,11 @@ rustix = { workspace = true }
 
 [features]
 # Exposes the pool's query-delay hook (`pool::TEST_QUERY_DELAY_MS`) to this
-# crate's own integration tests via the self-dev-dependency below. No
-# production consumer enables it, so release builds never carry the hook.
-test-support = []
+# crate's own integration tests via the self-dev-dependency below, and the
+# engine's phase-clock hold hook (`PhaseClock::hold_on_enter`) to the pool's
+# timing tests. No production consumer enables it, so release builds never
+# carry either hook.
+test-support = ["trawl-engine/test-support"]
 
 [dev-dependencies]
 # Self-dependency: enables the test-support hook for this crate's own
@@ -105,9 +107,14 @@ section = "net"
 priority = "optional"
 conf-files = ["/etc/trawl/trawld.toml", "/etc/default/trawld", "/etc/default/trawl-web"]
 maintainer-scripts = "debian/"
+# Installed disabled and stopped: the shipped trawld.toml holds CHANGE_ME
+# database URLs, so a started unit could only fail and restart. postinst tells
+# the operator to set the URLs and run `systemctl enable --now trawld trawl-web`.
+# With these flags cargo-deb still restarts, on upgrade, a unit the operator
+# has already started (see debian/tests/packaging.sh).
 systemd-units = [
-    { unit-name = "trawld", enable = true, start = true },
-    { unit-name = "trawl-web", enable = true, start = true },
+    { unit-name = "trawld", enable = false, start = false },
+    { unit-name = "trawl-web", enable = false, start = false },
 ]
 assets = [
     ["target/release/trawld", "usr/bin/", "755"],

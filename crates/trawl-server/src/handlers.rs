@@ -36,6 +36,7 @@ use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::PoolDebugInfo;
 use crate::query_log::{HotBufferDebug, QueryLogEntry, ResultDebug, SourceDebug, TimingDebug};
+use crate::query_timing::{ExportFormat, Outcome, TimingGuard, TimingKind};
 use crate::report_window::{ScheduleWindow, format_window_bound};
 use crate::scheduler::execute_scheduled_query;
 use crate::state::{AppState, CachedFieldValues};
@@ -43,6 +44,8 @@ use crate::store::{
     HistoryEntry, ManualRunClaim, ReportRun, RunOrigin, RunStatus, SavedQuery, Schedule,
     ScheduleWithStats, StoreError, format_interval, parse_duration_secs, parse_interval,
 };
+use crate::transport::http::RequestId;
+use trawl_engine::timing::QueryPhase;
 
 // -- handlers ----------------------------------------------------------------
 
@@ -82,6 +85,7 @@ fn guard_vanished_run_result(
 pub async fn query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
+    Extension(request_id): Extension<RequestId>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, ServerError> {
     if !verified.has_permission(Permission::Query) {
@@ -154,6 +158,12 @@ pub async fn query(
     let start = std::time::Instant::now();
     let capture_debug = state.query.query_log.is_some();
 
+    // The query's timing account (ADR-0046): its window starts where the
+    // execution record's `duration_ms` does. Dropped unwritten — the
+    // caller walked away before the pool took over — it writes
+    // `outcome=abandoned`.
+    let timing = TimingGuard::for_request(query_id, request_id.0, TimingKind::Query, start);
+
     // Check for `| from saved` — if present, resolve to parquet source
     // and execute with the pre-computed source instead of normal glob scan.
     //
@@ -171,17 +181,48 @@ pub async fn query(
     // outcome and finish tracking through the one path below. Expiry is
     // the pre-start capacity refusal, since no work was ever started and a
     // timeout history row would claim otherwise.
-    let admitted = match crate::admission::check_dsl(&req.query) {
-        Err(refusal) => Err(refusal),
-        Ok(()) => match deadline
+    //
+    // `saved_lookup` is booked for every `from saved` read, and only one
+    // that resolved makes the account a `from_saved` one: every query
+    // takes the detection parse, and an ordinary query's is not a lookup.
+    // A lookup that failed (an unknown saved query, a database error) is
+    // booked like one that resolved, and one the deadline cut is booked
+    // like any request-side wait a deadline ends (ADR-0046): the refusal
+    // shows where its time went.
+    let checked = timing.clock().time(QueryPhase::DslCheck, || {
+        crate::admission::check_dsl(&req.query)
+    });
+    let admitted = if let Err(refusal) = checked {
+        Err(refusal)
+    } else {
+        timing.clock().enter(QueryPhase::SavedLookup);
+        match deadline
             .run(try_resolve_from_saved(&state, &verified, &req.query))
             .await
         {
-            Ok(resolved) => resolved,
-            Err(crate::deadline::Expired) => Err(ServerError::ServiceUnavailable(
-                crate::error::CAPACITY_NOT_STARTED.to_owned(),
-            )),
-        },
+            Ok(Ok(Some(resolved))) => {
+                timing.clock().exit(QueryPhase::SavedLookup);
+                timing.set_kind(TimingKind::FromSaved);
+                Ok(Some(resolved))
+            }
+            Ok(Ok(None)) => {
+                timing.clock().discard(QueryPhase::SavedLookup);
+                Ok(None)
+            }
+            Ok(Err(refusal)) => {
+                timing.clock().exit(QueryPhase::SavedLookup);
+                Err(refusal)
+            }
+            Err(crate::deadline::Expired) => {
+                timing.clock().exit(QueryPhase::SavedLookup);
+                // Refused here, before any work: named where it is made,
+                // like the pool's own capacity refusals.
+                timing.emit_complete(Outcome::CapacityRefused, std::time::Instant::now());
+                Err(ServerError::ServiceUnavailable(
+                    crate::error::CAPACITY_NOT_STARTED.to_owned(),
+                ))
+            }
+        }
     };
 
     // The stored result files this read depends on, kept past resolution so
@@ -238,7 +279,8 @@ pub async fn query(
                                 crate::pool::WorkKind::FromSaved,
                                 verified.id,
                             )
-                            .with_user(&verified.name),
+                            .with_user(&verified.name)
+                            .with_timing(timing.timing().clone()),
                         )
                         .await,
                     degraded,
@@ -258,7 +300,8 @@ pub async fn query(
                         capture_debug,
                         utc_offset_secs,
                         crate::pool::WorkContext::key(crate::pool::WorkKind::Query, verified.id)
-                            .with_user(&verified.name),
+                            .with_user(&verified.name)
+                            .with_timing(timing.timing().clone()),
                     )
                     .await,
                 degraded,
@@ -268,10 +311,32 @@ pub async fn query(
 
     // Between the check above and `DuckDB`'s open there is a window a
     // delete can land in. This closes it on the way out.
-    let outcome = guard_vanished_run_result(outcome, &run_files);
+    //
+    // The re-check is `post` for a `from saved` read, the one query it
+    // can do anything for. An account the pool already wrote (a timeout,
+    // a capacity refusal) is closed, and its worker may still be inside a
+    // phase: nothing more is booked on it.
+    let outcome = if run_files.is_empty() || timing.emitted() {
+        guard_vanished_run_result(outcome, &run_files)
+    } else {
+        timing.clock().time(QueryPhase::Post, || {
+            guard_vanished_run_result(outcome, &run_files)
+        })
+    };
 
-    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let duration_secs = start.elapsed().as_secs_f64();
+    // One instant ends both the execution record's duration and the
+    // timing account's window, so the two cover the same time.
+    let end = std::time::Instant::now();
+    let elapsed = end.saturating_duration_since(start);
+    let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    let duration_secs = elapsed.as_secs_f64();
+    timing.emit_complete(
+        outcome
+            .result
+            .as_ref()
+            .map_or_else(Outcome::of_error, |_| Outcome::Success),
+        end,
+    );
 
     // Which result columns render as OTel tokens, decided by the executing
     // task under the pins the rows were produced with, not by the catalog as
@@ -353,6 +418,7 @@ pub async fn query(
                 &verified,
                 &req.query,
                 outcome.debug.as_ref(),
+                timing.written().as_ref(),
                 Some(&paginated),
                 duration_ms,
                 None,
@@ -395,6 +461,7 @@ pub async fn query(
                 &verified,
                 &req.query,
                 outcome.debug.as_ref(),
+                timing.written().as_ref(),
                 None,
                 duration_ms,
                 Some("query timed out"),
@@ -471,6 +538,7 @@ pub async fn query(
                 &verified,
                 &req.query,
                 outcome.debug.as_ref(),
+                timing.written().as_ref(),
                 None,
                 duration_ms,
                 Some(&safe_msg),
@@ -3031,6 +3099,7 @@ pub async fn get_report_run(
 pub async fn export(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
+    Extension(request_id): Extension<RequestId>,
     Query(params): Query<ExportParams>,
     Json(req): Json<ExportRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -3070,10 +3139,36 @@ pub async fn export(
         "raw query text (DEBUG-only: never stored under the default filter)"
     );
 
+    // The export's timing account (ADR-0046). Its window opens here, so
+    // it covers the admission check, and closes after the body renders;
+    // `export_complete.duration_ms` keeps its own narrower window below.
+    let timing = TimingGuard::for_request(
+        query_id,
+        request_id.0,
+        TimingKind::Export(match format {
+            trawl_api::ExportFormat::Csv => ExportFormat::Csv,
+            trawl_api::ExportFormat::Json => ExportFormat::Json,
+            trawl_api::ExportFormat::Parquet => ExportFormat::Parquet,
+        }),
+        std::time::Instant::now(),
+    );
+    // Every early return writes the account with the error it returns;
+    // an account the pool already wrote (a timeout, a capacity refusal)
+    // stays as the pool wrote it.
+    let refused = |e: ServerError| {
+        timing.emit_complete(Outcome::of_error(&e), std::time::Instant::now());
+        e
+    };
+
     // One admission door for every lane (ADR-0024): the parquet export
     // takes a different route through the pool than CSV and JSON do, so
     // asking here is what makes all three refuse the same text.
-    crate::admission::check_dsl(&req.query)?;
+    timing
+        .clock()
+        .time(QueryPhase::DslCheck, || {
+            crate::admission::check_dsl(&req.query)
+        })
+        .map_err(refused)?;
 
     let start = std::time::Instant::now();
 
@@ -3089,10 +3184,14 @@ pub async fn export(
                 limit,
                 deadline,
                 crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id)
-                    .with_user(&verified.name),
+                    .with_user(&verified.name)
+                    .with_timing(timing.timing().clone()),
             )
-            .await?;
+            .await
+            .map_err(refused)?;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        // The readback, this format's render, ran inside the worker.
+        timing.emit_complete(Outcome::Success, std::time::Instant::now());
 
         tracing::info!(
             event_type = "export_complete",
@@ -3142,7 +3241,8 @@ pub async fn export(
             capture_debug,
             0,
             crate::pool::WorkContext::key(crate::pool::WorkKind::Export, verified.id)
-                .with_user(&verified.name),
+                .with_user(&verified.name)
+                .with_timing(timing.timing().clone()),
         )
         .await;
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -3150,12 +3250,14 @@ pub async fn export(
     let result = match outcome.result {
         Ok(qr) => qr,
         Err(e) => {
+            let e = refused(e);
             let error_msg = e.safe_message();
             write_query_log(
                 &state,
                 &verified,
                 &req.query,
                 outcome.debug.as_ref(),
+                timing.written().as_ref(),
                 None,
                 duration_ms,
                 Some(&error_msg),
@@ -3168,19 +3270,24 @@ pub async fn export(
         trawl_api::ExportFormat::Csv => (
             "text/csv; charset=utf-8".to_owned(),
             "attachment; filename=\"export.csv\"".to_owned(),
-            generate_csv(&result).into_bytes(),
+            timing
+                .clock()
+                .time(QueryPhase::Render, || generate_csv(&result).into_bytes()),
         ),
         trawl_api::ExportFormat::Json => (
             "application/x-ndjson".to_owned(),
             "attachment; filename=\"export.ndjson\"".to_owned(),
-            generate_ndjson(&result).into_bytes(),
+            timing
+                .clock()
+                .time(QueryPhase::Render, || generate_ndjson(&result).into_bytes()),
         ),
         trawl_api::ExportFormat::Parquet => {
-            return Err(ServerError::Internal(
+            return Err(refused(ServerError::Internal(
                 "parquet export reached unexpected code path".into(),
-            ));
+            )));
         }
     };
+    timing.emit_complete(Outcome::Success, std::time::Instant::now());
 
     tracing::info!(
         event_type = "export_complete",
@@ -3199,6 +3306,7 @@ pub async fn export(
         &verified,
         &req.query,
         outcome.debug.as_ref(),
+        timing.written().as_ref(),
         Some(&result),
         duration_ms,
         None,
@@ -3234,6 +3342,7 @@ fn write_query_log(
     verified: &VerifiedKey,
     dsl: &str,
     debug: Option<&PoolDebugInfo>,
+    phases: Option<&trawl_engine::timing::PhaseTotals>,
     result: Option<&QueryResult>,
     duration_ms: u64,
     error: Option<&str>,
@@ -3265,10 +3374,7 @@ fn write_query_log(
         sql: debug.sql.clone(),
         params: debug.params.clone(),
         result: build_result_debug(result),
-        timing_ms: TimingDebug {
-            pool_wait: debug.pool_wait_ms,
-            total: duration_ms,
-        },
+        timing_ms: TimingDebug::new(phases, duration_ms),
         error: error.map(String::from),
     };
 

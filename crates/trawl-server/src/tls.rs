@@ -368,4 +368,35 @@ mod tests {
         assert!(tls_dir.join("cert.pem").exists());
         assert!(tls_dir.join("key.pem").exists());
     }
+
+    /// The Debian package's trawl-web pins the certificate this module
+    /// generates, so the packaged `[web] upstream_ca_path` must be the file
+    /// trawld writes for the packaged `[data] path`.
+    #[test]
+    fn the_debian_config_pins_the_generated_certificate() {
+        let config = trawl_config::Config::parse_toml(include_str!("../debian/trawld.toml"))
+            .expect("the packaged trawld.toml parses");
+        assert!(
+            config.server.tls_cert_path.is_none() && config.server.tls_key_path.is_none(),
+            "the pin assumes trawld generates its own certificate"
+        );
+        let pin = config
+            .web
+            .upstream_ca_path
+            .as_deref()
+            .expect("the packaged trawld.toml sets [web] upstream_ca_path");
+        let relative = pin
+            .strip_prefix(config.state_dir())
+            .expect("the pin lies under trawld's state directory");
+
+        // Generate into a scratch state directory and read the pin from it.
+        let tmp = tempfile::tempdir().unwrap();
+        build_server_config(None, None, tmp.path()).unwrap();
+        let pem = fs::read(tmp.path().join(relative)).expect("trawld wrote the pinned file");
+        let certs = CertificateDer::pem_slice_iter(&pem)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the pinned file is PEM");
+        assert_eq!(certs.len(), 1, "the pinned file holds the certificate");
+        assert_eq!(relative, Path::new("tls").join(CERT_FILENAME));
+    }
 }

@@ -35,6 +35,97 @@ A flush reserves hot-buffer space before it writes. Telemetry may fill the whole
 
 `telemetry_buffer_max_bytes` bounds one memory charge across the active buffer, the queued batches, and any in-flight write. At capacity Trawl sheds the oldest queued batches first, then new events. `trawl_telemetry_events_dropped_total` separates `buffer_cap`, `preinit_cap`, `write_crashed`, and `unmetered_cap`. `trawl_telemetry_bytes_dropped_total` covers only the first three, because an `unmetered_cap` drop counts events and no bytes. Missing internal events therefore never prove the daemon was idle.
 
+### Query timing
+
+`/metrics` shows that queries got slow. It cannot show where one query spent
+its time. A query can wait for an executor permit, resolve its files, bind in
+DuckDB, or execute, and each of those needs a different fix. So trawld writes
+one `query_timing` event for each DSL query, and the event splits the query's
+time into query phases. A DSL `stats` over those events then answers which
+phase is slow, behind authentication, where a per-phase Prometheus histogram on
+the unauthenticated `/metrics` would not. The recipes are in
+[Find the slow phase of a query](/operate/health/#find-the-slow-phase-of-a-query),
+and the decision is
+[ADR-0046](https://github.com/jakub/trawl/blob/main/docs/adr/0046-a-query-reports-its-phases-in-one-timing-event.md).
+
+Every DSL query that reaches its DSL check gets one account, refusals at that
+check and capacity refusals included. `kind` is `query`, `from_saved`,
+`export`, or `scheduled`, which covers manual runs too. Live tail, the pool
+ping, and field sampling get none. Live tail never reaches DuckDB, and the
+other two do not run user DSL.
+
+Each phase is an integer number of microseconds in a field named
+`query_<phase>_us`. Milliseconds would floor the short phases of a typical
+query to zero. A phase the query never entered is absent, and a present zero is
+a measured value. A phase entered more than once adds to one field. There are
+14 phases:
+
+| Phase | Covers |
+| --- | --- |
+| `dsl_check` | The entry point's parse and pipeline validation. |
+| `saved_lookup` | `from saved` resolution, including its PostgreSQL read. |
+| `pool_wait` | The wait for an executor permit. |
+| `publication_wait` | The wait for the publication read guard. Absent for `from_saved`. |
+| `startup` | Dispatch to the blocking pool, up to the moment work starts. |
+| `source` | Source resolution, file discovery, and the pin snapshot. |
+| `hot_snapshot` | The hot-buffer snapshot, including a build under its lock. |
+| `emit` | The worker's parse and SQL emission, including fallback and debug-preview re-emits. |
+| `probe` | Timechart input probes, both their bind and their execution. |
+| `bind` | The DuckDB bind of the main statement. It ends when `prepare` returns. |
+| `execute` | Statement execution up to the last row materialized, including parquet staging. |
+| `copy` | The parquet `COPY` and its cleanup. |
+| `post` | Rust tail stages, the cap trim, reorder, the severity walk, and the vanished-result guard. |
+| `render` | Export body rendering, or the parquet readback. |
+
+Each span of work counts in one phase only. A timechart probe's bind counts in
+`probe`, never also in `bind` or `execute`. The bind inside a parquet `COPY` is
+opaque to trawld, so the whole `COPY` counts in `copy`.
+
+The rest of the event identifies the query and says how it ended. None of its
+fields carries a user, a role, DSL, SQL, a literal, a path, or error text.
+
+| Field | Value |
+| --- | --- |
+| `query_id` | The pool's query ID. It restarts at 0 each time trawld starts. |
+| `kind`, `format` | The kind of work. `format` is `csv`, `json`, or `parquet`, on exports only. |
+| `request_id` | The HTTP request's ULID, from its `X-Request-Id` header. Absent on report runs. |
+| `run_id` | The report run's ID. Present on scheduled and manual runs only. |
+| `outcome` | `success`, `error`, `capacity_refused`, `timeout`, or `abandoned`. |
+| `work_started` | Whether the worker crossed its work-start transition. |
+| `error_class` | The server's closed error class, on `outcome=error` only. |
+| `timing_complete` | `false` when trawld wrote the event while work still ran. |
+| `active_query_phase`, `active_elapsed_us` | On a partial event, the phase still running and how long it had run. |
+| `duckdb_attempts` | How many times DuckDB bound the main statement. |
+| `fallback` | Why there was more than one attempt: `none`, `raw_retry`, `hot_only`, or `both`. |
+| `query_observed_us` | The whole window. For a query, it starts at the same instant as the response's `execution.duration_ms`. An export has no `execution.duration_ms`: its window starts before `dsl_check`, earlier than `export_complete.duration_ms` starts, and runs through `render`. |
+| `query_other_us` | The observed time no phase measured. Never negative. |
+
+On a complete event, the present phases plus `query_other_us` add up exactly
+to `query_observed_us`. On a partial event, the finished phases plus
+`active_elapsed_us` plus `query_other_us` do. A large residual is a gap in the
+measurement, not a phase to guess at.
+
+A timeout or an abandoned request does not wait for its worker, because a bind
+already inside DuckDB cannot be interrupted. The request writes a partial event
+at once. When the work outlives its request, `query_permit_reclaimed` carries
+the worker's final phase totals, `duckdb_attempts`, `fallback`, and a
+`physical_outcome` of `completed`, `failed`, `cancelled`, `panicked`, or
+`not_started`. The pool's registry lock decides which side writes the final
+account, so each query gets exactly one. If the worker had already finished
+and released its permit when the deadline fired, no reclaim is coming. The
+request then writes a complete event with `outcome=timeout`.
+
+A tracing event holds at most 32 fields. `query_timing` declares 31:
+`event_type`, the 15 fields in the table above, 14 phases, and the message. A test
+holds that count and requires one field per phase on both events, so a new
+field on `query_timing` is a design decision, with one slot left.
+
+Two older events changed with this one. trawld no longer writes
+`pool_acquired`. Its one value, the permit wait, is now `query_pool_wait_us`,
+which joins to the rest of the query. `scheduled_query_failed` carries
+`error_class` instead of the error text, and the scheduled run events carry
+`query_id`. The run record keeps the error text as its `error_message`.
+
 ### What telemetry does not cover
 
 - Internal telemetry covers `trawld`. The proxy and the CLIs log to stdout and stderr for your collector.
