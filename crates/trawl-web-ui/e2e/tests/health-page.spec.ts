@@ -1074,7 +1074,9 @@ test.describe('Disk and retention', () => {
     // The card reads on a phone width without a horizontal scroll.
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(reach(disk, 'prod')).toBeVisible();
-    expect(await page.locator(SEL.healthPage).evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    // The page's width settles a frame or more after the resize (under load
+    // it read 190px of the 390px viewport), so poll until it has.
+    await expect.poll(() => page.locator(SEL.healthPage).evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
     // Every ISO date is one unbreakable run: it never wraps at its hyphen.
     const isoDates = (await disk.textContent())!.match(/\d{4}-\d{2}-\d{2}/g) ?? [];
     expect(isoDates.length).toBeGreaterThan(0);
