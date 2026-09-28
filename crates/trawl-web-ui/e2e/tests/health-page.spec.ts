@@ -958,7 +958,7 @@ test.describe('Disk and retention', () => {
   const LAB_OBSERVED = 'Observed: 6 days, 2026-09-20 to 2026-09-25.';
   const WITHHELD = {
     history: 'Reach withheld: not enough observed days yet.',
-    repin: 'Reach withheld: a repin ran during the latest samples, so they may count files twice or miss free space.',
+    repin: 'Reach withheld: a repin ran during the latest samples, or its staging is still on disk, so they may count files twice or miss free space.',
     measurement: 'Reach withheld: measurement unavailable; the disk or Parquet sample is not complete.',
   };
 
