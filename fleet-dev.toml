@@ -38,8 +38,11 @@ TRAWL_DATABASE_URL = "app.database_url"
 name = "trawl-web"
 command = ["target/debug/trawl-web"]
 
+# Pin the certificate the dev trawld generates in its state directory
+# (default config ~/.trawl/trawld.toml, [data] path ~/.trawl/data). Until
+# trawld's first start writes it, trawl-web answers 503 and then loads it.
 [processes.env]
-TRAWL_WEB_INSECURE_UPSTREAM = "1"
+TRAWL_WEB_UPSTREAM_CA_PATH = "~/.trawl/tls/cert.pem"
 
 [processes.resolved_env]
 FLEET_SESSION_AEAD_KEY = "fleet.session_aead_key"
