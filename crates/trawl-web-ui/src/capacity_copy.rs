@@ -407,13 +407,13 @@ mod tests {
     fn date_runs_split_out_each_iso_date_and_keep_the_text() {
         let joined =
             |runs: Vec<(&str, bool)>| runs.into_iter().map(|(text, _)| text).collect::<String>();
-        let line = "Policy: 90 days. Oldest date: 2026-07-01. Stored: 9.0 GB.";
+        let line = "Policy: 90 days. Oldest date: 2026-08-15. Stored: 111.1 GB.";
         assert_eq!(
             date_runs(line),
             [
                 ("Policy: 90 days. Oldest date: ", false),
-                ("2026-07-01", true),
-                (". Stored: 9.0 GB.", false),
+                ("2026-08-15", true),
+                (". Stored: 111.1 GB.", false),
             ]
         );
         let observed = "Observed: 7 days, 2026-09-19 to 2026-09-25.";
@@ -483,6 +483,13 @@ mod tests {
         assert_eq!(sweep_line(None), "No sweep yet since process start");
         assert_eq!(
             sweep_line(Some(LastSweep {
+                outcome: SweepOutcome::Suppressed,
+                age_secs: 300
+            })),
+            "Suppressed, 300s ago"
+        );
+        assert_eq!(
+            sweep_line(Some(LastSweep {
                 outcome: SweepOutcome::ExhaustedBelowFloor,
                 age_secs: 61
             })),
@@ -502,5 +509,88 @@ mod tests {
             }),
             Err("Awaiting measurement")
         );
+    }
+
+    /// Each Health e2e capacity fixture is a state the server can emit
+    /// (`tests/e2e_wire_fixture_contract.rs`). Its key sentences, read
+    /// through the copy the card renders, are the ones the spec asserts.
+    #[test]
+    fn fixture_scenarios_read_as_their_sentences() {
+        const OBSERVED: &str = "Observed: 7 days, 2026-09-19 to 2026-09-25.";
+        const LAB_OBSERVED: &str = "Observed: 6 days, 2026-09-20 to 2026-09-25.";
+        let capacity = |text: &str| -> trawl_api::Capacity {
+            let part: serde_json::Value = serde_json::from_str(text).unwrap();
+            serde_json::from_value(part["capacity"].clone()).unwrap()
+        };
+        let fills = "Reach if the observed days repeat: at the largest observed day, the disk \
+                     fills before retention is reached;";
+        let history = "Reach withheld: not enough observed days yet.";
+        for (fixture, text, lines, excluded) in [
+            (
+                "complete",
+                include_str!("../e2e/harness/wire/health-capacity-complete.json"),
+                vec![
+                    ("prod", format!("Reach: about 38\u{2013}52 of 90 days if the observed days repeat. {OBSERVED}")),
+                    ("staging", format!("Reach: about 12\u{2013}17 of 30 days if the observed days repeat. {OBSERVED}")),
+                    ("lab", format!("Reach: about 3\u{2013}4 of 7 days if the observed days repeat. {LAB_OBSERVED}")),
+                    ("archive", format!("Mean growth: 120 MB per day. {OBSERVED}")),
+                    ("k8s", history.to_owned()),
+                ],
+                Some("Excludes growth of k8s: not enough history yet."),
+            ),
+            (
+                "failed-retained",
+                include_str!("../e2e/harness/wire/health-capacity-failed-retained.json"),
+                ["archive", "k8s", "prod"]
+                    .map(|env| (env, "Reach withheld: measurement unavailable; the disk or Parquet sample is not complete.".to_owned()))
+                    .to_vec(),
+                None,
+            ),
+            (
+                "repin-suppressed",
+                include_str!("../e2e/harness/wire/health-capacity-repin-suppressed.json"),
+                ["k8s", "prod", "staging"]
+                    .map(|env| (env, "Reach withheld: a repin holds two generations, so stored bytes are inflated.".to_owned()))
+                    .to_vec(),
+                None,
+            ),
+            (
+                "floor-zero",
+                include_str!("../e2e/harness/wire/health-capacity-floor-zero.json"),
+                vec![
+                    ("prod", format!("{fills} at the mean day, the full 90 days. {OBSERVED}")),
+                    ("lab", format!("{fills} at the mean day, the full 7 days. {LAB_OBSERVED}")),
+                    ("fresh", history.to_owned()),
+                ],
+                Some("Excludes growth of fresh: not enough history yet."),
+            ),
+            (
+                "pressure",
+                include_str!("../e2e/harness/wire/health-capacity-pressure.json"),
+                ["archive", "lab", "prod"]
+                    .map(|env| (env, history.to_owned()))
+                    .to_vec(),
+                Some("Excludes growth of lab, prod: not enough history yet."),
+            ),
+        ] {
+            let capacity = capacity(text);
+            let rendered = capacity
+                .environments
+                .iter()
+                .map(|env| (env.env.as_str(), reach_line(&env.reach, env.max_age_days)))
+                .collect::<Vec<_>>();
+            for (env, line) in &lines {
+                assert!(
+                    rendered.contains(&(*env, line.clone())),
+                    "{fixture} {env}: {rendered:#?}"
+                );
+            }
+            assert_eq!(rendered.len(), lines.len(), "{fixture}");
+            assert_eq!(
+                growth_excluded_note(&capacity.growth_excluded).as_deref(),
+                excluded,
+                "{fixture}"
+            );
+        }
     }
 }

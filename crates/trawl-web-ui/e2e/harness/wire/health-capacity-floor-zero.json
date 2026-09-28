@@ -1,0 +1,96 @@
+{
+  "parquet_files": 100,
+  "parquet_bytes": 90052000000,
+  "parquet_measurement": {
+    "status": "complete",
+    "sample_age_secs": 5
+  },
+  "wal_files": 7,
+  "wal_bytes": 2048,
+  "wal_measurement": {
+    "status": "complete",
+    "sample_age_secs": 5
+  },
+  "capacity": {
+    "headroom": {
+      "measurement": {
+        "status": "complete",
+        "sample_age_secs": 5
+      },
+      "filesystems": [
+        {
+          "roles": [
+            "data",
+            "wal",
+            "spill"
+          ],
+          "total_bytes": 200000000000,
+          "available_bytes": 20000000000,
+          "floor": {
+            "state": "off"
+          }
+        }
+      ]
+    },
+    "pressure": {
+      "removals_age": 3,
+      "removals_disk_pressure": 0,
+      "pressure_attempts": 0,
+      "last_sweep": {
+        "outcome": "completed",
+        "age_secs": 120
+      }
+    },
+    "environments": [
+      {
+        "env": "fresh",
+        "max_age_days": 30,
+        "oldest_date": "2026-09-25",
+        "stored_bytes": 12000000,
+        "reach": {
+          "state": "withheld",
+          "reason": "insufficient_history"
+        }
+      },
+      {
+        "env": "lab",
+        "max_age_days": 7,
+        "oldest_date": "2026-09-20",
+        "stored_bytes": 440000000,
+        "reach": {
+          "state": "projected",
+          "observed_first": "2026-09-20",
+          "observed_last": "2026-09-25",
+          "observed_days": 6,
+          "low": {
+            "kind": "disk_fills_first"
+          },
+          "high": {
+            "kind": "full_policy"
+          }
+        }
+      },
+      {
+        "env": "prod",
+        "max_age_days": 90,
+        "oldest_date": "2026-07-01",
+        "stored_bytes": 89600000000,
+        "reach": {
+          "state": "projected",
+          "observed_first": "2026-09-19",
+          "observed_last": "2026-09-25",
+          "observed_days": 7,
+          "low": {
+            "kind": "disk_fills_first"
+          },
+          "high": {
+            "kind": "full_policy"
+          }
+        }
+      }
+    ],
+    "growth_excluded": [
+      "fresh"
+    ]
+  }
+}

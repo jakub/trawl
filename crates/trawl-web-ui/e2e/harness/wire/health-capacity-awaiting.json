@@ -5,6 +5,12 @@
     "status": "not_sampled",
     "sample_age_secs": null
   },
+  "wal_files": 0,
+  "wal_bytes": 0,
+  "wal_measurement": {
+    "status": "not_sampled",
+    "sample_age_secs": null
+  },
   "capacity": {
     "headroom": {
       "measurement": {

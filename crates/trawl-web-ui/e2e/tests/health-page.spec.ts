@@ -944,18 +944,24 @@ test('the footer re-reads health every 30 s, one read at a time, and the chip cl
 });
 
 // The Disk and retention card (ADR-0042). Each case loads one capacity
-// object over the base snapshot: the harness merges `dashboardSnapshot`
-// shallowly, so the whole object rides along. The fixtures are pinned to
-// these states natively in tests/e2e_wire_fixture_contract.rs.
+// fixture over the base snapshot: a slice of the snapshot holding the
+// capacity object with the Parquet and WAL fields it was assembled beside.
+// The harness merges `dashboardSnapshot` shallowly, so each field rides
+// along whole. tests/e2e_wire_fixture_contract.rs checks every fixture
+// against the producer's invariants and pins each one to its state.
 const capacity = (name: string) => JSON.parse(readFileSync(`${__dirname}/../harness/wire/health-capacity-${name}.json`, 'utf8'));
 
 test.describe('Disk and retention', () => {
   const OBSERVED = 'Observed: 7 days, 2026-09-19 to 2026-09-25.';
+  const LAB_OBSERVED = 'Observed: 6 days, 2026-09-20 to 2026-09-25.';
+  const WITHHELD = {
+    history: 'Reach withheld: not enough observed days yet.',
+    repin: 'Reach withheld: a repin holds two generations, so stored bytes are inflated.',
+    measurement: 'Reach withheld: measurement unavailable; the disk or Parquet sample is not complete.',
+  };
 
-  // `part` fixtures carry snapshot fields beside the capacity object and
-  // merge whole; the rest are a capacity object alone.
-  async function open(page: Page, request: APIRequestContext, fixture: string, part = false) {
-    await setup(request, 'health-admin', { dashboardSnapshot: part ? capacity(fixture) : { capacity: capacity(fixture) } });
+  async function open(page: Page, request: APIRequestContext, fixture: string) {
+    await setup(request, 'health-admin', { dashboardSnapshot: capacity(fixture) });
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.goto('/settings/health');
     await diagnosticPhase(page, 'Live');
@@ -966,6 +972,15 @@ test.describe('Disk and retention', () => {
   const group = (disk: Locator, name: string) => disk.locator(`[data-group="${name}"]`);
   const env = (disk: Locator, name: string) => disk.locator(`[data-env="${name}"]`);
   const reach = (disk: Locator, name: string) => env(disk, name).locator('.health-disk-reach');
+
+  // A withheld reach names its reason and carries no digit at all.
+  async function withheld(disk: Locator, names: string[], text: string) {
+    await expect(disk.locator('.health-disk-reach')).toHaveCount(names.length);
+    for (const name of names) {
+      await expect(reach(disk, name)).toHaveText(text);
+      expect(await reach(disk, name).textContent()).not.toMatch(/\d/);
+    }
+  }
 
   // No verdict: no incident role or tone class, no reassurance word, and
   // every reach sentence drawn in the same ink as the Storage card's
@@ -1016,13 +1031,13 @@ test.describe('Disk and retention', () => {
     }, null, 2));
   }
 
-  test('a complete sample shows headroom rows and each reach form', async ({ page, request }, testInfo) => {
+  test('a complete sample shows headroom rows and each projected form', async ({ page, request }, testInfo) => {
     const disk = await open(page, request, 'complete');
     const headroom = group(disk, 'headroom');
     await expect(headroom.locator('dl > div')).toHaveCount(2);
     const data = headroom.locator('[data-roles="data wal"]');
     await expect(data.locator('dt')).toHaveText('Data + WAL');
-    await expect(data).toContainText('Complete measurement: 128.8 GB available of 536.9 GB. Sample age: 2s at this snapshot.');
+    await expect(data).toContainText('Complete measurement: 26.0 GB available of 250.0 GB. Sample age: 2s at this snapshot.');
     await expect(data).toContainText('Deletion floor: 1.1 GB.');
     await expect(data).not.toContainText('Deficit');
     const spill = headroom.locator('[data-roles="spill"]');
@@ -1037,19 +1052,23 @@ test.describe('Disk and retention', () => {
     await fact(pressure, 'Last sweep', 'Completed, 754s ago');
     await expect(pressure).toContainText('since process start');
     await expect(group(disk, 'reach').locator('dl > div')).toHaveCount(5);
-    await expect(env(disk, 'prod')).toContainText('Policy: 90 days. Oldest date: 2026-07-01. Stored: 9.0 GB.');
+    // One fraction of each policy per end: every projected env reads as
+    // whole days at both ends.
+    await expect(env(disk, 'prod')).toContainText('Policy: 90 days. Oldest date: 2026-08-15. Stored: 111.1 GB.');
     await expect(reach(disk, 'prod')).toHaveText(`Reach: about 38–52 of 90 days if the observed days repeat. ${OBSERVED}`);
-    await expect(reach(disk, 'staging')).toHaveText(`Reach: about 12 days to the full 30 if the observed days repeat. ${OBSERVED}`);
-    await expect(reach(disk, 'lab')).toHaveText(`Reach: the full 7 days if the observed days repeat. ${OBSERVED}`);
-    await expect(env(disk, 'archive')).toContainText('Policy: keep forever. Oldest date: 2026-03-14. Stored: 21.0 GB.');
+    await expect(reach(disk, 'staging')).toHaveText(`Reach: about 12–17 of 30 days if the observed days repeat. ${OBSERVED}`);
+    await expect(env(disk, 'lab')).toContainText('Policy: 7 days. Oldest date: 2026-09-20. Stored: 480 MB.');
+    await expect(reach(disk, 'lab')).toHaveText(`Reach: about 3–4 of 7 days if the observed days repeat. ${LAB_OBSERVED}`);
+    await expect(env(disk, 'archive')).toContainText('Policy: keep forever. Oldest date: 2026-03-14. Stored: 20.0 GB.');
     await expect(reach(disk, 'archive')).toHaveText(`Mean growth: 120 MB per day. ${OBSERVED}`);
-    await expect(reach(disk, 'k8s')).toHaveText('Reach withheld: not enough observed days yet.');
+    await expect(env(disk, 'k8s')).toContainText('Policy: 14 days. Oldest date: 2026-09-24. Stored: 36 MB.');
+    await expect(reach(disk, 'k8s')).toHaveText(WITHHELD.history);
     await expect(disk.locator('.health-disk-excluded')).toHaveText('Excludes growth of k8s: not enough history yet.');
     await expect(disk).toContainText('holds only if those days repeat');
     await expect(disk).not.toContainText(/guarantee/i);
     await noVerdict(page, disk);
     await capture(page, testInfo, disk, 'disk-retention-complete-1440.png',
-      'Complete sample: two headroom rows with a floor and no deficit, a completed sweep, and a projected range, a mixed range, a full policy, keep-forever growth, and one withheld env with the growth-excluded note');
+      'Complete sample with a floor: two headroom rows and no deficit, a completed sweep, three envs projected in whole days from one shared fraction per end, keep-forever growth, and one env withheld for history with the growth-excluded note');
     // The card reads on a phone width without a horizontal scroll.
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(reach(disk, 'prod')).toBeVisible();
@@ -1074,43 +1093,51 @@ test.describe('Disk and retention', () => {
     await expect(data).toContainText('Deletion floor: 1.1 GB. Deficit: 274 MB below the floor.');
     await expect(headroom.locator('[data-roles="wal"]')).toContainText('Collection failed; last complete reading: 60.0 GB available of 64.0 GB. Sample age: 3600s at this snapshot.');
     await fact(group(disk, 'pressure'), 'Last sweep', 'Failed, 41s ago');
-    await expect(disk.locator('.health-disk-reach')).toHaveCount(2);
-    for (const name of ['archive', 'prod']) {
-      await expect(reach(disk, name)).toHaveText('Reach withheld: measurement unavailable; the disk or Parquet sample is not complete.');
-      expect(await reach(disk, name).textContent()).not.toMatch(/\d/);
-    }
+    // Global: the rate-less k8s is withheld for the measurement too, and
+    // nothing is excluded from a projection that did not run.
+    await withheld(disk, ['archive', 'k8s', 'prod'], WITHHELD.measurement);
     await expect(disk.locator('.health-disk-excluded')).toHaveCount(0);
     await noVerdict(page, disk);
     await capture(page, testInfo, disk, 'disk-retention-failed-retained-1440.png',
-      'Failed attempt with a retained sample: rows read "Collection failed; last complete reading" with a 3600s age and a deficit, and every reach is withheld as measurement unavailable with no digit');
+      'Failed headroom attempt with a retained sample: rows read "Collection failed; last complete reading" with a 3600s age and a deficit, and every reach is withheld as measurement unavailable with no digit and no growth-excluded note');
   });
 
-  test('withheld reaches name their reason and no number, and a floor of 0 reads as off', async ({ page, request }, testInfo) => {
-    const disk = await open(page, request, 'withheld');
+  test('a repin in flight withholds every reach as suppressed without a number', async ({ page, request }, testInfo) => {
+    const disk = await open(page, request, 'repin-suppressed');
+    const data = group(disk, 'headroom').locator('[data-roles="data wal spill"]');
+    await expect(data).toContainText('Complete measurement: 90.0 GB available of 250.0 GB. Sample age: 3s at this snapshot.');
+    await expect(data).toContainText('Deletion floor: 1.1 GB.');
+    await fact(group(disk, 'pressure'), 'Last sweep', 'Suppressed, 300s ago');
+    await withheld(disk, ['k8s', 'prod', 'staging'], WITHHELD.repin);
+    await expect(disk.locator('.health-disk-excluded')).toHaveCount(0);
+    await noVerdict(page, disk);
+    await capture(page, testInfo, disk, 'disk-retention-repin-suppressed-1440.png',
+      'A repin in flight with both samples complete: the last sweep was suppressed, and every reach is withheld as retention suppressed with no digit and no growth-excluded note');
+  });
+
+  test('a floor of 0 reads as off, and the disk fills first at the largest observed day', async ({ page, request }, testInfo) => {
+    const disk = await open(page, request, 'floor-zero');
     const data = group(disk, 'headroom').locator('[data-roles="data wal spill"]');
     await expect(data.locator('dt')).toHaveText('Data + WAL + Spill');
     await expect(data).toContainText('Pressure deletion off (floor 0).');
     await expect(data).not.toContainText('Deletion floor');
     const pressure = group(disk, 'pressure');
     await fact(pressure, 'Removed by pressure', '0');
-    await fact(pressure, 'Last sweep', 'No sweep yet since process start');
-    for (const [name, text] of [
-      ['fresh', 'Reach withheld: not enough observed days yet.'],
-      ['repinned', 'Reach withheld: a repin holds two generations, so stored bytes are inflated.'],
-      ['prod', 'Reach withheld: measurement unavailable; the disk or Parquet sample is not complete.'],
-    ]) {
-      await expect(reach(disk, name)).toHaveText(text);
-      expect(await reach(disk, name).textContent()).not.toMatch(/\d/);
-    }
+    await fact(pressure, 'Pressure attempts', '0');
+    await fact(pressure, 'Last sweep', 'Completed, 120s ago');
+    const fills = 'Reach if the observed days repeat: at the largest observed day, the disk fills before retention is reached;';
+    await expect(reach(disk, 'prod')).toHaveText(`${fills} at the mean day, the full 90 days. ${OBSERVED}`);
+    await expect(reach(disk, 'lab')).toHaveText(`${fills} at the mean day, the full 7 days. ${LAB_OBSERVED}`);
     await expect(env(disk, 'fresh')).toContainText('Policy: 30 days. Oldest date: 2026-09-25. Stored: 12 MB.');
-    await expect(reach(disk, 'scratch')).toHaveText(`Reach: the disk fills before retention is reached if the observed days repeat. ${OBSERVED}`);
+    await expect(reach(disk, 'fresh')).toHaveText(WITHHELD.history);
+    expect(await reach(disk, 'fresh').textContent()).not.toMatch(/\d/);
     await expect(disk.locator('.health-disk-excluded')).toHaveText('Excludes growth of fresh: not enough history yet.');
     await noVerdict(page, disk);
-    await capture(page, testInfo, disk, 'disk-retention-withheld-1440.png',
-      'Floor of 0 reads as pressure deletion off with no sweep yet; three withheld reaches name their reason with no digit, and a floor-0 env reads as the disk filling first');
+    await capture(page, testInfo, disk, 'disk-retention-floor-zero-1440.png',
+      'Floor of 0 reads as pressure deletion off with no pressure attempts; both projected envs read the disk filling first at the largest observed day and the full policy at the mean day, and a fresh env is withheld for history with the growth-excluded note');
   });
 
-  test('pressure evidence shows the counts, the deficit, and the last sweep outcome', async ({ page, request }, testInfo) => {
+  test('pressure evidence shows the counts, the deficit, and an exhausted sweep', async ({ page, request }, testInfo) => {
     const disk = await open(page, request, 'pressure');
     const data = group(disk, 'headroom').locator('[data-roles="data wal spill"]');
     await expect(data).toContainText('Complete measurement: 600 MB available of 100.0 GB. Sample age: 1s at this snapshot.');
@@ -1123,12 +1150,14 @@ test.describe('Disk and retention', () => {
     await expect(pressure).toContainText('Counts are since process start.');
     // Evidence is counts and an outcome: no bytes figure anywhere in it.
     await expect(pressure).not.toContainText(/\d(\.\d+)? [KMG]?B\b/);
-    await expect(env(disk, 'prod')).toContainText('Policy: 90 days. Oldest date: 2026-08-19. Stored: 41.0 GB.');
-    await expect(reach(disk, 'prod')).toHaveText(`Reach: about 22–40 of 90 days if the observed days repeat. ${OBSERVED}`);
-    await expect(reach(disk, 'lab')).toHaveText(`Reach: the full 7 days if the observed days repeat. ${OBSERVED}`);
+    // The exhausted sweep left each env today's partition alone, so no
+    // env has a rate and every finite one is left out of the growth.
+    await expect(env(disk, 'prod')).toContainText('Policy: 90 days. Oldest date: 2026-09-27. Stored: 4.1 GB.');
+    await withheld(disk, ['archive', 'lab', 'prod'], WITHHELD.history);
+    await expect(disk.locator('.health-disk-excluded')).toHaveText('Excludes growth of lab, prod: not enough history yet.');
     await noVerdict(page, disk);
     await capture(page, testInfo, disk, 'disk-retention-pressure-1440.png',
-      'Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, a sweep that ran out of candidates below the floor, and a shortened prod range');
+      'Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, and a sweep that ran out of candidates below the floor; each env holds today alone, so every reach is withheld for history and the finite envs are excluded');
   });
 
   // An empty environment list is measured only when a complete Parquet
@@ -1150,7 +1179,7 @@ test.describe('Disk and retention', () => {
     },
   ]) {
     test(`an empty list without a complete scan reads as ${fixture}, not as measured`, async ({ page, request }, testInfo) => {
-      const disk = await open(page, request, fixture, true);
+      const disk = await open(page, request, fixture);
       const parquet = page.locator(`${SEL.healthStorage} [data-source="parquet"] > p`).first();
       await expect(parquet).toHaveText(line);
       const reachGroup = group(disk, 'reach');
@@ -1166,7 +1195,7 @@ test.describe('Disk and retention', () => {
   }
 
   test('the card is admin-gated with the rest of the diagnostics', async ({ page, request }) => {
-    await setup(request, 'health-viewer', { dashboardSnapshot: { capacity: capacity('pressure') } });
+    await setup(request, 'health-viewer', { dashboardSnapshot: capacity('pressure') });
     await page.goto('/settings/health');
     await rows(page);
     await expect(page.locator(SEL.healthDisk)).toHaveCount(0);

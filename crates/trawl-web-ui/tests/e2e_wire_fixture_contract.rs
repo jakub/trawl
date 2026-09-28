@@ -699,21 +699,604 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
     }
 }
 
-/// The Disk and retention cases (ADR-0042) each load one capacity object
-/// over the base snapshot. Each fixture is pinned to the state its spec
-/// case asserts on, so a drifted fixture cannot pass the wrong case.
-/// A complete sample: two rows, a floor with no deficit, and every reach
-/// form the card renders.
+/// Every Disk and retention case (ADR-0042) loads one capacity fixture
+/// over the base snapshot. Each is a slice of `DashboardSnapshot`: the
+/// capacity object with the Parquet and WAL fields it was assembled
+/// beside, because the card reads the Parquet measurement and the
+/// producer derives reach from both measurements. Each field is the
+/// snapshot field of the same name and type, and nothing else rides along.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapacitySnapshotPart {
+    parquet_files: u64,
+    parquet_bytes: u64,
+    parquet_measurement: trawl_api::StorageMeasurement,
+    wal_files: u64,
+    wal_bytes: u64,
+    wal_measurement: trawl_api::StorageMeasurement,
+    capacity: trawl_api::Capacity,
+}
+
+/// The fields `CapacitySnapshotPart` takes from a whole snapshot.
+const CAPACITY_PART_FIELDS: [&str; 7] = [
+    "parquet_files",
+    "parquet_bytes",
+    "parquet_measurement",
+    "wal_files",
+    "wal_bytes",
+    "wal_measurement",
+    "capacity",
+];
+
+const CAPACITY_FIXTURES: [(&str, &str); 7] = [
+    (
+        "health-capacity-complete.json",
+        include_str!("../e2e/harness/wire/health-capacity-complete.json"),
+    ),
+    (
+        "health-capacity-failed-retained.json",
+        include_str!("../e2e/harness/wire/health-capacity-failed-retained.json"),
+    ),
+    (
+        "health-capacity-repin-suppressed.json",
+        include_str!("../e2e/harness/wire/health-capacity-repin-suppressed.json"),
+    ),
+    (
+        "health-capacity-floor-zero.json",
+        include_str!("../e2e/harness/wire/health-capacity-floor-zero.json"),
+    ),
+    (
+        "health-capacity-pressure.json",
+        include_str!("../e2e/harness/wire/health-capacity-pressure.json"),
+    ),
+    (
+        "health-capacity-awaiting.json",
+        include_str!("../e2e/harness/wire/health-capacity-awaiting.json"),
+    ),
+    (
+        "health-capacity-scan-failed.json",
+        include_str!("../e2e/harness/wire/health-capacity-scan-failed.json"),
+    ),
+];
+
+/// The UTC date every capacity fixture was assembled on. Its observed
+/// window runs from `FIXTURE_TODAY` − 8 through `FIXTURE_TODAY` − 2
+/// (`capacity::observed_days` in trawl-server).
+const FIXTURE_TODAY: &str = "2026-09-27";
+
+fn capacity_fixture(name: &str) -> CapacitySnapshotPart {
+    let (name, text) = CAPACITY_FIXTURES
+        .iter()
+        .find(|(file, _)| *file == name)
+        .unwrap_or_else(|| panic!("no capacity fixture {name}"));
+    decode(name, text)
+}
+
+fn fixture_date(text: &str) -> chrono::NaiveDate {
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .unwrap_or_else(|e| panic!("{text:?} is not a YYYY-MM-DD date: {e}"))
+}
+
+/// Every way `raw`, a capacity snapshot part, departs from what the
+/// server's producer (`capacity::assemble` in trawl-server) can emit.
+/// Empty when the fixture is a state the server can be in.
+///
+/// The producer's invariants, checked here:
+/// - Rows exist only from a sample (complete or retained after failure);
+///   roles are disjoint, each row's roles ordered, the data row alone
+///   carries the floor, and its deficit is the floor less the available
+///   bytes. The WAL role is present exactly when the WAL is configured.
+/// - Environments exist only from a Parquet sample, sorted by name, and
+///   their stored bytes fit in the Parquet total.
+/// - `measurement_unavailable` and `retention_suppressed` are global:
+///   every environment carries the one reason and nothing is excluded.
+///   The first holds exactly when the two measurements are not both
+///   complete; the second needs both complete.
+/// - Otherwise each environment's observed days are the dates from
+///   max(oldest date, today − 8) through today − 2, so the count equals
+///   the span, and three or more give a rate. A finite env with a rate is
+///   projected, a keep-forever one reports its growth, and any env
+///   without a rate is withheld for history; the finite ones among those
+///   are exactly `growth_excluded`.
+/// - One fraction per end drives every projected env (`run_ends`): per
+///   end, every env is at the full policy or none is; below it, whole
+///   days with a floor and the disk filling first without one. The days
+///   fit one shared fraction, stay under the policy, and the low end
+///   never exceeds the high.
+/// - A withheld reach carries no field but its reason.
+/// - Pressure counters need a pressure attempt, and none happen with a
+///   floor of 0.
+#[allow(clippy::too_many_lines)] // one list of the producer's invariants
+fn capacity_violations(raw: &serde_json::Value) -> Vec<String> {
+    use std::collections::BTreeSet;
+    use trawl_api::{
+        DeletionFloor, FilesystemRole, Reach, ReachEnd, StorageMeasurementStatus as Status,
+        SweepOutcome, WithheldReason,
+    };
+
+    let mut violations: Vec<String> = Vec::new();
+    // The message is built only when the check fails.
+    macro_rules! check {
+        ($ok:expr, $what:expr $(,)?) => {
+            if !$ok {
+                violations.push($what.into());
+            }
+        };
+    }
+    // On the raw JSON first: the decode below may drop or refuse a field.
+    for env in raw["capacity"]["environments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if env["reach"]["state"] == "withheld" {
+            let keys = env["reach"]
+                .as_object()
+                .map(|reach| reach.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            check!(
+                keys == ["reason", "state"],
+                format!("{}: a withheld reach carries {keys:?}", env["env"])
+            );
+        }
+    }
+    let part: CapacitySnapshotPart = match serde_json::from_value(raw.clone()) {
+        Ok(part) => part,
+        Err(e) => {
+            violations.push(format!("does not decode: {e}"));
+            return violations;
+        }
+    };
+    let capacity = &part.capacity;
+    check!(
+        serde_json::to_value(&part.capacity).unwrap() == raw["capacity"],
+        "carries a field the wire type drops"
+    );
+
+    // Headroom rows.
+    let headroom = &capacity.headroom;
+    let rows = &headroom.filesystems;
+    check!(
+        rows.is_empty() == headroom.measurement.sample_age_secs.is_none(),
+        "headroom rows exist exactly when a sample was taken",
+    );
+    check!(
+        headroom.measurement.status != Status::Complete
+            || headroom.measurement.sample_age_secs.is_some(),
+        "a complete headroom measurement has an age",
+    );
+    let mut seen = BTreeSet::new();
+    let mut floor = None;
+    for row in rows {
+        check!(!row.roles.is_empty(), "a headroom row has no role");
+        check!(
+            row.roles.windows(2).all(|pair| pair[0] < pair[1]),
+            format!("{:?} is not ordered data, wal, spill", row.roles),
+        );
+        for role in &row.roles {
+            check!(seen.insert(*role), format!("{role:?} is on two rows"));
+        }
+        check!(
+            row.available_bytes <= row.total_bytes,
+            format!("{:?} has more available than total", row.roles),
+        );
+        let holds_data = row.roles.contains(&FilesystemRole::Data);
+        check!(
+            row.floor.is_some() == holds_data,
+            format!("{:?}: only the data row carries the floor", row.roles),
+        );
+        if let Some(DeletionFloor::Armed {
+            floor_bytes,
+            deficit_bytes,
+        }) = row.floor
+        {
+            check!(floor_bytes > 0, "an armed floor of 0");
+            check!(
+                deficit_bytes == floor_bytes.saturating_sub(row.available_bytes),
+                format!("deficit {deficit_bytes} is not the floor less the available bytes"),
+            );
+        }
+        if holds_data {
+            floor = row.floor;
+        }
+    }
+    check!(
+        rows.windows(2)
+            .all(|pair| pair[0].roles[0] < pair[1].roles[0]),
+        "headroom rows are not ordered by their first role",
+    );
+    if !rows.is_empty() {
+        check!(
+            seen.contains(&FilesystemRole::Data) && seen.contains(&FilesystemRole::Spill),
+            "a sample stats the data and spill roles",
+        );
+        check!(
+            seen.contains(&FilesystemRole::Wal)
+                == (part.wal_measurement.status != Status::NotConfigured),
+            "the WAL role is present exactly when the WAL is configured",
+        );
+    }
+    if part.wal_measurement.sample_age_secs.is_none() {
+        check!(
+            (part.wal_files, part.wal_bytes) == (0, 0),
+            "WAL totals without a WAL sample",
+        );
+    }
+
+    // Pressure evidence.
+    let pressure = &capacity.pressure;
+    check!(
+        pressure.removals_disk_pressure == 0 || pressure.pressure_attempts > 0,
+        "pressure removals without a pressure attempt",
+    );
+    check!(
+        pressure.last_sweep.map(|s| s.outcome) != Some(SweepOutcome::ExhaustedBelowFloor)
+            || pressure.pressure_attempts > 0,
+        "a sweep exhausted below the floor without a pressure attempt",
+    );
+    if floor == Some(DeletionFloor::Off) {
+        check!(
+            pressure.pressure_attempts == 0 && pressure.removals_disk_pressure == 0,
+            "pressure deletion ran with a floor of 0",
+        );
+    }
+
+    // Environments and their Parquet sample.
+    let envs = &capacity.environments;
+    let parquet = &part.parquet_measurement;
+    if parquet.sample_age_secs.is_none() {
+        check!(
+            envs.is_empty() && (part.parquet_files, part.parquet_bytes) == (0, 0),
+            "environments or Parquet totals without a Parquet sample",
+        );
+    }
+    check!(
+        envs.windows(2).all(|pair| pair[0].env < pair[1].env),
+        "environments are not sorted by name",
+    );
+    check!(
+        capacity
+            .growth_excluded
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "growth_excluded is not sorted",
+    );
+    let stored = envs.iter().map(|e| e.stored_bytes).sum::<u64>();
+    check!(
+        stored <= part.parquet_bytes,
+        format!(
+            "stored bytes {stored} exceed the Parquet total {}",
+            part.parquet_bytes
+        ),
+    );
+    check!(
+        part.parquet_files >= u64::try_from(envs.len()).unwrap(),
+        "fewer Parquet files than environments",
+    );
+
+    // Global reasons.
+    let both_complete = parquet.status == Status::Complete
+        && headroom.measurement.status == Status::Complete
+        && seen.contains(&FilesystemRole::Data);
+    let withheld_for = |reason| {
+        envs.iter()
+            .filter(|e| e.reach == Reach::Withheld { reason })
+            .count()
+    };
+    for reason in [
+        WithheldReason::MeasurementUnavailable,
+        WithheldReason::RetentionSuppressed,
+    ] {
+        let count = withheld_for(reason);
+        if count > 0 {
+            check!(
+                count == envs.len(),
+                format!(
+                    "{reason:?} is global, yet {count} of {} envs carry it",
+                    envs.len()
+                ),
+            );
+            check!(
+                capacity.growth_excluded.is_empty(),
+                format!("{reason:?} withholds everything, yet growth is excluded"),
+            );
+        }
+    }
+    let unavailable = withheld_for(WithheldReason::MeasurementUnavailable) > 0;
+    check!(
+        envs.is_empty() || unavailable != both_complete,
+        format!(
+            "measurement_unavailable holds exactly when the measurements are not both \
+             complete (Parquet {:?}, headroom {:?})",
+            parquet.status, headroom.measurement.status
+        ),
+    );
+    if unavailable || withheld_for(WithheldReason::RetentionSuppressed) > 0 {
+        return violations;
+    }
+
+    // A projection: each env's observed days, reach form and exclusion.
+    let today = fixture_date(FIXTURE_TODAY);
+    let window_start = today - chrono::Days::new(8);
+    let window_end = today - chrono::Days::new(2);
+    let mut rate_less_finite = Vec::new();
+    let mut by_end: [Vec<(ReachEnd, u64)>; 2] = [Vec::new(), Vec::new()];
+    for env in envs {
+        let name = &env.env;
+        let oldest = fixture_date(&env.oldest_date);
+        check!(oldest <= today, format!("{name}: oldest date after today"));
+        let first = oldest.max(window_start);
+        let observed = u64::try_from((window_end - first).num_days() + 1).unwrap_or(0);
+        let rated = observed >= 3;
+        let window = |observed_first: &str, observed_last: &str, observed_days: u8| {
+            observed_first == first.format("%Y-%m-%d").to_string()
+                && observed_last == window_end.format("%Y-%m-%d").to_string()
+                && u64::from(observed_days) == observed
+                && (3..=7).contains(&observed_days)
+        };
+        match (&env.reach, env.max_age_days, rated) {
+            (
+                Reach::Projected {
+                    observed_first,
+                    observed_last,
+                    observed_days,
+                    low,
+                    high,
+                },
+                max_age,
+                true,
+            ) if max_age > 0 => {
+                check!(
+                    window(observed_first, observed_last, *observed_days),
+                    format!(
+                        "{name}: observed {observed_days} days {observed_first}..{observed_last}, \
+                         but oldest {oldest} gives {observed} from {first} to {window_end}"
+                    ),
+                );
+                for (index, end) in [*low, *high].into_iter().enumerate() {
+                    by_end[index].push((end, max_age));
+                    if let ReachEnd::Days { days } = end {
+                        check!(
+                            days < max_age,
+                            format!("{name}: {days} days is not below the {max_age}-day policy"),
+                        );
+                    }
+                    check!(
+                        !matches!(
+                            (floor, end),
+                            (Some(DeletionFloor::Off), ReachEnd::Days { .. })
+                                | (Some(DeletionFloor::Armed { .. }), ReachEnd::DiskFillsFirst)
+                        ),
+                        format!("{name}: {end:?} with floor {floor:?}")
+                    );
+                }
+                check!(
+                    match (low, high) {
+                        (ReachEnd::FullPolicy, high) => *high == ReachEnd::FullPolicy,
+                        (ReachEnd::Days { days: a }, ReachEnd::Days { days: b }) => a <= b,
+                        _ => true,
+                    },
+                    format!("{name}: the low end {low:?} exceeds the high end {high:?}"),
+                );
+            }
+            (
+                Reach::KeepForever {
+                    observed_first,
+                    observed_last,
+                    observed_days,
+                    mean_daily_bytes,
+                },
+                0,
+                true,
+            ) => {
+                check!(
+                    window(observed_first, observed_last, *observed_days),
+                    format!(
+                        "{name}: observed {observed_days} days {observed_first}..{observed_last}, \
+                         but oldest {oldest} gives {observed} from {first} to {window_end}"
+                    ),
+                );
+                check!(
+                    mean_daily_bytes.saturating_mul(u64::from(*observed_days)) <= env.stored_bytes,
+                    format!("{name}: the observed days hold more than is stored"),
+                );
+            }
+            (
+                Reach::Withheld {
+                    reason: WithheldReason::InsufficientHistory,
+                },
+                max_age,
+                false,
+            ) => {
+                if max_age > 0 {
+                    rate_less_finite.push(name.clone());
+                }
+            }
+            (reach, max_age, rated) => check!(
+                false,
+                format!(
+                    "{name}: {reach:?} for a {max_age}-day policy with {observed} observed days \
+                     (rated: {rated})"
+                ),
+            ),
+        }
+    }
+    check!(
+        capacity.growth_excluded == rate_less_finite,
+        format!(
+            "growth_excluded {:?} is not the finite envs without a rate {rate_less_finite:?}",
+            capacity.growth_excluded
+        ),
+    );
+    for (end, readings) in ["low", "high"].into_iter().zip(&by_end) {
+        let full = readings
+            .iter()
+            .filter(|(reach, _)| *reach == ReachEnd::FullPolicy)
+            .count();
+        check!(
+            full == 0 || full == readings.len(),
+            format!(
+                "the {end} end puts {full} of {} envs at the full policy",
+                readings.len()
+            ),
+        );
+        // Each Days{d} of a policy m says the shared fraction f lies in
+        // [d/m, (d+1)/m); those intervals must meet.
+        let days = readings
+            .iter()
+            .filter_map(|(reach, max_age)| match reach {
+                ReachEnd::Days { days } => Some((u128::from(*days), u128::from(*max_age))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for &(d1, m1) in &days {
+            for &(d2, m2) in &days {
+                check!(
+                    d1 * m2 < (d2 + 1) * m1,
+                    format!(
+                        "the {end} end's {d1} of {m1} and {d2} of {m2} days fit no shared fraction"
+                    ),
+                );
+            }
+        }
+    }
+    violations
+}
+
+/// Every capacity fixture, and the base snapshot's capacity, is a state
+/// the server can emit.
 #[test]
-fn health_capacity_complete_fixture_carries_every_reach_form() {
+fn health_capacity_fixtures_are_states_the_server_can_emit() {
+    for (name, text) in CAPACITY_FIXTURES {
+        let raw: serde_json::Value = serde_json::from_str(text).unwrap();
+        let violations = capacity_violations(&raw);
+        assert!(violations.is_empty(), "{name}: {violations:#?}");
+    }
+    let base: serde_json::Value =
+        serde_json::from_str(include_str!("../e2e/harness/wire/health-dashboard.json")).unwrap();
+    let part = CAPACITY_PART_FIELDS
+        .iter()
+        .map(|field| ((*field).to_owned(), base[*field].clone()))
+        .collect::<serde_json::Map<_, _>>();
+    let violations = capacity_violations(&serde_json::Value::Object(part));
+    assert!(
+        violations.is_empty(),
+        "health-dashboard.json: {violations:#?}"
+    );
+}
+
+/// The check rejects each contradiction the earlier fixtures carried, so
+/// a fixture cannot drift back into one.
+#[test]
+fn capacity_violations_reject_states_the_server_cannot_emit() {
+    fn env_index(raw: &serde_json::Value, name: &str) -> usize {
+        raw["capacity"]["environments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|e| e["env"] == name)
+            .unwrap()
+    }
+    fn set_reach(raw: &mut serde_json::Value, name: &str, reach: serde_json::Value) {
+        let index = env_index(raw, name);
+        raw["capacity"]["environments"][index]["reach"] = reach;
+    }
+    let complete: serde_json::Value = serde_json::from_str(CAPACITY_FIXTURES[0].1).unwrap();
+    let mutated = |mutate: &dyn Fn(&mut serde_json::Value)| {
+        let mut raw = complete.clone();
+        mutate(&mut raw);
+        capacity_violations(&raw)
+    };
+    for (case, mutate, expect) in [
+        (
+            "a global reason on one env beside a projection",
+            Box::new(|raw: &mut serde_json::Value| {
+                set_reach(
+                    raw,
+                    "prod",
+                    serde_json::json!({"state": "withheld", "reason": "measurement_unavailable"}),
+                );
+            }) as Box<dyn Fn(&mut serde_json::Value)>,
+            "is global",
+        ),
+        (
+            "measurement_unavailable while both measurements are complete",
+            Box::new(|raw: &mut serde_json::Value| {
+                for env in raw["capacity"]["environments"].as_array_mut().unwrap() {
+                    env["reach"] = serde_json::json!({"state": "withheld", "reason": "measurement_unavailable"});
+                }
+                raw["capacity"]["growth_excluded"] = serde_json::json!([]);
+            }),
+            "not both complete",
+        ),
+        (
+            "one env at the full policy beside one at whole days",
+            Box::new(|raw: &mut serde_json::Value| {
+                let index = env_index(raw, "lab");
+                raw["capacity"]["environments"][index]["reach"]["low"] =
+                    serde_json::json!({"kind": "full_policy"});
+            }),
+            "at the full policy",
+        ),
+        (
+            "an observed day before the oldest date",
+            Box::new(|raw: &mut serde_json::Value| {
+                let index = env_index(raw, "lab");
+                raw["capacity"]["environments"][index]["reach"]["observed_first"] =
+                    serde_json::json!("2026-09-19");
+                raw["capacity"]["environments"][index]["reach"]["observed_days"] =
+                    serde_json::json!(7);
+            }),
+            "lab: observed 7 days",
+        ),
+        (
+            "days that fit no shared fraction",
+            Box::new(|raw: &mut serde_json::Value| {
+                let index = env_index(raw, "staging");
+                raw["capacity"]["environments"][index]["reach"]["low"] =
+                    serde_json::json!({"kind": "days", "days": 20});
+            }),
+            "fit no shared fraction",
+        ),
+        (
+            "a rate-less env missing from growth_excluded",
+            Box::new(|raw: &mut serde_json::Value| {
+                raw["capacity"]["growth_excluded"] = serde_json::json!([]);
+            }),
+            "growth_excluded",
+        ),
+        (
+            "a number on a withheld reach",
+            Box::new(|raw: &mut serde_json::Value| {
+                let index = env_index(raw, "k8s");
+                raw["capacity"]["environments"][index]["reach"]["days"] = serde_json::json!(3);
+            }),
+            "a withheld reach carries",
+        ),
+    ] {
+        let violations = mutated(&*mutate);
+        assert!(
+            violations.iter().any(|v| v.contains(expect)),
+            "{case}: expected a violation naming {expect:?}, got {violations:#?}"
+        );
+    }
+}
+
+/// A complete sample with a floor: two rows, a completed sweep, three
+/// projected envs sharing one fraction per end, keep-forever growth, and
+/// one env left out of the growth for want of history.
+#[test]
+fn health_capacity_complete_fixture_carries_every_projected_form() {
     use trawl_api::{
         DeletionFloor, FilesystemRole, Reach, ReachEnd, StorageMeasurementStatus, SweepOutcome,
         WithheldReason,
     };
 
-    let complete: trawl_api::Capacity = decode(
-        "health-capacity-complete.json",
-        include_str!("../e2e/harness/wire/health-capacity-complete.json"),
+    let part = capacity_fixture("health-capacity-complete.json");
+    let complete = &part.capacity;
+    assert_eq!(
+        part.parquet_measurement.status,
+        StorageMeasurementStatus::Complete
     );
     assert_eq!(
         complete.headroom.measurement.status,
@@ -735,7 +1318,6 @@ fn health_capacity_complete_fixture_carries_every_reach_form() {
         complete.headroom.filesystems[1].roles,
         [FilesystemRole::Spill]
     );
-    assert_eq!(complete.headroom.filesystems[1].floor, None);
     assert_eq!(
         complete.pressure.last_sweep.map(|s| s.outcome),
         Some(SweepOutcome::Completed)
@@ -749,64 +1331,55 @@ fn health_capacity_complete_fixture_carries_every_reach_form() {
             .reach
             .clone()
     };
-    assert!(matches!(
-        reach("prod"),
-        Reach::Projected {
-            low: ReachEnd::Days { days: 38 },
-            high: ReachEnd::Days { days: 52 },
-            observed_days: 7,
-            ..
-        }
-    ));
-    assert!(matches!(
-        reach("staging"),
-        Reach::Projected {
-            low: ReachEnd::Days { days: 12 },
-            high: ReachEnd::FullPolicy,
-            ..
-        }
-    ));
-    assert!(matches!(
-        reach("lab"),
-        Reach::Projected {
-            low: ReachEnd::FullPolicy,
-            high: ReachEnd::FullPolicy,
-            ..
-        }
-    ));
+    for (env, low, high, observed) in [
+        ("prod", 38, 52, 7),
+        ("staging", 12, 17, 7),
+        ("lab", 3, 4, 6),
+    ] {
+        assert!(
+            matches!(
+                reach(env),
+                Reach::Projected {
+                    low: ReachEnd::Days { days: l },
+                    high: ReachEnd::Days { days: h },
+                    observed_days: o,
+                    ..
+                } if (l, h, o) == (low, high, observed)
+            ),
+            "{env}: {:?}",
+            reach(env)
+        );
+    }
     assert!(matches!(
         reach("archive"),
         Reach::KeepForever {
             mean_daily_bytes: 120_000_000,
+            observed_days: 7,
             ..
         }
     ));
-    assert!(matches!(
+    assert_eq!(
         reach("k8s"),
         Reach::Withheld {
             reason: WithheldReason::InsufficientHistory
         }
-    ));
+    );
     assert_eq!(complete.growth_excluded, ["k8s"]);
-    let names = complete
-        .environments
-        .iter()
-        .map(|e| e.env.as_str())
-        .collect::<Vec<_>>();
-    let mut sorted = names.clone();
-    sorted.sort_unstable();
-    assert_eq!(names, sorted, "environments arrive sorted by name");
 }
 
-/// A failed attempt that retained its rows: every reach is withheld as
-/// measurement unavailable and serializes with no numeric field.
+/// The headroom attempt failed after a complete sample with a deficit:
+/// the rows are kept with their age, and every reach is withheld as
+/// measurement unavailable, the rate-less k8s included, so nothing is
+/// excluded.
 #[test]
 fn health_capacity_failed_retained_fixture_withholds_every_reach() {
     use trawl_api::{DeletionFloor, Reach, StorageMeasurementStatus, SweepOutcome, WithheldReason};
 
-    let failed: trawl_api::Capacity = decode(
-        "health-capacity-failed-retained.json",
-        include_str!("../e2e/harness/wire/health-capacity-failed-retained.json"),
+    let part = capacity_fixture("health-capacity-failed-retained.json");
+    let failed = &part.capacity;
+    assert_eq!(
+        part.parquet_measurement.status,
+        StorageMeasurementStatus::Complete
     );
     assert_eq!(
         failed.headroom.measurement.status,
@@ -826,84 +1399,110 @@ fn health_capacity_failed_retained_fixture_withholds_every_reach() {
         failed.pressure.last_sweep.map(|s| s.outcome),
         Some(SweepOutcome::Failed)
     );
-    assert!(!failed.environments.is_empty());
-    for env in &failed.environments {
-        assert_eq!(
-            env.reach,
-            Reach::Withheld {
-                reason: WithheldReason::MeasurementUnavailable
-            },
-            "{} projects from a retained failed sample",
-            env.env
-        );
-        let wire = serde_json::to_value(&env.reach).unwrap();
-        assert_eq!(
-            wire.as_object().unwrap().keys().collect::<Vec<_>>(),
-            ["reason", "state"],
-            "a withheld reach carries no numeric field"
-        );
-    }
-}
-
-/// A floor of 0 with no sweep yet, each withheld reason once, and a
-/// floor-0 env whose disk fills first.
-#[test]
-fn health_capacity_withheld_fixture_names_every_reason_once() {
-    use trawl_api::{DeletionFloor, Reach, ReachEnd, WithheldReason};
-
-    let withheld: trawl_api::Capacity = decode(
-        "health-capacity-withheld.json",
-        include_str!("../e2e/harness/wire/health-capacity-withheld.json"),
-    );
-    assert_eq!(withheld.headroom.filesystems.len(), 1);
     assert_eq!(
-        withheld.headroom.filesystems[0].floor,
-        Some(DeletionFloor::Off)
-    );
-    assert_eq!(withheld.pressure.last_sweep, None);
-    let reasons = withheld
-        .environments
-        .iter()
-        .filter_map(|e| match e.reach {
-            Reach::Withheld { reason } => Some(reason),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        reasons,
-        [
-            WithheldReason::InsufficientHistory,
-            WithheldReason::MeasurementUnavailable,
-            WithheldReason::RetentionSuppressed,
-        ],
-        "every withheld reason appears once"
-    );
-    assert!(matches!(
-        withheld
+        failed
             .environments
             .iter()
-            .find(|e| e.env == "scratch")
-            .unwrap()
-            .reach,
-        Reach::Projected {
-            low: ReachEnd::DiskFillsFirst,
-            high: ReachEnd::DiskFillsFirst,
-            ..
-        }
-    ));
-    assert_eq!(withheld.growth_excluded, ["fresh"]);
+            .map(|e| (e.env.as_str(), e.reach.clone()))
+            .collect::<Vec<_>>(),
+        ["archive", "k8s", "prod"].map(|env| (
+            env,
+            Reach::Withheld {
+                reason: WithheldReason::MeasurementUnavailable
+            }
+        ))
+    );
+    assert!(failed.growth_excluded.is_empty());
 }
 
-/// Under pressure: one row for every role with a deficit, nonzero
-/// counters, and a sweep that ran out of candidates below the floor.
+/// Both samples are complete, but the headroom attempt saw a repin: every
+/// reach is withheld as retention suppressed, the rate-less k8s included,
+/// and retention's last sweep stood down.
+#[test]
+fn health_capacity_repin_suppressed_fixture_withholds_every_reach() {
+    use trawl_api::{Reach, StorageMeasurementStatus, SweepOutcome, WithheldReason};
+
+    let part = capacity_fixture("health-capacity-repin-suppressed.json");
+    let suppressed = &part.capacity;
+    assert_eq!(
+        part.parquet_measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(
+        suppressed.headroom.measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(
+        suppressed.pressure.last_sweep.map(|s| s.outcome),
+        Some(SweepOutcome::Suppressed)
+    );
+    assert_eq!(
+        suppressed
+            .environments
+            .iter()
+            .map(|e| (e.env.as_str(), e.reach.clone()))
+            .collect::<Vec<_>>(),
+        ["k8s", "prod", "staging"].map(|env| (
+            env,
+            Reach::Withheld {
+                reason: WithheldReason::RetentionSuppressed
+            }
+        ))
+    );
+    assert!(suppressed.growth_excluded.is_empty());
+}
+
+/// A floor of 0 turns pressure deletion off: at the largest observed day
+/// the disk fills first for every projected env, and at the mean day
+/// every one keeps its full policy.
+#[test]
+fn health_capacity_floor_zero_fixture_turns_pressure_deletion_off() {
+    use trawl_api::{DeletionFloor, Reach, ReachEnd, WithheldReason};
+
+    let part = capacity_fixture("health-capacity-floor-zero.json");
+    let off = &part.capacity;
+    assert_eq!(off.headroom.filesystems.len(), 1);
+    assert_eq!(off.headroom.filesystems[0].floor, Some(DeletionFloor::Off));
+    assert_eq!(off.pressure.pressure_attempts, 0);
+    for env in ["lab", "prod"] {
+        assert!(
+            matches!(
+                off.environments
+                    .iter()
+                    .find(|e| e.env == env)
+                    .unwrap()
+                    .reach,
+                Reach::Projected {
+                    low: ReachEnd::DiskFillsFirst,
+                    high: ReachEnd::FullPolicy,
+                    ..
+                }
+            ),
+            "{env}"
+        );
+    }
+    assert_eq!(
+        off.environments
+            .iter()
+            .find(|e| e.env == "fresh")
+            .unwrap()
+            .reach,
+        Reach::Withheld {
+            reason: WithheldReason::InsufficientHistory
+        }
+    );
+    assert_eq!(off.growth_excluded, ["fresh"]);
+}
+
+/// Under pressure the sweep ran out of candidates below the floor.
+/// Pressure deletion spares only today's partition, so every env holds
+/// today alone, none has a rate, and every finite one is excluded.
 #[test]
 fn health_capacity_pressure_fixture_carries_the_evidence() {
-    use trawl_api::{DeletionFloor, FilesystemRole, Reach, ReachEnd, SweepOutcome};
+    use trawl_api::{DeletionFloor, FilesystemRole, Reach, SweepOutcome, WithheldReason};
 
-    let pressure: trawl_api::Capacity = decode(
-        "health-capacity-pressure.json",
-        include_str!("../e2e/harness/wire/health-capacity-pressure.json"),
-    );
+    let part = capacity_fixture("health-capacity-pressure.json");
+    let pressure = &part.capacity;
     assert_eq!(pressure.headroom.filesystems.len(), 1);
     assert_eq!(
         pressure.headroom.filesystems[0].roles,
@@ -923,40 +1522,31 @@ fn health_capacity_pressure_fixture_carries_the_evidence() {
     assert_eq!(pressure.pressure.removals_age, 30);
     assert_eq!(pressure.pressure.removals_disk_pressure, 12);
     assert_eq!(pressure.pressure.pressure_attempts, 5);
+    let last = pressure.pressure.last_sweep.unwrap();
     assert_eq!(
-        pressure
-            .pressure
-            .last_sweep
-            .map(|s| (s.outcome, s.age_secs)),
-        Some((SweepOutcome::ExhaustedBelowFloor, 61))
+        (last.outcome, last.age_secs),
+        (SweepOutcome::ExhaustedBelowFloor, 61)
     );
-    assert!(matches!(
-        pressure
-            .environments
-            .iter()
-            .find(|e| e.env == "prod")
-            .unwrap()
-            .reach,
-        Reach::Projected {
-            low: ReachEnd::Days { days: 22 },
-            high: ReachEnd::Days { days: 40 },
-            ..
-        }
-    ));
-}
-
-/// The unmeasured cases carry the snapshot's Parquet fields beside the
-/// capacity object, since the card reads the Parquet measurement to tell
-/// an unmeasured empty list from a measured one. Each field is the
-/// `DashboardSnapshot` field of the same name and type, and nothing else
-/// rides along.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct UnmeasuredSnapshotPart {
-    parquet_files: u64,
-    parquet_bytes: u64,
-    parquet_measurement: trawl_api::StorageMeasurement,
-    capacity: trawl_api::Capacity,
+    // Both samples postdate the sweep, so they see what it left.
+    for age in [
+        part.parquet_measurement.sample_age_secs,
+        pressure.headroom.measurement.sample_age_secs,
+    ] {
+        assert!(age.unwrap() < last.age_secs);
+    }
+    assert_eq!(part.parquet_files, pressure.environments.len() as u64);
+    for env in &pressure.environments {
+        assert_eq!(env.oldest_date, FIXTURE_TODAY, "{}", env.env);
+        assert_eq!(
+            env.reach,
+            Reach::Withheld {
+                reason: WithheldReason::InsufficientHistory
+            },
+            "{}",
+            env.env
+        );
+    }
+    assert_eq!(pressure.growth_excluded, ["lab", "prod"]);
 }
 
 /// No environments, and no complete Parquet scan to establish that: one
@@ -966,14 +1556,8 @@ struct UnmeasuredSnapshotPart {
 fn health_capacity_unmeasured_fixtures_carry_no_complete_scan() {
     use trawl_api::StorageMeasurementStatus;
 
-    let awaiting: UnmeasuredSnapshotPart = decode(
-        "health-capacity-awaiting.json",
-        include_str!("../e2e/harness/wire/health-capacity-awaiting.json"),
-    );
-    let scan_failed: UnmeasuredSnapshotPart = decode(
-        "health-capacity-scan-failed.json",
-        include_str!("../e2e/harness/wire/health-capacity-scan-failed.json"),
-    );
+    let awaiting = capacity_fixture("health-capacity-awaiting.json");
+    let scan_failed = capacity_fixture("health-capacity-scan-failed.json");
     for (name, part, status) in [
         ("awaiting", &awaiting, StorageMeasurementStatus::NotSampled),
         (
@@ -987,9 +1571,7 @@ fn health_capacity_unmeasured_fixtures_carry_no_complete_scan() {
             part.parquet_measurement.sample_age_secs, None,
             "{name}: no retained scan"
         );
-        assert_eq!((part.parquet_files, part.parquet_bytes), (0, 0), "{name}");
         assert!(part.capacity.environments.is_empty(), "{name}");
-        assert!(part.capacity.growth_excluded.is_empty(), "{name}");
         assert_eq!(part.capacity.pressure.last_sweep, None, "{name}");
     }
     // Before the first attempt nothing is measured; after a failed scan
@@ -998,7 +1580,6 @@ fn health_capacity_unmeasured_fixtures_carry_no_complete_scan() {
         awaiting.capacity.headroom.measurement.status,
         StorageMeasurementStatus::NotSampled
     );
-    assert!(awaiting.capacity.headroom.filesystems.is_empty());
     assert_eq!(
         scan_failed.capacity.headroom.measurement.status,
         StorageMeasurementStatus::Complete
