@@ -576,8 +576,9 @@ mod tests {
             json!("2026-09-27T14:00:00.123456+02:00"),
             json!("2026-09-27 12:00:00.123456Z"),
             json!("2026-09-27t12:00:00.123456z"),
+            // Instants ingest writes, but compaction's cast cannot read.
             json!("2026-06-30T23:59:60.000000Z"),
-            json!("0000-01-01T00:00:00.000000Z"),
+            json!("+10000-01-01T00:00:00.000000Z"),
         ];
         for column in trawl_core::schema::TIMESTAMP_COLUMNS {
             let mut missing = stamped(Event::new());
@@ -626,12 +627,23 @@ mod tests {
             json!({"service": "api", "_time": "not-a-date", "Mixed_Case": true}),
             json!({"service": "api", "time": 1_790_000_000, "nested": {"a": [1, 2]}}),
             json!({"Service": "api", "_env": "prod", "_host": "web-1", "@timestamp": "2026-09-27"}),
+            // Years before 1 keep their year: ingest flags them as out of
+            // range, and compaction's repair keeps them.
+            json!({"service": "api", "_time": "0000-01-01T00:00:00Z"}),
+            json!({"service": "api", "_time": "-0001-06-15 08:30:00+00:00"}),
         ];
         let mut batch = ServiceBatch::default();
         for client in clients {
             let canonical = canonicalize(client.as_object().unwrap(), &ctx).unwrap();
             batch.push(canonical.obj);
         }
+        let times: Vec<&str> = batch
+            .maps
+            .iter()
+            .filter_map(|event| event[trawl_core::schema::TIME].as_str())
+            .collect();
+        assert!(times.contains(&"0000-01-01T00:00:00.000000Z"), "{times:?}");
+        assert!(times.contains(&"-0001-06-15T08:30:00.000000Z"), "{times:?}");
         assert_eq!(recognize(&batch.ndjson), Some(batch.maps));
     }
 

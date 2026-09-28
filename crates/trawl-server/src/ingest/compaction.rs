@@ -2814,10 +2814,15 @@ fn timestamp_repair_list(prov_col: &str) -> String {
 /// [`trawl_core::schema::TIMESTAMP_COLUMNS`], the list the repair walks.
 /// Rust cannot run `DuckDB`'s cast, so the check is stricter than the cast:
 /// each column must hold a string spelled exactly as ingest spells an
-/// instant, RFC 3339 UTC at microsecond precision
-/// (`SecondsFormat::Micros`), with a year from 1 to 9999 and no leap
-/// second. `repair_leaves_unchanged_agrees_with_repair_expr` runs
-/// [`repair_expr`] itself over values on both sides of the check.
+/// instant, chrono's RFC 3339 UTC at microsecond precision
+/// (`SecondsFormat::Micros`). The cast refuses two such spellings, so the
+/// check does too: a year after 9999, which chrono writes with a leading
+/// `+`, and a leap second. A year before 1 is written `0000` or with a
+/// leading `-`, and the cast reads it as the same year BC on both sides.
+/// `repair_leaves_unchanged_agrees_with_repair_expr` runs [`repair_expr`]
+/// itself over values on both sides of the check, and ingest's
+/// canonicalizer over each, so the check refuses nothing the canonicalizer
+/// writes and the repair keeps.
 pub(crate) fn repair_leaves_unchanged(row: &serde_json::Map<String, serde_json::Value>) -> bool {
     trawl_core::schema::TIMESTAMP_COLUMNS.iter().all(|column| {
         row.get(*column)
@@ -2830,10 +2835,12 @@ pub(crate) fn repair_leaves_unchanged(row: &serde_json::Map<String, serde_json::
 /// [`repair_leaves_unchanged`]).
 fn is_ingest_instant(text: &str) -> bool {
     use chrono::{Datelike as _, Timelike as _};
-    chrono::DateTime::parse_from_rfc3339(text).is_ok_and(|parsed| {
-        let instant = parsed.to_utc();
+    // `%Y` also reads the signed year chrono writes outside 0 to 9999. The
+    // round trip below refuses every spelling ingest does not write.
+    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.fZ").is_ok_and(|parsed| {
+        let instant = parsed.and_utc();
         // chrono keeps a leap second as a nanosecond count past one second.
-        (1..=9999).contains(&instant.year())
+        instant.year() <= 9999
             && instant.nanosecond() < 1_000_000_000
             && instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true) == text
     })
@@ -10922,6 +10929,9 @@ mod tests {
         use serde_json::json;
         use trawl_core::schema::TIMESTAMP_COLUMNS;
 
+        let micros = |instant: chrono::DateTime<chrono::Utc>| {
+            json!(instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
+        };
         let values = [
             // Accepted.
             json!(PROBE_INSTANT),
@@ -10929,6 +10939,13 @@ mod tests {
             json!("9999-12-31T23:59:59.999999Z"),
             json!("1970-01-01T00:00:00.000000Z"),
             json!("2024-02-29T23:59:59.000001Z"),
+            // Years before 1, as the canonicalizer writes them.
+            json!("0000-01-01T00:00:00.000000Z"),
+            json!("0000-02-29T12:00:00.000000Z"),
+            json!("0000-12-31T23:59:59.999999Z"),
+            json!("-0001-01-01T00:00:00.000000Z"),
+            json!("-10000-06-15T08:30:00.250000Z"),
+            micros(chrono::DateTime::<chrono::Utc>::MIN_UTC),
             // Refused.
             json!(null),
             json!(true),
@@ -10943,9 +10960,11 @@ mod tests {
             json!("2026-09-27T14:00:00.123456+02:00"),
             json!("2026-09-27 12:00:00.123456Z"),
             json!("2026-09-27t12:00:00.123456z"),
+            // Instants the canonicalizer writes as they are, but the
+            // repair changes.
             json!("2026-06-30T23:59:60.000000Z"),
-            json!("0000-01-01T00:00:00.000000Z"),
             json!("+10000-01-01T00:00:00.000000Z"),
+            micros(chrono::DateTime::<chrono::Utc>::MAX_UTC),
         ];
         let stamped = || -> serde_json::Map<String, serde_json::Value> {
             TIMESTAMP_COLUMNS
@@ -10967,6 +10986,40 @@ mod tests {
             rows.push(row);
         }
         rows
+    }
+
+    /// Whether ingest's canonicalizer writes `row`'s envelope instants as
+    /// they are: each one, sent as a client's `_time`, comes out of
+    /// [`crate::ingest::envelope::canonicalize`] unchanged. The
+    /// canonicalizer spells `_ingested` the same way, from the arrival
+    /// clock.
+    fn canonicalizer_emits(row: &serde_json::Map<String, serde_json::Value>) -> bool {
+        use crate::ingest::envelope::{EnvelopeContext, canonicalize};
+        use crate::ingest::producer::{Derivation, Producer};
+
+        let arrival_instant = chrono::DateTime::parse_from_rfc3339(PROBE_INSTANT)
+            .unwrap()
+            .to_utc();
+        let envs = ["prod".to_owned()];
+        let derivation = Derivation::defaults();
+        let ctx = EnvelopeContext {
+            arrival: PROBE_INSTANT,
+            arrival_instant,
+            envs: &envs,
+            default_env: "prod",
+            producer: Producer::Http {
+                peer_host: "10.0.4.55",
+                peer_is_trusted_relay: false,
+            },
+            derivation: &derivation,
+        };
+        trawl_core::schema::TIMESTAMP_COLUMNS.iter().all(|column| {
+            row.get(*column).is_some_and(|value| {
+                let client = serde_json::json!({"service": "svc", "_time": value});
+                let canonical = canonicalize(client.as_object().unwrap(), &ctx).unwrap();
+                canonical.obj.get(trawl_core::schema::TIME) == Some(value)
+            })
+        })
     }
 
     /// Write the indexed rows as `dir/svc_1000_abcd.ndjson`, each carrying
@@ -11034,11 +11087,15 @@ mod tests {
     /// reader and a bare `TRY_CAST` per envelope TIMESTAMP column. Every
     /// row the check accepts must leave the repair with the instants the
     /// hot read gives it, and every row the repair changes must be refused.
+    /// A row the canonicalizer writes as it is, and that the repair leaves
+    /// as the hot read gives it, must be accepted: refusing it would leave
+    /// real writer output for compaction, as overhang.
     #[test]
     fn repair_leaves_unchanged_agrees_with_repair_expr() {
         let rows = repair_probe_rows();
         let verdicts: Vec<bool> = rows.iter().map(repair_leaves_unchanged).collect();
         assert!(verdicts.iter().any(|v| *v) && verdicts.iter().any(|v| !*v));
+        let emitted: Vec<bool> = rows.iter().map(canonicalizer_emits).collect();
 
         let tmp = tempfile::tempdir().unwrap();
         let all: Vec<_> = rows.iter().enumerate().collect();
@@ -11058,6 +11115,11 @@ mod tests {
             }
             if hot != cold {
                 assert!(!verdicts[*idx], "a repaired row was accepted: {row:?}");
+            } else if emitted[*idx] {
+                assert!(
+                    verdicts[*idx],
+                    "canonicalizer output the repair leaves unchanged was refused: {row:?}"
+                );
             }
         }
         let changed = hot.iter().zip(&repaired).filter(|(h, c)| h != c).count();
