@@ -305,10 +305,13 @@ async function experiment() {
   }
   await startServer('trawld');
   const webConfig = path.join(privateDir, 'web.toml');
+  // trawl-web verifies trawld, so it pins the certificate trawld generated in
+  // its state directory, the parent of [data] path.
+  const trawldCert = path.join(path.dirname(dataDir), 'tls', 'cert.pem');
   async function startWeb(name) {
-    await fs.writeFile(webConfig, `${serverConfig}\n[web]\nbind_addr = "127.0.0.1:${webPort}"\nupstream_url = ${toml(upstream)}\nallow_insecure_cookies = true\npublic_origins = [${toml(browserOrigin)}]\ncookie_secret_env = "FLEET_SESSION_AEAD_KEY"\n`);
+    await fs.writeFile(webConfig, `${serverConfig}\n[web]\nbind_addr = "127.0.0.1:${webPort}"\nupstream_url = ${toml(upstream)}\nupstream_ca_path = ${toml(trawldCert)}\nallow_insecure_cookies = true\npublic_origins = [${toml(browserOrigin)}]\ncookie_secret_env = "FLEET_SESSION_AEAD_KEY"\n`);
     const proxy = await daemon(path.join(target, 'debug/trawl-web'), ['--config', webConfig], name,
-      { FLEET_SESSION_AEAD_KEY: sessionKey, TRAWL_WEB_INSECURE_UPSTREAM: '1', TRAWL_WEB_SPA_DIR: spaDirectory }, /trawl-web listening/);
+      { FLEET_SESSION_AEAD_KEY: sessionKey, TRAWL_WEB_SPA_DIR: spaDirectory }, /trawl-web listening/);
     proxy.identity = await processIdentity(proxy.child.pid, webConfig, report.build.binaries['trawl-web'], spaDirectory);
     return proxy;
   }
