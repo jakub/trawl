@@ -1053,6 +1053,16 @@ pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
 pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
 /// Default TLS certificate reload interval (seconds). 0 = disabled.
 pub const DEFAULT_TLS_RELOAD_INTERVAL_SECS: u64 = 300;
+/// Directory under [`Config::state_dir`] where trawld keeps the
+/// self-signed certificate it generates when `[server]` names none.
+pub const GENERATED_TLS_DIR: &str = "tls";
+/// File name of trawld's generated certificate inside [`GENERATED_TLS_DIR`].
+/// trawld publishes it world-readable (`0644`) so a proxy running as another
+/// user can pin it.
+pub const GENERATED_CERT_FILE: &str = "cert.pem";
+/// File name of trawld's generated private key inside [`GENERATED_TLS_DIR`].
+/// Owner-only (`0600`).
+pub const GENERATED_KEY_FILE: &str = "key.pem";
 /// Default schema cache TTL (seconds).
 pub const DEFAULT_SCHEMA_CACHE_TTL_SECS: u64 = 60;
 /// Default query history ring buffer capacity.
@@ -1310,6 +1320,18 @@ pub struct WebConfig {
     /// for the upstream connection, and the hostname is still verified.
     /// Unset: the platform trust store.
     pub upstream_ca_path: Option<PathBuf>,
+
+    /// Socket address the proxy connects to instead of resolving the
+    /// `upstream_url` host, e.g. `"127.0.0.1:5514"` (ADR-0048).
+    ///
+    /// TLS still verifies the host name in `upstream_url`, so a sidecar can
+    /// dial trawld over loopback and check that trawld's certificate covers
+    /// that name. Only an IP address and port are accepted, and
+    /// `upstream_url` must then name its host by DNS name. Unset: the proxy
+    /// resolves the `upstream_url` host normally.
+    ///
+    /// Kept as a raw string: `trawl-web` owns the parse and those rules.
+    pub upstream_connect_addr: Option<String>,
 
     /// Path to a file containing the 32-byte AEAD key for cookie encryption.
     /// Either this or `cookie_secret_env` must be set in production.
@@ -1614,6 +1636,23 @@ impl Config {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
 
+    /// Where trawld publishes the self-signed certificate it generates:
+    /// `{state_dir}/tls/cert.pem`.
+    ///
+    /// `None` when `[server]` names its own certificate, because trawld then
+    /// generates nothing. The file may not exist yet: trawld writes it on
+    /// its first start.
+    pub fn generated_cert_path(&self) -> Option<PathBuf> {
+        if self.server.tls_cert_path.is_some() {
+            return None;
+        }
+        Some(
+            self.state_dir()
+                .join(GENERATED_TLS_DIR)
+                .join(GENERATED_CERT_FILE),
+        )
+    }
+
     /// Return warnings about potentially dangerous configuration.
     ///
     /// Called after tracing is initialized so these can be logged.
@@ -1858,6 +1897,7 @@ mod tests {
             ("auth", "db_path"),
             ("auth", "auth_cache_ttl_secs"),
             ("web", "coastwatch_url"),
+            ("web", "upstream_conect_addr"),
             ("data", "paht"),
             ("ingest", "enable"),
             ("retention", "max_agge_days"),
@@ -2092,6 +2132,33 @@ path = "/data"
         let config: Config = toml::from_str(toml).unwrap();
         let warns = config.warnings();
         assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn generated_cert_lives_in_the_state_dir_tls_directory() {
+        let toml = r#"
+[server]
+[data]
+path = "/var/lib/trawl/data"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.generated_cert_path().as_deref(),
+            Some(Path::new("/var/lib/trawl/tls/cert.pem"))
+        );
+    }
+
+    #[test]
+    fn no_generated_cert_when_server_names_its_own() {
+        let toml = r#"
+[server]
+tls_cert_path = "/etc/trawl/cert.pem"
+tls_key_path = "/etc/trawl/key.pem"
+[data]
+path = "/var/lib/trawl/data"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.generated_cert_path(), None);
     }
 
     #[test]
@@ -2719,6 +2786,7 @@ path = "/data"
         assert!(config.web.bind_addr.is_none());
         assert!(config.web.upstream_url.is_none());
         assert!(config.web.upstream_ca_path.is_none());
+        assert!(config.web.upstream_connect_addr.is_none());
         assert!(config.web.cookie_secret_path.is_none());
         assert!(config.web.cookie_secret_env.is_none());
         assert!(config.web.session_ttl_secs.is_none());
@@ -2980,6 +3048,7 @@ path = "/data"
 bind_addr = "0.0.0.0:8090"
 upstream_url = "https://localhost:5514"
 upstream_ca_path = "/etc/trawl/upstream-ca.pem"
+upstream_connect_addr = "127.0.0.1:5514"
 cookie_secret_path = "/etc/trawl/web.key"
 session_ttl_secs = 3600
 allow_insecure_cookies = true
@@ -2993,6 +3062,11 @@ allow_insecure_cookies = true
         assert_eq!(
             config.web.upstream_ca_path.as_deref(),
             Some(std::path::Path::new("/etc/trawl/upstream-ca.pem"))
+        );
+        // Raw string here; trawl-web owns the parse.
+        assert_eq!(
+            config.web.upstream_connect_addr.as_deref(),
+            Some("127.0.0.1:5514")
         );
         assert_eq!(
             config.web.cookie_secret_path.as_deref(),
