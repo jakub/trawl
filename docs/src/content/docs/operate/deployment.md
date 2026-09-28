@@ -424,30 +424,55 @@ into your existing Prometheus installation. Plain rules include a matching
 HTTPS scrape example. Helm rule creation is opt-in and independent of
 ServiceMonitor creation; neither option installs a monitoring system.
 
-1. Check health. The route needs no token:
+1. Create a human key with [Create roles and keys](/operate/access/#create-roles-and-keys).
 
-   ```bash
-   curl --fail-with-body https://trawl.example.com:5514/api/v1/health
+2. Save the server in a [CLI profile](/start/connect/) with that key. When
+   the API certificate is from a CA the system trusts:
+
+   ```toml
+   [profiles.prod]
+   url = "https://trawl.example.com:5514"
+   token = "PASTE_THE_HUMAN_KEY_HERE"
    ```
 
-   Expect `"status":"ok"` and `"ok"` for each of `duckdb`, `auth_db`,
-   `storage_db`, and `data_path`. A `degraded` status also returns HTTP 200,
-   so read every check. For the generated certificate, run the check on the
-   host itself against `https://localhost:5514` with
-   `--cacert /var/lib/trawl/tls/cert.pem`.
-
-2. Create a human key with [Create roles and keys](/operate/access/#create-roles-and-keys)
-   and check its identity:
+   The generated self-signed certificate names only `localhost`, and
+   `trawl doctor --url` trusts only the system roots. On the host itself,
+   copy the certificate and pin it with `ca_cert`:
 
    ```bash
-   curl --fail-with-body -H "Authorization: Bearer $(cat alice.token)" \
-     https://trawl.example.com:5514/api/v1/whoami
+   install -d -m 0700 ~/.config/trawl
+   sudo cat /var/lib/trawl/tls/cert.pem > ~/.config/trawl/prod-ca.pem
    ```
 
-   Expect the key's `name`, `kind`, `roles`, and resolved `permissions`.
+   ```toml
+   [profiles.prod]
+   url = "https://localhost:5514"
+   ca_cert = "~/.config/trawl/prod-ca.pem"
+   token = "PASTE_THE_HUMAN_KEY_HERE"
+   ```
 
-3. Save the server in a [CLI profile](/start/connect/) and run one bounded
-   query:
+   Then run `chmod 0600 ~/.config/trawl/config.toml`.
+
+3. Run the doctor against the profile. If the browser UI is enabled, add its
+   origin with `--web-url`:
+
+   ```bash
+   trawl doctor -p prod --web-url https://trawl.example.com
+   ```
+
+   On the host with the packaged `public_origins`, use
+   `--web-url http://127.0.0.1:8090`. Expect `verdict: pass (exit 0)`.
+   `api.health.duckdb`, `api.health.auth_db`, `api.health.storage_db`,
+   `api.health.data_path`, and `api.health.ingest_capacity` are `complete`.
+   `api.identity` is `complete` and shows the key's name, kind, and
+   permissions. A `degraded` server fails the run, because the failing check
+   has its own `failed` line. Each failed line names its next action. The
+   [CLI reference](/reference/cli/#doctor-mode) lists every check.
+
+   `web.origin` shows that `trawl-web` accepts the origin. It does not show
+   that `trawl-web` reaches `trawld`. The sign-in in step 5 does.
+
+4. Run one bounded query:
 
    ```bash
    trawl -p prod query 'last=15m | head 10'
@@ -456,7 +481,7 @@ ServiceMonitor creation; neither option installs a monitoring system.
    Expect rows with `service` = `trawld`. Internal telemetry is on by default,
    so the daemon's own events appear before any sender connects.
 
-4. If the browser UI is enabled, open the origin and log in with the human
+5. If the browser UI is enabled, open the origin and log in with the human
    key. The search page loads.
 
 If a step fails, continue with [Check health and stalled work](/operate/health/).
