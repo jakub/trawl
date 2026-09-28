@@ -505,10 +505,10 @@ class TLS(unittest.TestCase):
                 self.assertEqual(cert.read_text(), "certificate")
                 self.assertEqual(cert.stat().st_mode & 0o7777, 0o644)
 
-    def test_tls_dir_script_removes_a_certificate_trawld_did_not_seal(self):
-        # A cert.pem another uid can rewrite could be swapped for one the
-        # sidecar then pins. trawld regenerates a missing certificate, so it
-        # goes before any app container starts.
+    def test_tls_dir_script_reseals_or_removes_the_certificate(self):
+        # The fsGroup walk adds group write to trawld's own cert.pem. Removing
+        # it would regenerate the certificate that ingest clients may pin, so
+        # a regular file trawld owns is resealed to 0644 and kept.
         init = init_container(self.objects({"web": web()}), "init-tls-dir")
         with tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
             tls_dir = Path(directory) / "tls"
@@ -520,7 +520,9 @@ class TLS(unittest.TestCase):
                     cert.chmod(mode)
                     result = run_tls_dir_script(init, tls_dir)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertFalse(cert.exists() or cert.is_symlink())
+                    self.assertEqual(cert.read_text(), "certificate")
+                    self.assertEqual(cert.stat().st_mode & 0o7777, 0o644)
+            cert.unlink()
 
             # A symlink or other non-regular file is not what trawld writes:
             # the link itself goes, never its target.

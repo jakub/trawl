@@ -128,11 +128,16 @@ spec:
               # keeps on a directory.
               chmod 0755 -- "$dir"
               chmod ug-s -- "$dir"
-              # A certificate trawld did not write, or one another uid can
-              # rewrite, is not one the sidecar may pin. trawld generates a
-              # new pair when the certificate is missing, so it goes. A
-              # symlink is removed, never followed.
+              # A certificate trawld did not write is not one the sidecar may
+              # pin. trawld generates a new pair when the certificate is
+              # missing, so it goes. A symlink is removed, never followed.
+              # trawld's own file is kept and resealed to 0644: the fsGroup
+              # walk adds group write, and regenerating would change the
+              # certificate that ingest clients may pin.
               cert=$dir/cert.pem
+              if [ -f "$cert" ] && [ ! -L "$cert" ] && [ "$(stat -c %u -- "$cert")" = "$uid" ]; then
+                chmod 0644 -- "$cert"
+              fi
               if [ -L "$cert" ] || { [ -e "$cert" ] && {
                 [ ! -f "$cert" ] ||
                 [ "$(stat -c %u -- "$cert")" != "$uid" ] ||
