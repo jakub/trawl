@@ -17,12 +17,18 @@
 //! rendering, values plumbing included; only a missing binary falls back to
 //! `values.yaml`. A chart that fails to render when it should is a test
 //! failure, never a skip.
+//!
+//! The deployment guide's Helm TLS examples ride along (ADR-0048): each one
+//! is rendered and the `trawld.toml` it produces goes through trawl-web's
+//! own config resolution. That test requires helm, since only a render
+//! shows what the sidecar is given.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use fleet_auth::PublicOrigins;
 use trawl_config::Config;
+use trawl_web::config::{ENV_UPSTREAM_CA_PATH, ResolvedConfig, UpstreamTls};
 
 /// An origin an operator is told to write. Every example in every packaged
 /// artifact has to be one `PublicOrigins::parse` accepts, so this is the
@@ -307,4 +313,181 @@ fn the_chart_quick_start_forwards_the_port_its_origin_names() {
         "the quick start allows {origin} but forwards {forward:?}, which never binds {port} \
          locally"
     );
+}
+
+/// The Helm TLS examples of the deployment guide: every fenced `yaml` block
+/// under "Configure the daemon API certificate" that starts with `tls:`.
+/// Each is a values fragment an operator pastes into `trawl-values.yaml`.
+fn documented_helm_tls_examples(deployment: &str) -> Vec<String> {
+    let section = deployment
+        .split("\n### Configure the daemon API certificate\n")
+        .nth(1)
+        .expect("the deployment guide must have a section that configures the API certificate")
+        .split("\n### ")
+        .next()
+        .expect("splitting always yields a first piece");
+    let mut examples = Vec::new();
+    let mut lines = section.lines();
+    while let Some(line) = lines.next() {
+        if line.trim_end() != "```yaml" {
+            continue;
+        }
+        let block: Vec<&str> = lines
+            .by_ref()
+            .take_while(|l| l.trim_end() != "```")
+            .collect();
+        if block
+            .first()
+            .is_some_and(|first| first.trim_end() == "tls:")
+        {
+            examples.push(block.join("\n") + "\n");
+        }
+    }
+    examples
+}
+
+/// Render one template for a documented example. Helm is required here:
+/// the claim under test is that the chart, not a reading of the values
+/// file, turns the example into a config trawl-web accepts.
+fn render_documented_example(template: &str, values: &Path, example: &str) -> String {
+    let values = values.to_str().expect("the temporary path must be UTF-8");
+    helm_template(
+        template,
+        &[
+            "-f",
+            values,
+            "--set",
+            "web.enabled=true",
+            "--set-string",
+            &format!("web.publicOrigins[0]={EXAMPLE_ORIGIN}"),
+        ],
+    )
+    .expect(
+        "helm must be on PATH for this test: it renders every documented Helm TLS example, \
+         and reading values.yaml instead proves nothing about the render. Install helm 3 or later",
+    )
+    .unwrap_or_else(|error| panic!("the documented example\n{example}\nmust render: {error}"))
+}
+
+/// The `trawld.toml` a rendered `ConfigMap` carries, de-indented.
+fn rendered_trawld_toml(configmap: &str) -> String {
+    let mut lines = configmap
+        .lines()
+        .skip_while(|line| line.trim_end() != "  trawld.toml: |");
+    assert!(
+        lines.next().is_some(),
+        "the ConfigMap must carry trawld.toml:\n{configmap}"
+    );
+    lines
+        .take_while(|line| line.is_empty() || line.starts_with("    "))
+        .map(|line| line.strip_prefix("    ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The `mountPath` of every volume mount of the `trawl-web` container in a
+/// rendered `StatefulSet`.
+fn sidecar_mount_paths(statefulset: &str) -> Vec<PathBuf> {
+    let container = statefulset
+        .split("- name: trawl-web\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the StatefulSet must run trawl-web:\n{statefulset}"))
+        .split("\n      volumes:\n")
+        .next()
+        .expect("splitting always yields a first piece");
+    container
+        .lines()
+        // `toYaml` sorts keys, so a mount from `web.extraVolumeMounts` starts
+        // its list item with `mountPath`.
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_prefix("- ").unwrap_or(line).strip_prefix("mountPath:")
+        })
+        .map(|path| PathBuf::from(path.trim().trim_matches('"')))
+        .collect()
+}
+
+#[test]
+fn every_documented_helm_tls_example_renders_a_config_trawl_web_accepts() {
+    let deployment = read("docs/src/content/docs/operate/deployment.md");
+    let examples = documented_helm_tls_examples(&deployment);
+    for mode in ["auto", "secret", "certManager"] {
+        assert!(
+            examples
+                .iter()
+                .any(|e| e.lines().any(|l| l.trim() == format!("mode: {mode}"))),
+            "the deployment guide must show a Helm TLS example for tls.mode={mode}"
+        );
+    }
+
+    for example in &examples {
+        let scratch = tempfile::tempdir().expect("a temporary directory");
+        let values = scratch.path().join("values.yaml");
+        std::fs::write(&values, example).expect("write the example values");
+        let configmap = render_documented_example("configmap.yaml", &values, example);
+        let statefulset = render_documented_example("statefulset.yaml", &values, example);
+
+        let toml = rendered_trawld_toml(&configmap);
+        let mut config = Config::parse_toml(&toml)
+            .unwrap_or_else(|e| panic!("the rendered trawld.toml must parse: {e}\n{toml}"));
+
+        // The rendered paths name files inside the pod. Resolution reads
+        // them, so the test points them into an empty scratch root: the
+        // cookie key gets a real 32-byte file, and the pinned CA stays
+        // absent, which trawl-web accepts as pending. The host's own
+        // /etc/trawl or /var/lib/trawl never decides the result.
+        let cookie = scratch.path().join("web.cookie");
+        std::fs::write(&cookie, [7_u8; 32]).expect("write a cookie key");
+        config.web.cookie_secret_path = Some(cookie);
+        let rendered_ca = config.web.upstream_ca_path.clone();
+        let pod_root = scratch.path().join("pod");
+        let local_ca = rendered_ca.as_ref().map(|ca| {
+            assert!(
+                ca.is_absolute(),
+                "the chart must pin an absolute path; got {}",
+                ca.display()
+            );
+            pod_root.join(ca.strip_prefix("/").expect("an absolute path"))
+        });
+        config.web.upstream_ca_path.clone_from(&local_ca);
+
+        let resolved = ResolvedConfig::from_parsed(&config.web, Some(&config.server))
+            .unwrap_or_else(|e| {
+                panic!("trawl-web must accept the config rendered from\n{example}\nError: {e}")
+            });
+        match (&resolved.upstream_tls, &local_ca) {
+            (UpstreamTls::PinnedCa { path, roots }, Some(expected)) => {
+                assert_eq!(
+                    path, expected,
+                    "trawl-web must pin the rendered upstream_ca_path; is \
+                     {ENV_UPSTREAM_CA_PATH} set in this environment?"
+                );
+                assert!(roots.is_none(), "the pinned CA is absent, so it is pending");
+            }
+            (UpstreamTls::System, None) => {}
+            (trust, _) => panic!(
+                "the rendered config for\n{example}\nresolved to {trust:?}, but the chart \
+                 rendered upstream_ca_path = {rendered_ca:?}"
+            ),
+        }
+        if let Some(connect) = &resolved.upstream_connect {
+            assert!(
+                connect.addr.ip().is_loopback(),
+                "the sidecar must connect to trawld over the pod's loopback; got {}",
+                connect.addr
+            );
+        }
+
+        if let Some(ca) = &rendered_ca {
+            let directory = ca.parent().expect("an absolute file path has a parent");
+            let mounts = sidecar_mount_paths(&statefulset);
+            assert!(
+                mounts.iter().any(|mount| mount == directory),
+                "the sidecar pins {} but mounts no {} directory; its mounts are {mounts:?}. \
+                 The example is\n{example}",
+                ca.display(),
+                directory.display()
+            );
+        }
+    }
 }
