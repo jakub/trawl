@@ -744,7 +744,8 @@ pub struct EnvironmentCapacity {
     pub env: String,
     /// The effective `max_age_days`; 0 keeps the data forever.
     pub max_age_days: u64,
-    /// The oldest surviving date partition, `YYYY-MM-DD`.
+    /// The oldest surviving date partition holding Parquet, `YYYY-MM-DD`.
+    /// An empty date directory does not count.
     pub oldest_date: String,
     /// Parquet bytes stored under the environment's date partitions.
     pub stored_bytes: u64,
@@ -918,6 +919,11 @@ pub struct DashboardSnapshot {
     pub parquet_bytes: u64,
     /// Availability and age of the ingested Parquet totals.
     pub parquet_measurement: StorageMeasurement,
+    /// Disk headroom, retention's pressure-deletion evidence and each
+    /// environment's projected retention reach (ADR-0042). Required, like
+    /// the storage measurements: a missing object is a contract break, not
+    /// "nothing to report".
+    pub capacity: Capacity,
 
     // -- SSE --
     /// Active SSE streaming connections.
@@ -2805,6 +2811,166 @@ mod tests {
         assert!(!rt.cached);
     }
 
+    /// A capacity object carrying every reach, reach-end and withheld
+    /// variant at once.
+    fn capacity_fixture() -> Capacity {
+        let observed = |first: &str| (first.to_owned(), "2026-09-25".to_owned());
+        let projected = |low, high| {
+            let (observed_first, observed_last) = observed("2026-09-19");
+            Reach::Projected {
+                observed_first,
+                observed_last,
+                observed_days: 7,
+                low,
+                high,
+            }
+        };
+        let env = |env: &str, max_age_days, reach| EnvironmentCapacity {
+            env: env.into(),
+            max_age_days,
+            oldest_date: "2026-06-01".into(),
+            stored_bytes: 9_000_000_000,
+            reach,
+        };
+        let (observed_first, observed_last) = observed("2026-09-22");
+        Capacity {
+            headroom: HeadroomReading {
+                measurement: StorageMeasurement {
+                    status: StorageMeasurementStatus::Failed,
+                    sample_age_secs: Some(45),
+                },
+                filesystems: vec![
+                    FilesystemHeadroom {
+                        roles: vec![FilesystemRole::Data, FilesystemRole::Spill],
+                        total_bytes: 500_000_000_000,
+                        available_bytes: 800_000_000,
+                        floor: Some(DeletionFloor::Armed {
+                            floor_bytes: 1_073_741_824,
+                            deficit_bytes: 273_741_824,
+                        }),
+                    },
+                    FilesystemHeadroom {
+                        roles: vec![FilesystemRole::Wal],
+                        total_bytes: 64_000_000_000,
+                        available_bytes: 60_000_000_000,
+                        floor: None,
+                    },
+                ],
+            },
+            pressure: PressureEvidence {
+                removals_age: 14,
+                removals_disk_pressure: 3,
+                pressure_attempts: 2,
+                last_sweep: Some(LastSweep {
+                    outcome: SweepOutcome::ExhaustedBelowFloor,
+                    age_secs: 754,
+                }),
+            },
+            environments: vec![
+                env(
+                    "archive",
+                    0,
+                    Reach::KeepForever {
+                        observed_first,
+                        observed_last,
+                        observed_days: 4,
+                        mean_daily_bytes: 120_000_000,
+                    },
+                ),
+                env(
+                    "fresh",
+                    30,
+                    Reach::Withheld {
+                        reason: WithheldReason::InsufficientHistory,
+                    },
+                ),
+                env(
+                    "lab",
+                    7,
+                    projected(ReachEnd::DiskFillsFirst, ReachEnd::FullPolicy),
+                ),
+                env(
+                    "prod",
+                    90,
+                    projected(ReachEnd::Days { days: 38 }, ReachEnd::Days { days: 52 }),
+                ),
+                env(
+                    "repinned",
+                    30,
+                    Reach::Withheld {
+                        reason: WithheldReason::RetentionSuppressed,
+                    },
+                ),
+                env(
+                    "unmeasured",
+                    30,
+                    Reach::Withheld {
+                        reason: WithheldReason::MeasurementUnavailable,
+                    },
+                ),
+            ],
+            growth_excluded: vec!["fresh".into()],
+        }
+    }
+
+    /// Every capacity variant survives the wire, alone and inside the
+    /// dashboard snapshot, and the snapshot refuses to decode without it.
+    #[test]
+    fn dashboard_capacity_roundtrip() {
+        let full = capacity_fixture();
+        assert_eq!(roundtrip(&full), full);
+
+        // The variants one object cannot hold at once: the other floor
+        // state, every sweep outcome, no sweep yet, and no sample yet.
+        let mut variants = Vec::new();
+        for outcome in [
+            SweepOutcome::Completed,
+            SweepOutcome::Suppressed,
+            SweepOutcome::Failed,
+            SweepOutcome::ExhaustedBelowFloor,
+        ] {
+            let mut capacity = capacity_fixture();
+            capacity.pressure.last_sweep = Some(LastSweep {
+                outcome,
+                age_secs: 1,
+            });
+            variants.push(capacity);
+        }
+        let mut floor_off = capacity_fixture();
+        floor_off.headroom.filesystems[0].floor = Some(DeletionFloor::Off);
+        variants.push(floor_off);
+        let mut unsampled = capacity_fixture();
+        unsampled.headroom = HeadroomReading {
+            measurement: StorageMeasurement {
+                status: StorageMeasurementStatus::NotSampled,
+                sample_age_secs: None,
+            },
+            filesystems: vec![],
+        };
+        unsampled.pressure.last_sweep = None;
+        unsampled.environments.clear();
+        unsampled.growth_excluded.clear();
+        variants.push(unsampled);
+        for capacity in variants {
+            assert_eq!(roundtrip(&capacity), capacity);
+            let snapshot = DashboardSnapshot {
+                capacity: capacity.clone(),
+                ..dashboard_fixture()
+            };
+            assert_eq!(roundtrip(&snapshot).capacity, capacity);
+        }
+
+        let mut missing = serde_json::to_value(dashboard_fixture()).unwrap();
+        assert!(
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("capacity")
+                .is_some()
+        );
+        assert!(serde_json::from_value::<DashboardSnapshot>(missing).is_err());
+    }
+
     /// One fully populated snapshot, shared by the tests that need a
     /// complete wire shape to take a field away from.
     fn dashboard_fixture() -> DashboardSnapshot {
@@ -2851,6 +3017,7 @@ mod tests {
                 status: StorageMeasurementStatus::Complete,
                 sample_age_secs: Some(2),
             },
+            capacity: capacity_fixture(),
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,

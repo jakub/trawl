@@ -324,7 +324,7 @@ fn render_syslog_ingest(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
     frame.render_widget(Paragraph::new(errors_line), errors_row);
 }
 
-/// WAL, compaction, and parquet storage panel.
+/// WAL, compaction, parquet storage, and disk capacity panel.
 fn render_data_pipeline(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, area: Rect) {
     let block = panel_block(" DATA PIPELINE ");
 
@@ -335,7 +335,8 @@ fn render_data_pipeline(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
         return;
     }
 
-    let [wal_row, parquet_row] = vertical![==1, ==1].areas(inner);
+    let [wal_row, parquet_row, capacity_row] =
+        vertical![==1, ==1, ==1].flex(Flex::Start).areas(inner);
 
     let compacted_ago = match snapshot.last_compaction_secs {
         Some(secs) => format!(
@@ -371,6 +372,78 @@ fn render_data_pipeline(snapshot: &DashboardSnapshot, frame: &mut Frame<'_>, are
         errors_suffix,
     );
     frame.render_widget(Paragraph::new(parquet_line), parquet_row);
+
+    if inner.height >= 3 {
+        frame.render_widget(
+            Paragraph::new(capacity_line(&snapshot.capacity)),
+            capacity_row,
+        );
+    }
+}
+
+/// The one-line disk and retention summary (ADR-0042): the data
+/// filesystem's headroom, its deletion floor, the last retention sweep, and
+/// the pressure deletions since process start.
+///
+/// Status and sample age lead, as in [`storage_reading`], so a clipped line
+/// never passes a retained reading off as fresh; the data filesystem's free
+/// and total bytes and its floor follow, and fit the 80-column panel. Available bytes are the
+/// data filesystem's own, never a sum across devices, and no environment's
+/// reach appears here: one environment is not the installation's answer.
+fn capacity_line(capacity: &trawl_api::Capacity) -> String {
+    use trawl_api::{DeletionFloor, FilesystemRole, StorageMeasurementStatus as Status};
+    let measurement = capacity.headroom.measurement;
+    let data = capacity
+        .headroom
+        .filesystems
+        .iter()
+        .find(|row| row.roles.contains(&FilesystemRole::Data));
+    let disk = match (measurement.status, measurement.sample_age_secs, data) {
+        (Status::NotConfigured, ..) => "not configured".to_owned(),
+        (Status::NotSampled, ..) => "awaiting measurement".to_owned(),
+        (status, Some(age), Some(data)) => {
+            let prefix = if status == Status::Failed {
+                "failed "
+            } else {
+                ""
+            };
+            let floor = match data.floor {
+                Some(DeletionFloor::Armed { floor_bytes, .. }) => {
+                    format!("floor {}", format_bytes(floor_bytes))
+                }
+                Some(DeletionFloor::Off) | None => "pressure deletion off".to_owned(),
+            };
+            format!(
+                "{prefix}age {age}s {}/{}  {floor}",
+                format_bytes(data.available_bytes),
+                format_bytes(data.total_bytes),
+            )
+        }
+        (Status::Failed, ..) => "failed; unavailable".to_owned(),
+        (Status::Complete, ..) => "unavailable".to_owned(),
+    };
+    let sweep = match capacity.pressure.last_sweep {
+        None => "none yet".to_owned(),
+        Some(sweep) => format!(
+            "{} {} ago",
+            sweep_outcome(sweep.outcome),
+            format_duration(Duration::from_secs(sweep.age_secs))
+        ),
+    };
+    format!(
+        " free: {disk}  sweep: {sweep}  pressure deletions: {}",
+        format_number(capacity.pressure.removals_disk_pressure)
+    )
+}
+
+fn sweep_outcome(outcome: trawl_api::SweepOutcome) -> &'static str {
+    use trawl_api::SweepOutcome;
+    match outcome {
+        SweepOutcome::Completed => "completed",
+        SweepOutcome::Suppressed => "suppressed",
+        SweepOutcome::Failed => "failed",
+        SweepOutcome::ExhaustedBelowFloor => "exhausted below floor",
+    }
 }
 
 /// Keep status and snapshot sample age ahead of totals and compaction suffixes
@@ -655,6 +728,66 @@ mod tests {
     use ratatui::backend::TestBackend;
     use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot, DashboardSnapshot};
 
+    /// A complete headroom sample: data and spill share a 500 GB device
+    /// with 120 GB free above a 1 GB floor, and the WAL has its own. One
+    /// pressure-deleting sweep has run.
+    fn test_capacity() -> trawl_api::Capacity {
+        use trawl_api::{
+            Capacity, DeletionFloor, EnvironmentCapacity, FilesystemHeadroom, FilesystemRole,
+            HeadroomReading, LastSweep, PressureEvidence, Reach, ReachEnd, StorageMeasurement,
+            StorageMeasurementStatus, SweepOutcome,
+        };
+        const GIB: u64 = 1024 * 1024 * 1024;
+        Capacity {
+            headroom: HeadroomReading {
+                measurement: StorageMeasurement {
+                    status: StorageMeasurementStatus::Complete,
+                    sample_age_secs: Some(2),
+                },
+                filesystems: vec![
+                    FilesystemHeadroom {
+                        roles: vec![FilesystemRole::Data, FilesystemRole::Spill],
+                        total_bytes: 500 * GIB,
+                        available_bytes: 120 * GIB,
+                        floor: Some(DeletionFloor::Armed {
+                            floor_bytes: GIB,
+                            deficit_bytes: 0,
+                        }),
+                    },
+                    FilesystemHeadroom {
+                        roles: vec![FilesystemRole::Wal],
+                        total_bytes: 64 * GIB,
+                        available_bytes: 60 * GIB,
+                        floor: None,
+                    },
+                ],
+            },
+            pressure: PressureEvidence {
+                removals_age: 14,
+                removals_disk_pressure: 3,
+                pressure_attempts: 2,
+                last_sweep: Some(LastSweep {
+                    outcome: SweepOutcome::Completed,
+                    age_secs: 754,
+                }),
+            },
+            environments: vec![EnvironmentCapacity {
+                env: "prod".into(),
+                max_age_days: 90,
+                oldest_date: "2026-07-01".into(),
+                stored_bytes: 12 * GIB,
+                reach: Reach::Projected {
+                    observed_first: "2026-09-19".into(),
+                    observed_last: "2026-09-25".into(),
+                    observed_days: 7,
+                    low: ReachEnd::Days { days: 38 },
+                    high: ReachEnd::Days { days: 52 },
+                },
+            }],
+            growth_excluded: vec![],
+        }
+    }
+
     fn test_snapshot() -> DashboardSnapshot {
         DashboardSnapshot {
             hostname: "test-host".into(),
@@ -699,6 +832,7 @@ mod tests {
                 status: trawl_api::StorageMeasurementStatus::Complete,
                 sample_age_secs: Some(2),
             },
+            capacity: test_capacity(),
             sse_active: 2,
             sse_max: 32,
             scheduler_enabled: true,
@@ -858,6 +992,86 @@ mod tests {
             !rendered.contains(&full),
             "large totals should exceed the existing narrow panel"
         );
+    }
+
+    #[test]
+    fn capacity_line_leads_with_status_age_and_the_data_filesystem() {
+        use trawl_api::{
+            DeletionFloor, HeadroomReading, LastSweep, StorageMeasurement,
+            StorageMeasurementStatus as Status, SweepOutcome,
+        };
+        let full = test_capacity();
+        assert_eq!(
+            capacity_line(&full),
+            " free: age 2s 120.0 GB/500.0 GB  floor 1.0 GB  \
+             sweep: completed 12m 34s ago  pressure deletions: 3"
+        );
+
+        // A failed attempt keeps the last rows, marked failed and aged.
+        let mut failed = test_capacity();
+        failed.headroom.measurement = StorageMeasurement {
+            status: Status::Failed,
+            sample_age_secs: Some(95),
+        };
+        assert!(
+            capacity_line(&failed).starts_with(" free: failed age 95s 120.0 GB/500.0 GB"),
+            "{}",
+            capacity_line(&failed)
+        );
+        // No rows yet: no numbers, and no floor claim.
+        for (status, expected) in [
+            (
+                Status::NotSampled,
+                " free: awaiting measurement  sweep: none yet",
+            ),
+            (
+                Status::Failed,
+                " free: failed; unavailable  sweep: none yet",
+            ),
+        ] {
+            let mut empty = test_capacity();
+            empty.headroom = HeadroomReading {
+                measurement: StorageMeasurement {
+                    status,
+                    sample_age_secs: None,
+                },
+                filesystems: vec![],
+            };
+            empty.pressure.last_sweep = None;
+            empty.pressure.removals_disk_pressure = 0;
+            assert_eq!(
+                capacity_line(&empty),
+                format!("{expected}  pressure deletions: 0")
+            );
+        }
+        // A floor of 0 says pressure deletion is off.
+        let mut off = test_capacity();
+        off.headroom.filesystems[0].floor = Some(DeletionFloor::Off);
+        assert!(
+            capacity_line(&off).contains("500.0 GB  pressure deletion off  sweep:"),
+            "{}",
+            capacity_line(&off)
+        );
+        for (outcome, label) in [
+            (SweepOutcome::Suppressed, "sweep: suppressed 5s ago"),
+            (SweepOutcome::Failed, "sweep: failed 5s ago"),
+            (
+                SweepOutcome::ExhaustedBelowFloor,
+                "sweep: exhausted below floor 5s ago",
+            ),
+        ] {
+            let mut swept = test_capacity();
+            swept.pressure.last_sweep = Some(LastSweep {
+                outcome,
+                age_secs: 5,
+            });
+            assert!(capacity_line(&swept).contains(label), "{label}");
+        }
+        // The WAL's own device never stands in for the data filesystem,
+        // and an environment's reach is not the installation's answer.
+        assert!(!capacity_line(&full).contains("60.0 GB"));
+        assert!(!capacity_line(&full).contains("prod"));
+        assert!(!capacity_line(&full).contains("38"));
     }
 
     #[test]

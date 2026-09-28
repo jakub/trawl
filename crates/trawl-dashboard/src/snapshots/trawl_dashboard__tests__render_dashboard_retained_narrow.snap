@@ -16,7 +16,7 @@ expression: terminal.backend().to_string()
 "┌ QUERY THROUGHPUT ────┐┌ DATA PIPELINE ───────────────────┐"
 "│ total: 1,247  2.1 q/s││ wal: age 2s 12f/4.2 MB  compacted│"
 "│ errors: 12  timeouts:││ parquet: age 2s 847f/12.4 GB  run│"
-"│                      ││                                  │"
+"│                      ││ free: age 2s 120.0 GB/500.0 GB  f│"
 "└──────────────────────┘└──────────────────────────────────┘"
 "┌ SSE STREAMS ─────────┐┌ SCHEDULER ───────────────────────┐"
 "│ active: 2/32         ││ enabled: 3 schedules             │"

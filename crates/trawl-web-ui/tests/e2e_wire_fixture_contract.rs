@@ -554,6 +554,20 @@ fn assert_dashboard_measurement_metadata_is_required(dashboard: &trawl_api::Dash
     }
 }
 
+/// The base snapshot carries a complete capacity object (ADR-0042): the
+/// daemon always sends one, and the snapshot refuses to decode without it.
+fn assert_dashboard_carries_capacity(dashboard: &trawl_api::DashboardSnapshot) {
+    assert_eq!(
+        dashboard.capacity.headroom.measurement.status,
+        trawl_api::StorageMeasurementStatus::Complete
+    );
+    assert_eq!(dashboard.capacity.headroom.filesystems.len(), 2);
+    assert_eq!(dashboard.capacity.environments.len(), 1);
+    let mut without_capacity = serde_json::to_value(dashboard).unwrap();
+    without_capacity.as_object_mut().unwrap().remove("capacity");
+    assert!(serde_json::from_value::<trawl_api::DashboardSnapshot>(without_capacity).is_err());
+}
+
 /// The ingest-refusal chip and Warn badge (ADR-0043) are built on refusal
 /// ALONE degrading the report; any other failed check would make the
 /// spec test a different case. The daemon ships `ingest_capacity` in
@@ -621,6 +635,7 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
     );
     assert_eq!(dashboard.parquet_measurement.sample_age_secs, Some(2));
     assert_dashboard_measurement_metadata_is_required(&dashboard);
+    assert_dashboard_carries_capacity(&dashboard);
     assert_eq!(dashboard.hot_buffer_events, 731);
     assert_eq!(dashboard.pool_active, 3);
     assert_eq!(dashboard.pool_retained, stats.pool_retained);

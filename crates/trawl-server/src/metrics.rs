@@ -1306,10 +1306,34 @@ pub(crate) fn cached_wal_stats(configured: bool) -> StorageSnapshot {
     wal_cache().snapshot(configured, Instant::now())
 }
 
+/// The Parquet totals and the scan they came from, from one cache read, so
+/// the dashboard's totals and its per-date buckets describe the same walk.
+/// The scan is shared behind its `Arc`, never cloned under the cache lock.
+///
 /// The fallback archive is configured even on a query-only cold start. An absent
 /// directory is a failed measurement, never a measured empty directory.
-pub(crate) fn cached_parquet_stats() -> StorageSnapshot {
-    parquet_cache().snapshot(true, Instant::now())
+pub(crate) fn cached_parquet_scan() -> (StorageSnapshot, Option<Arc<StorageScan>>) {
+    let (measurement, scan) = parquet_cache().read(true, Instant::now());
+    let totals = scan.as_ref().map(StorageSample::totals).unwrap_or_default();
+    (
+        StorageSnapshot {
+            files: totals.files,
+            bytes: totals.bytes,
+            measurement,
+        },
+        scan,
+    )
+}
+
+/// The headroom measurement and its retained sample, from one short cache
+/// read. The data root and the spill directory always exist as roles, so
+/// headroom is always configured: before the first attempt it is
+/// `not_sampled`.
+pub(crate) fn cached_headroom() -> (
+    trawl_api::StorageMeasurement,
+    Option<crate::capacity::HeadroomSample>,
+) {
+    headroom_cache().read(true, Instant::now())
 }
 
 #[cfg(test)]
@@ -1725,6 +1749,77 @@ mod tests {
         assert!(wal.env_dates.is_empty());
         assert_eq!(wal.unattributed_bytes, 12);
         assert_invariant(&wal);
+    }
+
+    /// An empty date directory holds no counted Parquet, so it gets no
+    /// bucket and never anchors an environment's oldest date: it is no
+    /// evidence of a quiet ingest day, and zero-filling from it would
+    /// overstate reach.
+    #[test]
+    fn storage_scan_ignores_empty_date_dirs() {
+        use crate::capacity::{HeadroomSample, project, projection_basis};
+        use chrono::NaiveDate;
+        use trawl_api::{Reach, StorageMeasurement, StorageMeasurementStatus};
+        let date = |day| NaiveDate::from_ymd_opt(2026, 9, day).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 09-10 is an empty date directory (and one holding only a
+        // non-Parquet file), then a gap, then Parquet from 09-20 on.
+        std::fs::create_dir_all(root.join("prod/2026-09-10/00")).unwrap();
+        std::fs::create_dir_all(root.join("prod/2026-09-11")).unwrap();
+        std::fs::write(root.join("prod/2026-09-11/x.parquet.tmp"), "xxxx").unwrap();
+        for day in 20..=25 {
+            let dir = root.join(format!("prod/2026-09-{day}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("x.parquet"), "0123456789").unwrap();
+        }
+        let scan = scan_storage(root, StorageKind::Parquet).unwrap();
+        assert_eq!(scan.env_dates.len(), 6, "{scan:?}");
+        assert_eq!(
+            scan.env_dates.keys().next(),
+            Some(&("prod".to_owned(), date(20)))
+        );
+        assert_eq!(scan.unattributed_bytes, 0);
+
+        // Projected against 2026-09-27 the window is 09-19..09-25. Anchored
+        // on the empty 09-10 it would hold seven days, one a false zero;
+        // anchored on 09-20 it holds six, all measured.
+        let complete = StorageMeasurement {
+            status: StorageMeasurementStatus::Complete,
+            sample_age_secs: Some(0),
+        };
+        let sample = HeadroomSample {
+            filesystems: vec![crate::capacity::DeviceHeadroom {
+                roles: vec![FilesystemRole::Data],
+                total_bytes: 1 << 40,
+                available_bytes: 1 << 30,
+            }],
+            repin_in_flight: false,
+        };
+        let projection = project(
+            date(27),
+            &scan.env_dates,
+            projection_basis(&complete, &complete, Some(&sample)),
+            &trawl_config::RetentionConfig {
+                max_age_days: 90,
+                min_free_disk_bytes: 1,
+                ..trawl_config::RetentionConfig::default()
+            },
+        );
+        let [prod] = projection.environments.as_slice() else {
+            panic!("{projection:?}");
+        };
+        assert_eq!(prod.oldest_date, "2026-09-20");
+        assert_eq!(prod.stored_bytes, 60);
+        assert!(
+            matches!(
+                &prod.reach,
+                Reach::Projected { observed_first, observed_days: 6, .. }
+                    if observed_first == "2026-09-20"
+            ),
+            "{:?}",
+            prod.reach
+        );
     }
 
     #[test]

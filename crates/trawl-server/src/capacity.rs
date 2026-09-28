@@ -16,8 +16,9 @@ use std::path::Path;
 
 use chrono::{Days, NaiveDate};
 use trawl_api::{
-    DeletionFloor, EnvironmentCapacity, FilesystemHeadroom, FilesystemRole, Reach, ReachEnd,
-    StorageMeasurement, StorageMeasurementStatus, WithheldReason,
+    Capacity, DeletionFloor, EnvironmentCapacity, FilesystemHeadroom, FilesystemRole,
+    HeadroomReading, PressureEvidence, Reach, ReachEnd, StorageMeasurement,
+    StorageMeasurementStatus, WithheldReason,
 };
 use trawl_config::RetentionConfig;
 
@@ -185,10 +186,14 @@ const RATE_SCALE: u128 = 420;
 /// An environment's observed days: each date from today−8 through today−2
 /// with its stored bytes, oldest first.
 ///
+/// The oldest date is the oldest one holding counted Parquet: `partitions`
+/// is one environment's bytes by date from the storage scan, which buckets
+/// only counted files, so an empty date directory never appears in it.
 /// Retention always deletes an environment's oldest date first, so a
-/// missing date newer than the oldest surviving partition was a quiet day
-/// and counts as zero. A date older than it is absent, not zero.
-/// `partitions` is one environment's bytes by date.
+/// missing date newer than the oldest date was a quiet day and counts as
+/// zero. A date older than it is absent, not zero. An empty date directory
+/// does not anchor that zero-fill: it is no evidence of a quiet ingest day,
+/// and anchoring on it would add zero days and overstate reach.
 #[must_use]
 pub fn observed_days(
     today: NaiveDate,
@@ -267,6 +272,8 @@ pub struct Projection {
 struct EnvRow<'a> {
     env: &'a str,
     max_age_days: u64,
+    /// The oldest date holding counted Parquet. An empty date directory is
+    /// not a partition here (see [`observed_days`]).
     oldest: NaiveDate,
     stored_bytes: u64,
     observed: Vec<(NaiveDate, u64)>,
@@ -316,14 +323,17 @@ fn date_string(date: NaiveDate) -> String {
 ///
 /// `env_dates` is the storage scan's partition bytes; every environment
 /// with a partition is listed, with its effective `max_age_days` from
-/// `retention` and its oldest date and stored bytes, whatever the basis.
+/// `retention` and its oldest date (the oldest holding counted Parquet)
+/// and stored bytes, whatever the basis.
 /// `basis` comes from [`projection_basis`]; an `Err` withholds every
 /// environment's reach with that reason.
 ///
 /// The model: under sustained pressure the expiry-ratio order (ADR-0018)
 /// drives every finite environment toward one fraction `f` of its
 /// `max_age_days`. The budget is every partition's bytes plus the data
-/// filesystem's available bytes, minus `floor_bytes`. Keep-forever
+/// filesystem's available bytes, minus the deletion floor
+/// (`retention.min_free_disk_bytes`, the one the retention loop enforces).
+/// Keep-forever
 /// environments, and finite ones with fewer than [`MIN_OBSERVED_DAYS`]
 /// observed days, are reserved at their stored bytes. The rest solve
 /// `Σ daily_bytes × f × max_age_days = budget − reserved`, once with each
@@ -339,7 +349,6 @@ pub fn project(
     today: NaiveDate,
     env_dates: &EnvDateBytes,
     basis: Result<ProjectionBasis, WithheldReason>,
-    floor_bytes: u64,
     retention: &RetentionConfig,
 ) -> Projection {
     let mut partitions: BTreeMap<&str, BTreeMap<NaiveDate, u64>> = BTreeMap::new();
@@ -368,7 +377,7 @@ pub fn project(
             Vec::new(),
         ),
         Ok(basis) => (
-            reach_all(&rows, basis, floor_bytes),
+            reach_all(&rows, basis, retention.min_free_disk_bytes),
             rows.iter()
                 .filter(|row| !row.keeps_forever() && !row.has_rate())
                 .map(|row| row.env.to_owned())
@@ -479,6 +488,60 @@ fn run_ends<'a>(
             })
         })
         .collect()
+}
+
+/// The cached readings one dashboard snapshot assembles capacity from.
+///
+/// Each pair is one cache read: a measurement and the sample retained
+/// with it, so a status never describes a different sample's numbers.
+#[derive(Debug, Clone, Copy)]
+pub struct CapacityReadings<'a> {
+    /// The Parquet scan's measurement.
+    pub parquet: &'a StorageMeasurement,
+    /// That scan's partition bytes; `None` before a complete scan.
+    pub env_dates: Option<&'a EnvDateBytes>,
+    /// The headroom measurement.
+    pub headroom: &'a StorageMeasurement,
+    /// That measurement's retained sample; `None` before a complete one.
+    pub sample: Option<&'a HeadroomSample>,
+}
+
+/// The dashboard's capacity object (ADR-0042).
+///
+/// `today` is the UTC date, read once per snapshot so every environment is
+/// projected against the same day. `pressure` is retention's evidence,
+/// with the last sweep's age already evaluated. The deletion floor comes
+/// from `retention`, the config the retention loop enforces, for the
+/// headroom rows and the projection alike.
+#[must_use]
+pub fn assemble(
+    today: NaiveDate,
+    readings: CapacityReadings<'_>,
+    pressure: PressureEvidence,
+    retention: &RetentionConfig,
+) -> Capacity {
+    let basis = projection_basis(readings.parquet, readings.headroom, readings.sample);
+    let Projection {
+        environments,
+        growth_excluded,
+    } = project(
+        today,
+        readings.env_dates.unwrap_or(&EnvDateBytes::new()),
+        basis,
+        retention,
+    );
+    Capacity {
+        headroom: HeadroomReading {
+            measurement: *readings.headroom,
+            filesystems: readings
+                .sample
+                .map(|sample| filesystem_rows(sample, retention.min_free_disk_bytes))
+                .unwrap_or_default(),
+        },
+        pressure,
+        environments,
+        growth_excluded,
+    }
 }
 
 #[cfg(test)]
@@ -719,6 +782,14 @@ mod tests {
         }
     }
 
+    /// `config` with a deletion floor of `floor` bytes.
+    fn floored(config: &RetentionConfig, floor: u64) -> RetentionConfig {
+        RetentionConfig {
+            min_free_disk_bytes: floor,
+            ..config.clone()
+        }
+    }
+
     fn measured(status: StorageMeasurementStatus) -> StorageMeasurement {
         StorageMeasurement {
             status,
@@ -826,7 +897,12 @@ mod tests {
         let mut env_dates = EnvDateBytes::new();
         plant(&mut env_dates, "three", &[(4, 10), (0, 99)]);
         plant(&mut env_dates, "two", &[(3, 10), (2, 10)]);
-        let projection = project(today(), &env_dates, basis(1 << 40), 0, &retention(30, &[]));
+        let projection = project(
+            today(),
+            &env_dates,
+            basis(1 << 40),
+            &floored(&retention(30, &[]), 0),
+        );
         assert!(
             matches!(
                 reach_of(&projection, "three"),
@@ -861,7 +937,14 @@ mod tests {
         plant(&mut env_dates, "archive", &[(30, 650)]);
         let config = retention(365, &[("lab", 7), ("archive", 0)]);
         let floor = 1_000;
-        let run = |available| project(today(), &env_dates, basis(available), floor, &config);
+        let run = |available| {
+            project(
+                today(),
+                &env_dates,
+                basis(available),
+                &floored(&config, floor),
+            )
+        };
 
         // available 15_050: budget − reserved = 8_700 + 14_050 − 1_000 =
         // 21_750, f = 21_750 / 43_500 = 1/2. Each env keeps the same half
@@ -919,7 +1002,10 @@ mod tests {
         let mut quiet = EnvDateBytes::new();
         plant(&mut quiet, "prod", &[(9, 500)]);
         assert_eq!(
-            reach_of(&project(today(), &quiet, basis(0), floor, &config), "prod"),
+            reach_of(
+                &project(today(), &quiet, basis(0), &floored(&config, floor)),
+                "prod"
+            ),
             &projected(8, 7, ReachEnd::FullPolicy, ReachEnd::FullPolicy)
         );
 
@@ -930,7 +1016,7 @@ mod tests {
         plant(&mut huge, "lab", &week([u64::MAX / 8; 7]));
         let config = retention(u64::MAX, &[("lab", 7)]);
         for available in [0, u64::MAX] {
-            let projection = project(today(), &huge, basis(available), 1, &config);
+            let projection = project(today(), &huge, basis(available), &floored(&config, 1));
             for (env, max_age) in [("prod", u64::MAX), ("lab", 7)] {
                 let Reach::Projected { low, high, .. } = reach_of(&projection, env) else {
                     panic!("{env} is projected: {projection:?}");
@@ -957,7 +1043,7 @@ mod tests {
         let config = retention(90, &[]);
         assert_eq!(
             reach_of(
-                &project(today(), &env_dates, basis(2_350), 100, &config),
+                &project(today(), &env_dates, basis(2_350), &floored(&config, 100)),
                 "prod"
             ),
             &projected(8, 7, days(36), days(63))
@@ -974,7 +1060,7 @@ mod tests {
         let lab_30 = retention(90, &[("lab", 30)]);
         assert_eq!(
             reach_of(
-                &project(today(), &env_dates, basis(40), 100, &lab_30),
+                &project(today(), &env_dates, basis(40), &floored(&lab_30, 100)),
                 "lab"
             ),
             &projected(4, 3, days(22), days(27))
@@ -990,7 +1076,7 @@ mod tests {
         let mut env_dates = EnvDateBytes::new();
         plant(&mut env_dates, "prod", &week([100; 7]));
         plant(&mut env_dates, "lab", &[(4, 1), (3, 2), (2, 2), (0, 100)]);
-        let projection = project(today(), &env_dates, basis(5_000), 1_230, &config);
+        let projection = project(today(), &env_dates, basis(5_000), &floored(&config, 1_230));
         assert_eq!(
             reach_of(&projection, "prod"),
             &projected(8, 7, days(44), days(45))
@@ -1010,7 +1096,7 @@ mod tests {
         let mut env_dates = EnvDateBytes::new();
         plant(&mut env_dates, "archive", &week([0, 0, 0, 0, 0, 0, 700]));
         plant(&mut env_dates, "vault", &[(5, 30), (3, 60)]);
-        let projection = project(today(), &env_dates, basis(0), 1, &config);
+        let projection = project(today(), &env_dates, basis(0), &floored(&config, 1));
         assert_eq!(
             reach_of(&projection, "archive"),
             &Reach::KeepForever {
@@ -1040,7 +1126,12 @@ mod tests {
         let crowded_config = retention(90, &[("archive", 0)]);
         assert_eq!(
             reach_of(
-                &project(today(), &crowded, basis(100), 1_000, &crowded_config),
+                &project(
+                    today(),
+                    &crowded,
+                    basis(100),
+                    &floored(&crowded_config, 1_000)
+                ),
                 "prod"
             ),
             &projected(8, 7, days(0), days(0))
@@ -1051,13 +1142,13 @@ mod tests {
         // 100 a day: D = 1_000, stored 700.
         let mut steady = EnvDateBytes::new();
         plant(&mut steady, "prod", &week([100; 7]));
-        let fills = project(today(), &steady, basis(299), 0, &config);
+        let fills = project(today(), &steady, basis(299), &floored(&config, 0));
         assert_eq!(
             reach_of(&fills, "prod"),
             &projected(8, 7, ReachEnd::DiskFillsFirst, ReachEnd::DiskFillsFirst)
         );
         // 700 + 300 = 1_000 = D: the policy fits exactly.
-        let fits = project(today(), &steady, basis(300), 0, &config);
+        let fits = project(today(), &steady, basis(300), &floored(&config, 0));
         assert_eq!(
             reach_of(&fits, "prod"),
             &projected(8, 7, ReachEnd::FullPolicy, ReachEnd::FullPolicy)
@@ -1072,14 +1163,17 @@ mod tests {
             &week([100, 100, 100, 800, 100, 100, 100]),
         );
         assert_eq!(
-            reach_of(&project(today(), &bursty, basis(1_000), 0, &config), "prod"),
+            reach_of(
+                &project(today(), &bursty, basis(1_000), &floored(&config, 0)),
+                "prod"
+            ),
             &projected(8, 7, ReachEnd::DiskFillsFirst, ReachEnd::FullPolicy)
         );
     }
 
     /// prod rated (7 × 100 at 90 days, D = 9000), fresh finite with two
     /// observed days (stored 4000), vault keep-forever with two observed
-    /// days (stored 6000).
+    /// days (stored 6000). The deletion floor is 200.
     fn history_fixture() -> (EnvDateBytes, RetentionConfig) {
         let mut env_dates = EnvDateBytes::new();
         plant(&mut env_dates, "prod", &week([100; 7]));
@@ -1089,7 +1183,10 @@ mod tests {
             &[(3, 2_000), (1, 1_000), (0, 1_000)],
         );
         plant(&mut env_dates, "vault", &[(3, 6_000)]);
-        (env_dates, retention(90, &[("fresh", 30), ("vault", 0)]))
+        (
+            env_dates,
+            floored(&retention(90, &[("fresh", 30), ("vault", 0)]), 200),
+        )
     }
 
     #[test]
@@ -1099,7 +1196,7 @@ mod tests {
         // 10_700 + available 4_000 − floor 200 = 14_500, so 4_500 is left
         // for prod's D = 9_000: f = 1/2, 45 of 90 days. fresh's growth is
         // left out and named.
-        let projection = project(today(), &env_dates, basis(4_000), 200, &config);
+        let projection = project(today(), &env_dates, basis(4_000), &config);
         assert_eq!(
             reach_of(&projection, "prod"),
             &projected(8, 7, days(45), days(45))
@@ -1135,7 +1232,7 @@ mod tests {
         let complete = measured(StorageMeasurementStatus::Complete);
         let basis = projection_basis(&complete, &complete, Some(&headroom_sample(1 << 40, true)));
         assert_eq!(basis, Err(WithheldReason::RetentionSuppressed));
-        let projection = project(today(), &env_dates, basis, 200, &config);
+        let projection = project(today(), &env_dates, basis, &config);
         // Every env is withheld, even those that would lack history; the
         // stored facts stay listed, and nothing was projected to exclude.
         for capacity in &projection.environments {
@@ -1201,7 +1298,6 @@ mod tests {
             today(),
             &env_dates,
             projection_basis(&measured(Failed), &complete, Some(&repinning)),
-            200,
             &config,
         );
         for capacity in &projection.environments {
@@ -1216,6 +1312,79 @@ mod tests {
         }
         assert_eq!(projection.environments.len(), 3);
         assert!(projection.growth_excluded.is_empty());
+    }
+
+    /// Assembly reads the floor from the retention config for the rows and
+    /// the projection alike, and lists stored facts even while withheld.
+    #[test]
+    fn capacity_assemble_takes_the_floor_from_config() {
+        use trawl_api::{LastSweep, PressureEvidence, SweepOutcome};
+        let (env_dates, config) = history_fixture();
+        let complete = measured(StorageMeasurementStatus::Complete);
+        let sample = headroom_sample(4_000, false);
+        let pressure = PressureEvidence {
+            removals_age: 1,
+            removals_disk_pressure: 2,
+            pressure_attempts: 3,
+            last_sweep: Some(LastSweep {
+                outcome: SweepOutcome::Suppressed,
+                age_secs: 9,
+            }),
+        };
+        let readings = CapacityReadings {
+            parquet: &complete,
+            env_dates: Some(&env_dates),
+            headroom: &complete,
+            sample: Some(&sample),
+        };
+        let capacity = assemble(today(), readings, pressure.clone(), &config);
+        assert_eq!(capacity.headroom.measurement, complete);
+        assert_eq!(
+            capacity.headroom.filesystems,
+            filesystem_rows(&sample, 200),
+            "the data row's floor is the config's 200"
+        );
+        assert_eq!(capacity.pressure, pressure);
+        // The same numbers as reach_withheld_insufficient_history_reserves_bytes,
+        // whose floor is also 200.
+        assert_eq!(
+            capacity.environments,
+            project(today(), &env_dates, basis(4_000), &config).environments
+        );
+        assert_eq!(capacity.growth_excluded, ["fresh"]);
+
+        // A retained, failed Parquet scan still lists its stored facts,
+        // every reach withheld; with no scan at all, nothing is listed.
+        let failed = measured(StorageMeasurementStatus::Failed);
+        let withheld = assemble(
+            today(),
+            CapacityReadings {
+                parquet: &failed,
+                ..readings
+            },
+            pressure.clone(),
+            &config,
+        );
+        assert_eq!(withheld.environments.len(), 3);
+        assert!(withheld.environments.iter().all(|env| env.reach
+            == Reach::Withheld {
+                reason: WithheldReason::MeasurementUnavailable
+            }));
+        let not_sampled = measured(StorageMeasurementStatus::NotSampled);
+        let empty = assemble(
+            today(),
+            CapacityReadings {
+                parquet: &not_sampled,
+                env_dates: None,
+                headroom: &not_sampled,
+                sample: None,
+            },
+            pressure,
+            &config,
+        );
+        assert_eq!(empty.headroom.measurement, not_sampled);
+        assert!(empty.headroom.filesystems.is_empty());
+        assert!(empty.environments.is_empty() && empty.growth_excluded.is_empty());
     }
 
     #[test]
@@ -1240,7 +1409,7 @@ mod tests {
         ];
         let mut reasons = Vec::new();
         for basis in bases {
-            for capacity in project(today(), &env_dates, basis, 200, &config).environments {
+            for capacity in project(today(), &env_dates, basis, &config).environments {
                 let Reach::Withheld { reason } = capacity.reach else {
                     continue;
                 };
