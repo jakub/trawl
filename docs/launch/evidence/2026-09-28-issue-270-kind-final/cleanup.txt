@@ -1,0 +1,7 @@
+$ kind delete cluster --name trawl-270-final --kubeconfig ~/trawl-270-kind-final-scratch/kubeconfig
+Deleting cluster "trawl-270-final" ...
+Deleted nodes: ["trawl-270-final-control-plane"]
+$ kind get clusters
+No kind clusters found.
+$ docker ps -a --filter name=trawl-270 --format "{{.Names}}"
+(end of list)

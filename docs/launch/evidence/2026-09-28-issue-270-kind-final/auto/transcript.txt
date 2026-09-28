@@ -1,0 +1,309 @@
+
+## leg auto in namespace trawl-auto, 2026-09-28T21:13:42Z
+$ helm version --short
+v4.2.2+gb05881c
+$ kubectl --context kind-trawl-270-final version
+Client Version: v1.36.4
+Kustomize Version: v5.8.1
+Server Version: v1.36.4
+
+## fresh install
+$ helm install trawl /home/jakub/trawl-270-kind-final-scratch/src/chart/trawl --namespace trawl-auto -f /home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/docs/launch/evidence/2026-09-28-issue-270-kind-final/auto/values.yaml
+NAME: trawl
+LAST DEPLOYED: Mon Sep 28 14:13:42 2026
+NAMESPACE: trawl-auto
+STATUS: deployed
+REVISION: 1
+DESCRIPTION: Install complete
+NOTES:
+Trawl has been installed.
+
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Use a personal API key to sign in to the browser and a service key for each collector.
+The init-auth container initializes the database schema; it does not create API keys.
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+
+Browser-ingress TLS is configured separately through ingress.tls.
+
+Check the HTTPS API through a local port-forward:
+
+  kubectl port-forward --namespace trawl-auto svc/trawl 5514:5514
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
+
+Configured browser origins:
+  http://localhost:8090
+
+For the configured local browser origin, keep this port-forward running:
+
+  kubectl port-forward --namespace trawl-auto svc/trawl 8090:8090
+
+Open http://localhost:8090 and sign in with your personal API key.
+
+## pod status every 3s until both containers are Ready, then 60s more
++001s Pending 
++004s Pending 
++007s Pending trawl-web:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} trawld:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} 
++010s Pending trawl-web:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} trawld:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} 
++013s Pending trawl-web:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} trawld:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} 
++017s Pending trawl-web:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} trawld:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} 
++022s Pending trawl-web:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} trawld:ready=false,restarts=0,state={"waiting":{"reason":"PodInitializing"}} 
++026s Running trawl-web:ready=false,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=false,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++036s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=false,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++047s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=false,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++050s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=false,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++054s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=false,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++057s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=false,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++060s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=false,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++072s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++085s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++089s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++092s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++095s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++098s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++101s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++104s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++107s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++110s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++113s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++116s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++119s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++122s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++125s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++128s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
++132s Running trawl-web:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} trawld:ready=true,restarts=0,state={"running":{"startedAt":"2026-09-28T21:14:05Z"}} 
+$ kubectl --context kind-trawl-270-final -n trawl-auto get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE     IP           NODE                            NOMINATED NODE   READINESS GATES
+postgres-84967f7bcb-z6g7x   1/1     Running   0          2m32s   10.244.0.5   trawl-270-final-control-plane   <none>           <none>
+trawl-0                     2/2     Running   0          2m12s   10.244.0.7   trawl-270-final-control-plane   <none>           <none>
+$ kubectl --context kind-trawl-270-final -n trawl-auto get pod trawl-0 -o json | jq '[.status.containerStatuses[] | {name, ready, restartCount, image, imageID, state, lastState}]'
+[
+  {
+    "name": "trawl-web",
+    "ready": true,
+    "restartCount": 0,
+    "image": "docker.io/library/trawl-270-kind-final:898effaa326d",
+    "imageID": "docker.io/library/import-2026-09-28@sha256:a0d7355a7da7d524308111d3ad67dc4fd5e8d1fa55c6157760baeafdacbad0b3",
+    "state": {
+      "running": {
+        "startedAt": "2026-09-28T21:14:05Z"
+      }
+    },
+    "lastState": {}
+  },
+  {
+    "name": "trawld",
+    "ready": true,
+    "restartCount": 0,
+    "image": "docker.io/library/trawl-270-kind-final:898effaa326d",
+    "imageID": "docker.io/library/import-2026-09-28@sha256:a0d7355a7da7d524308111d3ad67dc4fd5e8d1fa55c6157760baeafdacbad0b3",
+    "state": {
+      "running": {
+        "startedAt": "2026-09-28T21:14:05Z"
+      }
+    },
+    "lastState": {}
+  }
+]
+$ kubectl --context kind-trawl-270-final -n trawl-auto get events --field-selector involvedObject.name=trawl-0 --sort-by=.lastTimestamp -o custom-columns=TYPE:.type,REASON:.reason,MESSAGE:.message
+TYPE      REASON      MESSAGE
+Normal    Scheduled   Successfully assigned trawl-auto/trawl-0 to trawl-270-final-control-plane
+Normal    Pulled      Container image "trawl-270-kind-final:898effaa326d" already present on machine and can be accessed by the pod
+Normal    Created     Container created
+Normal    Started     Container started
+Normal    Pulled      Container image "trawl-270-kind-final:898effaa326d" already present on machine and can be accessed by the pod
+Normal    Created     Container created
+Normal    Started     Container started
+Normal    Pulled      Container image "trawl-270-kind-final:898effaa326d" already present on machine and can be accessed by the pod
+Normal    Created     Container created
+Normal    Started     Container started
+Normal    Pulled      Container image "trawl-270-kind-final:898effaa326d" already present on machine and can be accessed by the pod
+Normal    Created     Container created
+Normal    Started     Container started
+Warning   Unhealthy   Startup probe failed: Get "https://10.244.0.7:5514/api/v1/health": dial tcp 10.244.0.7:5514: connect: connection refused
+
+## rendered pod spec: security contexts, init and app container mounts, volumes
+(written to auto/pod-spec.json)
+$ sed -n '/^\[web\]/,/^\[/p' '/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/docs/launch/evidence/2026-09-28-issue-270-kind-final/auto/trawld.toml'
+[web]
+bind_addr = "0.0.0.0:8090"
+public_origins = ["http://localhost:8090"]
+cookie_secret_path = "/etc/trawl/web.cookie"
+session_ttl_secs = 86400
+allow_insecure_cookies = true
+upstream_ca_path = "/var/lib/trawl/tls/cert.pem"
+
+## container logs
+$ kubectl --context kind-trawl-270-final -n trawl-auto get pod trawl-0 -o json | jq '[.status.initContainerStatuses[] | {name, ready, restartCount, state}]'
+[
+  {
+    "name": "init-auth",
+    "ready": true,
+    "restartCount": 0,
+    "state": {
+      "terminated": {
+        "containerID": "containerd://dcc3e8b7eea06383a1b6cc4483ff0e257cb6cdca974e2924f05afc07f8ca83d2",
+        "exitCode": 0,
+        "finishedAt": "2026-09-28T21:13:54Z",
+        "reason": "Completed",
+        "startedAt": "2026-09-28T21:13:48Z"
+      }
+    }
+  },
+  {
+    "name": "init-tls-dir",
+    "ready": true,
+    "restartCount": 0,
+    "state": {
+      "terminated": {
+        "containerID": "containerd://1c21e1aa1057ac8a33ae6c21ff817246043b75b8f15f5f1a4daff3e32e86235d",
+        "exitCode": 0,
+        "finishedAt": "2026-09-28T21:13:56Z",
+        "reason": "Completed",
+        "startedAt": "2026-09-28T21:13:56Z"
+      }
+    }
+  }
+]
+$ kubectl --context kind-trawl-270-final -n trawl-auto logs trawl-0 -c init-tls-dir
+(init-tls-dir log: 0 bytes, written to auto/init-tls-dir.txt)
+$ cat '/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/docs/launch/evidence/2026-09-28-issue-270-kind-final/auto/trawl-web.txt'
+2026-09-28T21:14:05.664690Z  INFO trawl_web::config: the environment restates the configured browser-origin allowlist event_type="session_public_origins_override_matched" env="FLEET_SESSION_PUBLIC_ORIGINS" origins_count=1 origins=http://localhost:8090
+2026-09-28T21:14:05.664755Z  WARN trawl_web::config: the pinned upstream CA file does not exist yet; trawl-web cannot reach trawld until it does event_type="upstream_ca_pending" path=/var/lib/trawl/tls/cert.pem
+2026-09-28T21:14:05.664766Z  INFO trawl_web: loaded config config=/etc/trawl/trawld.toml bind_addr=0.0.0.0:8090 upstream=https://127.0.0.1:5514 public_origins_count=1 public_origins=http://localhost:8090
+2026-09-28T21:14:05.664865Z  INFO trawl_web::routes: SPA fallback: embedded bundle
+2026-09-28T21:14:05.664925Z  INFO trawl_web: trawl-web listening addr=0.0.0.0:8090
+2026-09-28T21:15:05.670625Z  INFO trawl_web::upstream: loaded the pinned upstream CA file; trawl-web can reach trawld event_type="upstream_ca_loaded" path=/var/lib/trawl/tls/cert.pem
+$ grep -E 'tls|TLS|certificate|listening' '/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/docs/launch/evidence/2026-09-28-issue-270-kind-final/auto/trawld.txt' | head -20
+2026-09-28T21:14:05.293228Z  WARN trawld: no TLS certificate configured — using auto-generated self-signed certificate event_type="config_warning"
+2026-09-28T21:14:42.224038Z  INFO trawl_server::tls: no TLS certificate found, generating self-signed certificate event_type="lifecycle"
+2026-09-28T21:14:42.260679Z  INFO trawl_server::tls: self-signed TLS certificate generated event_type="lifecycle" cert=/var/lib/trawl/tls/cert.pem key=/var/lib/trawl/tls-key/key.pem
+2026-09-28T21:14:42.268432Z  INFO trawl_server::tls: TLS certificate details event_type="tls_cert_details" subject=CN=rcgen self signed cert issuer=CN=rcgen self signed cert not_before=Wed, 01 Jan 1975 00:00:00 +0000 not_after=Sun, 01 Jan 4096 00:00:00 +0000
+2026-09-28T21:14:42.268544Z  WARN trawl_server::transport::http: using auto-generated self-signed certificate — clients must use --insecure or trust the cert event_type="lifecycle"
+2026-09-28T21:14:42.268584Z  INFO trawl_server::transport::http: HTTPS server listening event_type="lifecycle" addr=0.0.0.0:5514
+
+## what each container can see
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawld -- id
+uid=1000 gid=1000 groups=1000
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- id
+uid=1001 gid=1000 groups=1000
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawld -- ls -lnd /var/lib/trawl /var/lib/trawl/tls /var/lib/trawl/tls-key
+drwxrwxrwx 1    0    0 28 Sep 28 21:14 /var/lib/trawl
+drwxr-xr-x 1 1000 1000 16 Sep 28 21:14 /var/lib/trawl/tls
+drwx------ 1 1000 1000 14 Sep 28 21:14 /var/lib/trawl/tls-key
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawld -- ls -ln /var/lib/trawl/tls /var/lib/trawl/tls-key
+/var/lib/trawl/tls:
+total 4
+-rw-r--r-- 1 1000 1000 570 Sep 28 21:14 cert.pem
+
+/var/lib/trawl/tls-key:
+total 4
+-rw------- 1 1000 1000 241 Sep 28 21:14 key.pem
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawld -- stat -c %n\ mode=%a\ uid=%u\ gid=%g\ type=%F /var/lib/trawl/tls /var/lib/trawl/tls/cert.pem /var/lib/trawl/tls-key /var/lib/trawl/tls-key/key.pem
+/var/lib/trawl/tls mode=755 uid=1000 gid=1000 type=directory
+/var/lib/trawl/tls/cert.pem mode=644 uid=1000 gid=1000 type=regular file
+/var/lib/trawl/tls-key mode=700 uid=1000 gid=1000 type=directory
+/var/lib/trawl/tls-key/key.pem mode=600 uid=1000 gid=1000 type=regular file
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- ls -lnd /var/lib/trawl/tls
+drwxr-xr-x 1 1000 1000 16 Sep 28 21:14 /var/lib/trawl/tls
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- ls -ln /var/lib/trawl/tls
+total 4
+-rw-r--r-- 1 1000 1000 570 Sep 28 21:14 cert.pem
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- ls -ln /var/lib/trawl
+total 0
+drwxr-xr-x 1 1000 1000 16 Sep 28 21:14 tls
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- cat /var/lib/trawl/tls-key/key.pem
+cat: /var/lib/trawl/tls-key/key.pem: No such file or directory
+command terminated with exit code 1
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- cat /var/lib/trawl/tls/key.pem
+cat: /var/lib/trawl/tls/key.pem: No such file or directory
+command terminated with exit code 1
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- sh -c touch\ /var/lib/trawl/tls/probe
+touch: cannot touch '/var/lib/trawl/tls/probe': Read-only file system
+command terminated with exit code 1
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- cat /var/lib/trawl/tls/cert.pem | openssl x509 -noout -subject -issuer -ext subjectAltName -fingerprint -sha256
+subject=CN=rcgen self signed cert
+issuer=CN=rcgen self signed cert
+X509v3 Subject Alternative Name: 
+    DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1
+sha256 Fingerprint=69:63:4C:48:B9:E3:CE:0E:1F:01:FC:18:E8:13:58:88:D5:B1:EA:03:45:C3:6E:E5:99:3C:35:5C:BE:B8:CA:8C
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawld -- cat /var/lib/trawl/tls/cert.pem | openssl x509 -noout -fingerprint -sha256
+sha256 Fingerprint=69:63:4C:48:B9:E3:CE:0E:1F:01:FC:18:E8:13:58:88:D5:B1:EA:03:45:C3:6E:E5:99:3C:35:5C:BE:B8:CA:8C
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- stat -L -c %n\ mode=%a\ uid=%u\ gid=%g /etc/trawl/web.cookie /etc/trawl/trawld.toml
+/etc/trawl/web.cookie mode=440 uid=0 gid=1000
+/etc/trawl/trawld.toml mode=644 uid=0 gid=1000
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawl-web -- sh -c test\ -r\ /etc/trawl/web.cookie\ \&\&\ echo\ \"cookie\ key\ readable\ by\ uid\ \$\(id\ -u\)\"
+cookie key readable by uid 1001
+
+## a key for the sign-in (token to the private directory only)
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawld -- sh -c DATABASE_URL=\"\$FLEET_DATABASE_URL\"\ exec\ fleet-admin\ roles\ create\ --name\ trawl-reader\ --perm\ trawl:query\ --perm\ trawl:schema_read\ --perm\ trawl:validate\ --perm\ trawl:export\ --perm\ trawl:stream\ --perm\ trawl:saved_query\ --perm\ trawl:query_cancel
+created role:
+
+  name:      trawl-reader
+  rate_rpm:  (class default)
+  perms:     trawl:export, trawl:query, trawl:query_cancel, trawl:saved_query, trawl:schema_read, trawl:stream, trawl:validate
+$ kubectl -n trawl-auto exec trawl-0 -c trawld -- sh -c 'DATABASE_URL="$FLEET_DATABASE_URL" exec fleet-admin keys create --name kind-proof --kind human --role trawl-reader' > $PRIV/token
+created API key:
+
+  name:    kind-proof
+  kind:    human
+  roles:   trawl-reader
+  prefix:  aOHIyXFr
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+token bytes: 48
+
+## sign-in through trawl-web (port-forward svc/trawl 8090)
+$ curl -sS -o /dev/null -w GET\ /healthz\ -\>\ %\{http_code\}\\n http://localhost:8090/healthz
+GET /healthz -> 200
+$ curl -sS -o /dev/null -w GET\ /\ -\>\ %\{http_code\}\ %\{content_type\}\\n http://localhost:8090/
+GET / -> 200 text/html
+$ curl -sS -w \\n-\>\ %\{http_code\}\\n -H Origin:\ http://localhost:8090 http://localhost:8090/api/v1/whoami
+{"error":"unauthorized"}
+-> 401
+$ curl -sS -D - -H 'Origin: http://localhost:8090' -H 'Content-Type: application/json' --data @$PRIV/login.json -c $PRIV/cookies http://localhost:8090/api/auth/login | redact
+HTTP/1.1 200 OK
+content-type: application/json
+set-cookie: fleet_session=<redacted>; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+referrer-policy: no-referrer
+x-frame-options: DENY
+content-length: 142
+date: Mon, 28 Sep 2026 21:16:27 GMT
+
+{"name":"kind-proof","roles":["trawl-reader"],"permissions":["query","schema_read","validate","saved_query","export","stream","query_cancel"]}
+-> 200
+$ curl -sS -b $PRIV/cookies -H 'Origin: http://localhost:8090' http://localhost:8090/api/auth/me
+{"name":"kind-proof","roles":["trawl-reader"],"permissions":["query","schema_read","validate","saved_query","export","stream","query_cancel"],"exp":1790716587}
+-> 200
+$ curl -sS -b $PRIV/cookies -H 'Origin: http://localhost:8090' http://localhost:8090/api/v1/whoami
+{"prefix":"aOHIyXFr","name":"kind-proof","kind":"human","roles":["trawl-reader"],"permissions":["query","schema_read","validate","saved_query","export","stream","query_cancel"]}
+-> 200
+$ curl -sS -o $PRIV/schema.json -b $PRIV/cookies -H 'Origin: http://localhost:8090' http://localhost:8090/api/v1/schema; jq -c keys $PRIV/schema.json
+-> 200
+["cached","columns","earliest_date","file_count","hot_buffer_bytes","hot_buffer_events","latest_date","services","total_bytes"]
+
+## after the sign-in
+$ kubectl --context kind-trawl-270-final -n trawl-auto get pod trawl-0 -o jsonpath=\{range\ .status.containerStatuses\[\*\]\}\{.name\}\{\"\ ready=\"\}\{.ready\}\{\"\ restarts=\"\}\{.restartCount\}\{\"\\n\"\}\{end\}
+trawl-web ready=true restarts=0
+trawld ready=true restarts=0
+$ tail -n 5 '/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/docs/launch/evidence/2026-09-28-issue-270-kind-final/auto/trawl-web.txt'
+2026-09-28T21:14:05.664755Z  WARN trawl_web::config: the pinned upstream CA file does not exist yet; trawl-web cannot reach trawld until it does event_type="upstream_ca_pending" path=/var/lib/trawl/tls/cert.pem
+2026-09-28T21:14:05.664766Z  INFO trawl_web: loaded config config=/etc/trawl/trawld.toml bind_addr=0.0.0.0:8090 upstream=https://127.0.0.1:5514 public_origins_count=1 public_origins=http://localhost:8090
+2026-09-28T21:14:05.664865Z  INFO trawl_web::routes: SPA fallback: embedded bundle
+2026-09-28T21:14:05.664925Z  INFO trawl_web: trawl-web listening addr=0.0.0.0:8090
+2026-09-28T21:15:05.670625Z  INFO trawl_web::upstream: loaded the pinned upstream CA file; trawl-web can reach trawld event_type="upstream_ca_loaded" path=/var/lib/trawl/tls/cert.pem
+
+## done 2026-09-28T21:16:27Z

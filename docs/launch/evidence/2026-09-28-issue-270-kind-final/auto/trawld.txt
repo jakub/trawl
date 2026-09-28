@@ -1,0 +1,25 @@
+2026-09-28T21:14:05.293036Z  INFO trawld: configuration loaded event_type="lifecycle" config=/etc/trawl/trawld.toml
+2026-09-28T21:14:05.293228Z  WARN trawld: no TLS certificate configured — using auto-generated self-signed certificate event_type="config_warning"
+2026-09-28T21:14:05.293248Z  INFO trawld: starting trawld event_type="lifecycle" https_addr=0.0.0.0:5514 data_path=/var/lib/trawl/data max_queries=16 version="0.9.0" git_sha="unknown" git_date="unknown" rustc="1.98.0" target="x86_64-unknown-linux-gnu" monitor=false
+2026-09-28T21:14:29.834543Z  INFO trawl_server::store: app-state database migrated and advisory-locked event_type="storage_ready"
+2026-09-28T21:14:29.936257Z  INFO trawld: boot publication recovery finished event_type="publication_recovery" markers=0 blocked=0 unlisted_envs=0
+2026-09-28T21:14:29.936296Z  INFO trawld: storage epoch verified event_type="epoch_gate" outcome=FreshRoot epoch="3"
+2026-09-28T21:14:42.095454Z  INFO trawl_server::catalog::conform: boot conformance pass starting (first boot with this catalog, a catalog/data-root identity mismatch, or an incomplete pass) event_type="catalog_conform_start" data_dir=/var/lib/trawl/data conformed=false
+2026-09-28T21:14:42.209281Z  INFO trawl_server::catalog::conform: boot conformance pass complete event_type="catalog_conform_complete" scanned=0 rewritten=0 skipped=0 observed=0 conflicts=0
+2026-09-28T21:14:42.209326Z  INFO trawld: boot conformance pass finished event_type="catalog_conform" ran=true scanned=0 rewritten=0 skipped=0 observed=0
+2026-09-28T21:14:42.218122Z  INFO trawld: ingest pipeline enabled event_type="lifecycle" wal_dir=/var/lib/trawl/data/wal data_dir=/var/lib/trawl/data interval_secs=10
+2026-09-28T21:14:42.220433Z  INFO trawl_server::retention: retention task started event_type="lifecycle" action="retention_start" data_dir=/var/lib/trawl/data max_age_days=90 min_free_disk_bytes=1073741824 interval_secs=3600
+2026-09-28T21:14:42.220655Z  INFO trawl_server::ingest::compaction: compaction task started event_type="lifecycle" action="compaction_start" wal_dir=/var/lib/trawl/data/wal data_dir=/var/lib/trawl/data interval_secs=10 daily_rollup=true chunk_size=500 memory_limit=2GB
+2026-09-28T21:14:42.224038Z  INFO trawl_server::tls: no TLS certificate found, generating self-signed certificate event_type="lifecycle"
+2026-09-28T21:14:42.225049Z  INFO trawl_server::schema_refresh: service schema refresh complete event_type="schema_refresh_complete" services=0
+2026-09-28T21:14:42.225902Z  INFO trawl_server::scheduler: scheduler started event_type="scheduler_started" poll_interval_secs=10 report_max_rows=10000
+2026-09-28T21:14:42.260679Z  INFO trawl_server::tls: self-signed TLS certificate generated event_type="lifecycle" cert=/var/lib/trawl/tls/cert.pem key=/var/lib/trawl/tls-key/key.pem
+2026-09-28T21:14:42.268432Z  INFO trawl_server::tls: TLS certificate details event_type="tls_cert_details" subject=CN=rcgen self signed cert issuer=CN=rcgen self signed cert not_before=Wed, 01 Jan 1975 00:00:00 +0000 not_after=Sun, 01 Jan 4096 00:00:00 +0000
+2026-09-28T21:14:42.268544Z  WARN trawl_server::transport::http: using auto-generated self-signed certificate — clients must use --insecure or trust the cert event_type="lifecycle"
+2026-09-28T21:14:42.268584Z  INFO trawl_server::transport::http: HTTPS server listening event_type="lifecycle" addr=0.0.0.0:5514
+2026-09-28T21:14:44.982510Z  INFO trawl_server::audit: key audit task started event_type="lifecycle" action="audit_start" interval_secs=30 keys=0 roles=0
+2026-09-28T21:15:08.307126Z  INFO trawl_server::ingest::compaction: compaction complete event_type="compaction_complete" compact_service=trawld output=/var/lib/trawl/data/prod/2026-09-28/21/trawld.parquet wal_files=2 merged=false rows=20 conflicts=0 output_bytes=15680 duration_ms=6083
+2026-09-28T21:15:18.504522Z  INFO trawl_server::ingest::compaction: compaction complete event_type="compaction_complete" compact_service=trawld output=/var/lib/trawl/data/prod/2026-09-28/21/trawld.parquet wal_files=1 merged=true rows=21 conflicts=0 output_bytes=17578 duration_ms=156
+2026-09-28T21:15:38.596382Z  INFO trawl_server::ingest::compaction: compaction complete event_type="compaction_complete" compact_service=trawld output=/var/lib/trawl/data/prod/2026-09-28/21/trawld.parquet wal_files=1 merged=true rows=22 conflicts=0 output_bytes=17704 duration_ms=74
+2026-09-28T21:15:42.225719Z  INFO trawl_server::stats: periodic server stats event_type="server_stats" uptime_secs=60 total_queries=0 pool_available=16 pool_max=16 pool_active=0 pool_retained=0 sse_available=32 hot_buffer_events=1 hot_buffer_bytes=871 hot_buffer_batches=1
+2026-09-28T21:15:42.226444Z  INFO trawl_server::schema_refresh: service schema refresh complete event_type="schema_refresh_complete" services=1

@@ -1,0 +1,4 @@
+2026-09-28T21:17:34.625187Z  INFO trawl_web::config: the environment restates the configured browser-origin allowlist event_type="session_public_origins_override_matched" env="FLEET_SESSION_PUBLIC_ORIGINS" origins_count=1 origins=http://localhost:8090
+2026-09-28T21:17:34.625247Z  INFO trawl_web: loaded config config=/etc/trawl/trawld.toml bind_addr=0.0.0.0:8090 upstream=https://trawl.trawl-cm.svc.cluster.local:5514 public_origins_count=1 public_origins=http://localhost:8090
+2026-09-28T21:17:34.625315Z  INFO trawl_web::routes: SPA fallback: embedded bundle
+2026-09-28T21:17:34.625352Z  INFO trawl_web: trawl-web listening addr=0.0.0.0:8090

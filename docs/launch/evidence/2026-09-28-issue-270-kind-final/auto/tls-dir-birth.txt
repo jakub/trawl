@@ -1,0 +1,10 @@
+# Run by hand after run-leg.sh auto, 2026-09-28T21:16:45Z: who created <state_dir>/tls, and when.
+$ kubectl --context kind-trawl-270-final -n trawl-auto exec trawl-0 -c trawld -- stat -c '%n birth=%w modify=%y' /var/lib/trawl/tls /var/lib/trawl/tls/cert.pem /var/lib/trawl/tls-key
+/var/lib/trawl/tls birth=2026-09-28 21:13:56.663981230 +0000 modify=2026-09-28 21:14:42.259024748 +0000
+/var/lib/trawl/tls/cert.pem birth=2026-09-28 21:14:42.246024776 +0000 modify=2026-09-28 21:14:42.246024776 +0000
+/var/lib/trawl/tls-key birth=2026-09-28 21:14:42.223024825 +0000 modify=2026-09-28 21:14:42.236024797 +0000
+$ kubectl --context kind-trawl-270-final -n trawl-auto get pod trawl-0 -o json | jq -r '(.status.initContainerStatuses + .status.containerStatuses)[] | "\(.name) started=\(.state.terminated.startedAt // .state.running.startedAt) finished=\(.state.terminated.finishedAt // "-")"'
+init-auth started=2026-09-28T21:13:48Z finished=2026-09-28T21:13:54Z
+init-tls-dir started=2026-09-28T21:13:56Z finished=2026-09-28T21:13:56Z
+trawl-web started=2026-09-28T21:14:05Z finished=-
+trawld started=2026-09-28T21:14:05Z finished=-
