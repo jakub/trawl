@@ -1647,7 +1647,7 @@ fn doctor_redacts_the_key_from_remote_fields() {
             assert_eq!(check_by_id(&report, "api.identity")["outcome"], "complete");
             assert_eq!(
                 check_by_id(&report, "api.identity")["detail"],
-                "name: [redacted] owner [redacted]; kind: service; permissions: query, [redacted]"
+                "name: [redacted] owner [redacted]; kind: service; permissions: query; 1 unrecognized"
             );
             assert_eq!(
                 check_by_id(&report, "api.health.auth_db")["reason"],
@@ -1659,6 +1659,75 @@ fn doctor_redacts_the_key_from_remote_fields() {
             );
         }
     }
+}
+
+/// `api.identity`'s detail uses trawl's closed vocabulary. A server that
+/// splits the key into pieces too short to redact (7 characters, one
+/// fewer than the shortest redacted run), one per permission, gets none
+/// of them into the report: only exact permission names are shown, and
+/// the rest are counted. The name is the one field shown as sent, capped
+/// at 32 characters. The key base64-encoded in the name is not caught:
+/// that is the residual risk the redaction site documents, bounded by
+/// the cap, and this test pins it rather than promising otherwise.
+#[test]
+fn doctor_identity_shows_only_trawl_vocabulary() {
+    let fragments: Vec<String> = PROFILE_TOKEN
+        .as_bytes()
+        .chunks(7)
+        .map(|piece| String::from_utf8(piece.to_vec()).unwrap())
+        .collect();
+    let permissions = std::iter::once("\"ingest\"".to_owned())
+        .chain(fragments.iter().map(|piece| format!("\"{piece}\"")))
+        .chain(["\"query\"".to_owned(), "\"QUERY\"".to_owned()])
+        .collect::<Vec<_>>()
+        .join(",");
+    // base64 of PROFILE_TOKEN.
+    let encoded = "Zmx0X3Byb2ZpbGV0b2tlbnZhbHVl";
+    let who = format!(
+        r#"{{"prefix":"pfx12345","name":"key copy: {encoded}","kind":"human","roles":[],"permissions":[{permissions}]}}"#
+    );
+    let (output, _stub) = doctor_against(vec![healthy(), (WHOAMI_PATH, 200, who)]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let all = text(&output);
+    for piece in &fragments {
+        assert!(
+            !all.contains(piece.as_str()),
+            "fragment {piece} leaked: {all}"
+        );
+    }
+    let report = report(&output);
+    let identity = check_by_id(&report, "api.identity");
+    assert_eq!(identity["outcome"], "complete");
+    assert_eq!(
+        identity["detail"],
+        format!(
+            "name: key copy: {}…; kind: human; permissions: query, ingest; {} unrecognized",
+            &encoded[..22],
+            fragments.len() + 1
+        )
+    );
+}
+
+/// `kind` is one of trawl's principal kinds or the answer is not trawl's:
+/// a whoami whose `kind` is the key fails `api.identity` as a foreign
+/// answer, and neither the report nor its text quotes the value.
+#[test]
+fn doctor_unknown_kind_is_a_foreign_answer() {
+    let who = format!(
+        r#"{{"prefix":"pfx12345","name":"ops-key","kind":"{PROFILE_TOKEN}","roles":[],"permissions":["query"]}}"#
+    );
+    let (output, _stub) = doctor_against(vec![healthy(), (WHOAMI_PATH, 200, who)]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let all = text(&output);
+    assert!(!all.contains("profiletoken"), "the key leaked: {all}");
+    let report = report(&output);
+    let identity = check_by_id(&report, "api.identity");
+    assert_eq!(identity["outcome"], "failed");
+    assert_eq!(
+        identity["reason"],
+        "the answer is not a trawl whoami response"
+    );
+    assert!(identity["detail"].is_null(), "{identity}");
 }
 
 /// Run the doctor against a verified-TLS stub serving `routes`, through a

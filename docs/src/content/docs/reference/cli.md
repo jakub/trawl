@@ -423,7 +423,7 @@ The doctor runs the checks in this order. When a check's prerequisite is not
 | `api.health` | The health answer parses as a Trawl health response with the status `ok`, `degraded`, or `unavailable`, a `checks` map, and a `version`. `trawld` always sends all three. An answer without the map or the version fails with `not a trawl health answer`. A 503 answer counts | `api.tls` |
 | `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `error`, `refusing`, and every other value are `failed` | `api.health` |
 | `api.health._invalid` | The server reported a check name that is not `[a-z][a-z0-9_]{0,63}`. This row is always `failed`, and the report does not show the names. No check name starts with `_`, so this ID cannot match a server's check | `api.health` |
-| `api.identity` | `GET /api/v1/whoami` answers HTTP 200 and accepts the key. `detail` shows the key's name, kind, and permissions, never the key or its prefix. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail. Any other 2xx status fails with `unexpected status` | `api.health`, and a key selected |
+| `api.identity` | `GET /api/v1/whoami` answers HTTP 200 and accepts the key. `detail` shows the key's name, its kind, and its permissions, never the key or its prefix. The name shows at most 32 characters. The kind is `human` or `service`: any other kind fails with `the answer is not a trawl whoami response`. Only Trawl's own permission names show, such as `query` or `ingest`. Any other permission string is counted as `N unrecognized` and not shown. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail. Any other 2xx status fails with `unexpected status` | `api.health`, and a key selected |
 | `web.transport` | `GET /healthz` on `--web-url` answers HTTP 200 with the body `ok` | `--web-url` given |
 | `web.origin` | `trawl-web` accepts `--web-url` as a browser origin. The doctor sends `POST /api/auth/login` with `Origin: <web-url>` and an empty `api_key`. Only `400 {"error":"bad request"}` is `complete`. `403 {"error":"cross-origin request rejected"}` fails with `origin not in public_origins`. HTTP 429 gives `not_sampled` with the reason `rate_limited`. Any other answer fails with `not a trawl-web login endpoint` | `web.transport` |
 
@@ -433,10 +433,13 @@ host, an untrusted certificate, `insecure`, or an `http` URL never receives
 the key.
 
 The report never shows the key or its prefix, even when a server echoes
-them. In every string that a server sends, such as a key's name, a
-permission, a health check's value, or the server version, each run of 8 or
-more of the key's characters shows as `[redacted]`. A health check name that
-holds such a run counts as an invalid name.
+them. In every string that a server sends, such as a key's name, a health
+check's value, or the server version, each run of 8 or more of the key's
+characters shows as `[redacted]`. A health check name that holds such a run
+counts as an invalid name. Redaction finds only the key's own characters. A
+server that already holds the key can still send it in another form, such as
+base64, in the key's name. The 32-character limit on the name bounds how much
+of it the report shows.
 
 The `web.*` checks do not depend on the `api.*` checks, and they send no key.
 Without `--web-url`, the report has no `web.*` rows.

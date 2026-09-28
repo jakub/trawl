@@ -134,13 +134,20 @@ const KEY_RUN: usize = 8;
 pub fn display_safe(raw: &str, key: Option<&str>) -> String {
     /// The most characters of one remote string the report shows.
     const MAX_CHARS: usize = 64;
+    display_safe_within(raw, key, MAX_CHARS)
+}
+
+/// [`display_safe`] with a cap of `max_chars` characters instead of the
+/// default.
+#[must_use]
+pub fn display_safe_within(raw: &str, key: Option<&str>, max_chars: usize) -> String {
     let clean: Vec<char> = raw.chars().filter(|c| is_shown(*c)).collect();
     let key: Vec<char> = key.map(|key| key.chars().collect()).unwrap_or_default();
     let mut shown = String::new();
     let mut count = 0usize;
     let mut at = 0usize;
     while at < clean.len() {
-        if count >= MAX_CHARS {
+        if count >= max_chars {
             shown.push('…');
             break;
         }

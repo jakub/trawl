@@ -25,6 +25,7 @@
 //! the report.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use trawl_api::doctor::{Check, Outcome, reason};
@@ -32,7 +33,7 @@ use trawl_api::{HealthResponse, HealthStatus, WhoAmIResponse};
 use trawl_client::{ClientError, NetworkKind, TlsTrust};
 
 use super::resolve::{Connection, Scheme};
-use super::{display_safe, holds_key};
+use super::{display_safe, display_safe_within, holds_key};
 
 /// `api.transport`.
 pub const API_TRANSPORT: &str = "api.transport";
@@ -675,21 +676,48 @@ fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
     }
 }
 
-/// The key's name, kind and permissions, never its prefix, with every run
-/// of `secret` redacted.
+/// The most characters of the key's name the report shows.
+const NAME_MAX_CHARS: usize = 32;
+
+/// The key's name, kind and permissions, never its prefix.
+///
+/// Only the name is the server's own text. `kind` is already one of
+/// trawl's principal kinds: whoami's `kind` decodes only as `human` or
+/// `service`, so any other value fails the whole answer. Permissions are
+/// shown only when they are exactly one of trawl's permission names, in
+/// canonical order and printed from that list; anything else is counted
+/// and never shown. A key split into short pieces, one per permission,
+/// therefore never reaches the report.
 fn identity_detail(who: &WhoAmIResponse, secret: &str) -> String {
-    let permissions = if who.permissions.is_empty() {
+    let known: Vec<&str> = trawl_api::PERMISSION_NAMES
+        .iter()
+        .copied()
+        .filter(|name| who.permissions.iter().any(|p| p == name))
+        .collect();
+    let unrecognized = who
+        .permissions
+        .iter()
+        .filter(|p| !trawl_api::PERMISSION_NAMES.contains(&p.as_str()))
+        .count();
+    let mut permissions = if known.is_empty() {
         "none".to_owned()
     } else {
-        who.permissions
-            .iter()
-            .map(|p| display_safe(p, Some(secret)))
-            .collect::<Vec<_>>()
-            .join(", ")
+        known.join(", ")
     };
+    if unrecognized > 0 {
+        write!(permissions, "; {unrecognized} unrecognized").expect("writing to a String");
+    }
+    // The name is shown as the server sent it, stripped of control
+    // characters, with every literal run of the key redacted, and capped
+    // at NAME_MAX_CHARS. Redaction catches only the key's own characters:
+    // a server that already holds the key could still echo it encoded
+    // (base64, hex, reversed) in the name, and up to NAME_MAX_CHARS of
+    // that encoding would reach the report. That residual risk is
+    // accepted: such a server already has the key, and the cap bounds how
+    // much of it one report can carry.
     format!(
         "name: {}; kind: {}; permissions: {permissions}",
-        display_safe(&who.name, Some(secret)),
+        display_safe_within(&who.name, Some(secret), NAME_MAX_CHARS),
         who.kind.as_str()
     )
 }
