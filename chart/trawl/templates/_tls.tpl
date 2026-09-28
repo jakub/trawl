@@ -125,7 +125,9 @@ is false, except that auto refuses the values it would contradict.
 {{- if $web.enabled -}}
   {{- $_ := set $trust "enabled" true -}}
   {{- /* trawld's key.pem is 0600 and owned by trawld's uid. A sidecar with
-       that uid could read it, and in auto mode it shares the directory. */ -}}
+       that uid could read it. In auto mode the key is in tls-key/, outside
+       the tls/ directory the sidecar mounts, so the uid is a second
+       barrier there. */ -}}
   {{- $daemonUid := coalesce (dig "runAsUser" nil (.Values.securityContext | default dict)) (dig "runAsUser" nil (.Values.podSecurityContext | default dict)) -}}
   {{- if and $daemonUid (eq (int $daemonUid) (int $web.runAsUser)) -}}
     {{- fail (printf "web.runAsUser must differ from trawld's uid %d, so trawl-web cannot read trawld's private key" (int $daemonUid)) -}}

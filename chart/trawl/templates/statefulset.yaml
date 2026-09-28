@@ -219,8 +219,8 @@ spec:
             # subPath: that binds one inode at container start, so kubelet
             # would create a directory where a not-yet-written cert.pem
             # belongs, and a certificate replaced by rename would never
-            # reach the sidecar. Read-only, and web.runAsUser keeps the
-            # key.pem beside it unreadable.
+            # reach the sidecar. Read-only. It holds only cert.pem: trawld's
+            # key.pem is in tls-key/, outside this mount.
             - name: data
               mountPath: {{ $trust.dataMountPath | quote }}
               subPath: {{ $trust.dataSubPath | quote }}

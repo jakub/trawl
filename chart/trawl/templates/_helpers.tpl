@@ -102,10 +102,11 @@ trawl-web keep the unmodified securityContext.
 {{/*
 The trawl-web container's securityContext: the shared securityContext with
 the sidecar's own uid, web.runAsUser (ADR-0048). In tls.mode=auto the
-sidecar mounts trawld's tls directory to pin cert.pem, and key.pem sits
-next to it, 0600 and owned by trawld's uid. A separate uid keeps the key
-unreadable. The pod's runAsGroup and fsGroup still apply, and those are
-what let the sidecar read its ConfigMap and cookie Secret.
+sidecar mounts trawld's tls directory to pin cert.pem. That directory holds
+only the certificate: key.pem is in tls-key/, 0600 and owned by trawld's uid.
+A separate uid keeps the key unreadable as well. The pod's runAsGroup and
+fsGroup still apply, and those are what let the sidecar read its ConfigMap
+and cookie Secret.
 */}}
 {{- define "trawl.webSecurityContext" -}}
 {{- $sc := deepCopy (.Values.securityContext | default dict) -}}

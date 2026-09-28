@@ -66,8 +66,9 @@ two Certificates do not manage that Secret.
 
 The `trawl-web` sidecar connects to trawld over the pod's loopback and always
 verifies trawld's certificate. With `tls.mode: auto`, it mounts the `tls`
-directory of the data volume read-only and pins the generated `cert.pem`. It
-runs as `web.runAsUser`, so it cannot read the `key.pem` beside it. With
+directory of the data volume read-only and pins the generated `cert.pem`.
+trawld keeps its key in `tls-key/`, outside that mount, and the sidecar runs
+as `web.runAsUser`, a uid that cannot read the key's 0600 file. With
 `secret` or `certManager`, the sidecar requests `https://<tls.upstreamServerName>:<port>`
 and connects to `127.0.0.1:<port>`. `tls.upstreamCa` is then required:
 `secret` pins the Secret's `ca.crt`, `system` uses the platform roots, and an

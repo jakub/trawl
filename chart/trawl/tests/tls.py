@@ -220,7 +220,8 @@ class TLS(unittest.TestCase):
         self.assertEqual(data, [{"name": "data", "mountPath": "/var/lib/trawl/tls", "subPath": "tls", "readOnly": True}])
         self.assertNotIn("tls", [m["name"] for m in sidecar["volumeMounts"]])
         self.assertNotIn("upstream-ca", [v["name"] for v in pod(objects)["volumes"]])
-        # A uid of its own: trawld's key.pem (0600) sits in that directory.
+        # A uid of its own: trawld's key.pem (0600) is in tls-key/, outside
+        # that mount, and this uid could not read it either.
         self.assertEqual(sidecar["securityContext"], {
             "readOnlyRootFilesystem": True, "runAsNonRoot": True, "allowPrivilegeEscalation": False,
             "capabilities": {"drop": ["ALL"]}, "runAsUser": 1001,
