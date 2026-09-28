@@ -8,8 +8,42 @@
 //! globs `data/{env}/…`), the compactor (`ingest::compaction`, which walks
 //! both `wal/{env}/` and `data/{env}/`) and the repin engine. They must all
 //! agree on the set of envs, so the rule lives here once.
+//!
+//! [`date_partition`] extends it one level down: which `{env}/{date}`
+//! directory is a date partition. Retention deletes by it and the storage
+//! scan buckets bytes by it (ADR-0042), so the two agree on what a
+//! partition is.
 
 use std::path::{Path, PathBuf};
+
+use chrono::NaiveDate;
+
+/// Whether a top-level directory name is an env: the env charset, with the
+/// reserved names (`wal`, `scheduled`, …) excluded.
+pub(crate) fn is_env_dir_name(name: &str) -> bool {
+    trawl_config::is_valid_env_name(name) && !trawl_config::RESERVED_ENV_NAMES.contains(&name)
+}
+
+/// The date of the partition directory `{env}/{date}`, or `None` when the
+/// pair is not one: `env` must be an env directory name and `date` a
+/// `YYYY-MM-DD` calendar date.
+///
+/// The single env/date recognition rule. It says nothing about today:
+/// retention skips today's partition, the storage scan counts it.
+pub(crate) fn date_partition(env: &str, date: &str) -> Option<NaiveDate> {
+    if !is_env_dir_name(env) || !looks_like_date(date) {
+        return None;
+    }
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()
+}
+
+/// Check if a directory name looks like a date (YYYY-MM-DD).
+fn looks_like_date(name: &str) -> bool {
+    name.len() == 10
+        && name.as_bytes().get(4) == Some(&b'-')
+        && name.as_bytes().get(7) == Some(&b'-')
+        && name[..4].bytes().all(|b| b.is_ascii_digit())
+}
 
 /// Enumerate env directories under `root`, reporting an unreadable root.
 ///
@@ -64,9 +98,7 @@ pub(crate) fn try_list_env_dirs_observed(
                 return None;
             }
             let name = path.file_name()?.to_str()?.to_owned();
-            if !trawl_config::is_valid_env_name(&name)
-                || trawl_config::RESERVED_ENV_NAMES.contains(&name.as_str())
-            {
+            if !is_env_dir_name(&name) {
                 return None;
             }
             Some((name, path))
@@ -104,6 +136,36 @@ pub(crate) fn list_env_names(root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn looks_like_date_valid() {
+        assert!(looks_like_date("2026-02-13"));
+        assert!(looks_like_date("2025-01-01"));
+        assert!(looks_like_date("1999-12-31"));
+    }
+
+    #[test]
+    fn looks_like_date_invalid() {
+        assert!(!looks_like_date("wal"));
+        assert!(!looks_like_date("00"));
+        assert!(!looks_like_date("2026-1-01"));
+        assert!(!looks_like_date(""));
+        assert!(!looks_like_date("not-a-date"));
+    }
+
+    #[test]
+    fn date_partition_needs_an_env_and_a_calendar_date() {
+        let date = NaiveDate::from_ymd_opt(2026, 2, 13).unwrap();
+        assert_eq!(date_partition("prod", "2026-02-13"), Some(date));
+        // Reserved and out-of-charset env names are not envs.
+        assert_eq!(date_partition("wal", "2026-02-13"), None);
+        assert_eq!(date_partition("scheduled", "2026-02-13"), None);
+        assert_eq!(date_partition("Prod", "2026-02-13"), None);
+        // Date-shaped but not a calendar date, and not date-shaped at all.
+        assert_eq!(date_partition("prod", "2026-02-30"), None);
+        assert_eq!(date_partition("prod", "2026-2-13"), None);
+        assert_eq!(date_partition("prod", "00"), None);
+    }
 
     #[test]
     fn keeps_valid_envs_sorted_and_skips_the_rest() {

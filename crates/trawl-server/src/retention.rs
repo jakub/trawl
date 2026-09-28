@@ -831,6 +831,8 @@ fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
 /// and non-date directories. Env directories are recognised by the env
 /// charset with `wal`/`scheduled` reserved — anything else at the top
 /// level (a stray file, the EPOCH marker, a set-aside dir) is skipped.
+/// [`crate::env_dirs::date_partition`] is the recognition rule, shared
+/// with the storage scan's per-date byte buckets.
 /// Candidates are merged across envs and sorted by (date, path): a
 /// deterministic base order for phase 1, which deletes in it, and for
 /// phase 2, which re-sorts by expiry ratio with these two as tie-breaks.
@@ -848,9 +850,7 @@ fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> Result<Vec<DateDir>
         let Some(env_name) = env_path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !trawl_config::is_valid_env_name(env_name)
-            || trawl_config::RESERVED_ENV_NAMES.contains(&env_name)
-        {
+        if !crate::env_dirs::is_env_dir_name(env_name) {
             continue;
         }
         let Ok(date_entries) = std::fs::read_dir(&env_path) else {
@@ -862,10 +862,7 @@ fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> Result<Vec<DateDir>
                 return None;
             }
             let name = path.file_name()?.to_str()?;
-            if !looks_like_date(name) {
-                return None;
-            }
-            let date = NaiveDate::parse_from_str(name, "%Y-%m-%d").ok()?;
+            let date = crate::env_dirs::date_partition(env_name, name)?;
             if date == today {
                 return None;
             }
@@ -879,14 +876,6 @@ fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> Result<Vec<DateDir>
 
     dirs.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.path.cmp(&b.path)));
     Ok(dirs)
-}
-
-/// Check if a directory name looks like a date (YYYY-MM-DD).
-fn looks_like_date(name: &str) -> bool {
-    name.len() == 10
-        && name.as_bytes().get(4) == Some(&b'-')
-        && name.as_bytes().get(7) == Some(&b'-')
-        && name[..4].bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Delete a date directory and return the bytes freed.
@@ -1056,22 +1045,6 @@ mod tests {
             Some(u64::MAX),
             "the global saturates the same way"
         );
-    }
-
-    #[test]
-    fn looks_like_date_valid() {
-        assert!(looks_like_date("2026-02-13"));
-        assert!(looks_like_date("2025-01-01"));
-        assert!(looks_like_date("1999-12-31"));
-    }
-
-    #[test]
-    fn looks_like_date_invalid() {
-        assert!(!looks_like_date("wal"));
-        assert!(!looks_like_date("00"));
-        assert!(!looks_like_date("2026-1-01"));
-        assert!(!looks_like_date(""));
-        assert!(!looks_like_date("not-a-date"));
     }
 
     #[test]

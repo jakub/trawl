@@ -771,6 +771,56 @@ struct StorageTotals {
     bytes: u64,
 }
 
+/// One storage walk: its flat totals and, for the Parquet tree, the same
+/// bytes split by date partition (ADR-0042).
+///
+/// Every counted byte lands in exactly one place, so the partition bytes
+/// plus `unattributed_bytes` always equal `totals.bytes`. A Parquet file
+/// at any depth under a `{env}/{date}/` partition
+/// ([`crate::env_dirs::date_partition`]) counts toward that partition.
+/// Any other counted file is unattributed: a stray top-level Parquet file,
+/// one under a non-date directory, and every WAL file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StorageScan {
+    totals: StorageTotals,
+    pub(crate) env_dates: crate::capacity::EnvDateBytes,
+    pub(crate) unattributed_bytes: u64,
+}
+
+impl StorageScan {
+    fn count(&mut self, partition: Partition<'_>, bytes: u64) {
+        self.totals.files += 1;
+        self.totals.bytes += bytes;
+        match partition {
+            Partition::Date(env, date) => {
+                *self.env_dates.entry((env.to_owned(), date)).or_default() += bytes;
+            }
+            Partition::Root | Partition::Env(_) | Partition::Unattributed => {
+                self.unattributed_bytes += bytes;
+            }
+        }
+    }
+}
+
+/// A cached sample that carries a file and byte total.
+trait StorageSample: Clone {
+    fn totals(&self) -> StorageTotals;
+}
+
+impl StorageSample for StorageTotals {
+    fn totals(&self) -> StorageTotals {
+        *self
+    }
+}
+
+/// The Parquet cache holds the whole scan behind an `Arc`, so a reader
+/// never clones the partition map under the cache lock.
+impl StorageSample for Arc<StorageScan> {
+    fn totals(&self) -> StorageTotals {
+        self.totals
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CompleteStorageSample<T> {
     value: T,
@@ -822,10 +872,10 @@ pub(crate) struct StorageSnapshot {
     pub measurement: trawl_api::StorageMeasurement,
 }
 
-impl StorageCache<StorageTotals> {
+impl<T: StorageSample> StorageCache<T> {
     fn snapshot(&self, configured: bool, now: Instant) -> StorageSnapshot {
-        let (measurement, totals) = self.read(configured, now);
-        let totals = totals.unwrap_or_default();
+        let (measurement, sample) = self.read(configured, now);
+        let totals = sample.map(|sample| sample.totals()).unwrap_or_default();
         StorageSnapshot {
             files: totals.files,
             bytes: totals.bytes,
@@ -905,8 +955,8 @@ impl<T: Clone> StorageCache<T> {
     }
 }
 
-fn parquet_cache() -> &'static StorageCache<StorageTotals> {
-    static CACHE: OnceLock<StorageCache<StorageTotals>> = OnceLock::new();
+fn parquet_cache() -> &'static StorageCache<Arc<StorageScan>> {
+    static CACHE: OnceLock<StorageCache<Arc<StorageScan>>> = OnceLock::new();
     CACHE.get_or_init(StorageCache::default)
 }
 
@@ -979,8 +1029,8 @@ fn data_root(fallback_glob: &str) -> &Path {
 fn collect_parquet_gauges(base: &Path) {
     parquet_cache().collect(
         Instant::now,
-        || scan_storage(base, StorageKind::Parquet),
-        |totals| publish_storage_gauges(StorageKind::Parquet, totals),
+        || scan_storage(base, StorageKind::Parquet).map(Arc::new),
+        |scan| publish_storage_gauges(StorageKind::Parquet, scan.totals),
     );
 }
 
@@ -1100,6 +1150,41 @@ impl StorageKind {
     }
 }
 
+/// Where a walked directory sits in the `{env}/{date}/…` layout.
+#[derive(Clone, Copy)]
+enum Partition<'a> {
+    /// The Parquet root: a child directory may be an env.
+    Root,
+    /// A root child: a child directory may be a date partition.
+    Env(&'a str),
+    /// A date partition, at any depth below it.
+    Date(&'a str, chrono::NaiveDate),
+    /// Anywhere else, and the whole WAL tree.
+    Unattributed,
+}
+
+impl StorageKind {
+    /// The WAL is never bucketed: its partitions are not retention's.
+    fn root_partition(self) -> Partition<'static> {
+        match self {
+            Self::Parquet => Partition::Root,
+            Self::Wal => Partition::Unattributed,
+        }
+    }
+}
+
+/// The partition of `parent`'s child directory `name`. A non-UTF-8 name is
+/// no env and no date.
+fn child_partition<'a>(parent: Partition<'a>, name: Option<&'a str>) -> Partition<'a> {
+    match parent {
+        Partition::Root => name.map_or(Partition::Unattributed, Partition::Env),
+        Partition::Env(env) => name
+            .and_then(|name| crate::env_dirs::date_partition(env, name))
+            .map_or(Partition::Unattributed, |date| Partition::Date(env, date)),
+        Partition::Date(..) | Partition::Unattributed => parent,
+    }
+}
+
 /// Operations at which tests can inject faults or remove real descendants.
 /// Production still uses the same filesystem calls and error policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1112,7 +1197,7 @@ enum StorageWalkOp {
     CompleteRoot,
 }
 
-fn scan_storage(root: &Path, kind: StorageKind) -> std::io::Result<StorageTotals> {
+fn scan_storage(root: &Path, kind: StorageKind) -> std::io::Result<StorageScan> {
     scan_storage_with(root, kind, &mut |_, _| Ok(()))
 }
 
@@ -1120,8 +1205,9 @@ fn scan_storage_with(
     root: &Path,
     kind: StorageKind,
     before: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
-) -> std::io::Result<StorageTotals> {
-    let totals = scan_storage_dir(root, root, kind, before)?;
+) -> std::io::Result<StorageScan> {
+    let mut scan = StorageScan::default();
+    scan_storage_dir(root, root, kind, kind.root_partition(), &mut scan, before)?;
     // Even a successful empty traversal must finish with an enumerable root.
     // Consume entries as read_dir can succeed and subsequently yield an error.
     before(StorageWalkOp::CompleteRoot, root)?;
@@ -1129,7 +1215,12 @@ fn scan_storage_with(
         before(StorageWalkOp::Entry, root)?;
         entry?;
     }
-    Ok(totals)
+    debug_assert_eq!(
+        scan.env_dates.values().sum::<u64>() + scan.unattributed_bytes,
+        scan.totals.bytes,
+        "every counted byte is bucketed exactly once"
+    );
+    Ok(scan)
 }
 
 fn confirmed_absent(
@@ -1145,20 +1236,21 @@ fn confirmed_absent(
             .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// Walk `dir`, counting into `scan`. A failed walk's partial counts are
+/// discarded with the scan, never published.
 fn scan_storage_dir(
     root: &Path,
     dir: &Path,
     kind: StorageKind,
+    partition: Partition<'_>,
+    scan: &mut StorageScan,
     before: &mut impl FnMut(StorageWalkOp, &Path) -> std::io::Result<()>,
-) -> std::io::Result<StorageTotals> {
+) -> std::io::Result<()> {
     let entries = match before(StorageWalkOp::ReadDir, dir).and_then(|()| std::fs::read_dir(dir)) {
         Ok(entries) => entries,
-        Err(error) if confirmed_absent(root, dir, &error, before) => {
-            return Ok(StorageTotals::default());
-        }
+        Err(error) if confirmed_absent(root, dir, &error, before) => return Ok(()),
         Err(error) => return Err(error),
     };
-    let mut totals = StorageTotals::default();
     for entry in entries {
         // An iterator failure has no trustworthy descendant path. Never excuse
         // it as a disappearing file, even when its error kind is NotFound.
@@ -1172,9 +1264,9 @@ fn scan_storage_dir(
                 Err(error) => return Err(error),
             };
         if file_type.is_dir() && !kind.excluded_dir(&path) {
-            let child = scan_storage_dir(root, &path, kind, before)?;
-            totals.files += child.files;
-            totals.bytes += child.bytes;
+            let name = entry.file_name();
+            let child = child_partition(partition, name.to_str());
+            scan_storage_dir(root, &path, kind, child, scan, before)?;
         } else if file_type.is_file() && kind.selected(&path) {
             let metadata =
                 match before(StorageWalkOp::Metadata, &path).and_then(|()| entry.metadata()) {
@@ -1182,18 +1274,17 @@ fn scan_storage_dir(
                     Err(error) if confirmed_absent(root, &path, &error, before) => continue,
                     Err(error) => return Err(error),
                 };
-            totals.files += 1;
-            totals.bytes += metadata.len();
+            scan.count(partition, metadata.len());
         }
     }
-    Ok(totals)
+    Ok(())
 }
 
 /// WAL and Parquet use separate owners, but the same invariant implementation.
 fn collect_wal_gauges(wal_dir: &Path) {
     wal_cache().collect(
         Instant::now,
-        || scan_storage(wal_dir, StorageKind::Wal),
+        || scan_storage(wal_dir, StorageKind::Wal).map(|scan| scan.totals),
         |totals| publish_storage_gauges(StorageKind::Wal, totals),
     );
 }
@@ -1522,7 +1613,7 @@ mod tests {
         ] {
             let tmp = tempfile::tempdir().unwrap();
             assert_eq!(
-                scan_storage(tmp.path(), kind).unwrap(),
+                scan_storage(tmp.path(), kind).unwrap().totals,
                 StorageTotals::default()
             );
             let env = tmp.path().join("prod");
@@ -1530,7 +1621,7 @@ mod tests {
             std::fs::write(env.join(format!("selected.{extension}")), "123").unwrap();
             std::fs::write(env.join("ignored.tmp"), "12345").unwrap();
             assert_eq!(
-                scan_storage(tmp.path(), kind).unwrap(),
+                scan_storage(tmp.path(), kind).unwrap().totals,
                 StorageTotals { files: 1, bytes: 3 }
             );
             let absent = tmp.path().join("query-only-archive-not-created");
@@ -1542,9 +1633,98 @@ mod tests {
         std::fs::create_dir(tmp.path().join("scheduled")).unwrap();
         std::fs::write(tmp.path().join("scheduled/report.parquet"), "123").unwrap();
         assert_eq!(
-            scan_storage(tmp.path(), StorageKind::Parquet).unwrap(),
+            scan_storage(tmp.path(), StorageKind::Parquet)
+                .unwrap()
+                .totals,
             StorageTotals::default()
         );
+    }
+
+    #[test]
+    fn storage_scan_buckets_env_date_bytes() {
+        use chrono::NaiveDate;
+        use std::collections::BTreeMap;
+        let date = |day| NaiveDate::from_ymd_opt(2026, 9, day).unwrap();
+        let bucket = |env: &str, day| (env.to_owned(), date(day));
+        let write = |root: &Path, path: &str, bytes: usize| {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; bytes]).unwrap();
+        };
+        let assert_invariant = |scan: &StorageScan| {
+            assert_eq!(
+                scan.env_dates.values().sum::<u64>() + scan.unattributed_bytes,
+                scan.totals.bytes,
+                "{scan:?}"
+            );
+        };
+
+        // A valid layout: hourly files under {env}/{date}/{hour}/, daily
+        // files under {env}/{date}/, a non-Parquet sibling, and saved
+        // report output under scheduled/.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "prod/2026-09-20/00/nginx.parquet", 10);
+        write(root, "prod/2026-09-20/01/nginx.parquet", 20);
+        write(root, "prod/2026-09-20/nginx.parquet.tmp", 999);
+        write(root, "prod/2026-09-19/nginx.parquet", 100);
+        write(root, "prod/2026-09-19/api.parquet", 1);
+        write(root, "lab/2026-09-20/api.parquet", 7);
+        write(root, "lab/2026-09-20/03/api.parquet", 3);
+        write(root, "scheduled/report.parquet", 5_000);
+        write(root, "scheduled/2026-09-20/report.parquet", 5_000);
+
+        let scan = scan_storage(root, StorageKind::Parquet).unwrap();
+        let buckets = BTreeMap::from([
+            (bucket("lab", 20), 10),
+            (bucket("prod", 19), 101),
+            (bucket("prod", 20), 30),
+        ]);
+        assert_eq!(
+            scan.totals,
+            StorageTotals {
+                files: 6,
+                bytes: 141
+            }
+        );
+        assert_eq!(scan.env_dates, buckets);
+        assert_eq!(scan.unattributed_bytes, 0);
+        assert_invariant(&scan);
+
+        // Parquet outside a date partition is counted but unattributed: a
+        // stray top-level file, one directly under an env, one under a
+        // non-date directory, and one under a reserved name.
+        write(root, "stray.parquet", 11);
+        write(root, "prod/stray.parquet", 17);
+        write(root, "prod/not-a-date/x.parquet", 5);
+        write(root, "prod/2026-02-30/x.parquet", 19);
+        write(root, "wal/2026-09-20/x.parquet", 13);
+        let scan = scan_storage(root, StorageKind::Parquet).unwrap();
+        assert_eq!(
+            scan.totals,
+            StorageTotals {
+                files: 11,
+                bytes: 206
+            }
+        );
+        assert_eq!(scan.env_dates, buckets, "stray files never join a bucket");
+        assert_eq!(scan.unattributed_bytes, 65);
+        assert_invariant(&scan);
+
+        // The WAL never buckets, even laid out as {env}/{date}/.
+        write(root, "prod/2026-09-20/batch.ndjson", 8);
+        write(root, "stray.ndjson", 4);
+        let wal = scan_storage(root, StorageKind::Wal).unwrap();
+        assert_eq!(
+            wal.totals,
+            StorageTotals {
+                files: 2,
+                bytes: 12
+            }
+        );
+        assert!(wal.env_dates.is_empty());
+        assert_eq!(wal.unattributed_bytes, 12);
+        assert_invariant(&wal);
     }
 
     #[test]
@@ -1567,7 +1747,11 @@ mod tests {
                 std::fs::write(nested.join(format!("events.{extension}")), "12345").unwrap();
                 let cache = StorageCache::default();
                 let now = Instant::now();
-                cache.collect(|| now, || scan_storage(tmp.path(), kind), |_| {});
+                cache.collect(
+                    || now,
+                    || scan_storage(tmp.path(), kind).map(|scan| scan.totals),
+                    |_| {},
+                );
                 cache.collect(
                     || now + Duration::from_secs(30),
                     || {
@@ -1578,6 +1762,7 @@ mod tests {
                                 Ok(())
                             }
                         })
+                        .map(|scan| scan.totals)
                     },
                     |totals| assert_eq!(totals, StorageTotals { files: 1, bytes: 5 }),
                 );
@@ -1624,7 +1809,8 @@ mod tests {
                     }
                     Ok(())
                 })
-                .unwrap();
+                .unwrap()
+                .totals;
                 assert_eq!(totals, StorageTotals::default());
             }
             let tmp = tempfile::tempdir().unwrap();
@@ -1665,7 +1851,10 @@ mod tests {
                 .is_err()
             );
             std::fs::create_dir(&root).unwrap();
-            assert_eq!(scan_storage(&root, kind).unwrap(), StorageTotals::default());
+            assert_eq!(
+                scan_storage(&root, kind).unwrap().totals,
+                StorageTotals::default()
+            );
         }
     }
 
@@ -1678,7 +1867,7 @@ mod tests {
         let now = Instant::now();
         cache.collect(
             || now,
-            || scan_storage(&root, StorageKind::Parquet),
+            || scan_storage(&root, StorageKind::Parquet).map(|scan| scan.totals),
             |_| panic!("absent archive was not measured"),
         );
         assert_storage(
@@ -2015,7 +2204,7 @@ mod tests {
                 .expect("write corrupt file");
         }
 
-        let totals = scan_storage(wal_dir, StorageKind::Wal).unwrap();
+        let totals = scan_storage(wal_dir, StorageKind::Wal).unwrap().totals;
         assert_eq!(totals.files, 2);
         assert_eq!(totals.bytes, 6);
     }
