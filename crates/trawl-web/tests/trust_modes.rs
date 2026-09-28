@@ -86,3 +86,87 @@ fn fleet_dev_pins_the_dev_certificate() {
         .expect("the starter config names no [server] certificate, so trawld generates one");
     assert_eq!(Path::new(pinned), generated);
 }
+
+/// Every file under `path`, depth first. Symlinks are not followed, and
+/// build output (`target/`, `node_modules/`) and `skip` are left out.
+fn walk(path: &Path, skip: &[PathBuf], files: &mut Vec<PathBuf>) {
+    if skip.iter().any(|skipped| skipped == path) {
+        return;
+    }
+    let metadata =
+        std::fs::symlink_metadata(path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    if metadata.is_file() {
+        files.push(path.to_owned());
+        return;
+    }
+    if !metadata.is_dir()
+        || path
+            .file_name()
+            .is_some_and(|name| name == "target" || name == "node_modules")
+    {
+        return;
+    }
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+        .unwrap_or_else(|e| panic!("list {}: {e}", path.display()))
+        .map(|entry| entry.expect("a directory entry").path())
+        .collect();
+    entries.sort();
+    for entry in entries {
+        walk(&entry, skip, files);
+    }
+}
+
+/// The unverified-upstream switch is deleted, not deprecated (ADR-0048).
+///
+/// No code reads it and nothing shipped may mention it: a config line, a
+/// chart value, a dev-stack entry or a doc that names it would teach an
+/// operator a setting that does nothing. The needle is spelled in two
+/// parts so this file does not match itself; the trial's absence checks
+/// and `packaging.sh` rule 11 split it the same way.
+///
+/// `docs/launch/evidence/` is out of scope: it holds dated records of what
+/// earlier builds did, and a record is not rewritten.
+#[test]
+fn insecure_upstream_switch_is_gone() {
+    const NEEDLE: &str = concat!("TRAWL_WEB_", "INSECURE_UPSTREAM");
+    let root = repo_root();
+    let skip = [root.join("docs/launch/evidence")];
+    let mut files = Vec::new();
+    for scanned in [
+        "crates",
+        "chart",
+        "fleet-dev.toml",
+        "docs/src",
+        "docs/releases",
+    ] {
+        walk(&root.join(scanned), &skip, &mut files);
+    }
+    assert!(
+        files.len() > 100,
+        "the scan must cover the tree; it found {} files",
+        files.len()
+    );
+
+    let mut hits = Vec::new();
+    for file in &files {
+        let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        // A NUL byte marks a binary file, as git decides it.
+        if bytes.contains(&0) {
+            continue;
+        }
+        for (index, line) in bytes.split(|&byte| byte == b'\n').enumerate() {
+            if line
+                .windows(NEEDLE.len())
+                .any(|window| window == NEEDLE.as_bytes())
+            {
+                let relative = file.strip_prefix(&root).unwrap_or(file);
+                hits.push(format!("{}:{}", relative.display(), index + 1));
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "{NEEDLE} was removed (ADR-0048) but is still mentioned at:\n{}",
+        hits.join("\n")
+    );
+}
