@@ -1589,6 +1589,64 @@ fn doctor_health_rows_map_values() {
     );
 }
 
+/// A server that echoes the key back never gets it into the report. The
+/// stub's whoami puts the bearer token in the key's name and in a
+/// permission (with a control character spliced in), and the key's prefix
+/// (the 8 characters after `flt_`) in the name; its health answer uses the
+/// prefix as a check name and a piece of the key as a value and a version.
+/// Neither the key nor its prefix appears in the text or the JSON report.
+#[test]
+fn doctor_redacts_the_key_from_remote_fields() {
+    let home = Sandbox::new();
+    let server_ca = ca("trawl doctor server CA");
+    let pem = home.file("ca.pem", &server_ca.pem());
+    let body = PROFILE_TOKEN.strip_prefix("flt_").unwrap();
+    let prefix = &body[..8];
+    let spliced = format!("{}\\u001b{}", &PROFILE_TOKEN[..9], &PROFILE_TOKEN[9..]);
+    let health = format!(
+        r#"{{"status":"ok","checks":{{"duckdb":"ok","{prefix}":"ok","auth_db":"{body}"}},"version":"{PROFILE_TOKEN}"}}"#
+    );
+    let who = format!(
+        r#"{{"prefix":"{prefix}","name":"{PROFILE_TOKEN} owner {prefix}","kind":"service","roles":[],"permissions":["query","{spliced}"]}}"#
+    );
+    let stub = Stub::tls(
+        leaf(&server_ca),
+        vec![(HEALTH_PATH, 200, health), (WHOAMI_PATH, 200, who)],
+    );
+    profile(
+        &home,
+        "prod",
+        &stub.url("https"),
+        &format!("ca_cert = \"{}\"", pem.display()),
+    );
+    for format in ["json", "table"] {
+        let output = home.trawl(&["doctor", "-p", "prod", "--format", format], &[]);
+        let all = text(&output);
+        assert!(!all.contains(prefix), "{format}: the prefix leaked: {all}");
+        assert!(!all.contains(body), "{format}: the key leaked: {all}");
+        assert!(
+            all.contains("[redacted] owner [redacted]"),
+            "{format}: {all}"
+        );
+        if format == "json" {
+            let report = report(&output);
+            assert_eq!(check_by_id(&report, "api.identity")["outcome"], "complete");
+            assert_eq!(
+                check_by_id(&report, "api.identity")["detail"],
+                "name: [redacted] owner [redacted]; kind: service; permissions: query, [redacted]"
+            );
+            assert_eq!(
+                check_by_id(&report, "api.health.auth_db")["reason"],
+                "unrecognized value"
+            );
+            assert_eq!(
+                check_by_id(&report, "api.health.invalid_key")["outcome"],
+                "failed"
+            );
+        }
+    }
+}
+
 /// The versioned JSON document for a pass, a fail, and an incomplete run,
 /// and the text form of the fail. Ports and the CLI's own version are
 /// replaced by placeholders, so the snapshots hold only the contract.

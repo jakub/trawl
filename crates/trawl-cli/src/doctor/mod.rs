@@ -113,30 +113,89 @@ impl ClientCheck {
     }
 }
 
+/// What a run of the key shows as in the report.
+pub const REDACTED: &str = "[redacted]";
+
+/// The shortest run of the key's characters that is redacted. It is the
+/// length of the prefix `fleet-auth` derives from a key (the first 8
+/// characters after `flt_`), so that prefix, the whole key, and any longer
+/// piece of it are all caught; a shorter key is redacted whole.
+const KEY_RUN: usize = 8;
+
 /// Strip control and bidirectional-formatting characters from a string a
-/// remote party sent, and cap its length, before the report shows it.
+/// remote party sent, redact every run of `key` in what is left, and cap
+/// the length, before the report shows it.
+///
+/// A run is any stretch of at least [`KEY_RUN`] characters that also
+/// appears in the key. Redaction runs after stripping, so control
+/// characters spliced into the key do not hide it, and before the cap, so
+/// the cap never leaves a piece of the key behind.
 #[must_use]
-pub fn display_safe(raw: &str) -> String {
+pub fn display_safe(raw: &str, key: Option<&str>) -> String {
     /// The most characters of one remote string the report shows.
     const MAX_CHARS: usize = 64;
-    let mut clean: String = raw
-        .chars()
-        .filter(|c| {
-            !c.is_control()
-                && !matches!(
-                    c,
-                    '\u{200b}'..='\u{200f}'
-                        | '\u{202a}'..='\u{202e}'
-                        | '\u{2060}'..='\u{2069}'
-                        | '\u{feff}'
-                )
-        })
-        .collect();
-    if let Some((cut, _)) = clean.char_indices().nth(MAX_CHARS) {
-        clean.truncate(cut);
-        clean.push('…');
+    let clean: Vec<char> = raw.chars().filter(|c| is_shown(*c)).collect();
+    let key: Vec<char> = key.map(|key| key.chars().collect()).unwrap_or_default();
+    let mut shown = String::new();
+    let mut count = 0usize;
+    let mut at = 0usize;
+    while at < clean.len() {
+        if count >= MAX_CHARS {
+            shown.push('…');
+            break;
+        }
+        let run = key_run(&clean[at..], &key);
+        if run > 0 {
+            shown.push_str(REDACTED);
+            count += REDACTED.len();
+            at += run;
+        } else {
+            shown.push(clean[at]);
+            count += 1;
+            at += 1;
+        }
     }
-    clean
+    shown
+}
+
+/// Whether `raw`, with control and formatting characters stripped, holds a
+/// run of `key` that [`display_safe`] would redact.
+#[must_use]
+pub fn holds_key(raw: &str, key: Option<&str>) -> bool {
+    let Some(key) = key else { return false };
+    let clean: Vec<char> = raw.chars().filter(|c| is_shown(*c)).collect();
+    let key: Vec<char> = key.chars().collect();
+    (0..clean.len()).any(|at| key_run(&clean[at..], &key) > 0)
+}
+
+/// Whether the report may show `c`: not a control or bidirectional
+/// formatting character.
+fn is_shown(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'
+        )
+}
+
+/// The length of the longest start of `text` that appears somewhere in
+/// `key`, when that is a redactable run, else 0.
+fn key_run(text: &[char], key: &[char]) -> usize {
+    let shortest = key.len().min(KEY_RUN);
+    if shortest == 0 {
+        return 0;
+    }
+    let mut longest = 0;
+    // A piece of a piece of the key is a piece of the key, so the first
+    // length that is not one ends the search.
+    for len in 1..=text.len().min(key.len()) {
+        if key.windows(len).any(|piece| piece == &text[..len]) {
+            longest = len;
+        } else {
+            break;
+        }
+    }
+    if longest >= shortest { longest } else { 0 }
 }
 
 /// Output format for the report.
@@ -535,13 +594,51 @@ mod tests {
 
     #[test]
     fn display_safe_strips_controls_and_caps() {
-        assert_eq!(display_safe("ops-key"), "ops-key");
-        assert_eq!(display_safe("a\u{1b}[31mb\r\nc"), "a[31mbc");
-        assert_eq!(display_safe("evil\u{202e}txt\u{200b}"), "eviltxt");
+        assert_eq!(display_safe("ops-key", None), "ops-key");
+        assert_eq!(display_safe("a\u{1b}[31mb\r\nc", None), "a[31mbc");
+        assert_eq!(display_safe("evil\u{202e}txt\u{200b}", None), "eviltxt");
         let long = "x".repeat(200);
-        let shown = display_safe(&long);
+        let shown = display_safe(&long, None);
         assert_eq!(shown.chars().count(), 65);
         assert!(shown.ends_with('…'));
+        assert_eq!(display_safe(&"x".repeat(64), None), "x".repeat(64));
+    }
+
+    /// The key, its `fleet-auth` prefix, and any piece of 8 or more of its
+    /// characters are redacted, also when control characters are spliced
+    /// into them or the piece straddles the length cap. Shorter pieces
+    /// stay, and so does everything without a key.
+    #[test]
+    fn display_safe_redacts_the_key() {
+        const KEY: &str = "flt_Ab3dEf9hIjKlMnOpQrStUvWxYz0123456789-_abcde";
+        let key = Some(KEY);
+        assert_eq!(display_safe(KEY, key), REDACTED);
+        assert_eq!(
+            display_safe("owner Ab3dEf9h (prefix)", key),
+            "owner [redacted] (prefix)"
+        );
+        assert_eq!(
+            display_safe("x flt_Ab3d\u{1b}Ef9hIjKl\u{200b}Mn y", key),
+            "x [redacted] y"
+        );
+        assert_eq!(display_safe("Ab3dEf9", key), "Ab3dEf9");
+        assert_eq!(display_safe("ops-key", key), "ops-key");
+        let straddle = format!("{}{KEY}", "x".repeat(60));
+        let shown = display_safe(&straddle, key);
+        assert_eq!(shown, format!("{}{REDACTED}", "x".repeat(60)));
+        let beyond = format!("{}{KEY}", "x".repeat(64));
+        let shown = display_safe(&beyond, key);
+        assert!(
+            !shown.contains("flt_Ab3d") && shown.ends_with('…'),
+            "{shown}"
+        );
+        // A key shorter than the run is redacted whole.
+        assert_eq!(display_safe("a tiny b", Some("tiny")), "a [redacted] b");
+
+        assert!(holds_key("check_Ab3dEf9h", key));
+        assert!(holds_key("Ab3d\u{1b}Ef9h", key));
+        assert!(!holds_key("duckdb", key));
+        assert!(!holds_key("Ab3dEf9h", None));
     }
 
     #[test]

@@ -431,6 +431,12 @@ unkeyed health request got a Trawl health answer under verified TLS. A wrong
 host, an untrusted certificate, `insecure`, or an `http` URL never receives
 the key.
 
+The report never shows the key or its prefix, even when a server echoes
+them. In every string that a server sends, such as a key's name, a
+permission, a health check's value, or the server version, each run of 8 or
+more of the key's characters shows as `[redacted]`. A health check name that
+holds such a run counts as an invalid name.
+
 The `web.*` checks do not depend on the `api.*` checks, and they send no key.
 Without `--web-url`, the report has no `web.*` rows.
 

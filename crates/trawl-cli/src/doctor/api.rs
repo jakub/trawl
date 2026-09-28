@@ -19,7 +19,10 @@
 //! Every outcome is decided from [`ClientError::network_kind`] or a
 //! [`ClientError::Server`] status, never from an error's text, and no
 //! error's `Display` or `Debug` reaches the report. Strings the server sent
-//! pass through [`display_safe`] first.
+//! pass through [`display_safe`] first, which also redacts any run of the
+//! selected key: a server that echoes the key, or its prefix, in a name, a
+//! permission, a check name or value, or its version does not get it into
+//! the report.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
@@ -28,8 +31,8 @@ use trawl_api::doctor::{Check, Outcome, reason};
 use trawl_api::{HealthResponse, HealthStatus, WhoAmIResponse};
 use trawl_client::{ClientError, NetworkKind, TlsTrust};
 
-use super::display_safe;
 use super::resolve::{Connection, Scheme};
+use super::{display_safe, holds_key};
 
 /// `api.transport`.
 pub const API_TRANSPORT: &str = "api.transport";
@@ -348,6 +351,14 @@ impl<'a> ApiRun<'a> {
         }
     }
 
+    /// The selected key's secret, for redaction.
+    fn secret(&self) -> Option<&'a str> {
+        self.connection
+            .key
+            .as_ref()
+            .map(super::resolve::Key::secret)
+    }
+
     /// `api.health` and its `api.health.<key>` rows, from the probe's
     /// answer. The runner calls it only after `api.tls` completed. A trawl
     /// health body, one that parses and carries both `checks` and
@@ -377,15 +388,16 @@ impl<'a> ApiRun<'a> {
             HealthStatus::Degraded => "degraded",
             HealthStatus::Unavailable => "unavailable",
         };
+        let secret = self.secret();
         let mut detail = format!("status: {status}");
         if let Some(version) = &health.version {
+            let shown = display_safe(version, secret);
             detail.push_str("; server version ");
-            detail.push_str(&display_safe(version));
+            detail.push_str(&shown);
             let cli = env!("CARGO_PKG_VERSION");
             if version != cli {
                 self.notes.push(format!(
-                    "this CLI is version {cli} and the server reports version {}",
-                    display_safe(version)
+                    "this CLI is version {cli} and the server reports version {shown}"
                 ));
             }
         }
@@ -396,7 +408,7 @@ impl<'a> ApiRun<'a> {
         }];
         // The witness exists, so the answer carried a checks map.
         if let Some(checks) = &health.checks {
-            rows.extend(health_rows(checks));
+            rows.extend(health_rows(checks, secret));
         }
         self.health = Some(health);
         rows
@@ -427,7 +439,7 @@ impl<'a> ApiRun<'a> {
         match result {
             Ok(who) => {
                 check.outcome = Outcome::Complete;
-                check.detail = Some(identity_detail(&who));
+                check.detail = Some(identity_detail(&who, key.secret()));
                 self.identity = Some(who);
                 check
             }
@@ -574,13 +586,13 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
 }
 
 /// One row per check name the server reports, sorted by name. Names that
-/// are not identifiers become one `api.health.invalid_key` row, and none of
-/// them is echoed.
-fn health_rows(checks: &HashMap<String, String>) -> Vec<Check> {
+/// are not identifiers, or that hold a run of the key, become one
+/// `api.health.invalid_key` row, and none of them is echoed.
+fn health_rows(checks: &HashMap<String, String>, secret: Option<&str>) -> Vec<Check> {
     let mut named = BTreeMap::new();
     let mut invalid = 0usize;
     for (name, value) in checks {
-        if is_health_key(name) {
+        if is_health_key(name) && !holds_key(name, secret) {
             named.insert(name.as_str(), value.as_str());
         } else {
             invalid += 1;
@@ -588,7 +600,7 @@ fn health_rows(checks: &HashMap<String, String>) -> Vec<Check> {
     }
     let mut rows: Vec<Check> = named
         .into_iter()
-        .map(|(name, value)| health_row(name, value))
+        .map(|(name, value)| health_row(name, value, secret))
         .collect();
     if invalid > 0 {
         rows.push(with_next(
@@ -605,7 +617,7 @@ fn health_rows(checks: &HashMap<String, String>) -> Vec<Check> {
     rows
 }
 
-fn health_row(name: &str, value: &str) -> Check {
+fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
     let id = format!("{API_HEALTH_KEY_PREFIX}{name}");
     match value {
         "ok" => Check {
@@ -616,7 +628,7 @@ fn health_row(name: &str, value: &str) -> Check {
             with_reason(row(&id, Outcome::Failed), format!("reported {value}")),
             format!("read the server's log for why {name} reports {value}"),
         ),
-        other if is_quotable_value(other) => with_next(
+        other if is_quotable_value(other) && !holds_key(other, secret) => with_next(
             with_reason(
                 row(&id, Outcome::Failed),
                 format!("reported {other}, a value this CLI does not know"),
@@ -630,20 +642,21 @@ fn health_row(name: &str, value: &str) -> Check {
     }
 }
 
-/// The key's name, kind and permissions, never its prefix.
-fn identity_detail(who: &WhoAmIResponse) -> String {
+/// The key's name, kind and permissions, never its prefix, with every run
+/// of `secret` redacted.
+fn identity_detail(who: &WhoAmIResponse, secret: &str) -> String {
     let permissions = if who.permissions.is_empty() {
         "none".to_owned()
     } else {
         who.permissions
             .iter()
-            .map(|p| display_safe(p))
+            .map(|p| display_safe(p, Some(secret)))
             .collect::<Vec<_>>()
             .join(", ")
     };
     format!(
         "name: {}; kind: {}; permissions: {permissions}",
-        display_safe(&who.name),
+        display_safe(&who.name, Some(secret)),
         who.kind.as_str()
     )
 }
@@ -677,7 +690,7 @@ mod tests {
             ("Bad-Key".to_owned(), "ok".to_owned()),
             ("x\u{202e}y".to_owned(), "ok".to_owned()),
         ]);
-        let rows = health_rows(&checks);
+        let rows = health_rows(&checks, None);
         let summary: Vec<(&str, Outcome, Option<&str>)> = rows
             .iter()
             .map(|c| (c.id.as_str(), c.outcome, c.reason.as_deref()))
@@ -722,7 +735,7 @@ mod tests {
             roles: vec!["admin".to_owned()],
             permissions: vec!["query".to_owned(), "ingest".to_owned()],
         };
-        let detail = identity_detail(&who);
+        let detail = identity_detail(&who, "flt_pfx12345restofthekey");
         assert_eq!(
             detail,
             "name: ops[2Jkey; kind: service; permissions: query, ingest"
