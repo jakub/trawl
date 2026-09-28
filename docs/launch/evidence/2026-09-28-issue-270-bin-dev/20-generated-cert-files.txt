@@ -1,0 +1,25 @@
+# Recorded while bin/dev was running, after the sign-in.
+$ ls -ln ~/.trawl/tls ~/.trawl/tls-key
+/home/jakub/.trawl/tls:
+total 4
+-rw-r--r-- 1 1000 1000 566 Sep 28 11:56 cert.pem
+
+/home/jakub/.trawl/tls-key:
+total 4
+-rw------- 1 1000 1000 241 Sep 28 11:56 key.pem
+$ stat -c '%A %a uid=%u %n' ~/.trawl/tls ~/.trawl/tls/cert.pem ~/.trawl/tls-key ~/.trawl/tls-key/key.pem
+drwxr-xr-x 755 uid=1000 /home/jakub/.trawl/tls
+-rw-r--r-- 644 uid=1000 /home/jakub/.trawl/tls/cert.pem
+drwx------ 700 uid=1000 /home/jakub/.trawl/tls-key
+-rw------- 600 uid=1000 /home/jakub/.trawl/tls-key/key.pem
+$ stat -c '%n birth=%w' ~/.trawl/tls/cert.pem ~/.trawl/tls-key/key.pem
+/home/jakub/.trawl/tls/cert.pem birth=2026-09-28 11:56:04.081332315 -0700
+/home/jakub/.trawl/tls-key/key.pem birth=2026-09-28 11:56:04.073332339 -0700
+$ openssl x509 -in ~/.trawl/tls/cert.pem -noout -subject -issuer -ext subjectAltName -fingerprint -sha256
+subject=CN=rcgen self signed cert
+issuer=CN=rcgen self signed cert
+X509v3 Subject Alternative Name: 
+    DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1
+sha256 Fingerprint=33:0C:E7:D7:55:CF:EC:0E:52:71:DF:97:F3:B4:2D:93:1D:63:E2:2D:C0:E6:81:09:43:A0:BF:30:0C:CF:A7:19
+$ openssl s_client -connect 127.0.0.1:5514 -servername localhost </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256   # the cert trawld serves
+sha256 Fingerprint=33:0C:E7:D7:55:CF:EC:0E:52:71:DF:97:F3:B4:2D:93:1D:63:E2:2D:C0:E6:81:09:43:A0:BF:30:0C:CF:A7:19

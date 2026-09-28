@@ -1,0 +1,33 @@
+# After mprocs 'q': bin/dev exited 0 (tmux: 'Pane is dead (status 0, Mon Sep 28 11:58:52 2026)'), then the private tmux server was killed.
+$ date -u
+Mon Sep 28 06:59:21 PM UTC 2026
+$ docker ps -a --filter name=fleet-dev --format '{{.Names}} {{.Status}}'
+fleet-dev-postgres Exited (0) 29 seconds ago
+$ docker volume ls --filter name=fleet-dev-postgres-data --format '{{.Name}}'   # the volume survives by design
+fleet-dev-postgres-data
+$ pgrep -l 'mprocs|trawld|trawl-web|fleet-dev|trunk'
+(exit 1; 1 = no match)
+$ ss -ltnH '( sport = :8081 or sport = :8090 or sport = :5514 or sport = :5435 )'
+(empty = nothing listening)
+$ tmux -L j270c9b ls
+no server running on /tmp/tmux-1000/j270c9b
+
+# State left for jakub: the backup of his previous pair, and the new pair trawld generated.
+$ ls -la ~/.trawl ~/.trawl/tls.bak-270
+/home/jakub/.trawl:
+total 4
+drwxr-xr-x 1 jakub jakub  102 Sep 28 11:56 .
+drwx------ 1 jakub jakub 1656 Sep 28 11:59 ..
+drwxr-xr-x 1 jakub jakub   54 Sep 14 17:39 data
+drwxr-xr-x 1 jakub jakub   54 Sep 14 01:46 data.pre-rebase
+drwxr-xr-x 1 jakub jakub   16 Sep 28 11:56 tls
+drwxr-xr-x 1 jakub jakub   30 Sep 14 01:42 tls.bak-270
+drwx------ 1 jakub jakub   14 Sep 28 11:56 tls-key
+-rw------- 1 jakub jakub  553 Sep 14 01:42 trawld.toml
+
+/home/jakub/.trawl/tls.bak-270:
+total 8
+drwxr-xr-x 1 jakub jakub  30 Sep 14 01:42 .
+drwxr-xr-x 1 jakub jakub 102 Sep 28 11:56 ..
+-rw-r--r-- 1 jakub jakub 566 Sep 14 01:42 cert.pem
+-rw------- 1 jakub jakub 241 Sep 14 01:42 key.pem
