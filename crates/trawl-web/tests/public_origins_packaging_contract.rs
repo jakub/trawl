@@ -227,6 +227,8 @@ fn the_chart_renders_the_origins_it_is_given() {
 
     // The sidecar gets the same list as an env var, so the allowlist
     // survives a config.raw that replaces the generated TOML wholesale.
+    // The raw TOML names its data path, because the chart mounts trawld's
+    // generated certificate into the sidecar from that path's parent.
     let statefulset = helm_template(
         "statefulset.yaml",
         &[
@@ -235,7 +237,7 @@ fn the_chart_renders_the_origins_it_is_given() {
             "--set-string",
             &format!("web.publicOrigins[0]={EXAMPLE_ORIGIN}"),
             "--set-string",
-            "config.raw=[server]",
+            "config.raw=[server]\n[data]\npath = \"/var/lib/trawl/data\"",
         ],
     )
     .expect("helm was on PATH a moment ago")
