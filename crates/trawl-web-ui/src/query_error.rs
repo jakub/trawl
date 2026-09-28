@@ -710,6 +710,12 @@ mod tests {
                 status: 500,
                 message: "execution failed".to_owned(),
             },
+            ApiError::Recovering {
+                status: 503,
+                message: "Search is unavailable while the server finishes loading data from \
+                          before its restart."
+                    .to_owned(),
+            },
         ] {
             assert_eq!(refusal_notice(&error, SAMPLE), None, "{error}");
         }

@@ -1281,6 +1281,8 @@ const QUERY_VALIDATION_HINT: &str = include_str!("../e2e/harness/wire/query-vali
 const QUERY_VALIDATION_NO_HINT: &str =
     include_str!("../e2e/harness/wire/query-validation-no-hint.json");
 const QUERY_EXECUTION_ERROR: &str = include_str!("../e2e/harness/wire/query-execution-error.json");
+const QUERY_CORPUS_RECOVERING: &str =
+    include_str!("../e2e/harness/wire/query-corpus-recovering.json");
 
 /// `ErrorDetail` has no `PartialEq`; compare the wire form instead.
 fn json(details: &[trawl_api::ErrorDetail]) -> serde_json::Value {
@@ -1372,5 +1374,21 @@ fn the_execution_error_fixture_is_not_a_query_error() {
     let body: trawl_api::ErrorResponse =
         decode("query-execution-error.json", QUERY_EXECUTION_ERROR);
     assert_eq!(body.error.code, trawl_api::ErrorCode::ExecutionError);
+    assert!(body.error.details.is_empty());
+}
+
+/// The recovering spec's body: the code, and the server's fixed sentence
+/// for a restart backlog (trawl-server's `corpus_recovering_message`),
+/// with no details. The browser shows that sentence verbatim, so a
+/// fixture carrying other text would test copy the server never writes.
+#[test]
+fn the_corpus_recovering_fixture_is_the_restart_backlog_refusal() {
+    let body: trawl_api::ErrorResponse =
+        decode("query-corpus-recovering.json", QUERY_CORPUS_RECOVERING);
+    assert_eq!(body.error.code, trawl_api::ErrorCode::CorpusRecovering);
+    assert_eq!(
+        body.error.message,
+        "Search is unavailable while the server finishes loading data from before its restart."
+    );
     assert!(body.error.details.is_empty());
 }

@@ -1,0 +1,11 @@
+$ CARGO_TARGET_DIR=/home/jakub/code/trawl/target/issue-265-ev node visual-evidence/issue-235/harness.mjs setup
+# started 2026-09-27T22:12:22Z
+{"accepted":520000,"retriedStatuses":{"503":4},"compaction":{"trawld":{"runs":10,"merged":9,"maxRows":146,"maxMs":113},"coredns":{"runs":9,"merged":8,"maxRows":370000,"maxMs":980},"machined":{"runs":5,"merged":4,"maxRows":150000,"maxMs":534}}}
+# exit 0 at 2026-09-27T22:12:35Z
+$ CARGO_TARGET_DIR=/home/jakub/code/trawl/target/issue-265-ev node visual-evidence/issue-235/harness.mjs restart-probe
+# started 2026-09-27T22:12:41Z
+{"compaction_interval_secs":30,"service":"probefc26594b","events":50,"beforeRestart":50,"walFilesAfterStop":1,"restartMs":249,"series":[[0,50]],"visibleAfterS":0,"compactionAfterRestart":["2026-09-27T22:12:42.131505Z"]}
+# exit 0 at 2026-09-27T22:12:42Z
+$ CARGO_TARGET_DIR=/home/jakub/code/trawl/target/issue-265-ev node visual-evidence/issue-235/harness.mjs teardown
+removed trawl-i235-c603ed4a3671 and /home/jakub/code/trawl/target/issue-265-ev/issue-235-harness
+# exit 0 at 2026-09-27T22:13:09Z

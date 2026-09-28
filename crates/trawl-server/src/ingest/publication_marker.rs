@@ -29,16 +29,39 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
+use super::no_follow;
+
 /// Marker file name prefix inside `wal_dir/{env}`.
 const MARKER_PREFIX: &str = ".publish-";
 /// Marker file name suffix. Anything but `.ndjson`, which the WAL scan claims.
 const MARKER_SUFFIX: &str = ".json";
+
+/// Most WAL entries one marker names. A marker names the surviving inputs of
+/// one compaction chunk, and configuration caps a chunk at this many files.
+const MAX_MARKER_WAL_ENTRIES: usize = trawl_config::MAX_COMPACTION_CHUNK_SIZE;
+
+/// Longest WAL entry a marker names. An entry is one file name in a WAL
+/// directory, and Linux caps a file name at 255 bytes (`NAME_MAX`).
+const MAX_WAL_ENTRY_BYTES: usize = 255;
+
+/// Largest marker [`read_marker`] reads, about 1 MiB. The WAL writer calls
+/// [`read_marker`] on every write, so the bound keeps a planted marker from
+/// making each write load a file of any size.
+///
+/// [`ValidatedMarker::encode`] writes compact JSON, and validation bounds
+/// every part of it. The keys and punctuation, the 13-byte partition, a
+/// `u64` size of at most 20 digits and the 64-digit digest take 142 bytes;
+/// 1 KiB covers them. Each WAL entry takes its name, two quotes and a comma.
+/// So every marker compaction can write fits, and one at the configured
+/// default holds about 500 names of 30 to 160 bytes, a few dozen KiB.
+pub const MAX_MARKER_BYTES: u64 =
+    (1024 + MAX_MARKER_WAL_ENTRIES * (MAX_WAL_ENTRY_BYTES + 3)) as u64;
 
 /// The on-disk marker body. Every component is relative; see the module
 /// docs for how paths are rebuilt from it.
@@ -222,7 +245,7 @@ impl ValidatedMarker {
     }
 }
 
-fn marker_file_name(service: &str) -> String {
+pub(crate) fn marker_file_name(service: &str) -> String {
     format!("{MARKER_PREFIX}{service}{MARKER_SUFFIX}")
 }
 
@@ -253,13 +276,26 @@ fn validate_service(service: &str) -> Result<(), String> {
 }
 
 /// Each entry is one path component inside `wal_dir/{env}` that the WAL
-/// scan would have picked up for `service`.
+/// scan would have picked up for `service`, and the list is no longer than
+/// one compaction chunk: what [`MAX_MARKER_BYTES`] is derived from.
 fn validate_wal_names(service: &str, wal: &[String]) -> Result<(), String> {
     if wal.is_empty() {
         return Err("WAL list is empty".to_owned());
     }
+    if wal.len() > MAX_MARKER_WAL_ENTRIES {
+        return Err(format!(
+            "WAL list has {} entries, over the {MAX_MARKER_WAL_ENTRIES}-entry limit",
+            wal.len()
+        ));
+    }
     let mut seen = BTreeSet::new();
     for name in wal {
+        if name.len() > MAX_WAL_ENTRY_BYTES {
+            return Err(format!(
+                "WAL entry is {} bytes, over the {MAX_WAL_ENTRY_BYTES}-byte limit",
+                name.len()
+            ));
+        }
         // The service charset excludes `/`, NUL and spaces; a name made of it
         // is a single component. `.` and `..` fail the suffix check.
         let Some(stem) = name.strip_suffix(".ndjson") else {
@@ -307,6 +343,8 @@ fn parse_hex_digest(hex: &str) -> Option<blake3::Hash> {
 /// Why a marker could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerError {
+    /// No marker exists at the path.
+    Missing,
     /// The marker is readable but fails confinement or parsing.
     Invalid(String),
     /// The marker could not be inspected or read.
@@ -316,14 +354,32 @@ pub enum MarkerError {
 impl fmt::Display for MarkerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Missing => f.write_str("the publication marker is gone"),
             Self::Invalid(reason) => write!(f, "invalid publication marker: {reason}"),
             Self::Io(error) => f.write_str(error),
         }
     }
 }
 
+/// [`MarkerError::Missing`] for `NotFound`, else [`MarkerError::Io`].
+fn io_error(path: &Path, operation: &str, error: &io::Error) -> MarkerError {
+    if error.kind() == io::ErrorKind::NotFound {
+        MarkerError::Missing
+    } else {
+        MarkerError::Io(format!("failed to {operation} {}: {error}", path.display()))
+    }
+}
+
 /// Read and confine the marker at `path`. The env is the parent directory's
 /// name and the service comes from the file name.
+///
+/// The marker is opened without following a symlink and without waiting on
+/// a FIFO ([`no_follow::open`]), and its type and size come from `fstat` on
+/// that descriptor, so nothing swapped in at the path after a check is ever
+/// read. Anything but a regular file is invalid. A marker over
+/// [`MAX_MARKER_BYTES`] is invalid: one `fstat` reports is never read, and
+/// one that grows after the `fstat` is read only up to one byte past the
+/// bound. Off Unix no marker is opened, so a present one cannot be read.
 pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     let file_name = path
         .file_name()
@@ -339,16 +395,30 @@ pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     validate_env(env).map_err(MarkerError::Invalid)?;
     validate_service(service).map_err(MarkerError::Invalid)?;
 
-    let kind = std::fs::symlink_metadata(path)
-        .map_err(|e| MarkerError::Io(format!("failed to inspect {}: {e}", path.display())))?
-        .file_type();
-    if !kind.is_file() {
-        return Err(MarkerError::Invalid(
-            "marker is not a regular file".to_owned(),
-        ));
+    let not_regular = || MarkerError::Invalid("marker is not a regular file".to_owned());
+    let file = no_follow::open(path).map_err(|e| {
+        if no_follow::is_symlink_refusal(&e) {
+            not_regular()
+        } else {
+            io_error(path, "open", &e)
+        }
+    })?;
+    let metadata = file.metadata().map_err(|e| io_error(path, "inspect", &e))?;
+    if !metadata.file_type().is_file() {
+        return Err(not_regular());
     }
-    let body = std::fs::read(path)
-        .map_err(|e| MarkerError::Io(format!("failed to read {}: {e}", path.display())))?;
+    let over_limit =
+        || MarkerError::Invalid(format!("marker is over the {MAX_MARKER_BYTES}-byte limit"));
+    if metadata.len() > MAX_MARKER_BYTES {
+        return Err(over_limit());
+    }
+    let mut body = Vec::new();
+    file.take(MAX_MARKER_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| io_error(path, "read", &e))?;
+    if body.len() as u64 > MAX_MARKER_BYTES {
+        return Err(over_limit());
+    }
     let record: PublicationMarker = serde_json::from_slice(&body)
         .map_err(|e| MarkerError::Invalid(format!("unparseable marker: {e}")))?;
     ValidatedMarker::from_record(env, service, record).map_err(MarkerError::Invalid)
@@ -674,6 +744,17 @@ impl RecoveryReport {
         }
         blocked
     }
+
+    /// Markers whose interrupted publish recovery completed: each retired
+    /// the WAL files it names, whose rows the canonical output holds.
+    /// Compaction counts them as drained, so a pass whose only progress was
+    /// finishing a publish does not read as stuck.
+    pub fn retired(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|entry| entry.kind() == RecoveryOutcomeKind::Published)
+            .count() as u64
+    }
 }
 
 /// Recover every pending marker under `wal_dir`.
@@ -791,7 +872,9 @@ pub fn recover_one(
                 Contradiction::InvalidMarker(reason),
             ));
         }
-        Err(MarkerError::Io(error)) => return Err(error),
+        Err(error @ (MarkerError::Missing | MarkerError::Io(_))) => {
+            return Err(error.to_string());
+        }
     };
     let canonical = marker.canonical(data_dir);
     let published = match inspect(&canonical)? {
@@ -1271,6 +1354,158 @@ mod tests {
         assert_invalid(read_marker(&link), "not a regular file");
     }
 
+    /// The WAL writer reads the marker on every write, so a FIFO at the
+    /// marker path must not block the read waiting for a FIFO writer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_marker_is_invalid_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(ENV);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(marker_file_name(SERVICE));
+        crate::ingest::no_follow::test_support::make_fifo(&path);
+        let result =
+            crate::ingest::no_follow::test_support::returns_promptly(move || read_marker(&path));
+        assert_invalid(result, "not a regular file");
+    }
+
+    /// A FIFO or a symlink swapped in for a valid marker between a check
+    /// of the path and the open must neither block the read nor be
+    /// followed. A swapper flips the marker path between a valid marker, a
+    /// FIFO and a symlink to a valid marker while reads run; every read
+    /// returns, and none reads through the symlink.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_marker_swapped_under_the_read_never_blocks_or_is_followed() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(ENV);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(marker_file_name(SERVICE));
+        let valid = body("2026-09-23/07", &[WAL_A], &hex());
+        std::fs::write(&path, &valid).unwrap();
+        // The symlink's target names another partition, so a read that
+        // followed it is told apart from one of the valid marker.
+        let elsewhere = tmp.path().join("elsewhere.json");
+        std::fs::write(&elsewhere, body("2026-09-23/08", &[WAL_A], &hex())).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let swapper = {
+            let (stop, dir, path) = (Arc::clone(&stop), dir.clone(), path.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let staged = dir.join(format!("staged-{n}"));
+                    match n % 3 {
+                        0 => crate::ingest::no_follow::test_support::make_fifo(&staged),
+                        1 => std::os::unix::fs::symlink(&elsewhere, &staged).unwrap(),
+                        _ => std::fs::write(&staged, &valid).unwrap(),
+                    }
+                    std::fs::rename(&staged, &path).unwrap();
+                    n += 1;
+                }
+            })
+        };
+        let followed = crate::ingest::no_follow::test_support::returns_promptly(move || {
+            (0..20_000)
+                .filter(|_| read_marker(&path).is_ok_and(|marker| marker.hour() == 8))
+                .count()
+        });
+        stop.store(true, Ordering::Relaxed);
+        swapper.join().unwrap();
+        assert_eq!(followed, 0, "a read followed a swapped-in symlink");
+    }
+
+    /// A marker far over the size bound is refused from `fstat` on its
+    /// descriptor, before any read. It is sparse, so it costs no disk.
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_marker_is_invalid_without_being_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(ENV);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(marker_file_name(SERVICE));
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+        assert_invalid(read_marker(&path), "byte limit");
+    }
+
+    /// A valid marker body padded with trailing whitespace, which JSON
+    /// allows, to exactly `len` bytes.
+    fn padded_body(len: u64) -> String {
+        let mut padded = body("2026-09-23/07", &[WAL_A], &hex());
+        padded.push_str(&" ".repeat(usize::try_from(len).unwrap() - padded.len()));
+        padded
+    }
+
+    #[test]
+    fn a_marker_at_the_size_bound_reads_and_one_byte_more_is_invalid() {
+        let marker = read_body(ENV, SERVICE, &padded_body(MAX_MARKER_BYTES)).unwrap();
+        assert_eq!(marker.wal_names(), [WAL_A]);
+        assert_invalid(
+            read_body(ENV, SERVICE, &padded_body(MAX_MARKER_BYTES + 1)),
+            "byte limit",
+        );
+    }
+
+    /// The largest marker validation admits: the most entries, each the
+    /// longest file name, the largest size and the latest hour.
+    fn largest_marker() -> ValidatedMarker {
+        // `s_{digits}_ab.ndjson` at exactly the longest entry.
+        let digits = MAX_WAL_ENTRY_BYTES - "s__ab.ndjson".len();
+        let wal: Vec<String> = (0..MAX_MARKER_WAL_ENTRIES)
+            .map(|n| format!("s_{n:0digits$}_ab.ndjson"))
+            .collect();
+        assert!(wal.iter().all(|name| name.len() == MAX_WAL_ENTRY_BYTES));
+        ValidatedMarker::new(
+            ENV,
+            "s",
+            date(),
+            23,
+            wal,
+            OutputIdentity {
+                size: u64::MAX,
+                hash: blake3::hash(b""),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn every_marker_validation_admits_fits_the_size_bound() {
+        let largest = largest_marker();
+        let encoded = largest.encode().len() as u64;
+        assert!(
+            encoded <= MAX_MARKER_BYTES,
+            "{encoded} > {MAX_MARKER_BYTES}"
+        );
+        // The bound is the entries plus a frame of at most 1 KiB.
+        assert!(MAX_MARKER_BYTES - encoded <= 1024, "{encoded}");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir_all(largest.wal_env_dir(&wal)).unwrap();
+        write_marker(&wal, &largest).unwrap();
+        assert_eq!(read_marker(&largest.marker_path(&wal)).unwrap(), largest);
+    }
+
+    #[test]
+    fn validation_bounds_the_entries_the_size_bound_is_derived_from() {
+        let mut too_many = largest_marker().wal_names().to_vec();
+        too_many.push("s_1_ab.ndjson".to_owned());
+        let err = ValidatedMarker::new(ENV, "s", date(), 0, too_many, identity(b"")).unwrap_err();
+        assert!(err.contains("entry limit"), "{err}");
+
+        let too_long = format!("s_{}_ab.ndjson", "1".repeat(MAX_WAL_ENTRY_BYTES));
+        let err =
+            ValidatedMarker::new(ENV, "s", date(), 0, vec![too_long], identity(b"")).unwrap_err();
+        assert!(err.contains("byte limit"), "{err}");
+    }
+
     #[test]
     fn marker_files_are_invisible_to_the_wal_scan() {
         // A service named like a WAL file must not turn its marker, the
@@ -1534,6 +1769,28 @@ mod tests {
         assert_eq!(snapshot(f.root.path()), before);
     }
 
+    #[test]
+    fn row_contradictory_oversized_marker() {
+        let f = published_fixture();
+        std::fs::write(
+            f.marker.marker_path(&f.wal),
+            padded_body(MAX_MARKER_BYTES + 1),
+        )
+        .unwrap();
+        let before = snapshot(f.root.path());
+        for _ in 0..2 {
+            let report = recover_all(&f, &mut Vec::new());
+            match only_result(&report) {
+                Ok(RecoveryOutcome::Contradictory(Contradiction::InvalidMarker(reason))) => {
+                    assert!(reason.contains("byte limit"), "{reason}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(scan_claims(&f.wal).unwrap().blocks_service(ENV, SERVICE));
+        }
+        assert_eq!(snapshot(f.root.path()), before, "nothing touched");
+    }
+
     #[cfg(unix)]
     #[test]
     fn row_contradictory_symlinked_canonical_tmp_or_wal() {
@@ -1600,6 +1857,7 @@ mod tests {
         let f = published_fixture();
         let report = recover(&f.wal, &f.data, |_| Err("drain failed".to_owned())).unwrap();
         assert_eq!(only_result(&report), &Err("drain failed".to_owned()));
+        assert_eq!(report.retired(), 0);
         assert!(f.marker.marker_path(&f.wal).is_file());
         for path in f.marker.wal_paths(&f.wal) {
             assert!(path.is_file());
@@ -1657,6 +1915,7 @@ mod tests {
                 ("prod", "nginx", Ok(RecoveryOutcome::Published)),
             ]
         );
+        assert_eq!(report.retired(), 1, "only the published marker retired WAL");
         assert!(!scan_claims(&f.wal).unwrap().any());
     }
 

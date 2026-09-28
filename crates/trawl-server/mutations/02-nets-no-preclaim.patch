@@ -1,0 +1,15 @@
+diff --git a/crates/trawl-server/src/scheduler.rs b/crates/trawl-server/src/scheduler.rs
+index 33410d48..2bcf1c91 100644
+--- a/crates/trawl-server/src/scheduler.rs
++++ b/crates/trawl-server/src/scheduler.rs
+@@ -212,10 +212,6 @@ pub async fn poll_and_execute(
+ ) -> Vec<JoinHandle<()>> {
+     let mut spawned = Vec::new();
+ 
+-    if pool.publication().unsettled().is_some() {
+-        return spawned;
+-    }
+-
+     let schedules = match schedule_store.list_enabled_schedules().await {
+         Ok(s) => s,
+         Err(e) => {

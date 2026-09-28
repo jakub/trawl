@@ -30,6 +30,7 @@ flate2 = { workspace = true }
 fs4 = { workspace = true }
 governor = { workspace = true }
 indexmap = { workspace = true }
+memchr = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 hyper = { workspace = true }
@@ -64,6 +65,11 @@ zstd = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 metrics-process = { workspace = true }
+
+# `ingest::no_follow` opens WAL files and markers with `O_NOFOLLOW |
+# O_NONBLOCK` on every Unix host. The Linux-only paths (the `statx` mount
+# root) take the same `fs` feature.
+[target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
 [features]
@@ -91,6 +97,11 @@ reqwest = { workspace = true }
 # `tests/span_context.rs` probes the `log` bridge the way sqlx's statement
 # logger does. Already in the graph through sqlx and tracing-log.
 log = { workspace = true }
+
+# Tests that lock a directory with mode bits drop the DAC capabilities
+# from the test thread, so the lock binds when the suite runs as root.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { workspace = true, features = ["thread"] }
 
 [package.metadata.deb]
 name = "trawl-server"

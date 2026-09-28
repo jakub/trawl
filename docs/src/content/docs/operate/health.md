@@ -27,10 +27,10 @@ establish recovery when an alert resolves.
    curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/health"
    ```
 
-   A serving server answers 200 with `"status":"ok"` and five checks that read `ok`:
+   A serving server answers 200 with `"status":"ok"` and six checks that read `ok`:
 
    ```json
-   {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"..."}
+   {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"..."}
    ```
 
 2. Confirm that your key is accepted.
@@ -70,6 +70,7 @@ alone. The response shape is in [the API reference](/reference/api/#health).
 | `storage_db` | The app-state database did not answer. Saved queries, history, and repin jobs fail. | Check the app-state database and the `[storage]` settings. |
 | `data_path` | `[data] path` is missing or is not a readable directory. Cold data is unreadable. | Check the mount and the directory permissions for the `trawl` user. |
 | `ingest_capacity` | Reads `refusing`, not `error`. The hot buffer is full, so ingest is refused until compaction drains it. Reads stay complete. | Follow [ingest admission refusing](/operate/operational-alerts/#ingest-admission-refusing). |
+| `corpus` | Reads `restart_backlog` or `rollup_pending`, not `error`. The server cannot yet count every stored event once, so searches, exports, manual runs, and repins answer 503 `corpus_recovering`. Live tail still works. `restart_backlog` means WAL from before a restart is not yet proven covered. `rollup_pending` means a daily rollup marker is unfinished. | Wait for compaction to clear it. If it stays, follow [corpus unsettled](/operate/operational-alerts/#corpus-unsettled). |
 
 ## Inspect capacity
 
@@ -159,13 +160,16 @@ signal. Flat values alone cannot confirm collector health.
 
 `timeout_secs`, 30 seconds by default, starts one deadline right after
 authentication, and that deadline covers admission, queueing, and execution.
-Where it expires decides the status code.
+Where it expires decides the status code. Two other 503s refuse a query
+whose answer could not be complete.
 
 | Symptom | Meaning | What to do |
 | --- | --- | --- |
 | 503 with `server at capacity: the query was not started` | The deadline expired before any database work started. Nothing ran, and query history has no row. | Read `pool_retained` and the `retained` list. Cancel retained work, or raise `max_concurrent_queries`. |
 | 504 with `query timed out` | The deadline expired after work started. The bind or scan can still hold its permit. | Find the id in `retained` and cancel it. |
 | `trawl_query_permits_retained` stays above zero | Finished requests still occupy the pool. | Cancel each retained id. |
+| 503 `corpus_recovering` | The corpus is unsettled after a restart or an interrupted rollup. Nothing ran. | Read `checks.corpus` in `/api/v1/health`. If it stays unsettled, follow [corpus unsettled](/operate/operational-alerts/#corpus-unsettled). |
+| 503 with `recent events could not be read for this query` | The hot buffer's snapshot could not be built, so the server refused the query rather than answer without the newest events. | Read the `http_failure` event's `cause_kind`, then the trawld journal for the I/O error. See [Trace a server failure](#trace-a-server-failure). |
 
 To cancel, send `DELETE /api/v1/queries/{id}` with `server_manage`, or with
 `query_cancel` when your key submitted the query. The response
@@ -313,7 +317,7 @@ generated SQL, event values, and the caller's DSL.
 | `stage` | How far the request got. See the next table. |
 | `reached` | On `stage=unrecorded` only: `pre_admission`, `admitted`, or `handler`, the last point the request passed. |
 | `error_class` | The server's closed error class. `panic` for a caught panic, `unknown` when nothing was recorded. |
-| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, `auth_worker`, or `hot_buffer_full` for an ingest request that the hot buffer had no room for. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
+| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, `auth_worker`, `hot_buffer_full` for an ingest request that the hot buffer had no room for, or `restart_backlog` or `rollup_pending` for a read refused as `corpus_recovering`. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
 | `query_id` | Present when the request allocated a query ID. |
 | `key_id` | Present when a rate limiter metered the request. Names the key it metered. |
 | `peer_addr` | Present when no rate limiter metered the request. The client address, the only lead when no key is known. |

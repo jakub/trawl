@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "corpus_recovering",
+    "message": "Search is unavailable while the server finishes loading data from before its restart."
+  }
+}

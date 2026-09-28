@@ -238,5 +238,21 @@
       "description": "Target {{ $labels.job }}/{{ $labels.instance }}: The oldest batch in the hot buffer is older than 10 compaction intervals (at least 60 seconds) for at least 2 minutes. Compaction is not draining the hot buffer, and ingest is refused once the buffer fills. Admitted events stay searchable.",
       "runbook_url": "https://trawl.sh/operate/operational-alerts/#hot-buffer-drain-stalled"
     }
+  },
+  {
+    "alert": "TrawlCorpusUnsettled",
+    "family": "corpus_unsettled",
+    "metric": "trawl_corpus_unsettled",
+    "expr": "max without (reason) (trawl_corpus_unsettled{$SELECTOR}) > 0",
+    "for": "10m",
+    "severity": "warning",
+    "variants": [
+      {}
+    ],
+    "annotations": {
+      "summary": "Search is refused because the corpus is unsettled on {{ $labels.instance }}",
+      "description": "Target {{ $labels.job }}/{{ $labels.instance }}: The corpus has been unsettled for at least 10 minutes, for reason restart_backlog or rollup_pending. Searches and manual runs answer 503 corpus_recovering, scheduled runs wait, and repins are refused until the corpus settles. Live tail is unaffected. checks.corpus in /api/v1/health names the current reason; a change of reason does not restart the delay.",
+      "runbook_url": "https://trawl.sh/operate/operational-alerts/#corpus-unsettled"
+    }
   }
 ]

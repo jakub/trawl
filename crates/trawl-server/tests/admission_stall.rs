@@ -22,6 +22,10 @@
 //!
 //! `self_telemetry_is_admitted_where_a_trawld_named_request_is_refused`
 //! drives a real `WalLayer` flush against the same fixture shape.
+//!
+//! `overhang_stall_stays_bounded` boots over WAL planted above the caps, so
+//! the corpus is overhang (ADR-0041 slice 2), and stalls compaction the same
+//! way while refused reads feed self-telemetry.
 
 mod common;
 
@@ -30,13 +34,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{HotBufferKnobs, TestServer, setup_with_hot_buffer, setup_with_hot_buffer_in};
+use common::{
+    HotBufferKnobs, TestServer, seed_data_root, setup_observing_boot, setup_with_hot_buffer,
+    setup_with_hot_buffer_in,
+};
 use sqlx::{Connection as _, Executor as _};
 use tracing_subscriber::layer::SubscriberExt as _;
 use trawl_server::catalog::CatalogContext;
 use trawl_server::config::IngestConfig;
 use trawl_server::hot_buffer::{AdmissionState, HotBuffer};
 use trawl_server::ingest::producer::Derivation;
+use trawl_server::publication::CorpusUnsettled;
 use trawl_server::telemetry::{WalHandle, WalLayer};
 
 /// 64 events, so the HTTP ceiling is 60 and self-telemetry keeps 4. Bytes
@@ -565,4 +573,270 @@ async fn self_telemetry_is_admitted_where_a_trawld_named_request_is_refused() {
         2,
         "both trawld-named HTTP requests were refused as http"
     );
+}
+
+// -- AC10 (#265) ------------------------------------------------------------------
+
+/// A search's status and error code.
+async fn search_refusal(server: &TestServer, dsl: &str) -> (u16, String) {
+    refusal(
+        client()
+            .post(format!("{}/api/v1/query", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": dsl }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
+/// Captured events whose `event_type` is exactly `name`.
+fn captured(
+    capture: &common::audit_capture::Capture,
+    name: &str,
+) -> Vec<common::audit_capture::Captured> {
+    let quoted = format!("{name:?}");
+    capture
+        .events()
+        .into_iter()
+        .filter(|event| event.fields.get("event_type") == Some(&quoted))
+        .collect()
+}
+
+/// A stall under overhang stays bounded (ADR-0041 slice 2, ADR-0043).
+///
+/// The boot hydrates two of three planted WAL files and leaves the third
+/// as overhang, so every search is refused. The catalog is down from the
+/// first pass, so no planted file can drain and every pass fails its
+/// chunks. Each refused search logs one WARN `http_failure`, which real
+/// self-telemetry, wired as trawld's `main` wires it, flushes into the WAL
+/// and the hot buffer. Those inserts, with the buffer in `Pressure`, wake
+/// the compaction loop over and over.
+///
+/// Over the window, the passes stay at or below the elapsed intervals
+/// plus one: a failing pass cools down until the next normal pass, and the
+/// boot pass is the one extra. The compaction interval is three telemetry
+/// flushes long, so the loop is woken more often than a normal pass falls
+/// due, and a loop that let those wakes start passes would break the bound.
+/// Every pass logs one `coverage_proof`, which fails with the stuck file not
+/// resident. Once the catalog is back, the next pass drains everything, the
+/// proof settles the corpus, and a search counts every planted event once.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one scenario, stated in order
+async fn overhang_stall_stays_bounded() {
+    const SERVICE: &str = "overhang-stall";
+    const INTERVAL: Duration = Duration::from_secs(3);
+    const WINDOW: Duration = Duration::from_secs(12);
+    const FILE_EVENTS: usize = 350;
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let data = seed_data_root(dir.path());
+
+    // Three WAL files in the live writer's name and line format. Two fit
+    // under the caps; the third is overhang. Every event carries a field
+    // no pin covers yet, so compacting it must reach the catalog.
+    let time = (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let writer = trawl_server::ingest::wal::WalWriter::new(dir.path().join("wal"));
+    writer.ensure_dir().unwrap();
+    let mut planted = Vec::new();
+    for file in 0..3 {
+        let mut ndjson = Vec::new();
+        for n in 0..FILE_EVENTS {
+            let id = format!("file{file}-{n}");
+            let event = serde_json::json!({
+                "_time": time,
+                "_ingested": time,
+                "env": "prod",
+                "service": SERVICE,
+                "id": id,
+                "stall_probe": "overhang",
+                "message": "overhang stall probe",
+            });
+            serde_json::to_writer(&mut ndjson, &event).unwrap();
+            ndjson.push(b'\n');
+            planted.push(id);
+        }
+        writer.write("prod", SERVICE, &ndjson).unwrap();
+    }
+    let knobs = HotBufferKnobs {
+        max_events: 1024,
+        max_bytes: 16 * 1024 * 1024,
+        compaction_interval_secs: INTERVAL.as_secs(),
+    };
+    let server = setup_observing_boot(dir.path(), data, Some(knobs), &mut |_| {}).await;
+    let buffer = Arc::clone(hot(&server));
+    let gate = buffer.publication();
+    assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RestartBacklog));
+    assert_eq!(buffer.event_count(), 2 * FILE_EVENTS, "two files hydrated");
+    assert_eq!(
+        buffer.admission_state(),
+        AdmissionState::Pressure,
+        "hydration above half the cap: every insert wakes the loop"
+    );
+
+    // The catalog on a database of its own, down before the first pass.
+    let catalog_db = common::create_app_database().await;
+    let catalog_storage =
+        trawl_server::store::StorageState::from_pool(common::app_pool(&catalog_db).await)
+            .await
+            .expect("boot the catalog database");
+    let catalog = CatalogContext {
+        store: catalog_storage.catalog.clone(),
+        cache: server.state.query.field_catalog.clone(),
+    };
+    block_database(&catalog_db).await;
+
+    // Self-telemetry as trawld's `main` activates it after the boot: the
+    // WAL layer on the process's subscriber, then the writer, the hot
+    // buffer and the flush task. The capture layer beside it counts.
+    let defaults = IngestConfig::default();
+    let handle = WalHandle::new();
+    let telemetry = WalLayer::new_with_buffer_cap(
+        handle.clone(),
+        &defaults.effective_envs(),
+        &defaults.default_env,
+        Arc::new(Derivation::defaults()),
+        defaults.telemetry_buffer_max_bytes,
+    );
+    let capture = common::audit_capture::Capture::default();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry()
+            .with(telemetry.clone())
+            .with(capture.clone())
+            .with(tracing_subscriber::EnvFilter::new(
+                trawl_server::telemetry::DEFAULT_LOG_FILTER,
+            )),
+    )
+    .expect("this test owns the process's tracing subscriber");
+    handle.set(
+        Arc::clone(
+            server
+                .state
+                .ingest
+                .wal_writer
+                .as_ref()
+                .expect("ingest is enabled"),
+        ),
+        &defaults.default_env,
+    );
+    telemetry.set_hot_buffer(Arc::clone(&buffer));
+    let (stop_flush, flush_stop_rx) = tokio::sync::watch::channel(false);
+    let flush = trawl_server::telemetry::spawn_flush_task(
+        telemetry.clone(),
+        Duration::from_secs(defaults.telemetry_flush_interval_secs),
+        flush_stop_rx,
+    );
+
+    let stats = server
+        .state
+        .ingest
+        .compaction_stats
+        .clone()
+        .expect("ingest is enabled");
+    let pressure = buffer.subscribe_pressure();
+    let wakes_before = *pressure.borrow();
+    let inserted_before = buffer.inserted_batches();
+    let loop_started = tokio::time::Instant::now();
+    let (stop_compaction, compaction_stop_rx) = tokio::sync::watch::channel(false);
+    let compaction = trawl_server::ingest::compaction::spawn_compaction(
+        dir.path().join("wal"),
+        data_dir.clone(),
+        INTERVAL,
+        false,
+        defaults.compaction_chunk_size,
+        defaults.compaction_memory_limit.clone(),
+        Some(Arc::clone(&buffer)),
+        Some(Arc::clone(&stats)),
+        Some(catalog),
+        server.state.ingest.repin_coordinator.clone(),
+        compaction_stop_rx,
+    );
+
+    // Refused searches for the whole window, ten per interval.
+    let dsl = format!("service={SERVICE} last=1h");
+    let mut refused = 0;
+    while loop_started.elapsed() < WINDOW {
+        assert_eq!(
+            search_refusal(&server, &dsl).await,
+            (503, "corpus_recovering".to_owned())
+        );
+        refused += 1;
+        tokio::time::sleep(INTERVAL / 10).await;
+    }
+    let proofs = captured(&capture, "coverage_proof");
+    let finished = stats.total_runs.load(std::sync::atomic::Ordering::Relaxed);
+    let intervals = loop_started.elapsed().as_secs() / INTERVAL.as_secs();
+
+    // What the window offered the loop: refusals, their WARNs, and the
+    // self-telemetry inserts that wake it.
+    assert_eq!(
+        captured(&capture, "http_failure")
+            .iter()
+            .filter(|event| event.field("cause_kind").contains("restart_backlog"))
+            .count(),
+        refused,
+        "one http_failure per refused search"
+    );
+    assert!(
+        buffer.inserted_batches() > inserted_before,
+        "self-telemetry inserted during the stall"
+    );
+    assert!(
+        *pressure.borrow() > wakes_before,
+        "the loop was woken during the stall"
+    );
+
+    // The bound: the boot pass, then at most one pass per interval.
+    assert!(
+        proofs.len() as u64 <= intervals + 1,
+        "{} passes in {intervals} intervals",
+        proofs.len()
+    );
+    assert!(
+        finished <= intervals + 1,
+        "{finished} finished passes in {intervals} intervals"
+    );
+    assert!(
+        proofs.len() >= 2,
+        "the boot pass and at least one normal pass ran: {proofs:?}"
+    );
+    for proof in &proofs {
+        assert!(
+            proof.field("outcome").contains("not_resident"),
+            "the stuck file stays uncovered: {proof:?}"
+        );
+    }
+    assert_eq!(gate.unsettled(), Some(CorpusUnsettled::RestartBacklog));
+    assert!(
+        captured(&capture, "corpus_settled").is_empty(),
+        "nothing settled during the stall"
+    );
+
+    // Catalog back: the next pass drains everything and settles the corpus.
+    unblock_database(&catalog_db).await;
+    eventually(
+        "the corpus to settle once the catalog is back",
+        Duration::from_secs(60),
+        || gate.unsettled().is_none(),
+    )
+    .await;
+    assert_eq!(captured(&capture, "corpus_settled").len(), 1);
+    assert_exactly_once(&server, SERVICE, &planted).await;
+
+    let _ = stop_compaction.send(true);
+    tokio::time::timeout(Duration::from_secs(30), compaction)
+        .await
+        .expect("compaction stops")
+        .expect("compaction task does not panic");
+    let _ = stop_flush.send(true);
+    tokio::time::timeout(Duration::from_secs(30), flush)
+        .await
+        .expect("the telemetry flush stops")
+        .expect("the flush task does not panic");
+    drop(catalog_storage);
+    // Leak the tempdir, as the fixtures do: the server's detached tasks
+    // still hold its paths until the process exits.
+    std::mem::forget(dir);
 }

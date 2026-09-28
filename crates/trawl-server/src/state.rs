@@ -666,7 +666,12 @@ impl AppState {
                 })
                 // Snapshots carry the catalog pins so the hot branch of the
                 // query union is conformed to the write-time invariant.
-                .with_field_catalog(Arc::clone(&field_catalog)),
+                .with_field_catalog(Arc::clone(&field_catalog))
+                // Corpus reads refuse `restart_backlog` until boot hydration
+                // finishes (`boot::prepare_corpus`, ADR-0041 slice 2). A
+                // query-only node has no buffer, so its pool builds a
+                // settled gate.
+                .with_publication(crate::publication::PublicationGate::starting()),
             );
             let pipeline = Arc::new(PipelineWriter::new(
                 Arc::clone(&writer),

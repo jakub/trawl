@@ -5,6 +5,23 @@ description: Understand the markers Trawl writes on disk and how an interrupted 
 
 Why can Trawl finish an interrupted rewrite instead of guessing what happened? Every long operation that touches files writes a marker beside the data it governs, before it starts. A marker is durable state, not a lockfile. On the next boot Trawl reads the markers. It finishes or rolls back each operation it can prove, and it blocks the work it cannot prove safe. Nothing rewrites or deletes a file it cannot prove it wrote.
 
+## Boot order
+
+Boot finishes the interrupted work it can before the server answers HTTP. An ingest node runs these steps in order:
+
+1. Check the storage format marker, `data/EPOCH`.
+2. Run repin filesystem recovery.
+3. Recover publication markers.
+4. Reconcile repin state with PostgreSQL, then build the server state. The publication gate scans for rollup markers here.
+5. Recover rollup markers.
+6. Run boot conformance.
+7. Hydrate the surviving WAL into the hot buffer.
+8. Activate self-telemetry, start compaction, the other workers, and the scheduler, then bind the HTTPS listener.
+
+Every response the server sends therefore comes after recovery and hydration. Hydration must finish before self-telemetry starts: a WAL file that telemetry wrote earlier would reach the hot buffer twice, once when it was inserted and once from hydration. [Restart visibility](/architecture/data-flow/#restart-visibility) explains hydration and the overhang it can leave.
+
+A query-only node checks the format marker and the repin state, builds its state, and checks that the archive belongs to the connected catalog. It skips steps 3, 5, 6, and 7, and it never reads the WAL. If it finds `*.ndjson` files under the WAL root, it logs one `wal_present_on_query_node` WARN with the file count and no path. Their rows are missing from its answers until an ingest node compacts them. The restart guarantee covers ingest nodes only.
+
 ## Storage format marker
 
 `data/EPOCH` identifies the storage format. Startup creates a missing data root and writes the current value, `3`, even with ingestion disabled. An unknown marker stops startup instead of letting the daemon guess. Keep this file with the corpus when you back up or restore data.
@@ -45,7 +62,11 @@ A query-only node can hold stale pins until you restart it. Repin is a single-da
 
 ## Daily rollup
 
-Rollup writes a durable marker listing its complete input set before replacing hourly files with the daily output, and holds the publication write guard through input retirement. An unfinished marker refuses corpus reads until recovery completes, including across a restart. That is what stops a query counting the hourly and daily copies of one event.
+Rollup writes a durable marker listing its complete input set before replacing hourly files with the daily output, and holds the publication write guard through input retirement. An unfinished marker refuses corpus reads with 503 `corpus_recovering` and cause kind `rollup_pending` until recovery completes, including across a restart. That is what stops a query counting the hourly and daily copies of one event.
+
+An ingest boot recovers rollup markers before boot conformance, so a marker that recovery can finish never reaches a client. Recovery renames or retires files and reads Parquet footers. It never merges again. It opens a rollup marker and the staged `.parquet.tmp` output as regular files only: it never follows a symlink, and a FIFO does not make it wait. A marker over its size bound is never read. Recovery of such a marker fails, and the marker stays pending. `rollup_boot_recovery` logs the marker count at INFO. A failure does not stop the boot. `rollup_boot_recovery` then logs at ERROR with the count still pending, reads stay refused as `rollup_pending`, and each compaction pass retries. Boot conformance leaves a day directory alone while a rollup marker in it is unresolved, and logs `catalog_conform_skip` with `phase="rollup"` for each file it skips. If conformance cannot read the rollup markers at all, it skips every file and logs `catalog_conform_rollups_unreadable`.
+
+If the gate's scan for rollup markers fails, the gate cannot know which markers exist, so reads refuse as `rollup_pending`. An ingest boot then logs `rollup_boot_recovery` at ERROR to say that the marker scan failed, not the INFO line of a finished recovery. Only a later complete scan clears that. On an ingest node, each compaction pass scans again, and `publication_scan_recovered` logs the scan that clears it. A query-only node has no compaction, so its failed scan stays until you restart it.
 
 ## Publication markers
 
@@ -80,7 +101,7 @@ Every recovery step can be interrupted and run again, and both branches reach th
 
 ### When recovery runs
 
-An ingest-enabled boot recovers publication markers after the storage-format check and the repin filesystem recovery. That is before boot conformance can rewrite a canonical file, and before any reader, producer, or compaction tick exists. A query-only node does not run publication recovery. Only an unreadable WAL root stops the boot. A marker that recovery cannot resolve is logged and counted, and the daemon starts.
+An ingest-enabled boot recovers publication markers after the storage-format check and the repin filesystem recovery. That is before boot conformance can rewrite a canonical file, and before any reader, producer, or compaction tick exists. A query-only node does not run publication recovery. Only an unreadable WAL root stops the boot. A marker that recovery cannot resolve is logged and counted, and the daemon starts. Hydration then skips the scope that the marker blocks, so search answers 503 `corpus_recovering` with cause kind `restart_backlog` until an operator resolves the marker and compaction drains the scope.
 
 Every compaction tick runs recovery again before it merges any WAL file or cleans up a temporary output. The tick holds the repin corpus read guard, and it drains hot batches under the publication write guard.
 
@@ -93,20 +114,24 @@ A marker claims the files it names until recovery removes it. While it exists:
 - daily rollup skips that service's day.
 - retention keeps that date directory.
 - a repin cutover is refused.
+- boot hydration skips that environment and service.
+- the WAL writer does not reuse a file name that the marker lists. If the marker is invalid or cannot be read, the writer refuses every write for that environment and service instead.
 
 ### Directory fsync is part of the acknowledgement
 
-The marker protocol assumes that an existing WAL file holds rows that are not yet in Parquet. That holds only if every acknowledged WAL file is durable. The WAL writer therefore acknowledges a write only after the WAL directory fsync succeeds. The first write into an environment also fsyncs the WAL root. If a directory fsync fails, the write fails and the writer tries to remove the renamed file. If the removal fails, the file stays visible and compaction merges it, so an HTTP sender that retries the batch duplicates its rows. Each producer handles the failure on its existing path:
+The marker protocol assumes that an existing WAL file holds rows that are not yet in Parquet. That holds only if every acknowledged WAL file is durable. The WAL writer therefore acknowledges a write only after the WAL directory fsync succeeds. The first write into an environment also fsyncs the WAL root. If a directory fsync fails, the write fails, and the writer removes the new `.ndjson` file and fsyncs the directory again. If the removal or that second fsync fails, the writer reports the file as left visible. Compaction can then merge it, and a power loss can bring back a removal that was not synced, so an HTTP sender that retries the batch duplicates its rows. Each producer handles the failure on its existing path:
 
 - HTTP ingest answers a redacted HTTP 500.
 - Syslog discards the group and counts it.
-- Self-telemetry keeps the batch for retry. If the writer could not remove the file, telemetry releases the batch instead, because compaction still merges that file.
+- Self-telemetry keeps the batch for retry. If the writer reported the file as left visible, telemetry releases the batch instead, because compaction can still merge that file.
+
+The writer also never replaces an existing WAL file. It publishes with a hard link, which fails when the name exists, so a name that a file or a pending marker already holds gets a fresh one.
 
 [Ingest and publication](/architecture/data-flow/#wal-writer) describes the WAL writer.
 
 ### Shutdown
 
-Compaction stops at shutdown without a final pass. WAL files that it has not merged stay for the next run. The next boot recovers any publish that the stop interrupted.
+Compaction stops at shutdown without a final pass. WAL files that it has not merged stay for the next run. The next boot recovers any publish that the stop interrupted, then hydrates the WAL that remains.
 
 ### Limits
 
@@ -114,6 +139,10 @@ The protocol does not cover every failure:
 
 - A successful fsync is the only durability proof that Trawl uses. After a failed fsync, some Linux filesystems drop the unwritten pages and report a later fsync as successful. Recovery fsyncs again and cannot detect that case.
 - Retention re-reads the publication markers immediately before it deletes each date directory. Retention never deletes the date that it reads as today. A publish that starts before midnight can still write into yesterday's directory while retention, already on the new date, deletes that directory. If compaction writes its marker between the re-read and the delete, each of that publish's rows is either still in the WAL or was published into the deleted date. No acknowledged row is counted twice, and no row is lost that retention was not already deleting with its date. The marker can outlive its output. Recovery then reports it as `contradictory`, `TrawlPublicationRecoveryBlocked` fires, and the service stays blocked until an operator resolves the marker.
+
+## What the data directory is trusted with
+
+The data root and the WAL directory are trusted storage, owned by the user that runs trawld. Anyone who can write to them can already delete or change the corpus, so Trawl does not defend against them. Recovery and hydration open files without following a symlink and without waiting on a FIFO, and they read each marker only up to a size bound. Those guards keep crash residue, a truncated file, or garbage from hanging the boot. They do not make a planted FIFO, a planted symlink, or a flood of WAL files safe. Give write access to both directories to the trawld user only.
 
 ## Recovery is not backup
 

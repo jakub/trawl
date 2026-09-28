@@ -10,6 +10,7 @@
 
 pub mod admission;
 pub mod audit;
+pub mod boot;
 pub mod bus;
 pub mod catalog;
 pub mod config;

@@ -260,7 +260,7 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
     assert_eq!(durable_ids, [1, 5, 6]);
     assert!(durable.iter().all(|event| event["env"] == "prod"));
     assert_eq!(hot.event_count(), 3);
-    let snapshot = hot.snapshot().unwrap();
+    let snapshot = hot.snapshot().unwrap().unwrap();
     let mut hot_ids: Vec<_> = std::fs::read_to_string(snapshot.path())
         .unwrap()
         .lines()
@@ -300,7 +300,7 @@ async fn http_handler_directory_sync_failure_is_a_redacted_500_after_publishing_
     let hot = state.query.hot_buffer.as_ref().unwrap().clone();
     let wal = state.ingest.wal_writer.as_ref().unwrap().clone();
     // Make `prod` durable first, so the injected failure hits the env
-    // directory sync after the first group's rename, not the root sync.
+    // directory sync after the first group's link, not the root sync.
     std::fs::remove_file(wal.write("prod", "warm", b"{}\n").unwrap()).unwrap();
 
     let metrics = common::test_metrics_handle();
@@ -416,7 +416,7 @@ async fn pending_rollup_does_not_reject_ingest() {
     std::fs::write(&marker, "unfinished").unwrap();
     {
         let _writer = publication.write().await;
-        publication.mark_rollup(&marker);
+        drop(publication.mark_rollup(&marker));
     }
     assert!(publication.read().await.is_err());
     let pipeline = PipelineWriter::new(
