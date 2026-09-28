@@ -64,7 +64,12 @@ async fn capacity_metrics_endpoint_exposes_role_series_only() {
 
     // Positive control: the sample this scrape used walked the planted
     // environment.
-    let planted = dashboard_environment(&client, &server, env).await;
+    let capacity = dashboard_capacity(&client, &server, env).await;
+    let planted = capacity
+        .environments
+        .iter()
+        .find(|capacity| capacity.env == env)
+        .expect("the planted environment");
     assert_eq!(planted.stored_bytes, payload.len() as u64);
     assert_eq!(planted.oldest_date, "2026-09-20");
 
@@ -123,20 +128,49 @@ async fn capacity_metrics_endpoint_exposes_role_series_only() {
             "{series} is missing from /metrics:\n{body}"
         );
     }
+    assert_data_gauges_match(&body, &capacity);
 }
 
-/// The dashboard's capacity row for `env`, once a snapshot lists it.
+/// The data-role gauges carry the retained headroom sample's numbers, which
+/// the dashboard shows as the row holding the data role.
+fn assert_data_gauges_match(body: &str, capacity: &trawl_api::Capacity) {
+    // Whole byte counts render without a fraction, so they parse as `u64`.
+    let gauge = |series: &str| -> u64 {
+        body.lines()
+            .find_map(|line| line.strip_prefix(series))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{series} has a whole-byte value:\n{body}"))
+    };
+    let data = capacity
+        .headroom
+        .filesystems
+        .iter()
+        .find(|row| row.roles.contains(&trawl_api::FilesystemRole::Data))
+        .expect("a data row");
+    assert!(data.total_bytes > 0 && data.available_bytes <= data.total_bytes);
+    assert_eq!(
+        gauge("trawl_disk_total_bytes{role=\"data\"} "),
+        data.total_bytes
+    );
+    assert_eq!(
+        gauge("trawl_disk_available_bytes{role=\"data\"} "),
+        data.available_bytes
+    );
+}
+
+/// The dashboard's capacity object, once a snapshot lists `env`.
 ///
 /// The snapshot collector reads the cache a scrape filled, so an environment
 /// that walk saw appears once the next snapshot lands. Nothing else in this
-/// process collects. The collector ticks once a second; polling at 250ms
+/// process collects, so the headroom rows are the same retained sample the
+/// scrape published. The collector ticks once a second; polling at 250ms
 /// keeps a full timeout of reads inside the admin key's default 100 rpm
 /// budget.
-async fn dashboard_environment(
+async fn dashboard_capacity(
     client: &reqwest::Client,
     server: &common::TestServer,
     env: &str,
-) -> trawl_api::EnvironmentCapacity {
+) -> trawl_api::Capacity {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let response = client
@@ -151,13 +185,13 @@ async fn dashboard_environment(
             }
             assert_eq!(response.status(), 200);
             let snapshot: trawl_api::DashboardSnapshot = response.json().await.unwrap();
-            if let Some(capacity) = snapshot
+            if snapshot
                 .capacity
                 .environments
-                .into_iter()
-                .find(|capacity| capacity.env == env)
+                .iter()
+                .any(|capacity| capacity.env == env)
             {
-                break capacity;
+                break snapshot.capacity;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
