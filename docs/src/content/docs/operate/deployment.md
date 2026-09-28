@@ -262,6 +262,15 @@ verifies trawld's certificate. Each mode below also sets what the sidecar
 trusts. The sidecar runs as `web.runAsUser`, 1001 by default, which must
 differ from trawld's uid so that the sidecar cannot read trawld's private key.
 
+The chart trusts whoever writes the values file, and does not refuse the
+following overrides. A `web.extraEnv` entry can set
+`TRAWL_WEB_UPSTREAM_CA_PATH` or `TRAWL_HTTP_ADDR`. The first replaces the CA
+file the sidecar pins, and the second moves the trawld address the sidecar
+derives its upstream from. Either one bypasses the pin. A
+`web.extraVolumeMounts` entry can mount any pod volume into the sidecar,
+including trawld's TLS Secret or the data volume. Such a mount bypasses the
+isolation of trawld's private key.
+
 #### Keep the generated certificate
 
 `tls.mode: auto` needs no other `tls` value:

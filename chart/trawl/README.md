@@ -302,10 +302,10 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `web.allowInsecureCookies` | bool | `false` | `[web] allow_insecure_cookies`. Set `true` only when the browser connects over HTTP |
 | `web.sharedDomain` | string | `""` | `[web] shared_domain`, the parent domain for a session shared with other Fleet applications. Empty scopes the cookie to the origin |
 | `web.resources` | object | cpu `50m`, memory `64Mi` to `256Mi` | Sidecar resources |
-| `web.extraEnv` | list | `[]` | Extra environment variables for the sidecar |
+| `web.extraEnv` | list | `[]` | Extra environment variables for the sidecar. The chart trusts whoever writes the values file: an entry can override `TRAWL_WEB_UPSTREAM_CA_PATH` or `TRAWL_HTTP_ADDR` and bypass the chart's pin of trawld's certificate |
 | `web.runAsUser` | int | `1001` | The sidecar's uid. Must differ from trawld's uid so the sidecar cannot read trawld's private key |
 | `web.extraVolumes` | list | `[]` | Extra pod volumes, for example the CA file that `tls.upstreamCa` names by path |
-| `web.extraVolumeMounts` | list | `[]` | Extra sidecar volume mounts. Mount a directory, not a file `subPath`, so a replaced CA reaches trawl-web without a restart |
+| `web.extraVolumeMounts` | list | `[]` | Extra sidecar volume mounts. Mount a directory, not a file `subPath`, so a replaced CA reaches trawl-web without a restart. The chart trusts whoever writes the values file: a mount can name any pod volume, including trawld's TLS Secret or the data volume, and bypass the isolation of trawld's private key |
 | `web.logLevel` | string | `trawl_web=info,fleet_auth=info` | `RUST_LOG` for the sidecar. Keep both targets |
 | `web.cookieSecret.existingSecret` | string | `""` | Secret holding the 32-byte session key. Empty makes the chart generate one and keep it across upgrades |
 | `web.cookieSecret.existingSecretKey` | string | `cookie.key` | Key in that Secret |
