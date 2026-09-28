@@ -233,7 +233,8 @@ impl HttpClient {
     /// unavailable daemon still reports its per-subsystem checks, so it is
     /// returned as `Ok` with `status: unavailable`. Any other failure status,
     /// or a 503 with a foreign body (a proxy's error page), stays a
-    /// [`ClientError::Server`].
+    /// [`ClientError::Server`]. No body is read past [`HEALTH_BODY_CAP`]: a
+    /// success body past it is [`ClientError::TooLarge`].
     pub async fn health(&self) -> Result<HealthResponse, ClientError> {
         let url = self.endpoint("/api/v1/health");
 
@@ -244,15 +245,19 @@ impl HttpClient {
             .await
             .map_err(sanitize_reqwest_error)?;
 
-        if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        let status = resp.status();
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
             let (body, truncated) = read_capped(resp, HEALTH_BODY_CAP).await?;
             if !truncated && let Ok(health) = serde_json::from_slice::<HealthResponse>(&body) {
                 return Ok(health);
             }
             return Err(server_error(503, &body));
         }
-        let resp = check_status(resp).await?;
-        resp.json().await.map_err(body_read_error)
+        if !status.is_success() {
+            let (body, _) = read_capped(resp, HEALTH_BODY_CAP).await?;
+            return Err(server_error(status.as_u16(), &body));
+        }
+        read_json_capped(resp, HEALTH_BODY_CAP).await
     }
 
     /// Fetch schema introspection from the daemon.
@@ -482,10 +487,26 @@ impl HttpClient {
     }
 
     /// Fetch identity and permissions for the current token.
+    ///
+    /// The daemon answers exactly `200`; any other status, another `2xx`
+    /// included, is a [`ClientError::Server`]. No body is read past
+    /// [`WHOAMI_BODY_CAP`]: a success body past it is
+    /// [`ClientError::TooLarge`].
     pub async fn whoami(&self) -> Result<WhoAmIResponse, ClientError> {
         let url = self.endpoint("/api/v1/whoami");
-        let req = self.client.get(&url);
-        self.send_authenticated(req).await
+        let resp = self
+            .client
+            .get(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await
+            .map_err(sanitize_reqwest_error)?;
+        let status = resp.status();
+        if status != reqwest::StatusCode::OK {
+            let (body, _) = read_capped(resp, WHOAMI_BODY_CAP).await?;
+            return Err(server_error(status.as_u16(), &body));
+        }
+        read_json_capped(resp, WHOAMI_BODY_CAP).await
     }
 
     /// Fetch the full dashboard snapshot (needs `server_manage`).
@@ -962,15 +983,38 @@ impl HttpClient {
 ///
 /// reqwest reports every failure collecting a body as a decode error, a
 /// stall past the request's deadline included. A timeout is a transport
-/// failure, not a malformed answer, so it keeps its [`NetworkKind::Timeout`]
-/// and the same sanitized message as a timeout before the headers. Anything
+/// failure, not a malformed answer, so it is a [`NetworkKind::BodyTimeout`]
+/// with the same sanitized message as a timeout before the headers. Anything
 /// else stays [`ClientError::Parse`].
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(body_read_error)`
 fn body_read_error(e: reqwest::Error) -> ClientError {
     if e.is_timeout() {
-        sanitize_reqwest_error(e)
+        body_timeout(e)
     } else {
         ClientError::Parse(e.to_string())
+    }
+}
+
+/// Classify a failure reading one chunk of a response body: a stall past
+/// the deadline is a [`NetworkKind::BodyTimeout`], anything else is
+/// sanitized as a transport failure.
+fn body_chunk_error(e: reqwest::Error) -> ClientError {
+    if e.is_timeout() {
+        body_timeout(e)
+    } else {
+        sanitize_reqwest_error(e)
+    }
+}
+
+/// A timeout that struck after the headers arrived: the sanitized timeout,
+/// retyped as [`NetworkKind::BodyTimeout`] so a caller can tell that the
+/// server answered.
+fn body_timeout(e: reqwest::Error) -> ClientError {
+    match sanitize_reqwest_error(e) {
+        ClientError::Network(error) if error.kind == NetworkKind::Timeout => {
+            ClientError::Network(NetworkError::new(NetworkKind::BodyTimeout, error.message))
+        }
+        other => other,
     }
 }
 
@@ -992,9 +1036,26 @@ async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, Clie
     Ok(resp)
 }
 
-/// The most a 503 health body may hold and still be read as one. The
+/// The most a health body may hold and still be read as one. The
 /// daemon's is a few hundred bytes; anything this large is not its body.
 const HEALTH_BODY_CAP: usize = 64 * 1024;
+
+/// The most a whoami body may hold. The daemon's names one key, its roles
+/// and its permissions, well under a kilobyte.
+const WHOAMI_BODY_CAP: usize = 64 * 1024;
+
+/// Read a success body of at most `cap` bytes and parse it as JSON. A body
+/// past the cap is [`ClientError::TooLarge`], and the rest is never read.
+async fn read_json_capped<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    cap: usize,
+) -> Result<T, ClientError> {
+    let (body, truncated) = read_capped(resp, cap).await?;
+    if truncated {
+        return Err(ClientError::TooLarge { cap });
+    }
+    serde_json::from_slice(&body).map_err(|e| ClientError::Parse(e.to_string()))
+}
 
 /// A `Server` error for `status`, carrying the body's error envelope when
 /// it holds one.
@@ -1012,8 +1073,15 @@ async fn read_capped(
     mut resp: reqwest::Response,
     cap: usize,
 ) -> Result<(Vec<u8>, bool), ClientError> {
+    // A chunk's error carries no URL; restore it so the sanitized message
+    // names the origin as a failure before the headers does.
+    let url = resp.url().clone();
     let mut body = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(sanitize_reqwest_error)? {
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| body_chunk_error(e.with_url(url.clone())))?
+    {
         let room = cap - body.len();
         if chunk.len() > room {
             body.extend_from_slice(&chunk[..room]);
@@ -1468,10 +1536,10 @@ mod tests {
         socket
     }
 
-    /// A body that stalls after the headers is a timeout, the same kind and
-    /// message as a stall before them, not a malformed answer. Both body
-    /// readers the doctor uses are covered: the unkeyed health and the
-    /// keyed whoami.
+    /// A body that stalls after the headers is a body timeout: the same
+    /// message as a stall before them, not a malformed answer, and a kind
+    /// of its own, because the server did answer. Both body readers the
+    /// doctor uses are covered: the unkeyed health and the keyed whoami.
     #[tokio::test]
     async fn body_stall_after_headers_is_a_timeout() {
         init();
@@ -1496,7 +1564,7 @@ mod tests {
             let error = result.unwrap_err();
             assert_eq!(
                 error.network_kind(),
-                Some(NetworkKind::Timeout),
+                Some(NetworkKind::BodyTimeout),
                 "keyed={keyed}: {error:?}"
             );
             assert_eq!(
@@ -1667,6 +1735,86 @@ mod tests {
             matches!(err, ClientError::Server { status: 503, .. }),
             "{err:?}"
         );
+    }
+
+    async fn whoami_answered_with(response: Vec<u8>) -> Result<WhoAmIResponse, ClientError> {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let (result, request) = tokio::join!(client.whoami(), serve_once(listener, response));
+        assert!(request.starts_with("GET /api/v1/whoami "), "{request}");
+        result
+    }
+
+    /// `prefix` (an object missing its closing brace) padded past `cap`
+    /// bytes and closed: still valid JSON, so only the cap can refuse it.
+    fn padded(prefix: &[u8], cap: usize) -> Vec<u8> {
+        let mut body = prefix.to_vec();
+        body.extend_from_slice(br#","pad":""#);
+        body.extend(std::iter::repeat_n(b'x', cap));
+        body.extend_from_slice(br#""}"#);
+        body
+    }
+
+    /// A 200 health body past the cap is refused as too large, not parsed.
+    #[tokio::test]
+    async fn health_200_past_the_cap_is_too_large() {
+        let body = padded(
+            br#"{"status":"ok","checks":{"duckdb":"ok"}"#,
+            HEALTH_BODY_CAP,
+        );
+        let err = health_answered_with(http_response("200 OK", "application/json", &body))
+            .await
+            .expect_err("a body past the cap is not read");
+        assert!(
+            matches!(err, ClientError::TooLarge { cap } if cap == HEALTH_BODY_CAP),
+            "{err:?}"
+        );
+    }
+
+    const WHOAMI: &[u8] =
+        br#"{"prefix":"abcd1234","name":"ops","kind":"service","roles":[],"permissions":["query"]}"#;
+
+    /// A 200 whoami body past the cap is refused as too large, not parsed;
+    /// one within it parses.
+    #[tokio::test]
+    async fn whoami_200_past_the_cap_is_too_large() {
+        let who = whoami_answered_with(http_response("200 OK", "application/json", WHOAMI))
+            .await
+            .expect("a whoami body parses");
+        assert_eq!(who.name, "ops");
+
+        let body = padded(&WHOAMI[..WHOAMI.len() - 1], WHOAMI_BODY_CAP);
+        let err = whoami_answered_with(http_response("200 OK", "application/json", &body))
+            .await
+            .expect_err("a body past the cap is not read");
+        assert!(
+            matches!(err, ClientError::TooLarge { cap } if cap == WHOAMI_BODY_CAP),
+            "{err:?}"
+        );
+    }
+
+    /// whoami answers exactly 200: another 2xx carrying a valid body is a
+    /// server error that keeps its status.
+    #[tokio::test]
+    async fn whoami_other_2xx_is_an_error() {
+        for status in ["201 Created", "202 Accepted"] {
+            let err = whoami_answered_with(http_response(status, "application/json", WHOAMI))
+                .await
+                .expect_err("only 200 is a whoami answer");
+            let code: u16 = status[..3].parse().unwrap();
+            assert!(
+                matches!(err, ClientError::Server { status, .. } if status == code),
+                "{err:?}"
+            );
+        }
     }
 
     fn probe(address: std::net::SocketAddr) -> OriginProbe {

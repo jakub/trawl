@@ -33,6 +33,14 @@ pub enum ClientError {
     #[error("invalid CA certificate: {0}")]
     InvalidCa(String),
 
+    /// A response body larger than the endpoint's cap. Only the first
+    /// `cap` bytes were read; the rest never was.
+    #[error("response too large: more than {cap} bytes")]
+    TooLarge {
+        /// The most bytes the endpoint's body may hold.
+        cap: usize,
+    },
+
     /// A URL the client refuses to build on. The reason never quotes the
     /// URL.
     #[error("invalid URL: {0}")]
@@ -51,8 +59,11 @@ pub enum NetworkKind {
     /// No connection opened: nothing listening, a reset, or a handshake that
     /// failed for a reason other than the certificate.
     Connect,
-    /// The request got no answer within its deadline.
+    /// No response headers arrived within the request's deadline.
     Timeout,
+    /// The response headers arrived, so the server answered, but its body
+    /// did not finish within the request's deadline.
+    BodyTimeout,
     /// The server answered with a redirect the client refused to follow.
     Redirect,
     /// Any other transport failure.
