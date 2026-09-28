@@ -2,7 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-import type { APIRequestContext, Locator, Page } from '@playwright/test';
+import type { APIRequestContext, Locator, Page, TestInfo } from '@playwright/test';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { test, expect } from '../fixtures';
@@ -487,8 +489,9 @@ async function fact(section: Locator, label: string, value: string) {
   await expect(row.locator('dd')).toHaveText(value);
 }
 
+// Ingestion, Storage, and Disk and retention each carry the phase label.
 async function diagnosticPhase(page: Page, label: string) {
-  await expect(page.locator(SEL.healthDiagnosticState)).toHaveText([label, label]);
+  await expect(page.locator(SEL.healthDiagnosticState)).toHaveText([label, label, label]);
 }
 
 for (const width of [1440, 720]) {
@@ -938,4 +941,192 @@ test('the footer re-reads health every 30 s, one read at a time, and the chip cl
   } finally {
     release();
   }
+});
+
+// The Disk and retention card (ADR-0042). Each case loads one capacity
+// object over the base snapshot: the harness merges `dashboardSnapshot`
+// shallowly, so the whole object rides along. The fixtures are pinned to
+// these states natively in tests/e2e_wire_fixture_contract.rs.
+const capacity = (name: string) => JSON.parse(readFileSync(`${__dirname}/../harness/wire/health-capacity-${name}.json`, 'utf8'));
+
+test.describe('Disk and retention', () => {
+  const OBSERVED = 'Observed: 7 days, 2026-09-19 to 2026-09-25.';
+
+  async function open(page: Page, request: APIRequestContext, fixture: string) {
+    await setup(request, 'health-admin', { dashboardSnapshot: { capacity: capacity(fixture) } });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.goto('/settings/health');
+    await diagnosticPhase(page, 'Live');
+    const disk = page.locator(SEL.healthDisk);
+    await expect(disk.getByRole('heading', { name: 'Disk and retention', exact: true })).toBeVisible();
+    return disk;
+  }
+  const group = (disk: Locator, name: string) => disk.locator(`[data-group="${name}"]`);
+  const env = (disk: Locator, name: string) => disk.locator(`[data-env="${name}"]`);
+  const reach = (disk: Locator, name: string) => env(disk, name).locator('.health-disk-reach');
+
+  // No verdict: no incident role or tone class, no reassurance word, and
+  // every reach sentence drawn in the same ink as the Storage card's
+  // reading, whether it projects, withholds, or names a filling disk.
+  async function noVerdict(page: Page, disk: Locator) {
+    await expect(disk.locator('[role="alert"], [role="status"], .badge, .health-check-error, [class*="danger"], [class*="warn"], [class*="success"], [class*="ok"]')).toHaveCount(0);
+    await expect(disk).not.toContainText(/\b(safe|healthy|ok|fine|good)\b/i);
+    const reading = await page.locator(`${SEL.healthStorage} [data-source="parquet"] > p`).first().evaluate(el => getComputedStyle(el).color);
+    const colors = await disk.locator('.health-disk-reach, .health-disk-list dd > p').evaluateAll(els => [...new Set(els.map(el => getComputedStyle(el).color))]);
+    expect(colors).toEqual([reading]);
+  }
+
+  // A capture of the card alone, with a sidecar naming what it claims.
+  // TRAWL_HEALTH_CAPTURE_DIR collects them for visual-evidence/. Health
+  // owns its scroll container, so an element screenshot cannot stitch a
+  // card taller than the viewport: scroll the card to the top of that
+  // scroller, grow the viewport until the whole card is on screen, and
+  // clip a viewport capture to the card's box. The width is untouched.
+  async function capture(page: Page, testInfo: TestInfo, disk: Locator, name: string, claim: string) {
+    const width = page.viewportSize()!.width;
+    const settle = () => page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    await disk.evaluate(el => el.scrollIntoView({ block: 'start' }));
+    await settle();
+    const scroller = page.locator(SEL.healthPage);
+    let box = (await disk.boundingBox())!;
+    let floor = (await scroller.boundingBox())!;
+    // The card must sit inside the scroller's own rect: the shell's footer
+    // lies below it. A taller viewport leaves the scroller less to scroll,
+    // so the card settles lower each round; grow until the box fits.
+    for (let round = 0; round < 4 && box.y + box.height > floor.y + floor.height; round++) {
+      const overshoot = box.y + box.height - (floor.y + floor.height);
+      await page.setViewportSize({ width, height: Math.ceil(page.viewportSize()!.height + overshoot + 24) });
+      await disk.evaluate(el => el.scrollIntoView({ block: 'start' }));
+      await settle();
+      box = (await disk.boundingBox())!;
+      floor = (await scroller.boundingBox())!;
+    }
+    expect(box.y + box.height).toBeLessThanOrEqual(floor.y + floor.height);
+    const file = process.env.TRAWL_HEALTH_CAPTURE_DIR
+      ? path.join(process.env.TRAWL_HEALTH_CAPTURE_DIR, name)
+      : testInfo.outputPath(name);
+    await mkdir(path.dirname(file), { recursive: true });
+    await page.screenshot({ path: file, clip: box, animations: 'disabled' });
+    await testInfo.attach(name, { path: file, contentType: 'image/png' });
+    const bytes = readFileSync(file);
+    await writeFile(file.replace(/\.png$/, '.json'), JSON.stringify({
+      file: name, claim, viewport: page.viewportSize(), sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length,
+    }, null, 2));
+  }
+
+  test('a complete sample shows headroom rows and each reach form', async ({ page, request }, testInfo) => {
+    const disk = await open(page, request, 'complete');
+    const headroom = group(disk, 'headroom');
+    await expect(headroom.locator('dl > div')).toHaveCount(2);
+    const data = headroom.locator('[data-roles="data wal"]');
+    await expect(data.locator('dt')).toHaveText('Data + WAL');
+    await expect(data).toContainText('Complete measurement: 128.8 GB available of 536.9 GB. Sample age: 2s at this snapshot.');
+    await expect(data).toContainText('Deletion floor: 1.1 GB.');
+    await expect(data).not.toContainText('Deficit');
+    const spill = headroom.locator('[data-roles="spill"]');
+    await expect(spill.locator('dt')).toHaveText('Spill');
+    await expect(spill).toContainText('Complete measurement: 64.4 GB available of 68.7 GB. Sample age: 2s at this snapshot.');
+    await expect(spill).not.toContainText('floor');
+    await expect(headroom).toContainText('never added across filesystems');
+    const pressure = group(disk, 'pressure');
+    await fact(pressure, 'Removed by age', '14');
+    await fact(pressure, 'Removed by pressure', '0');
+    await fact(pressure, 'Pressure attempts', '0');
+    await fact(pressure, 'Last sweep', 'Completed, 754s ago');
+    await expect(pressure).toContainText('since process start');
+    await expect(group(disk, 'reach').locator('dl > div')).toHaveCount(5);
+    await expect(env(disk, 'prod')).toContainText('Policy: 90 days. Oldest date: 2026-07-01. Stored: 9.0 GB.');
+    await expect(reach(disk, 'prod')).toHaveText(`Reach: about 38–52 of 90 days if the observed days repeat. ${OBSERVED}`);
+    await expect(reach(disk, 'staging')).toHaveText(`Reach: about 12 days to the full 30 if the observed days repeat. ${OBSERVED}`);
+    await expect(reach(disk, 'lab')).toHaveText(`Reach: the full 7 days if the observed days repeat. ${OBSERVED}`);
+    await expect(env(disk, 'archive')).toContainText('Policy: keep forever. Oldest date: 2026-03-14. Stored: 21.0 GB.');
+    await expect(reach(disk, 'archive')).toHaveText(`Mean growth: 120 MB per day. ${OBSERVED}`);
+    await expect(reach(disk, 'k8s')).toHaveText('Reach withheld: not enough observed days yet.');
+    await expect(disk.locator('.health-disk-excluded')).toHaveText('Excludes growth of k8s: not enough history yet.');
+    await expect(disk).toContainText('holds only if those days repeat');
+    await expect(disk).not.toContainText(/guarantee/i);
+    await noVerdict(page, disk);
+    await capture(page, testInfo, disk, 'disk-retention-complete-1440.png',
+      'Complete sample: two headroom rows with a floor and no deficit, a completed sweep, and a projected range, a mixed range, a full policy, keep-forever growth, and one withheld env with the growth-excluded note');
+    // The card reads on a phone width without a horizontal scroll.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(reach(disk, 'prod')).toBeVisible();
+    expect(await page.locator(SEL.healthPage).evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+    await capture(page, testInfo, disk, 'disk-retention-complete-390.png', 'The same complete sample at a 390px phone width: every sentence wraps inside the card');
+  });
+
+  test('a failed attempt keeps its aged rows and withholds every reach without a number', async ({ page, request }, testInfo) => {
+    const disk = await open(page, request, 'failed-retained');
+    const headroom = group(disk, 'headroom');
+    await expect(headroom.locator('dl > div')).toHaveCount(2);
+    const data = headroom.locator('[data-roles="data spill"]');
+    await expect(data.locator('dt')).toHaveText('Data + Spill');
+    await expect(data).toContainText('Collection failed; last complete reading: 800 MB available of 500.0 GB. Sample age: 3600s at this snapshot.');
+    await expect(data).toContainText('Deletion floor: 1.1 GB. Deficit: 274 MB below the floor.');
+    await expect(headroom.locator('[data-roles="wal"]')).toContainText('Collection failed; last complete reading: 60.0 GB available of 64.0 GB. Sample age: 3600s at this snapshot.');
+    await fact(group(disk, 'pressure'), 'Last sweep', 'Failed, 41s ago');
+    await expect(disk.locator('.health-disk-reach')).toHaveCount(2);
+    for (const name of ['archive', 'prod']) {
+      await expect(reach(disk, name)).toHaveText('Reach withheld: measurement unavailable; the disk or Parquet sample is not complete.');
+      expect(await reach(disk, name).textContent()).not.toMatch(/\d/);
+    }
+    await expect(disk.locator('.health-disk-excluded')).toHaveCount(0);
+    await noVerdict(page, disk);
+    await capture(page, testInfo, disk, 'disk-retention-failed-retained-1440.png',
+      'Failed attempt with a retained sample: rows read "Collection failed; last complete reading" with a 3600s age and a deficit, and every reach is withheld as measurement unavailable with no digit');
+  });
+
+  test('withheld reaches name their reason and no number, and a floor of 0 reads as off', async ({ page, request }, testInfo) => {
+    const disk = await open(page, request, 'withheld');
+    const data = group(disk, 'headroom').locator('[data-roles="data wal spill"]');
+    await expect(data.locator('dt')).toHaveText('Data + WAL + Spill');
+    await expect(data).toContainText('Pressure deletion off (floor 0).');
+    await expect(data).not.toContainText('Deletion floor');
+    const pressure = group(disk, 'pressure');
+    await fact(pressure, 'Removed by pressure', '0');
+    await fact(pressure, 'Last sweep', 'No sweep yet since process start');
+    for (const [name, text] of [
+      ['fresh', 'Reach withheld: not enough observed days yet.'],
+      ['repinned', 'Reach withheld: a repin holds two generations, so stored bytes are inflated.'],
+      ['prod', 'Reach withheld: measurement unavailable; the disk or Parquet sample is not complete.'],
+    ]) {
+      await expect(reach(disk, name)).toHaveText(text);
+      expect(await reach(disk, name).textContent()).not.toMatch(/\d/);
+    }
+    await expect(env(disk, 'fresh')).toContainText('Policy: 30 days. Oldest date: 2026-09-25. Stored: 12 MB.');
+    await expect(reach(disk, 'scratch')).toHaveText(`Reach: the disk fills before retention is reached if the observed days repeat. ${OBSERVED}`);
+    await expect(disk.locator('.health-disk-excluded')).toHaveText('Excludes growth of fresh: not enough history yet.');
+    await noVerdict(page, disk);
+    await capture(page, testInfo, disk, 'disk-retention-withheld-1440.png',
+      'Floor of 0 reads as pressure deletion off with no sweep yet; three withheld reaches name their reason with no digit, and a floor-0 env reads as the disk filling first');
+  });
+
+  test('pressure evidence shows the counts, the deficit, and the last sweep outcome', async ({ page, request }, testInfo) => {
+    const disk = await open(page, request, 'pressure');
+    const data = group(disk, 'headroom').locator('[data-roles="data wal spill"]');
+    await expect(data).toContainText('Complete measurement: 600 MB available of 100.0 GB. Sample age: 1s at this snapshot.');
+    await expect(data).toContainText('Deletion floor: 1.1 GB. Deficit: 474 MB below the floor.');
+    const pressure = group(disk, 'pressure');
+    await fact(pressure, 'Removed by age', '30');
+    await fact(pressure, 'Removed by pressure', '12');
+    await fact(pressure, 'Pressure attempts', '5');
+    await fact(pressure, 'Last sweep', 'Ran out of candidates below the floor, 61s ago');
+    await expect(pressure).toContainText('Counts are since process start.');
+    // Evidence is counts and an outcome: no bytes figure anywhere in it.
+    await expect(pressure).not.toContainText(/\d(\.\d+)? [KMG]?B\b/);
+    await expect(env(disk, 'prod')).toContainText('Policy: 90 days. Oldest date: 2026-08-19. Stored: 41.0 GB.');
+    await expect(reach(disk, 'prod')).toHaveText(`Reach: about 22–40 of 90 days if the observed days repeat. ${OBSERVED}`);
+    await expect(reach(disk, 'lab')).toHaveText(`Reach: the full 7 days if the observed days repeat. ${OBSERVED}`);
+    await noVerdict(page, disk);
+    await capture(page, testInfo, disk, 'disk-retention-pressure-1440.png',
+      'Under pressure: one row for all three roles with a 474 MB deficit, 12 pressure removals over 5 attempts, a sweep that ran out of candidates below the floor, and a shortened prod range');
+  });
+
+  test('the card is admin-gated with the rest of the diagnostics', async ({ page, request }) => {
+    await setup(request, 'health-viewer', { dashboardSnapshot: { capacity: capacity('pressure') } });
+    await page.goto('/settings/health');
+    await rows(page);
+    await expect(page.locator(SEL.healthDisk)).toHaveCount(0);
+    await expect(page.locator(SEL.healthDiagnostics)).toHaveCount(0);
+  });
 });

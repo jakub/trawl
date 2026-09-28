@@ -1,0 +1,63 @@
+{
+  "headroom": {
+    "measurement": {
+      "status": "failed",
+      "sample_age_secs": 3600
+    },
+    "filesystems": [
+      {
+        "roles": [
+          "data",
+          "spill"
+        ],
+        "total_bytes": 500000000000,
+        "available_bytes": 800000000,
+        "floor": {
+          "state": "armed",
+          "floor_bytes": 1073741824,
+          "deficit_bytes": 273741824
+        }
+      },
+      {
+        "roles": [
+          "wal"
+        ],
+        "total_bytes": 64000000000,
+        "available_bytes": 60000000000,
+        "floor": null
+      }
+    ]
+  },
+  "pressure": {
+    "removals_age": 14,
+    "removals_disk_pressure": 3,
+    "pressure_attempts": 2,
+    "last_sweep": {
+      "outcome": "failed",
+      "age_secs": 41
+    }
+  },
+  "environments": [
+    {
+      "env": "archive",
+      "max_age_days": 0,
+      "oldest_date": "2026-03-14",
+      "stored_bytes": 21000000000,
+      "reach": {
+        "state": "withheld",
+        "reason": "measurement_unavailable"
+      }
+    },
+    {
+      "env": "prod",
+      "max_age_days": 90,
+      "oldest_date": "2026-07-01",
+      "stored_bytes": 9000000000,
+      "reach": {
+        "state": "withheld",
+        "reason": "measurement_unavailable"
+      }
+    }
+  ],
+  "growth_excluded": []
+}

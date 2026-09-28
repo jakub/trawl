@@ -699,6 +699,252 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
     }
 }
 
+/// The Disk and retention cases (ADR-0042) each load one capacity object
+/// over the base snapshot. Each fixture is pinned to the state its spec
+/// case asserts on, so a drifted fixture cannot pass the wrong case.
+/// A complete sample: two rows, a floor with no deficit, and every reach
+/// form the card renders.
+#[test]
+fn health_capacity_complete_fixture_carries_every_reach_form() {
+    use trawl_api::{
+        DeletionFloor, FilesystemRole, Reach, ReachEnd, StorageMeasurementStatus, SweepOutcome,
+        WithheldReason,
+    };
+
+    let complete: trawl_api::Capacity = decode(
+        "health-capacity-complete.json",
+        include_str!("../e2e/harness/wire/health-capacity-complete.json"),
+    );
+    assert_eq!(
+        complete.headroom.measurement.status,
+        StorageMeasurementStatus::Complete
+    );
+    assert_eq!(complete.headroom.measurement.sample_age_secs, Some(2));
+    assert_eq!(
+        complete.headroom.filesystems[0].roles,
+        [FilesystemRole::Data, FilesystemRole::Wal]
+    );
+    assert_eq!(
+        complete.headroom.filesystems[0].floor,
+        Some(DeletionFloor::Armed {
+            floor_bytes: 1_073_741_824,
+            deficit_bytes: 0
+        })
+    );
+    assert_eq!(
+        complete.headroom.filesystems[1].roles,
+        [FilesystemRole::Spill]
+    );
+    assert_eq!(complete.headroom.filesystems[1].floor, None);
+    assert_eq!(
+        complete.pressure.last_sweep.map(|s| s.outcome),
+        Some(SweepOutcome::Completed)
+    );
+    let reach = |env: &str| {
+        complete
+            .environments
+            .iter()
+            .find(|e| e.env == env)
+            .unwrap_or_else(|| panic!("health-capacity-complete.json lacks env {env}"))
+            .reach
+            .clone()
+    };
+    assert!(matches!(
+        reach("prod"),
+        Reach::Projected {
+            low: ReachEnd::Days { days: 38 },
+            high: ReachEnd::Days { days: 52 },
+            observed_days: 7,
+            ..
+        }
+    ));
+    assert!(matches!(
+        reach("staging"),
+        Reach::Projected {
+            low: ReachEnd::Days { days: 12 },
+            high: ReachEnd::FullPolicy,
+            ..
+        }
+    ));
+    assert!(matches!(
+        reach("lab"),
+        Reach::Projected {
+            low: ReachEnd::FullPolicy,
+            high: ReachEnd::FullPolicy,
+            ..
+        }
+    ));
+    assert!(matches!(
+        reach("archive"),
+        Reach::KeepForever {
+            mean_daily_bytes: 120_000_000,
+            ..
+        }
+    ));
+    assert!(matches!(
+        reach("k8s"),
+        Reach::Withheld {
+            reason: WithheldReason::InsufficientHistory
+        }
+    ));
+    assert_eq!(complete.growth_excluded, ["k8s"]);
+    let names = complete
+        .environments
+        .iter()
+        .map(|e| e.env.as_str())
+        .collect::<Vec<_>>();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(names, sorted, "environments arrive sorted by name");
+}
+
+/// A failed attempt that retained its rows: every reach is withheld as
+/// measurement unavailable and serializes with no numeric field.
+#[test]
+fn health_capacity_failed_retained_fixture_withholds_every_reach() {
+    use trawl_api::{DeletionFloor, Reach, StorageMeasurementStatus, SweepOutcome, WithheldReason};
+
+    let failed: trawl_api::Capacity = decode(
+        "health-capacity-failed-retained.json",
+        include_str!("../e2e/harness/wire/health-capacity-failed-retained.json"),
+    );
+    assert_eq!(
+        failed.headroom.measurement.status,
+        StorageMeasurementStatus::Failed
+    );
+    assert_eq!(failed.headroom.measurement.sample_age_secs, Some(3600));
+    assert_eq!(
+        failed.headroom.filesystems.len(),
+        2,
+        "the failed attempt retains its rows"
+    );
+    assert!(matches!(
+        failed.headroom.filesystems[0].floor,
+        Some(DeletionFloor::Armed { deficit_bytes, .. }) if deficit_bytes > 0
+    ));
+    assert_eq!(
+        failed.pressure.last_sweep.map(|s| s.outcome),
+        Some(SweepOutcome::Failed)
+    );
+    assert!(!failed.environments.is_empty());
+    for env in &failed.environments {
+        assert_eq!(
+            env.reach,
+            Reach::Withheld {
+                reason: WithheldReason::MeasurementUnavailable
+            },
+            "{} projects from a retained failed sample",
+            env.env
+        );
+        let wire = serde_json::to_value(&env.reach).unwrap();
+        assert_eq!(
+            wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["reason", "state"],
+            "a withheld reach carries no numeric field"
+        );
+    }
+}
+
+/// A floor of 0 with no sweep yet, each withheld reason once, and a
+/// floor-0 env whose disk fills first.
+#[test]
+fn health_capacity_withheld_fixture_names_every_reason_once() {
+    use trawl_api::{DeletionFloor, Reach, ReachEnd, WithheldReason};
+
+    let withheld: trawl_api::Capacity = decode(
+        "health-capacity-withheld.json",
+        include_str!("../e2e/harness/wire/health-capacity-withheld.json"),
+    );
+    assert_eq!(withheld.headroom.filesystems.len(), 1);
+    assert_eq!(
+        withheld.headroom.filesystems[0].floor,
+        Some(DeletionFloor::Off)
+    );
+    assert_eq!(withheld.pressure.last_sweep, None);
+    let reasons = withheld
+        .environments
+        .iter()
+        .filter_map(|e| match e.reach {
+            Reach::Withheld { reason } => Some(reason),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reasons,
+        [
+            WithheldReason::InsufficientHistory,
+            WithheldReason::MeasurementUnavailable,
+            WithheldReason::RetentionSuppressed,
+        ],
+        "every withheld reason appears once"
+    );
+    assert!(matches!(
+        withheld
+            .environments
+            .iter()
+            .find(|e| e.env == "scratch")
+            .unwrap()
+            .reach,
+        Reach::Projected {
+            low: ReachEnd::DiskFillsFirst,
+            high: ReachEnd::DiskFillsFirst,
+            ..
+        }
+    ));
+    assert_eq!(withheld.growth_excluded, ["fresh"]);
+}
+
+/// Under pressure: one row for every role with a deficit, nonzero
+/// counters, and a sweep that ran out of candidates below the floor.
+#[test]
+fn health_capacity_pressure_fixture_carries_the_evidence() {
+    use trawl_api::{DeletionFloor, FilesystemRole, Reach, ReachEnd, SweepOutcome};
+
+    let pressure: trawl_api::Capacity = decode(
+        "health-capacity-pressure.json",
+        include_str!("../e2e/harness/wire/health-capacity-pressure.json"),
+    );
+    assert_eq!(pressure.headroom.filesystems.len(), 1);
+    assert_eq!(
+        pressure.headroom.filesystems[0].roles,
+        [
+            FilesystemRole::Data,
+            FilesystemRole::Wal,
+            FilesystemRole::Spill
+        ]
+    );
+    assert_eq!(
+        pressure.headroom.filesystems[0].floor,
+        Some(DeletionFloor::Armed {
+            floor_bytes: 1_073_741_824,
+            deficit_bytes: 473_741_824
+        })
+    );
+    assert_eq!(pressure.pressure.removals_age, 30);
+    assert_eq!(pressure.pressure.removals_disk_pressure, 12);
+    assert_eq!(pressure.pressure.pressure_attempts, 5);
+    assert_eq!(
+        pressure
+            .pressure
+            .last_sweep
+            .map(|s| (s.outcome, s.age_secs)),
+        Some((SweepOutcome::ExhaustedBelowFloor, 61))
+    );
+    assert!(matches!(
+        pressure
+            .environments
+            .iter()
+            .find(|e| e.env == "prod")
+            .unwrap()
+            .reach,
+        Reach::Projected {
+            low: ReachEnd::Days { days: 22 },
+            high: ReachEnd::Days { days: 40 },
+            ..
+        }
+    ));
+}
+
 #[test]
 fn history_export_and_error_fixtures_match_wire_types_and_test_cases() {
     let rows: trawl_api::HistoryResponse = decode(

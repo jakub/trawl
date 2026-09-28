@@ -62,6 +62,11 @@ export const SEL = {
   healthLiveState: '.health-live-state',
   healthIngestion: '.health-ingestion',
   healthStorage: '.health-storage',
+  /// crates/trawl-web-ui/src/pages/health.rs HealthDiagnostics: the
+  /// Disk and retention card (ADR-0042). Its groups carry `data-group`
+  /// (headroom, pressure, reach), headroom rows `data-roles`, and
+  /// environment rows `data-env`; the reach sentence is `.health-disk-reach`.
+  healthDisk: '.health-disk',
   healthDiagnostics: '.health-diagnostics',
   healthDiagnosticState: '.health-diagnostic-state',
   /// crates/trawl-web-ui/src/pages/health.rs HealthPage and HealthQueries.

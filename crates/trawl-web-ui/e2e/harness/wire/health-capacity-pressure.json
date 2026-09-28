@@ -1,0 +1,74 @@
+{
+  "headroom": {
+    "measurement": {
+      "status": "complete",
+      "sample_age_secs": 1
+    },
+    "filesystems": [
+      {
+        "roles": [
+          "data",
+          "wal",
+          "spill"
+        ],
+        "total_bytes": 100000000000,
+        "available_bytes": 600000000,
+        "floor": {
+          "state": "armed",
+          "floor_bytes": 1073741824,
+          "deficit_bytes": 473741824
+        }
+      }
+    ]
+  },
+  "pressure": {
+    "removals_age": 30,
+    "removals_disk_pressure": 12,
+    "pressure_attempts": 5,
+    "last_sweep": {
+      "outcome": "exhausted_below_floor",
+      "age_secs": 61
+    }
+  },
+  "environments": [
+    {
+      "env": "lab",
+      "max_age_days": 7,
+      "oldest_date": "2026-09-25",
+      "stored_bytes": 300000000,
+      "reach": {
+        "state": "projected",
+        "observed_first": "2026-09-19",
+        "observed_last": "2026-09-25",
+        "observed_days": 7,
+        "low": {
+          "kind": "full_policy"
+        },
+        "high": {
+          "kind": "full_policy"
+        }
+      }
+    },
+    {
+      "env": "prod",
+      "max_age_days": 90,
+      "oldest_date": "2026-08-19",
+      "stored_bytes": 41000000000,
+      "reach": {
+        "state": "projected",
+        "observed_first": "2026-09-19",
+        "observed_last": "2026-09-25",
+        "observed_days": 7,
+        "low": {
+          "kind": "days",
+          "days": 22
+        },
+        "high": {
+          "kind": "days",
+          "days": 40
+        }
+      }
+    }
+  ],
+  "growth_excluded": []
+}

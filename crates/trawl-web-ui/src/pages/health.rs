@@ -6,7 +6,12 @@
 use crate::dashboard_state::DashboardPhase;
 use crate::state::stats_stream::SharedDashboard;
 use crate::{
-    api, perms,
+    api,
+    capacity_copy::{
+        floor_line, growth_excluded_note, headroom_state, policy_line, reach_line, roles_key,
+        roles_label, sweep_line,
+    },
+    perms,
     service_card_fmt::{format_bytes, format_count, format_exact, format_uptime},
 };
 use fleet_ui::{Badge, ConfirmModal, ConfirmState, Tone};
@@ -16,7 +21,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use trawl_api::{
-    HealthResponse, HealthStatus, QueriesResponse, StatsResponse, StorageMeasurement,
+    Capacity, HealthResponse, HealthStatus, QueriesResponse, StatsResponse, StorageMeasurement,
     StorageMeasurementStatus,
 };
 
@@ -232,6 +237,75 @@ fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> S
     }
 }
 
+/// The Disk and retention card (ADR-0042). It states measurements,
+/// evidence and a conditional projection, and never a verdict: no
+/// colour, no badge, no "safe".
+#[component]
+fn HealthDiskRetention(capacity: Capacity) -> impl IntoView {
+    let Capacity {
+        headroom,
+        pressure,
+        environments,
+        growth_excluded,
+    } = capacity;
+    let excluded = growth_excluded_note(&growth_excluded);
+    view! {
+        <div class="health-disk-group" data-group="headroom">
+            <h3>"Headroom"</h3>
+            {match headroom_state(headroom.measurement) {
+                Ok(_) if headroom.filesystems.is_empty() => view! { <p>"Measurement unavailable"</p> }.into_any(),
+                Err(line) => view! { <p>{line}</p> }.into_any(),
+                Ok((prefix, age)) => view! {
+                    <dl class="health-disk-list">{headroom.filesystems.into_iter().map(|row| view! {
+                        <div data-roles=roles_key(&row.roles)>
+                            <dt>{roles_label(&row.roles)}</dt>
+                            <dd>
+                                <p>{format!(
+                                    "{prefix}: {} available of {}. Sample age: {age}s at this snapshot.",
+                                    format_bytes(row.available_bytes),
+                                    format_bytes(row.total_bytes)
+                                )}</p>
+                                {row.floor.map(|floor| view! { <p>{floor_line(floor)}</p> })}
+                            </dd>
+                        </div>
+                    }).collect_view()}</dl>
+                }.into_any(),
+            }}
+            <p class="health-note">"Roles on one filesystem share a row. Available bytes are never added across filesystems."</p>
+        </div>
+        <div class="health-disk-group" data-group="pressure">
+            <h3>"Pressure deletion"</h3>
+            <dl class="health-facts">
+                <div><dt>"Removed by age"</dt><dd>{format_exact(pressure.removals_age)}</dd></div>
+                <div><dt>"Removed by pressure"</dt><dd>{format_exact(pressure.removals_disk_pressure)}</dd></div>
+                <div><dt>"Pressure attempts"</dt><dd>{format_exact(pressure.pressure_attempts)}</dd></div>
+                <div><dt>"Last sweep"</dt><dd>{sweep_line(pressure.last_sweep)}</dd></div>
+            </dl>
+            <p class="health-note">"Counts are since process start. A removal is one date directory confirmed deleted; no bytes-freed figure is claimed."</p>
+        </div>
+        <div class="health-disk-group" data-group="reach">
+            <h3>"Retention reach"</h3>
+            {if environments.is_empty() {
+                view! { <p>"No stored date partitions yet."</p> }.into_any()
+            } else {
+                view! {
+                    <dl class="health-disk-list">{environments.into_iter().map(|env| view! {
+                        <div data-env=env.env.clone()>
+                            <dt><span class="mono">{env.env.clone()}</span></dt>
+                            <dd>
+                                <p>{policy_line(&env)}</p>
+                                <p class="health-disk-reach">{reach_line(&env.reach, env.max_age_days)}</p>
+                            </dd>
+                        </div>
+                    }).collect_view()}</dl>
+                }.into_any()
+            }}
+            {excluded.map(|note| view! { <p class="health-note health-disk-excluded">{note}</p> })}
+            <p class="health-note">"Reach is a projection from the observed days, and holds only if those days repeat. Today and yesterday are left out while they settle."</p>
+        </div>
+    }
+}
+
 #[component]
 fn HealthDiagnostics() -> impl IntoView {
     let dashboard = expect_context::<SharedDashboard>();
@@ -282,6 +356,12 @@ fn HealthDiagnostics() -> impl IntoView {
                     <p class="health-note">"Compaction counters are since process startup. The error tally includes failed cycles and loss/error tallies; it can accompany successful cycles and exceed their count. A successful cycle can have no eligible work."</p>
                 })}
                 <p class="health-note"><a href="https://trawl.sh/architecture/recovery/" target="_blank" rel="noopener noreferrer">"Storage recovery"</a>" · "<a href="https://trawl.sh/operate/retention/" target="_blank" rel="noopener noreferrer">"Retention guidance"</a></p>
+            </section>
+            <section class="health-disk" aria-labelledby="health-disk-title">
+                <h2 id="health-disk-title">"Disk and retention"</h2>
+                <p class="health-diagnostic-state" class:sr-only=move || dashboard.get().phase == DashboardPhase::Live>{move || dashboard.get().phase.label()}</p>
+                {move || dashboard.get().snapshot.map(|s| view! { <HealthDiskRetention capacity=s.capacity/> })}
+                <p class="health-note"><a href="https://trawl.sh/operate/health/" target="_blank" rel="noopener noreferrer">"How to read disk and retention"</a></p>
             </section>
         </div>
     }

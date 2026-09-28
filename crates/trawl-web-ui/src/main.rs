@@ -8,6 +8,7 @@
 // their tests run under plain `cargo test` on native.
 mod api_error;
 mod auth_return;
+mod capacity_copy;
 mod categorical;
 mod chart_hint;
 mod completion;

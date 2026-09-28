@@ -1,0 +1,81 @@
+{
+  "headroom": {
+    "measurement": {
+      "status": "complete",
+      "sample_age_secs": 5
+    },
+    "filesystems": [
+      {
+        "roles": [
+          "data",
+          "wal",
+          "spill"
+        ],
+        "total_bytes": 200000000000,
+        "available_bytes": 50000000000,
+        "floor": {
+          "state": "off"
+        }
+      }
+    ]
+  },
+  "pressure": {
+    "removals_age": 0,
+    "removals_disk_pressure": 0,
+    "pressure_attempts": 0,
+    "last_sweep": null
+  },
+  "environments": [
+    {
+      "env": "fresh",
+      "max_age_days": 30,
+      "oldest_date": "2026-09-25",
+      "stored_bytes": 12000000,
+      "reach": {
+        "state": "withheld",
+        "reason": "insufficient_history"
+      }
+    },
+    {
+      "env": "prod",
+      "max_age_days": 90,
+      "oldest_date": "2026-07-01",
+      "stored_bytes": 9000000000,
+      "reach": {
+        "state": "withheld",
+        "reason": "measurement_unavailable"
+      }
+    },
+    {
+      "env": "repinned",
+      "max_age_days": 30,
+      "oldest_date": "2026-08-28",
+      "stored_bytes": 2500000000,
+      "reach": {
+        "state": "withheld",
+        "reason": "retention_suppressed"
+      }
+    },
+    {
+      "env": "scratch",
+      "max_age_days": 7,
+      "oldest_date": "2026-09-20",
+      "stored_bytes": 6000000000,
+      "reach": {
+        "state": "projected",
+        "observed_first": "2026-09-19",
+        "observed_last": "2026-09-25",
+        "observed_days": 7,
+        "low": {
+          "kind": "disk_fills_first"
+        },
+        "high": {
+          "kind": "disk_fills_first"
+        }
+      }
+    }
+  ],
+  "growth_excluded": [
+    "fresh"
+  ]
+}
