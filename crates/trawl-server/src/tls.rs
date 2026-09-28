@@ -169,8 +169,9 @@ fn log_cert_details(pem_bytes: &[u8]) {
 ///
 /// `cert.pem` is also a published artifact: a `trawl-web` running as
 /// another user pins it (ADR-0048), so it is world-readable and appears
-/// only once complete. The key is written first and `cert.pem` last, so a
-/// visible certificate always has its key beside it.
+/// only once complete. Generation removes any old `cert.pem` first, then
+/// writes the key, and publishes `cert.pem` last, so a visible certificate
+/// always has its own key beside it.
 ///
 /// Returns `(cert_pem, key_pem, was_generated)`.
 fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
@@ -184,8 +185,12 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
             key = %key_path.display(),
             "loading existing self-signed TLS certificate"
         );
-        let (c, k) = load_pem_files(&cert_path, &key_path)?;
-        return Ok((c, k, false));
+        let cert = fs::read(&cert_path).map_err(|source| TlsError::ReadCert {
+            path: cert_path.clone(),
+            source,
+        })?;
+        let key = read_generated_key(&key_path)?;
+        return Ok((cert, key, false));
     }
 
     tracing::info!(
@@ -209,20 +214,36 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
     // Persist so the cert is stable across daemon restarts.
     fs::create_dir_all(tls_dir).map_err(TlsError::Write)?;
 
+    // A certificate whose key was lost must go before the new key lands:
+    // an interruption between the key write and the publication below would
+    // otherwise leave the old certificate beside an unrelated key, and every
+    // later start would load that pair and fail TLS. With it gone, an
+    // interrupted generation leaves at most a key with no certificate, which
+    // the next start regenerates. The directory sync makes the removal
+    // durable before the new key exists.
+    remove_if_present(&cert_path).map_err(TlsError::Write)?;
+    #[cfg(unix)]
+    fs::File::open(tls_dir)
+        .and_then(|dir| dir.sync_all())
+        .map_err(TlsError::Write)?;
+
     // Write the private key with restricted permissions from the start
-    // to avoid a TOCTOU window where the key is world-readable.
+    // to avoid a TOCTOU window where the key is world-readable. A key left
+    // by an interrupted generation is removed rather than truncated, so the
+    // new key never inherits the old file's mode.
+    remove_if_present(&key_path).map_err(TlsError::Write)?;
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&key_path)
             .map_err(TlsError::Write)?;
         f.write_all(key_pem.as_bytes()).map_err(TlsError::Write)?;
+        f.sync_all().map_err(TlsError::Write)?;
     }
     #[cfg(not(unix))]
     {
@@ -239,6 +260,42 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
     );
 
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
+}
+
+/// Read the generated private key, first putting it back to owner-only if
+/// its mode grants any group or other access.
+///
+/// Kubernetes' fsGroup ownership walk adds group bits to files on the data
+/// volume (`0600` becomes `0660`), and the Helm chart's trawl-web sidecar
+/// runs as another uid in that group, so it could read the key. The mode is
+/// checked and changed through the open handle, so the file changed is the
+/// file read.
+fn read_generated_key(key_path: &Path) -> Result<Vec<u8>, TlsError> {
+    use std::io::Read;
+
+    let read_error = |source: std::io::Error| TlsError::ReadKey {
+        path: key_path.to_owned(),
+        source,
+    };
+    let mut f = fs::File::open(key_path).map_err(read_error)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = f.metadata().map_err(read_error)?.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            f.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(TlsError::Write)?;
+            tracing::info!(
+                event_type = "lifecycle",
+                key = %key_path.display(),
+                previous_mode = %format_args!("{mode:03o}"),
+                "restored the generated TLS key to owner-only"
+            );
+        }
+    }
+    let mut key = Vec::new();
+    f.read_to_end(&mut key).map_err(read_error)?;
+    Ok(key)
 }
 
 /// Publish `pem` at `cert_path` so that a reader sees either no file or the
@@ -258,10 +315,7 @@ fn publish_cert(cert_path: &Path, pem: &[u8]) -> std::io::Result<()> {
     let tmp_path = cert_path.with_file_name(tmp_name);
 
     // A crash between create and rename leaves the temporary file behind.
-    match fs::remove_file(&tmp_path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
+    remove_if_present(&tmp_path)?;
 
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -281,6 +335,14 @@ fn publish_cert(cert_path: &Path, pem: &[u8]) -> std::io::Result<()> {
     f.sync_all()?;
     drop(f);
     fs::rename(&tmp_path, cert_path)
+}
+
+/// Remove the file at `path`; a file that is already gone is not an error.
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Background task that polls cert/key files for changes and sends a new
@@ -457,6 +519,73 @@ mod tests {
         // The pair on disk is what a restart loads, so it must still serve.
         let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
         assert!(!self_signed, "the restart loads the published pair");
+    }
+
+    /// A certificate whose key is gone is regenerated, and a generation
+    /// interrupted after the new key is written must not leave the old
+    /// certificate beside it: the next start would load a pair that does not
+    /// match and fail TLS on every start after. Publication is made to fail
+    /// by a directory squatting on `cert.pem.tmp`.
+    #[test]
+    fn an_interrupted_generation_never_pairs_a_new_key_with_the_old_cert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+        fs::create_dir_all(&tls_dir).unwrap();
+        let cert_path = tls_dir.join(GENERATED_CERT_FILE);
+        let key_path = tls_dir.join(GENERATED_KEY_FILE);
+
+        // Only a certificate from some other keypair survives.
+        let rcgen::CertifiedKey { cert: stale, .. } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        fs::write(&cert_path, stale.pem()).unwrap();
+
+        let squatter = tls_dir.join(format!("{GENERATED_CERT_FILE}.tmp"));
+        fs::create_dir(&squatter).unwrap();
+        build_server_config(None, None, tmp.path())
+            .expect_err("publication fails while cert.pem.tmp is a directory");
+        assert!(
+            key_path.exists(),
+            "the interruption came after the key write"
+        );
+        assert!(
+            !cert_path.exists(),
+            "the stale certificate is gone before a new key is written"
+        );
+
+        fs::remove_dir(&squatter).unwrap();
+        // rustls refuses a key whose public half is not the certificate's.
+        let (_, self_signed) = build_server_config(None, None, tmp.path())
+            .expect("the next start serves a matching pair");
+        assert!(self_signed, "the next start regenerates");
+        let (_, self_signed) =
+            build_server_config(None, None, tmp.path()).expect("the regenerated pair loads");
+        assert!(!self_signed, "the start after loads the published pair");
+    }
+
+    /// Kubernetes' fsGroup ownership walk adds group bits to files on the
+    /// data volume, and the Helm trawl-web sidecar runs as another uid in
+    /// that group. Loading the generated pair puts the key back to owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn loading_the_generated_pair_restores_an_owner_only_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        build_server_config(None, None, tmp.path()).unwrap();
+        let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+        let key_path = tls_dir.join(GENERATED_KEY_FILE);
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o660)).unwrap();
+
+        let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
+        assert!(!self_signed, "the existing pair is loaded, not replaced");
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "key.pem is owner-only again");
+        let cert_mode = fs::metadata(tls_dir.join(GENERATED_CERT_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(cert_mode, 0o644, "cert.pem stays world-readable");
     }
 
     /// The Debian package's trawl-web pins the certificate this module
