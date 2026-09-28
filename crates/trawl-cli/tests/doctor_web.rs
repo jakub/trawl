@@ -434,6 +434,110 @@ fn doctor_web_truncated_body_is_too_large() {
     }
 }
 
+/// A plain loopback origin that answers `GET /healthz` with `200 ok`
+/// unless `cut_healthz`, and cuts every other answer short: headers that
+/// declare 100 bytes of body, 10 of them, then a closed connection. It
+/// returns the origin and the `METHOD path` of each request it read.
+fn cut_short_origin(cut_healthz: bool) -> (String, Arc<Mutex<Vec<String>>>) {
+    use std::io::{Read as _, Write as _};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for tcp in listener.incoming() {
+            let Ok(mut tcp) = tcp else { return };
+            tcp.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head_end = loop {
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                match tcp.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+            while request.len() < head_end + length {
+                match tcp.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => request.extend_from_slice(&buf[..n]),
+                }
+            }
+            let line = head.lines().next().unwrap_or_default().to_owned();
+            let mut parts = line.split(' ');
+            let (method, path) = (
+                parts.next().unwrap_or_default().to_ascii_uppercase(),
+                parts.next().unwrap_or_default().to_owned(),
+            );
+            let response: &[u8] = if path == "/healthz" && !cut_healthz {
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+            } else {
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{\"error\":"
+            };
+            record.lock().unwrap().push(format!("{method} {path}"));
+            let _ = tcp.write_all(response);
+            let _ = tcp.flush();
+        }
+    });
+    (url, seen)
+}
+
+/// A web answer the origin cuts short after its headers is an observed
+/// failure, not a failed connection and not a timeout: the check that
+/// read it fails with `response body broken`. A broken `/healthz` fails
+/// `web.transport` and blocks `web.origin`; a broken login answer after a
+/// good `/healthz` fails `web.origin` alone.
+#[test]
+fn doctor_web_body_cut_short_is_broken() {
+    let (url, seen) = cut_short_origin(true);
+    let (output, report) = doctor(&url);
+    assert_api_failed_independently(&report, "healthz cut short");
+    assert_eq!(
+        outcome(&report, "web.transport"),
+        (
+            "failed".to_owned(),
+            Some("response body broken".to_owned()),
+            None
+        )
+    );
+    assert_eq!(
+        outcome(&report, "web.origin"),
+        (
+            "not_sampled".to_owned(),
+            Some("blocked".to_owned()),
+            Some("web.transport".to_owned())
+        )
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(*seen.lock().unwrap(), ["GET /healthz"]);
+
+    let (url, seen) = cut_short_origin(false);
+    let (output, report) = doctor(&url);
+    assert_api_failed_independently(&report, "login cut short");
+    assert_eq!(
+        outcome(&report, "web.transport"),
+        ("complete".to_owned(), None, None)
+    );
+    assert_eq!(
+        outcome(&report, "web.origin"),
+        (
+            "failed".to_owned(),
+            Some("response body broken".to_owned()),
+            None
+        )
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(*seen.lock().unwrap(), PROBES);
+}
+
 /// `GET /healthz` answering 429 samples nothing: `web.transport` is
 /// `not_sampled` with `rate_limited`, and `web.origin` is not sent.
 #[test]

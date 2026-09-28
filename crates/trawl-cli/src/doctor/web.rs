@@ -203,6 +203,11 @@ fn network_failure(check: Check, e: &ClientError) -> Check {
             with_reason(check, "redirect refused"),
             "give --web-url the origin trawl-web serves, not an address that redirects",
         ),
+        Some(NetworkKind::BodyRead) => with_next(
+            with_reason(check, "response body broken"),
+            "run trawl doctor again; if it repeats, check for a proxy between here and \
+             trawl-web that cuts answers short",
+        ),
         _ => with_next(
             with_reason(check, "the request failed"),
             "run trawl doctor again, and check the network path to trawl-web",

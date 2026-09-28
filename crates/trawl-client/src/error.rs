@@ -64,6 +64,10 @@ pub enum NetworkKind {
     /// The response headers arrived, so the server answered, but its body
     /// did not finish within the request's deadline.
     BodyTimeout,
+    /// The response headers arrived, so the server answered, but reading
+    /// its body failed for a reason other than the deadline: the peer
+    /// closed before the declared length, or sent a malformed chunk.
+    BodyRead,
     /// The server answered with a redirect the client refused to follow.
     Redirect,
     /// Any other transport failure.

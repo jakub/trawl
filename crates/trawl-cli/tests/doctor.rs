@@ -199,12 +199,17 @@ struct StubSeen {
 }
 
 /// An answer: status and JSON body. The status [`STALL`] sends `200`
-/// headers and the body's first byte, then holds the connection open.
+/// headers and the body's first byte, then holds the connection open. The
+/// status [`BROKEN`] sends `200` headers and part of the body, then closes.
 type Route = (&'static str, u16, String);
 
 /// A route status that stalls after the headers, past the doctor's 10 s
 /// request deadline.
 const STALL: u16 = 0;
+
+/// A route status whose headers declare 100 bytes of body, then send 10 of
+/// them and close the connection.
+const BROKEN: u16 = 1;
 
 /// A listener on `127.0.0.1` that speaks TLS (or plain HTTP), answers each
 /// routed path with a fixed status and body, and records everything.
@@ -368,6 +373,12 @@ fn answer<S: std::io::Read + std::io::Write>(
         let _ = stream.write_all(head.as_bytes());
         let _ = stream.flush();
         std::thread::sleep(Duration::from_secs(30));
+        return;
+    }
+    if status == BROKEN {
+        let head = "HTTP/1.1 200 Stub\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{\"status\":";
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.flush();
         return;
     }
     let response = format!(
@@ -1799,6 +1810,52 @@ fn doctor_body_stall_is_not_a_transport_timeout() {
     let paths: Vec<String> = stub.requests().into_iter().map(|r| r.path).collect();
     assert_eq!(paths, [HEALTH_PATH]);
     stub.assert_no_authorization("body stall");
+}
+
+/// A health answer whose headers arrived under verified TLS and whose body
+/// the server then cut short proves the transport and the certificate, and
+/// the broken body is an observed failure: `api.health` fails with
+/// `response body broken`, not a timeout and not a failed connection.
+/// Identity is blocked, no key is sent, and the run fails, exit 1. A
+/// whoami body cut short fails `api.identity` the same way.
+#[test]
+fn doctor_body_cut_short_is_not_a_broken_connection() {
+    let (output, stub) = doctor_against(vec![
+        (HEALTH_PATH, BROKEN, String::new()),
+        whoami(r#""query""#),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let health_report = report(&output);
+    assert_eq!(
+        api_rows(&health_report),
+        [
+            own_row("api.transport", "complete", None, None),
+            own_row("api.tls", "complete", None, None),
+            own_row("api.health", "failed", Some("response body broken"), None),
+            own_row(
+                "api.identity",
+                "not_sampled",
+                Some("blocked"),
+                Some("api.health")
+            ),
+        ]
+    );
+    let paths: Vec<String> = stub.requests().into_iter().map(|r| r.path).collect();
+    assert_eq!(paths, [HEALTH_PATH]);
+    stub.assert_no_authorization("health body cut short");
+
+    let (output, _stub) = doctor_against(vec![healthy(), (WHOAMI_PATH, BROKEN, String::new())]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let report = report(&output);
+    assert_eq!(
+        api_rows(&report),
+        [
+            own_row("api.transport", "complete", None, None),
+            own_row("api.tls", "complete", None, None),
+            own_row("api.health", "complete", None, None),
+            own_row("api.identity", "failed", Some("response body broken"), None),
+        ]
+    );
 }
 
 /// trawld's whoami answers exactly 200. Another 2xx with a valid body is

@@ -236,8 +236,8 @@ mod witness {
 }
 
 /// Whether `result` holds an HTTP answer, whatever its status. A body too
-/// large to read, or one that stalled after the headers, still followed
-/// an answer's status line.
+/// large to read, one that stalled after the headers, or one that broke
+/// off after them still followed an answer's status line.
 fn answered<T>(result: &Result<T, ClientError>) -> bool {
     match result {
         Ok(_)
@@ -246,7 +246,7 @@ fn answered<T>(result: &Result<T, ClientError>) -> bool {
         }
         Err(e) => matches!(
             e.network_kind(),
-            Some(NetworkKind::Redirect | NetworkKind::BodyTimeout)
+            Some(NetworkKind::Redirect | NetworkKind::BodyTimeout | NetworkKind::BodyRead)
         ),
     }
 }
@@ -607,6 +607,13 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
                     "run trawl doctor again; the answer began but did not finish within 10 s",
                 )
             }
+            // The server answered, so transport and TLS stand; this answer
+            // broke off, which the doctor saw, so the check failed.
+            Some(NetworkKind::BodyRead) => with_next(
+                with_reason(check, "response body broken"),
+                "run trawl doctor again; if it repeats, check for a proxy between here and the \
+                 server that cuts answers short, and read the server's log",
+            ),
             Some(NetworkKind::UntrustedCertificate) => with_next(
                 with_reason(check, "certificate not trusted"),
                 "the server's certificate changed during the run; run trawl doctor again",

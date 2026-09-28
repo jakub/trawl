@@ -448,12 +448,17 @@ Each request waits up to 10 seconds. A request with no answer in that time
 gives `not_sampled` with the reason `timed_out`. When the answer starts but its
 body does not finish in that time, the connection and the certificate are
 proved: `api.transport` and `api.tls` are `complete`, and only the check that
-reads the body is `not_sampled` with `timed_out`. An HTTP 429 answer gives
-`not_sampled` with the reason `rate_limited`. The doctor does not follow a
-redirect: the check fails with `redirect refused`. The doctor reads at most
-64 KiB of a health or `whoami` answer, and at most 4 KiB of a `web.*` answer.
-A larger answer fails the check with `response too large`, whatever its
-status, and the doctor never judges the part that it read.
+reads the body is `not_sampled` with `timed_out`. When the answer starts but
+the server closes the connection before the body is complete, the connection
+and the certificate are also proved. The check that reads the body fails with
+`response body broken`, because the doctor saw the answer break. An HTTP 429
+answer gives `not_sampled` with the reason `rate_limited`. The doctor does not
+follow a redirect: the check fails with `redirect refused`. The doctor reads
+at most 64 KiB of a health or `whoami` answer, and at most 4 KiB of a `web.*`
+answer. A larger answer fails the check with `response too large`, whatever
+its status. The doctor never judges the part that it read. For example, an
+HTTP 429 answer larger than the limit fails with `response too large`. It
+does not give `rate_limited`.
 
 ### Outcomes and verdict
 

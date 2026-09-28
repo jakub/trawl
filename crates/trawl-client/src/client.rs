@@ -997,14 +997,24 @@ fn body_read_error(e: reqwest::Error) -> ClientError {
 }
 
 /// Classify a failure reading one chunk of a response body: a stall past
-/// the deadline is a [`NetworkKind::BodyTimeout`], anything else is
-/// sanitized as a transport failure.
+/// the deadline is a [`NetworkKind::BodyTimeout`], anything else is a
+/// [`NetworkKind::BodyRead`]. Either way the headers arrived, so the
+/// server answered; the connection itself is not in doubt. The message
+/// names the origin at most, never the transport library's reason.
 fn body_chunk_error(e: reqwest::Error) -> ClientError {
     if e.is_timeout() {
-        body_timeout(e)
-    } else {
-        sanitize_reqwest_error(e)
+        return body_timeout(e);
     }
+    let message = e.url().map_or_else(
+        || "response body broken".to_owned(),
+        |url| {
+            format!(
+                "response body broken for API {}",
+                url.origin().ascii_serialization()
+            )
+        },
+    );
+    ClientError::Network(NetworkError::new(NetworkKind::BodyRead, message))
 }
 
 /// A timeout that struck after the headers arrived: the sanitized timeout,
@@ -1580,6 +1590,52 @@ mod tests {
                 error.to_string(),
                 format!("network error: request timed out for API http://{address}"),
                 "keyed={keyed}"
+            );
+        }
+    }
+
+    /// Headers that declare 100 bytes of body, then 10 of them, then the
+    /// connection closes.
+    const CUT_SHORT: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{\"status\":";
+
+    /// A body the peer cuts short after the headers is a body read
+    /// failure, a kind of its own: the server answered, so it is neither a
+    /// failed connection nor a timeout. Every capped reader is covered: the
+    /// unkeyed health, the keyed whoami, and both origin probes. The
+    /// message names the origin and nothing the server sent.
+    #[tokio::test]
+    async fn body_cut_short_after_headers_is_a_body_read_failure() {
+        init();
+        for endpoint in ["health", "whoami", "healthz", "login"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = HttpClient::with_trust_timeout(
+                format!("http://{address}"),
+                "tok",
+                &TlsTrust::System,
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            let web = probe(address);
+            let request = async {
+                match endpoint {
+                    "health" => client.health().await.map(|_| ()),
+                    "whoami" => client.whoami().await.map(|_| ()),
+                    "healthz" => web.healthz().await.map(|_| ()),
+                    _ => web.login_probe("http://example.test").await.map(|_| ()),
+                }
+            };
+            let (result, _) = tokio::join!(request, serve_once(listener, CUT_SHORT.to_vec()));
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.network_kind(),
+                Some(NetworkKind::BodyRead),
+                "{endpoint}: {error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("network error: response body broken for API http://{address}"),
+                "{endpoint}"
             );
         }
     }
