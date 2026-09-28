@@ -13,6 +13,8 @@
 //! - `/api/v1/stream` is handled by the SSE-specific handler in
 //!   `routes::stream`, which streams bytes rather than buffering.
 //! - Hop-by-hop headers are stripped (connection, upgrade, te, etc.).
+//! - An upstream 3xx becomes the proxy's own 502, and `Location` never
+//!   reaches the browser; see `refuse_redirect`.
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -103,6 +105,7 @@ async fn do_forward(
     }
 
     let upstream_resp = upstream_req.send().await.map_err(ProxyError::Network)?;
+    refuse_redirect(upstream_resp.status())?;
 
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -143,6 +146,28 @@ pub(crate) fn clear_cookie_for_proxied_response(
     None
 }
 
+/// Turn an upstream redirect into an upstream error.
+///
+/// trawld never redirects, and the client follows no redirect (see
+/// [`AppState::from_config`]). Mirroring the 3xx would let the browser
+/// follow it instead: in the insecure-loopback mode another process can
+/// answer on the upstream port, and a `Location` naming another port on
+/// the browser's host would carry the host-scoped session cookie there,
+/// since a cookie's scope ignores the port. Every 3xx is refused, 304
+/// included: trawld sends no validators, so a 304 is not an answer it
+/// gives. Shared by every route that relays an upstream status.
+///
+/// # Errors
+/// [`ProxyError::Upstream`] for any 3xx, which answers 502.
+pub(crate) fn refuse_redirect(status: reqwest::StatusCode) -> Result<(), ProxyError> {
+    if status.is_redirection() {
+        return Err(ProxyError::Upstream(
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+        ));
+    }
+    Ok(())
+}
+
 const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Compose the upstream URL: the configured base followed by the
@@ -163,12 +188,17 @@ fn reqwest_method(m: &Method) -> reqwest::Method {
     reqwest::Method::from_bytes(m.as_str().as_bytes()).unwrap_or(reqwest::Method::GET)
 }
 
+/// Mirror upstream response headers, minus hop-by-hop headers,
+/// `Set-Cookie` (trawld owns no browser cookie) and `Location` (the proxy
+/// never points the browser anywhere on trawld's say-so; see
+/// [`refuse_redirect`]).
 fn copy_response_headers(src: &reqwest::header::HeaderMap, dst: &mut HeaderMap) {
     for (name, value) in src {
         if HOP_BY_HOP
             .iter()
             .any(|h| name.as_str().eq_ignore_ascii_case(h))
-            || name.as_str().eq_ignore_ascii_case("set-cookie")
+            || name == reqwest::header::SET_COOKIE
+            || name == reqwest::header::LOCATION
         {
             continue;
         }
@@ -399,6 +429,40 @@ mod tests {
         assert!(
             set_cookies.is_empty(),
             "upstream Set-Cookie headers must be stripped, got {set_cookies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_strips_upstream_location_outside_a_redirect() {
+        // A 3xx never gets this far (`refuse_redirect`), but a navigation
+        // that lands on a proxied 201 still sees its headers, so
+        // `Location` is dropped whatever the status.
+        let upstream = MockServer::start().await;
+        let app = build_app(state_pointing_at(&upstream));
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/saved"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header("location", "http://127.0.0.1:1/steal")
+                    .set_body_string("{}"),
+            )
+            .mount(&upstream)
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/saved")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(
+            resp.headers().get(header::LOCATION).is_none(),
+            "upstream Location must be stripped, got {:?}",
+            resp.headers().get(header::LOCATION)
         );
     }
 

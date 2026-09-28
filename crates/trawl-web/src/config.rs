@@ -46,7 +46,10 @@ pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
 
 /// Env var name that, when set to a non-empty value, makes the proxy's
 /// upstream HTTP client accept self-signed / invalid TLS certificates.
-/// Dev-only escape hatch; MUST NOT be set in production.
+///
+/// Honoured only for a loopback upstream (see [`resolve_upstream_tls`]):
+/// the proxy and trawld on one host, as the Debian package and the Helm
+/// sidecar run them. Any other upstream refuses to start.
 pub const ENV_INSECURE_UPSTREAM: &str = "TRAWL_WEB_INSECURE_UPSTREAM";
 
 /// Env var name overriding `[web] bind_addr`. Lets a listener move without
@@ -62,7 +65,7 @@ pub struct ResolvedConfig {
     pub upstream_url: String,
     pub session_ttl_secs: u64,
     pub allow_insecure_cookies: bool,
-    pub insecure_upstream_tls: bool,
+    pub upstream_tls: UpstreamTls,
     pub cookie_key: SessionKey,
     /// Parent domain for the shared `fleet_session` SSO cookie
     /// (`Domain=` attribute). `None` (unset or empty in config) means
@@ -76,6 +79,30 @@ pub struct ResolvedConfig {
     /// knows the operator stated an origin and the guard is a plain
     /// membership test with no "unset means allow" branch to forget.
     pub public_origins: PublicOrigins,
+}
+
+/// How the proxy's upstream client decides whether to trust trawld's
+/// TLS certificate.
+pub enum UpstreamTls {
+    /// The platform trust store.
+    System,
+    /// Only the roots read from `[web] upstream_ca_path`. The chain and the
+    /// hostname are still verified; no platform or built-in root is trusted.
+    PinnedCa(Vec<reqwest::Certificate>),
+    /// No certificate verification: [`ENV_INSECURE_UPSTREAM`] is set and
+    /// the upstream host is loopback.
+    InsecureLoopback,
+}
+
+/// Hand-written so a pinned bundle shows its size, not its certificates.
+impl std::fmt::Debug for UpstreamTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => f.write_str("System"),
+            Self::PinnedCa(roots) => write!(f, "PinnedCa(<{} certificates>)", roots.len()),
+            Self::InsecureLoopback => f.write_str("InsecureLoopback"),
+        }
+    }
 }
 
 /// Errors while loading or validating proxy configuration.
@@ -140,6 +167,46 @@ pub enum ConfigError {
     /// second vocabulary for one failure.
     #[error(transparent)]
     SessionEnvOrigins(SessionRuntimeError),
+
+    /// [`ENV_INSECURE_UPSTREAM`] is set but the upstream host is not
+    /// loopback. Carries the host so the operator sees which upstream the
+    /// variable would have switched verification off for.
+    #[error(
+        "{ENV_INSECURE_UPSTREAM} is set, but the upstream host `{host}` is not loopback. \
+         The variable is honoured only for 127.0.0.0/8, ::1 or localhost: unset it, \
+         or pin trawld's CA with `[web] upstream_ca_path`"
+    )]
+    InsecureUpstreamNotLoopback { host: String },
+
+    /// [`ENV_INSECURE_UPSTREAM`] is set but the upstream is loopback over
+    /// a scheme other than `https`. The variable skips certificate
+    /// verification; it never drops TLS, which would send bearer tokens
+    /// in cleartext.
+    #[error(
+        "{ENV_INSECURE_UPSTREAM} is set, but the upstream URL scheme is `{scheme}`. \
+         The variable skips certificate verification of an https upstream; \
+         it does not turn TLS off. Use an https:// upstream URL"
+    )]
+    InsecureUpstreamNotHttps { scheme: String },
+
+    /// [`ENV_INSECURE_UPSTREAM`] is set and the upstream URL has no host
+    /// that can be judged loopback. The URL itself is not echoed.
+    #[error(
+        "{ENV_INSECURE_UPSTREAM} is set, but the upstream URL does not parse as a URL \
+         with a host, so it cannot be confirmed as loopback"
+    )]
+    InsecureUpstreamUnparseable,
+
+    /// Both a pinned CA and "verify nothing" were asked for.
+    #[error(
+        "{ENV_INSECURE_UPSTREAM} is set together with `[web] upstream_ca_path`: \
+         a pinned CA and no verification contradict each other. Unset one"
+    )]
+    InsecureUpstreamWithCa,
+
+    /// `[web] upstream_ca_path` cannot be used as a trust root.
+    #[error("upstream CA file {path}: {reason}")]
+    UpstreamCa { path: PathBuf, reason: String },
 }
 
 impl ResolvedConfig {
@@ -196,6 +263,11 @@ impl ResolvedConfig {
             .upstream_url
             .clone()
             .unwrap_or_else(|| default_upstream_from_server(server));
+        let upstream_tls = resolve_upstream_tls(
+            std::env::var(ENV_INSECURE_UPSTREAM).ok().as_deref(),
+            &upstream_url,
+            web.upstream_ca_path.as_deref(),
+        )?;
         let allow_insecure_cookies = runtime
             .secure
             .map_or(web.allow_insecure_cookies, |secure| !secure);
@@ -216,8 +288,7 @@ impl ResolvedConfig {
             upstream_url,
             session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
             allow_insecure_cookies,
-            insecure_upstream_tls: std::env::var(ENV_INSECURE_UPSTREAM)
-                .is_ok_and(|v| !v.is_empty()),
+            upstream_tls,
             cookie_key,
             shared_domain,
             public_origins,
@@ -378,6 +449,121 @@ fn resolve_bind_addr(env_value: Option<&str>, configured: Option<&str>) -> Strin
     pick(env_value)
         .or_else(|| pick(configured))
         .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned())
+}
+
+/// Decide how the upstream client verifies trawld's certificate.
+///
+/// `insecure_env` is the raw value of [`ENV_INSECURE_UPSTREAM`]; any
+/// non-empty value turns it on, as it always has. Split from `from_parsed`
+/// so every case is testable without mutating the process environment
+/// (forbidden under `unsafe_code = "forbid"`).
+///
+/// - The variable with `ca_path` refuses: the two contradict each other.
+/// - The variable is honoured only when the upstream URL's host is a
+///   loopback literal: an IPv4 address in `127.0.0.0/8`, `::1`, or the name
+///   `localhost` in any case. The decision is made on the parsed URL, by the
+///   same parser the client dials with, and never by resolving a name. That
+///   alone would not hold the boundary for `localhost`, which the client
+///   resolves when it dials; the client in this mode maps that name to
+///   `127.0.0.1` and `::1` itself and ignores proxy settings (see
+///   `state::upstream_client`), so neither a resolver answer nor a proxy
+///   can widen it. A URL that does not parse refuses.
+/// - The variable also needs an `https` upstream: it skips certificate
+///   verification, and a plain `http` upstream would send every bearer
+///   token in cleartext instead.
+/// - `ca_path` is read now, so a missing, empty or unparseable file stops
+///   startup instead of failing every request later. The upstream must be
+///   `https`, since a plain `http` upstream would never consult the pin.
+///
+/// # Errors
+/// Returns a [`ConfigError`] naming the rule that refused.
+pub fn resolve_upstream_tls(
+    insecure_env: Option<&str>,
+    upstream_url: &str,
+    ca_path: Option<&Path>,
+) -> Result<UpstreamTls, ConfigError> {
+    let insecure = insecure_env.is_some_and(|value| !value.is_empty());
+    if insecure {
+        if ca_path.is_some() {
+            return Err(ConfigError::InsecureUpstreamWithCa);
+        }
+        let url = reqwest::Url::parse(upstream_url)
+            .map_err(|_| ConfigError::InsecureUpstreamUnparseable)?;
+        let host = url
+            .host_str()
+            .filter(|host| !host.is_empty())
+            .ok_or(ConfigError::InsecureUpstreamUnparseable)?;
+        if !is_loopback_host(host) {
+            return Err(ConfigError::InsecureUpstreamNotLoopback {
+                host: host.to_owned(),
+            });
+        }
+        if url.scheme() != "https" {
+            return Err(ConfigError::InsecureUpstreamNotHttps {
+                scheme: url.scheme().to_owned(),
+            });
+        }
+        return Ok(UpstreamTls::InsecureLoopback);
+    }
+    let Some(path) = ca_path else {
+        return Ok(UpstreamTls::System);
+    };
+    let path = PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).into_owned());
+    let refuse = |reason: &str| ConfigError::UpstreamCa {
+        path: path.clone(),
+        reason: reason.to_owned(),
+    };
+    if !reqwest::Url::parse(upstream_url).is_ok_and(|url| url.scheme() == "https") {
+        return Err(refuse(
+            "the upstream URL is not https, so the pinned CA would never be consulted",
+        ));
+    }
+    let pem = std::fs::read(&path).map_err(|e| refuse(&e.to_string()))?;
+    let roots = pinned_roots(&pem).map_err(refuse)?;
+    Ok(UpstreamTls::PinnedCa(roots))
+}
+
+/// Whether a parsed URL host is a loopback literal.
+///
+/// `host` is [`reqwest::Url::host_str`]'s spelling: IPv4 already
+/// normalized to dotted-quad, IPv6 in brackets. A name other than
+/// `localhost` is never loopback here, whatever it resolves to.
+fn is_loopback_host(host: &str) -> bool {
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    literal.parse::<std::net::IpAddr>().map_or_else(
+        |_| host.eq_ignore_ascii_case("localhost"),
+        |ip| ip.is_loopback(),
+    )
+}
+
+/// Parse a PEM bundle into trust anchors, refusing one that yields none.
+///
+/// Every certificate goes through the same root-store check the TLS stack
+/// applies when the client is built, so a bundle that passes here cannot
+/// fail there with a bare "builder error".
+fn pinned_roots(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, &'static str> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject as _;
+
+    let ders = CertificateDer::pem_slice_iter(pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "the file is not valid PEM")?;
+    if ders.is_empty() {
+        return Err("the file holds no PEM certificate");
+    }
+    let mut store = rustls::RootCertStore::empty();
+    ders.iter()
+        .map(|der| {
+            store
+                .add(der.clone())
+                .map_err(|_| "a certificate in the file does not parse")?;
+            reqwest::Certificate::from_der(der)
+                .map_err(|_| "a certificate in the file does not parse")
+        })
+        .collect()
 }
 
 /// Build the default upstream URL from the trawld `[server].http_addr`.
@@ -1215,6 +1401,289 @@ session_ttl_secs = 3600
         };
         let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
         assert!(resolved.shared_domain.is_none());
+    }
+
+    // -- upstream TLS: the loopback rule and the pinned CA -----------------
+
+    #[test]
+    fn insecure_upstream_is_honoured_for_every_loopback_literal() {
+        for upstream in [
+            "https://127.0.0.1:5514",
+            "https://127.9.9.9:5514",
+            "https://[::1]:5514",
+            "https://localhost:5514",
+            "https://LOCALHOST:5514",
+            "https://LocalHost",
+        ] {
+            let tls = resolve_upstream_tls(Some("1"), upstream, None)
+                .unwrap_or_else(|e| panic!("{upstream} is loopback: {e}"));
+            assert!(
+                matches!(tls, UpstreamTls::InsecureLoopback),
+                "{upstream} gave {tls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn insecure_upstream_refuses_a_host_that_is_not_loopback_and_names_it() {
+        for (upstream, host) in [
+            ("https://trawld:5514", "trawld"),
+            ("https://10.0.0.1:5514", "10.0.0.1"),
+            ("https://trawl.example.com", "trawl.example.com"),
+            // A name that usually resolves to loopback is still a name.
+            (
+                "https://localhost.localdomain:5514",
+                "localhost.localdomain",
+            ),
+            ("https://[::ffff:127.0.0.1]:5514", "[::ffff:7f00:1]"),
+            ("https://0.0.0.0:5514", "0.0.0.0"),
+        ] {
+            let error = resolve_upstream_tls(Some("1"), upstream, None)
+                .expect_err("a non-loopback upstream must refuse");
+            assert!(
+                matches!(&error, ConfigError::InsecureUpstreamNotLoopback { host: h } if h == host),
+                "{upstream} gave {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(ENV_INSECURE_UPSTREAM), "got: {message}");
+            assert!(message.contains(&format!("`{host}`")), "got: {message}");
+        }
+    }
+
+    #[test]
+    fn insecure_upstream_refuses_a_loopback_upstream_without_tls_and_names_the_scheme() {
+        // The variable skips certificate checks; it does not drop TLS, which
+        // would put every bearer token on the wire in cleartext.
+        for (upstream, scheme) in [
+            ("http://127.0.0.1:5514", "http"),
+            ("http://[::1]:5514", "http"),
+            ("http://localhost:5514", "http"),
+            ("ws://127.0.0.1:5514", "ws"),
+        ] {
+            let error = resolve_upstream_tls(Some("1"), upstream, None)
+                .expect_err("a cleartext upstream must refuse");
+            assert!(
+                matches!(&error, ConfigError::InsecureUpstreamNotHttps { scheme: s } if s == scheme),
+                "{upstream} gave {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(ENV_INSECURE_UPSTREAM), "got: {message}");
+            assert!(message.contains(&format!("`{scheme}`")), "got: {message}");
+            assert!(message.contains("https"), "got: {message}");
+        }
+    }
+
+    #[test]
+    fn insecure_upstream_refuses_an_upstream_that_does_not_parse() {
+        for upstream in ["", "not a url", "127.0.0.1:5514", "unix:/run/trawld.sock"] {
+            let error = resolve_upstream_tls(Some("1"), upstream, None)
+                .expect_err("an unparseable upstream cannot be judged loopback");
+            assert!(
+                matches!(error, ConfigError::InsecureUpstreamUnparseable),
+                "{upstream:?} gave {error:?}"
+            );
+            assert!(error.to_string().contains(ENV_INSECURE_UPSTREAM));
+        }
+    }
+
+    #[test]
+    fn insecure_upstream_keeps_its_any_non_empty_value_reading() {
+        // Any non-empty value turns it on, `0` included, as before the
+        // loopback rule; empty or absent is off.
+        for value in ["1", "true", "0"] {
+            assert!(matches!(
+                resolve_upstream_tls(Some(value), "https://127.0.0.1:5514", None),
+                Ok(UpstreamTls::InsecureLoopback)
+            ));
+            assert!(matches!(
+                resolve_upstream_tls(Some(value), "https://trawld:5514", None),
+                Err(ConfigError::InsecureUpstreamNotLoopback { .. })
+            ));
+        }
+        for value in [None, Some("")] {
+            assert!(matches!(
+                resolve_upstream_tls(value, "https://trawld:5514", None),
+                Ok(UpstreamTls::System)
+            ));
+        }
+    }
+
+    #[test]
+    fn insecure_upstream_with_a_pinned_ca_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, test_ca_pem()).unwrap();
+        let error = resolve_upstream_tls(Some("1"), "https://127.0.0.1:5514", Some(&ca_path))
+            .expect_err("a pin and no verification contradict each other");
+        assert!(matches!(error, ConfigError::InsecureUpstreamWithCa));
+        let message = error.to_string();
+        assert!(message.contains(ENV_INSECURE_UPSTREAM), "got: {message}");
+        assert!(message.contains("upstream_ca_path"), "got: {message}");
+    }
+
+    #[test]
+    fn a_pinned_ca_file_resolves_to_its_certificates() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, format!("{}{}", test_ca_pem(), test_ca_pem())).unwrap();
+        let tls = resolve_upstream_tls(None, "https://trawld:5514", Some(&ca_path)).unwrap();
+        assert!(
+            matches!(&tls, UpstreamTls::PinnedCa(roots) if roots.len() == 2),
+            "{tls:?}"
+        );
+        assert_eq!(format!("{tls:?}"), "PinnedCa(<2 certificates>)");
+    }
+
+    #[test]
+    fn an_unusable_pinned_ca_file_refuses_at_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_only = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        let bad_der = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n";
+        let bad_pem = "-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n";
+        let good_then_bad = format!("{}{bad_der}", test_ca_pem());
+        for (contents, reason) in [
+            ("", "no PEM certificate"),
+            ("not pem at all\n", "no PEM certificate"),
+            (key_only, "no PEM certificate"),
+            (bad_der, "does not parse"),
+            (good_then_bad.as_str(), "does not parse"),
+            (bad_pem, "not valid PEM"),
+        ] {
+            let ca_path = dir.path().join("ca.pem");
+            std::fs::write(&ca_path, contents).unwrap();
+            let error = resolve_upstream_tls(None, "https://trawld:5514", Some(&ca_path))
+                .expect_err("an unusable bundle must stop startup");
+            assert!(
+                matches!(&error, ConfigError::UpstreamCa { reason: r, .. } if r.contains(reason)),
+                "{contents:?} gave {error:?}"
+            );
+            assert!(error.to_string().contains("ca.pem"), "{error}");
+        }
+
+        let missing = dir.path().join("missing.pem");
+        let error = resolve_upstream_tls(None, "https://trawld:5514", Some(&missing))
+            .expect_err("a missing file must stop startup");
+        assert!(matches!(error, ConfigError::UpstreamCa { .. }), "{error:?}");
+        assert!(error.to_string().contains("missing.pem"), "{error}");
+    }
+
+    #[test]
+    fn a_pinned_ca_refuses_a_plain_http_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, test_ca_pem()).unwrap();
+        let error = resolve_upstream_tls(None, "http://127.0.0.1:5514", Some(&ca_path))
+            .expect_err("a pin on a plain-http upstream would never be consulted");
+        assert!(
+            matches!(&error, ConfigError::UpstreamCa { reason, .. } if reason.contains("not https")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_file_carries_the_pinned_ca_into_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, test_ca_pem()).unwrap();
+        let web = WebConfig {
+            upstream_url: Some("https://trawld:5514".into()),
+            upstream_ca_path: Some(ca_path),
+            ..configured_web()
+        };
+        let runtime = SessionRuntimeOverrides::parse(None, None, None, None, None).unwrap();
+        // Reads the real process environment for the insecure variable,
+        // which the test runner does not set.
+        let resolved = ResolvedConfig::from_parsed_with_runtime(&web, None, runtime).unwrap();
+        assert!(matches!(resolved.upstream_tls, UpstreamTls::PinnedCa(_)));
+    }
+
+    #[test]
+    fn derived_loopback_upstreams_keep_the_insecure_variable() {
+        // The Helm sidecar: `httpAddr: 0.0.0.0:5514` with the variable set.
+        for http_addr in ["0.0.0.0:5514", "[::]:5514", "127.0.0.1:5514", "[::1]:5514"] {
+            let srv = ServerConfig {
+                http_addr: http_addr.into(),
+                ..dummy_server()
+            };
+            let upstream = default_upstream_from_server(Some(&srv));
+            assert!(
+                matches!(
+                    resolve_upstream_tls(Some("1"), &upstream, None),
+                    Ok(UpstreamTls::InsecureLoopback)
+                ),
+                "{http_addr} derived {upstream}"
+            );
+        }
+        // No `[server]` at all falls back to a loopback upstream too.
+        assert!(matches!(
+            resolve_upstream_tls(Some("1"), FALLBACK_UPSTREAM_URL, None),
+            Ok(UpstreamTls::InsecureLoopback)
+        ));
+    }
+
+    /// The Debian package pins the certificate trawld generates for itself.
+    /// The path itself is guarded beside trawld's generator, in
+    /// `trawl-server`'s `tls.rs`, where the file name is defined.
+    #[test]
+    fn the_debian_default_config_pins_trawld_generated_certificate() {
+        let config = Config::parse_toml(include_str!("../../trawl-server/debian/trawld.toml"))
+            .expect("the packaged trawld.toml parses");
+        let upstream = config
+            .web
+            .upstream_url
+            .clone()
+            .unwrap_or_else(|| default_upstream_from_server(Some(&config.server)));
+        let packaged_pin = config
+            .web
+            .upstream_ca_path
+            .as_deref()
+            .expect("the packaged trawld.toml sets [web] upstream_ca_path");
+
+        // With trawld's certificate at the pinned path, the pin resolves. The
+        // certificate here is the shape trawld generates: self-signed, with
+        // the loopback names as SANs.
+        let dir = tempfile::tempdir().unwrap();
+        let generated = dir.path().join("cert.pem");
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_owned(),
+            "127.0.0.1".to_owned(),
+            "::1".to_owned(),
+        ])
+        .unwrap()
+        .cert;
+        std::fs::write(&generated, cert.pem()).unwrap();
+        assert!(
+            matches!(
+                resolve_upstream_tls(None, &upstream, Some(&generated)),
+                Ok(UpstreamTls::PinnedCa(roots)) if roots.len() == 1
+            ),
+            "the Debian upstream {upstream} must accept a pin"
+        );
+
+        // Before trawld's first start writes it, trawl-web refuses to start
+        // and names the file.
+        let missing = dir.path().join("tls").join("cert.pem");
+        let error = resolve_upstream_tls(None, &upstream, Some(&missing)).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::UpstreamCa { path, .. } if *path == missing),
+            "{error:?}"
+        );
+
+        // The insecure variable beside the packaged pin refuses.
+        assert!(matches!(
+            resolve_upstream_tls(Some("1"), &upstream, Some(packaged_pin)),
+            Err(ConfigError::InsecureUpstreamWithCa)
+        ));
+    }
+
+    /// A self-signed CA certificate in PEM.
+    fn test_ca_pem() -> String {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
     }
 
     #[test]

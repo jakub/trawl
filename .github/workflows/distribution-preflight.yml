@@ -8,9 +8,21 @@ on:
       - '.github/workflows/macos-cli.yml'
       - '.github/workflows/distribution-preflight.yml'
       - 'scripts/release/**'
+      - 'Dockerfile'
       - 'Cargo.lock'
       - 'Cargo.toml'
-      - 'crates/trawl-cli/Cargo.toml'
+      # The trial job runs the CLI, the browser proxy, and the Debian units
+      # from these crates, and follows the trial tutorial. It also reads the
+      # web UI and the shared fleet UI (sign-in form, range dialog) by
+      # selector, and the admin tools by their output text.
+      - 'crates/trawl-cli/**'
+      - 'crates/trawl-web/**'
+      - 'crates/trawl-server/debian/**'
+      - 'crates/trawl-web-ui/**'
+      - 'crates/fleet-ui/**'
+      - 'crates/fleet-admin/**'
+      - 'crates/trawl-admin/**'
+      - 'docs/src/content/docs/getting-started/first-query.md'
       - 'crates/trawl-core/Cargo.toml'
       - 'crates/trawl-core/build.rs'
       - 'crates/trawl-core/build_support/**'

@@ -156,6 +156,9 @@ directory. This override leaves per-test timeouts, assertions and
   (`batch1-controls.spec.ts`, `chrome-controls.spec.ts`) — an
   assertion on `.sd-scrim` at the default width is asserting a panel
   that is not there.
+- A browser language that is not a BCP 47 tag: `posix-locale.spec.ts`
+  sets Playwright's `locale` to `en-US@posix`, as Chromium reported on
+  the arm64 runner, and checks that the sign-in form and a chart render.
 - No visual regression / screenshot diffing.
 - No real backend — every response is a fixture in `harness/fixtures.mjs`.
   Re-verify those shapes against `crates/trawl-api/src/lib.rs` /

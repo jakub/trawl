@@ -382,6 +382,7 @@ the Helm chart.
 |-----|------|---------|-------------|
 | `bind_addr` | string | `"127.0.0.1:8090"` | Proxy listen address. Front it with a reverse proxy for external access |
 | `upstream_url` | string | derived from `[server] http_addr` | How the proxy reaches trawld. A wildcard bind is rewritten to loopback |
+| `upstream_ca_path` | path | *(none)* | PEM file of the CA certificates to trust for trawld. The proxy then trusts only these CAs and still checks the hostname. `upstream_url` must be `https`. A missing, empty, or unparseable file is a startup error |
 | `cookie_secret_path` | path | *(none)* | File holding the 32-byte AEAD cookie-encryption key |
 | `cookie_secret_env` | string | *(none)* | Name of an environment variable holding the base64-encoded key |
 | `session_ttl_secs` | integer | `86400` | Browser session lifetime in seconds |
@@ -437,7 +438,7 @@ variables log a line when they displace a configured value.
 | `FLEET_SESSION_COOKIE_SECURE` | `true` or `false`. `false` clears `Secure` on the session cookie |
 | `FLEET_SESSION_COOKIE_PATH` | Cookie `Path=`. The only accepted value is `/`. There is no `[web]` counterpart |
 | `TRAWL_WEB_BIND_ADDR` | Overrides `[web] bind_addr` |
-| `TRAWL_WEB_INSECURE_UPSTREAM` | Skip TLS verification of the upstream trawld certificate. Loopback only |
+| `TRAWL_WEB_INSECURE_UPSTREAM` | Any non-empty value skips TLS verification of the upstream trawld certificate. It does not turn TLS off. The proxy honours it only when the upstream URL is `https` and its host is an address in `127.0.0.0/8`, `::1`, or `localhost`. The proxy then dials `localhost` at `127.0.0.1` or `::1` without asking the resolver, and ignores proxy variables such as `HTTPS_PROXY`. Any other host, an `http` upstream, an upstream URL that does not parse, or a set `upstream_ca_path` is a startup error that names the variable. There is no `[web]` counterpart |
 
 The Helm chart passes `FLEET_SESSION_PUBLIC_ORIGINS` to the sidecar as well as
 rendering `public_origins` into the generated TOML, so a `config.raw` that
@@ -501,7 +502,8 @@ The default connection, used when no `--profile` is selected.
 |-----|------|---------|-------------|
 | `url` | string | `"https://localhost:5514"` | Server URL |
 | `token` | string | *(none)* | API token |
-| `insecure` | bool | `false` | Accept self-signed TLS certificates |
+| `insecure` | bool | `false` | Accept self-signed TLS certificates. `trawl` then prints a warning to stderr |
+| `ca_cert` | path | *(none)* | PEM file of the CA certificates to trust for this server. `trawl` trusts only these CAs and still checks the hostname. The path must be absolute or start with `~`. Setting it together with `insecure` is an error |
 
 ### `[profiles.<name>]`
 
@@ -513,6 +515,7 @@ Select a profile with `-p dev`, `--profile dev`, or `TRAWL_PROFILE=dev`.
 | `url` | string | *(inherits `[server]`)* | Server URL |
 | `token` | string | *(inherits `[server]`)* | API token |
 | `insecure` | bool | *(inherits `[server]`)* | Accept self-signed TLS certificates |
+| `ca_cert` | path | *(inherits `[server]`)* | PEM file of the CA certificates to trust. `""` clears an inherited `ca_cert` |
 
 ```toml
 [server]
@@ -522,7 +525,7 @@ token = "flt_prod_token"
 [profiles.dev]
 url = "https://localhost:5514"
 token = "flt_dev_token"
-insecure = true
+ca_cert = "~/.config/trawl/dev-ca.pem"
 ```
 
 ### `[ui]`

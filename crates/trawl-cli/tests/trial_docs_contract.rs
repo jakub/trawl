@@ -1,0 +1,321 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+//! The trial tutorial and the CLI reference are packaging artifacts: they
+//! quote what `trawl trial up` prints and the row the documented query
+//! returns. `trial` is a private module, so the literals cannot be imported
+//! here. Each one is duplicated below and held against the `insta`
+//! snapshot of the summary, which `render.rs` produces from the constants in
+//! `sample.rs`. A change on either side fails here before it reaches a
+//! reader.
+
+const FIRST_QUERY: &str =
+    include_str!("../../../docs/src/content/docs/getting-started/first-query.md");
+const QUERY_TUTORIAL: &str = include_str!("../../../docs/src/content/docs/use/query-tutorial.md");
+const CLI_REFERENCE: &str = include_str!("../../../docs/src/content/docs/reference/cli.md");
+/// The browser's range presets and its range dialog: the tutorials say how
+/// long the widest preset covers the samples and name the tab that reaches
+/// them afterwards.
+const WEB_QUERY_MERGE: &str = include_str!("../../trawl-web-ui/src/query_merge.rs");
+const RANGE_DIALOG: &str = include_str!("../../fleet-ui/src/range_dialog.rs");
+const SUMMARY_SNAPSHOT: &str = include_str!(
+    "../src/trial/snapshots/trawl_cli__trial__render__tests__the_summary_of_a_fixture_trial.snap"
+);
+const STATUS_SNAPSHOT: &str = include_str!(
+    "../src/trial/snapshots/trawl_cli__trial__render__tests__the_status_of_a_fixture_trial.snap"
+);
+
+/// `sample::DOCUMENTED_QUERY`.
+const DOCUMENTED_QUERY: &str =
+    "service=checkout _severity>=error | stats count() as errors by service";
+/// `sample::documented_row()`: the checkout plan's error count.
+const DOCUMENTED_SERVICE: &str = "checkout";
+const DOCUMENTED_ERRORS: u64 = 20;
+
+/// `sample::TUTORIAL_EVENTS`: the durations of all three, and the message
+/// of the one error event, which the query tutorial selects by name.
+const TUTORIAL_DURATIONS: [u64; 3] = [12, 1500, 700];
+const TUTORIAL_ERROR_MESSAGE: &str = "connection refused";
+
+/// `sample::QUICK_START_QUERIES`.
+const QUICK_START_QUERIES: [&str; 4] = [
+    "* | head 20",
+    "* | stats count() by service",
+    "_severity>=error | stats count() as errors by service | sort -errors | head 10",
+    "service=web _severity>=warn | timechart span=5m count()",
+];
+
+#[test]
+fn the_snapshot_prints_the_literals_this_test_duplicates() {
+    let command = format!("trawl -p trial query '{DOCUMENTED_QUERY}'");
+    assert!(
+        SUMMARY_SNAPSHOT.contains(&command),
+        "the summary snapshot no longer prints {command:?}; update DOCUMENTED_QUERY here and in the docs"
+    );
+    let row = format!("service {DOCUMENTED_SERVICE}, errors {DOCUMENTED_ERRORS}.");
+    assert!(
+        SUMMARY_SNAPSHOT.contains(&row),
+        "the summary snapshot no longer prints {row:?}; update the row here and in the docs"
+    );
+}
+
+#[test]
+fn the_tutorial_quotes_the_documented_query_and_its_row() {
+    assert!(FIRST_QUERY.contains(DOCUMENTED_QUERY));
+    assert!(
+        FIRST_QUERY.contains(&format!("trawl -p trial query '{DOCUMENTED_QUERY}'")),
+        "the tutorial quotes the command line the summary prints"
+    );
+    assert!(FIRST_QUERY.contains(&format!("\"errors\":{DOCUMENTED_ERRORS}")));
+    assert!(FIRST_QUERY.contains(&format!("\"service\":\"{DOCUMENTED_SERVICE}\"")));
+    assert!(FIRST_QUERY.contains(&format!(
+        "service {DOCUMENTED_SERVICE}, errors {DOCUMENTED_ERRORS}."
+    )));
+}
+
+#[test]
+fn the_tutorial_quotes_the_summary_verbatim() {
+    // The snapshot's fixture paths are `/state/trawl/trial/...`; the page
+    // shows the default state home instead. Every other line is verbatim.
+    let body = SUMMARY_SNAPSHOT
+        .splitn(3, "---\n")
+        .nth(2)
+        .expect("insta header, then the summary");
+    for line in body
+        .lines()
+        .filter(|line| !line.contains("/state/trawl/trial/"))
+    {
+        assert!(
+            FIRST_QUERY.contains(line),
+            "the tutorial lacks the summary line {line:?}"
+        );
+    }
+    for file in ["operator.token", "ingest.token"] {
+        assert!(FIRST_QUERY.contains(&format!("~/.local/state/trawl/trial/{file}")));
+    }
+}
+
+/// The trial publishes the browser UI on 127.0.0.1 only. `localhost` can
+/// reach `::1` first, where another local program may listen, so the docs
+/// send the browser to the published address.
+#[test]
+fn the_docs_send_the_browser_to_the_published_address() {
+    assert!(SUMMARY_SNAPSHOT.contains("  Browser   http://127.0.0.1:18090\n"));
+    assert!(FIRST_QUERY.contains("Open `http://127.0.0.1:18090`"));
+    assert!(CLI_REFERENCE.contains("`http://127.0.0.1:<web-port>`"));
+    for (page, text) in [("first-query", FIRST_QUERY), ("cli", CLI_REFERENCE)] {
+        assert!(
+            !text.contains("http://localhost:18090") && !text.contains("http://localhost:<"),
+            "{page} sends the browser to localhost"
+        );
+    }
+}
+
+#[test]
+fn the_tutorial_is_the_trial_tutorial() {
+    assert!(FIRST_QUERY.contains("## From trial to installation"));
+    assert!(
+        FIRST_QUERY.contains("Linux"),
+        "the page states the supported platform"
+    );
+    for heading in ["## Start the trial", "## Delete the trial"] {
+        assert!(FIRST_QUERY.contains(heading), "{heading}");
+    }
+    for verb in [
+        "trawl trial up",
+        "trawl trial key",
+        "trawl trial status",
+        "trawl trial stop",
+        "trawl trial down",
+    ] {
+        assert!(FIRST_QUERY.contains(verb), "{verb}");
+    }
+    for query in QUICK_START_QUERIES {
+        assert!(
+            FIRST_QUERY.contains(&format!("trawl -p trial query '{query}'")),
+            "{query}"
+        );
+    }
+    // `start/local-parquet.md` links to this anchor.
+    assert!(FIRST_QUERY.contains("### Query the export without a server"));
+    // The manual walkthrough is gone.
+    for gone in [
+        "fleet-admin migrate\n",
+        "trawl-admin tls generate",
+        "docker run",
+        "insecure = true",
+    ] {
+        assert!(
+            !FIRST_QUERY.contains(gone),
+            "the manual walkthrough is back: {gone:?}"
+        );
+    }
+}
+
+/// The tutorial events sit at the newest sample timestamp, so a relative
+/// bound on `service=tutorial` stops matching soon after `up`.
+#[test]
+fn the_query_tutorial_examples_hold_for_the_trials_life() {
+    assert!(QUERY_TUTORIAL.contains(TUTORIAL_ERROR_MESSAGE));
+    for duration in TUTORIAL_DURATIONS {
+        assert!(QUERY_TUTORIAL.contains(&duration.to_string()), "{duration}");
+    }
+    let examples: Vec<&str> = QUERY_TUTORIAL
+        .lines()
+        .filter(|line| line.starts_with("service=tutorial"))
+        .collect();
+    assert!(
+        examples.len() >= 8,
+        "the tutorial's examples moved: {examples:?}"
+    );
+    for example in examples {
+        assert!(
+            !example.contains("last=") && !example.contains("earliest="),
+            "a time bound on the tutorial events ages out: {example:?}"
+        );
+    }
+}
+
+#[test]
+fn the_tutorials_say_when_the_widest_preset_stops_covering_the_samples() {
+    // The samples keep the timestamps of the first `up`, and the browser's
+    // widest preset is a window that ends now: it loses them within a week.
+    assert!(
+        WEB_QUERY_MERGE.contains(r#"&["5m", "15m", "1h", "4h", "24h", "7d"]"#),
+        "the browser's range presets moved; recheck how long `7d` covers the samples"
+    );
+    assert!(RANGE_DIALOG.contains(r#"SegmentedOption::new("absolute", "Absolute")"#));
+    assert!(FIRST_QUERY.contains("about six days"));
+    assert!(QUERY_TUTORIAL.contains("about seven days"));
+    for (page, text) in [
+        ("first-query", FIRST_QUERY),
+        ("query-tutorial", QUERY_TUTORIAL),
+    ] {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for claim in [
+            "a later `up` does not move them",
+            "select **Absolute**",
+            "`trawl trial status` prints",
+        ] {
+            assert!(flat.contains(claim), "{page}: {claim}");
+        }
+    }
+}
+
+/// `status` prints `created <ts>` above the `Samples` section, and most
+/// samples are older than `created`. The tutorials name the timestamp after
+/// `from` on the `Samples` line and show that line as `status` prints it.
+///
+/// The status snapshot's fixture records its samples through
+/// `sample::complete` over a generated set, the call `up` makes, so the
+/// line below has the shape a real trial prints: RFC 3339 in UTC with
+/// milliseconds. The browser's **From** field accepts that shape
+/// (`normalize_instant` in `trawl-web-ui/src/search_url.rs`, tested there
+/// with a fractional second).
+#[test]
+fn the_tutorials_point_at_the_first_sample_timestamp() {
+    let mut lines = STATUS_SNAPSHOT.lines();
+    lines
+        .by_ref()
+        .find(|line| *line == "Samples")
+        .expect("the status snapshot has a Samples section");
+    let samples = lines.next().expect("a line under Samples");
+    let words: Vec<&str> = samples.split_whitespace().collect();
+    let [_count, "events", "from", first, "to", last] = words[..] else {
+        panic!("the status Samples line changed shape: {samples:?}");
+    };
+    for time in [first, last] {
+        assert!(
+            is_rfc3339_millis(time),
+            "the status snapshot prints {time:?}, not a UTC time with milliseconds"
+        );
+    }
+    let created = STATUS_SNAPSHOT
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("created"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the status snapshot prints created <ts>");
+    assert_ne!(created, first, "the fixture no longer tells the two apart");
+
+    for (page, text) in [
+        ("first-query", FIRST_QUERY),
+        ("query-tutorial", QUERY_TUTORIAL),
+    ] {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let claim = "In the `Samples` section that `trawl trial status` prints, \
+                     copy the timestamp after `from` into **From**";
+        assert!(flat.contains(claim), "{page}: {claim}");
+        assert!(
+            flat.contains("not the `created` timestamp"),
+            "{page} does not rule out the created timestamp"
+        );
+        let shown = text
+            .lines()
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|pair| pair == ["Samples", samples.trim()]);
+        assert!(shown, "{page} does not show the status line {samples:?}");
+        assert!(
+            flat.contains(&format!("`{first}`")),
+            "{page} does not name the example value {first}"
+        );
+        assert!(
+            flat.contains("**From** accepts the timestamp with its milliseconds"),
+            "{page} does not say that **From** accepts the milliseconds"
+        );
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+fn is_rfc3339_millis(time: &str) -> bool {
+    let shape = "dddd-dd-ddTdd:dd:dd.dddZ";
+    time.len() == shape.len()
+        && time.chars().zip(shape.chars()).all(|(c, s)| match s {
+            'd' => c.is_ascii_digit(),
+            _ => c == s,
+        })
+}
+
+#[test]
+fn the_cli_reference_documents_every_trial_flag_and_ca_cert() {
+    for text in [
+        "## Trial mode",
+        "trawl trial <VERB>",
+        "`--api-port`",
+        "`--web-port`",
+        "`--image`",
+        "`--no-sample-data`",
+        "`--yes`",
+        "$XDG_STATE_HOME/trawl/trial",
+        "trial.lock",
+        "[profiles.trial]",
+        "### Pin a CA with `ca_cert`",
+    ] {
+        assert!(CLI_REFERENCE.contains(text), "{text}");
+    }
+    for verb in ["`up`", "`status`", "`key`", "`stop`", "`down`"] {
+        assert!(CLI_REFERENCE.contains(&format!("| {verb} |")), "{verb}");
+    }
+}
+
+/// The samples age out under the default retention, so no page promises an
+/// exact result for longer than they are kept.
+#[test]
+fn the_exact_results_are_bounded_by_retention() {
+    for (page, text) in [
+        ("first-query", FIRST_QUERY),
+        ("query-tutorial", QUERY_TUTORIAL),
+    ] {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            !flat.contains("whole life"),
+            "{page} promises a result for the trial's whole life"
+        );
+        assert!(
+            flat.contains("while the samples are retained (90 days by default)"),
+            "{page} does not bound its exact results by retention"
+        );
+    }
+}

@@ -742,13 +742,7 @@ pub async fn run(
     direct_token: Option<&str>,
     driver_path: Option<&Path>,
 ) -> Result<(), CliError> {
-    let token = config.load_token(direct_token)?;
-
-    let client = if config.server.insecure {
-        HttpClient::new_insecure(&config.server.url, token)?
-    } else {
-        HttpClient::new(&config.server.url, token)?
-    };
+    let client = crate::connection(config, direct_token)?.client()?;
 
     // Set up terminal.
     enable_raw_mode()?;

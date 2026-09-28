@@ -1,0 +1,20 @@
+---
+source: crates/trawl-cli/src/trial/compose.rs
+expression: web_toml(&state())
+---
+# Rendered by `trawl trial up`. Holds no secret: the cookie key is in
+# the file cookie_secret_path names.
+
+[server]
+
+[data]
+path = "/var/lib/trawl/data"
+
+[web]
+bind_addr = "0.0.0.0:8090"
+upstream_url = "https://trawld:5514"
+upstream_ca_path = "/var/lib/trawl/trial/ca.pem"
+cookie_secret_path = "/var/lib/trawl/trial/web.cookie"
+public_origins = ["http://localhost:18090", "http://127.0.0.1:18090"]
+# The browser leg is plain HTTP on loopback.
+allow_insecure_cookies = true

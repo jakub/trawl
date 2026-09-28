@@ -1,0 +1,239 @@
+---
+source: crates/trawl-cli/src/trial/compose.rs
+expression: text
+---
+{
+  "name": "trawl-trial",
+  "networks": {
+    "default": {
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      }
+    }
+  },
+  "services": {
+    "fleet-admin": {
+      "dns_opt": [
+        "ndots:1"
+      ],
+      "dns_search": [
+        "."
+      ],
+      "entrypoint": [
+        "fleet-admin"
+      ],
+      "environment": {
+        "DATABASE_URL": "postgres://fleet@postgres:5432/fleet",
+        "PGPASSFILE": "/var/lib/trawl/trial/secrets/pgpass"
+      },
+      "image": "sha256:aaaa",
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      },
+      "logging": {
+        "driver": "none"
+      },
+      "profiles": [
+        "init"
+      ],
+      "pull_policy": "never",
+      "volumes": [
+        {
+          "read_only": true,
+          "source": "trawld",
+          "target": "/var/lib/trawl",
+          "type": "volume"
+        }
+      ]
+    },
+    "postgres": {
+      "dns_opt": [
+        "ndots:1"
+      ],
+      "dns_search": [
+        "."
+      ],
+      "environment": {
+        "POSTGRES_PASSWORD_FILE": "/var/lib/postgresql/trial/superuser.password"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 90,
+        "test": [
+          "CMD",
+          "pg_isready",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "5432",
+          "--username",
+          "postgres",
+          "--dbname",
+          "postgres"
+        ],
+        "timeout": "5s"
+      },
+      "image": "sha256:cccc",
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      },
+      "pull_policy": "never",
+      "volumes": [
+        {
+          "source": "postgres",
+          "target": "/var/lib/postgresql",
+          "type": "volume"
+        }
+      ]
+    },
+    "tls-init": {
+      "dns_opt": [
+        "ndots:1"
+      ],
+      "dns_search": [
+        "."
+      ],
+      "entrypoint": [
+        "/bin/sh",
+        "-c",
+        "set -eu\numask 077\nd=/var/lib/trawl/trial/tls\nif [ -e \"$$d/cert.pem\" ]; then exit 0; fi\nt=\"$$d.new\"\nrm -rf -- \"$$t\"\ntrawl-admin tls generate --output-dir \"$$t\" --san trawld --san localhost --san 127.0.0.1\nchmod 0400 \"$$t/key.pem\"\nmv -T -- \"$$t\" \"$$d\""
+      ],
+      "image": "sha256:aaaa",
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      },
+      "network_mode": "none",
+      "profiles": [
+        "init"
+      ],
+      "pull_policy": "never",
+      "volumes": [
+        {
+          "source": "trawld",
+          "target": "/var/lib/trawl",
+          "type": "volume"
+        }
+      ]
+    },
+    "trawl-web": {
+      "command": [
+        "--config",
+        "/var/lib/trawl/trial/web.toml"
+      ],
+      "depends_on": {
+        "trawld": {
+          "condition": "service_healthy"
+        }
+      },
+      "dns_opt": [
+        "ndots:1"
+      ],
+      "dns_search": [
+        "."
+      ],
+      "entrypoint": [
+        "trawl-web"
+      ],
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 90,
+        "test": [
+          "CMD",
+          "bash",
+          "-c",
+          "exec 3<>/dev/tcp/127.0.0.1/8090"
+        ],
+        "timeout": "5s"
+      },
+      "image": "sha256:aaaa",
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      },
+      "ports": [
+        {
+          "host_ip": "127.0.0.1",
+          "protocol": "tcp",
+          "published": "18090",
+          "target": 8090
+        }
+      ],
+      "pull_policy": "never",
+      "volumes": [
+        {
+          "source": "web",
+          "target": "/var/lib/trawl",
+          "type": "volume"
+        }
+      ]
+    },
+    "trawld": {
+      "command": [
+        "--config",
+        "/var/lib/trawl/trial/trawld.toml",
+        "--no-monitor"
+      ],
+      "depends_on": {
+        "postgres": {
+          "condition": "service_healthy"
+        }
+      },
+      "dns_opt": [
+        "ndots:1"
+      ],
+      "dns_search": [
+        "."
+      ],
+      "environment": {
+        "PGPASSFILE": "/var/lib/trawl/trial/secrets/pgpass"
+      },
+      "healthcheck": {
+        "interval": "2s",
+        "retries": 90,
+        "test": [
+          "CMD",
+          "bash",
+          "-c",
+          "exec 3<>/dev/tcp/127.0.0.1/5514"
+        ],
+        "timeout": "5s"
+      },
+      "image": "sha256:aaaa",
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      },
+      "ports": [
+        {
+          "host_ip": "127.0.0.1",
+          "protocol": "tcp",
+          "published": "15514",
+          "target": 5514
+        }
+      ],
+      "pull_policy": "never",
+      "volumes": [
+        {
+          "source": "trawld",
+          "target": "/var/lib/trawl",
+          "type": "volume"
+        }
+      ]
+    }
+  },
+  "volumes": {
+    "postgres": {
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      }
+    },
+    "trawld": {
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      }
+    },
+    "web": {
+      "labels": {
+        "sh.trawl.trial.id": "0123456789abcdef0123456789abcdef"
+      }
+    }
+  }
+}

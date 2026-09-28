@@ -4,26 +4,46 @@ description: Filter events, pick columns, sort rows, and summarize counts with t
 ---
 
 A query selects events, then passes them through pipe stages. Run each example
-in browser Search or pass it, quoted, to `trawl query`. The examples use the
-three `service=tutorial` events from [Your first query](/getting-started/first-query/).
-With your own logs, replace the service and look at a few rows first.
+in browser Search or pass it, quoted, to `trawl -p trial query`. The examples
+use the three `service=tutorial` events that `trawl trial up` loads with its
+sample data ([Your first query](/getting-started/first-query/)). They carry the
+time at which the first `trawl trial up` loaded the samples, and a later `up`
+does not move them, so the examples name no time range. `trawl query` adds
+none. The expected rows hold while the samples are retained (90 days by
+default). In the browser, select `7d` in **Date range**, because the default 15
+minutes stops covering the events soon after `up`. `7d` ends at the current
+time, so it covers the events for about seven days. After that, open
+**Date range** and select **Absolute**. In the `Samples` section that
+`trawl trial status` prints, copy the timestamp after `from` into **From**,
+not the `created` timestamp above it. The section looks like this, and here
+the value is `2026-09-24T12:01:36.453Z`:
+
+```text
+Samples
+  2000 events from 2026-09-24T12:01:36.453Z to 2026-09-25T12:00:00.000Z
+```
+
+**From** accepts the timestamp with its milliseconds and drops them, which
+moves the start a fraction of a second earlier. Leave **To** at `now`, and
+select **Apply**. With your own logs, replace the
+service and look at a few rows first.
 
 ## Find your events
 
 ```text
-service=tutorial last=1h
+service=tutorial
 ```
 
-Expect three rows. Both filters apply: `service` equals `tutorial` and the
-event time falls in the last hour. Start with a small range and widen it when
-you have a reason. In the browser, the range control and the **Filters**
-sidebar add to the editor text, and a [shared link](/use/sharing-export/)
-carries all three.
+Expect three rows: `service` equals `tutorial`. On real logs, add a time
+bound such as `last=1h`, so the event time must also fall in the last hour.
+Start with a small range and widen it when you have a reason. In the browser,
+the range control and the **Filters** sidebar add to the editor text, and a
+[shared link](/use/sharing-export/) carries all three.
 
 ## Pick the columns to show
 
 ```text
-service=tutorial last=1h | table _time, level, _severity, message, duration
+service=tutorial | table _time, level, _severity, message, duration
 ```
 
 Expect three rows with those five columns. `_time` is the event time and
@@ -37,7 +57,7 @@ in backticks, such as `` `http.status` ``, rather than renaming source fields.
 ## Select errors
 
 ```text
-service=tutorial _severity>=error last=1h | table message, duration
+service=tutorial _severity>=error | table message, duration
 ```
 
 Expect the one `connection refused` row. `_severity` compares severity bands.
@@ -47,7 +67,7 @@ vocabulary.
 ## Search raw text
 
 ```text
-service=tutorial "connection refused" last=1h
+service=tutorial "connection refused"
 ```
 
 Expect the same row. A quoted term matches the raw event text, field names
@@ -56,7 +76,7 @@ included, so name the field when you mean one. See [text search](/reference/dsl/
 ## Filter and sort rows
 
 ```text
-service=tutorial last=1h | where duration > 500 | sort -duration | table message, duration
+service=tutorial | where duration > 500 | sort -duration | table message, duration
 ```
 
 Expect the 1500 row, then the 700 row. `where` keeps rows where the expression
@@ -70,7 +90,7 @@ when a negated filter returns fewer rows than you expect.
 ## Count and summarize
 
 ```text
-service=tutorial last=1h | stats count() by service
+service=tutorial | stats count() by service
 ```
 
 Expect one row: `tutorial`, `3`. `stats` replaces event rows with summary
@@ -78,14 +98,14 @@ rows, and fields you did not group by or aggregate are gone. Name calculated
 columns for later use:
 
 ```text
-service=tutorial last=1h | stats avg(duration) as mean_duration, count() as events by service
+service=tutorial | stats avg(duration) as mean_duration, count() as events by service
 ```
 
 Expect `mean_duration` close to 737.33 and `events` equal to 3. Filter after
 `stats` with the output names:
 
 ```text
-service=tutorial last=1h | stats count() as events by service | where events >= 3
+service=tutorial | stats count() as events by service | where events >= 3
 ```
 
 Expect the same row.
@@ -93,7 +113,7 @@ Expect the same row.
 ## Chart counts over time
 
 ```text
-service=tutorial last=1h | timechart span=5m count()
+service=tutorial | timechart span=5m count()
 ```
 
 In the browser, open **Visualization**. Expect a line with one point at
