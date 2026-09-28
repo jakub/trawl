@@ -49,7 +49,9 @@ retry() {
 image="$image_repository:$image_tag"
 echo "== anonymous docker pull $image"
 retry docker pull "$image"
-docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}} {{join .RepoDigests " "}}' "$image"
+# `range`, not `join`: some Docker versions hand the template RepoDigests
+# as []interface{}, which `join` rejects.
+docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}{{range .RepoDigests}} {{.}}{{end}}' "$image"
 
 chart="$chart_repository/trawl"
 echo "== anonymous helm pull $chart --version $version"
