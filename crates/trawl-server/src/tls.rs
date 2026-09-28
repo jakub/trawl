@@ -18,9 +18,7 @@ use rustls::ServerConfig;
 use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
-
-const CERT_FILENAME: &str = "cert.pem";
-const KEY_FILENAME: &str = "key.pem";
+use trawl_config::{GENERATED_CERT_FILE, GENERATED_KEY_FILE, GENERATED_TLS_DIR};
 
 /// TLS configuration errors.
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +69,7 @@ pub fn build_server_config(
             (c, k, false)
         }
         (None, None) => {
-            let tls_dir = state_dir.join("tls");
+            let tls_dir = state_dir.join(GENERATED_TLS_DIR);
             let (c, k, generated) = load_or_generate_default(&tls_dir)?;
             (c, k, generated)
         }
@@ -169,10 +167,15 @@ fn log_cert_details(pem_bytes: &[u8]) {
 
 /// Load existing default certs or generate new self-signed ones.
 ///
+/// `cert.pem` is also a published artifact: a `trawl-web` running as
+/// another user pins it (ADR-0048), so it is world-readable and appears
+/// only once complete. The key is written first and `cert.pem` last, so a
+/// visible certificate always has its key beside it.
+///
 /// Returns `(cert_pem, key_pem, was_generated)`.
 fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
-    let cert_path = tls_dir.join(CERT_FILENAME);
-    let key_path = tls_dir.join(KEY_FILENAME);
+    let cert_path = tls_dir.join(GENERATED_CERT_FILE);
+    let key_path = tls_dir.join(GENERATED_KEY_FILE);
 
     if cert_path.exists() && key_path.exists() {
         tracing::info!(
@@ -205,7 +208,6 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
 
     // Persist so the cert is stable across daemon restarts.
     fs::create_dir_all(tls_dir).map_err(TlsError::Write)?;
-    fs::write(&cert_path, &cert_pem).map_err(TlsError::Write)?;
 
     // Write the private key with restricted permissions from the start
     // to avoid a TOCTOU window where the key is world-readable.
@@ -227,6 +229,8 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
         fs::write(&key_path, &key_pem).map_err(TlsError::Write)?;
     }
 
+    publish_cert(&cert_path, cert_pem.as_bytes()).map_err(TlsError::Write)?;
+
     tracing::info!(
         event_type = "lifecycle",
         cert = %cert_path.display(),
@@ -235,6 +239,48 @@ fn load_or_generate_default(tls_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), 
     );
 
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
+}
+
+/// Publish `pem` at `cert_path` so that a reader sees either no file or the
+/// whole certificate, never a partial one.
+///
+/// Writes a sibling `cert.pem.tmp`, syncs it, then renames it over
+/// `cert_path` (rename within one directory is atomic). On unix the
+/// temporary file is created exclusively and set to `0644` explicitly, so
+/// neither a leftover file from a crashed start nor a restrictive umask
+/// decides who can read the published certificate. The `tempfile` crate is
+/// not used because it creates files `0600`.
+fn publish_cert(cert_path: &Path, pem: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut tmp_name = cert_path.file_name().unwrap_or_default().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = cert_path.with_file_name(tmp_name);
+
+    // A crash between create and rename leaves the temporary file behind.
+    match fs::remove_file(&tmp_path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o644);
+    }
+    let mut f = options.open(&tmp_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `mode` above is filtered through the umask; this is not.
+        f.set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
+    f.write_all(pem)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp_path, cert_path)
 }
 
 /// Background task that polls cert/key files for changes and sends a new
@@ -369,6 +415,50 @@ mod tests {
         assert!(tls_dir.join("key.pem").exists());
     }
 
+    /// The generated certificate is published for a proxy running as another
+    /// user: world-readable and complete, while the key stays owner-only. A
+    /// temporary file left by a crashed start (here `0600` and garbage) must
+    /// not leak its mode or bytes into the published certificate.
+    #[cfg(unix)]
+    #[test]
+    fn generated_cert_is_world_readable_and_key_is_owner_only() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tls_dir = tmp.path().join(GENERATED_TLS_DIR);
+        fs::create_dir_all(&tls_dir).unwrap();
+        let leftover = tls_dir.join(format!("{GENERATED_CERT_FILE}.tmp"));
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&leftover)
+                .unwrap();
+            f.write_all(b"half a certificate").unwrap();
+        }
+
+        let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
+        assert!(self_signed);
+
+        let cert_path = tls_dir.join(GENERATED_CERT_FILE);
+        let key_path = tls_dir.join(GENERATED_KEY_FILE);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&cert_path), 0o644, "cert.pem is world-readable");
+        assert_eq!(mode(&key_path), 0o600, "key.pem is owner-only");
+        assert!(!leftover.exists(), "the temporary file was renamed away");
+
+        let certs = CertificateDer::pem_slice_iter(&fs::read(&cert_path).unwrap())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("cert.pem is PEM");
+        assert_eq!(certs.len(), 1, "cert.pem holds one certificate");
+
+        // The pair on disk is what a restart loads, so it must still serve.
+        let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
+        assert!(!self_signed, "the restart loads the published pair");
+    }
+
     /// The Debian package's trawl-web pins the certificate this module
     /// generates, so the packaged `[web] upstream_ca_path` must be the file
     /// trawld writes for the packaged `[data] path`.
@@ -385,9 +475,13 @@ mod tests {
             .upstream_ca_path
             .as_deref()
             .expect("the packaged trawld.toml sets [web] upstream_ca_path");
-        let relative = pin
+        let generated = config
+            .generated_cert_path()
+            .expect("trawld generates a certificate for the packaged config");
+        assert_eq!(pin, generated, "the pin is trawld's generated certificate");
+        let relative = generated
             .strip_prefix(config.state_dir())
-            .expect("the pin lies under trawld's state directory");
+            .expect("the generated certificate lies under trawld's state directory");
 
         // Generate into a scratch state directory and read the pin from it.
         let tmp = tempfile::tempdir().unwrap();
@@ -397,6 +491,6 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("the pinned file is PEM");
         assert_eq!(certs.len(), 1, "the pinned file holds the certificate");
-        assert_eq!(relative, Path::new("tls").join(CERT_FILENAME));
+        assert_eq!(relative, Path::new("tls").join(GENERATED_CERT_FILE));
     }
 }
