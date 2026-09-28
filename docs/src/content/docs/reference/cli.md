@@ -362,10 +362,11 @@ missing, unreadable, empty, not a regular file, or larger than an API key.
 With `--profile NAME`, the config file must exist and hold
 `[profiles.NAME]` with a `url`. When the file, the profile, or its `url` is
 missing, `connection.config` fails, names the missing source, and the doctor
-contacts nothing. The key is the profile's own `token`. The doctor never uses
-`[server].token`, so a profile without `token` gives `api.identity`
-`not_configured`. `ca_cert` and `insecure` inherit from `[server]` as they do
-for every other command.
+does not contact the API. With `--web-url`, the `web.*` checks still run,
+because they do not depend on the API. The key is the profile's own `token`.
+The doctor never uses `[server].token`, so a profile without `token` gives
+`api.identity` `not_configured`. `ca_cert` and `insecure` inherit from
+`[server]` as they do for every other command.
 
 `-p trial` resolves through the rules of the
 [reserved trial profile](#the-reserved--p-trial-profile): the trial's API
@@ -424,7 +425,7 @@ The doctor runs the checks in this order. When a check's prerequisite is not
 | `api.health._invalid` | The server reported a check name that is not `[a-z][a-z0-9_]{0,63}`. This row is always `failed`, and the report does not show the names. No check name starts with `_`, so this ID cannot match a server's check | `api.health` |
 | `api.identity` | `GET /api/v1/whoami` answers HTTP 200 and accepts the key. `detail` shows the key's name, kind, and permissions, never the key or its prefix. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail. Any other 2xx status fails with `unexpected status` | `api.health`, and a key selected |
 | `web.transport` | `GET /healthz` on `--web-url` answers HTTP 200 with the body `ok` | `--web-url` given |
-| `web.origin` | `trawl-web` accepts `--web-url` as a browser origin. The doctor sends `POST /api/auth/login` with `Origin: <web-url>` and an empty `api_key`. Only `400 {"error":"bad request"}` is `complete`. `403 {"error":"cross-origin request rejected"}` fails with `origin not in public_origins`. Any other answer fails with `not a trawl-web login endpoint` | `web.transport` |
+| `web.origin` | `trawl-web` accepts `--web-url` as a browser origin. The doctor sends `POST /api/auth/login` with `Origin: <web-url>` and an empty `api_key`. Only `400 {"error":"bad request"}` is `complete`. `403 {"error":"cross-origin request rejected"}` fails with `origin not in public_origins`. HTTP 429 gives `not_sampled` with the reason `rate_limited`. Any other answer fails with `not a trawl-web login endpoint` | `web.transport` |
 
 The doctor sends the key only in `GET /api/v1/whoami`, and only after the
 unkeyed health request got a Trawl health answer under verified TLS. A wrong
