@@ -64,8 +64,8 @@ pub const ENV_UPSTREAM_CA_PATH: &str = "TRAWL_WEB_UPSTREAM_CA_PATH";
 pub struct ResolvedConfig {
     pub bind_addr: String,
     /// The `https` URL the proxy reaches trawld at. Resolution refused any
-    /// other scheme and any user name or password, so the value is safe to
-    /// log.
+    /// other scheme, any user name or password, and any query or fragment,
+    /// so the value is safe to log.
     pub upstream_url: String,
     pub session_ttl_secs: u64,
     pub allow_insecure_cookies: bool,
@@ -262,6 +262,12 @@ pub enum UpstreamUrlError {
          to trawld, so the URL must hold no credentials: remove the part before `@`"
     )]
     Userinfo,
+    /// The URL carries a query or a fragment, even an empty one.
+    #[error(
+        "carries a query or fragment. trawl-web appends each request's path and query \
+         to the URL, so it must end at the path: remove the part from `?` or `#`"
+    )]
+    QueryOrFragment,
     /// The URL is not `https`. Carries the scheme, which the parser has
     /// already limited to letters, digits, `+`, `-` and `.`.
     #[error(
@@ -603,6 +609,10 @@ fn resolve_upstream_ca_path(
 /// - It parses, with the parser the client dials with.
 /// - It carries no user name or password. reqwest would turn them into a
 ///   Basic `Authorization` header, and the URL goes into the startup log.
+/// - It carries no query or fragment. Each request's path and query are
+///   appended to the URL as text, which would land them inside the query
+///   or fragment, and a query may hold a token the startup log would show.
+///   A path prefix is kept: the request path is appended after it.
 /// - It is `https`, since both trust modes verify trawld's certificate and
 ///   a plain `http` upstream would send every user's key in cleartext.
 /// - It names a host.
@@ -620,6 +630,11 @@ pub fn check_upstream_url(upstream_url: &str) -> Result<reqwest::Url, UpstreamUr
     // no credential, and the parser drops it from the URL the client dials.
     if !url.username().is_empty() || url.password().is_some() {
         return Err(UpstreamUrlError::Userinfo);
+    }
+    // The parser keeps an empty `?` or `#` as an empty query or fragment,
+    // so those are refused too.
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(UpstreamUrlError::QueryOrFragment);
     }
     if url.scheme() != "https" {
         return Err(UpstreamUrlError::NotHttps {
@@ -1733,6 +1748,57 @@ session_ttl_secs = 3600
                 lines.iter().all(|line| !line.contains(SENTINEL)),
                 "{upstream}: {lines:?}"
             );
+        }
+    }
+
+    #[test]
+    fn upstream_query_or_fragment_refused_without_echo() {
+        const SENTINEL: &str = "s3ntinel";
+        for upstream in [
+            format!("https://trawld:5514/?token={SENTINEL}"),
+            format!("https://trawld:5514?{SENTINEL}"),
+            format!("https://trawld:5514/#{SENTINEL}"),
+            format!("https://trawld:5514/prefix?{SENTINEL}#{SENTINEL}"),
+            // Empty, but kept by the parser: appending a request path after
+            // them would still land in the query or the fragment.
+            "https://trawld:5514/?".to_owned(),
+            "https://trawld:5514/#".to_owned(),
+            // Refused before the scheme is judged, like credentials.
+            format!("http://trawld:5514/?{SENTINEL}"),
+        ] {
+            let web = WebConfig {
+                upstream_url: Some(upstream.clone()),
+                ..configured_web()
+            };
+            let (outcome, lines) = captured_logs(|| resolve(&web));
+            let error = outcome.expect_err("a URL with a query or fragment must refuse");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::UpstreamUrl(UpstreamUrlError::QueryOrFragment)
+                ),
+                "{upstream}: {error:?}"
+            );
+            let display = error.to_string();
+            for rendered in [&display, &format!("{error:?}")] {
+                assert!(!rendered.contains(SENTINEL), "{upstream}: {rendered}");
+                assert!(!rendered.contains("trawld:5514"), "{upstream}: {rendered}");
+            }
+            assert!(display.contains("[web] upstream_url"), "got: {display}");
+            assert!(
+                lines.iter().all(|line| !line.contains(SENTINEL)),
+                "{upstream}: {lines:?}"
+            );
+        }
+
+        // A path prefix is kept: each request's path is appended after it.
+        for upstream in ["https://trawld:5514/", "https://trawld:5514/prefix"] {
+            let web = WebConfig {
+                upstream_url: Some(upstream.to_owned()),
+                ..configured_web()
+            };
+            let resolved = resolve(&web).expect("a path without a query resolves");
+            assert_eq!(resolved.upstream_url, upstream);
         }
     }
 
