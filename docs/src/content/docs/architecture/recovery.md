@@ -140,6 +140,10 @@ The protocol does not cover every failure:
 - A successful fsync is the only durability proof that Trawl uses. After a failed fsync, some Linux filesystems drop the unwritten pages and report a later fsync as successful. Recovery fsyncs again and cannot detect that case.
 - Retention re-reads the publication markers immediately before it deletes each date directory. Retention never deletes the date that it reads as today. A publish that starts before midnight can still write into yesterday's directory while retention, already on the new date, deletes that directory. If compaction writes its marker between the re-read and the delete, each of that publish's rows is either still in the WAL or was published into the deleted date. No acknowledged row is counted twice, and no row is lost that retention was not already deleting with its date. The marker can outlive its output. Recovery then reports it as `contradictory`, `TrawlPublicationRecoveryBlocked` fires, and the service stays blocked until an operator resolves the marker.
 
+## What the data directory is trusted with
+
+The data root and the WAL directory are trusted storage, owned by the user that runs trawld. Anyone who can write to them can already delete or change the corpus, so Trawl does not defend against them. Recovery and hydration open files without following a symlink and without waiting on a FIFO, and they read each marker only up to a size bound. Those guards keep crash residue, a truncated file, or garbage from hanging the boot. They do not make a planted FIFO, a planted symlink, or a flood of WAL files safe. Give write access to both directories to the trawld user only.
+
 ## Recovery is not backup
 
 Markers make an interrupted owned operation restartable. They do not replace a backup of the corpus, the Trawl database, the Fleet keystore, and the session material. Restore those together and test the result. Removing a marker to make a failed startup look clean destroys the evidence that would finish the job.
