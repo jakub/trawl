@@ -57,14 +57,13 @@ APT repository from [Installation](/getting-started/).
    configuration names no real databases yet. An upgrade keeps the units you
    enabled and restarts the ones that are running.
 
-   The package now pins trawld's generated certificate with
+   The package pins trawld's generated certificate with
    `[web] upstream_ca_path` in `trawld.toml`. An upgrade from an earlier
    package can leave `trawl-web` without a working upstream.
-   `/etc/trawl/trawld.toml` and `/etc/default/trawl-web` are conffiles. When
-   you edited one, dpkg asks whether to keep your copy. Keeping it is the
-   default answer, and `--force-confold` keeps it without asking. A kept
-   `trawld.toml` does not get the new setting. Without it, and without
-   `TRAWL_WEB_INSECURE_UPSTREAM=1`, `trawl-web` checks trawld's self-signed
+   `/etc/trawl/trawld.toml` is a conffile. When you edited it, dpkg asks
+   whether to keep your copy. Keeping it is the default answer, and
+   `--force-confold` keeps it without asking. A kept `trawld.toml` does not
+   get the new setting. Without it, `trawl-web` checks trawld's self-signed
    certificate against the system roots, the check fails, and every sign-in
    returns 502. After the upgrade:
 
@@ -80,14 +79,15 @@ APT repository from [Installation](/getting-started/).
       directory of that path, where trawld writes the certificate instead.
       If you set your own `tls_cert_path`, use the file of the CA that
       issued it.
-   2. If `/etc/default/trawl-web` sets `TRAWL_WEB_INSECURE_UPSTREAM=1`,
-      remove that line. `trawl-web` refuses to start when both settings are
-      present. systemd then restarts it every 5 seconds, and
-      `systemctl status trawl-web` shows `activating (auto-restart)` with a
-      log line that names `TRAWL_WEB_INSECURE_UPSTREAM` and
-      `upstream_ca_path`.
-   3. Run `sudo systemctl restart trawl-web`. Check that
+   2. Run `sudo systemctl restart trawl-web`. Check that
       `systemctl status trawl-web` shows `active (running)`, then sign in.
+
+   trawld now keeps its generated private key in `/var/lib/trawl/tls-key/`,
+   not beside the certificate. On its first start after the upgrade, trawld
+   deletes the old `tls/key.pem` and generates a new certificate and key.
+   `trawl-web` loads the new certificate within 30 seconds. A client that
+   pinned the old `cert.pem`, such as a CLI profile's `ca_cert` or a Vector
+   CA file, needs a copy of the new one.
 
 2. Put the two DSNs in `/etc/default/trawld`. They take precedence over
    `[auth] database_url` and `[storage] database_url` in the TOML file, and
@@ -138,8 +138,9 @@ APT repository from [Installation](/getting-started/).
 
    Both show `active (running)`. On the first start, trawld writes its
    certificate only after it connects to both databases. Until then,
-   `trawl-web` exits and systemd restarts it every 5 seconds, so it can show
-   `activating (auto-restart)` for a few seconds. Then
+   `trawl-web` runs and answers sign-in with 503
+   `upstream certificate not available`. It loads the certificate when
+   trawld writes it, with no restart. Then
    [verify the installation](#verify-the-installation).
 
 The package creates these files and directories:
@@ -150,10 +151,11 @@ The package creates these files and directories:
 | `/usr/lib/systemd/system/trawld.service`, `trawl-web.service` | root:root 0644 | Run `trawld --config /etc/trawl/trawld.toml --no-monitor` as `trawl:trawl`, and `trawl-web --config /etc/trawl/trawld.toml` as `trawl-web:trawl` after it. |
 | `/etc/trawl/trawld.toml` | root:trawl 0640 | Configuration for both daemons. |
 | `/etc/default/trawld` | root:trawl 0640 | Environment for `trawld.service`: `FLEET_DATABASE_URL`, `TRAWL_DATABASE_URL`, `RUST_LOG`. |
-| `/etc/default/trawl-web` | root:root 0644 | Environment for `trawl-web.service`: `RUST_LOG`, and `TRAWL_WEB_INSECURE_UPSTREAM`, which works only after you remove `upstream_ca_path` from `trawld.toml`. World-readable, so no secrets. |
+| `/etc/default/trawl-web` | root:root 0644 | Environment for `trawl-web.service`: `RUST_LOG`. World-readable, so no secrets. |
 | `/var/lib/trawl` | trawl:trawl 0750 | State directory. `trawld` writes only here and to `/var/log/trawl`. |
 | `/var/lib/trawl/data` | trawl:trawl | Parquet files, `wal/`, `scheduled/`, and the `EPOCH` and `CATALOG` markers. Created on first start. |
-| `/var/lib/trawl/tls` | trawl:trawl | `cert.pem` and `key.pem`, generated when `[server]` names no certificate. The packaged `[web] upstream_ca_path` pins `cert.pem`. |
+| `/var/lib/trawl/tls` | trawl:trawl | `cert.pem`, mode 0644, generated when `[server]` names no certificate. The packaged `[web] upstream_ca_path` pins it. |
+| `/var/lib/trawl/tls-key` | trawl:trawl 0700 | `key.pem`, mode 0600, the private key of the generated certificate. |
 | `/var/lib/trawl/web.cookie` | trawl:trawl 0640 | 32-byte session cookie key, generated once on first install. The `trawl` group lets `trawl-web` read it. |
 | `/var/lib/trawl/cores` | trawl:trawl 0700 | Crash dumps. Empty unless the [crash-dump drop-in](/reference/crash-dumps/) is enabled. |
 | `/var/log/trawl` | trawl:trawl | Log directory for `[server] log_file`. |
@@ -258,24 +260,59 @@ These settings require structured chart config values. They cannot be combined
 with `config.raw`, because Helm cannot verify arbitrary TOML TLS paths against
 its Secret mounts.
 
+The `trawl-web` sidecar connects to trawld over the pod's loopback and always
+verifies trawld's certificate. Each mode below also sets what the sidecar
+trusts. The sidecar runs as `web.runAsUser`, 1001 by default, which must
+differ from trawld's uid so that the sidecar cannot read trawld's private key.
+
+#### Keep the generated certificate
+
+`tls.mode: auto` needs no other `tls` value:
+
+```yaml
+tls:
+  mode: auto
+```
+
+trawld writes `cert.pem` to the `tls/` directory beside its data path on the
+data volume, and its key to `tls-key/`. The chart mounts only the `tls/`
+directory into the sidecar, read-only, and sets `[web] upstream_ca_path` to
+its `cert.pem`. On a first install, the sidecar answers 503 until trawld has
+written the certificate. It then loads the file with no restart.
+
+With `web.enabled`, a `config.raw` must set `[data] path`, because the chart
+mounts the `tls/` directory beside it. It must also set
+`upstream_ca_path` under `[web]` to `tls/cert.pem` in the parent directory of
+that path.
+
 #### Mount an existing TLS Secret
 
 Obtain a certificate and matching private key for the DNS names or IP addresses
-clients use. Create a TLS Secret in the release namespace:
+clients use. With `web.enabled`, the certificate must also name one DNS name
+for the sidecar to verify. Create a TLS Secret in the release namespace, and
+include the CA that issued the certificate as `ca.crt`:
 
 ```bash
-kubectl -n trawl create secret tls trawl-api-tls --cert=api.crt --key=api.key
+kubectl -n trawl create secret generic trawl-api-tls --type=kubernetes.io/tls \
+  --from-file=tls.crt=api.crt --from-file=tls.key=api.key --from-file=ca.crt=ca.crt
 ```
 
 ```yaml
 tls:
   mode: secret
   secretName: trawl-api-tls
+  upstreamServerName: api.example.com
+  upstreamCa: secret
 ```
 
-The chart mounts its `tls.crt` and `tls.key` at `/etc/trawl/tls/` and sets the
-daemon's certificate paths to those files. The chart does not replace or
-populate this Secret.
+The chart mounts `tls.crt` and `tls.key` at `/etc/trawl/tls/` in the trawld
+container and sets the daemon's certificate paths to those files. The sidecar
+gets only `ca.crt`, at `/etc/trawl/upstream-ca/`. It requests
+`https://api.example.com:5514` and connects to `127.0.0.1:5514`, so the name
+does not need to resolve inside the pod. `tls.upstreamServerName` is required
+in this mode. It must be one DNS name in the certificate, not a wildcard or an
+IP address. Until the Secret holds `ca.crt`, the sidecar answers 503. The chart
+does not replace or populate this Secret.
 
 #### Request a certificate through cert-manager
 
@@ -296,6 +333,7 @@ tls:
     dnsNames:
       - api.example.com
       - trawl.trawl.svc.cluster.local
+  upstreamCa: secret
 ```
 
 Replace the issuer and DNS names with yours. An `Issuer` must exist in the
@@ -303,6 +341,11 @@ release namespace; a `ClusterIssuer` is cluster-scoped. There is no
 `issuerRef.namespace` setting. Use `tls.mode: secret` for certificates with IP
 address SANs. DNS wildcards cover one label: `*.example.com` covers
 `api.example.com`, but not `example.com` or `deep.api.example.com`.
+
+A CA or self-signed issuer writes `ca.crt` into the Secret, and
+`upstreamCa: secret` pins it. The sidecar verifies the first `dnsNames` entry
+that is not a wildcard, `api.example.com` here. To verify another listed name,
+set `tls.upstreamServerName`.
 
 For release `trawl`, the chart creates Certificate `trawl-tls` in namespace
 `trawl`. cert-manager creates and renews Secret `trawl-tls`; the daemon mounts
@@ -321,6 +364,55 @@ requested DNS names cover configured API ingress and HTTPRoute hosts. It does
 not publish those names, configure DNS, or install the issuer's CA on clients.
 The [cert-manager Certificate documentation](https://cert-manager.io/docs/usage/certificate/)
 explains issuance and renewal.
+
+#### Choose the CA the sidecar trusts
+
+In `secret` and `certManager` modes, `tls.upstreamCa` is required and has no
+default, because the chart cannot see inside the Secret. It takes one of three
+values:
+
+| Value | The sidecar trusts | Use it when |
+| --- | --- | --- |
+| `secret` | `ca.crt` from the TLS Secret | A private CA or a self-signed issuer signed the certificate |
+| `system` | The platform roots in the image | A publicly trusted CA issued the certificate |
+| An absolute path | The CA file at that path | The Secret holds no `ca.crt`. Mount the CA with `web.extraVolumes` and `web.extraVolumeMounts` |
+
+For a CA in a ConfigMap named `trawl-api-ca`, under the key `ca.crt`, merge
+these values into `trawl-values.yaml`:
+
+```yaml
+tls:
+  mode: secret
+  secretName: trawl-api-tls
+  upstreamServerName: api.example.com
+  upstreamCa: /etc/trawl/api-ca/ca.crt
+web:
+  extraVolumes:
+    - name: trawl-api-ca
+      configMap:
+        name: trawl-api-ca
+  extraVolumeMounts:
+    - name: trawl-api-ca
+      mountPath: /etc/trawl/api-ca
+      readOnly: true
+```
+
+Mount a directory, as above, not a single file through `subPath`. Kubernetes
+updates a directory mount when the ConfigMap changes, and the sidecar loads the
+new file within 30 seconds after it changes.
+
+#### Upgrade from an earlier chart
+
+An earlier chart let the sidecar skip certificate verification. This chart
+always verifies. In `secret` and `certManager` modes with `web.enabled`, set
+`tls.upstreamCa` before `helm upgrade`, and set `tls.upstreamServerName` in
+`secret` mode. Without them, `helm upgrade` fails, and the error names the
+value to set. `auto` mode needs no new value.
+
+In `auto` mode, trawld now keeps its generated key in `tls-key/`, outside the
+directory the sidecar mounts. The first trawld start after the upgrade deletes
+the old `tls/key.pem` and generates a new certificate and key. A client that
+pinned the old certificate needs a copy of the new one.
 
 #### Verify the requested name and trust
 
@@ -341,10 +433,11 @@ curl --fail-with-body --cacert ca.crt \
 
 For a certificate already trusted by the operating system, omit `--cacert`.
 The browser ingress certificate remains configured through `ingress.tls`.
-The browser sidecar keeps its existing HTTPS connection to the daemon over
-pod loopback with verification disabled; external clients must verify the
-certificate normally. Mounted certificate changes are reloaded at
-`config.server.tlsReloadIntervalSecs`, which defaults to 300 seconds.
+The browser sidecar verifies the same certificate over pod loopback, with the
+name and CA that `tls.upstreamServerName` and `tls.upstreamCa` set. trawld
+reloads a changed mounted certificate every
+`config.server.tlsReloadIntervalSecs` seconds, 300 by default. The sidecar
+reads its CA file again every 30 seconds.
 
 ### Use a local browser
 
@@ -391,6 +484,9 @@ nothing else. You supply what the package supplies:
   daemon.
 - A 32-byte cookie key: `head -c 32 /dev/urandom > /var/lib/trawl/web.cookie`,
   owned by `trawl:trawl`, mode 0640, named in `[web] cookie_secret_path`.
+- `[web] upstream_ca_path = "/var/lib/trawl/tls/cert.pem"` in `trawld.toml`,
+  as the package sets it. Without it, `trawl-web` checks trawld's self-signed
+  certificate against the system roots and every sign-in fails.
 - A supervisor that runs `trawld --config /etc/trawl/trawld.toml --no-monitor`
   as `trawl` and `trawl-web --config /etc/trawl/trawld.toml` as `trawl-web`.
   Start from the packaged units in

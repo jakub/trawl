@@ -105,9 +105,9 @@ terminal. Without a terminal they refuse unless you pass `--yes`.
 
 trawld serves HTTPS only. When `tls_cert_path` and `tls_key_path` are unset, it
 generates a self-signed certificate at startup, valid for `localhost`,
-`127.0.0.1`, and `::1`, and writes `cert.pem` and `key.pem` to the `tls/`
-directory beside the data path. Clients on other hosts need a certificate they
-trust:
+`127.0.0.1`, and `::1`. It writes the certificate to `tls/cert.pem` beside the
+data path, and the private key to `tls-key/key.pem`, in a directory that only
+trawld's user can open. Clients on other hosts need a certificate they trust:
 
 ```toml
 [server]
@@ -127,28 +127,68 @@ trawld re-reads both files every `tls_reload_interval_secs` seconds, so a
 renewed certificate needs no restart. `trawl --insecure` skips certificate
 verification. Use it only for a check on the same host.
 
-`trawl-web` checks trawld's certificate against the system trust store, unless
-`[web] upstream_ca_path` names a CA file. The proxy then trusts only the CAs in
-that file and still checks the hostname in `upstream_url`. The Debian package
-ships this setting, which pins the certificate that trawld generates:
+### Choose how trawl-web trusts trawld
+
+`trawl-web` always verifies trawld's certificate. It trusts one of two sets of
+CAs:
+
+- The platform trust store, when `[web] upstream_ca_path` is unset.
+- Only the CA certificates in the PEM file that `upstream_ca_path` names.
+
+In both modes the certificate must name the host in `upstream_url`. By default
+that host is `127.0.0.1`, derived from `[server] http_addr`. `trawl-web`
+refuses to start when `upstream_url` is not `https`, or when it holds a user
+name or password. It never follows a redirect from trawld, and it ignores
+proxy variables such as `HTTPS_PROXY`, so it always connects to trawld
+directly.
+
+The Debian package ships this setting, which pins the certificate that trawld
+generates:
 
 ```toml
 [web]
 upstream_ca_path = "/var/lib/trawl/tls/cert.pem"
 ```
 
-`trawl-web` reads the file at startup and refuses to start while it is
-missing. If you set `tls_cert_path`, change `upstream_ca_path` to the CA that
-issued your certificate. That certificate must also name the host in
-`upstream_url`. By default the host is `127.0.0.1`, derived from
-`[server] http_addr`. Restart `trawl-web` after you change either file.
+If you set `tls_cert_path`, change `upstream_ca_path` to the CA that issued
+your certificate. That certificate must also name the host in `upstream_url`.
+Restart `trawl-web` after you change `trawld.toml`.
 
-The other way is `TRAWL_WEB_INSECURE_UPSTREAM=1`, which turns verification off.
-The Helm chart sets it. `trawl-web` accepts it only when the upstream URL is
-`https`, its host is loopback, and `upstream_ca_path` is not set. Otherwise
-`trawl-web` refuses to start. On
-a Debian install, remove `upstream_ca_path` from `trawld.toml` before you set
-the variable in `/etc/default/trawl-web`.
+`trawl-web` starts even when the pinned file does not exist yet, because
+trawld writes its generated certificate only on its first start. Until the
+file exists, `/healthz` answers `ok`, and every request that needs trawld gets
+a 503 response with `{"error":"upstream certificate not available"}`. The
+first request after the file appears reads it and succeeds.
+
+`trawl-web` also reads the file again every 30 seconds and compares its
+contents. A CA that you replace takes effect within 30 seconds, with no
+restart. A file that does not parse at startup stops `trawl-web`. If a later
+change does not parse, or the file disappears, `trawl-web` keeps the last CA
+that loaded and logs one `upstream_ca_refused` warning for the change.
+
+### Verify a certificate name over another address
+
+Set `upstream_connect_addr` when trawld's certificate names a DNS host that
+does not resolve to trawld where `trawl-web` runs. `trawl-web` connects to the
+address in `upstream_connect_addr` and still verifies the name in
+`upstream_url`. For a certificate issued for `api.example.com`, with trawld on
+the same host as `trawl-web`:
+
+```toml
+[web]
+upstream_url = "https://api.example.com:5514"
+upstream_connect_addr = "127.0.0.1:5514"
+upstream_ca_path = "/etc/trawl/ca.pem"
+```
+
+- The value is an IP address and a port. Write an IPv6 address in brackets,
+  as in `[::1]:5514`. A host name is refused.
+- The host in `upstream_url` must be a DNS name, not an IP address.
+- The two ports must be equal. A URL with no port counts as port 443.
+
+The Helm chart sets `upstream_url` and `upstream_connect_addr` in `tls.mode`
+`secret` and `certManager`. See
+[Configure the daemon API certificate](/operate/deployment/#configure-the-daemon-api-certificate).
 
 ## Set the browser origin
 

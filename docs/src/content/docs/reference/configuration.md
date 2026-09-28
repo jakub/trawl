@@ -86,7 +86,7 @@ The HTTPS listener, query limits, TLS, and logging.
 
 Notes:
 
-- `tls_cert_path` and `tls_key_path` must both be set or both omitted. With both omitted, trawld generates a self-signed ECDSA P-256 certificate at startup, with SANs for `localhost`, `127.0.0.1`, and `::1`, under `{state_dir}/tls/`. `state_dir` is the parent of `[data] path`.
+- `tls_cert_path` and `tls_key_path` must both be set or both omitted. With both omitted, trawld generates a self-signed ECDSA P-256 certificate at startup, with SANs for `localhost`, `127.0.0.1`, and `::1`. The certificate is `{state_dir}/tls/cert.pem`, mode 0644, and the key is `{state_dir}/tls-key/key.pem`, in a 0700 directory. `state_dir` is the parent of `[data] path`.
 - `timeout_secs` covers queue waits, execution, and best-effort history writes, but not request-body reading or response delivery. Expiry before work starts is 503, and after work starts it is 504. A timed-out worker can hold its permit until it finishes. See [the query deadline](/operate/health/#diagnose-a-503-or-504-from-a-query).
 - `0` disables a limit only where the row says so.
 
@@ -134,6 +134,21 @@ daemon paths accordingly. They require structured config values;
 TLS Secret mounts. See [configure the daemon API certificate](/operate/deployment/#configure-the-daemon-api-certificate)
 for complete setup and verification instructions. Browser-ingress TLS remains
 a separate setting under `ingress.tls`.
+
+With `web.enabled`, the chart also sets how the `trawl-web` sidecar verifies
+trawld:
+
+| `tls.mode` | Values the sidecar needs | Rendered `[web]` keys |
+|------------|--------------------------|-----------------------|
+| `auto` | None. `tls.upstreamServerName` and `tls.upstreamCa` are refused | `upstream_ca_path = "{state_dir}/tls/cert.pem"`, from the data volume's `tls/` directory mounted read-only |
+| `secret` | `tls.upstreamServerName` and `tls.upstreamCa` | `upstream_url = "https://<upstreamServerName>:<port>"`, `upstream_connect_addr = "127.0.0.1:<port>"`, and `upstream_ca_path` unless `upstreamCa` is `system` |
+| `certManager` | `tls.upstreamCa`. `tls.upstreamServerName` defaults to the first `dnsNames` entry that is not a wildcard | The same keys as `secret` |
+
+`tls.upstreamCa` accepts `secret`, which pins `ca.crt` from the TLS Secret,
+`system`, which uses the platform roots, or the absolute path of a CA file
+that you mount with `web.extraVolumes` and `web.extraVolumeMounts`. A
+`config.raw` in `auto` mode must set `[data] path` and the matching
+`[web] upstream_ca_path` itself.
 
 ### `[data]`
 
@@ -382,8 +397,9 @@ the Helm chart.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bind_addr` | string | `"127.0.0.1:8090"` | Proxy listen address. Front it with a reverse proxy for external access |
-| `upstream_url` | string | derived from `[server] http_addr` | How the proxy reaches trawld. A wildcard bind is rewritten to loopback |
-| `upstream_ca_path` | path | *(none)* | PEM file of the CA certificates to trust for trawld. The proxy then trusts only these CAs and still checks the hostname. `upstream_url` must be `https`. A missing, empty, or unparseable file is a startup error |
+| `upstream_url` | string | derived from `[server] http_addr` | How the proxy reaches trawld. A wildcard bind is rewritten to loopback. Must be `https` and must hold no user name or password. Either fault is a startup error, and the error does not quote the URL |
+| `upstream_ca_path` | path | *(none)* | PEM file of the CA certificates to trust for trawld. The proxy then trusts only these CAs and still checks the hostname. Unset means the platform trust store. A file that does not exist yet is accepted at startup: until it appears, requests that need trawld get 503 `upstream certificate not available`. The file is read again every 30 seconds and on the first request after it appears, so a replaced CA loads without a restart. An empty path or a file that does not parse is a startup error. A later change that does not parse keeps the last good CA |
+| `upstream_connect_addr` | string | *(none)* | IP address and port to connect to, such as `"127.0.0.1:5514"` or `"[::1]:5514"`, while TLS verifies the host in `upstream_url`. Requires an `upstream_url` whose host is a DNS name, and the same port as `upstream_url` (443 when the URL has none) |
 | `cookie_secret_path` | path | *(none)* | File holding the 32-byte AEAD cookie-encryption key |
 | `cookie_secret_env` | string | *(none)* | Name of an environment variable holding the base64-encoded key |
 | `session_ttl_secs` | integer | `86400` | Browser session lifetime in seconds |
@@ -404,6 +420,7 @@ Notes:
 - With neither `cookie_secret_path` nor `cookie_secret_env` set, the proxy generates an ephemeral key at each startup, and sessions do not survive a restart. The Debian `trawl-server` package creates a persistent key at `/var/lib/trawl/web.cookie` and preserves it on upgrade.
 - `shared_domain` scopes the session cookie to a parent domain, so every Fleet app under it accepts one login. All those apps need the same session key. See [shared browser sessions](/operate/access/#share-a-browser-session-across-fleet-applications).
 - API clients that carry a bearer token talk to trawld directly. The proxy handles cookie-authenticated browser traffic only, and blocks `/api/v1/ingest`.
+- The proxy always verifies trawld's certificate, against the platform trust store or the `upstream_ca_path` file. It never follows a redirect from trawld and ignores proxy variables such as `HTTPS_PROXY`. See [Configure TLS](/operate/access/#configure-tls).
 
 #### The browser-origin allowlist
 
@@ -439,7 +456,7 @@ variables log a line when they displace a configured value.
 | `FLEET_SESSION_COOKIE_SECURE` | `true` or `false`. `false` clears `Secure` on the session cookie |
 | `FLEET_SESSION_COOKIE_PATH` | Cookie `Path=`. The only accepted value is `/`. There is no `[web]` counterpart |
 | `TRAWL_WEB_BIND_ADDR` | Overrides `[web] bind_addr` |
-| `TRAWL_WEB_INSECURE_UPSTREAM` | Any non-empty value skips TLS verification of the upstream trawld certificate. It does not turn TLS off. The proxy honours it only when the upstream URL is `https` and its host is an address in `127.0.0.0/8`, `::1`, or `localhost`. The proxy then dials `localhost` at `127.0.0.1` or `::1` without asking the resolver, and ignores proxy variables such as `HTTPS_PROXY`. Any other host, an `http` upstream, an upstream URL that does not parse, or a set `upstream_ca_path` is a startup error that names the variable. There is no `[web]` counterpart |
+| `TRAWL_WEB_UPSTREAM_CA_PATH` | Overrides `[web] upstream_ca_path`. An empty value counts as unset, so the `[web]` key applies |
 
 The Helm chart passes `FLEET_SESSION_PUBLIC_ORIGINS` to the sidecar as well as
 rendering `public_origins` into the generated TOML, so a `config.raw` that

@@ -19,7 +19,7 @@ both databases before you scale back up. A PVC snapshot alone is not a backup.
 | --- | --- | --- |
 | `trawl` database | Field catalog, query history, saved queries, schedules, report run records | `pg_dump` |
 | `fleet` database | API keys and roles, shared with other Fleet applications | `pg_dump` |
-| `/var/lib/trawl` | `data/` with the Parquet files, `wal/`, `scheduled/`, `EPOCH`, `CATALOG`, and any repin state. `web.cookie`. `tls/` when trawld generated the certificate | `tar` |
+| `/var/lib/trawl` | `data/` with the Parquet files, `wal/`, `scheduled/`, `EPOCH`, `CATALOG`, and any repin state. `web.cookie`. `tls/` and `tls-key/` when trawld generated the certificate | `tar` |
 | `/etc/trawl`, `/etc/default/trawld`, `/etc/default/trawl-web` | Configuration, DSNs, and environment | `tar` |
 
 Leave out `/var/lib/trawl/cores`. A crash dump is a copy of process memory.
