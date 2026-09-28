@@ -360,6 +360,9 @@ impl MonitorState {
             crate::capacity::CapacityReadings {
                 parquet: &parquet.measurement,
                 env_dates: parquet_scan.as_deref().map(|scan| &scan.env_dates),
+                parquet_repin_in_flight: parquet_scan
+                    .as_deref()
+                    .is_some_and(|scan| scan.repin_in_flight),
                 headroom: &headroom,
                 sample: headroom_sample.as_ref(),
             },

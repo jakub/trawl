@@ -223,17 +223,20 @@ pub struct ProjectionBasis {
 /// Admit the measurements behind a projection, or name why it is withheld.
 ///
 /// `parquet` is the storage scan's measurement; the partition bytes handed
-/// to [`project`] must be the sample read with it. `headroom` and `sample`
-/// are the headroom measurement and its retained sample. Precedence:
-/// either measurement not `complete` is
-/// [`WithheldReason::MeasurementUnavailable`]; a repin in flight at the
-/// headroom attempt is [`WithheldReason::RetentionSuppressed`], since it
-/// holds two generations of stored bytes.
+/// to [`project`] must be the sample read with it, and `parquet_saw_repin`
+/// is that sample's repin evidence. `headroom` and `sample` are the
+/// headroom measurement and its retained sample. Precedence: either
+/// measurement not `complete` is [`WithheldReason::MeasurementUnavailable`];
+/// a repin in flight at either sample's attempt is
+/// [`WithheldReason::RetentionSuppressed`], since it holds two generations
+/// of stored bytes. The two samples come from separate caches with
+/// separate ages, so neither one's evidence speaks for the other.
 ///
 /// # Errors
 /// The reason every environment's reach is withheld.
 pub fn projection_basis(
     parquet: &StorageMeasurement,
+    parquet_saw_repin: bool,
     headroom: &StorageMeasurement,
     sample: Option<&HeadroomSample>,
 ) -> Result<ProjectionBasis, WithheldReason> {
@@ -248,7 +251,7 @@ pub fn projection_basis(
         .iter()
         .find(|device| device.roles.contains(&FilesystemRole::Data))
         .ok_or(WithheldReason::MeasurementUnavailable)?;
-    if sample.repin_in_flight {
+    if parquet_saw_repin || sample.repin_in_flight {
         return Err(WithheldReason::RetentionSuppressed);
     }
     Ok(ProjectionBasis {
@@ -500,6 +503,9 @@ pub struct CapacityReadings<'a> {
     pub parquet: &'a StorageMeasurement,
     /// That scan's partition bytes; `None` before a complete scan.
     pub env_dates: Option<&'a EnvDateBytes>,
+    /// Whether a repin held the data root during that scan's attempt;
+    /// `false` before a complete scan, which is withheld as unmeasured.
+    pub parquet_repin_in_flight: bool,
     /// The headroom measurement.
     pub headroom: &'a StorageMeasurement,
     /// That measurement's retained sample; `None` before a complete one.
@@ -520,7 +526,12 @@ pub fn assemble(
     pressure: PressureEvidence,
     retention: &RetentionConfig,
 ) -> Capacity {
-    let basis = projection_basis(readings.parquet, readings.headroom, readings.sample);
+    let basis = projection_basis(
+        readings.parquet,
+        readings.parquet_repin_in_flight,
+        readings.headroom,
+        readings.sample,
+    );
     let Projection {
         environments,
         growth_excluded,
@@ -817,6 +828,7 @@ mod tests {
         let complete = measured(StorageMeasurementStatus::Complete);
         projection_basis(
             &complete,
+            false,
             &complete,
             Some(&headroom_sample(available, false)),
         )
@@ -1230,7 +1242,12 @@ mod tests {
     fn reach_withheld_retention_suppressed() {
         let (env_dates, config) = history_fixture();
         let complete = measured(StorageMeasurementStatus::Complete);
-        let basis = projection_basis(&complete, &complete, Some(&headroom_sample(1 << 40, true)));
+        let basis = projection_basis(
+            &complete,
+            false,
+            &complete,
+            Some(&headroom_sample(1 << 40, true)),
+        );
         assert_eq!(basis, Err(WithheldReason::RetentionSuppressed));
         let projection = project(today(), &env_dates, basis, &config);
         // Every env is withheld, even those that would lack history; the
@@ -1250,6 +1267,59 @@ mod tests {
         assert!(projection.growth_excluded.is_empty());
     }
 
+    /// The Parquet scan and the headroom sample are separate caches with
+    /// separate ages, so a scan taken during a repin can pair with an older
+    /// headroom sample that saw none. Either sample's repin evidence
+    /// withholds the projection.
+    #[test]
+    fn reach_withheld_retention_suppressed_when_either_sample_saw_a_repin() {
+        let (env_dates, config) = history_fixture();
+        let complete = measured(StorageMeasurementStatus::Complete);
+        let quiet = headroom_sample(1 << 40, false);
+        let repinning = headroom_sample(1 << 40, true);
+        let suppressed = Err(WithheldReason::RetentionSuppressed);
+        for (parquet_saw_repin, sample) in [(true, &quiet), (false, &repinning), (true, &repinning)]
+        {
+            assert_eq!(
+                projection_basis(&complete, parquet_saw_repin, &complete, Some(sample)),
+                suppressed,
+                "parquet {parquet_saw_repin}, headroom {}",
+                sample.repin_in_flight
+            );
+        }
+        assert!(projection_basis(&complete, false, &complete, Some(&quiet)).is_ok());
+
+        // Assembly reads the scan's own evidence, not only the headroom's.
+        let capacity = assemble(
+            today(),
+            CapacityReadings {
+                parquet: &complete,
+                env_dates: Some(&env_dates),
+                parquet_repin_in_flight: true,
+                headroom: &complete,
+                sample: Some(&quiet),
+            },
+            PressureEvidence {
+                removals_age: 0,
+                removals_disk_pressure: 0,
+                pressure_attempts: 0,
+                last_sweep: None,
+            },
+            &config,
+        );
+        assert_eq!(capacity.environments.len(), 3);
+        for env in &capacity.environments {
+            assert_eq!(
+                env.reach,
+                Reach::Withheld {
+                    reason: WithheldReason::RetentionSuppressed
+                },
+                "{}",
+                env.env
+            );
+        }
+    }
+
     #[test]
     fn reach_withheld_measurement_unavailable_retained_failed() {
         use StorageMeasurementStatus::{Complete, Failed, NotConfigured, NotSampled};
@@ -1257,7 +1327,7 @@ mod tests {
         let repinning = headroom_sample(1 << 40, true);
         let unavailable = Err(WithheldReason::MeasurementUnavailable);
         // A retained, failed sample of either measurement never feeds a
-        // projection, and outranks a repin in flight.
+        // projection, and outranks a repin in flight seen by either sample.
         for (parquet, headroom, sample) in [
             (Failed, Complete, Some(&sample)),
             (Complete, Failed, Some(&sample)),
@@ -1271,11 +1341,18 @@ mod tests {
             // no measurement of the data filesystem.
             (Complete, Complete, None),
         ] {
-            assert_eq!(
-                projection_basis(&measured(parquet), &measured(headroom), sample),
-                unavailable,
-                "{parquet:?} {headroom:?}"
-            );
+            for parquet_saw_repin in [false, true] {
+                assert_eq!(
+                    projection_basis(
+                        &measured(parquet),
+                        parquet_saw_repin,
+                        &measured(headroom),
+                        sample
+                    ),
+                    unavailable,
+                    "{parquet:?} {headroom:?} {parquet_saw_repin}"
+                );
+            }
         }
         let no_data_row = HeadroomSample {
             filesystems: vec![device(&[WAL], 10, 10)],
@@ -1283,11 +1360,11 @@ mod tests {
         };
         let complete = measured(Complete);
         assert_eq!(
-            projection_basis(&complete, &complete, Some(&no_data_row)),
+            projection_basis(&complete, false, &complete, Some(&no_data_row)),
             unavailable
         );
         assert_eq!(
-            projection_basis(&complete, &complete, Some(&sample)),
+            projection_basis(&complete, false, &complete, Some(&sample)),
             Ok(ProjectionBasis {
                 data_available_bytes: 1 << 40
             })
@@ -1297,7 +1374,7 @@ mod tests {
         let projection = project(
             today(),
             &env_dates,
-            projection_basis(&measured(Failed), &complete, Some(&repinning)),
+            projection_basis(&measured(Failed), true, &complete, Some(&repinning)),
             &config,
         );
         for capacity in &projection.environments {
@@ -1334,6 +1411,7 @@ mod tests {
         let readings = CapacityReadings {
             parquet: &complete,
             env_dates: Some(&env_dates),
+            parquet_repin_in_flight: false,
             headroom: &complete,
             sample: Some(&sample),
         };
@@ -1376,6 +1454,7 @@ mod tests {
             CapacityReadings {
                 parquet: &not_sampled,
                 env_dates: None,
+                parquet_repin_in_flight: false,
                 headroom: &not_sampled,
                 sample: None,
             },
@@ -1404,8 +1483,8 @@ mod tests {
         let failed = measured(StorageMeasurementStatus::Failed);
         let bases = [
             basis(4_000),
-            projection_basis(&complete, &complete, Some(&headroom_sample(1, true))),
-            projection_basis(&failed, &complete, Some(&headroom_sample(1, false))),
+            projection_basis(&complete, false, &complete, Some(&headroom_sample(1, true))),
+            projection_basis(&failed, false, &complete, Some(&headroom_sample(1, false))),
         ];
         let mut reasons = Vec::new();
         for basis in bases {

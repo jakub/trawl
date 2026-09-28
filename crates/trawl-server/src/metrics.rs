@@ -848,6 +848,11 @@ pub(crate) struct StorageScan {
     totals: StorageTotals,
     pub(crate) env_dates: crate::capacity::EnvDateBytes,
     pub(crate) unattributed_bytes: u64,
+    /// Whether a repin held the data root at either end of a Parquet
+    /// attempt's walk ([`scan_parquet`]). The Parquet cache ages apart from
+    /// the headroom cache, so this scan carries its own evidence rather than
+    /// borrow the headroom sample's. Always `false` for the WAL.
+    pub(crate) repin_in_flight: bool,
 }
 
 impl StorageScan {
@@ -1092,9 +1097,34 @@ fn data_root(fallback_glob: &str) -> &Path {
 fn collect_parquet_gauges(base: &Path) {
     parquet_cache().collect(
         Instant::now,
-        || scan_storage(base, StorageKind::Parquet).map(Arc::new),
+        || {
+            scan_parquet(base, |root| {
+                crate::repin::in_flight_evidence(root).map(|evidence| evidence.is_some())
+            })
+            .map(Arc::new)
+        },
         |scan| publish_storage_gauges(StorageKind::Parquet, scan.totals),
     );
+}
+
+/// One Parquet attempt: the walk, bracketed by the repin authority
+/// (`repin_in_flight`, [`crate::repin::in_flight_evidence`] in production).
+///
+/// Asking before and after the walk records a repin that overlaps either
+/// end of it. The projection withholds reach from a scan that saw one,
+/// because a repin holds two generations of stored bytes.
+///
+/// # Errors
+/// The walk's error, or either evidence read's: unreadable evidence fails
+/// the attempt, so the cache keeps the last complete scan (ADR-0033).
+fn scan_parquet(
+    root: &Path,
+    repin_in_flight: impl Fn(&Path) -> std::io::Result<bool>,
+) -> std::io::Result<StorageScan> {
+    let before = repin_in_flight(root)?;
+    let mut scan = scan_storage(root, StorageKind::Parquet)?;
+    scan.repin_in_flight = repin_in_flight(root)? || before;
+    Ok(scan)
 }
 
 /// Sample the data, WAL and spill filesystems with the shared attempt/cache
@@ -1839,6 +1869,88 @@ mod tests {
         assert_invariant(&wal);
     }
 
+    /// The Parquet attempt reads the repin authority before and after its
+    /// walk, so a scan that overlaps either end of a repin records it, and
+    /// unreadable evidence fails the attempt like a walk error: the cache
+    /// keeps the last complete scan with the flag it was taken under.
+    #[test]
+    fn storage_scan_records_repin_evidence_or_fails_the_attempt() {
+        use std::cell::Cell;
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("prod/2026-09-20")).unwrap();
+        std::fs::write(tmp.path().join("prod/2026-09-20/x.parquet"), "12345").unwrap();
+
+        // Evidence at either end of the walk is recorded, and the scan is
+        // otherwise the plain walk.
+        for evidence in [[false, false], [true, false], [false, true], [true, true]] {
+            let calls = Cell::new(0);
+            let scan = scan_parquet(tmp.path(), |root| {
+                assert_eq!(root, tmp.path());
+                let seen = evidence[calls.get()];
+                calls.set(calls.get() + 1);
+                Ok(seen)
+            })
+            .unwrap();
+            assert_eq!(calls.get(), 2, "{evidence:?}");
+            assert_eq!(
+                scan.repin_in_flight,
+                evidence.contains(&true),
+                "{evidence:?}"
+            );
+            assert_eq!(
+                scan.totals,
+                scan_storage(tmp.path(), StorageKind::Parquet)
+                    .unwrap()
+                    .totals
+            );
+        }
+
+        // The real authority: a marker in the data root is a repin.
+        std::fs::write(crate::repin::marker::marker_path(tmp.path()), "{}").unwrap();
+        let scan = scan_parquet(tmp.path(), |root| {
+            crate::repin::in_flight_evidence(root).map(|evidence| evidence.is_some())
+        })
+        .unwrap();
+        assert!(scan.repin_in_flight);
+        std::fs::remove_file(crate::repin::marker::marker_path(tmp.path())).unwrap();
+
+        // Unreadable evidence at either end fails the attempt, and the
+        // cache retains the last complete scan and its flag.
+        for failing_call in 0..2 {
+            let cache = StorageCache::<Arc<StorageScan>>::default();
+            let now = Instant::now();
+            cache.collect(
+                || now,
+                || scan_parquet(tmp.path(), |_| Ok(false)).map(Arc::new),
+                |_| {},
+            );
+            let calls = Cell::new(0);
+            cache.collect(
+                || now + Duration::from_secs(30),
+                || {
+                    scan_parquet(tmp.path(), |_| {
+                        let call = calls.get();
+                        calls.set(call + 1);
+                        if call == failing_call {
+                            Err(io_failure())
+                        } else {
+                            Ok(true)
+                        }
+                    })
+                    .map(Arc::new)
+                },
+                |_| {},
+            );
+            let (measurement, scan) = cache.read(true, now + Duration::from_secs(30));
+            assert_eq!(
+                measurement.status,
+                trawl_api::StorageMeasurementStatus::Failed
+            );
+            assert!(!scan.expect("retained").repin_in_flight);
+        }
+    }
+
     /// An empty date directory holds no counted Parquet, so it gets no
     /// bucket and never anchors an environment's oldest date: it is no
     /// evidence of a quiet ingest day, and zero-filling from it would
@@ -1887,7 +1999,7 @@ mod tests {
         let projection = project(
             date(27),
             &scan.env_dates,
-            projection_basis(&complete, &complete, Some(&sample)),
+            projection_basis(&complete, scan.repin_in_flight, &complete, Some(&sample)),
             &trawl_config::RetentionConfig {
                 max_age_days: 90,
                 min_free_disk_bytes: 1,
