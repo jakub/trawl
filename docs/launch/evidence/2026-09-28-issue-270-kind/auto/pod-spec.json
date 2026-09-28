@@ -1,0 +1,105 @@
+{
+  "podSecurityContext": {
+    "fsGroup": 1000,
+    "fsGroupChangePolicy": "OnRootMismatch",
+    "runAsGroup": 1000,
+    "runAsUser": 1000
+  },
+  "containers": [
+    {
+      "name": "trawld",
+      "securityContext": {
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true
+      },
+      "volumeMounts": [
+        {
+          "mountPath": "/var/lib/trawl",
+          "name": "data"
+        },
+        {
+          "mountPath": "/tmp",
+          "name": "tmp"
+        },
+        {
+          "mountPath": "/etc/trawl/trawld.toml",
+          "name": "config",
+          "readOnly": true,
+          "subPath": "trawld.toml"
+        }
+      ]
+    },
+    {
+      "name": "trawl-web",
+      "securityContext": {
+        "allowPrivilegeEscalation": false,
+        "capabilities": {
+          "drop": [
+            "ALL"
+          ]
+        },
+        "readOnlyRootFilesystem": true,
+        "runAsNonRoot": true,
+        "runAsUser": 1001
+      },
+      "volumeMounts": [
+        {
+          "mountPath": "/tmp",
+          "name": "tmp"
+        },
+        {
+          "mountPath": "/etc/trawl/trawld.toml",
+          "name": "config",
+          "readOnly": true,
+          "subPath": "trawld.toml"
+        },
+        {
+          "mountPath": "/etc/trawl/web.cookie",
+          "name": "web-cookie",
+          "readOnly": true,
+          "subPath": "cookie.key"
+        },
+        {
+          "mountPath": "/var/lib/trawl/tls",
+          "name": "data",
+          "readOnly": true,
+          "subPath": "tls"
+        }
+      ]
+    }
+  ],
+  "volumes": [
+    {
+      "emptyDir": {
+        "sizeLimit": "512Mi"
+      },
+      "name": "tmp"
+    },
+    {
+      "configMap": {
+        "defaultMode": 420,
+        "name": "trawl"
+      },
+      "name": "config"
+    },
+    {
+      "name": "web-cookie",
+      "secret": {
+        "defaultMode": 256,
+        "items": [
+          {
+            "key": "cookie.key",
+            "path": "cookie.key"
+          }
+        ],
+        "secretName": "trawl-web"
+      }
+    }
+  ]
+}

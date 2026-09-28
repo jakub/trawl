@@ -1,0 +1,63 @@
+[server]
+http_addr = "0.0.0.0:5514"
+timeout_secs = 30
+max_result_rows = 100000
+max_export_rows = 1000000
+max_request_body_bytes = "128K"
+max_concurrent_requests = 256
+shutdown_drain_secs = 30
+max_sse_connections = 32
+schema_cache_ttl_secs = 60
+max_query_history = 1000
+[server.rate_limit]
+default_rpm = 100
+ingest_rpm = 1000
+
+[data]
+path = "/var/lib/trawl/data"
+
+[auth]
+# database_url deliberately absent: the fleet keystore DSN is injected
+# as the FLEET_DATABASE_URL env var from a Secret (never rendered here).
+audit_interval_secs = 30
+
+# [storage] database_url deliberately absent too: the trawl app-state
+# DSN is injected as the TRAWL_DATABASE_URL env var from a Secret.
+
+[ingest]
+enabled = true
+max_body_bytes = "16M"
+compaction_interval_secs = 10
+internal_telemetry = true
+daily_rollup = true
+event_bus_capacity = 4096
+hot_buffer_max_events = 100000
+hot_buffer_max_bytes = "100M"
+stats_interval_secs = 60
+telemetry_flush_interval_secs = 1
+severity_from = ["severity", "severity_text", "level"]
+time_from = ["_time", "timestamp", "@timestamp"]
+
+[retention]
+max_age_days = 90
+min_free_disk_bytes = "1G"
+retention_interval_secs = 3600
+
+[syslog]
+enabled = false
+
+[scheduler]
+enabled = true
+poll_interval_secs = 10
+report_max_rows = 10000
+max_runs_per_schedule = 100
+report_retention_days = 30
+max_catchup_intervals = 24
+
+[web]
+bind_addr = "0.0.0.0:8090"
+public_origins = ["http://localhost:8090"]
+cookie_secret_path = "/etc/trawl/web.cookie"
+session_ttl_secs = 86400
+allow_insecure_cookies = true
+upstream_ca_path = "/var/lib/trawl/tls/cert.pem"
