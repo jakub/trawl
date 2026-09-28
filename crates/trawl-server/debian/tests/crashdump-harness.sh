@@ -895,18 +895,17 @@ web_masked=$(nshq "systemctl show trawl-web -p InaccessiblePaths --value")
 [[ "$web_masked" == *"$CORES"* ]] \
   || die "trawl-web.service does not mask $CORES (InaccessiblePaths='$web_masked')"
 
-# The start below is only evidence about the mask once trawl-web's other
-# precondition holds. This is trawld's first start, and it writes
-# $WEB_UPSTREAM_CA only after connecting to both databases, while
-# `systemctl is-active` said active at exec. Without the file trawl-web exits
-# and comes back 5s later, which the check below would misread. trawld writes
-# the key after the certificate is complete, so both present means the
-# certificate is whole.
+# The start below is only evidence about the mask once the pinned certificate
+# exists. This is trawld's first start, and it writes $WEB_UPSTREAM_CA only
+# after connecting to both databases, while `systemctl is-active` said active
+# at exec. Without the file trawl-web starts anyway and waits for it, so the
+# checks below could not tell a hidden certificate from a late one. trawld
+# publishes the certificate with a rename, so a non-empty file is whole.
 printf '\n$ grep -Fx %s /etc/trawl/trawld.toml\n' "'upstream_ca_path = \"$WEB_UPSTREAM_CA\"'"
 nshq "grep -Fx 'upstream_ca_path = \"$WEB_UPSTREAM_CA\"' /etc/trawl/trawld.toml" \
   || die "the installed trawld.toml does not pin $WEB_UPSTREAM_CA for trawl-web"
 wait_for "$ACTIVE_WAIT_SECS" "trawld wrote $WEB_UPSTREAM_CA" \
-  "docker exec $NODE test -s $WEB_UPSTREAM_CA -a -e ${WEB_UPSTREAM_CA%/*}/key.pem" \
+  "docker exec $NODE test -s $WEB_UPSTREAM_CA" \
   || { docker exec "$NODE" journalctl -u trawld --no-pager -n 40 || true
        die "trawld never wrote $WEB_UPSTREAM_CA, the certificate trawl-web pins"; }
 
@@ -916,12 +915,21 @@ wait_for "$ACTIVE_WAIT_SECS" "trawl-web is-active=active" \
   || { docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true
        die "trawl-web did not start; the mask may be hiding web.cookie or $WEB_UPSTREAM_CA"; }
 # Type=simple reports active on exec, and trawl-web reads the cookie and the
-# pinned certificate during startup config resolution, so a still-active unit a
-# few seconds later is the evidence that both reads succeeded.
+# pinned certificate during startup config resolution. It exits when either
+# read fails, except a certificate that is not there: then it logs
+# upstream_ca_pending and keeps running. So a still-active unit a few seconds
+# later, whose run logged no upstream_ca_pending, is the evidence that both
+# reads succeeded.
 sleep 3
 [[ "$(nshq "systemctl is-active trawl-web")" == "active" ]] \
   || { docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true
        die "trawl-web exited after starting; check whether the mask hid /var/lib/trawl/web.cookie or $WEB_UPSTREAM_CA"; }
+web_invocation=$(nshq "systemctl show trawl-web -p InvocationID --value" | tr -d ' \r')
+[[ -n "$web_invocation" ]] || die "systemd reports no invocation id for the running trawl-web"
+if nshq "journalctl _SYSTEMD_INVOCATION_ID=$web_invocation --no-pager -o cat" | grep -q upstream_ca_pending; then
+  docker exec "$NODE" journalctl -u trawl-web --no-pager -n 20 || true
+  die "trawl-web started without $WEB_UPSTREAM_CA, which trawld had written; the mask may be hiding it"
+fi
 
 # The uid is the load-bearing part, not the mask. Read it off the running
 # process rather than off the unit file, and check the key's mode beside it:
