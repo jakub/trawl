@@ -121,6 +121,27 @@ spec:
                 echo "$0: could not remove the private key $key from $dir, which trawl-web mounts." >&2
                 exit 1
               fi
+              # trawl-web runs as another uid and pins the certificate in
+              # this directory, so it must search it, and only trawld may
+              # write it. An older trawld made it 0700; the fsGroup walk
+              # makes it group-writable and setgid, a bit a numeric chmod
+              # keeps on a directory.
+              chmod 0755 -- "$dir"
+              chmod ug-s -- "$dir"
+              # A certificate trawld did not write, or one another uid can
+              # rewrite, is not one the sidecar may pin. trawld generates a
+              # new pair when the certificate is missing, so it goes. A
+              # symlink is removed, never followed.
+              cert=$dir/cert.pem
+              if [ -L "$cert" ] || { [ -e "$cert" ] && {
+                [ ! -f "$cert" ] ||
+                [ "$(stat -c %u -- "$cert")" != "$uid" ] ||
+                [ $((0$(stat -c %a -- "$cert") & 022)) -ne 0 ]; }; }; then
+                if ! rm -f -- "$cert" || [ -e "$cert" ] || [ -L "$cert" ]; then
+                  echo "$0: could not remove $cert, which trawld did not write or another uid can change. trawl-web pins it; remove it so trawld generates a new certificate." >&2
+                  exit 1
+                fi
+              fi
             - init-tls-dir
             - {{ $trust.dataMountPath | quote }}
           securityContext:

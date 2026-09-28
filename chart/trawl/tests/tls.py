@@ -412,13 +412,14 @@ class TLS(unittest.TestCase):
             self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o755)
             self.assertEqual(tls_dir.stat().st_uid, os.getuid())
             # Idempotent: a directory trawld already owns, with its
-            # certificate in it, is left as it is.
+            # certificate in it, keeps the certificate and is left 0755.
             (tls_dir / "cert.pem").write_text("certificate")
+            (tls_dir / "cert.pem").chmod(0o644)
             tls_dir.chmod(0o750)
             result = run_tls_dir_script(init, tls_dir)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((tls_dir / "cert.pem").read_text(), "certificate")
-            self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o750)
+            self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o755)
 
             # Refusals name the path and the reason.
             file_path = Path(directory) / "file"
@@ -482,6 +483,93 @@ class TLS(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(f"{key} is not a regular file", result.stderr)
             self.assertEqual((key / "inside").read_text(), "kept")
+
+    def test_tls_dir_script_seals_the_directory(self):
+        # The sidecar runs as another uid, so it needs search permission on
+        # a directory an older trawld made 0700, and nothing but trawld may
+        # write where the sidecar reads its pin: kubelet's fsGroup walk
+        # leaves the directory group-writable and setgid.
+        init = init_container(self.objects({"web": web()}), "init-tls-dir")
+        for mode in [0o700, 0o750, 0o775, 0o777, 0o2775, 0o1777]:
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
+                tls_dir = Path(directory) / "tls"
+                tls_dir.mkdir()
+                tls_dir.chmod(mode)
+                cert = tls_dir / "cert.pem"
+                cert.write_text("certificate")
+                cert.chmod(0o644)
+                result = run_tls_dir_script(init, tls_dir)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o755)
+                # trawld's own certificate, which only trawld can change, stays.
+                self.assertEqual(cert.read_text(), "certificate")
+                self.assertEqual(cert.stat().st_mode & 0o7777, 0o644)
+
+    def test_tls_dir_script_removes_a_certificate_trawld_did_not_seal(self):
+        # A cert.pem another uid can rewrite could be swapped for one the
+        # sidecar then pins. trawld regenerates a missing certificate, so it
+        # goes before any app container starts.
+        init = init_container(self.objects({"web": web()}), "init-tls-dir")
+        with tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
+            tls_dir = Path(directory) / "tls"
+            tls_dir.mkdir()
+            cert = tls_dir / "cert.pem"
+            for mode in [0o664, 0o646, 0o666, 0o620]:
+                with self.subTest(mode=oct(mode)):
+                    cert.write_text("certificate")
+                    cert.chmod(mode)
+                    result = run_tls_dir_script(init, tls_dir)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse(cert.exists() or cert.is_symlink())
+
+            # A symlink or other non-regular file is not what trawld writes:
+            # the link itself goes, never its target.
+            target = Path(directory) / "target.pem"
+            target.write_text("elsewhere")
+            target.chmod(0o644)
+            cert.symlink_to(target)
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(cert.is_symlink())
+            self.assertEqual(target.read_text(), "elsewhere")
+            os.mkfifo(cert)
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(cert.exists() or cert.is_symlink())
+
+            # A directory cannot be removed with its contents unseen: refuse.
+            cert.mkdir()
+            (cert / "inside").write_text("kept")
+            result = run_tls_dir_script(init, tls_dir)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"could not remove {cert}", result.stderr)
+            self.assertEqual((cert / "inside").read_text(), "kept")
+
+    def test_tls_dir_script_removes_a_certificate_another_uid_owns(self):
+        # A user namespace stands in for root: the script runs as uid 0
+        # there, which owns this test's files, and cert.pem is given to a
+        # subordinate uid. Without one this case cannot be staged unprivileged;
+        # it takes the same removal branch as the group-writable certificate.
+        userns = ["unshare", "--map-auto", "--map-root-user", "--"]
+        probe = subprocess.run(userns + ["true"], capture_output=True, text=True) if shutil.which("unshare") else None
+        if probe is None or probe.returncode != 0:
+            self.skipTest(f"no unprivileged user namespace: {probe.stderr.strip() if probe else 'no unshare'}")
+        init = init_container(self.objects({"web": web()}), "init-tls-dir")
+        with tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
+            tls_dir = Path(directory) / "tls"
+            tls_dir.mkdir()
+            cert = tls_dir / "cert.pem"
+            cert.write_text("certificate")
+            cert.chmod(0o644)
+            # Owned by trawld (uid 0 in the namespace): kept.
+            result = subprocess.run(userns + init["command"][:4] + [str(tls_dir)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(cert.read_text(), "certificate")
+            subprocess.run(userns + ["chown", "1000", str(cert)], check=True)
+            self.assertNotEqual(cert.stat().st_uid, os.getuid())
+            result = subprocess.run(userns + init["command"][:4] + [str(tls_dir)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(cert.exists())
 
     def test_upstream_trust_secret_modes(self):
         secret = {"mode": "secret", "secretName": "operator-api-tls", "upstreamServerName": "trawl.example.com"}
