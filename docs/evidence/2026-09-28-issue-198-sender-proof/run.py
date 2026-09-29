@@ -72,12 +72,16 @@ pipes each key from the guest straight into grep's standard input.
 # - invalid_env and env_not_allowed, Vector logs no sink error: the journal
 #   read must succeed. The 401 case, which runs first, is the control: the
 #   same pipeline must have found the 401 there, or these checks fail.
-# - first start, Vector dropped no events: the journal read must succeed
-#   and hold at least one Vector line. Its control is the 401 case, which
-#   reads its own window through the same drop_extraction() and must count
-#   more than zero dropped events there (Vector 0.57 logs "Events dropped
-#   intentional=false count=N" for a non-retriable 401). The verdict is
-#   written only then; if the 401 case never runs, it is written as FAIL.
+# - first start, Vector dropped no events: the window is Vector's whole
+#   first run, from VECTOR_START to a timestamp taken just before its first
+#   restart (the 401 case's), so a backfill batch dropped late still counts.
+#   The read runs after that restart and must succeed and hold at least one
+#   Vector line. Its control is the 401 case, which reads its own window
+#   through the same drop_extraction() and must count more than zero
+#   dropped events there (Vector 0.57 logs "Events dropped
+#   intentional=false count=N" for a non-retriable 401). The verdict, with
+#   both window bounds, is written only then; if the 401 case never runs or
+#   Vector is never restarted, it is written as FAIL.
 # - the key in /etc/default/vector equals the minted key: the minted file
 #   must be non-empty, so two empty files cannot compare equal.
 # - token absence: each key's grep pipe is first proven to find that key in
@@ -641,12 +645,31 @@ def json_rows(text: str) -> tuple[list[dict], list[str]]:
     return rows, other
 
 
-def expect_fields(label: str, rows: list[dict], expected: dict[str, str]) -> None:
-    """At least one row carries every expected value (retries can duplicate)."""
-    T.check(f"{label}: at least one row", bool(rows), f"{len(rows)} row(s)")
-    for field, value in expected.items():
-        got = sorted({str(r.get(field)) for r in rows})
-        T.check(f"{label}: {field}={value}", value in got, f"seen {got}")
+def expect_fields(label: str, rows: list[dict], expected: dict[str, str],
+                  contains: dict[str, str] | None = None) -> bool:
+    """One event shape: PASS only when a single row carries every `expected`
+    value and every `contains` substring at once. A union across rows could
+    assemble the shape from several events, so it proves nothing. Other rows
+    may exist (retries can duplicate the event). Each row's matched and
+    missed fields go into the transcript as diagnostics."""
+    contains = contains or {}
+    shape = ", ".join([f"{k}={v}" for k, v in expected.items()]
+                      + [f"{k} contains {v!r}" for k, v in contains.items()])
+    T.note(f"{label}: expected event: {shape}")
+    matching = 0
+    for n, row in enumerate(rows, 1):
+        missed = [f"{k}={v} (got {str(row.get(k))[:80]!r})"
+                  for k, v in expected.items() if str(row.get(k)) != v]
+        missed += [f"{k} contains {v!r} (got {str(row.get(k))[:80]!r})"
+                   for k, v in contains.items() if v not in str(row.get(k))]
+        if missed:
+            T.note(f"{label}: row {n} matches {len(expected) + len(contains) - len(missed)} "
+                   f"of {len(expected) + len(contains)}; misses {'; '.join(missed)}")
+        else:
+            matching += 1
+            T.note(f"{label}: row {n} matches every field")
+    return T.check(f"{label}: one row carries the whole expected event", matching > 0,
+                   f"{matching} of {len(rows)} row(s) match every field")
 
 
 def poll_block(shell: ProofShell, block: Block, label: str, until=None,
@@ -781,9 +804,11 @@ class Run:
         self.run_dir: Path | None = None
         self.qemu: subprocess.Popen | None = None
         self.httpd: http.server.ThreadingHTTPServer | None = None
-        # The first-start drop read, held until the 401 case has proven the
-        # same extraction; see phase_vector() and settle_first_start().
-        self.first_start: tuple[int, list[str]] | None = None
+        # The first Vector run's drop read: taken by restart_vector() over
+        # [VECTOR_START, the first restart], and held until the 401 case has
+        # proven the same extraction; see settle_first_start().
+        self.first_start: tuple[int, list[str], str] | None = None
+        self.first_start_settled = False
         # Set only while a build container may be running; see build_container().
         self.build_cidfile: Path | None = None
         self.guest: Guest | None = None
@@ -1457,12 +1482,11 @@ journalctl -u vector --no-pager -o cat --since '{since}' | sed -e 's/\\x1b\\[[0-
   | grep -E ' (ERROR|WARN) ' | grep -v 'Failed to glob path' | cut -c1-400 | head -20 || true
 journalctl -u vector --no-pager -o cat --since '{since}' | grep -c 'Failed to glob path' || true""",
               root=True)
-        # The verdict waits for the 401 case, whose deliberate drops must show
-        # up through this same extraction; see settle_first_start().
-        self.first_start = self.vector_drops(since)
-        lines, drops = self.first_start
-        T.note(f"first start: {len(drops)} 'Events dropped' line(s) in {lines} line(s) of "
-               "journalctl -u vector; the verdict follows the 401 case's control")
+        # The drop read covers the whole first run, so it is taken just
+        # before the first restart; see restart_vector(). The verdict waits
+        # for the 401 case's control; see settle_first_start().
+        T.note(f"first start: Vector's drops are read over its whole first run, from {since} "
+               "to just before its first restart; the verdict follows the 401 case's control")
 
     # -- phase 8: history -------------------------------------------------
 
@@ -1608,9 +1632,8 @@ ss -Hltn 'sport = :1514'""", root=True)
         rows = poll_block(sh, b["syslog-check"], "syslog check").rows
         expect_fields("syslog", rows, {"env": TRAWL_ENV, "service": "firewall", "host": "fw01",
                                        "_producer": "syslog",
-                                       "syslog_source_ip": PEER_DEVICE.peer_ip})
-        T.check("syslog: the test message carries the device's marker",
-                any(device_marker in str(r.get("message")) for r in rows))
+                                       "syslog_source_ip": PEER_DEVICE.peer_ip},
+                      contains={"message": device_marker})
 
     # -- phase 10: negatives ------------------------------------------------
 
@@ -1635,35 +1658,59 @@ ss -Hltn 'sport = :1514'""", root=True)
             "| { grep -v 'has been suppressed' || true; } | cut -c1-300",
             root=True, echo=False).stdout
 
-    def vector_drops(self, since: str) -> tuple[int, list[str]]:
-        """Vector's journal line count since `since`, and its drop lines, through
-        drop_extraction(). The journal read must succeed."""
+    def vector_drops(self, since: str, until: str | None = None) -> tuple[int, list[str]]:
+        """Vector's journal line count from `since` (to `until`, if given), and
+        its drop lines, through drop_extraction(). The journal read must
+        succeed."""
         assert self.guest is not None
-        journal = self.guest.run(f"journalctl -u vector --since '{since}' -o cat",
+        bound = f" --until '{until}'" if until else ""
+        journal = self.guest.run(f"journalctl -u vector --since '{since}'{bound} -o cat",
                                  root=True, echo=False, merge=False).stdout
         return drop_extraction(journal)
 
     def settle_first_start(self, control: bool, why: str) -> None:
-        """The first-start "no drops" verdict. It passes only when the read held
-        Vector's lines, found no drop line, and `control` says the same
-        extraction found the 401 case's drops."""
-        pending, self.first_start = self.first_start, None
-        if pending is None:
+        """The first-start "no drops" verdict, written once. It passes only when
+        the read over the whole first run held Vector's lines, found no drop
+        line, and `control` says the same extraction found the 401 case's
+        drops. With no read (Vector was never restarted) it fails."""
+        if self.first_start_settled:
             return
-        lines, drops = pending
-        T.check("Vector dropped no events on its first start",
-                lines > 0 and not drops and control,
+        self.first_start_settled = True
+        name = "Vector dropped no events on its first start"
+        since = self.state.get("vector_since", "?")
+        if self.first_start is None:
+            T.check(name, False, f"no read: the first run, since {since}, never ended in a "
+                                 f"restart; {why}")
+            return
+        lines, drops, until = self.first_start
+        T.check(name, lines > 0 and not drops and control,
                 f"{len(drops)} 'Events dropped' line(s) in {lines} line(s) of "
-                f"journalctl -u vector; {why}"
+                f"journalctl -u vector --since '{since}' --until '{until}'; {why}"
                 + (f"; first: {drops[0][:200]}" if drops else ""))
 
+    def read_first_start(self, until: str) -> None:
+        """The first run's drop read, over [VECTOR_START, `until`], where `until`
+        is taken just before the first restart. Later calls do nothing."""
+        if self.first_start is not None or "vector_since" not in self.state:
+            return
+        since = self.state["vector_since"]
+        lines, drops = self.vector_drops(since, until)
+        self.first_start = (lines, drops, until)
+        T.note(f"first start: {len(drops)} 'Events dropped' line(s) in {lines} line(s) of "
+               f"journalctl -u vector --since '{since}' --until '{until}' (the whole first "
+               "run); the verdict follows the 401 case's control")
+
     def restart_vector(self, script: str) -> str:
+        """Run `script`, then restart Vector. Returns the time taken just before
+        the restart. The first call also closes the first run's drop window."""
         assert self.guest is not None
         out = self.guest.run(f"""{script}
 grep -E '^TRAWL_(URL|ENV)=' /etc/default/vector
 since=$(date -u '+%Y-%m-%d %H:%M:%S UTC'); echo "since=$since"
+until=$(date -u '+%Y-%m-%d %H:%M:%S.%6N UTC'); echo "until=$until"
 systemctl restart vector
 systemctl is-active vector""", root=True).stdout
+        self.read_first_start(re.search(r"until=(.+)", out).group(1).strip())  # type: ignore[union-attr]
         return re.search(r"since=(.+)", out).group(1).strip()  # type: ignore[union-attr]
 
     def positive_control(self, label: str) -> None:
@@ -1677,7 +1724,8 @@ systemctl is-active vector""", root=True).stdout
         self.shell.run_block(b["journald-send"])
         rows = poll_block(self.shell, b["journald-check"], f"{label} positive control").rows
         expect_fields(f"{label}: positive control after restore", rows, {
-            "env": TRAWL_ENV, "service": marker, "host": host_, "message": marker})
+            "env": TRAWL_ENV, "service": marker, "host": host_, "_producer": "http",
+            "message": marker})
         T.note(f"{label}: the env-free marker query from the negative, for this marker")
         rows = poll_query(self.guest, marker_query(marker, t0),
                           f"{label} env-free control").rows
