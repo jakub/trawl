@@ -16,6 +16,10 @@
 # SOURCE
 # =============================================================================
 
+# first start: Vector 0.57 docker_logs collects from collector start. It keeps
+# no persisted cursor and has no since_now setting, so lines a container wrote
+# while Vector was down are not collected.
+
 [sources.docker]
 type = "docker_logs"
 
