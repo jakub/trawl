@@ -23,8 +23,8 @@ HTTPS address. `trawl-web` answers 404 on `/api/v1/ingest`.
      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > events.json
    ```
 
-   The timestamp is the current time, so the `last=15m` query below finds
-   the event. An old timestamp is stored as sent and falls outside that range.
+   The timestamp is the current time, so the `last=1d` query below finds
+   the event. An old timestamp is stored as sent and falls outside that window.
 
 2. Send it:
 
@@ -41,7 +41,7 @@ HTTPS address. `trawl-web` answers 404 on `/api/v1/ingest`.
 3. Query it back:
 
    ```bash
-   trawl -p prod query 'service=ingest-check last=15m | head 10'
+   trawl -p prod query 'service=ingest-check host=app1.example.com last=1d | head 10'
    ```
 
    Expect one row with `_producer` = `http`, `_severity` derived from `level`,
@@ -85,36 +85,79 @@ A 503 that repeats for minutes means compaction is not draining. See
 
 ## Receive syslog
 
-1. Enable the listener in `/etc/trawl/trawld.toml`:
+A network appliance, such as a firewall, can send syslog directly to trawld's
+listener. This recipe connects one appliance and proves that its first event
+arrived, with the same pattern as
+[Prove the first event arrived](/getting-started/vector-integration/#prove-the-first-event-arrived).
+How trawld parses the fields depends on the vendor's line format. trawld
+reads the syslog frame. It does not parse fields inside the vendor's message
+text, such as a rule name, and those stay in `message`.
 
+1. Enable the listener in `/etc/trawl/trawld.toml`. Set `allow_cidrs` to the
+   appliance's address, and map that address to a service name in
+   `source_service_map`:
+
+   <!-- proof:syslog-config -->
    ```toml
    [syslog]
    enabled = true
    udp_addr = "0.0.0.0:1514"
    tcp_addr = "0.0.0.0:1514"
-   allow_cidrs = ["192.0.2.0/24"]
+   allow_cidrs = ["192.0.2.1/32"]
    default_service = "syslog"
 
    [syslog.source_service_map]
    "192.0.2.1" = "firewall"
    ```
 
-   An empty `allow_cidrs` accepts every peer. UDP source addresses can be
-   forged, and the listener has no TLS and no tokens, so limit who can reach
-   the port.
+   An empty `allow_cidrs` accepts every peer. `allow_cidrs` is not
+   authentication. A UDP sender can forge its source address, and the
+   listener has no TLS and no tokens. Anyone who can reach the port can send
+   events that look like the appliance's. Keep `allow_cidrs` as narrow as the
+   appliance's address, and limit who can reach the port.
+
+   `unifi-syslog.toml`, the Vector drop-in for UniFi devices, also listens on
+   port 1514 by default. Do not run it and trawld's listener on the same host
+   with the same port.
 
 2. Restart trawld. On Helm, set `config.syslog.enabled: true` and
    `service.syslog.enabled: true` to expose the ports.
 
-3. Point one device at the host on port 1514, then query its service:
+3. On the trawld host, set the appliance's address and record the start time
+   in UTC:
 
+   <!-- proof:syslog-vars -->
    ```bash
-   trawl -p prod query 'service=firewall last=15m | head 10'
+   DEVICE=192.0.2.1
+   T0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
    ```
 
-   Expect `_producer` = `syslog`, `host` from the frame, and the parsed
+4. If UFW runs on the trawld host, allow the appliance's syslog through it:
+
+   <!-- proof:syslog-firewall-allow -->
+   ```bash
+   sudo ufw allow proto udp from "$DEVICE" to any port 1514
+   ```
+
+   If the appliance sends over TCP, allow `proto tcp` as well.
+
+5. In the appliance's settings, point remote syslog at the trawld host on port
+   1514. Then send the appliance's test message. If it has no test message,
+   send a packet that one of its rules blocks and logs.
+
+6. Query for the appliance's events:
+
+   <!-- proof:syslog-check -->
+   ```bash
+   trawl -p prod query "service=firewall _producer=syslog syslog_source_ip=$DEVICE last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, syslog_source_ip, message"
+   ```
+
+   The check passes on at least one row. `last=1d` bounds the scan, and
+   `_ingested` proves that the event arrived after `T0`. The appliance's test
+   message carries no marker, so `syslog_source_ip` and `_ingested` identify
+   it. Expect `_producer` = `syslog`, `host` from the frame, and the parsed
    `syslog_severity`, `syslog_timestamp`, and `syslog_facility` columns. `env`
-   is `[ingest] default_env`. A source in `source_service_map` gets that
+   is `[ingest] default_env`. A sender in `source_service_map` gets that
    service name whatever its APP-NAME says. An APP-NAME that fails the service
    charset falls back to `default_service` with the repair
    `service.from_profile`. The [`[syslog]` reference](/reference/configuration/#syslog)
