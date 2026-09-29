@@ -456,18 +456,38 @@ jobs:
         run: test -f crates/trawl-web-ui/dist/index.html
       - run: cargo build --release -p trawl-web
 
-  web-ui-health-mutation:
-    name: Health page request-gate mutation
+  web-ui-mutations:
+    # Each patch in crates/trawl-web-ui/e2e/mutations plants one regression.
+    # mutation-check.sh builds each mutant SPA, requires its target spec to
+    # fail and its routing control to pass, then reverts. A kill only counts
+    # next to a green baseline on the same commit, and the workflow gives
+    # that by requiring web-ui-e2e too. Two legs of six patches each run in
+    # parallel. Each leg builds its own debug (wasm-dev) SPAs, so neither
+    # waits on trunk-build.
+    name: web UI mutations (${{ matrix.set }})
     runs-on: ubuntu-24.04
-    # Mutation jobs start once trunk-build is done and run alongside the
-    # web-ui-e2e shards. They build their own mutant and pristine SPAs (the
-    # atmosphere job downloads trunk-build's dist). They do not wait for the
-    # baseline suite: a kill still only counts next to a green baseline on the
-    # same commit, and the workflow gives that by requiring both. Waiting on
-    # trunk-build instead of nothing keeps these six k8s-big jobs from taking
-    # the runner slots that the trunk build needs.
-    needs: trunk-build
-    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - set: overlays, Health, pagination
+            patches: >-
+              17-range-dialog-no-layer.patch
+              23-range-close-on-refusal.patch
+              24-palette-overlay-gate.patch
+              25-palette-toggle.patch
+              20-health-admin-gate.patch
+              22-runs-filtered-window.patch
+          - set: search, live, schedules
+            patches: >-
+              26-save-editor-snapshot.patch
+              27-stop-live-replace.patch
+              28-live-snapshot-query.patch
+              29-schedule-lag-leak.patch
+              30-preview-known-total.patch
+              32-rail-choice-from-toggle.patch
+    # Six apply/build/run cycles after browser and package setup.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -480,97 +500,7 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: health-mutation
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill the Health admin-request gate mutation
-        run: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 20-health-admin-gate.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: health-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-palette-mutations:
-    name: Command palette admission and toggle mutations
-    runs-on: ubuntu-24.04
-    needs: trunk-build
-    # Browser system packages can take 15 minutes before the SPA rebuilds.
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: palette-mutations
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill command palette admission and toggle mutations
-        run: env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 24-palette-overlay-gate.patch 25-palette-toggle.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: palette-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-save-snapshot-mutation:
-    name: Save editor snapshot mutation
-    runs-on: ubuntu-24.04
-    needs: trunk-build
-    # Allow package setup plus pristine, mutated, and restored SPA checks.
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: save-snapshot-mutation
+          shared-key: web-mutations
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
@@ -589,215 +519,21 @@ jobs:
       - run: npx playwright install --with-deps chromium
         working-directory: crates/trawl-web-ui/e2e
       - name: Validate Save mutation report attribution
+        if: contains(matrix.patches, '26-save-editor-snapshot.patch')
         run: node --test crates/trawl-web-ui/e2e/scripts/check-save-mutation.test.mjs
-      - name: Build pristine SPA
-        # Incremental, like mutation-check.sh, so the mutant build that
-        # follows reuses this build's compiled crates.
-        run: env -u NO_COLOR CARGO_INCREMENTAL=1 trunk build
-        working-directory: crates/trawl-web-ui
-      - name: Verify pristine Settings and Save behavior
-        run: npx playwright test tests/settings-disposition.spec.ts
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill the Save editor snapshot mutation and restore pristine SPA
-        run: env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 26-save-editor-snapshot.patch
-      - name: Verify restored Settings and Save behavior
-        run: npx playwright test tests/settings-disposition.spec.ts
-        working-directory: crates/trawl-web-ui/e2e
+      # NO_COLOR is unset because Trunk parses it as a boolean and rejects an
+      # inherited value of 1.
+      - name: Kill the mutations
+        env:
+          PATCHES: ${{ matrix.patches }}
+        run: |
+          read -ra patch_files <<<"$PATCHES"
+          env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh "${patch_files[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
-          name: save-snapshot-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-pagination-range-mutations:
-    name: Pagination and range dialog mutations
-    runs-on: ubuntu-24.04
-    needs: trunk-build
-    timeout-minutes: 35
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: pagination-range-mutations
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill pagination and range dialog regressions
-        run: >-
-          crates/trawl-web-ui/e2e/scripts/mutation-check.sh
-          17-range-dialog-no-layer.patch
-          22-runs-filtered-window.patch
-          23-range-close-on-refusal.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: pagination-range-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-live-coherence-mutations:
-    name: Live-mode coherence mutations
-    runs-on: ubuntu-24.04
-    needs: trunk-build
-    # Two apply/build/run cycles plus the pristine restore build.
-    timeout-minutes: 35
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: live-coherence-mutations
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill the Stop live replace and live snapshot query mutations
-        run: >-
-          env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh
-          27-stop-live-replace.patch
-          28-live-snapshot-query.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: live-coherence-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-filter-rail-mutation:
-    name: Filter rail hand-choice mutation
-    runs-on: ubuntu-24.04
-    needs: trunk-build
-    # One apply/build/run cycle plus the pristine restore build.
-    timeout-minutes: 35
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: filter-rail-mutation
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill the filter rail hand choice recorded from toggle
-        run: >-
-          env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh
-          32-rail-choice-from-toggle.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: filter-rail-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-schedule-preview-mutations:
-    name: Schedule window and preview paging mutations
-    runs-on: ubuntu-24.04
-    needs: trunk-build
-    timeout-minutes: 35
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: schedule-preview-mutations
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill schedule lag leak and preview total regressions
-        run: >-
-          env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh
-          29-schedule-lag-leak.patch
-          30-preview-known-total.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: schedule-preview-mutation-traces
-          path: e2e-artifacts/test-results/
+          name: web-ui-mutations-${{ strategy.job-index }}
+          path: e2e-artifacts/mutations/
           retention-days: 7
 
   web-ui-e2e:

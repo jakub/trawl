@@ -352,8 +352,9 @@ missing browser fails the target spec too, and playwright records a
 launch failure as executed-and-failed tests rather than as no tests. It
 refuses to run against a dirty working tree, since a patch that can't be
 cleanly reverted would strand a mutation in your tree. This is evidence
-tooling for reviewing the suite's effectiveness. Dedicated CI jobs run the
-Health, pagination, range-dialog, command-palette, and Save mutations after the same commit's baseline E2E job passes.
+tooling for reviewing the suite's effectiveness. The two legs of the
+`web-ui-mutations` CI job run patches 17, 20, 22–30 and 32 alongside the same
+commit's baseline E2E job.
 
 08 through 11 and 31 are focus-order sensitive: the thing they break is
 where `document.activeElement` ends up after a keypress, and a browser
@@ -447,7 +448,7 @@ env -u NO_COLOR E2E_PORT=8168 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 
 `NO_COLOR` is unset because the installed Trunk parses it as a boolean and rejects
 an inherited value of `1`. The runner builds each mutant, requires its target spec
 to fail and the routing control to pass, reverses the patch, and finally deletes
-`dist/`, which still holds the last mutant. Rebuild before the next browser run. The `web-ui-palette-mutations` CI job runs these two patches alongside
+`dist/`, which still holds the last mutant. Rebuild before the next browser run. The `web-ui-mutations` CI job runs these two patches alongside
 `web-ui-e2e` and uploads browser traces on failure. A failed build or
 control is not a killed mutation.
 
@@ -467,7 +468,7 @@ release, and drop stream data, and release a delayed bootstrap response.
 Run `e2e/scripts/mutation-check.sh 20-health-admin-gate.patch` from a clean
 checkout. The script reads the named test's JSON result and requires the
 request-counter assertion itself to fail. A rendering failure elsewhere in
-the spec is not a kill. The `web-ui-health-mutation` CI job runs alongside
+the spec is not a kill. The `web-ui-mutations` CI job runs it alongside
 `web-ui-e2e` on the same commit, and the workflow is green only when both pass.
 Browser traces remain available on job failure.
 
@@ -550,7 +551,7 @@ E2E_PORT=8166 crates/trawl-web-ui/e2e/scripts/mutation-check.sh \
 ```
 
 Each uses `routing.spec.ts` as an independent passing control. The
-`web-ui-pagination-range-mutations` CI job runs alongside the full `web-ui-e2e`
+`web-ui-mutations` CI job runs alongside the full `web-ui-e2e`
 baseline, runs these three mutations and uploads failure traces. Apply or build
 failure is not a kill; the target must execute and fail, the control must pass,
 and the runner must restore clean source and delete the mutant's app dist. Mutation
@@ -582,7 +583,7 @@ env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 26-save-editor
 ```
 
 The mutation runner reverses the patch and deletes the mutant's `dist/` before it
-returns. The explicit
-`web-ui-save-snapshot-mutation` CI job runs this sequence alongside `web-ui-e2e`,
-with separate steps for the pristine and restored assertions. A failed build,
+returns. The
+`web-ui-mutations` CI job runs the checker tests and the mutation alongside
+`web-ui-e2e`, whose full suite is the pristine baseline. A failed build,
 unattributed target failure, failed control, or dirty restored tree fails the job.
