@@ -599,11 +599,14 @@ class Polled:
 
 
 def expect_absent(name: str, polled: Polled) -> bool:
-    """Absence holds only on a successful read: a failed query proves nothing."""
+    """Absence holds only when the final attempt read successfully: a failed
+    query proves nothing, and an early empty read says nothing about the end
+    of the window."""
     if polled.rows:
         return T.check(name, False, f"{len(polled.rows)} row(s)")
-    if polled.reads == 0:
-        return T.check(name, False, f"no query succeeded in {polled.attempts} attempts")
+    if polled.last_read != polled.attempts:
+        return T.check(name, False, f"the final query (attempt {polled.attempts}) did not "
+                                    f"succeed; {polled.reads} of {polled.attempts} did")
     return T.check(name, True, f"0 rows; {polled.reads} of {polled.attempts} queries "
                                f"succeeded, the last on attempt {polled.last_read}")
 
