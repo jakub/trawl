@@ -15,129 +15,21 @@ use std::path::{Path, PathBuf};
 
 use sqlx::migrate::{Migrate as _, Migrator};
 use sqlx::{Connection as _, Executor as _, PgConnection};
-use trawl_api::doctor::{Check, Outcome, Report};
+use trawl_api::doctor::{Outcome, Report};
 
 use crate::common;
 use crate::support::{
-    DoctorConfig, SECRET, assert_no_values, report, run_doctor, write_doctor_config,
+    ADVISORY_FUNCTIONS, DoctorConfig, LOCKLESS, ROLE, SECRET, admin, assert_no_values,
+    database_rows_complete, ensure_role, forbid_advisory_locks, lockless, migrated_app,
+    migrated_fleet, planted, report, row, run_doctor, url_values, verdict, with_login,
+    write_doctor_config,
 };
-
-/// The login role every doctor run here uses. Its password is [`SECRET`];
-/// it inherits the admin role's privileges on the test databases.
-const ROLE: &str = "trawl_doctor_planted";
 
 /// The pre-1.0 app-state migrations boot refuses to adopt.
 const LEGACY_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/schema-baseline/fixtures/trawl"
 );
-
-/// A second login role, also with the password [`SECRET`], that is a
-/// member of no role: it holds only what a test database grants it or
-/// `PUBLIC`. [`forbid_advisory_locks`] leaves it no advisory-lock function.
-const LOCKLESS: &str = "trawl_doctor_lockless";
-
-/// Make sure [`ROLE`] exists with the planted password and the admin
-/// role's privileges, and [`LOCKLESS`] with the planted password and no
-/// membership. Idempotent, and serialized across the test processes that
-/// share the cluster by a transaction-scoped lock on the admin connection
-/// (the test's, never the doctor's).
-async fn ensure_role() {
-    let mut admin = PgConnection::connect(&common::admin_database_url())
-        .await
-        .expect("connect to the admin database");
-    let mut tx = admin.begin().await.expect("begin");
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('trawl_doctor_planted'))")
-        .execute(&mut *tx)
-        .await
-        .expect("serialize role setup");
-    for role in [ROLE, LOCKLESS] {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
-                .bind(role)
-                .fetch_one(&mut *tx)
-                .await
-                .expect("look up the role");
-        if !exists {
-            tx.execute(sqlx::AssertSqlSafe(format!("CREATE ROLE {role} LOGIN")))
-                .await
-                .expect("create the planted role");
-        }
-        tx.execute(sqlx::AssertSqlSafe(format!(
-            "ALTER ROLE {role} LOGIN NOSUPERUSER PASSWORD '{SECRET}'"
-        )))
-        .await
-        .expect("set the planted password");
-    }
-    let admin_role: String = sqlx::query_scalar("SELECT current_user::text")
-        .fetch_one(&mut *tx)
-        .await
-        .expect("admin role");
-    tx.execute(sqlx::AssertSqlSafe(format!(
-        r#"GRANT "{admin_role}" TO {ROLE}"#
-    )))
-    .await
-    .expect("let the planted role read what the admin role owns");
-    let memberships: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member
-         WHERE r.rolname = $1",
-    )
-    .bind(LOCKLESS)
-    .fetch_one(&mut *tx)
-    .await
-    .expect("look up the lockless role's memberships");
-    assert_eq!(memberships, 0, "{LOCKLESS} must inherit nothing");
-    tx.commit().await.expect("commit role setup");
-    admin.close().await.expect("close");
-}
-
-/// The advisory-lock functions: every `pg_advisory*` and
-/// `pg_try_advisory*` function, including the unlocks.
-const ADVISORY_FUNCTIONS: &str = "SELECT oid FROM pg_proc WHERE proname ~ '^pg_(try_)?advisory'";
-
-/// In the database `url` names: revoke `EXECUTE` on every advisory-lock
-/// function from `PUBLIC`, grant it back to the admin role, which trawld
-/// runs as here, and let [`LOCKLESS`] read every table. Function
-/// privileges live in each database's own `pg_proc`, so this changes no
-/// other database. Asserts afterwards that [`LOCKLESS`] may execute none
-/// of them, so any call it makes is refused with `insufficient_privilege`.
-async fn forbid_advisory_locks(url: &str) {
-    let mut conn = admin(url).await;
-    conn.execute(sqlx::AssertSqlSafe(format!(
-        "DO $$ DECLARE f regprocedure; BEGIN
-            FOR f IN SELECT oid::regprocedure FROM pg_proc WHERE oid IN ({ADVISORY_FUNCTIONS}) LOOP
-                EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
-                EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', f, current_user);
-            END LOOP;
-        END $$"
-    )))
-    .await
-    .expect("revoke the advisory-lock functions from PUBLIC");
-    conn.execute(sqlx::AssertSqlSafe(format!(
-        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {LOCKLESS}"
-    )))
-    .await
-    .expect("let the lockless role read the ledger and catalog_state");
-    let (total, allowed): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT count(*), count(*) FILTER (WHERE has_function_privilege($1, oid, 'EXECUTE'))
-         FROM pg_proc WHERE oid IN ({ADVISORY_FUNCTIONS})"
-    )))
-    .bind(LOCKLESS)
-    .fetch_one(&mut conn)
-    .await
-    .expect("count the advisory-lock functions");
-    // Postgres 18 has 21: lock, lock_shared, unlock, unlock_shared,
-    // xact_lock and xact_lock_shared in both key forms, their try_
-    // forms, and unlock_all.
-    assert!(total >= 21, "only {total} advisory-lock functions found");
-    assert_eq!(allowed, 0, "{LOCKLESS} may still take an advisory lock");
-    conn.close().await.unwrap();
-}
-
-/// `url` as [`LOCKLESS`] with the planted password in it.
-fn lockless(url: &str) -> String {
-    with_login(url, LOCKLESS, Some(SECRET))
-}
 
 /// `url` with `query` added to its query string.
 fn with_query(url: &str, query: &str) -> String {
@@ -169,103 +61,6 @@ async fn install_probe(url: &str, body: &str) {
     .await
     .expect("install the probe function");
     conn.close().await.unwrap();
-}
-
-/// Every database row of `report` is `complete`: what a doctor run as
-/// [`LOCKLESS`] shows when it calls no advisory-lock function. A call is
-/// refused with `insufficient_privilege`, which turns the row that made
-/// it `not_sampled`, `permission_denied`.
-fn database_rows_complete(report: &Report) -> Result<(), String> {
-    for id in [
-        "server.fleet.connect",
-        "server.fleet.schema",
-        "server.app.connect",
-        "server.app.schema",
-        "server.app.writer",
-    ] {
-        let check = row(report, id);
-        if check.outcome != Outcome::Complete {
-            return Err(format!(
-                "{id} is {:?} ({:?})",
-                check.outcome,
-                check.reason.as_deref()
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// `url` (an admin URL naming a test database) with its userinfo replaced
-/// by `user` and, when given, `password`.
-fn with_login(url: &str, user: &str, password: Option<&str>) -> String {
-    let (scheme, rest) = url.split_once("://").expect("a URL with a scheme");
-    let host_at = rest.find('/').unwrap_or(rest.len());
-    let authority = &rest[..host_at];
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    let login = match password {
-        Some(password) => format!("{user}:{password}"),
-        None => user.to_owned(),
-    };
-    format!("{scheme}://{login}@{host}{}", &rest[host_at..])
-}
-
-/// `url` as [`ROLE`] with the planted password in it.
-fn planted(url: &str) -> String {
-    with_login(url, ROLE, Some(SECRET))
-}
-
-/// What the report must not show of a database URL: the URL, its host and
-/// port, its database name, and the role.
-fn url_values(url: &str) -> Vec<String> {
-    let rest = url.split_once("://").unwrap().1;
-    let authority = &rest[..rest.find('/').unwrap_or(rest.len())];
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    let database = rest[rest.find('/').unwrap() + 1..]
-        .split('?')
-        .next()
-        .unwrap();
-    vec![
-        url.to_owned(),
-        host.to_owned(),
-        database.to_owned(),
-        ROLE.to_owned(),
-        LOCKLESS.to_owned(),
-    ]
-}
-
-/// A connection to `url` as the admin role.
-async fn admin(url: &str) -> PgConnection {
-    PgConnection::connect(url)
-        .await
-        .expect("connect to a test database")
-}
-
-/// A test database with the Fleet schema current.
-async fn migrated_fleet() -> String {
-    let url = common::create_fleet_database().await;
-    let mut conn = admin(&url).await;
-    fleet_auth::MIGRATOR
-        .run(&mut conn)
-        .await
-        .expect("migrate the Fleet database");
-    conn.close().await.unwrap();
-    url
-}
-
-/// A test database with the app-state schema current.
-async fn migrated_app() -> String {
-    let url = common::create_app_database().await;
-    let mut conn = admin(&url).await;
-    trawl_server::store::migrations::MIGRATOR
-        .run(&mut conn)
-        .await
-        .expect("migrate the app-state database");
-    conn.close().await.unwrap();
-    url
 }
 
 /// One doctor run over an ingest node in its own directory, with `env`
@@ -319,20 +114,6 @@ fn doctor_env(dir: &Path, fleet: &str, app: &str) -> (i32, Report, String) {
         ],
         &planted_values,
     )
-}
-
-fn row<'a>(report: &'a Report, id: &str) -> &'a Check {
-    report
-        .checks()
-        .iter()
-        .find(|check| check.id == id)
-        .unwrap_or_else(|| panic!("no {id} row: {report:?}"))
-}
-
-/// `(outcome, reason)` of one row.
-fn verdict<'a>(report: &'a Report, id: &str) -> (Outcome, Option<&'a str>) {
-    let check = row(report, id);
-    (check.outcome, check.reason.as_deref())
 }
 
 #[tokio::test]
