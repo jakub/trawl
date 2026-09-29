@@ -90,18 +90,33 @@ impl InitReport {
     }
 }
 
+/// Proof that [`seal_for_config_check`] ran and succeeded in this process.
+///
+/// Only `seal_for_config_check` makes one: the type has no public
+/// constructor, its one field is private to this crate, and it implements
+/// neither `Default` nor any conversion. So a function that takes a
+/// `Sealed` cannot be called before the seal, and code that reads
+/// configuration only through such a function cannot read it earlier: the
+/// order is checked by the compiler, not by a test that samples the
+/// process. Copying one proves nothing new; the seal ran either way.
+#[derive(Debug, Clone, Copy)]
+pub struct Sealed {
+    _private: (),
+}
+
 /// Seal a validation-only process without starting crash capture.
 ///
 /// Call on the main thread before reading configuration or starting threads.
 /// This drops ptrace privileges and prevents privilege acquisition on exec,
-/// but creates no files, monitor processes, or signal handlers.
+/// but creates no files, monitor processes, or signal handlers. The
+/// [`Sealed`] it returns is what a check mode passes on to prove it.
 ///
 /// # Errors
 /// Returns a content-free seal failure if either protection cannot be set.
-pub fn seal_for_config_check() -> Result<(), FailureReason> {
+pub fn seal_for_config_check() -> Result<Sealed, FailureReason> {
     #[cfg(target_os = "linux")]
     caps::seal().map_err(|_| FailureReason::Seal)?;
-    Ok(())
+    Ok(Sealed { _private: () })
 }
 
 /// Initialize crash-dump capture.

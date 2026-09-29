@@ -82,11 +82,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args_os()
         .any(|arg| arg == "--doctor" || arg.as_encoded_bytes().starts_with(b"--doctor="))
     {
-        if trawl_crashdump::seal_for_config_check().is_err() {
+        let Ok(sealed) = trawl_crashdump::seal_for_config_check() else {
             eprintln!("[trawld] doctor refused: capability seal failed");
             std::process::exit(1);
-        }
-        std::process::exit(i32::from(doctor_main()));
+        };
+        std::process::exit(i32::from(doctor_main(sealed)));
     }
     if std::env::args_os().any(|arg| arg == "--check-config") {
         if trawl_crashdump::seal_for_config_check().is_err() {
@@ -165,12 +165,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// The usage line every `--doctor` usage error ends with.
 const DOCTOR_USAGE: &str = "Usage: trawld --doctor --config <PATH> [--format <table|json>]";
 
-/// `trawld --doctor`, in a process `main` already sealed. Returns the exit
-/// status: the report's (0, 1, 3) or 2 for a refused command line.
+/// `trawld --doctor`, in a process `main` already sealed, as `sealed`
+/// proves. Returns the exit status: the report's (0, 1, 3) or 2 for a
+/// refused command line.
 ///
 /// No tracing subscriber and no `log` logger exist on this path, so a log
 /// line from shared code goes nowhere.
-fn doctor_main() -> u8 {
+fn doctor_main(sealed: trawl_crashdump::Sealed) -> u8 {
     // clap's help shows an env-bound argument's current value, as
     // `[env: NAME=value]`. The doctor's output names no value it did not
     // select (ADR-0047), so its help names each variable without one.
@@ -193,7 +194,7 @@ fn doctor_main() -> u8 {
         Err(error) => return doctor_usage_error(&error),
     };
     let path = resolve_path(cli.config.as_deref().expect("clap requires config"));
-    trawl_server::doctor::run(&path, cli.format)
+    trawl_server::doctor::run(sealed, &path, cli.format)
 }
 
 /// Report a refused `--doctor` command line, exit status 2, without

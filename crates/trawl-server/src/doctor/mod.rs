@@ -34,6 +34,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use trawl_api::doctor::{Outcome, Report, Target, Vantage, reason};
+use trawl_crashdump::Sealed;
 
 use crate::config::{Config, ConfigError};
 use crate::config_check::{LoadedFault, LogFileRefusal, check_loaded};
@@ -453,10 +454,11 @@ const USER_LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 /// Run `trawld --doctor --config <config>` and return its exit status: 0
 /// pass, 1 fail, 3 incomplete (ADR-0047).
 ///
-/// Call only from a sealed process (`seal_for_config_check`), on its main
-/// thread, before any other thread exists.
+/// Call on the main thread of a sealed process, before any other thread
+/// exists. `sealed` proves the seal ran: only
+/// [`trawl_crashdump::seal_for_config_check`] makes one.
 #[must_use]
-pub fn run(config: &Path, format: Option<Format>) -> u8 {
+pub fn run(sealed: Sealed, config: &Path, format: Option<Format>) -> u8 {
     install_panic_hook(io::stderr);
     let format = format.unwrap_or_else(Format::detect);
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -469,7 +471,7 @@ pub fn run(config: &Path, format: Option<Format>) -> u8 {
     // The listener probe builds its TLS client from this provider. An
     // earlier install in this process is the same provider.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let report = runtime.block_on(check(config));
+    let report = runtime.block_on(check(sealed, config));
     runtime.shutdown_timeout(SHUTDOWN_BUDGET);
 
     let stdout = io::stdout();
@@ -497,13 +499,14 @@ fn install_panic_hook<W: Write>(sink: impl Fn() -> W + Send + Sync + 'static) {
 }
 
 /// Run every check and build the report. Nothing is rendered until the
-/// whole report exists.
-pub async fn check(config_path: &Path) -> Report {
+/// whole report exists. `sealed` proves the seal ran before the
+/// configuration is read.
+pub async fn check(sealed: Sealed, config_path: &Path) -> Report {
     let run_as = RunAs::current();
     let shown = SelectedPath::new(Selection::ConfigFlag, config_path);
     let mut runner = Runner::new(run_as);
 
-    let config = check_config(&mut runner, config_path, &shown).await;
+    let config = check_config(sealed, &mut runner, config_path, &shown).await;
     check_identity(&mut runner, run_as).await;
 
     if let Some(config) = config {
@@ -546,7 +549,12 @@ pub async fn check(config_path: &Path) -> Report {
 /// checks `--check-config` runs, on the blocking pool under
 /// [`VALIDATE_DEADLINE`]. The validation text is never shown; the next
 /// action is `--check-config`, which prints it.
-async fn check_config(runner: &mut Runner, path: &Path, shown: &SelectedPath) -> Option<Config> {
+async fn check_config(
+    _sealed: Sealed,
+    runner: &mut Runner,
+    path: &Path,
+    shown: &SelectedPath,
+) -> Option<Config> {
     let gate = runner
         .gate(ServerCheck::Config)
         .expect("server.config has no prerequisite");
@@ -1073,7 +1081,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fifo = dir.path().join("trawld.toml");
         crate::ingest::no_follow::test_support::make_fifo(&fifo);
-        let report = tokio::time::timeout(Duration::from_secs(10), check(&fifo))
+        let sealed = trawl_crashdump::seal_for_config_check().expect("the seal");
+        let report = tokio::time::timeout(Duration::from_secs(10), check(sealed, &fifo))
             .await
             .expect("the doctor returned");
         let rows = summary(&report);
