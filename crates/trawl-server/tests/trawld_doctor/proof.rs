@@ -1065,28 +1065,78 @@ impl Drop for WriteProtected {
     }
 }
 
+/// How a run of [`doctor_writes_nothing`] saw the installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    /// As the test's own user, over the tree as it is.
+    AsIs,
+    /// As the test's own user, with every write bit cleared.
+    WriteProtected,
+    /// As root in a user namespace, over a read-only bind mount.
+    ReadOnlyMount,
+}
+
 /// What a run over `installation` must have looked at, so a run that read
 /// nothing cannot pass for one that wrote nothing: every database row
 /// complete as [`LOCKLESS`] (an advisory-lock call is refused, and a write
-/// is refused by the read-only session and the role), and, where the data
-/// root was admitted, the rows that read under it.
-fn assert_looked(installation: &Installation, report: &Report, label: &str) {
+/// is refused by the read-only session and the role), and every storage
+/// content row run and complete: the epoch, the archive's identity,
+/// conformance (`not_configured` on a query-only node), and both recovery
+/// checks.
+///
+/// Only the write-protected leg of an ingest node may stop at the data
+/// root, which the running user then cannot write. A root run over the
+/// read-only mount never asks about access, so its data root is
+/// `ran_as_root` and every content row still has to run.
+fn assert_looked(
+    installation: &Installation,
+    ingest: bool,
+    leg: Leg,
+    report: &Report,
+    label: &str,
+) {
     database_rows_complete(report).unwrap_or_else(|why| panic!("{label}: {why}: {report:#?}"));
-    if installation.name == "fresh" || verdict(report, "server.data.root").0 == Outcome::Failed {
-        return;
+    let root = verdict(report, "server.data.root");
+    match leg {
+        Leg::ReadOnlyMount => assert_eq!(
+            root,
+            (Outcome::NotSampled, Some("ran_as_root")),
+            "{label}: {report:#?}"
+        ),
+        Leg::WriteProtected if ingest => {
+            assert_eq!(root.0, Outcome::Failed, "{label}: {report:#?}");
+            return;
+        }
+        Leg::AsIs | Leg::WriteProtected => {
+            assert_eq!(root.0, Outcome::Complete, "{label}: {report:#?}");
+        }
     }
-    for id in [
-        "server.data.epoch",
-        "server.data.identity",
-        "server.recovery.repin",
+    let conformance = if ingest {
+        Outcome::Complete
+    } else {
+        Outcome::NotConfigured
+    };
+    for (id, outcome) in [
+        ("server.data.epoch", Outcome::Complete),
+        ("server.data.identity", Outcome::Complete),
+        ("server.data.conformance", conformance),
+        ("server.recovery.repin", Outcome::Complete),
+        ("server.recovery.publication", Outcome::Complete),
     ] {
-        assert_eq!(verdict(report, id).0, Outcome::Complete, "{label}: {id}");
+        let check = row(report, id);
+        assert_eq!(
+            (check.outcome, check.blocked_by.as_deref()),
+            (outcome, None),
+            "{label}: {id}: {report:#?}"
+        );
     }
-    assert_eq!(
-        verdict(report, "server.recovery.publication"),
-        (Outcome::Complete, Some("pending_at_next_boot")),
-        "{label}: {report:#?}"
-    );
+    if installation.name == "populated" {
+        assert_eq!(
+            verdict(report, "server.recovery.publication"),
+            (Outcome::Complete, Some("pending_at_next_boot")),
+            "{label}: {report:#?}"
+        );
+    }
 }
 
 /// `trawld --doctor` writes nothing (#269 AC4, D19). Over a fresh and a
@@ -1117,7 +1167,13 @@ async fn doctor_writes_nothing() {
             let before = fs_snapshot(root);
             let (_, report) = doctor(&config, &installation.env(), &installation.planted());
             assert_unchanged(&before, &fs_snapshot(root), &label("as it is"));
-            assert_looked(&installation, &report, &label("as it is"));
+            assert_looked(
+                &installation,
+                ingest,
+                Leg::AsIs,
+                &report,
+                &label("as it is"),
+            );
             if installation.name == "fresh" && ingest {
                 assert_fresh_install_rows(&report);
             }
@@ -1127,7 +1183,13 @@ async fn doctor_writes_nothing() {
                 let before = fs_snapshot(root);
                 let (_, report) = doctor(&config, &installation.env(), &installation.planted());
                 assert_unchanged(&before, &fs_snapshot(root), &label("write-protected"));
-                assert_looked(&installation, &report, &label("write-protected"));
+                assert_looked(
+                    &installation,
+                    ingest,
+                    Leg::WriteProtected,
+                    &report,
+                    &label("write-protected"),
+                );
             }
 
             if let Some(userns) = &userns {
@@ -1159,7 +1221,13 @@ async fn doctor_writes_nothing() {
                         .is_some_and(|detail| detail.starts_with("uid 0")),
                     "{parsed:#?}"
                 );
-                assert_looked(&installation, &parsed, &label("read-only mount"));
+                assert_looked(
+                    &installation,
+                    ingest,
+                    Leg::ReadOnlyMount,
+                    &parsed,
+                    &label("read-only mount"),
+                );
             }
         }
         assert_eq!(

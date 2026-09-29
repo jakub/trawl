@@ -153,7 +153,10 @@ A failure outweighs a check that could not look. The same codes apply to
 
 Root reads what the service user may not, so a root run cannot prove that the
 service user has access. An access check, `server.data.root`, is `not_sampled`
-with the reason `ran_as_root`. Content checks still report what they read: a
+with the reason `ran_as_root`. It still fails when the data root is not a
+directory, or is absent and cannot be created there. It does not ask what the
+running user may do with the data root, and so does not report a read-only
+filesystem. Content checks still report what they read: a
 certificate parses, an epoch is current. A check that waits on the access check
 still runs. A root run never exits `0`. Run the doctor as the service user to
 get an answer about access.

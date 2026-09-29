@@ -73,7 +73,7 @@ pub(super) async fn run(ctx: &mut Ctx, runner: &mut Runner) {
             continue;
         };
         let row = match check {
-            ServerCheck::DataRoot => check_root(data_root.clone(), ingest)
+            ServerCheck::DataRoot => check_root(data_root.clone(), ingest, !ctx.run_as.root)
                 .await
                 .source(data_source(ctx)),
             ServerCheck::DataEpoch => check_epoch(data_root.clone(), wal_dir.clone(), ingest)
@@ -149,6 +149,10 @@ enum Access {
     ReadOnlyFs,
     /// The question itself failed.
     Unknown,
+    /// Not asked: the doctor runs as root, whose answer says nothing about
+    /// the service user's, so no `accessat` ran and no answer, not even
+    /// a read-only filesystem's, was consulted.
+    NotAsked,
 }
 
 /// What `server.data.root` saw at the configured path.
@@ -175,10 +179,13 @@ enum RootSeen {
 
 /// `server.data.root`: the root is a directory, or boot creates it, and the
 /// running user may read it and, on an ingest node, write it. The only
-/// access check: run as root, the runner reports it as not sampled.
-async fn check_root(data_root: PathBuf, ingest: bool) -> Row {
+/// access check. Unless `ask_access`, as in a root run, only the structural
+/// half is evaluated: the root is a directory, or absent below a directory
+/// boot could create it in. When that holds the row is `not_sampled`,
+/// reason `ran_as_root`, and the checks that wait on it still look.
+async fn check_root(data_root: PathBuf, ingest: bool, ask_access: bool) -> Row {
     let check = ServerCheck::DataRoot;
-    match look(move || observe_root(&data_root, ingest)).await {
+    match look(move || observe_root(&data_root, ingest, ask_access)).await {
         Ok(seen) => root_row(seen, ingest),
         Err(why) => missed(check, why),
     }
@@ -203,6 +210,11 @@ fn root_row(seen: RootSeen, ingest: bool) -> Row {
                  create it",
             ))
         }
+        RootSeen::Directory(Access::NotAsked) => not_asked(check, "a directory"),
+        RootSeen::Absent(Some(Access::NotAsked)) => not_asked(
+            check,
+            "absent below a directory: trawld creates it at its next start",
+        ),
         RootSeen::Directory(access) => access_row(check, access, false),
         RootSeen::Absent(Some(access)) => access_row(check, access, true),
         RootSeen::NotADirectory => Row::failed(check, "the data root is not a directory")
@@ -220,6 +232,17 @@ fn root_row(seen: RootSeen, ingest: bool) -> Row {
             .next(detail("rerun once the data root stops changing")),
         RootSeen::Unreadable => Row::not_sampled(check, reason::UNREADABLE),
     }
+}
+
+/// The row of a root whose structure holds and whose access was not asked
+/// about, because a root run's access proves nothing about the service
+/// user's.
+fn not_asked(check: ServerCheck, seen: &'static str) -> Row {
+    Row::not_sampled(check, reason::RAN_AS_ROOT)
+        .detail(Text::new(seen))
+        .next(Text::new(
+            "rerun as the service user to check what it can read and write",
+        ))
 }
 
 /// The row for access the running user lacks, at the root or, when
@@ -244,18 +267,23 @@ fn access_row(check: ServerCheck, access: Access, absent: bool) -> Row {
                 "an ingest node writes its data root: mount it read-write, or disable ingest",
             )),
         (Access::Unknown, _) => Row::not_sampled(check, reason::UNREADABLE),
+        (Access::NotAsked, _) => not_asked(check, "the data root's access was not asked about"),
     }
 }
 
 /// Look at the data root the way boot's gate first looks at it (a dangling
-/// symlink is an error, never absence), then ask what the running user may
-/// do there.
-fn observe_root(data_root: &Path, ingest: bool) -> RootSeen {
+/// symlink is an error, never absence), then, when `ask_access`, ask what
+/// the running user may do there.
+fn observe_root(data_root: &Path, ingest: bool, ask_access: bool) -> RootSeen {
     match epoch::metadata_if_present::<std::convert::Infallible>(data_root) {
-        Ok(Some(meta)) if meta.is_dir() => RootSeen::Directory(access(data_root, ingest)),
+        Ok(Some(meta)) if meta.is_dir() => RootSeen::Directory(if ask_access {
+            access(data_root, ingest)
+        } else {
+            Access::NotAsked
+        }),
         Ok(Some(_)) => RootSeen::NotADirectory,
         Ok(None) if !ingest => RootSeen::Absent(None),
-        Ok(None) => nearest_ancestor(data_root),
+        Ok(None) => nearest_ancestor(data_root, ask_access),
         Err(RootFault::Inspect { error, .. }) => inspect_seen(error.kind(), is_symlink(data_root)),
         Err(_) => RootSeen::Unreadable,
     }
@@ -281,8 +309,9 @@ fn is_symlink(path: &Path) -> bool {
 }
 
 /// For an absent root on an ingest node: whether the running user may
-/// create entries in the nearest directory above it that exists.
-fn nearest_ancestor(data_root: &Path) -> RootSeen {
+/// create entries in the nearest directory above it that exists, asked
+/// only when `ask_access`.
+fn nearest_ancestor(data_root: &Path, ask_access: bool) -> RootSeen {
     let mut current = data_root;
     loop {
         let parent = match current.parent() {
@@ -291,7 +320,11 @@ fn nearest_ancestor(data_root: &Path) -> RootSeen {
         };
         match std::fs::metadata(parent) {
             Ok(meta) if meta.is_dir() => {
-                return RootSeen::Absent(Some(write_access(parent)));
+                return RootSeen::Absent(Some(if ask_access {
+                    write_access(parent)
+                } else {
+                    Access::NotAsked
+                }));
             }
             Ok(_) => return RootSeen::AncestorNotADirectory,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && parent != current => {
@@ -1643,27 +1676,82 @@ mod tests {
     async fn the_root_is_absent_created_or_a_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("state/data");
-        let row = check_root(data.clone(), true).await;
+        let row = check_root(data.clone(), true, true).await;
         assert_eq!(
             (row.outcome(), row.reason()),
             (Outcome::Complete, Some(reason::WILL_INITIALIZE))
         );
-        let row = check_root(data.clone(), false).await;
+        let row = check_root(data.clone(), false, true).await;
         assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
         std::fs::create_dir_all(&data).unwrap();
         for ingest in [false, true] {
-            let row = check_root(data.clone(), ingest).await;
+            let row = check_root(data.clone(), ingest, true).await;
             assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
         }
         let file = tmp.path().join("file");
         std::fs::write(&file, b"x").unwrap();
-        let row = check_root(file.clone(), true).await;
+        let row = check_root(file.clone(), true, true).await;
         assert_eq!(
             (row.outcome(), row.reason()),
             (Outcome::Failed, Some("the data root is not a directory"))
         );
-        let row = check_root(file.join("data"), true).await;
+        let row = check_root(file.join("data"), true, true).await;
         assert_eq!(row.outcome(), Outcome::Failed, "{row:?}");
+    }
+
+    /// Unless the doctor asks about access, as in a root run, a structure
+    /// that holds is `ran_as_root`, whatever `accessat` would have said: a
+    /// root no one may enter, and one below a directory no one may write,
+    /// are not failed. A structure that does not hold still fails.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_root_run_asks_nothing_about_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let sealed = tmp.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut rows = Vec::new();
+        for ingest in [false, true] {
+            rows.push(check_root(data.clone(), ingest, false).await);
+        }
+        rows.push(check_root(sealed.join("data"), true, false).await);
+        let asked = check_root(data.clone(), false, true).await;
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for row in rows {
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
+                "{row:?}"
+            );
+        }
+        if !privileged_over(&tmp) {
+            assert_eq!(asked.outcome(), Outcome::Failed, "{asked:?}");
+        }
+
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        for path in [file.clone(), file.join("data")] {
+            let row = check_root(path, true, false).await;
+            assert_eq!(row.outcome(), Outcome::Failed, "{row:?}");
+        }
+    }
+
+    /// Whether the running user reads a directory its mode forbids, as root
+    /// or a holder of `CAP_DAC_OVERRIDE` does.
+    #[cfg(unix)]
+    fn privileged_over(tmp: &tempfile::TempDir) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let probe = tmp.path().join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let privileged = std::fs::read_dir(&probe).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        privileged
     }
 
     /// Mode 0500 lets the running user read the root but not write it. A
@@ -1678,8 +1766,8 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
         let privileged = std::fs::File::create(data.join("probe")).is_ok();
-        let ingest = check_root(data.clone(), true).await;
-        let query = check_root(data.clone(), false).await;
+        let ingest = check_root(data.clone(), true, true).await;
+        let query = check_root(data.clone(), false, true).await;
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(query.outcome(), Outcome::Complete);
         if privileged {
