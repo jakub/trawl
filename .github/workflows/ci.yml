@@ -260,10 +260,11 @@ jobs:
           cargo xtask pg-admission-guard --
           --no-default-features
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+      # The launcher runs whatever target/debug/trawld exists, and the suite
+      # above already built it, so this proves the loader path without a
+      # second trawld build in another feature set (about a minute).
       - name: Smoke-test verified DuckDB development launcher
-        run: |
-          cargo build -p trawl-server --no-default-features
-          bin/trawld-dev --version
+        run: bin/trawld-dev --version
 
   server-mutations:
     # Each crates/trawl-server/mutations/*.patch removes one guard. The
