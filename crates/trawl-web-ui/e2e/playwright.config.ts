@@ -42,6 +42,10 @@ export default defineConfig({
   // A cut-off suite reports remaining cases as "did not run", never passes.
   globalTimeout: 720_000,
   reporter: process.env.CI ? [['github'], ['list']] : [['list']],
+  // In CI, Playwright otherwise records git metadata no reporter here reads,
+  // running `git fetch` under a 3 s timeout on every invocation and printing
+  // any failure to stdout, which corrupted mutation-check.sh's JSON reports.
+  captureGitInfo: { commit: false, diff: false },
   use: {
     trace: 'retain-on-failure',
     // The contract fixture in fixtures.ts takes the failure screenshot
