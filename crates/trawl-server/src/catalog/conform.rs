@@ -334,8 +334,8 @@ pub(crate) fn archive_is_empty(data_dir: &Path) -> bool {
     if !data_dir.is_dir() {
         return true;
     }
-    let (files, errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
-    if let Some((path, e)) = errors.into_iter().next() {
+    let walk = walk_archive(data_dir);
+    if let Some((path, e)) = walk.failure {
         tracing::warn!(
             event_type = "catalog_identity_walk_failed",
             file = %path.display(),
@@ -345,7 +345,29 @@ pub(crate) fn archive_is_empty(data_dir: &Path) -> bool {
         );
         return false;
     }
-    files.is_empty()
+    !walk.parquet
+}
+
+/// What one walk of a data root for parquet saw ([`walk_archive`]).
+#[derive(Debug)]
+pub(crate) struct ArchiveWalk {
+    /// Whether the walk found a parquet file.
+    pub(crate) parquet: bool,
+    /// The first path the walk could not enumerate, and why. With it set,
+    /// `parquet: false` says only that the enumerable part holds none.
+    pub(crate) failure: Option<crate::metrics::WalkError>,
+}
+
+/// Walk the data root for parquet the way [`archive_is_empty`] does, and
+/// keep what it saw apart from what it could not see. Boot reads a failed
+/// walk as standing data; `trawld --doctor` reads it as a look that did not
+/// finish, unless the walk found parquet anyway.
+pub(crate) fn walk_archive(data_dir: &Path) -> ArchiveWalk {
+    let (files, errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
+    ArchiveWalk {
+        parquet: !files.is_empty(),
+        failure: errors.into_iter().next(),
+    }
 }
 
 /// Run the boot conformance pass unless the dual-sided identity says it

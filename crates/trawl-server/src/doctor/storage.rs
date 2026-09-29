@@ -165,6 +165,8 @@ enum RootSeen {
     AncestorNotADirectory,
     /// A symlink to nothing.
     Dangling,
+    /// Something that was there at the first look and gone at the second.
+    Vanished,
     /// The running user may not look up the path.
     Denied,
     /// Inspecting it failed otherwise.
@@ -176,10 +178,15 @@ enum RootSeen {
 /// access check: run as root, the runner reports it as not sampled.
 async fn check_root(data_root: PathBuf, ingest: bool) -> Row {
     let check = ServerCheck::DataRoot;
-    let seen = match look(move || observe_root(&data_root, ingest)).await {
-        Ok(seen) => seen,
-        Err(why) => return missed(check, why),
-    };
+    match look(move || observe_root(&data_root, ingest)).await {
+        Ok(seen) => root_row(seen, ingest),
+        Err(why) => missed(check, why),
+    }
+}
+
+/// The `server.data.root` row for what was seen at the configured path.
+fn root_row(seen: RootSeen, ingest: bool) -> Row {
+    let check = ServerCheck::DataRoot;
     let detail = |text: &'static str| Text::new(text);
     match seen {
         RootSeen::Directory(Access::Granted) => Row::complete(check).detail(detail(if ingest {
@@ -209,6 +216,8 @@ async fn check_root(data_root: PathBuf, ingest: bool) -> Row {
         RootSeen::Denied => Row::failed(check, "the running user cannot reach the data root").next(
             detail("give the service user search access to every directory above the data root"),
         ),
+        RootSeen::Vanished => Row::not_sampled(check, reason::MATERIAL_CHANGED)
+            .next(detail("rerun once the data root stops changing")),
         RootSeen::Unreadable => Row::not_sampled(check, reason::UNREADABLE),
     }
 }
@@ -247,14 +256,28 @@ fn observe_root(data_root: &Path, ingest: bool) -> RootSeen {
         Ok(Some(_)) => RootSeen::NotADirectory,
         Ok(None) if !ingest => RootSeen::Absent(None),
         Ok(None) => nearest_ancestor(data_root),
-        Err(RootFault::Inspect { error, .. }) => match error.kind() {
-            std::io::ErrorKind::NotFound => RootSeen::Dangling,
-            std::io::ErrorKind::PermissionDenied => RootSeen::Denied,
-            std::io::ErrorKind::NotADirectory => RootSeen::AncestorNotADirectory,
-            _ => RootSeen::Unreadable,
-        },
+        Err(RootFault::Inspect { error, .. }) => inspect_seen(error.kind(), is_symlink(data_root)),
         Err(_) => RootSeen::Unreadable,
     }
+}
+
+/// What a failed inspection of the data root says. `linked` says the path
+/// is a symlink now: only then is "not found" after the path was seen a
+/// symlink to nothing, which boot refuses; otherwise the path went away
+/// between two looks, which proves nothing about the next boot.
+fn inspect_seen(kind: std::io::ErrorKind, linked: bool) -> RootSeen {
+    match kind {
+        std::io::ErrorKind::NotFound if linked => RootSeen::Dangling,
+        std::io::ErrorKind::NotFound => RootSeen::Vanished,
+        std::io::ErrorKind::PermissionDenied => RootSeen::Denied,
+        std::io::ErrorKind::NotADirectory => RootSeen::AncestorNotADirectory,
+        _ => RootSeen::Unreadable,
+    }
+}
+
+/// Whether `path` is a symlink, without following it.
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 
 /// For an absent root on an ingest node: whether the running user may
@@ -375,15 +398,7 @@ async fn check_epoch(data_root: PathBuf, wal_dir: PathBuf, ingest: bool) -> Row 
     let check = ServerCheck::DataEpoch;
     let observed = look(move || {
         let state = classify(&data_root, &wal_dir, ingest);
-        let symlink = |path: &Path| {
-            std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
-        };
-        let linked = match &state {
-            Err(RootFault::ReadEpoch { path, .. } | RootFault::ReadStaged { path, .. }) => {
-                symlink(path)
-            }
-            _ => false,
-        };
+        let linked = fault_names_symlink(&state);
         (state, linked)
     })
     .await;
@@ -393,9 +408,25 @@ async fn check_epoch(data_root: PathBuf, wal_dir: PathBuf, ingest: bool) -> Row 
     }
 }
 
+/// Whether the path the classifier's fault names is a symlink now: a marker
+/// the doctor does not follow under the data root, or, for a path found
+/// and then not found, a symlink to nothing rather than an entry that went
+/// away between two looks.
+fn fault_names_symlink(state: &Result<DataRootState, RootFault<Unread>>) -> bool {
+    match state {
+        Err(
+            RootFault::ReadEpoch { path, .. }
+            | RootFault::ReadStaged { path, .. }
+            | RootFault::Inspect { path, .. },
+        ) => is_symlink(path),
+        _ => false,
+    }
+}
+
 /// The `server.data.epoch` row for what the classifier decided. `linked`
-/// says the marker it could not read is a symlink, which the doctor does
-/// not follow under the data root.
+/// is [`fault_names_symlink`]: the marker it could not read is a symlink,
+/// which the doctor does not follow under the data root, or the path it
+/// did not find is a symlink to nothing.
 fn epoch_row(state: Result<DataRootState, RootFault<Unread>>, linked: bool) -> Row {
     let check = ServerCheck::DataEpoch;
     let restore = Text::new(
@@ -453,11 +484,13 @@ fn epoch_row(state: Result<DataRootState, RootFault<Unread>>, linked: bool) -> R
             std::io::ErrorKind::PermissionDenied => {
                 Row::not_sampled(check, reason::PERMISSION_DENIED)
             }
-            std::io::ErrorKind::NotFound => Row::failed(
+            std::io::ErrorKind::NotFound if linked => Row::failed(
                 check,
                 "the data root or the WAL directory holds a symlink to nothing",
             )
             .next(Text::new("remove or repair the dangling symlink")),
+            std::io::ErrorKind::NotFound => Row::not_sampled(check, reason::MATERIAL_CHANGED)
+                .next(Text::new("rerun once the data root stops changing")),
             std::io::ErrorKind::NotADirectory => Row::failed(
                 check,
                 "the WAL directory, or a path the data root needs, is not a directory",
@@ -547,6 +580,42 @@ struct IdentitySeen {
     linked: bool,
     /// The judgement, when the marker was read.
     judgement: Option<IdentityJudgement>,
+    /// What the walk for parquet saw, when the judgement needed one.
+    walked: Option<ArchiveSeen>,
+}
+
+/// What the doctor's walk of the data root for parquet saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveSeen {
+    /// No parquet, and nothing the walk could not enumerate.
+    Empty,
+    /// A parquet file, whether or not the walk enumerated everything.
+    Parquet,
+    /// No parquet in what the walk enumerated, and a path it could not.
+    Unwalked,
+}
+
+/// Walk the data root for parquet as boot's identity gate does. Boot reads
+/// a walk that did not finish as standing data, which is conservative for
+/// boot; the doctor keeps it apart as a look that did not finish, unless
+/// the walk found parquet anyway. A root that is absent or not a directory
+/// holds none, as boot reads it; one the doctor cannot inspect is a walk
+/// that did not finish.
+fn see_archive(data_root: &Path) -> ArchiveSeen {
+    match std::fs::metadata(data_root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return ArchiveSeen::Empty,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ArchiveSeen::Empty,
+        Err(_) => return ArchiveSeen::Unwalked,
+    }
+    let walk = conform::walk_archive(data_root);
+    if walk.parquet {
+        ArchiveSeen::Parquet
+    } else if walk.failure.is_some() {
+        ArchiveSeen::Unwalked
+    } else {
+        ArchiveSeen::Empty
+    }
 }
 
 /// `server.data.identity`: the data root's `CATALOG` marker names the
@@ -571,15 +640,19 @@ async fn check_identity(
         let linked = marker.is_err()
             && std::fs::symlink_metadata(data_root.join("CATALOG"))
                 .is_ok_and(|meta| meta.file_type().is_symlink());
+        let mut walked = None;
         let judgement = marker.as_ref().ok().map(|marker| {
             conform::judge_archive_identity(marker.as_deref(), catalog_id.as_deref(), || {
-                conform::archive_is_empty(&data_root)
+                let seen = see_archive(&data_root);
+                walked = Some(seen);
+                seen == ArchiveSeen::Empty
             })
         });
         IdentitySeen {
             marker,
             linked,
             judgement,
+            walked,
         }
     })
     .await;
@@ -588,6 +661,7 @@ async fn check_identity(
         Err(why) => return (missed(check, why), None),
     };
     let row = match (&seen.marker, seen.judgement) {
+        (_, Some(_)) if seen.walked == Some(ArchiveSeen::Unwalked) => unwalked_row(),
         (_, Some(judgement)) => identity_row(judgement, fresh_catalog, ingest),
         (Err(Unread::NotText), _) => Row::not_sampled(check, reason::UNREADABLE)
             .detail(Text::new("the CATALOG marker is not text")),
@@ -600,6 +674,21 @@ async fn check_identity(
         (Ok(_), None) => Row::not_sampled(check, reason::UNREADABLE),
     };
     (row, seen.marker.ok().flatten())
+}
+
+/// The `server.data.identity` row when the marker does not prove the
+/// pairing and the walk for parquet did not finish without finding any.
+/// Boot reads that as standing data, so a foreign marker refuses it; the
+/// doctor has not seen parquet the marker must account for, and does not
+/// fail on what it could not see.
+fn unwalked_row() -> Row {
+    Row::not_sampled(ServerCheck::DataIdentity, reason::UNREADABLE)
+        .detail(Text::new(
+            "part of the data root could not be walked and the rest holds no parquet, so \
+             nothing shows whether the CATALOG marker must name the app-state database's \
+             catalog",
+        ))
+        .next(Text::new("rerun as the service user"))
 }
 
 /// The `server.data.identity` row for a judgement.
@@ -767,12 +856,23 @@ fn repin_row(found: &marker::RepinMarker, ingest: bool) -> Row {
 // server.recovery.publication
 // ---------------------------------------------------------------------------
 
+/// The publication markers `server.recovery.publication` counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Publications {
+    /// A query-only node: its boot recovers no publication marker and
+    /// never reads the WAL, so none are counted.
+    NotCounted,
+    /// The WAL root could not be listed.
+    Unlisted,
+    /// What the census of the WAL root found.
+    Counted(publication_marker::MarkerCensus),
+}
+
 /// What `server.recovery.publication` counted.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MarkersSeen {
-    /// The publication markers, or `None` when the WAL root cannot be
-    /// listed.
-    publication: Option<publication_marker::MarkerCensus>,
+    /// The publication markers under the WAL root.
+    publication: Publications,
     /// Whether the data root's day directories could all be listed.
     rollup_listed: bool,
     /// Rollup markers that read.
@@ -783,13 +883,26 @@ struct MarkersSeen {
     rollup_unreadable: usize,
 }
 
-/// Count the publication markers under the WAL root and the rollup markers
-/// in the data root's day directories, each by the decoder boot recovers
-/// it with.
-fn count_markers(data_root: &Path, wal_dir: &Path) -> MarkersSeen {
+/// Count the rollup markers in the data root's day directories and, on an
+/// ingest node, the publication markers under the WAL root, each by the
+/// decoder boot recovers it with.
+///
+/// The rollup census runs on every node type: the publication gate's boot
+/// scan registers every rollup marker on a query-only node too, and its
+/// reads refuse `rollup_pending` while one remains. Publication markers
+/// are an ingest node's, whose boot recovers them.
+fn count_markers(data_root: &Path, wal_dir: &Path, ingest: bool) -> MarkersSeen {
+    let publication = if ingest {
+        publication_marker::census(wal_dir).map_or(Publications::Unlisted, Publications::Counted)
+    } else {
+        Publications::NotCounted
+    };
     let mut seen = MarkersSeen {
-        publication: publication_marker::census(wal_dir).ok(),
-        ..MarkersSeen::default()
+        publication,
+        rollup_listed: false,
+        rollup_pending: 0,
+        rollup_malformed: 0,
+        rollup_unreadable: 0,
     };
     let mut rollups = std::collections::HashSet::new();
     seen.rollup_listed = crate::publication::scan_markers(data_root, &mut rollups).is_ok();
@@ -804,18 +917,12 @@ fn count_markers(data_root: &Path, wal_dir: &Path) -> MarkersSeen {
     seen
 }
 
-/// `server.recovery.publication`: the publication and rollup markers are
-/// readable and well formed. A pending one is boot's to finish.
+/// `server.recovery.publication`: the rollup markers and, on an ingest
+/// node, the publication markers are readable and well formed. A pending
+/// one is boot's to finish.
 async fn check_markers(data_root: PathBuf, wal_dir: PathBuf, ingest: bool) -> Row {
     let check = ServerCheck::RecoveryPublication;
-    if !ingest {
-        return Row::not_configured(
-            check,
-            "ingest is disabled, so this node recovers no markers",
-        )
-        .detail(Text::new("a query-only node never publishes or rolls up"));
-    }
-    match look(move || count_markers(&data_root, &wal_dir)).await {
+    match look(move || count_markers(&data_root, &wal_dir, ingest)).await {
         Ok(seen) => markers_row(seen),
         Err(why) => missed(check, why),
     }
@@ -826,22 +933,38 @@ async fn check_markers(data_root: PathBuf, wal_dir: PathBuf, ingest: bool) -> Ro
 /// ones.
 fn markers_row(seen: MarkersSeen) -> Row {
     let check = ServerCheck::RecoveryPublication;
-    let publication = seen.publication.unwrap_or_default();
-    let counts = Text::new("")
-        .int(publication.pending as u64)
-        .lit(" pending and ")
-        .int(publication.invalid as u64)
-        .lit(" malformed publication marker(s); ")
-        .int(seen.rollup_pending as u64)
-        .lit(" pending and ")
-        .int(seen.rollup_malformed as u64)
-        .lit(" malformed rollup marker(s)");
-    let inspect = Text::new(
+    let rollups = |text: Text| {
+        text.int(seen.rollup_pending as u64)
+            .lit(" pending and ")
+            .int(seen.rollup_malformed as u64)
+            .lit(" malformed rollup marker(s)")
+    };
+    // `None` on a query-only node, which counts no publication marker.
+    let census = match seen.publication {
+        Publications::NotCounted => None,
+        Publications::Unlisted => Some(publication_marker::MarkerCensus::default()),
+        Publications::Counted(census) => Some(census),
+    };
+    let counts = rollups(census.map_or_else(
+        || Text::new(""),
+        |census| {
+            Text::new("")
+                .int(census.pending as u64)
+                .lit(" pending and ")
+                .int(census.invalid as u64)
+                .lit(" malformed publication marker(s); ")
+        },
+    ));
+    let inspect = Text::new(if census.is_some() {
         "trawld leaves a malformed marker in place and keeps what it claims blocked; \
          inspect the markers in the WAL directory's environments and the data root's \
-         day directories",
-    );
-    if publication.invalid > 0 {
+         day directories"
+    } else {
+        "this query-only node refuses corpus reads while a rollup marker remains, and the \
+         ingest node's recovery leaves a malformed one in place; inspect the markers in \
+         the data root's day directories"
+    });
+    if census.is_some_and(|census| census.invalid > 0) {
         return Row::failed(check, "a publication marker is malformed")
             .detail(counts)
             .next(inspect);
@@ -851,24 +974,37 @@ fn markers_row(seen: MarkersSeen) -> Row {
             .detail(counts)
             .next(inspect);
     }
-    if seen.publication.is_none()
-        || publication.root_incomplete
-        || publication.unlisted_envs > 0
-        || publication.unreadable > 0
-        || !seen.rollup_listed
-        || seen.rollup_unreadable > 0
-    {
+    let publication_unread = match seen.publication {
+        Publications::NotCounted => false,
+        Publications::Unlisted => true,
+        Publications::Counted(census) => {
+            census.root_incomplete || census.unlisted_envs > 0 || census.unreadable > 0
+        }
+    };
+    if publication_unread || !seen.rollup_listed || seen.rollup_unreadable > 0 {
         return Row::not_sampled(check, reason::UNREADABLE)
             .detail(Text::new(
                 "a marker, or a directory that may hold one, could not be read",
             ))
             .next(Text::new("rerun as the service user"));
     }
-    if publication.pending + seen.rollup_pending > 0 {
+    let publication_pending = census.map_or(0, |census| census.pending);
+    if publication_pending + seen.rollup_pending > 0 {
+        let finish = if census.is_some() {
+            ": trawld finishes the pending ones at its next start"
+        } else {
+            ": this query-only node refuses corpus reads while one remains, and the ingest \
+             node that writes this data root finishes it"
+        };
         return Row::complete_because(check, reason::PENDING_AT_NEXT_BOOT)
-            .detail(counts.lit(": trawld finishes the pending ones at its next start"));
+            .detail(counts.lit(finish));
     }
-    Row::complete(check).detail(Text::new("no publication or rollup marker"))
+    Row::complete(check).detail(Text::new(if census.is_some() {
+        "no publication or rollup marker"
+    } else {
+        "no rollup marker; publication markers are an ingest node's, and this query-only \
+         node reads none"
+    }))
 }
 
 #[cfg(test)]
@@ -1076,7 +1212,8 @@ mod tests {
             }
 
             let admitted = doctor.as_ref().ok().cloned();
-            let row = epoch_row(doctor, false);
+            let linked = fault_names_symlink(&doctor);
+            let row = epoch_row(doctor, linked);
             match (&boot, admitted) {
                 (Ok(outcome), Some(state)) => {
                     assert!(
@@ -1264,7 +1401,7 @@ mod tests {
             ..Default::default()
         };
         let seen = |publication, rollup_pending, rollup_malformed, rollup_unreadable| MarkersSeen {
-            publication: Some(publication),
+            publication: Publications::Counted(publication),
             rollup_listed: true,
             rollup_pending,
             rollup_malformed,
@@ -1299,7 +1436,7 @@ mod tests {
             (Outcome::NotSampled, Some(reason::UNREADABLE))
         );
         let unlisted = MarkersSeen {
-            publication: None,
+            publication: Publications::Unlisted,
             ..seen(census(0, 0, 0), 0, 0, 0)
         };
         assert_eq!(
@@ -1336,14 +1473,142 @@ mod tests {
         );
         write(&day.join(".rollup-api"), &[0xff, 0xfe]);
         write(&wal.join("prod/.publish-nginx.json"), b"{ not json");
-        let seen = count_markers(&data, &wal);
+        let seen = count_markers(&data, &wal, true);
         assert_eq!(seen.rollup_pending, 1);
         assert_eq!(seen.rollup_malformed, 1);
         assert_eq!(seen.rollup_unreadable, 0);
         assert!(seen.rollup_listed);
-        let publication = seen.publication.unwrap();
+        let Publications::Counted(publication) = seen.publication else {
+            panic!("{seen:?}");
+        };
         assert_eq!((publication.pending, publication.invalid), (0, 1));
         assert_eq!(markers_row(seen).outcome(), Outcome::Failed);
+    }
+
+    /// A query-only node's publication gate registers every rollup marker
+    /// its boot scan finds and refuses corpus reads while one remains, so
+    /// the census counts them there too. Publication markers are an ingest
+    /// node's: a query-only node never reads the WAL and counts none.
+    #[test]
+    fn a_query_only_node_counts_rollup_markers_and_no_publication_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = data.join("wal");
+        let day = data.join("prod/2026-09-23");
+        write(
+            &day.join(".rollup-nginx"),
+            b"/data/prod/2026-09-23/07/nginx.parquet\n",
+        );
+        write(&wal.join("prod/.publish-nginx.json"), b"{ not json");
+        let seen = count_markers(&data, &wal, false);
+        assert_eq!(seen.publication, Publications::NotCounted);
+        assert_eq!((seen.rollup_pending, seen.rollup_malformed), (1, 0));
+        let row = markers_row(seen);
+        assert_eq!(
+            (row.outcome(), row.reason()),
+            (Outcome::Complete, Some(reason::PENDING_AT_NEXT_BOOT))
+        );
+        let detail = row.into_check().detail.unwrap();
+        assert!(
+            detail.contains("1 pending and 0 malformed rollup marker(s)")
+                && !detail.contains("publication marker(s)"),
+            "{detail}"
+        );
+
+        write(&day.join(".rollup-api"), &[0xff, 0xfe]);
+        let row = markers_row(count_markers(&data, &wal, false));
+        assert_eq!(
+            (row.outcome(), row.reason()),
+            (Outcome::Failed, Some("a rollup marker is malformed"))
+        );
+
+        let query_only = |rollup_listed, rollup_unreadable| MarkersSeen {
+            publication: Publications::NotCounted,
+            rollup_listed,
+            rollup_pending: 0,
+            rollup_malformed: 0,
+            rollup_unreadable,
+        };
+        for unread in [query_only(false, 0), query_only(true, 1)] {
+            let row = markers_row(unread);
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (Outcome::NotSampled, Some(reason::UNREADABLE)),
+                "{unread:?}"
+            );
+        }
+        let row = markers_row(query_only(true, 0));
+        assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
+    }
+
+    /// A path the classifier saw and then did not find is a symlink to
+    /// nothing only when it is a symlink; otherwise it went away between
+    /// two looks, which says nothing about the next boot. Only the first
+    /// fails, for the data root and for `server.data.epoch`.
+    #[test]
+    fn a_path_gone_between_two_looks_is_not_a_dangling_symlink() {
+        let gone = |linked| {
+            epoch_row(
+                Err(RootFault::Inspect {
+                    at: epoch::Inspected::Path,
+                    path: PathBuf::from("entry"),
+                    error: std::io::ErrorKind::NotFound.into(),
+                }),
+                linked,
+            )
+        };
+        let row = gone(false);
+        assert_eq!(
+            (row.outcome(), row.reason()),
+            (Outcome::NotSampled, Some(reason::MATERIAL_CHANGED))
+        );
+        assert_eq!(gone(true).outcome(), Outcome::Failed);
+
+        for ingest in [false, true] {
+            let row = root_row(inspect_seen(std::io::ErrorKind::NotFound, false), ingest);
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (Outcome::NotSampled, Some(reason::MATERIAL_CHANGED))
+            );
+            let row = root_row(inspect_seen(std::io::ErrorKind::NotFound, true), ingest);
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (
+                    Outcome::Failed,
+                    Some("the data root is a symlink to nothing")
+                )
+            );
+        }
+    }
+
+    /// A walk that could not enumerate part of the root and found no
+    /// parquet is kept apart from an empty archive and from one holding
+    /// parquet; boot's reading of the same walk stays conservative.
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_that_did_not_finish_is_not_standing_data() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let sealed = data.join("prod");
+        std::fs::create_dir_all(&sealed).unwrap();
+        assert_eq!(see_archive(&data), ArchiveSeen::Empty);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let privileged = std::fs::read_dir(&sealed).is_ok();
+        let unwalked = see_archive(&data);
+        let boot_empty = conform::archive_is_empty(&data);
+        write(&data.join("other/2026-01-01/10/svc.parquet"), b"corpus");
+        let with_parquet = see_archive(&data);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if privileged {
+            assert_eq!(unwalked, ArchiveSeen::Empty);
+            assert!(boot_empty);
+        } else {
+            assert_eq!(unwalked, ArchiveSeen::Unwalked);
+            assert!(!boot_empty, "boot reads a walk that did not finish as data");
+        }
+        assert_eq!(with_parquet, ArchiveSeen::Parquet);
+        assert_eq!(see_archive(&tmp.path().join("absent")), ArchiveSeen::Empty);
     }
 
     #[test]

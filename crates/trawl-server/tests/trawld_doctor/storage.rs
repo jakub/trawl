@@ -450,3 +450,156 @@ async fn doctor_recovery_markers() {
         assert_ne!(run.code, 0, "rollup {rollup}");
     }
 }
+
+/// A query-only node's data root holding `EPOCH` 3, with a WAL directory
+/// inside it that the node never reads.
+fn current_query_only_root(dir: &Path) -> DoctorConfig {
+    DoctorConfig {
+        ingest: false,
+        ..current_ingest_root(dir)
+    }
+}
+
+/// `server.recovery.publication` on a query-only node: its publication
+/// gate registers every rollup marker the boot scan finds and refuses
+/// corpus reads while one remains, so the rollup census runs there too. A
+/// malformed rollup marker is `failed`, an unreadable one is
+/// `not_sampled`/`unreadable`, and a pending one is
+/// `complete`/`pending_at_next_boot`. Publication markers stay an ingest
+/// node's: a malformed one in the WAL a query-only node never reads changes
+/// nothing.
+#[tokio::test]
+async fn doctor_query_only_rollup_markers() {
+    const CHECK: &str = "server.recovery.publication";
+    let dbs = migrated_databases().await;
+    let malformed_publication =
+        |data: &Path| write(&data.join("wal/prod/.publish-nginx.json"), b"{ not json");
+
+    // Pending, beside a malformed publication marker it does not count.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let config = current_query_only_root(dir.path());
+        let (path, body) = rollup_marker(&config.data_path);
+        write(&path, body.as_bytes());
+        malformed_publication(&config.data_path);
+        let run = doctor(dir.path(), &config, &dbs).await;
+        assert_eq!(
+            run.outcome(CHECK),
+            (Outcome::Complete, Some(reason::PENDING_AT_NEXT_BOOT))
+        );
+        assert_ne!(run.code, 1, "{:?}", run.report.checks());
+        let detail = run.row(CHECK).detail.clone().unwrap();
+        assert!(
+            detail.contains("1 pending and 0 malformed rollup marker(s)")
+                && !detail.contains("publication marker(s)"),
+            "{detail}"
+        );
+    }
+
+    // No rollup marker: complete, whatever the WAL holds.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let config = current_query_only_root(dir.path());
+        malformed_publication(&config.data_path);
+        let run = doctor(dir.path(), &config, &dbs).await;
+        assert_eq!(run.outcome(CHECK), (Outcome::Complete, None));
+    }
+
+    // Malformed: not text, and not a regular file.
+    for (name, plant) in [
+        (
+            "rollup marker that is not text",
+            (|data: &Path| write(&data.join("prod/2026-09-23/.rollup-nginx"), &[0xff, 0xfe]))
+                as fn(&Path),
+        ),
+        ("rollup marker that is a directory", |data: &Path| {
+            std::fs::create_dir_all(data.join("prod/2026-09-23/.rollup-nginx")).unwrap();
+        }),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = current_query_only_root(dir.path());
+        plant(&config.data_path);
+        let run = doctor(dir.path(), &config, &dbs).await;
+        assert_eq!(
+            run.outcome(CHECK),
+            (Outcome::Failed, Some("a rollup marker is malformed")),
+            "{name}"
+        );
+        assert_eq!(run.code, 1, "{name}");
+    }
+
+    // Unreadable: a well-formed marker of mode 000. A user who reads it
+    // anyway sees it pending.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let config = current_query_only_root(dir.path());
+        let (path, body) = rollup_marker(&config.data_path);
+        write(&path, body.as_bytes());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let privileged = reads_mode_000(dir.path());
+        let run = doctor(dir.path(), &config, &dbs).await;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let expected = if privileged {
+            (Outcome::Complete, Some(reason::PENDING_AT_NEXT_BOOT))
+        } else {
+            (Outcome::NotSampled, Some(reason::UNREADABLE))
+        };
+        assert_eq!(run.outcome(CHECK), expected);
+        assert_ne!(run.code, 1);
+        assert_ne!(run.code, 0);
+    }
+}
+
+/// `server.data.identity` over an archive the walk could not enumerate in
+/// full. A foreign `CATALOG` marker over a root whose readable part holds
+/// no parquet, beside an empty directory of mode 000, is
+/// `not_sampled`/`unreadable` on both node types: the doctor has seen no
+/// parquet the marker must account for. Boot reads the same walk as
+/// standing data (`conform::archive_is_empty`), which this leaves alone.
+/// Parquet the walk does see still fails the mismatch. A user who reads the
+/// sealed directory anyway sees an empty archive.
+#[cfg(unix)]
+#[tokio::test]
+async fn doctor_identity_over_an_unwalked_archive() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const CHECK: &str = "server.data.identity";
+    let dbs = migrated_databases().await;
+    for ingest in [false, true] {
+        for parquet in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = DoctorConfig {
+                ingest,
+                ..current_ingest_root(dir.path())
+            };
+            let data = &config.data_path;
+            write(
+                &data.join("CATALOG"),
+                format!("{FOREIGN_CATALOG}\n").as_bytes(),
+            );
+            if parquet {
+                write(&data.join("prod/2026-01-02/10/svc.parquet"), b"corpus");
+            }
+            let sealed = data.join("prod/2026-01-01");
+            std::fs::create_dir_all(&sealed).unwrap();
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let privileged = reads_mode_000(dir.path());
+            let run = doctor(dir.path(), &config, &dbs).await;
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let label = format!("ingest {ingest}, parquet {parquet}");
+            let expected = match (parquet, privileged) {
+                (true, _) => (Outcome::Failed, Some(reason::CATALOG_IDENTITY_MISMATCH)),
+                (false, true) => (Outcome::Complete, None),
+                (false, false) => (Outcome::NotSampled, Some(reason::UNREADABLE)),
+            };
+            assert_eq!(run.outcome(CHECK), expected, "{label}");
+            if parquet {
+                assert_eq!(run.code, 1, "{label}");
+            } else if !privileged {
+                assert_ne!(run.code, 1, "{label}: {:?}", run.report.checks());
+                assert_ne!(run.code, 0, "{label}");
+            }
+        }
+    }
+}
