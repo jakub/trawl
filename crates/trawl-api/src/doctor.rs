@@ -303,9 +303,6 @@ pub mod reason {
     pub const UNREADABLE: &str = "unreadable";
     /// A file the check reads is larger than the doctor reads.
     pub const TOO_LARGE: &str = "too_large";
-    /// The check is not built yet. Present only while `trawld --doctor`
-    /// is being built; no released doctor reports it.
-    pub const NOT_IMPLEMENTED: &str = "not_implemented";
     /// With `complete`: trawld's boot creates or brings this state current
     /// on its next start, and accepts it as it is.
     pub const WILL_INITIALIZE: &str = "will_initialize";
