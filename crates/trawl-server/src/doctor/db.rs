@@ -19,8 +19,10 @@
 //!
 //! Before connecting, the doctor refuses a startup field that holds a
 //! control character, since a NUL ends the field early and drops the
-//! settings after it, and a password or TLS file `SQLx` would read that is
-//! not a regular file or is too large. Once connected, it reads the
+//! settings after it, and a password file `SQLx` would read that is not a
+//! regular file or is too large. It reads each TLS file the URL or the
+//! `PGSSL*` environment names once, through [`fsread`], and hands `SQLx`
+//! the bytes, so `SQLx` never opens one. Once connected, it reads the
 //! settings back, `default_transaction_read_only` first; a session that
 //! did not take them is `not_sampled`, `session_not_read_only`, and gets
 //! no other query. Every query runs in an explicit read-only transaction.
@@ -41,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use sqlx::postgres::{PgConnectOptions, PgConnection};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
 use sqlx::{ConnectOptions as _, Connection as _};
 use trawl_api::doctor::reason;
 
@@ -95,13 +97,14 @@ const PASSFILE_CAP: u64 = 1024 * 1024;
 
 /// A TLS file `SQLx` reads while connecting: the setting's name as the
 /// report shows it, the URL parameters that set it, the environment
-/// variable that sets it when no parameter does, and the most the doctor
-/// lets `SQLx` read.
+/// variable that sets it when no parameter does, the most the doctor
+/// reads of it, and how the bytes are handed to `SQLx` in its place.
 struct TlsFile {
     setting: &'static str,
     keys: &'static [&'static str],
     env: &'static str,
     cap: u64,
+    inline: fn(PgConnectOptions, Vec<u8>) -> PgConnectOptions,
 }
 
 /// Every TLS file `SQLx` 0.9.0 reads: `options/parse.rs`,
@@ -112,18 +115,21 @@ const TLS_FILES: [TlsFile; 3] = [
         keys: &["sslrootcert", "ssl-root-cert", "ssl-ca"],
         env: "PGSSLROOTCERT",
         cap: fsread::cap::CERT,
+        inline: PgConnectOptions::ssl_root_cert_from_pem,
     },
     TlsFile {
         setting: "sslcert",
         keys: &["sslcert", "ssl-cert"],
         env: "PGSSLCERT",
         cap: fsread::cap::CERT,
+        inline: PgConnectOptions::ssl_client_cert_from_pem,
     },
     TlsFile {
         setting: "sslkey",
         keys: &["sslkey", "ssl-key"],
         env: "PGSSLKEY",
         cap: fsread::cap::KEY,
+        inline: PgConnectOptions::ssl_client_key_from_pem,
     },
 ];
 
@@ -303,13 +309,13 @@ impl PasswordSource {
     }
 }
 
-/// A file `SQLx` would read while connecting that the doctor does not let
-/// it read.
+/// A password file the doctor does not let `SQLx` read, or a TLS file the
+/// doctor could not read for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFault {
     file: NamedFile,
     kind: FileFaultKind,
-    /// The most the doctor lets `SQLx` read of this file.
+    /// The most the doctor reads, or lets `SQLx` read, of this file.
     cap: u64,
 }
 
@@ -325,20 +331,28 @@ enum NamedFile {
     Tls(&'static str),
 }
 
-/// Why the doctor does not let `SQLx` read a file.
+/// Why the doctor does not connect with a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileFaultKind {
     /// Not a regular file: reading a FIFO or a device may block or never
     /// end.
     NotRegular,
-    /// Larger than the doctor lets `SQLx` read.
+    /// Larger than the doctor reads, or lets `SQLx` read.
     TooLarge,
+    /// A TLS file that does not exist. `tls_required` says the URL's
+    /// `sslmode` requires TLS, so trawld's boot reads the file on every
+    /// connection and cannot connect; otherwise it reads it only when the
+    /// server offers TLS.
+    Missing { tls_required: bool },
+    /// A TLS file the running user may not read.
+    PermissionDenied,
+    /// A TLS file the doctor could not read otherwise.
+    Unreadable,
 }
 
-/// Whether `SQLx` may read `path`: a regular file of at most `cap` bytes,
-/// or nothing the doctor can stat. `SQLx` goes on without a password file
-/// it cannot open, and reports a TLS file it cannot open as a connection
-/// error, so neither is the doctor's to refuse.
+/// Whether `SQLx` may read the password file `path`: a regular file of at
+/// most `cap` bytes, or nothing the doctor can stat. `SQLx` goes on without
+/// a password file it cannot open, so that is not the doctor's to refuse.
 fn admissible(path: &Path, cap: u64) -> Result<(), FileFaultKind> {
     let Ok(meta) = std::fs::metadata(path) else {
         return Ok(());
@@ -360,21 +374,52 @@ fn is_inline_pem(value: &str) -> bool {
     trimmed.starts_with("-----BEGIN") && trimmed.ends_with("-----")
 }
 
-/// Check every file `SQLx` would read for this URL before it reads any:
-/// the password files, when `password` says `SQLx` looks in them, and each
-/// TLS file the URL's last matching parameter, or else its environment
-/// variable, names.
-fn check_files(pairs: &[(String, String)], password: &PasswordSource) -> Result<(), FileFault> {
-    let refuse = |file: NamedFile, cap: u64| move |kind| FileFault { file, kind, cap };
+/// Check the password files `SQLx` reads for this URL, when `password`
+/// says it looks in them, before it reads either.
+///
+/// Trust posture (human decision 2026-09-29, the posture of the #265
+/// data-root ruling): the credential files an operator selects are
+/// trusted. This `stat` guards against an accident, such as a FIFO or a
+/// multi-gigabyte file left at the path, not against someone who can
+/// replace the file between this check and `SQLx`'s own read, which opens
+/// the path again while it parses the URL. The TLS files are not left to
+/// `SQLx` at all: [`inline_tls_files`] reads each once and hands it the
+/// bytes.
+fn check_pass_files(password: &PasswordSource) -> Result<(), FileFault> {
+    let refuse = |file: NamedFile| {
+        move |kind| FileFault {
+            file,
+            kind,
+            cap: PASSFILE_CAP,
+        }
+    };
     if password.reads_pass_files() {
         if let Some(path) = std::env::var_os("PGPASSFILE").map(PathBuf::from) {
-            admissible(&path, PASSFILE_CAP)
-                .map_err(refuse(NamedFile::PgPassFile(path.clone()), PASSFILE_CAP))?;
+            admissible(&path, PASSFILE_CAP).map_err(refuse(NamedFile::PgPassFile(path.clone())))?;
         }
         if let Some(path) = home_pgpass() {
-            admissible(&path, PASSFILE_CAP).map_err(refuse(NamedFile::HomePgPass, PASSFILE_CAP))?;
+            admissible(&path, PASSFILE_CAP).map_err(refuse(NamedFile::HomePgPass))?;
         }
     }
+    Ok(())
+}
+
+/// Read each TLS file `SQLx` would read for these options once, through
+/// [`fsread`], and hand `SQLx` its bytes in place of its path, so `SQLx`
+/// never opens it. The path is the one `SQLx` takes: the URL's last
+/// matching parameter, else the `PGSSL*` variable when it names a path
+/// rather than holding PEM. With an `sslmode` that never negotiates TLS,
+/// `SQLx` reads none of them, and neither does the doctor.
+fn inline_tls_files(
+    pairs: &[(String, String)],
+    mut options: PgConnectOptions,
+) -> Result<PgConnectOptions, FileFault> {
+    use fsread::ReadFault;
+    let mode = options.get_ssl_mode();
+    if matches!(mode, PgSslMode::Disable | PgSslMode::Allow) {
+        return Ok(options);
+    }
+    let tls_required = !matches!(mode, PgSslMode::Prefer);
     for file in &TLS_FILES {
         let named = pairs
             .iter()
@@ -387,11 +432,30 @@ fn check_files(pairs: &[(String, String)], password: &PasswordSource) -> Result<
                     .filter(|value| !is_inline_pem(value))
                     .map(PathBuf::from)
             });
-        if let Some(path) = named {
-            admissible(&path, file.cap).map_err(refuse(NamedFile::Tls(file.setting), file.cap))?;
-        }
+        let Some(path) = named else {
+            continue;
+        };
+        let bytes =
+            fsread::read_bounded(&path, file.cap, fsread::Links::Follow).map_err(|fault| {
+                let kind = match fault {
+                    ReadFault::NotRegular => FileFaultKind::NotRegular,
+                    ReadFault::TooLarge => FileFaultKind::TooLarge,
+                    ReadFault::Missing => FileFaultKind::Missing { tls_required },
+                    ReadFault::PermissionDenied => FileFaultKind::PermissionDenied,
+                    ReadFault::SymlinkLoop
+                    | ReadFault::Changed
+                    | ReadFault::Io
+                    | ReadFault::TimedOut => FileFaultKind::Unreadable,
+                };
+                FileFault {
+                    file: NamedFile::Tls(file.setting),
+                    kind,
+                    cap: file.cap,
+                }
+            })?;
+        options = (file.inline)(options, bytes);
     }
-    Ok(())
+    Ok(options)
 }
 
 /// `~/.pgpass`, found as `SQLx` finds it, through `std::env::home_dir`.
@@ -420,18 +484,20 @@ fn startup_fields_clean(options: &PgConnectOptions) -> bool {
 enum Unprepared {
     /// `SQLx` does not parse it.
     Unparsable,
-    /// A file `SQLx` would read is refused.
+    /// A password file `SQLx` would read is refused, or a TLS file could
+    /// not be read.
     File(FileFault),
     /// A startup field holds a control character.
     ControlCharacter,
 }
 
-/// Check `url` and the files `SQLx` reads for it, then parse it exactly as
-/// trawld's boot does, through `SQLx`, and add the doctor's settings.
-/// `SQLx` reads the password file while parsing, so this runs on the
-/// blocking pool: a file swapped for a FIFO after its check blocks a
-/// thread, not the doctor. Nothing of a parse error is kept, so no parse
-/// error text can reach a row.
+/// Check `url` and the password files `SQLx` reads for it, parse it
+/// exactly as trawld's boot does, through `SQLx`, add the doctor's
+/// settings, and hand `SQLx` the TLS files' bytes. `SQLx` reads the
+/// password file while parsing, so this runs on the blocking pool: a file
+/// swapped for a FIFO after its check blocks a thread, not the doctor.
+/// Nothing of a parse error is kept, so no parse error text can reach a
+/// row.
 fn prepare(url: &str) -> Result<(PgConnectOptions, PasswordSource), Unprepared> {
     // The URL as SQLx's own parser reads it, before SQLx resolves anything.
     let given = parse_like(PgConnectOptions::from_url, url).ok_or(Unprepared::Unparsable)?;
@@ -452,11 +518,12 @@ fn prepare(url: &str) -> Result<(PgConnectOptions, PasswordSource), Unprepared> 
             PasswordSource::PassFile { pgpassfile, home }
         }
     };
-    check_files(&pairs, &password).map_err(Unprepared::File)?;
+    check_pass_files(&password).map_err(Unprepared::File)?;
     let options = PgConnectOptions::from_url(&given)
         .map_err(|_| Unprepared::Unparsable)?
         .application_name(APPLICATION_NAME)
         .options(SESSION_SETTINGS);
+    let options = inline_tls_files(&pairs, options).map_err(Unprepared::File)?;
     if !startup_fields_clean(&options) {
         return Err(Unprepared::ControlCharacter);
     }
@@ -608,7 +675,8 @@ async fn prepare_within_deadline(
     }
 }
 
-/// The row for a file the doctor does not let `SQLx` read.
+/// The row for a password file the doctor does not let `SQLx` read, or a
+/// TLS file it could not read.
 fn file_refused(check: ServerCheck, fault: &FileFault) -> Row {
     let named = match &fault.file {
         NamedFile::PgPassFile(path) => {
@@ -617,20 +685,43 @@ fn file_refused(check: ServerCheck, fault: &FileFault) -> Row {
         NamedFile::HomePgPass => Text::new("~/.pgpass"),
         NamedFile::Tls(setting) => Text::new("the file ").lit(setting).lit(" names"),
     };
-    let (outcome_reason, detail) = match fault.kind {
-        FileFaultKind::NotRegular => (reason::UNREADABLE, named.lit(" is not a regular file")),
-        FileFaultKind::TooLarge => (
-            reason::TOO_LARGE,
-            named.lit(" is larger than ").int(fault.cap).lit(" bytes"),
-        ),
+    let bounded = || {
+        Text::new("make it a regular file of at most ")
+            .int(fault.cap)
+            .lit(" bytes, or unset the setting that names it")
     };
-    Row::not_sampled(check, outcome_reason)
-        .detail(detail.lit("; the doctor did not connect"))
-        .next(
-            Text::new("make it a regular file of at most ")
-                .int(fault.cap)
-                .lit(" bytes, or unset the setting that names it"),
+    let did_not_connect = |text: Text| text.lit("; the doctor did not connect");
+    match fault.kind {
+        FileFaultKind::NotRegular => Row::not_sampled(check, reason::UNREADABLE)
+            .detail(did_not_connect(named.lit(" is not a regular file")))
+            .next(bounded()),
+        FileFaultKind::TooLarge => Row::not_sampled(check, reason::TOO_LARGE)
+            .detail(did_not_connect(
+                named.lit(" is larger than ").int(fault.cap).lit(" bytes"),
+            ))
+            .next(bounded()),
+        FileFaultKind::Missing { tls_required: true } => Row::failed(
+            check,
+            "a TLS file the URL's sslmode requires does not exist",
         )
+        .detail(did_not_connect(named.lit(" does not exist")))
+        .next(Text::new("point the setting at the file, or unset it")),
+        FileFaultKind::Missing {
+            tls_required: false,
+        } => Row::not_sampled(check, reason::UNREADABLE)
+            .detail(did_not_connect(named.lit(
+                " does not exist; trawld reads it only when the server offers TLS",
+            )))
+            .next(Text::new("point the setting at the file, or unset it")),
+        FileFaultKind::PermissionDenied => Row::not_sampled(check, reason::PERMISSION_DENIED)
+            .detail(did_not_connect(
+                named.lit(" may not be read by the running user"),
+            ))
+            .next(Text::new("rerun as the service user")),
+        FileFaultKind::Unreadable => Row::not_sampled(check, reason::UNREADABLE)
+            .detail(did_not_connect(named.lit(" could not be read")))
+            .next(bounded()),
+    }
 }
 
 /// The row for a connection the server or the network refused.
@@ -1124,6 +1215,62 @@ mod tests {
             )),
             None
         );
-        assert_eq!(refused("sslrootcert=/nonexistent/ca.pem".to_owned()), None);
+        assert_eq!(
+            refused("sslrootcert=/nonexistent/ca.pem".to_owned()),
+            Some((
+                NamedFile::Tls("sslrootcert"),
+                FileFaultKind::Missing {
+                    tls_required: false
+                }
+            ))
+        );
+        assert_eq!(
+            refused("sslmode=verify-ca&sslrootcert=/nonexistent/ca.pem".to_owned()),
+            Some((
+                NamedFile::Tls("sslrootcert"),
+                FileFaultKind::Missing { tls_required: true }
+            ))
+        );
+        // An sslmode that never negotiates TLS reads no TLS file.
+        for mode in ["disable", "allow"] {
+            assert_eq!(
+                refused(format!("sslmode={mode}&sslkey=/dev/zero")),
+                None,
+                "{mode}"
+            );
+        }
+    }
+
+    /// Each TLS file reaches `SQLx` as the bytes the doctor read, never as
+    /// a path `SQLx` would open.
+    #[test]
+    fn tls_files_reach_sqlx_as_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut query = Vec::new();
+        for (key, body) in [
+            ("sslrootcert", "root-bytes"),
+            ("sslcert", "cert-bytes"),
+            ("sslkey", "key-bytes"),
+        ] {
+            let path = dir.path().join(format!("{key}.pem"));
+            std::fs::write(&path, body).unwrap();
+            query.push(format!("{key}={}", path.display()));
+        }
+        let url = format!(
+            "postgres://user:pw@127.0.0.1:1/db?sslmode=verify-ca&{}",
+            query.join("&")
+        );
+        let Ok((options, _)) = prepare(&url) else {
+            panic!("the URL prepares");
+        };
+        let shown = format!("{options:?}");
+        assert!(!shown.contains("File("), "{shown}");
+        for body in ["root-bytes", "cert-bytes", "key-bytes"] {
+            let bytes = format!("{:?}", body.as_bytes());
+            assert!(
+                shown.contains(&format!("Inline({bytes})")),
+                "{body}: {shown}"
+            );
+        }
     }
 }

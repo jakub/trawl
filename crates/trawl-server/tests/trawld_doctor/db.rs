@@ -878,9 +878,9 @@ fn credential_file_cases(dir: &Path, app: &str, bare_app: &str) -> Vec<FileCase>
     ]
 }
 
-/// A password or TLS file `SQLx` would read that is not a regular file, or
-/// is larger than the doctor lets it read, is refused before the doctor
-/// parses the URL or connects: `not_sampled`, promptly, with the file
+/// A password file `SQLx` would read, or a TLS file the doctor reads for
+/// it, that is not a regular file or is larger than the cap is refused
+/// before the doctor connects: `not_sampled`, promptly, with the file
 /// named by its setting. Only `PGPASSFILE`'s path is shown. A file named
 /// in the environment for every connection refuses both databases.
 #[tokio::test]
@@ -1061,4 +1061,115 @@ async fn doctor_refuses_a_session_that_is_not_read_only() {
     conn.close().await.unwrap();
     let (_, report, _) = doctor_env(dir.path(), &planted(&fleet), &planted(&app));
     database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}"));
+}
+
+/// A database server that speaks TLS for [`doctor_hands_sqlx_the_tls_file_bytes`].
+///
+/// For each connection it reads the `SSLRequest`, moves `ca` aside, and
+/// only then answers `S`. It completes the TLS handshake with `config`,
+/// puts `ca` back, reads the startup message, and refuses it with SQLSTATE
+/// 28P01. A driver that opened `ca` during the handshake finds nothing at
+/// the path; one that holds its bytes already connects.
+fn tls_database_server(config: rustls::ServerConfig, ca: PathBuf) -> std::net::SocketAddr {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = std::sync::Arc::new(config);
+    let aside = ca.with_extension("aside");
+    std::thread::spawn(move || {
+        for tcp in listener.incoming() {
+            let Ok(mut tcp) = tcp else { return };
+            let mut request = [0_u8; 8];
+            if tcp.read_exact(&mut request).is_err()
+                || request != [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f]
+            {
+                continue;
+            }
+            std::fs::rename(&ca, &aside).unwrap();
+            let _ = tcp.write_all(b"S");
+            let mut conn = rustls::ServerConnection::new(std::sync::Arc::clone(&config)).unwrap();
+            let mut handshake = Ok(());
+            while handshake.is_ok() && conn.is_handshaking() {
+                handshake = conn.complete_io(&mut tcp).map(drop);
+            }
+            std::fs::rename(&aside, &ca).unwrap();
+            if handshake.is_err() {
+                continue;
+            }
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let mut length = [0_u8; 4];
+            if tls.read_exact(&mut length).is_err() {
+                continue;
+            }
+            let mut startup = vec![0_u8; (u32::from_be_bytes(length) as usize).saturating_sub(4)];
+            if tls.read_exact(&mut startup).is_err() {
+                continue;
+            }
+            let fields = b"SFATAL\0VFATAL\0C28P01\0Mrefused\0\0";
+            let mut refusal = vec![b'E'];
+            refusal.extend_from_slice(&u32::try_from(fields.len() + 4).unwrap().to_be_bytes());
+            refusal.extend_from_slice(fields);
+            let _ = tls.write_all(&refusal);
+            let _ = tls.flush();
+            tls.conn.send_close_notify();
+            let _ = tls.conn.complete_io(&mut tls.sock);
+        }
+    });
+    addr
+}
+
+/// The doctor reads each database TLS file once and hands `SQLx` the
+/// bytes, so `SQLx` never opens the file (S2). The app-state URL names a
+/// valid CA in `sslrootcert` with `sslmode=verify-ca`, and the server moves
+/// the CA aside before it starts the handshake: the handshake still
+/// verifies, and the server's refusal of the login is the row,
+/// `failed`/`authentication failed`, where a driver reading the path would
+/// have failed TLS. A FIFO at the same setting is refused without
+/// hanging (`doctor_refuses_unbounded_credential_files`).
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_hands_sqlx_the_tls_file_bytes() {
+    ensure_role().await;
+    let fleet = migrated_fleet().await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+    let ca = dir.path().join("ca.pem");
+    std::fs::write(&ca, cert.pem()).unwrap();
+    let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![cert.der().clone()],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into()),
+    )
+    .unwrap();
+    let addr = tls_database_server(config, ca.clone());
+
+    let app_url = format!(
+        "postgres://trawl@{addr}/trawl?sslmode=verify-ca&sslrootcert={}",
+        ca.display()
+    );
+    let mut values = url_values(&planted(&fleet));
+    values.extend([app_url.clone(), ca.display().to_string()]);
+    let env = [
+        ("FLEET_DATABASE_URL", OsString::from(planted(&fleet))),
+        ("TRAWL_DATABASE_URL", OsString::from(app_url)),
+    ];
+    let (_, report, _) = tokio::task::spawn_blocking({
+        let dir = dir.path().to_owned();
+        move || doctor(&dir, &DoctorConfig::in_dir(&dir), &env, &values)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        verdict(&report, "server.app.connect"),
+        (Outcome::Failed, Some("authentication failed")),
+        "{report:#?}"
+    );
+    assert!(ca.exists(), "the server put the CA back");
 }
