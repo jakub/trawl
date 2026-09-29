@@ -17,10 +17,44 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Every job runs on a GitHub-hosted runner, and they share the repository's
+# 10 GB Actions cache. Each rust-cache step below saves only on main: pull
+# requests restore main's entries and never evict them with per-PR copies.
+# Jobs that compile the same thing share a key.
+
 jobs:
+  changes:
+    # Decides which path-gated jobs this run needs; see ci/changed-scopes.py.
+    # A push to main runs every job, so main stays fully verified and keeps
+    # the caches that pull requests restore warm.
+    name: changed scopes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      web_mutations: ${{ steps.scopes.outputs.web_mutations }}
+      server_mutations: ${{ steps.scopes.outputs.server_mutations }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          # A pull request checks out its merge commit, and HEAD^1 is the
+          # base it merges into, so HEAD^1..HEAD is exactly what the PR adds.
+          fetch-depth: 2
+      - run: python3 -m unittest ci/test_changed_scopes.py
+      - id: scopes
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            python3 ci/changed-scopes.py HEAD^1 HEAD | tee -a "$GITHUB_OUTPUT"
+          else
+            python3 ci/changed-scopes.py --all | tee -a "$GITHUB_OUTPUT"
+          fi
+
   vector-collector:
     name: Vector collector delivery
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -45,7 +79,7 @@ jobs:
 
   release-source:
     name: release source resolution
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -65,7 +99,7 @@ jobs:
 
   helm-template:
     name: helm template
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -89,7 +123,7 @@ jobs:
 
   deb-packaging:
     name: deb crash-dump packaging assertions
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -100,7 +134,7 @@ jobs:
 
   fmt:
     name: rustfmt
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -111,7 +145,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -121,6 +155,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --no-default-features
 
   test:
@@ -144,7 +179,7 @@ jobs:
     # .config/nextest.toml bounds pg-heavy test parallelism instead, and
     # the pg-admission-guard step below proves nothing escaped it.
     name: test
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     services:
@@ -155,8 +190,12 @@ jobs:
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
+        # tmpfs data directory, as in docker-compose.dev.yml. The health
+        # check asks over TCP: the image's init-time server listens only on
+        # the unix socket and is stopped before the real one starts.
         options: >-
-          --health-cmd="pg_isready -U postgres"
+          --tmpfs /var/lib/postgresql
+          --health-cmd="pg_isready -h 127.0.0.1 -U postgres"
           --health-interval=2s
           --health-timeout=3s
           --health-retries=15
@@ -164,6 +203,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Turn off postgres durability
+        run: ci/postgres-no-durability.sh ${{ job.services.postgres.id }}
       # Exercise real chart rendering in trawl-config's packaging contracts.
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -172,6 +213,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # nextest is pinned by VERSION, not just by the action sha: the action
       # manifest at this sha ships 0.9.132, whose filterset grammar predates
       # the `group()` predicate pg-admission-guard queries with -- the guard
@@ -218,10 +260,11 @@ jobs:
           cargo xtask pg-admission-guard --
           --no-default-features
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+      # The launcher runs whatever target/debug/trawld exists, and the suite
+      # above already built it, so this proves the loader path without a
+      # second trawld build in another feature set (about a minute).
       - name: Smoke-test verified DuckDB development launcher
-        run: |
-          cargo build -p trawl-server --no-default-features
-          bin/trawld-dev --version
+        run: bin/trawld-dev --version
 
   server-mutations:
     # Each crates/trawl-server/mutations/*.patch removes one guard. The
@@ -232,8 +275,12 @@ jobs:
     # real servers, hence the same postgres service and DATABASE_URL as
     # the test job. The workflow-level RUSTFLAGS makes every mutant compile
     # under -D warnings.
+    # It skips when the pull request cannot change what trawl-server
+    # compiles or how nextest runs it (ci/changed-scopes.py).
     name: Server guard mutations
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.server_mutations == 'true'
     timeout-minutes: 45
     permissions:
       contents: read
@@ -245,8 +292,12 @@ jobs:
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
+        # tmpfs data directory, as in docker-compose.dev.yml. The health
+        # check asks over TCP: the image's init-time server listens only on
+        # the unix socket and is stopped before the real one starts.
         options: >-
-          --health-cmd="pg_isready -U postgres"
+          --tmpfs /var/lib/postgresql
+          --health-cmd="pg_isready -h 127.0.0.1 -U postgres"
           --health-interval=2s
           --health-timeout=3s
           --health-retries=15
@@ -254,12 +305,15 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
+      - name: Turn off postgres durability
+        run: ci/postgres-no-durability.sh ${{ job.services.postgres.id }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: server-mutations
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Same pinned nextest as the test job, for the same filterset reason.
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
         with:
@@ -271,22 +325,23 @@ jobs:
 
   msrv:
     name: msrv check
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40 # 1.94.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --no-default-features
 
   deny:
     name: cargo-deny
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # Binary install instead of EmbarkStudios/cargo-deny-action because
-      # that action is Docker-based and k8s-small is unprivileged (no dind).
+      # Binary install instead of EmbarkStudios/cargo-deny-action, which is a
+      # Docker container action; install-action is already pinned here.
       # cargo-deny shells out to `cargo metadata`, so we need a toolchain.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
@@ -298,7 +353,7 @@ jobs:
 
   wasm-check:
     name: wasm32 clippy (web UI + fleet-ui)
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -309,6 +364,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: wasm-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown
       # Both sides of the default-off `atmosphere` feature: the bare run is
       # the shape non-mounting consumers compile (and the one that must NOT
@@ -318,7 +374,7 @@ jobs:
 
   vendor-drift:
     name: web UI vendor bundle drift
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
@@ -340,7 +396,7 @@ jobs:
 
   trunk-build:
     name: web UI release build (trunk)
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -350,6 +406,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: trunk-build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -399,7 +456,7 @@ jobs:
 
   trawl-web-tests:
     name: trawl-web tests
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Exercise real chart rendering in the packaging contract tests.
@@ -410,6 +467,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: trawl-web-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
         with:
           tool: nextest@0.9.143
@@ -417,7 +475,7 @@ jobs:
 
   trawl-web-release:
     name: trawl-web release build (SPA embedded)
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -427,6 +485,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: trawl-web-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4
         with:
           name: trawl-web-ui-dist
@@ -435,18 +494,41 @@ jobs:
         run: test -f crates/trawl-web-ui/dist/index.html
       - run: cargo build --release -p trawl-web
 
-  web-ui-health-mutation:
-    name: Health page request-gate mutation
-    runs-on: k8s-big
-    # Mutation jobs start once trunk-build is done and run alongside the
-    # web-ui-e2e shards. They build their own mutant and pristine SPAs (the
-    # atmosphere job downloads trunk-build's dist). They do not wait for the
-    # baseline suite: a kill still only counts next to a green baseline on the
-    # same commit, and the workflow gives that by requiring both. Waiting on
-    # trunk-build instead of nothing keeps these six k8s-big jobs from taking
-    # the runner slots that the trunk build needs.
-    needs: trunk-build
-    timeout-minutes: 20
+  web-ui-mutations:
+    # Each patch in crates/trawl-web-ui/e2e/mutations plants one regression.
+    # mutation-check.sh builds each mutant SPA, requires its target spec to
+    # fail and its routing control to pass, then reverts. A kill only counts
+    # next to a green baseline on the same commit, and the workflow gives
+    # that by requiring web-ui-e2e too. Two legs of six patches each run in
+    # parallel. Each leg builds its own debug (wasm-dev) SPAs, so neither
+    # waits on trunk-build. The legs skip when the pull request cannot
+    # change what the SPA compiles (ci/changed-scopes.py).
+    name: web UI mutations (${{ matrix.set }})
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.web_mutations == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - set: overlays, Health, pagination
+            patches: >-
+              17-range-dialog-no-layer.patch
+              23-range-close-on-refusal.patch
+              24-palette-overlay-gate.patch
+              25-palette-toggle.patch
+              20-health-admin-gate.patch
+              22-runs-filtered-window.patch
+          - set: search, live, schedules
+            patches: >-
+              26-save-editor-snapshot.patch
+              27-stop-live-replace.patch
+              28-live-snapshot-query.patch
+              29-schedule-lag-leak.patch
+              30-preview-known-total.patch
+              32-rail-choice-from-toggle.patch
+    # Six apply/build/run cycles after browser and package setup.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
@@ -459,95 +541,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: health-mutation
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill the Health admin-request gate mutation
-        run: crates/trawl-web-ui/e2e/scripts/mutation-check.sh 20-health-admin-gate.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: health-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-palette-mutations:
-    name: Command palette admission and toggle mutations
-    runs-on: k8s-big
-    needs: trunk-build
-    # Browser system packages can take 15 minutes before the SPA rebuilds.
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: palette-mutations
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill command palette admission and toggle mutations
-        run: env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 24-palette-overlay-gate.patch 25-palette-toggle.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: palette-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-save-snapshot-mutation:
-    name: Save editor snapshot mutation
-    runs-on: k8s-big
-    needs: trunk-build
-    # Allow package setup plus pristine, mutated, and restored SPA checks.
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: save-snapshot-mutation
+          shared-key: web-mutations
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -565,216 +560,26 @@ jobs:
       - run: npx playwright install --with-deps chromium
         working-directory: crates/trawl-web-ui/e2e
       - name: Validate Save mutation report attribution
+        if: contains(matrix.patches, '26-save-editor-snapshot.patch')
         run: node --test crates/trawl-web-ui/e2e/scripts/check-save-mutation.test.mjs
-      - name: Build pristine SPA
-        # Incremental, like mutation-check.sh, so the mutant build that
-        # follows reuses this build's compiled crates.
-        run: env -u NO_COLOR CARGO_INCREMENTAL=1 trunk build
-        working-directory: crates/trawl-web-ui
-      - name: Verify pristine Settings and Save behavior
-        run: npx playwright test tests/settings-disposition.spec.ts
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill the Save editor snapshot mutation and restore pristine SPA
-        run: env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 26-save-editor-snapshot.patch
-      - name: Verify restored Settings and Save behavior
-        run: npx playwright test tests/settings-disposition.spec.ts
-        working-directory: crates/trawl-web-ui/e2e
+      # NO_COLOR is unset because Trunk parses it as a boolean and rejects an
+      # inherited value of 1.
+      - name: Kill the mutations
+        env:
+          PATCHES: ${{ matrix.patches }}
+        run: |
+          read -ra patch_files <<<"$PATCHES"
+          env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh "${patch_files[@]}"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:
-          name: save-snapshot-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-pagination-range-mutations:
-    name: Pagination and range dialog mutations
-    runs-on: k8s-big
-    needs: trunk-build
-    timeout-minutes: 35
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: pagination-range-mutations
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill pagination and range dialog regressions
-        run: >-
-          crates/trawl-web-ui/e2e/scripts/mutation-check.sh
-          17-range-dialog-no-layer.patch
-          22-runs-filtered-window.patch
-          23-range-close-on-refusal.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: pagination-range-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-live-coherence-mutations:
-    name: Live-mode coherence mutations
-    runs-on: k8s-big
-    needs: trunk-build
-    # Two apply/build/run cycles plus the pristine restore build.
-    timeout-minutes: 35
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: live-coherence-mutations
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill the Stop live replace and live snapshot query mutations
-        run: >-
-          env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh
-          27-stop-live-replace.patch
-          28-live-snapshot-query.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: live-coherence-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-filter-rail-mutation:
-    name: Filter rail hand-choice mutation
-    runs-on: k8s-big
-    needs: trunk-build
-    # One apply/build/run cycle plus the pristine restore build.
-    timeout-minutes: 35
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: filter-rail-mutation
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill the filter rail hand choice recorded from toggle
-        run: >-
-          env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh
-          32-rail-choice-from-toggle.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: filter-rail-mutation-traces
-          path: e2e-artifacts/test-results/
-          retention-days: 7
-
-  web-ui-schedule-preview-mutations:
-    name: Schedule window and preview paging mutations
-    runs-on: k8s-big
-    needs: trunk-build
-    timeout-minutes: 35
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
-        with:
-          toolchain: 1.98.0
-          targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: schedule-preview-mutations
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
-        with:
-          tool: trunk
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: crates/trawl-web-ui/e2e/package-lock.json
-      - run: npm ci --no-audit --no-fund
-        working-directory: crates/trawl-web-ui/e2e
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
-        working-directory: crates/trawl-web-ui/e2e
-      - name: Kill schedule lag leak and preview total regressions
-        run: >-
-          env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh
-          29-schedule-lag-leak.patch
-          30-preview-known-total.patch
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: failure()
-        with:
-          name: schedule-preview-mutation-traces
-          path: e2e-artifacts/test-results/
+          name: web-ui-mutations-${{ strategy.job-index }}
+          path: e2e-artifacts/mutations/
           retention-days: 7
 
   web-ui-e2e:
     name: web UI browser tests (playwright ${{ matrix.shard }}/4)
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     needs: trunk-build
     # CI runs one worker per job (see playwright.config.ts), so the suite
     # is split across jobs instead, each with its own stub server.
@@ -858,7 +663,7 @@ jobs:
 
   theme-menu-captures:
     name: theme menu captures
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     needs: web-ui-e2e
     # Runs even when a shard fails, so a missing capture is reported next to
     # the failure. It only reads the shards' artifacts and uploads nothing,
@@ -883,7 +688,7 @@ jobs:
 
   theme-production:
     name: theme bootstrap and production browser evidence
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     timeout-minutes: 40
     permissions:
@@ -897,7 +702,8 @@ jobs:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: theme-production
+          shared-key: trawl-web-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: '22'
@@ -945,8 +751,9 @@ jobs:
 
   atmosphere-mutation:
     name: atmosphere terminal-latch mutation
-    runs-on: k8s-small
-    needs: trunk-build
+    runs-on: ubuntu-24.04
+    needs: [changes, trunk-build]
+    if: needs.changes.outputs.web_mutations == 'true'
     timeout-minutes: 10
     # This job executes third-party code (npm packages, a CDN-fetched
     # browser): read-only token, and no credentials persisted into
@@ -1019,27 +826,12 @@ jobs:
     # `--target x86_64-unknown-linux-gnu` makes the build independent of
     # how the tool was packaged.
     #
-    # This is also the one job here NOT on the self-hosted runners, and
-    # that is deliberate rather than accidental. Nothing is known to be
-    # wrong with k8s-small: the failure above describes the BUILD target
-    # and says nothing about that image, and the host triple there was
-    # never measured. But every step of this job is demonstrated working on
-    # `ubuntu-latest`, so it stays where the evidence is.
-    #
-    # `ubuntu-latest` rather than a pinned image, unlike the nightly below.
-    # The toolchain inputs are pinned already — the ASan runtime ships
-    # inside the pinned nightly, install-action pins cargo-fuzz — but the
-    # image's own glibc, C toolchain and linker are not, and this job does
-    # depend on all three. Needing a glibc runner is the reason it is here
-    # at all. So the claim is only the one that was tested: every step of
-    # this job is demonstrated working on `ubuntu-latest` today, and the
-    # explicit `--target` removes the dependency on how cargo-fuzz was
-    # PACKAGED, not the dependency on the image shipping a glibc toolchain.
-    # The image is left unpinned knowingly, and a future image change could
-    # in principle need attention here. docs.yml already runs on
-    # `ubuntu-latest`, so this follows the repo instead of inventing a
-    # third runner convention.
-    runs-on: ubuntu-latest
+    # The explicit `--target` removes the dependency on how cargo-fuzz was
+    # PACKAGED, not the dependency on the image shipping a glibc toolchain:
+    # the ASan runtime ships inside the pinned nightly and install-action
+    # pins cargo-fuzz, but the image's own glibc, C toolchain and linker
+    # come from the runner image this workflow pins.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     # This job executes code the PR controls: a fuzz target running mutated
     # input through PR-authored code, and every build script in the
@@ -1067,6 +859,7 @@ jobs:
           # every stable job here, so sharing a key would make the two sides
           # evict each other's artifacts on every run.
           shared-key: fuzz-smoke
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: crates/trawl-core/fuzz
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-fuzz
         with:

@@ -180,7 +180,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 
 use serde_json::Value;
 
@@ -382,7 +382,7 @@ fn name_list(names: &[&str]) -> String {
 
 /// Derive the pg-touching targets from `cargo metadata` and the sources.
 fn derive(root: &Path) -> Result<Vec<Derived>, String> {
-    let out = Command::new(env!("CARGO"))
+    let out = crate::cargo()
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
         .output()
@@ -1651,7 +1651,7 @@ fn char_literal_len(rest: &[u8]) -> usize {
 /// Ask nextest what it would run: binary id → its testcases and which of
 /// them the group filterset matched.
 fn group_membership(root: &Path, extra: &[String]) -> Result<BTreeMap<String, Suite>, String> {
-    let mut cmd = Command::new(env!("CARGO"));
+    let mut cmd = crate::cargo();
     cmd.args([
         "nextest",
         "list",

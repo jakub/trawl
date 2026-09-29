@@ -170,3 +170,11 @@ remains incompatible, because it refuses any added capability except
 `NET_BIND_SERVICE`. Rulings 2 and 8 are unaffected: the `+p` reasoning
 about the default `drop: [ALL]` pod still holds, and the evidence policy
 that produced this run is the reason the posture is now right.
+
+## Amendment (2026-09-28)
+
+Ruling 8's standing CI check moved from `k8s-big` to a GitHub-hosted
+`ubuntu-24.04` runner, along with the rest of CI. That runner also has a
+docker daemon, which is all the check needs. `ci/crashdump-image.sh`
+already reads the host's `ptrace_scope` and never writes it, so the
+shared-runner reasoning holds unchanged.

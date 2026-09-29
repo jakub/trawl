@@ -100,6 +100,11 @@ pub fn prepare() {
     } else {
         "libduckdb.so"
     };
+    // The staged library copies are watched so that a deleted one is restored.
+    // distribution.py stamps them with the archive's timestamp, so this run's
+    // own writes never look newer than its start. The archive cache is not
+    // watched: it is this script's scratch space, and a download or lock file
+    // inside it would rerun the script and every crate above trawl-core.
     for path in [
         source.join("Cargo.lock"),
         script,
@@ -107,12 +112,10 @@ pub fn prepare() {
         source.join("scripts/release/duckdb-LICENSE"),
         runtime.join(library),
         deps.join(library),
-        if explicit_runtime.is_some() {
-            runtime
-        } else {
-            cache
-        },
     ] {
         println!("cargo:rerun-if-changed={}", path.display());
+    }
+    if explicit_runtime.is_some() {
+        println!("cargo:rerun-if-changed={}", runtime.display());
     }
 }

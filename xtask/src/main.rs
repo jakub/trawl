@@ -305,7 +305,7 @@ fn build_web(release: bool) -> ExitCode {
         }
     }
 
-    let mut cargo = Command::new(env!("CARGO"));
+    let mut cargo = cargo();
     cargo.current_dir(&root).args(["build", "-p", "trawl-web"]);
     if release {
         cargo.arg("--release");
@@ -475,6 +475,33 @@ fn report_sizes(sizes: BundleSizes) {
 fn human_bytes(bytes: u64) -> String {
     let hundredths = u128::from(bytes) * 100 / (1024 * 1024);
     format!("{}.{:02} MiB", hundredths / 100, hundredths % 100)
+}
+
+/// A nested `cargo` command without the package variables `cargo xtask`
+/// exported to this process. `cargo xtask` is `cargo run`, which sets
+/// xtask's `CARGO_MANIFEST_DIR`, `CARGO_PKG_*` and friends for the binary. A
+/// nested cargo hands them on to build scripts, and ring's build script
+/// watches several of them, so the nested build recompiled ring and every
+/// crate above it, and left those units fingerprinted for the next plain
+/// cargo command to rebuild again.
+fn cargo() -> Command {
+    let mut cmd = Command::new(env!("CARGO"));
+    for (name, _) in std::env::vars_os() {
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with("CARGO_PKG_")
+            || matches!(
+                name,
+                "CARGO_MANIFEST_DIR"
+                    | "CARGO_MANIFEST_PATH"
+                    | "CARGO_CRATE_NAME"
+                    | "CARGO_BIN_NAME"
+                    | "CARGO_PRIMARY_PACKAGE"
+            )
+        {
+            cmd.env_remove(name);
+        }
+    }
+    cmd
 }
 
 fn run(mut cmd: Command) -> bool {

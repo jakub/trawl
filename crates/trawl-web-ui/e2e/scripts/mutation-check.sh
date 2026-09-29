@@ -22,6 +22,11 @@
 # flake that clears before the control runs) still reads as a kill. A
 # PASS here is evidence only NEXT TO a green baseline run of the full
 # suite on the same commit — which is exactly what CI enforces.
+#
+# Each Playwright invocation writes to its own directory under
+# e2e-artifacts/mutations/<patch>/, and the JSON verdict reports stay there
+# too, so a failed run keeps the evidence for every patch rather than only
+# the last invocation's (Playwright empties its output dir on each run).
 
 set -euo pipefail
 
@@ -33,9 +38,9 @@ MUTATIONS_DIR="$E2E_DIR/mutations"
 
 cd "$ROOT_DIR"
 
-# Every mutant and the restore rebuild the same crates, and trawl-core's
-# provenance build script watches every tracked file, so each patch
-# recompiles trawl-core, fleet-ui and trawl-web-ui. Incremental compilation
+# Every mutant rebuilds the same crates, and trawl-core's provenance build
+# script watches every tracked file, so each patch recompiles trawl-core
+# and trawl-web-ui (and fleet-ui when the patch touches it). Incremental compilation
 # lets those rebuilds reuse most of the previous compile. CI needs it set
 # here because rust-cache exports CARGO_INCREMENTAL=0 for the whole job.
 export CARGO_INCREMENTAL=1
@@ -45,6 +50,16 @@ if [[ -n "$(git status --porcelain)" ]]; then
   git status --short >&2
   exit 1
 fi
+
+ARTIFACTS_DIR="$ROOT_DIR/e2e-artifacts/mutations"
+rm -rf "$ARTIFACTS_DIR"
+mkdir -p "$ARTIFACTS_DIR"
+
+# A verdict read from a JSON report needs the report itself to parse. An
+# unreadable report is an infra failure, never a surviving mutant.
+report_readable() {
+  node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))' "$1" 2>/dev/null
+}
 
 # Every run below pins --workers=1, so the target and its control each use
 # exactly one stub server on E2E_PORT. With more workers a target could use
@@ -171,9 +186,6 @@ declare -A RESULT
 
 cleanup_patch() {
   local patch_path="$1"
-  if [[ "$patch_path" == "$MUTATIONS_DIR/26-save-editor-snapshot.patch" ]]; then
-    rm -f "$E2E_DIR/save-mutation-report.json"
-  fi
   if git apply --check -R "$patch_path" 2>/dev/null; then
     git apply -R "$patch_path"
   fi
@@ -188,6 +200,8 @@ for name in "${PATCHES[@]}"; do
   fi
 
   echo "=== $name -> $spec ==="
+  out="$ARTIFACTS_DIR/${name%.patch}"
+  report_error=""
   # EXIT/INT/TERM: the apply→revert window spans a trunk build plus a
   # Playwright run, and neither a fatal error (set -e exits → EXIT trap)
   # nor a Ctrl-C may strand a live mutation. No ERR trap: bash fires ERR
@@ -236,10 +250,15 @@ for name in "${PATCHES[@]}"; do
   set +e
   if [[ $name == 20-health-admin-gate.patch ]]; then
     # Require this assertion, not any failure elsewhere in the health spec.
-    # Keep the report outside test-results, which Playwright cleans on run.
-    health_report="$E2E_DIR/health-mutation-report.json"
-    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$spec" --grep 'non-admin request silence:' --reporter=json) > "$health_report"
+    # The JSON reporter writes to a file, never stdout: Playwright prints
+    # its own diagnostics to stdout, and one mixed into the report would
+    # make the verdict unreadable.
+    health_report="$out/health-report.json"
+    (cd "$E2E_DIR" && PLAYWRIGHT_JSON_OUTPUT_FILE="$health_report" npx playwright test --workers=1 "tests/$spec" --grep 'non-admin request silence:' --reporter=json --output "$out/target")
     status=$?
+    if ! report_readable "$health_report"; then
+      report_error="the health JSON report at $health_report is unreadable"
+    fi
     node - "$health_report" <<'JS'
 const fs = require('node:fs');
 const report = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
@@ -255,20 +274,20 @@ const killed = target?.tests.some(t => t.results.some(r => r.status === 'failed'
 if (!killed) process.exit(1);
 JS
     health_assertion=$?
-    rm -f "$health_report"
     if [[ $health_assertion -ne 0 ]]; then status=0; fi
   elif [[ $name == 26-save-editor-snapshot.patch ]]; then
     # The Save callback must break the console control at the snapshot assertion.
-    # Keep the JSON outside test-results, which Playwright cleans on each run.
-    save_report="$E2E_DIR/save-mutation-report.json"
-    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$spec" --grep 'Save captures editor buffer:' --reporter=json) > "$save_report"
+    save_report="$out/save-report.json"
+    (cd "$E2E_DIR" && PLAYWRIGHT_JSON_OUTPUT_FILE="$save_report" npx playwright test --workers=1 "tests/$spec" --grep 'Save captures editor buffer:' --reporter=json --output "$out/target")
     status=$?
+    if ! report_readable "$save_report"; then
+      report_error="the Save JSON report at $save_report is unreadable"
+    fi
     node "$SCRIPT_DIR/check-save-mutation.mjs" "$save_report"
     save_assertion=$?
-    rm -f "$save_report"
     if [[ $save_assertion -ne 0 ]]; then status=0; fi
   else
-    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$spec")
+    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$spec" --output "$out/target")
     status=$?
   fi
   set -e
@@ -279,14 +298,16 @@ JS
   if [[ $name == 20-health-admin-gate.patch ]]; then
     # The 404 route is outside AuthShell. Authenticated routing tests
     # would correctly fail the same disabled admin gate as the target.
-    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$control" --grep 'an unknown route renders the 404 page$')
+    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$control" --grep 'an unknown route renders the 404 page$' --output "$out/control")
   else
-    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$control")
+    (cd "$E2E_DIR" && npx playwright test --workers=1 "tests/$control" --output "$out/control")
   fi
   control_status=$?
   set -e
 
-  if [[ $control_status -ne 0 ]]; then
+  if [[ -n "$report_error" ]]; then
+    RESULT[$name]="INFRA-FAILED ($report_error)"
+  elif [[ $control_status -ne 0 ]]; then
     RESULT[$name]="INFRA-FAILED (control spec $control failed — the environment, not the mutation, is broken)"
   elif [[ $status -ne 0 ]]; then
     RESULT[$name]="PASS (target spec failed, control passed, exit $status)"
@@ -299,13 +320,10 @@ JS
 done
 
 # dist/ is gitignored, so the clean-tree check below can't see it — and it
-# still holds the LAST mutant's trunk build. Rebuild from the now-reverted
-# sources so a later `npm run test` exercises the real SPA, not a mutant.
-echo "-- trunk build (restore pristine dist) --"
-(cd "$WEB_UI_DIR" && trunk build) || {
-  echo "mutation-check: pristine rebuild failed — dist/ may still hold a mutant build" >&2
-  exit 2
-}
+# still holds the LAST mutant's trunk build. Remove it instead of spending
+# a rebuild: the e2e harness refuses to start without dist/index.html, so a
+# later `npm run test` asks for a real build rather than testing a mutant.
+rm -rf "$WEB_UI_DIR/dist"
 
 echo
 echo "mutation-check results:"
