@@ -42,7 +42,9 @@ jobs:
       RELEASE_TAG: ${{ inputs.release-tag }}
       SOURCE_SHA: ${{ inputs.source-sha }}
       TOOLING_SHA: ${{ inputs.tooling-sha }}
-    runs-on: k8s-big
+    # Pull-request preflights run on GitHub-hosted runners, next to CI.
+    # Release builds stay on k8s-big, where the release caches live.
+    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'k8s-big' }}
     strategy:
       fail-fast: false
       matrix:
@@ -59,7 +61,8 @@ jobs:
       # Both SHAs are free-form inputs, and this job saves default-branch
       # caches that later release builds restore. Refuse any commit main does
       # not contain before a checkout can run its code. Pull-request preflights
-      # build unmerged commits, but their caches stay in the PR's own scope.
+      # build unmerged commits and save no cache: on a hosted runner a
+      # per-PR copy would only evict CI's main-branch entries.
       - name: Refuse source or tooling that is not on main
         if: github.event_name != 'pull_request'
         env:
@@ -105,6 +108,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: release-${{ matrix.target }}-${{ matrix.cross && 'bookworm-gnu' || 'zig' }}
+          save-if: ${{ github.event_name != 'pull_request' }}
           workspaces: . -> ${{ matrix.build-root }}
           cache-directories: ${{ matrix.cross && 'target/bookworm-home/.cargo/registry' || '' }}
 
