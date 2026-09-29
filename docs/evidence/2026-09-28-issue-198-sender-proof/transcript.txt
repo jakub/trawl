@@ -5,15 +5,15 @@
 # working tree is clean
 
 $ git rev-parse HEAD
-277eff42e101b217a39d2669a0ab47920189ec4d
+d71e8a2b72bb85777f5472419c98bee6190b4da7
 
 $ git log -1 --format='%H %s'
-277eff42e101b217a39d2669a0ab47920189ec4d test: reject failure-tolerant operators in the key-write chain
+d71e8a2b72bb85777f5472419c98bee6190b4da7 docs(evidence): record the issue-198 sender proof run at 277eff42
 
 argv: run.py --build
 
 $ date -u +%Y-%m-%dT%H:%M:%SZ
-2026-09-29T22:02:20Z
+2026-09-29T23:20:17Z
 
 $ uname -sr
 Linux 7.2.5-3-omarchy
@@ -74,25 +74,25 @@ $ docker build -t trawl-evidence-builder:cargo-deb-3.8.0 -q - <<'EOF'
 > RUN cargo install cargo-deb --version 3.8.0 --locked \
 >  && chmod -R a+rwX "$CARGO_HOME" "$RUSTUP_HOME"
 > EOF
-sha256:5ab9e6ae5a05f69f04f63c9ba91ad17aa96313f80d06b1e38382d8ba19004b8e
+sha256:d4ad55c71d9da38034b98fb80a68050b99adc0c53c580e2d824b0578817a5200
 
 $ docker volume create trawl-evidence-cargo-registry
 trawl-evidence-cargo-registry
 
-$ docker run --rm --name trawl-evidence-198-build-issue-198-vm.63w1o7k7-chown --cidfile $RUN/chown.cid --user 0:0 -v trawl-evidence-cargo-registry:/usr/local/cargo/registry sha256:5ab9e6ae5a05f69f04f63c9ba91ad17aa96313f80d06b1e38382d8ba19004b8e chown -R 1000:1000 /usr/local/cargo/registry
+$ docker run --rm --name trawl-evidence-198-build-issue-198-vm.sencn77q-chown --cidfile $RUN/chown.cid --user 0:0 -v trawl-evidence-cargo-registry:/usr/local/cargo/registry sha256:d4ad55c71d9da38034b98fb80a68050b99adc0c53c580e2d824b0578817a5200 chown -R 1000:1000 /usr/local/cargo/registry
 # STUBBED the SPA: $RUN/spa is mounted over crates/trawl-web-ui/dist in the builder only; trawl-web in these .debs serves no real UI
 # CARGO_TARGET_DIR $REPO/target/issue-198-deb; cargo registry cache in docker volume trawl-evidence-cargo-registry
 
-$ docker run --rm --name trawl-evidence-198-build-issue-198-vm.63w1o7k7-build --cidfile $RUN/build.cid --user 1000:1000 -v $REPO:$REPO -w $REPO -v $RUN/spa:$REPO/crates/trawl-web-ui/dist:ro -v $GIT_COMMON_DIR:$GIT_COMMON_DIR:ro -v trawl-evidence-cargo-registry:/usr/local/cargo/registry -e CARGO_TARGET_DIR=$REPO/target/issue-198-deb -e XDG_CACHE_HOME=$REPO/target/issue-198-deb/cache sha256:5ab9e6ae5a05f69f04f63c9ba91ad17aa96313f80d06b1e38382d8ba19004b8e bash scripts/release/build-distribution.sh $REPO x86_64-unknown-linux-gnu $REPO/target/issue-198-deb/runtime
+$ docker run --rm --name trawl-evidence-198-build-issue-198-vm.sencn77q-build --cidfile $RUN/build.cid --user 1000:1000 -v $REPO:$REPO -w $REPO -v $RUN/spa:$REPO/crates/trawl-web-ui/dist:ro -v $GIT_COMMON_DIR:$GIT_COMMON_DIR:ro -v trawl-evidence-cargo-registry:/usr/local/cargo/registry -e CARGO_TARGET_DIR=$REPO/target/issue-198-deb -e XDG_CACHE_HOME=$REPO/target/issue-198-deb/cache sha256:d4ad55c71d9da38034b98fb80a68050b99adc0c53c580e2d824b0578817a5200 bash scripts/release/build-distribution.sh $REPO x86_64-unknown-linux-gnu $REPO/target/issue-198-deb/runtime
 [last 20 lines]
    Compiling trawl-web v0.9.0 ($REPO/crates/trawl-web)
 warning: linker stderr: ignoring deprecated linker optimization setting '1'
   |
   = note: `#[warn(linker_messages)]` on by default
 
-warning: `fleet-admin` (bin "fleet-admin") generated 1 warning
+warning: `fleet-dev` (bin "fleet-dev") generated 1 warning
 warning: `fleet-ui` (bin "shell_demo") generated 1 warning (1 duplicate)
-warning: `fleet-dev` (bin "fleet-dev") generated 1 warning (1 duplicate)
+warning: `fleet-admin` (bin "fleet-admin") generated 1 warning (1 duplicate)
 warning: `trawl-web` (bin "trawl-web") generated 1 warning (1 duplicate)
    Compiling trawl-engine v0.9.0 ($REPO/crates/trawl-engine)
    Compiling trawl-client v0.9.0 ($REPO/crates/trawl-client)
@@ -104,10 +104,20 @@ warning: `trawl-admin` (bin "trawl-admin") generated 1 warning (1 duplicate)
 warning: `xtask` (bin "xtask") generated 1 warning (1 duplicate)
 warning: `trawl-cli` (bin "trawl") generated 1 warning (1 duplicate)
 warning: `trawl-server` (bin "trawld") generated 1 warning (1 duplicate)
-    Finished `release` profile [optimized] target(s) in 57.90s
+    Finished `release` profile [optimized] target(s) in 42.51s
 
-$ docker run --rm --name trawl-evidence-198-build-issue-198-vm.63w1o7k7-package --cidfile $RUN/package.cid --user 1000:1000 -v $REPO:$REPO:ro -v $REPO/target/issue-198-deb:$REPO/target/issue-198-deb -v $RUN/debs:$RUN/debs -w $REPO -v $GIT_COMMON_DIR:$GIT_COMMON_DIR:ro -v trawl-evidence-cargo-registry:/usr/local/cargo/registry -e CARGO_TARGET_DIR=$REPO/target/issue-198-deb sha256:5ab9e6ae5a05f69f04f63c9ba91ad17aa96313f80d06b1e38382d8ba19004b8e python3 crates/trawl-server/debian/tests/package-snapshot.py --source $REPO --work-dir /tmp --binaries $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release --runtime $REPO/target/issue-198-deb/runtime --output $RUN/debs --target x86_64-unknown-linux-gnu
+$ docker run --rm --name trawl-evidence-198-build-issue-198-vm.sencn77q-package --cidfile $RUN/package.cid --user 1000:1000 -v $REPO:$REPO:ro -v $REPO/target/issue-198-deb:$REPO/target/issue-198-deb -v $RUN/debs:$RUN/debs -w $REPO -v $GIT_COMMON_DIR:$GIT_COMMON_DIR:ro -v trawl-evidence-cargo-registry:/usr/local/cargo/registry -e CARGO_TARGET_DIR=$REPO/target/issue-198-deb sha256:d4ad55c71d9da38034b98fb80a68050b99adc0c53c580e2d824b0578817a5200 python3 crates/trawl-server/debian/tests/package-snapshot.py --source $REPO --work-dir /tmp --binaries $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release --runtime $REPO/target/issue-198-deb/runtime --output $RUN/debs --target x86_64-unknown-linux-gnu
 [last 20 lines]
+ diversion by libc6 from: /lib64/ld-linux-x86-64.so.2
+dpkg-shlibdeps: warning: diversions involved - output may be incorrect
+ diversion by libc6 to: /lib64/ld-linux-x86-64.so.2.usr-is-merged
+dpkg-shlibdeps: warning: binaries to analyze should already be installed in their package's directory
+dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
+dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
+dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
+dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
+dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
+dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
 dpkg-shlibdeps: warning: binaries to analyze should already be installed in their package's directory
 dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-web and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
 dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-web and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
@@ -115,18 +125,8 @@ dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/
 dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-web and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
 dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-web and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
 dpkg-shlibdeps: warning: binaries to analyze should already be installed in their package's directory
-dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
-dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
-dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
-dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
-dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
-dpkg-shlibdeps: warning: binaries to analyze should already be installed in their package's directory
-dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-admin and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
-dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-admin and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
-dpkg-shlibdeps: warning: $ORIGIN is used in RPATH of $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-admin and the corresponding directory could not be identified due to lack of DEBIAN sub-directory in the root of package's build tree
-dpkg-shlibdeps: warning: binaries to analyze should already be installed in their package's directory
-dpkg-shlibdeps: warning: package could avoid a useless dependency if $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-web $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-admin were not linked against libpthread.so.0 (they use none of the library's symbols)
-dpkg-shlibdeps: warning: package could avoid a useless dependency if $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-web $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-admin were not linked against libdl.so.2 (they use none of the library's symbols)
+dpkg-shlibdeps: warning: package could avoid a useless dependency if $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-admin $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-web were not linked against libdl.so.2 (they use none of the library's symbols)
+dpkg-shlibdeps: warning: package could avoid a useless dependency if $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-admin $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/fleet-admin $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawld $REPO/target/issue-198-deb/x86_64-unknown-linux-gnu/release/trawl-web were not linked against libpthread.so.0 (they use none of the library's symbols)
 $RUN/debs/trawl-server_0.9.0-1_amd64.deb
 PASS exactly three distribution .debs: trawl-cli_0.9.0-1_amd64.deb, trawl-runtime_0.9.0-1_amd64.deb, trawl-server_0.9.0-1_amd64.deb
 
@@ -160,9 +160,9 @@ PASS trawl-server matches the set's version and architecture
 PASS trawl-server requires the exact trawl-runtime
 
 $ sha256sum trawl-cli_0.9.0-1_amd64.deb trawl-runtime_0.9.0-1_amd64.deb trawl-server_0.9.0-1_amd64.deb
-decfaca823a578150f224f8b13b5c325dc327a55457b76a19905ee64f91f969e  $RUN/debs/trawl-cli_0.9.0-1_amd64.deb
-bb4a95d92bd96ec6bb7d9387f0f4aeb021123787016c38a0e02ed437400be7e6  $RUN/debs/trawl-runtime_0.9.0-1_amd64.deb
-d6a73b62f4a3f5aa205d5fec824f088dd7f13e6522e228e80237ab6410b12d9e  $RUN/debs/trawl-server_0.9.0-1_amd64.deb
+6169710173f42509e8472b150786c9504500bf97691403f161506e8b8bf4a072  $RUN/debs/trawl-cli_0.9.0-1_amd64.deb
+c32094199747fc8cefcf20cceaee0dca5babfbeb349902b436e98391433386b2  $RUN/debs/trawl-runtime_0.9.0-1_amd64.deb
+12951cb0958d443723a7daaef30458c4565bcd12c70cf7bbbe4adba17ca11084  $RUN/debs/trawl-server_0.9.0-1_amd64.deb
 
 ==============================================================================
 == 3 image
@@ -203,7 +203,7 @@ $ cat $RUN/seed/user-data   # host private key elided
       "sudo": "ALL=(ALL) NOPASSWD:ALL",
       "lock_passwd": true,
       "ssh_authorized_keys": [
-        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKgeGWFsH3ZcJXjgbqVwroZ1y9Rvw5s7sCFSOLAihm8/ trawl-proof-client"
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMWEEbRJrSuup/1YakB6e0mUNX/rpJsIN11RyDbbxFfD trawl-proof-client"
       ]
     }
   ],
@@ -215,7 +215,7 @@ $ cat $RUN/seed/user-data   # host private key elided
   ],
   "ssh_keys": {
     "ed25519_private": "<elided: generated for this run>",
-    "ed25519_public": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH7csIj8qAAXTmgfiHRzeTKMOwffcIudJHNub0jNsfW4 trawl-proof-host"
+    "ed25519_public": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICjuliLB6qgwjq83Tb3BIBIdJfWThB0wMI3qUSxLIB99 trawl-proof-host"
   },
   "growpart": {
     "mode": "auto",
@@ -228,20 +228,20 @@ $ cat $RUN/seed/user-data   # host private key elided
 }
 
 $ cat $RUN/seed/meta-data
-instance-id: trawl-proof-7e08d6d9-dbed-49bc-a635-ff48c6bbb261
+instance-id: trawl-proof-fe6eb5ba-6181-4e1e-9552-a817b6453b53
 local-hostname: trawl-proof
-# seed served on 127.0.0.1:45677; the guest reaches it as 10.0.2.2:45677
+# seed served on 127.0.0.1:36087; the guest reaches it as 10.0.2.2:36087
 
-$ qemu-system-x86_64 -name trawl-proof -machine q35,accel=kvm -cpu host -smp 4 -m 4096 -drive file=$RUN/disk.raw,format=raw,if=virtio,discard=unmap -netdev user,id=n0,hostfwd=tcp:127.0.0.1:54173-:22 -device virtio-net-pci,netdev=n0 -object rng-random,filename=/dev/urandom,id=rng0 -device virtio-rng-pci,rng=rng0 -smbios 'type=1,serial=ds=nocloud;s=http://10.0.2.2:45677/' -display none -monitor none -serial file:$RUN/console.log -pidfile $RUN/qemu.pid
-# qemu pid 1556319; serial console in $RUN/console.log
-PASS SSH answers with the pinned host key: StrictHostKeyChecking=yes against $RUN/known_hosts, port 54173
+$ qemu-system-x86_64 -name trawl-proof -machine q35,accel=kvm -cpu host -smp 4 -m 4096 -drive file=$RUN/disk.raw,format=raw,if=virtio,discard=unmap -netdev user,id=n0,hostfwd=tcp:127.0.0.1:32801-:22 -device virtio-net-pci,netdev=n0 -object rng-random,filename=/dev/urandom,id=rng0 -device virtio-rng-pci,rng=rng0 -smbios 'type=1,serial=ds=nocloud;s=http://10.0.2.2:36087/' -display none -monitor none -serial file:$RUN/console.log -pidfile $RUN/qemu.pid
+# qemu pid 2037658; serial console in $RUN/console.log
+PASS SSH answers with the pinned host key: StrictHostKeyChecking=yes against $RUN/known_hosts, port 32801
 
 debian@trawl-proof$ cloud-init status --wait --long
 status: done
 extended_status: done
 boot_status_code: enabled-by-generator
-last_update: Thu, 01 Jan 1970 00:00:20 +0000
-detail: DataSourceNoCloudNet [seed=dmi,http://10.0.2.2:45677/]
+last_update: Thu, 01 Jan 1970 00:00:18 +0000
+detail: DataSourceNoCloudNet [seed=dmi,http://10.0.2.2:36087/]
 errors: []
 recoverable_errors: {}
 # seed requests served: ['/meta-data', '/network-config', '/user-data', '/vendor-data']
@@ -280,7 +280,7 @@ Get:15 https://deb.debian.org/debian trixie-backports/main Translation-en [241 k
 Get:16 https://deb.debian.org/debian-security trixie-security/main Sources [233 kB]
 Get:17 https://deb.debian.org/debian-security trixie-security/main amd64 Packages [264 kB]
 Get:18 https://deb.debian.org/debian-security trixie-security/main Translation-en [161 kB]
-Fetched 28.5 MB in 33s (862 kB/s)
+Fetched 28.5 MB in 34s (848 kB/s)
 Reading package lists...
 Setting up postgresql (17+278) ...
 Processing triggers for man-db (2.13.1-1) ...
@@ -294,9 +294,9 @@ $ scp $REPO/config/vector/debian/base.toml $REPO/config/vector/debian/nginx.toml
 
 debian@trawl-proof$ cd /home/debian/packages && sha256sum *.deb
 > echo 'ee24ecf72292ce965b2fefc5439efa9281c75a982c4a90a2295e30561311e88e  vector_0.57.0-1_amd64.deb' | sha256sum --check --strict
-decfaca823a578150f224f8b13b5c325dc327a55457b76a19905ee64f91f969e  trawl-cli_0.9.0-1_amd64.deb
-bb4a95d92bd96ec6bb7d9387f0f4aeb021123787016c38a0e02ed437400be7e6  trawl-runtime_0.9.0-1_amd64.deb
-d6a73b62f4a3f5aa205d5fec824f088dd7f13e6522e228e80237ab6410b12d9e  trawl-server_0.9.0-1_amd64.deb
+6169710173f42509e8472b150786c9504500bf97691403f161506e8b8bf4a072  trawl-cli_0.9.0-1_amd64.deb
+c32094199747fc8cefcf20cceaee0dca5babfbeb349902b436e98391433386b2  trawl-runtime_0.9.0-1_amd64.deb
+12951cb0958d443723a7daaef30458c4565bcd12c70cf7bbbe4adba17ca11084  trawl-server_0.9.0-1_amd64.deb
 ee24ecf72292ce965b2fefc5439efa9281c75a982c4a90a2295e30561311e88e  vector_0.57.0-1_amd64.deb
 vector_0.57.0-1_amd64.deb: OK
 
@@ -333,14 +333,14 @@ PASS dpkg: trawl-cli is 'install ok installed': install ok installed
 PASS dpkg: trawl-server is 'install ok installed': install ok installed
 
 debian@trawl-proof$ trawld --version
-trawld 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
-PASS trawld --version names the tested commit: expected (277eff42
-PASS trawld --version is not a dirty build: trawld 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+trawld 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+PASS trawld --version names the tested commit: expected (d71e8a2b
+PASS trawld --version is not a dirty build: trawld 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
 
 debian@trawl-proof$ trawl --version
-trawl 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
-PASS trawl --version names the tested commit: expected (277eff42; got trawl 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
-PASS trawl --version is not a dirty build: trawl 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+trawl 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+PASS trawl --version names the tested commit: expected (d71e8a2b; got trawl 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+PASS trawl --version is not a dirty build: trawl 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
 
 root@trawl-proof# cat /root/evidence/trawld.env >> /etc/default/trawld
 > chown root:trawl /etc/default/trawld && chmod 0640 /etc/default/trawld
@@ -363,7 +363,7 @@ root@trawl-proof# for i in $(seq 60); do
 > curl -fsS --cacert /var/lib/trawl/tls/cert.pem https://localhost:5514/api/v1/health | jq -c .
 > openssl x509 -in /var/lib/trawl/tls/cert.pem -noout -subject -ext subjectAltName
 active
-{"status":"ok","checks":{"duckdb":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.0"}
+{"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.0"}
 subject=CN=rcgen self signed cert
 X509v3 Subject Alternative Name: 
     DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1
@@ -393,7 +393,7 @@ created API key:
   name:    vector
   kind:    service
   roles:   trawl-ingest
-  prefix:  LGYpAu5F
+  prefix:  sfK1hU8z
   expires: never
 
 
@@ -403,7 +403,7 @@ created API key:
   name:    evidence-reader
   kind:    human
   roles:   trawl-reader
-  prefix:  2iTJ7Mea
+  prefix:  EklG44DX
   expires: never
 
 
@@ -441,7 +441,7 @@ root@trawl-proof# systemctl is-active nginx
 > tail -1 /var/log/nginx/access.log
 active
 200
-127.0.0.1 - - [29/Sep/2026:22:06:23 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.14.1"
+127.0.0.1 - - [29/Sep/2026:23:24:24 +0000] "GET / HTTP/1.1" 200 615 "-" "curl/8.14.1"
 
 root@trawl-proof# docker pull -q alpine
 > docker image inspect alpine --format '{{index .RepoDigests 0}}'
@@ -484,9 +484,9 @@ root@trawl-proof# ip netns add peer-ufw
 > ip -n peer-ufw link set lo up
 > ip -n peer-ufw -brief addr show peer-ufw-n
 > ip netns exec peer-ufw ping -c 1 -W 2 10.198.1.1 | tail -2
-peer-ufw-n@if5   UP             10.198.1.2/24 fe80::24b7:c6ff:febf:6359/64 
+peer-ufw-n@if5   UP             10.198.1.2/24 fe80::5473:8bff:fe4c:bfa0/64 
 1 packets transmitted, 1 received, 0% packet loss, time 0ms
-rtt min/avg/max/mdev = 0.063/0.063/0.063/0.000 ms
+rtt min/avg/max/mdev = 0.338/0.338/0.338/0.000 ms
 # peer-dev: 192.0.2.1, SIMULATED DEVICE (syslog sender)
 
 root@trawl-proof# ip netns add peer-dev
@@ -499,9 +499,9 @@ root@trawl-proof# ip netns add peer-dev
 > ip -n peer-dev link set lo up
 > ip -n peer-dev -brief addr show peer-dev-n
 > ip netns exec peer-dev ping -c 1 -W 2 192.0.2.254 | tail -2
-peer-dev-n@if7   UP             192.0.2.1/24 fe80::4412:fdff:fe7a:528c/64 
+peer-dev-n@if7   UP             192.0.2.1/24 fe80::10b9:d6ff:fe7e:24d1/64 
 1 packets transmitted, 1 received, 0% packet loss, time 0ms
-rtt min/avg/max/mdev = 0.027/0.027/0.027/0.000 ms
+rtt min/avg/max/mdev = 0.028/0.028/0.028/0.000 ms
 
 root@trawl-proof# cd /home/debian/packages
 > DEBIAN_FRONTEND=noninteractive apt-get install -y -q ./vector_0.57.0-1_amd64.deb 2>&1 | tail -2
@@ -539,7 +539,7 @@ verify_hostname = true
 087389af17dd16e640c585ad300e11da73bc1706547375f0f675d57f816b043c  /etc/vector/vector.d/base.toml
 eca5e22871d4c5f1eed5ff7c83bddfec0949e1fb18319b3b4276742e02886ba4  /etc/vector/vector.d/docker.toml
 f19538f76786d84a84d756766a73264ad407688cd064409d4a68a11ed0d864a0  /etc/vector/vector.d/nginx.toml
-3b1d0bf8d1ce545d76517eaa52499672be9bce824ad6870e2e395209f5ac999d  /etc/vector/trawl-ca.pem
+1bd71e813a27d93353d371e3381aa3aeebee578cbb8a57a48925641c04012e81  /etc/vector/trawl-ca.pem
 # the only edit to the shipped drop-ins: base.toml's commented ca_file line is uncommented, so Vector trusts trawld's generated localhost certificate
 
 debian@trawl-proof$ (umask 077; sudo cat /root/evidence/vector.token > vector.token)
@@ -579,22 +579,22 @@ PASS the key in /etc/default/vector is the minted ingest key
 ==============================================================================
 # one event per sender, written while Vector is stopped; the Docker container prints docker-pre now and docker-post once /tmp/go exists
 
-debian@trawl-proof$ sudo systemd-run --collect --quiet --unit trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 /bin/echo "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 journald-pre"
-> curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1/trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680-nginx-pre
-> sudo docker run -d --name trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 alpine sh -c \
->   'echo "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 docker-pre"; while [ ! -e /tmp/go ]; do sleep 1; done; echo "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 docker-post"; sleep 3600'
+debian@trawl-proof$ sudo systemd-run --collect --quiet --unit trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 /bin/echo "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 journald-pre"
+> curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1/trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69-nginx-pre
+> sudo docker run -d --name trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 alpine sh -c \
+>   'echo "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 docker-pre"; while [ ! -e /tmp/go ]; do sleep 1; done; echo "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 docker-post"; sleep 3600'
 > sleep 2
-> sudo docker logs trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680
-> sudo grep -c 'trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680-nginx-pre' /var/log/nginx/access.log
-> sudo journalctl --no-pager -o cat -u trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680
+> sudo docker logs trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69
+> sudo grep -c 'trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69-nginx-pre' /var/log/nginx/access.log
+> sudo journalctl --no-pager -o cat -u trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69
 > systemctl is-active vector || true
 404
-475bc4ed008dba8b947c6c8aa7131f6fbc1548c1120dbc5d8df51ce61e0628ba
-trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 docker-pre
+4f39e3e54515695538d59d8cfca6f5634c66e24525774d112b8bd83c9cb9b946
+trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 docker-pre
 1
-Started trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680.service - [systemd-run] /bin/echo "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 journald-pre".
-trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 journald-pre
-trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680.service: Deactivated successfully.
+Started trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69.service - [systemd-run] /bin/echo "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 journald-pre".
+trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 journald-pre
+trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69.service: Deactivated successfully.
 inactive
 
 ==============================================================================
@@ -608,54 +608,54 @@ debian@trawl-proof$ VECTOR_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 Created symlink '/etc/systemd/system/multi-user.target.wants/vector.service' → '/usr/lib/systemd/system/vector.service'.
 ● vector.service - Vector
      Loaded: loaded (/usr/lib/systemd/system/vector.service; enabled; preset: enabled)
-     Active: active (running) since Tue 2026-09-29 22:06:35 UTC; 13ms ago
- Invocation: eb3f12f4dcce479c898425007ce556dd
+     Active: active (running) since Tue 2026-09-29 23:24:37 UTC; 12ms ago
+ Invocation: 9b40a04cfbc64e2f828b7b29666e882d
        Docs: https://vector.dev
-    Process: 5362 ExecStartPre=/usr/bin/vector validate (code=exited, status=0/SUCCESS)
-   Main PID: 5370 ((vector))
+    Process: 5356 ExecStartPre=/usr/bin/vector validate (code=exited, status=0/SUCCESS)
+   Main PID: 5364 ((vector))
       Tasks: 1 (limit: 4676)
-     Memory: 1.8M (peak: 45.1M)
-        CPU: 78ms
+     Memory: 2.1M (peak: 45M)
+        CPU: 72ms
      CGroup: /system.slice/vector.service
-             └─5370 "(vector)"
+             └─5364 "(vector)"
 
-Sep 29 22:06:35 trawl-proof systemd[1]: Starting vector.service - Vector...
-Sep 29 22:06:35 trawl-proof vector[5362]: 2026-09-29T22:06:35.877833Z  WARN vector::config: Source has acknowledgements enabled by a sink, but acknowledgements are not supported by this source. Silent data loss could occur. source="docker" sink="trawld"
-Sep 29 22:06:35 trawl-proof vector[5362]: √ Loaded ["/etc/vector/vector.d"]
-Sep 29 22:06:35 trawl-proof vector[5362]: √ Transforms configuration
-Sep 29 22:06:35 trawl-proof vector[5362]: √ Component configuration
-Sep 29 22:06:35 trawl-proof vector[5362]: √ Health check "trawld"
-Sep 29 22:06:35 trawl-proof vector[5362]: ---------------------------------
-Sep 29 22:06:35 trawl-proof vector[5362]:                         Validated
-Sep 29 22:06:35 trawl-proof systemd[1]: Started vector.service - Vector.
-# VECTOR_START=2026-09-29T22:06:35Z; waiting for the first-start backfill to reach an outcome (up to 90s), then 10s more
+Sep 29 23:24:37 trawl-proof systemd[1]: Starting vector.service - Vector...
+Sep 29 23:24:37 trawl-proof vector[5356]: 2026-09-29T23:24:37.179405Z  WARN vector::config: Source has acknowledgements enabled by a sink, but acknowledgements are not supported by this source. Silent data loss could occur. source="docker" sink="trawld"
+Sep 29 23:24:37 trawl-proof vector[5356]: √ Loaded ["/etc/vector/vector.d"]
+Sep 29 23:24:37 trawl-proof vector[5356]: √ Transforms configuration
+Sep 29 23:24:37 trawl-proof vector[5356]: √ Component configuration
+Sep 29 23:24:37 trawl-proof vector[5356]: √ Health check "trawld"
+Sep 29 23:24:37 trawl-proof vector[5356]: ---------------------------------
+Sep 29 23:24:37 trawl-proof vector[5356]:                         Validated
+Sep 29 23:24:37 trawl-proof systemd[1]: Started vector.service - Vector.
+# VECTOR_START=2026-09-29T23:24:36Z; waiting for the first-start backfill to reach an outcome (up to 90s), then 10s more
 
 root@trawl-proof# for i in $(seq 90); do
->   if journalctl -u trawld --since '2026-09-29 22:06:35 UTC' -o cat | grep -q 'ingest_complete.*user=vector'; then break; fi
->   if journalctl -u vector --since '2026-09-29 22:06:35 UTC' -o cat | grep -q 'dropping the request'; then break; fi
+>   if journalctl -u trawld --since '2026-09-29 23:24:36 UTC' -o cat | grep -q 'ingest_complete.*user=vector'; then break; fi
+>   if journalctl -u vector --since '2026-09-29 23:24:36 UTC' -o cat | grep -q 'dropping the request'; then break; fi
 >   sleep 1
 > done
 > sleep 10
-> journalctl -u vector --no-pager -o cat --since '2026-09-29 22:06:35 UTC' | sed -e 's/\x1b\[[0-9;]*m//g' \
+> journalctl -u vector --no-pager -o cat --since '2026-09-29 23:24:36 UTC' | sed -e 's/\x1b\[[0-9;]*m//g' \
 >   | grep -E ' (ERROR|WARN) ' | grep -v 'Failed to glob path' | cut -c1-400 | head -20 || true
-> journalctl -u vector --no-pager -o cat --since '2026-09-29 22:06:35 UTC' | grep -c 'Failed to glob path' || true
-2026-09-29T22:06:35.877833Z  WARN vector::config: Source has acknowledgements enabled by a sink, but acknowledgements are not supported by this source. Silent data loss could occur. source="docker" sink="trawld"
-2026-09-29T22:06:36.027416Z  WARN vector::config: Source has acknowledgements enabled by a sink, but acknowledgements are not supported by this source. Silent data loss could occur. source="docker" sink="trawld"
+> journalctl -u vector --no-pager -o cat --since '2026-09-29 23:24:36 UTC' | grep -c 'Failed to glob path' || true
+2026-09-29T23:24:37.179405Z  WARN vector::config: Source has acknowledgements enabled by a sink, but acknowledgements are not supported by this source. Silent data loss could occur. source="docker" sink="trawld"
+2026-09-29T23:24:37.284087Z  WARN vector::config: Source has acknowledgements enabled by a sink, but acknowledgements are not supported by this source. Silent data loss could occur. source="docker" sink="trawld"
 29
-# first start: Vector's drops are read over its whole first run, from 2026-09-29 22:06:35 UTC to just before its first restart; the verdict follows the 401 case's control
+# first start: Vector's drops are read over its whole first run, from 2026-09-29 23:24:36 UTC to just before its first restart; the verdict follows the 401 case's control
 
 ==============================================================================
 == 8 history
 ==============================================================================
 # post-start controls: the same nginx and Docker senders, after Vector started
 
-debian@trawl-proof$ sudo docker exec trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 touch /tmp/go
-> curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1/trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680-nginx-post
+debian@trawl-proof$ sudo docker exec trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 touch /tmp/go
+> curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1/trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69-nginx-post
 > sleep 2
-> sudo docker logs trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680
+> sudo docker logs trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69
 404
-trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 docker-pre
-trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 docker-post
+trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 docker-pre
+trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 docker-post
 # proof:vars from docs/src/content/docs/getting-started/vector-integration.md:231 (verbatim)
 
 debian@trawl-proof$ SENDER_ENV=prod
@@ -666,94 +666,95 @@ debian@trawl-proof$ SENDER_ENV=prod
 
 debian@trawl-proof$ BOOT_DAYS=$(( ( $(date +%s) - $(date -d "$(uptime -s)" +%s) ) / 86400 + 1 ))
 > trawl -p prod query "env=$SENDER_ENV host=$HOST last=${BOOT_DAYS}d _ingested>=\"$VECTOR_START\" | stats count(), min(_time), max(_time) by service"
-{"count":6,"max__time":"2026-09-29 22:06:18.781126","min__time":"2026-09-29 22:06:16.304144","service":"session-13"}
-{"count":6,"max__time":"2026-09-29 22:06:22.010011","min__time":"2026-09-29 22:06:19.867474","service":"session-20"}
-{"count":6,"max__time":"2026-09-29 22:06:26.549376","min__time":"2026-09-29 22:06:23.88336","service":"session-24"}
-{"count":2,"max__time":"2026-09-29 22:06:15.594456","min__time":"2026-09-29 22:06:15.594344","service":"session-9"}
-{"count":125,"max__time":"2026-09-29 22:06:36.190967","min__time":"2026-09-29 22:04:29.910854","service":"systemd-logind"}
-{"count":5,"max__time":"2026-09-29 22:05:01.148509","min__time":"2026-09-29 22:04:29.540029","service":"systemd-timesyncd"}
-{"count":2,"max__time":"2026-09-29 22:06:15.767546","min__time":"2026-09-29 22:06:15.767445","service":"session-10"}
-{"count":2,"max__time":"2026-09-29 22:06:18.982828","min__time":"2026-09-29 22:06:18.982721","service":"session-15"}
-{"count":8,"max__time":"2026-09-29 22:06:23.642839","min__time":"2026-09-29 22:06:23.478056","service":"session-22"}
-{"count":6,"max__time":"2026-09-29 22:06:28.111028","min__time":"2026-09-29 22:06:26.775376","service":"session-26"}
-{"count":5,"max__time":"2026-09-29 22:06:31.648904","min__time":"2026-09-29 22:06:31.640844","service":"session-30"}
-{"count":2,"max__time":"2026-09-29 22:06:36.116098","min__time":"2026-09-29 22:06:36.115993","service":"session-41"}
-{"count":32,"max__time":"2026-09-29 22:06:15.121507","min__time":"2026-09-29 22:04:31.39596","service":"session-6"}
-{"count":259,"max__time":"2026-09-29 22:08:17.114243","min__time":"2026-09-29 22:06:19.779925","service":"trawld"}
-{"count":2,"max__time":"2026-09-29 22:04:30.529377","min__time":"2026-09-29 22:04:30.52929","service":"session-1"}
-{"count":2,"max__time":"2026-09-29 22:06:15.864761","min__time":"2026-09-29 22:06:15.86466","service":"session-11"}
-{"count":2,"max__time":"2026-09-29 22:06:36.232109","min__time":"2026-09-29 22:06:36.231868","service":"session-42"}
-{"count":9,"max__time":"2026-09-29 22:06:16.173498","min__time":"2026-09-29 22:06:15.975528","service":"session-12"}
-{"count":5,"max__time":"2026-09-29 22:06:32.5466","min__time":"2026-09-29 22:06:32.543641","service":"session-37"}
-{"count":2,"max__time":"2026-09-29 22:06:15.479685","min__time":"2026-09-29 22:06:15.479647","service":"session-8"}
-{"count":5,"max__time":"2026-09-29 22:04:30.007769","min__time":"2026-09-29 22:04:30.000205","service":"cloud-init"}
-{"count":2,"max__time":"2026-09-29 22:04:31.288339","min__time":"2026-09-29 22:04:31.28824","service":"session-5"}
-{"count":8,"max__time":"2026-09-29 22:06:08.486774","min__time":"2026-09-29 22:06:07.799361","service":"docker"}
-{"count":2,"max__time":"2026-09-29 22:06:15.220922","min__time":"2026-09-29 22:06:15.220822","service":"session-7"}
-{"count":242,"max__time":"2026-09-29 22:06:36.21986","min__time":"2026-09-29 22:04:29.540902","service":"init"}
-{"count":5,"max__time":"2026-09-29 22:06:31.98399","min__time":"2026-09-29 22:06:31.980974","service":"session-32"}
-{"count":1,"max__time":"2026-09-29 22:04:29.517505","min__time":"2026-09-29 22:04:29.517505","service":"systemd-resolved"}
-{"count":83,"max__time":"2026-09-29 22:08:10.417396","min__time":"2026-09-29 22:06:35.877869","service":"vector"}
-{"count":13,"max__time":"2026-09-29 22:06:33.404216","min__time":"2026-09-29 22:06:07.835993","service":"kernel"}
-{"count":5,"max__time":"2026-09-29 22:06:28.50272","min__time":"2026-09-29 22:06:28.45245","service":"session-28"}
-{"count":2,"max__time":"2026-09-29 22:06:32.086436","min__time":"2026-09-29 22:06:32.086346","service":"session-33"}
-{"count":8,"max__time":"2026-09-29 22:06:32.215571","min__time":"2026-09-29 22:06:32.202128","service":"session-34"}
-{"count":13,"max__time":"2026-09-29 22:06:35.395902","min__time":"2026-09-29 22:04:29.539786","service":"systemd-networkd"}
-{"count":5,"max__time":"2026-09-29 22:06:19.762244","min__time":"2026-09-29 22:06:19.4308","service":"session-19"}
-{"count":5,"max__time":"2026-09-29 22:06:23.767332","min__time":"2026-09-29 22:06:23.755008","service":"session-23"}
-{"count":2,"max__time":"2026-09-29 22:04:31.184678","min__time":"2026-09-29 22:04:31.184578","service":"session-4"}
-{"count":119,"max__time":"2026-09-29 22:06:36.188831","min__time":"2026-09-29 22:04:29.89447","service":"ssh"}
-{"count":17,"max__time":"2026-09-29 22:06:35.715811","min__time":"2026-09-29 22:06:03.391767","service":"systemd-ssh-generator"}
-{"count":19,"max__time":"2026-09-29 22:06:35.831764","min__time":"2026-09-29 22:06:28.460158","service":"ufw"}
-{"count":1,"max__time":"2026-09-29 22:04:30.021953","min__time":"2026-09-29 22:04:30.021953","service":"cloud-final"}
-{"count":2,"max__time":"2026-09-29 22:06:19.219017","min__time":"2026-09-29 22:06:19.218917","service":"session-17"}
-{"count":6,"max__time":"2026-09-29 22:06:23.373815","min__time":"2026-09-29 22:06:22.119894","service":"session-21"}
-{"count":5,"max__time":"2026-09-29 22:06:26.665493","min__time":"2026-09-29 22:06:26.655948","service":"session-25"}
-{"count":12,"max__time":"2026-09-29 22:06:31.538253","min__time":"2026-09-29 22:06:28.656265","service":"session-29"}
-{"count":1,"max__time":"2026-09-29 22:04:29.948467","min__time":"2026-09-29 22:04:29.948467","service":"cloud-config"}
-{"count":18,"max__time":"2026-09-29 22:06:35.510478","min__time":"2026-09-29 22:06:32.769359","service":"session-39"}
-{"count":6,"max__time":"2026-09-29 22:04:30.019213","min__time":"2026-09-29 22:04:29.638801","service":"cloud-init-main"}
-{"count":2,"max__time":"2026-09-29 22:06:19.330795","min__time":"2026-09-29 22:06:19.330713","service":"session-18"}
-{"count":2,"max__time":"2026-09-29 22:04:30.780833","min__time":"2026-09-29 22:04:30.78073","service":"session-3"}
-{"count":2,"max__time":"2026-09-29 22:06:32.316161","min__time":"2026-09-29 22:06:32.316077","service":"session-35"}
-{"count":5,"max__time":"2026-09-29 22:06:32.667706","min__time":"2026-09-29 22:06:32.664077","service":"session-38"}
-{"count":1,"max__time":"2026-09-29 22:04:29.806259","min__time":"2026-09-29 22:04:29.806259","service":"cloud-init-network"}
-{"count":2,"max__time":"2026-09-29 22:06:18.87888","min__time":"2026-09-29 22:06:18.878777","service":"session-14"}
-{"count":2,"max__time":"2026-09-29 22:06:19.098843","min__time":"2026-09-29 22:06:19.098744","service":"session-16"}
-{"count":5,"max__time":"2026-09-29 22:06:28.320794","min__time":"2026-09-29 22:06:28.257634","service":"session-27"}
-{"count":7,"max__time":"2026-09-29 22:06:31.870811","min__time":"2026-09-29 22:06:31.768837","service":"session-31"}
-{"count":5,"max__time":"2026-09-29 22:06:32.4373","min__time":"2026-09-29 22:06:32.43212","service":"session-36"}
-{"count":81,"max__time":"2026-09-29 22:06:33.312049","min__time":"2026-09-29 22:06:05.718806","service":"containerd"}
-{"count":8,"max__time":"2026-09-29 22:06:36.007239","min__time":"2026-09-29 22:06:35.652675","service":"session-40"}
-{"count":1,"max__time":"2026-09-29 22:06:32.797141","min__time":"2026-09-29 22:06:32.797141","service":"trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680"}
+{"count":245,"max__time":"2026-09-29 23:26:18.422352","min__time":"2026-09-29 23:21:50.869763","service":"init"}
+{"count":5,"max__time":"2026-09-29 23:24:33.514987","min__time":"2026-09-29 23:24:33.511556","service":"session-32"}
+{"count":1,"max__time":"2026-09-29 23:21:51.866707","min__time":"2026-09-29 23:21:51.866707","service":"cloud-init"}
+{"count":8,"max__time":"2026-09-29 23:23:55.298523","min__time":"2026-09-29 23:23:53.038674","service":"docker"}
+{"count":2,"max__time":"2026-09-29 23:22:23.365532","min__time":"2026-09-29 23:21:50.86069","service":"systemd-resolved"}
+{"count":2,"max__time":"2026-09-29 23:24:15.478832","min__time":"2026-09-29 23:24:15.478717","service":"session-7"}
+{"count":1,"max__time":"2026-09-29 23:24:34.371573","min__time":"2026-09-29 23:24:34.371573","service":"trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69"}
+{"count":87,"max__time":"2026-09-29 23:26:19.856619","min__time":"2026-09-29 23:24:37.179445","service":"vector"}
+{"count":2,"max__time":"2026-09-29 23:24:19.821466","min__time":"2026-09-29 23:24:19.821307","service":"session-15"}
+{"count":8,"max__time":"2026-09-29 23:24:24.601328","min__time":"2026-09-29 23:24:24.449008","service":"session-22"}
+{"count":6,"max__time":"2026-09-29 23:26:18.305573","min__time":"2026-09-29 23:24:37.481791","service":"session-42"}
+{"count":2,"max__time":"2026-09-29 23:24:15.819551","min__time":"2026-09-29 23:24:15.819506","service":"session-8"}
+{"count":2,"max__time":"2026-09-29 23:21:52.892602","min__time":"2026-09-29 23:21:52.892515","service":"session-1"}
+{"count":2,"max__time":"2026-09-29 23:24:16.209009","min__time":"2026-09-29 23:24:16.208905","service":"session-11"}
+{"count":6,"max__time":"2026-09-29 23:24:19.583458","min__time":"2026-09-29 23:24:16.687609","service":"session-13"}
+{"count":6,"max__time":"2026-09-29 23:24:22.981586","min__time":"2026-09-29 23:24:20.845315","service":"session-20"}
+{"count":6,"max__time":"2026-09-29 23:24:29.032831","min__time":"2026-09-29 23:24:24.855419","service":"session-24"}
+{"count":5,"max__time":"2026-09-29 23:24:33.199091","min__time":"2026-09-29 23:24:33.19037","service":"session-30"}
+{"count":2,"max__time":"2026-09-29 23:24:37.374648","min__time":"2026-09-29 23:24:37.374533","service":"session-41"}
+{"count":32,"max__time":"2026-09-29 23:24:15.364878","min__time":"2026-09-29 23:21:53.675472","service":"session-6"}
+{"count":269,"max__time":"2026-09-29 23:26:15.079471","min__time":"2026-09-29 23:24:20.739111","service":"trawld"}
+{"count":2,"max__time":"2026-09-29 23:24:16.103985","min__time":"2026-09-29 23:24:16.103874","service":"session-10"}
+{"count":9,"max__time":"2026-09-29 23:24:16.578142","min__time":"2026-09-29 23:24:16.323525","service":"session-12"}
+{"count":5,"max__time":"2026-09-29 23:24:34.085142","min__time":"2026-09-29 23:24:34.082156","service":"session-37"}
+{"count":2,"max__time":"2026-09-29 23:24:15.937546","min__time":"2026-09-29 23:24:15.937452","service":"session-9"}
+{"count":5,"max__time":"2026-09-29 23:22:23.365667","min__time":"2026-09-29 23:21:50.868123","service":"systemd-timesyncd"}
+{"count":6,"max__time":"2026-09-29 23:24:30.330815","min__time":"2026-09-29 23:24:29.25877","service":"session-26"}
+{"count":128,"max__time":"2026-09-29 23:26:18.389919","min__time":"2026-09-29 23:21:51.66604","service":"systemd-logind"}
+{"count":2,"max__time":"2026-09-29 23:24:20.22202","min__time":"2026-09-29 23:24:20.22191","service":"session-18"}
+{"count":5,"max__time":"2026-09-29 23:24:33.968639","min__time":"2026-09-29 23:24:33.96378","service":"session-36"}
+{"count":1,"max__time":"2026-09-29 23:21:51.484295","min__time":"2026-09-29 23:21:51.484295","service":"cloud-init-network"}
+{"count":2,"max__time":"2026-09-29 23:24:19.951089","min__time":"2026-09-29 23:24:19.950969","service":"session-16"}
+{"count":5,"max__time":"2026-09-29 23:24:30.532557","min__time":"2026-09-29 23:24:30.471643","service":"session-27"}
+{"count":5,"max__time":"2026-09-29 23:24:34.205696","min__time":"2026-09-29 23:24:34.201936","service":"session-38"}
+{"count":1,"max__time":"2026-09-29 23:21:51.738205","min__time":"2026-09-29 23:21:51.738205","service":"cloud-config"}
+{"count":81,"max__time":"2026-09-29 23:24:34.68326","min__time":"2026-09-29 23:23:48.108197","service":"containerd"}
+{"count":7,"max__time":"2026-09-29 23:24:33.398951","min__time":"2026-09-29 23:24:33.306218","service":"session-31"}
+{"count":8,"max__time":"2026-09-29 23:24:37.266644","min__time":"2026-09-29 23:24:36.990481","service":"session-40"}
+{"count":4,"max__time":"2026-09-29 23:24:20.720722","min__time":"2026-09-29 23:21:53.516825","service":"sshd-session"}
+{"count":10,"max__time":"2026-09-29 23:21:51.880009","min__time":"2026-09-29 23:21:51.120051","service":"cloud-init-main"}
+{"count":2,"max__time":"2026-09-29 23:24:19.703799","min__time":"2026-09-29 23:24:19.703672","service":"session-14"}
+{"count":2,"max__time":"2026-09-29 23:21:53.187436","min__time":"2026-09-29 23:21:53.187319","service":"session-3"}
+{"count":2,"max__time":"2026-09-29 23:24:33.855501","min__time":"2026-09-29 23:24:33.855388","service":"session-35"}
+{"count":18,"max__time":"2026-09-29 23:24:36.876286","min__time":"2026-09-29 23:24:34.331913","service":"session-39"}
+{"count":3,"max__time":"2026-09-29 23:26:18.483093","min__time":"2026-09-29 23:26:18.434443","service":"session-43"}
+{"count":1,"max__time":"2026-09-29 23:21:51.88434","min__time":"2026-09-29 23:21:51.88434","service":"cloud-final"}
+{"count":5,"max__time":"2026-09-29 23:24:29.153179","min__time":"2026-09-29 23:24:29.14251","service":"session-25"}
+{"count":12,"max__time":"2026-09-29 23:24:33.082508","min__time":"2026-09-29 23:24:30.861821","service":"session-29"}
+{"count":2,"max__time":"2026-09-29 23:21:53.387843","min__time":"2026-09-29 23:21:53.387684","service":"session-4"}
+{"count":121,"max__time":"2026-09-29 23:26:18.38779","min__time":"2026-09-29 23:21:51.627956","service":"ssh"}
+{"count":17,"max__time":"2026-09-29 23:24:37.038257","min__time":"2026-09-29 23:23:35.95247","service":"systemd-ssh-generator"}
+{"count":8,"max__time":"2026-09-29 23:24:33.749641","min__time":"2026-09-29 23:24:33.736874","service":"session-34"}
+{"count":3,"max__time":"2026-09-29 23:24:20.719276","min__time":"2026-09-29 23:24:20.361999","service":"session-19"}
+{"count":5,"max__time":"2026-09-29 23:24:24.73473","min__time":"2026-09-29 23:24:24.720833","service":"session-23"}
+{"count":5,"max__time":"2026-09-29 23:24:30.746278","min__time":"2026-09-29 23:24:30.670701","service":"session-28"}
+{"count":13,"max__time":"2026-09-29 23:24:36.718339","min__time":"2026-09-29 23:21:50.867732","service":"systemd-networkd"}
+{"count":19,"max__time":"2026-09-29 23:24:37.018263","min__time":"2026-09-29 23:24:30.686931","service":"ufw"}
+{"count":13,"max__time":"2026-09-29 23:24:34.790398","min__time":"2026-09-29 23:23:53.094971","service":"kernel"}
+{"count":2,"max__time":"2026-09-29 23:24:20.095041","min__time":"2026-09-29 23:24:20.094944","service":"session-17"}
+{"count":6,"max__time":"2026-09-29 23:24:24.327899","min__time":"2026-09-29 23:24:23.109615","service":"session-21"}
+{"count":2,"max__time":"2026-09-29 23:24:33.627454","min__time":"2026-09-29 23:24:33.627349","service":"session-33"}
 # history finder: rows on attempt 1 of 12
-PASS history finder lists the unit that ran before Vector started: service=trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680
-PASS its min(_time) is earlier than VECTOR_START: min(_time) 2026-09-29T22:06:32 < 2026-09-29T22:06:35Z
+PASS history finder lists the unit that ran before Vector started: service=trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69
+PASS its min(_time) is earlier than VECTOR_START: min(_time) 2026-09-29T23:24:34 < 2026-09-29T23:24:36Z
 # the next queries are the harness's, not the guide's: one per seeded line
 
-debian@trawl-proof$ trawl -p prod query 'service=trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 journald-pre" last=1d _ingested>="2026-09-29T22:06:35Z" | table _time, _ingested, service, message'
-{"_ingested":"2026-09-29 22:06:41.228344","_time":"2026-09-29 22:06:32.797141","message":"trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 journald-pre","service":"trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680"}
+debian@trawl-proof$ trawl -p prod query 'service=trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 journald-pre" last=1d _ingested>="2026-09-29T23:24:36Z" | table _time, _ingested, service, message'
+{"_ingested":"2026-09-29 23:24:42.504875","_time":"2026-09-29 23:24:34.371573","message":"trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 journald-pre","service":"trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69"}
 # journald-pre: rows on attempt 1 of 12
 PASS journald: the pre-start line arrived after Vector started
 
-debian@trawl-proof$ trawl -p prod query 'service=nginx "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680-nginx-post" last=1d _ingested>="2026-09-29T22:06:35Z" | table _time, _ingested, service, uri'
-{"_ingested":"2026-09-29 22:08:30.033388","_time":"2026-09-29 22:08:17","service":"nginx","uri":"/trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680-nginx-post"}
-# nginx-post control: rows on attempt 4 of 12
+debian@trawl-proof$ trawl -p prod query 'service=nginx "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69-nginx-post" last=1d _ingested>="2026-09-29T23:24:36Z" | table _time, _ingested, service, uri'
+{"_ingested":"2026-09-29 23:26:31.248428","_time":"2026-09-29 23:26:18","service":"nginx","uri":"/trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69-nginx-post"}
+# nginx-post control: rows on attempt 3 of 12
 PASS nginx control: the post-start request arrived
 
-debian@trawl-proof$ trawl -p prod query 'service=nginx "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680-nginx-pre" last=1d | table _time, _ingested, service, uri'
+debian@trawl-proof$ trawl -p prod query 'service=nginx "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69-nginx-pre" last=1d | table _time, _ingested, service, uri'
 PASS nginx: the pre-start access line is absent: 0 row(s)
 
-debian@trawl-proof$ trawl -p prod query 'host=trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 docker-post" last=1d | table _time, _ingested, service, host, message'
-{"_ingested":"2026-09-29 22:08:22.381884","_time":"2026-09-29 22:08:17.51173","host":"trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680","message":"trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 docker-post","service":"trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680"}
+debian@trawl-proof$ trawl -p prod query 'host=trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 docker-post" last=1d | table _time, _ingested, service, host, message'
+{"_ingested":"2026-09-29 23:26:20.532314","_time":"2026-09-29 23:26:18.883007","host":"trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69","message":"trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 docker-post","service":"trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69"}
 # docker-post control: rows on attempt 1 of 12
 PASS Docker control: the post-start line arrived
 
-debian@trawl-proof$ trawl -p prod query 'host=trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 "trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680 docker-pre" last=1d | table _time, _ingested, service, host, message'
+debian@trawl-proof$ trawl -p prod query 'host=trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 "trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69 docker-pre" last=1d | table _time, _ingested, service, host, message'
 PASS Docker: the pre-start line is absent: 0 row(s)
 
-debian@trawl-proof$ sudo docker rm -f trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680
-trawl-seed-823d757a-a071-4705-84c4-a88ec6bf6680
+debian@trawl-proof$ sudo docker rm -f trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69
+trawl-seed-888d9f89-4fbe-4315-a853-e93e09093a69
 
 ==============================================================================
 == 9 recipes
@@ -772,9 +773,9 @@ debian@trawl-proof$ sudo systemd-run --collect --quiet --unit "$MARKER" /bin/ech
 # proof:journald-check from docs/src/content/docs/getting-started/vector-integration.md:265 (verbatim; rerun up to 12 times, 5s apart, as the guide says to rerun a check)
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=$MARKER host=$HOST \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, message"
-{"_ingested":"2026-09-29 22:08:40.873438","_producer":"http","_time":"2026-09-29 22:08:37.293005","env":"prod","host":"trawl-proof","message":"trawl-check-10f40d02-a6d7-478d-975f-240d49729418","service":"trawl-check-10f40d02-a6d7-478d-975f-240d49729418"}
+{"_ingested":"2026-09-29 23:26:36.633017","_producer":"http","_time":"2026-09-29 23:26:32.887406","env":"prod","host":"trawl-proof","message":"trawl-check-8a2dc4b5-88ab-4e5f-8481-57427cc22304","service":"trawl-check-8a2dc4b5-88ab-4e5f-8481-57427cc22304"}
 # journald check: rows on attempt 2 of 12
-# journald: expected event: env=prod, service=trawl-check-10f40d02-a6d7-478d-975f-240d49729418, host=trawl-proof, _producer=http, message=trawl-check-10f40d02-a6d7-478d-975f-240d49729418
+# journald: expected event: env=prod, service=trawl-check-8a2dc4b5-88ab-4e5f-8481-57427cc22304, host=trawl-proof, _producer=http, message=trawl-check-8a2dc4b5-88ab-4e5f-8481-57427cc22304
 # journald: row 1 matches every field
 PASS journald: one row carries the whole expected event: 1 of 1 row(s) match every field
 
@@ -793,14 +794,14 @@ PASS nginx-send: nginx answered 404: 404
 # proof:nginx-confirm from docs/src/content/docs/getting-started/vector-integration.md:291 (verbatim)
 
 debian@trawl-proof$ sudo sh -c 'grep -F -- "$1" /var/log/nginx/*.log' sh "$MARKER"
-/var/log/nginx/access.log:::1 - - [29/Sep/2026:22:08:43 +0000] "GET /trawl-check-c55cef17-b53c-42f8-825e-cd57d639b9bc HTTP/1.1" 404 146 "-" "curl/8.14.1"
+/var/log/nginx/access.log:::1 - - [29/Sep/2026:23:26:38 +0000] "GET /trawl-check-c5ee245d-d0b1-491b-bcc5-ea80bfab9e1f HTTP/1.1" 404 146 "-" "curl/8.14.1"
 PASS nginx-confirm: the access log holds the marker line
 # proof:nginx-check from docs/src/content/docs/getting-started/vector-integration.md:315 (verbatim; rerun up to 12 times, 5s apart, as the guide says to rerun a check)
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=nginx host=$HOST \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, uri, status, message"
-{"_ingested":"2026-09-29 22:08:46.597286","_producer":"http","_time":"2026-09-29 22:08:43","env":"prod","host":"trawl-proof","message":"::1 - - [29/Sep/2026:22:08:43 +0000] \"GET /trawl-check-c55cef17-b53c-42f8-825e-cd57d639b9bc HTTP/1.1\" 404 146 \"-\" \"curl/8.14.1\"","service":"nginx","status":404,"uri":"/trawl-check-c55cef17-b53c-42f8-825e-cd57d639b9bc"}
-# nginx check: rows on attempt 2 of 12
-# nginx: expected event: env=prod, service=nginx, host=trawl-proof, _producer=http, uri=/trawl-check-c55cef17-b53c-42f8-825e-cd57d639b9bc, status=404
+{"_ingested":"2026-09-29 23:26:47.782389","_producer":"http","_time":"2026-09-29 23:26:38","env":"prod","host":"trawl-proof","message":"::1 - - [29/Sep/2026:23:26:38 +0000] \"GET /trawl-check-c5ee245d-d0b1-491b-bcc5-ea80bfab9e1f HTTP/1.1\" 404 146 \"-\" \"curl/8.14.1\"","service":"nginx","status":404,"uri":"/trawl-check-c5ee245d-d0b1-491b-bcc5-ea80bfab9e1f"}
+# nginx check: rows on attempt 3 of 12
+# nginx: expected event: env=prod, service=nginx, host=trawl-proof, _producer=http, uri=/trawl-check-c5ee245d-d0b1-491b-bcc5-ea80bfab9e1f, status=404
 # nginx: row 1 matches every field
 PASS nginx: one row carries the whole expected event: 1 of 1 row(s) match every field
 
@@ -814,23 +815,23 @@ debian@trawl-proof$ SENDER_ENV=prod
 # proof:docker-send from docs/src/content/docs/getting-started/vector-integration.md:330 (verbatim)
 
 debian@trawl-proof$ sudo docker run -d --name "$MARKER" alpine sh -c "sleep 15; echo $MARKER"
-578b7a8eec2ac5823c66dccc4cf1016f3de46a4a09eba391dc64e97c2afc5aa4
+384f302aeee4ed5932dea2876d78c44d8cb9d9c8d30c2b918c797daa8e958f26
 
 debian@trawl-proof$ sleep 30   # the recipe: wait about 30 seconds
 # proof:docker-check from docs/src/content/docs/getting-started/vector-integration.md:343 (verbatim; rerun up to 12 times, 5s apart, as the guide says to rerun a check)
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=$MARKER host=$MARKER \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, container_name, image, message"
-{"_ingested":"2026-09-29 22:09:08.854537","_producer":"http","_time":"2026-09-29 22:09:04.309081","container_name":"trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500","env":"prod","host":"trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500","image":"alpine","message":"trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500","service":"trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500"}
-{"_ingested":"2026-09-29 22:09:08.854537","_producer":"http","_time":"2026-09-29 22:09:04.309081","container_name":"trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500","env":"prod","host":"trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500","image":"alpine","message":"trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500","service":"trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500"}
+{"_ingested":"2026-09-29 23:27:09.784761","_producer":"http","_time":"2026-09-29 23:27:05.229265","container_name":"trawl-check-367b6c14-d268-43fe-ae86-15e107478370","env":"prod","host":"trawl-check-367b6c14-d268-43fe-ae86-15e107478370","image":"alpine","message":"trawl-check-367b6c14-d268-43fe-ae86-15e107478370","service":"trawl-check-367b6c14-d268-43fe-ae86-15e107478370"}
+{"_ingested":"2026-09-29 23:27:09.784761","_producer":"http","_time":"2026-09-29 23:27:05.229265","container_name":"trawl-check-367b6c14-d268-43fe-ae86-15e107478370","env":"prod","host":"trawl-check-367b6c14-d268-43fe-ae86-15e107478370","image":"alpine","message":"trawl-check-367b6c14-d268-43fe-ae86-15e107478370","service":"trawl-check-367b6c14-d268-43fe-ae86-15e107478370"}
 # docker check: rows on attempt 1 of 12
-# docker: expected event: env=prod, service=trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500, host=trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500, _producer=http, message=trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500
+# docker: expected event: env=prod, service=trawl-check-367b6c14-d268-43fe-ae86-15e107478370, host=trawl-check-367b6c14-d268-43fe-ae86-15e107478370, _producer=http, message=trawl-check-367b6c14-d268-43fe-ae86-15e107478370
 # docker: row 1 matches every field
 # docker: row 2 matches every field
 PASS docker: one row carries the whole expected event: 2 of 2 row(s) match every field
 # proof:docker-cleanup from docs/src/content/docs/getting-started/vector-integration.md:362 (verbatim)
 
 debian@trawl-proof$ sudo docker rm "$MARKER"
-trawl-check-f8ccfbb8-641a-42a1-85ca-0b8f6548f500
+trawl-check-367b6c14-d268-43fe-ae86-15e107478370
 
 --- recipe: host firewall (UFW)
 
@@ -850,7 +851,7 @@ debian@trawl-proof$ PEER=10.198.1.2
 > COLLECTOR=10.198.1.1
 > PORT="$(shuf -i 40000-59999 -n 1)"
 > echo "COLLECTOR=$COLLECTOR PORT=$PORT"
-COLLECTOR=10.198.1.1 PORT=55689
+COLLECTOR=10.198.1.1 PORT=53352
 # proof:ufw-rule from docs/src/content/docs/getting-started/vector-integration.md:399 (verbatim)
 
 debian@trawl-proof$ sudo ufw prepend deny log from "$PEER" to any port "$PORT" proto tcp
@@ -861,7 +862,7 @@ Status: active
 
      To                         Action      From
      --                         ------      ----
-[ 1] 55689/tcp                  DENY IN     10.198.1.2                 (log)
+[ 1] 53352/tcp                  DENY IN     10.198.1.2                 (log)
 [ 2] 22/tcp                     ALLOW IN    Anywhere                  
 # the other machine is network namespace peer-ufw, address 10.198.1.2; it reaches this host at 10.198.1.1
 # proof:ufw-send from docs/src/content/docs/getting-started/vector-integration.md:410 (verbatim, in network namespace peer-ufw)
@@ -871,12 +872,12 @@ blocked, as expected
 # proof:ufw-check from docs/src/content/docs/getting-started/vector-integration.md:417 (verbatim; rerun up to 12 times, 5s apart, as the guide says to rerun a check)
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=ufw host=$HOST src_ip=$PEER dst_port=$PORT last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, src_ip, dst_port, protocol, message"
-{"_ingested":"2026-09-29 22:09:24.686748","_producer":"http","_time":"2026-09-29 22:09:20.999761","dst_port":55689,"env":"prod","host":"trawl-proof","message":"[UFW BLOCK] IN=peer-ufw-h OUT= MAC=aa:e9:52:c5:1f:e1:26:b7:c6:bf:63:59:08:00 SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=49161 DF PROTO=TCP SPT=54084 DPT=55689 WINDOW=64240 RES=0x00 SYN URGP=0 ","protocol":"tcp","service":"ufw","src_ip":"10.198.1.2"}
-{"_ingested":"2026-09-29 22:09:24.686748","_producer":"http","_time":"2026-09-29 22:09:22.024173","dst_port":55689,"env":"prod","host":"trawl-proof","message":"[UFW BLOCK] IN=peer-ufw-h OUT= MAC=aa:e9:52:c5:1f:e1:26:b7:c6:bf:63:59:08:00 SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=49162 DF PROTO=TCP SPT=54084 DPT=55689 WINDOW=64240 RES=0x00 SYN URGP=0 ","protocol":"tcp","service":"ufw","src_ip":"10.198.1.2"}
-{"_ingested":"2026-09-29 22:09:24.686748","_producer":"http","_time":"2026-09-29 22:09:23.051777","dst_port":55689,"env":"prod","host":"trawl-proof","message":"[UFW BLOCK] IN=peer-ufw-h OUT= MAC=aa:e9:52:c5:1f:e1:26:b7:c6:bf:63:59:08:00 SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=49163 DF PROTO=TCP SPT=54084 DPT=55689 WINDOW=64240 RES=0x00 SYN URGP=0 ","protocol":"tcp","service":"ufw","src_ip":"10.198.1.2"}
-{"_ingested":"2026-09-29 22:09:24.686748","_producer":"http","_time":"2026-09-29 22:09:24.072117","dst_port":55689,"env":"prod","host":"trawl-proof","message":"[UFW BLOCK] IN=peer-ufw-h OUT= MAC=aa:e9:52:c5:1f:e1:26:b7:c6:bf:63:59:08:00 SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=49164 DF PROTO=TCP SPT=54084 DPT=55689 WINDOW=64240 RES=0x00 SYN URGP=0 ","protocol":"tcp","service":"ufw","src_ip":"10.198.1.2"}
+{"_ingested":"2026-09-29 23:27:25.61708","_producer":"http","_time":"2026-09-29 23:27:21.966269","dst_port":53352,"env":"prod","host":"trawl-proof","message":"[UFW BLOCK] IN=peer-ufw-h OUT= MAC=9a:42:8d:df:9c:dc:56:73:8b:4c:bf:a0:08:00 SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=32010 DF PROTO=TCP SPT=46488 DPT=53352 WINDOW=64240 RES=0x00 SYN URGP=0 ","protocol":"tcp","service":"ufw","src_ip":"10.198.1.2"}
+{"_ingested":"2026-09-29 23:27:25.61708","_producer":"http","_time":"2026-09-29 23:27:22.994229","dst_port":53352,"env":"prod","host":"trawl-proof","message":"[UFW BLOCK] IN=peer-ufw-h OUT= MAC=9a:42:8d:df:9c:dc:56:73:8b:4c:bf:a0:08:00 SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=32011 DF PROTO=TCP SPT=46488 DPT=53352 WINDOW=64240 RES=0x00 SYN URGP=0 ","protocol":"tcp","service":"ufw","src_ip":"10.198.1.2"}
+{"_ingested":"2026-09-29 23:27:25.61708","_producer":"http","_time":"2026-09-29 23:27:24.01843","dst_port":53352,"env":"prod","host":"trawl-proof","message":"[UFW BLOCK] IN=peer-ufw-h OUT= MAC=9a:42:8d:df:9c:dc:56:73:8b:4c:bf:a0:08:00 SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=32012 DF PROTO=TCP SPT=46488 DPT=53352 WINDOW=64240 RES=0x00 SYN URGP=0 ","protocol":"tcp","service":"ufw","src_ip":"10.198.1.2"}
+{"_ingested":"2026-09-29 23:27:25.61708","_producer":"http","_time":"2026-09-29 23:27:25.041896","dst_port":53352,"env":"prod","host":"trawl-proof","message":"[UFW BLOCK] IN=peer-ufw-h OUT= MAC=9a:42:8d:df:9c:dc:56:73:8b:4c:bf:a0:08:00 SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=32013 DF PROTO=TCP SPT=46488 DPT=53352 WINDOW=64240 RES=0x00 SYN URGP=0 ","protocol":"tcp","service":"ufw","src_ip":"10.198.1.2"}
 # ufw check: rows on attempt 1 of 12
-# ufw: expected event: env=prod, service=ufw, host=trawl-proof, _producer=http, src_ip=10.198.1.2, dst_port=55689
+# ufw: expected event: env=prod, service=ufw, host=trawl-proof, _producer=http, src_ip=10.198.1.2, dst_port=53352
 # ufw: row 1 matches every field
 # ufw: row 2 matches every field
 # ufw: row 3 matches every field
@@ -924,14 +925,14 @@ debian@trawl-proof$ sudo ufw allow proto udp from "$DEVICE" to any port 1514
 Rule added
 # SIMULATED DEVICE: namespace peer-dev at 192.0.2.1 stands in for the appliance and sends one RFC 5424 test message; this is not a doc block
 
-root@trawl-proof# ip netns exec peer-dev bash -c 'printf "<134>1 %s fw01 filterlog - - - test message trawl-device-d64d0bc0-ae9a-4168-b26b-180449ac5501\n" \
->   "2026-09-29T22:09:28Z" > /dev/udp/192.0.2.254/1514'
+root@trawl-proof# ip netns exec peer-dev bash -c 'printf "<134>1 %s fw01 filterlog - - - test message trawl-device-afaf6d93-dcef-40de-8042-fb42500471a4\n" \
+>   "2026-09-29T23:27:29Z" > /dev/udp/192.0.2.254/1514'
 # proof:syslog-check from docs/src/content/docs/operate/ingestion.md:151 (verbatim; rerun up to 12 times, 5s apart, as the guide says to rerun a check)
 
 debian@trawl-proof$ trawl -p prod query "service=firewall _producer=syslog syslog_source_ip=$DEVICE last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, syslog_source_ip, syslog_severity, syslog_timestamp, syslog_facility, message"
-{"_ingested":"2026-09-29 22:09:28.243661","_producer":"syslog","_time":"2026-09-29 22:09:28","env":"prod","host":"fw01","message":"test message trawl-device-d64d0bc0-ae9a-4168-b26b-180449ac5501","service":"firewall","syslog_facility":"local0","syslog_severity":6,"syslog_source_ip":"192.0.2.1","syslog_timestamp":"2026-09-29T22:09:28.000000Z"}
-# syslog check: rows on attempt 2 of 12
-# syslog: expected event: env=prod, service=firewall, host=fw01, _producer=syslog, syslog_source_ip=192.0.2.1, syslog_severity=6, syslog_facility=local0, message contains 'trawl-device-d64d0bc0-ae9a-4168-b26b-180449ac5501', syslog_timestamp contains '22:09:28'
+{"_ingested":"2026-09-29 23:27:29.248949","_producer":"syslog","_time":"2026-09-29 23:27:29","env":"prod","host":"fw01","message":"test message trawl-device-afaf6d93-dcef-40de-8042-fb42500471a4","service":"firewall","syslog_facility":"local0","syslog_severity":6,"syslog_source_ip":"192.0.2.1","syslog_timestamp":"2026-09-29T23:27:29.000000Z"}
+# syslog check: rows on attempt 1 of 12
+# syslog: expected event: env=prod, service=firewall, host=fw01, _producer=syslog, syslog_source_ip=192.0.2.1, syslog_severity=6, syslog_facility=local0, message contains 'trawl-device-afaf6d93-dcef-40de-8042-fb42500471a4', syslog_timestamp contains '23:27:29'
 # syslog: row 1 matches every field
 PASS syslog: one row carries the whole expected event: 1 of 1 row(s) match every field
 
@@ -951,10 +952,10 @@ root@trawl-proof# sed -i 's/^TRAWL_INGEST_TOKEN=.*/TRAWL_INGEST_TOKEN=flt_not_a_
 > systemctl is-active vector
 TRAWL_URL=https://localhost:5514
 TRAWL_ENV=prod
-since=2026-09-29 22:09:34 UTC
-until=2026-09-29 22:09:34.470765 UTC
+since=2026-09-29 23:27:29 UTC
+until=2026-09-29 23:27:29.867251 UTC
 active
-# first start: 0 'Events dropped' line(s) in 143 line(s) of journalctl -u vector --since '2026-09-29 22:06:35 UTC' --until '2026-09-29 22:09:34.470765 UTC' (the whole first run); the verdict follows the 401 case's control
+# first start: 0 'Events dropped' line(s) in 137 line(s) of journalctl -u vector --since '2026-09-29 23:24:36 UTC' --until '2026-09-29 23:27:29.867251 UTC' (the whole first run); the verdict follows the 401 case's control
 # proof:vars from docs/src/content/docs/getting-started/vector-integration.md:231 (verbatim)
 
 debian@trawl-proof$ SENDER_ENV=prod
@@ -966,7 +967,7 @@ debian@trawl-proof$ SENDER_ENV=prod
 debian@trawl-proof$ sudo systemd-run --collect --quiet --unit "$MARKER" /bin/echo "$MARKER"
 # 401: the assertion is an env-free query for the marker; an event wrongly accepted under the edited env still matches it
 
-debian@trawl-proof$ trawl -p prod query 'service=trawl-check-40c92a53-db44-477d-bb74-2ec0e5881333 "trawl-check-40c92a53-db44-477d-bb74-2ec0e5881333" last=1d _ingested>="2026-09-29T22:09:36Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
+debian@trawl-proof$ trawl -p prod query 'service=trawl-check-6ff69f9a-40c5-4c94-85b1-1cc5f661e146 "trawl-check-6ff69f9a-40c5-4c94-85b1-1cc5f661e146" last=1d _ingested>="2026-09-29T23:27:32Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
 (no output)
 # 401 env-free absence: no matching rows after 12 attempts, 5s apart; 12 of 12 queries succeeded
 PASS 401: no event for the marker, in any env: 0 rows; 12 of 12 queries succeeded, the last on attempt 12
@@ -975,34 +976,34 @@ PASS 401: no event for the marker, in any env: 0 rows; 12 of 12 queries succeede
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=$MARKER host=$HOST \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, message"
 
-root@trawl-proof# journalctl --no-pager -o cat -u trawl-check-40c92a53-db44-477d-bb74-2ec0e5881333
-Started trawl-check-40c92a53-db44-477d-bb74-2ec0e5881333.service - [systemd-run] /bin/echo trawl-check-40c92a53-db44-477d-bb74-2ec0e5881333.
-trawl-check-40c92a53-db44-477d-bb74-2ec0e5881333
-trawl-check-40c92a53-db44-477d-bb74-2ec0e5881333.service: Deactivated successfully.
+root@trawl-proof# journalctl --no-pager -o cat -u trawl-check-6ff69f9a-40c5-4c94-85b1-1cc5f661e146
+Started trawl-check-6ff69f9a-40c5-4c94-85b1-1cc5f661e146.service - [systemd-run] /bin/echo trawl-check-6ff69f9a-40c5-4c94-85b1-1cc5f661e146.
+trawl-check-6ff69f9a-40c5-4c94-85b1-1cc5f661e146
+trawl-check-6ff69f9a-40c5-4c94-85b1-1cc5f661e146.service: Deactivated successfully.
 PASS 401: the marker's unit wrote its line to the local journal
 PASS 401: Vector was still active at the end of the window: active
 
-root@trawl-proof# journalctl -u vector --since '2026-09-29 22:09:34 UTC' -o cat | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E ' ERROR sink' | grep -v 'has been suppressed' | cut -c1-300 | grep -E 'Unauthorized|Bad Request|dropped'
-2026-09-29T22:09:42.048137Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=1}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
-2026-09-29T22:09:42.048203Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=1}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=144 reason="Service call failed. No retries or retries exhausted."
-2026-09-29T22:09:47.480746Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=2}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
-2026-09-29T22:09:52.975044Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=3}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
-2026-09-29T22:09:52.975066Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=3}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=22 reason="Service call failed. No retries or retries exhausted."
-2026-09-29T22:09:58.469696Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=4}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
-2026-09-29T22:10:09.785272Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=5}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
-2026-09-29T22:10:09.785295Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=5}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=48 reason="Service call failed. No retries or retries exhausted."
-2026-09-29T22:10:14.959068Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=6}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
-2026-09-29T22:10:20.477891Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=7}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
-2026-09-29T22:10:20.477924Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=7}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=24 reason="Service call failed. No retries or retries exhausted."
-2026-09-29T22:10:25.975842Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=8}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
-2026-09-29T22:10:31.451810Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=9}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
-2026-09-29T22:10:31.451836Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=9}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=26 reason="Service call failed. No retries or retries exhausted."
-2026-09-29T22:10:36.854174Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=10}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
-2026-09-29T22:10:42.442285Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=11}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
-2026-09-29T22:10:42.442307Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=11}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=40 reason="Service call failed. No retries or retries exhausted."
+root@trawl-proof# journalctl -u vector --since '2026-09-29 23:27:29 UTC' -o cat | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E ' ERROR sink' | grep -v 'has been suppressed' | cut -c1-300 | grep -E 'Unauthorized|Bad Request|dropped'
+2026-09-29T23:27:37.878159Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=1}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
+2026-09-29T23:27:37.878201Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=1}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=147 reason="Service call failed. No retries or retries exhausted."
+2026-09-29T23:27:43.383572Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=2}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
+2026-09-29T23:27:48.387191Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=3}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
+2026-09-29T23:27:48.387216Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=3}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=23 reason="Service call failed. No retries or retries exhausted."
+2026-09-29T23:27:53.832079Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=4}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
+2026-09-29T23:27:59.315982Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=5}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
+2026-09-29T23:27:59.316007Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=5}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=19 reason="Service call failed. No retries or retries exhausted."
+2026-09-29T23:28:04.875298Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=6}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
+2026-09-29T23:28:09.993754Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=7}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
+2026-09-29T23:28:09.993784Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=7}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=19 reason="Service call failed. No retries or retries exhausted."
+2026-09-29T23:28:15.106064Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=8}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
+2026-09-29T23:28:20.222574Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=9}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
+2026-09-29T23:28:20.222596Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=9}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=19 reason="Service call failed. No retries or retries exhausted."
+2026-09-29T23:28:25.375007Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=10}: vector_common::internal_event::component_events_dropped: Internal log [Events dropped] is being suppressed to avoid flooding.
+2026-09-29T23:28:30.490995Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=11}: vector::sinks::util::retries: Not retriable; dropping the request. reason="Default retry strategy: Unauthorized"
+2026-09-29T23:28:30.491017Z ERROR sink{component_kind="sink" component_id=trawld component_type=http}:request{request_id=11}: vector_common::internal_event::component_events_dropped: Events dropped intentional=false count=25 reason="Service call failed. No retries or retries exhausted."
 PASS 401: Vector logs the 401 from the trawld sink
-PASS 401: control, the first-start drop extraction counts the rejected events: 16 'Events dropped' line(s), count=304 in total
-PASS Vector dropped no events on its first start: 0 'Events dropped' line(s) in 143 line(s) of journalctl -u vector --since '2026-09-29 22:06:35 UTC' --until '2026-09-29 22:09:34.470765 UTC'; control: the 401 case's drops counted
+PASS 401: control, the first-start drop extraction counts the rejected events: 16 'Events dropped' line(s), count=252 in total
+PASS Vector dropped no events on its first start: 0 'Events dropped' line(s) in 137 line(s) of journalctl -u vector --since '2026-09-29 23:24:36 UTC' --until '2026-09-29 23:27:29.867251 UTC'; control: the 401 case's drops counted
 
 root@trawl-proof# cp -p /root/evidence/vector.default /etc/default/vector
 > grep -E '^TRAWL_(URL|ENV)=' /etc/default/vector
@@ -1012,8 +1013,8 @@ root@trawl-proof# cp -p /root/evidence/vector.default /etc/default/vector
 > systemctl is-active vector
 TRAWL_URL=https://localhost:5514
 TRAWL_ENV=prod
-since=2026-09-29 22:10:42 UTC
-until=2026-09-29 22:10:42.904074 UTC
+since=2026-09-29 23:28:31 UTC
+until=2026-09-29 23:28:31.182842 UTC
 active
 # proof:vars from docs/src/content/docs/getting-started/vector-integration.md:231 (verbatim)
 
@@ -1027,15 +1028,15 @@ debian@trawl-proof$ sudo systemd-run --collect --quiet --unit "$MARKER" /bin/ech
 # proof:journald-check from docs/src/content/docs/getting-started/vector-integration.md:265 (verbatim; rerun up to 12 times, 5s apart, as the guide says to rerun a check)
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=$MARKER host=$HOST \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, message"
-{"_ingested":"2026-09-29 22:10:52.686694","_producer":"http","_time":"2026-09-29 22:10:48.112465","env":"prod","host":"trawl-proof","message":"trawl-check-c5cdd36e-e239-4c36-b83e-efad5ec09bb7","service":"trawl-check-c5cdd36e-e239-4c36-b83e-efad5ec09bb7"}
+{"_ingested":"2026-09-29 23:28:40.953033","_producer":"http","_time":"2026-09-29 23:28:36.418292","env":"prod","host":"trawl-proof","message":"trawl-check-bd3cb49e-7ec9-4759-b71f-b54f5f282005","service":"trawl-check-bd3cb49e-7ec9-4759-b71f-b54f5f282005"}
 # 401 positive control: rows on attempt 2 of 12
-# 401: positive control after restore: expected event: env=prod, service=trawl-check-c5cdd36e-e239-4c36-b83e-efad5ec09bb7, host=trawl-proof, _producer=http, message=trawl-check-c5cdd36e-e239-4c36-b83e-efad5ec09bb7
+# 401: positive control after restore: expected event: env=prod, service=trawl-check-bd3cb49e-7ec9-4759-b71f-b54f5f282005, host=trawl-proof, _producer=http, message=trawl-check-bd3cb49e-7ec9-4759-b71f-b54f5f282005
 # 401: positive control after restore: row 1 matches every field
 PASS 401: positive control after restore: one row carries the whole expected event: 1 of 1 row(s) match every field
 # 401: the env-free marker query from the negative, for this marker
 
-debian@trawl-proof$ trawl -p prod query 'service=trawl-check-c5cdd36e-e239-4c36-b83e-efad5ec09bb7 "trawl-check-c5cdd36e-e239-4c36-b83e-efad5ec09bb7" last=1d _ingested>="2026-09-29T22:10:47Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
-{"_ingested":"2026-09-29 22:10:52.686694","_producer":"http","_time":"2026-09-29 22:10:48.112465","env":"prod","host":"trawl-proof","message":"trawl-check-c5cdd36e-e239-4c36-b83e-efad5ec09bb7","service":"trawl-check-c5cdd36e-e239-4c36-b83e-efad5ec09bb7"}
+debian@trawl-proof$ trawl -p prod query 'service=trawl-check-bd3cb49e-7ec9-4759-b71f-b54f5f282005 "trawl-check-bd3cb49e-7ec9-4759-b71f-b54f5f282005" last=1d _ingested>="2026-09-29T23:28:35Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
+{"_ingested":"2026-09-29 23:28:40.953033","_producer":"http","_time":"2026-09-29 23:28:36.418292","env":"prod","host":"trawl-proof","message":"trawl-check-bd3cb49e-7ec9-4759-b71f-b54f5f282005","service":"trawl-check-bd3cb49e-7ec9-4759-b71f-b54f5f282005"}
 # 401 env-free control: rows on attempt 1 of 12
 PASS 401: control, the env-free marker query finds the restored marker: 1 row(s)
 
@@ -1052,8 +1053,8 @@ root@trawl-proof# sed -i 's/^TRAWL_ENV=.*/TRAWL_ENV=Prod/' /etc/default/vector
 > systemctl is-active vector
 TRAWL_URL=https://localhost:5514
 TRAWL_ENV=Prod
-since=2026-09-29 22:10:53 UTC
-until=2026-09-29 22:10:53.880056 UTC
+since=2026-09-29 23:28:42 UTC
+until=2026-09-29 23:28:42.243041 UTC
 active
 # proof:vars from docs/src/content/docs/getting-started/vector-integration.md:231 (verbatim)
 
@@ -1066,7 +1067,7 @@ debian@trawl-proof$ SENDER_ENV=prod
 debian@trawl-proof$ sudo systemd-run --collect --quiet --unit "$MARKER" /bin/echo "$MARKER"
 # invalid_env: the assertion is an env-free query for the marker; an event wrongly accepted under the edited env still matches it
 
-debian@trawl-proof$ trawl -p prod query 'service=trawl-check-34fc38fc-11ef-4754-ac43-de18d60ed923 "trawl-check-34fc38fc-11ef-4754-ac43-de18d60ed923" last=1d _ingested>="2026-09-29T22:10:58Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
+debian@trawl-proof$ trawl -p prod query 'service=trawl-check-518cfc12-1884-4537-a02b-1835ab2eb138 "trawl-check-518cfc12-1884-4537-a02b-1835ab2eb138" last=1d _ingested>="2026-09-29T23:28:46Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
 (no output)
 # invalid_env env-free absence: no matching rows after 12 attempts, 5s apart; 12 of 12 queries succeeded
 PASS invalid_env: no event for the marker, in any env: 0 rows; 12 of 12 queries succeeded, the last on attempt 12
@@ -1075,20 +1076,20 @@ PASS invalid_env: no event for the marker, in any env: 0 rows; 12 of 12 queries 
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=$MARKER host=$HOST \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, message"
 
-root@trawl-proof# journalctl --no-pager -o cat -u trawl-check-34fc38fc-11ef-4754-ac43-de18d60ed923
-Started trawl-check-34fc38fc-11ef-4754-ac43-de18d60ed923.service - [systemd-run] /bin/echo trawl-check-34fc38fc-11ef-4754-ac43-de18d60ed923.
-trawl-check-34fc38fc-11ef-4754-ac43-de18d60ed923
-trawl-check-34fc38fc-11ef-4754-ac43-de18d60ed923.service: Deactivated successfully.
+root@trawl-proof# journalctl --no-pager -o cat -u trawl-check-518cfc12-1884-4537-a02b-1835ab2eb138
+Started trawl-check-518cfc12-1884-4537-a02b-1835ab2eb138.service - [systemd-run] /bin/echo trawl-check-518cfc12-1884-4537-a02b-1835ab2eb138.
+trawl-check-518cfc12-1884-4537-a02b-1835ab2eb138
+trawl-check-518cfc12-1884-4537-a02b-1835ab2eb138.service: Deactivated successfully.
 PASS invalid_env: the marker's unit wrote its line to the local journal
 PASS invalid_env: Vector was still active at the end of the window: active
 
-root@trawl-proof# journalctl -u vector --since '2026-09-29 22:10:53 UTC' -o cat | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E ' ERROR sink' | grep -v 'has been suppressed' | cut -c1-300 | grep -E 'Unauthorized|Bad Request|dropped'
+root@trawl-proof# journalctl -u vector --since '2026-09-29 23:28:42 UTC' -o cat | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E ' ERROR sink' | grep -v 'has been suppressed' | cut -c1-300 | grep -E 'Unauthorized|Bad Request|dropped'
 (none)
 
 debian@trawl-proof$ m=$(curl -fsS --cacert /var/lib/trawl/tls/cert.pem https://localhost:5514/metrics)
 > printf '%s\n' "$m" | grep -F 'trawl_ingest_events_rejected_total{reason="invalid_env"}' || true
-trawl_ingest_events_rejected_total{reason="invalid_env"} 325
-PASS invalid_env: trawl_ingest_events_rejected_total{reason="invalid_env"} rose: 0 -> 325; attributable to the edited env, not to the marker's batch alone
+trawl_ingest_events_rejected_total{reason="invalid_env"} 326
+PASS invalid_env: trawl_ingest_events_rejected_total{reason="invalid_env"} rose: 0 -> 326; attributable to the edited env, not to the marker's batch alone
 PASS invalid_env: Vector logs no sink error (trawld answered 200): the same read found the 401 in the 401 case
 
 root@trawl-proof# cp -p /root/evidence/vector.default /etc/default/vector
@@ -1099,8 +1100,8 @@ root@trawl-proof# cp -p /root/evidence/vector.default /etc/default/vector
 > systemctl is-active vector
 TRAWL_URL=https://localhost:5514
 TRAWL_ENV=prod
-since=2026-09-29 22:11:58 UTC
-until=2026-09-29 22:11:58.445210 UTC
+since=2026-09-29 23:29:44 UTC
+until=2026-09-29 23:29:44.727450 UTC
 active
 # proof:vars from docs/src/content/docs/getting-started/vector-integration.md:231 (verbatim)
 
@@ -1114,15 +1115,15 @@ debian@trawl-proof$ sudo systemd-run --collect --quiet --unit "$MARKER" /bin/ech
 # proof:journald-check from docs/src/content/docs/getting-started/vector-integration.md:265 (verbatim; rerun up to 12 times, 5s apart, as the guide says to rerun a check)
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=$MARKER host=$HOST \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, message"
-{"_ingested":"2026-09-29 22:12:07.863463","_producer":"http","_time":"2026-09-29 22:12:03.337116","env":"prod","host":"trawl-proof","message":"trawl-check-87ce7f84-d2ba-471b-8334-14ca23f49f3b","service":"trawl-check-87ce7f84-d2ba-471b-8334-14ca23f49f3b"}
+{"_ingested":"2026-09-29 23:29:54.361669","_producer":"http","_time":"2026-09-29 23:29:49.819161","env":"prod","host":"trawl-proof","message":"trawl-check-c223a5e2-ace2-4e02-83f1-9097b6658bed","service":"trawl-check-c223a5e2-ace2-4e02-83f1-9097b6658bed"}
 # invalid_env positive control: rows on attempt 2 of 12
-# invalid_env: positive control after restore: expected event: env=prod, service=trawl-check-87ce7f84-d2ba-471b-8334-14ca23f49f3b, host=trawl-proof, _producer=http, message=trawl-check-87ce7f84-d2ba-471b-8334-14ca23f49f3b
+# invalid_env: positive control after restore: expected event: env=prod, service=trawl-check-c223a5e2-ace2-4e02-83f1-9097b6658bed, host=trawl-proof, _producer=http, message=trawl-check-c223a5e2-ace2-4e02-83f1-9097b6658bed
 # invalid_env: positive control after restore: row 1 matches every field
 PASS invalid_env: positive control after restore: one row carries the whole expected event: 1 of 1 row(s) match every field
 # invalid_env: the env-free marker query from the negative, for this marker
 
-debian@trawl-proof$ trawl -p prod query 'service=trawl-check-87ce7f84-d2ba-471b-8334-14ca23f49f3b "trawl-check-87ce7f84-d2ba-471b-8334-14ca23f49f3b" last=1d _ingested>="2026-09-29T22:12:02Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
-{"_ingested":"2026-09-29 22:12:07.863463","_producer":"http","_time":"2026-09-29 22:12:03.337116","env":"prod","host":"trawl-proof","message":"trawl-check-87ce7f84-d2ba-471b-8334-14ca23f49f3b","service":"trawl-check-87ce7f84-d2ba-471b-8334-14ca23f49f3b"}
+debian@trawl-proof$ trawl -p prod query 'service=trawl-check-c223a5e2-ace2-4e02-83f1-9097b6658bed "trawl-check-c223a5e2-ace2-4e02-83f1-9097b6658bed" last=1d _ingested>="2026-09-29T23:29:49Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
+{"_ingested":"2026-09-29 23:29:54.361669","_producer":"http","_time":"2026-09-29 23:29:49.819161","env":"prod","host":"trawl-proof","message":"trawl-check-c223a5e2-ace2-4e02-83f1-9097b6658bed","service":"trawl-check-c223a5e2-ace2-4e02-83f1-9097b6658bed"}
 # invalid_env env-free control: rows on attempt 1 of 12
 PASS invalid_env: control, the env-free marker query finds the restored marker: 1 row(s)
 
@@ -1139,8 +1140,8 @@ root@trawl-proof# sed -i 's/^TRAWL_ENV=.*/TRAWL_ENV=staging/' /etc/default/vecto
 > systemctl is-active vector
 TRAWL_URL=https://localhost:5514
 TRAWL_ENV=staging
-since=2026-09-29 22:12:09 UTC
-until=2026-09-29 22:12:09.246273 UTC
+since=2026-09-29 23:29:55 UTC
+until=2026-09-29 23:29:55.607790 UTC
 active
 # proof:vars from docs/src/content/docs/getting-started/vector-integration.md:231 (verbatim)
 
@@ -1153,7 +1154,7 @@ debian@trawl-proof$ SENDER_ENV=prod
 debian@trawl-proof$ sudo systemd-run --collect --quiet --unit "$MARKER" /bin/echo "$MARKER"
 # env_not_allowed: the assertion is an env-free query for the marker; an event wrongly accepted under the edited env still matches it
 
-debian@trawl-proof$ trawl -p prod query 'service=trawl-check-a0fe48ae-5a3b-48e5-bba9-920243fd04d1 "trawl-check-a0fe48ae-5a3b-48e5-bba9-920243fd04d1" last=1d _ingested>="2026-09-29T22:12:14Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
+debian@trawl-proof$ trawl -p prod query 'service=trawl-check-1b036d8c-f878-48c0-ae35-716daa12935d "trawl-check-1b036d8c-f878-48c0-ae35-716daa12935d" last=1d _ingested>="2026-09-29T23:30:00Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
 (no output)
 # env_not_allowed env-free absence: no matching rows after 12 attempts, 5s apart; 12 of 12 queries succeeded
 PASS env_not_allowed: no event for the marker, in any env: 0 rows; 12 of 12 queries succeeded, the last on attempt 12
@@ -1162,20 +1163,20 @@ PASS env_not_allowed: no event for the marker, in any env: 0 rows; 12 of 12 quer
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=$MARKER host=$HOST \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, message"
 
-root@trawl-proof# journalctl --no-pager -o cat -u trawl-check-a0fe48ae-5a3b-48e5-bba9-920243fd04d1
-Started trawl-check-a0fe48ae-5a3b-48e5-bba9-920243fd04d1.service - [systemd-run] /bin/echo trawl-check-a0fe48ae-5a3b-48e5-bba9-920243fd04d1.
-trawl-check-a0fe48ae-5a3b-48e5-bba9-920243fd04d1
-trawl-check-a0fe48ae-5a3b-48e5-bba9-920243fd04d1.service: Deactivated successfully.
+root@trawl-proof# journalctl --no-pager -o cat -u trawl-check-1b036d8c-f878-48c0-ae35-716daa12935d
+Started trawl-check-1b036d8c-f878-48c0-ae35-716daa12935d.service - [systemd-run] /bin/echo trawl-check-1b036d8c-f878-48c0-ae35-716daa12935d.
+trawl-check-1b036d8c-f878-48c0-ae35-716daa12935d
+trawl-check-1b036d8c-f878-48c0-ae35-716daa12935d.service: Deactivated successfully.
 PASS env_not_allowed: the marker's unit wrote its line to the local journal
 PASS env_not_allowed: Vector was still active at the end of the window: active
 
-root@trawl-proof# journalctl -u vector --since '2026-09-29 22:12:09 UTC' -o cat | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E ' ERROR sink' | grep -v 'has been suppressed' | cut -c1-300 | grep -E 'Unauthorized|Bad Request|dropped'
+root@trawl-proof# journalctl -u vector --since '2026-09-29 23:29:55 UTC' -o cat | sed -e 's/\x1b\[[0-9;]*m//g' | grep -E ' ERROR sink' | grep -v 'has been suppressed' | cut -c1-300 | grep -E 'Unauthorized|Bad Request|dropped'
 (none)
 
 debian@trawl-proof$ m=$(curl -fsS --cacert /var/lib/trawl/tls/cert.pem https://localhost:5514/metrics)
 > printf '%s\n' "$m" | grep -F 'trawl_ingest_events_rejected_total{reason="env_not_allowed"}' || true
-trawl_ingest_events_rejected_total{reason="env_not_allowed"} 329
-PASS env_not_allowed: trawl_ingest_events_rejected_total{reason="env_not_allowed"} rose: 0 -> 329; attributable to the edited env, not to the marker's batch alone
+trawl_ingest_events_rejected_total{reason="env_not_allowed"} 321
+PASS env_not_allowed: trawl_ingest_events_rejected_total{reason="env_not_allowed"} rose: 0 -> 321; attributable to the edited env, not to the marker's batch alone
 PASS env_not_allowed: Vector logs no sink error (trawld answered 200): the same read found the 401 in the 401 case
 
 root@trawl-proof# cp -p /root/evidence/vector.default /etc/default/vector
@@ -1186,8 +1187,8 @@ root@trawl-proof# cp -p /root/evidence/vector.default /etc/default/vector
 > systemctl is-active vector
 TRAWL_URL=https://localhost:5514
 TRAWL_ENV=prod
-since=2026-09-29 22:13:12 UTC
-until=2026-09-29 22:13:12.669284 UTC
+since=2026-09-29 23:30:58 UTC
+until=2026-09-29 23:30:58.750939 UTC
 active
 # proof:vars from docs/src/content/docs/getting-started/vector-integration.md:231 (verbatim)
 
@@ -1201,15 +1202,15 @@ debian@trawl-proof$ sudo systemd-run --collect --quiet --unit "$MARKER" /bin/ech
 # proof:journald-check from docs/src/content/docs/getting-started/vector-integration.md:265 (verbatim; rerun up to 12 times, 5s apart, as the guide says to rerun a check)
 
 debian@trawl-proof$ trawl -p prod query "env=$SENDER_ENV service=$MARKER host=$HOST \"$MARKER\" last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, message"
-{"_ingested":"2026-09-29 22:13:22.265696","_producer":"http","_time":"2026-09-29 22:13:17.724795","env":"prod","host":"trawl-proof","message":"trawl-check-df8b7b48-4e32-41a4-aa64-2ad3628b0dec","service":"trawl-check-df8b7b48-4e32-41a4-aa64-2ad3628b0dec"}
+{"_ingested":"2026-09-29 23:31:04.265419","_producer":"http","_time":"2026-09-29 23:30:59.727726","env":"prod","host":"trawl-proof","message":"trawl-check-efcf1a76-76a0-4bbb-81d0-4f47dd632388","service":"trawl-check-efcf1a76-76a0-4bbb-81d0-4f47dd632388"}
 # env_not_allowed positive control: rows on attempt 2 of 12
-# env_not_allowed: positive control after restore: expected event: env=prod, service=trawl-check-df8b7b48-4e32-41a4-aa64-2ad3628b0dec, host=trawl-proof, _producer=http, message=trawl-check-df8b7b48-4e32-41a4-aa64-2ad3628b0dec
+# env_not_allowed: positive control after restore: expected event: env=prod, service=trawl-check-efcf1a76-76a0-4bbb-81d0-4f47dd632388, host=trawl-proof, _producer=http, message=trawl-check-efcf1a76-76a0-4bbb-81d0-4f47dd632388
 # env_not_allowed: positive control after restore: row 1 matches every field
 PASS env_not_allowed: positive control after restore: one row carries the whole expected event: 1 of 1 row(s) match every field
 # env_not_allowed: the env-free marker query from the negative, for this marker
 
-debian@trawl-proof$ trawl -p prod query 'service=trawl-check-df8b7b48-4e32-41a4-aa64-2ad3628b0dec "trawl-check-df8b7b48-4e32-41a4-aa64-2ad3628b0dec" last=1d _ingested>="2026-09-29T22:13:17Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
-{"_ingested":"2026-09-29 22:13:22.265696","_producer":"http","_time":"2026-09-29 22:13:17.724795","env":"prod","host":"trawl-proof","message":"trawl-check-df8b7b48-4e32-41a4-aa64-2ad3628b0dec","service":"trawl-check-df8b7b48-4e32-41a4-aa64-2ad3628b0dec"}
+debian@trawl-proof$ trawl -p prod query 'service=trawl-check-efcf1a76-76a0-4bbb-81d0-4f47dd632388 "trawl-check-efcf1a76-76a0-4bbb-81d0-4f47dd632388" last=1d _ingested>="2026-09-29T23:30:59Z" | head 20 | table _time, _ingested, _producer, env, service, host, message'
+{"_ingested":"2026-09-29 23:31:04.265419","_producer":"http","_time":"2026-09-29 23:30:59.727726","env":"prod","host":"trawl-proof","message":"trawl-check-efcf1a76-76a0-4bbb-81d0-4f47dd632388","service":"trawl-check-efcf1a76-76a0-4bbb-81d0-4f47dd632388"}
 # env_not_allowed env-free control: rows on attempt 1 of 12
 PASS env_not_allowed: control, the env-free marker query finds the restored marker: 1 row(s)
 
@@ -1219,7 +1220,7 @@ root@trawl-proof# cmp -s /root/evidence/vector.default /etc/default/vector || { 
 ==============================================================================
 == 11 versions and hashes
 ==============================================================================
-# commit 277eff42e101b217a39d2669a0ab47920189ec4d
+# commit d71e8a2b72bb85777f5472419c98bee6190b4da7
 # image debian-13-genericcloud-amd64-20260914-2601.tar.xz sha512 ba03aae045d06ee3ccd8fe6d4fdac58f7fbb25e635927f23055223ad8be75c21850fef84b8146066ec1f24ffab65f4fc86d55344845e72e73d9fd569b83f26a0
 
 root@trawl-proof# uname -r
@@ -1237,8 +1238,8 @@ root@trawl-proof# uname -r
 > sha256sum /etc/vector/vector.d/*.toml /etc/trawl/trawld.toml
 6.12.107+deb13-cloud-amd64
 13.7
-trawld 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
-trawl 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+trawld 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+trawl 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
 vector 0.57.0 (x86_64-unknown-linux-gnu 8832452 2026-07-14 20:58:30.491174540)
 nginx version: nginx/1.26.3
 docker server 26.1.5+dfsg1
@@ -1259,8 +1260,8 @@ alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 eca5e22871d4c5f1eed5ff7c83bddfec0949e1fb18319b3b4276742e02886ba4  /etc/vector/vector.d/docker.toml
 f19538f76786d84a84d756766a73264ad407688cd064409d4a68a11ed0d864a0  /etc/vector/vector.d/nginx.toml
 2306a0e000bd82b57f0d49103bef3c211be389abc8854ca8c5617b769e285c5b  /etc/trawl/trawld.toml
-PASS trawld --version names the tested commit: trawld 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
-PASS trawld --version is not a dirty build: trawld 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+PASS trawld --version names the tested commit: trawld 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
+PASS trawld --version is not a dirty build: trawld 0.9.0 (d71e8a2b 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)
 
 $ sha256sum config/vector/debian/base.toml config/vector/debian/nginx.toml config/vector/debian/docker.toml
 2c8e44d13d7696e35b27eb5f8f9343ceab781f9670cb579e54157ba665f546f6  $REPO/config/vector/debian/base.toml
