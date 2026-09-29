@@ -109,6 +109,17 @@ where
 {
     let mut command = trawld();
     command.args(args);
+    observe(command, args, env)
+}
+
+/// Run `command`, a doctor run as built by [`trawld`] or [`Userns`], with
+/// `env` added, and watch it until it exits.
+fn observe<A, K, V>(mut command: Command, args: &[A], env: &[(K, V)]) -> Observed
+where
+    A: AsRef<OsStr>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
     for (name, value) in env {
         command.env(name, value);
         if name.as_ref() == "HOME" {
@@ -167,6 +178,167 @@ where
     }
 }
 
+/// The name that makes an unavailable user namespace a test failure rather
+/// than a skip. CI sets it, so a privileged test that did not run there is
+/// never counted as passing evidence.
+pub const REQUIRE_USERNS: &str = "TRAWL_TEST_REQUIRE_USERNS";
+
+/// Running the doctor as root inside an unprivileged user namespace, the
+/// way the root-run and read-only-mount tests do: `unshare --user
+/// --map-root-user --mount`, which maps this test's uid to 0, so the doctor
+/// sees euid 0 and the files the test made as owned by root.
+#[derive(Debug, Clone)]
+pub struct Userns {
+    unshare: PathBuf,
+    mount: PathBuf,
+    shell: PathBuf,
+}
+
+/// Inside the namespace: bind the directory `$2` onto itself read-only when
+/// it is not empty, then exec the rest of the arguments from the same
+/// working directory. `$1` is `mount`.
+/// Any failure ends the run before the doctor starts, with a status the
+/// doctor never exits with.
+const USERNS_SCRIPT: &str = r#"set -e
+mount="$1"
+ro="$2"
+shift 2
+if [ -n "$ro" ]; then
+    "$mount" --bind "$ro" "$ro"
+    "$mount" -o remount,bind,ro "$ro"
+    # A working directory opened before the mount still names the
+    # writable tree; look it up again, through the read-only one.
+    cd "$PWD"
+fi
+exec "$@"
+"#;
+
+impl Userns {
+    /// The namespace tools, once a probe proved this host lets this user
+    /// make the namespace, be root in it, and mount a directory read-only
+    /// there; otherwise why not.
+    ///
+    /// # Errors
+    /// The reason the namespace is unavailable.
+    pub fn probe() -> Result<Self, String> {
+        let find = |name: &str| {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            std::env::split_paths(&path)
+                .chain(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(PathBuf::from))
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_file())
+                .ok_or_else(|| format!("no {name} on PATH"))
+        };
+        let tools = Self {
+            unshare: find("unshare")?,
+            mount: find("mount")?,
+            shell: find("sh")?,
+        };
+        let dir = tempfile::tempdir().map_err(|e| format!("a probe directory: {e}"))?;
+        let probe = dir.path().join("probe");
+        std::fs::write(&probe, b"probe").map_err(|e| format!("a probe file: {e}"))?;
+        // As root in the namespace, a write to the read-only bind mount must
+        // fail; `id -u` must say 0.
+        let output = tools
+            .command(Some(dir.path()))
+            .args([
+                tools.shell.as_os_str(),
+                OsStr::new("-c"),
+                OsStr::new(
+                    r#"[ "$(id -u)" = 0 ] || exit 90; if ( : > "$1/probe" ) 2>/dev/null; then exit 91; fi"#,
+                ),
+                OsStr::new("sh"),
+                dir.path().as_os_str(),
+            ])
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .output()
+            .map_err(|e| format!("{} does not run: {e}", tools.unshare.display()))?;
+        match output.status.code() {
+            Some(0) => {}
+            Some(90) => return Err("the namespace's uid is not 0".to_owned()),
+            Some(91) => return Err("the read-only bind mount took a write".to_owned()),
+            _ => {
+                return Err(format!(
+                    "unshare --user --map-root-user --mount with a read-only bind mount \
+                     failed ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+        }
+        if std::fs::read(&probe).ok().as_deref() != Some(b"probe".as_slice()) {
+            return Err("the read-only bind mount's file changed".to_owned());
+        }
+        Ok(tools)
+    }
+
+    /// [`Userns::probe`] for the test `test`: the tools, or `None` after
+    /// printing `SKIPPED: ...` when the namespace is unavailable.
+    ///
+    /// # Panics
+    /// When the namespace is unavailable and [`REQUIRE_USERNS`] is `1`.
+    pub fn for_test(test: &str) -> Option<Self> {
+        match Self::probe() {
+            Ok(tools) => Some(tools),
+            Err(why) if std::env::var_os(REQUIRE_USERNS).is_some_and(|v| v == "1") => {
+                panic!("{test}: {REQUIRE_USERNS}=1, and a user namespace is unavailable: {why}")
+            }
+            Err(why) => {
+                eprintln!("SKIPPED: {test}: a user namespace is unavailable here ({why})");
+                None
+            }
+        }
+    }
+
+    /// `unshare` with the empty environment [`trawld`] runs with, set to
+    /// run [`USERNS_SCRIPT`]'s arguments, with `read_only` bound read-only.
+    fn command(&self, read_only: Option<&Path>) -> Command {
+        let mut command = Command::new(&self.unshare);
+        command.env_clear();
+        for name in ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command
+            .args(["--user", "--map-root-user", "--mount"])
+            .arg(&self.shell)
+            .args(["-c", USERNS_SCRIPT, "sh"])
+            .arg(&self.mount)
+            .arg(read_only.map_or_else(OsString::new, |dir| dir.as_os_str().to_owned()));
+        command
+    }
+}
+
+/// [`run_doctor`] as root in a user namespace, with `read_only`, when
+/// given, bind-mounted read-only over itself for the run.
+///
+/// # Panics
+/// As [`run_doctor_observed`], and when the namespace set-up fails after
+/// [`Userns::probe`] succeeded.
+pub fn run_doctor_in_userns<A, K, V>(
+    userns: &Userns,
+    read_only: Option<&Path>,
+    args: &[A],
+    env: &[(K, V)],
+) -> (i32, String, String)
+where
+    A: AsRef<OsStr>,
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut command = userns.command(read_only);
+    command.arg(env!("CARGO_BIN_EXE_trawld")).args(args);
+    let observed = observe(command, args, env);
+    assert!(
+        matches!(observed.code, 0..=3),
+        "the user namespace set-up failed (exit {}): {}",
+        observed.code,
+        observed.stderr
+    );
+    (observed.code, observed.stdout, observed.stderr)
+}
+
 /// Whether this test process itself runs with `no_new_privs`, which its
 /// children inherit, so that a child showing it proves nothing.
 #[cfg(target_os = "linux")]
@@ -201,10 +373,16 @@ impl ChildWatch {
     }
 
     /// Record every child any of the process's threads has right now, and
-    /// whether the process has `no_new_privs` set.
+    /// whether the process has `no_new_privs` set, once it is trawld: a
+    /// user-namespace run starts as `unshare` and a shell, whose `mount`
+    /// children are the set-up, not the doctor's.
     fn sample(&mut self) {
         #[cfg(target_os = "linux")]
         {
+            let comm = std::fs::read_to_string(format!("/proc/{}/comm", self.pid));
+            if comm.ok().as_deref().map(str::trim_end) != Some("trawld") {
+                return;
+            }
             if let Ok(status) = std::fs::read_to_string(format!("/proc/{}/status", self.pid)) {
                 self.sealed_seen |= status.lines().any(|line| {
                     line.split_whitespace().collect::<Vec<_>>() == ["NoNewPrivs:", "1"]

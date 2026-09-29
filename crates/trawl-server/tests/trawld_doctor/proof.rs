@@ -20,9 +20,11 @@ use trawl_api::doctor::{Outcome, Report};
 
 use crate::common;
 use crate::support::{
-    DoctorConfig, PLANTED_APP_URL, PLANTED_FLEET_URL, SECRET, admin, assert_fresh_install_rows,
-    assert_no_values, ensure_role, forbidden_shape, migrated_app, migrated_fleet, planted,
-    planted_env, report, row, run_doctor, url_values, verdict, write_doctor_config,
+    DoctorConfig, LOCKLESS, PLANTED_APP_URL, PLANTED_FLEET_URL, SECRET, Userns, admin,
+    assert_fresh_install_rows, assert_no_values, database_rows_complete, ensure_role,
+    forbid_advisory_locks, forbidden_shape, lockless, migrated_app, migrated_fleet, planted,
+    planted_env, report, row, run_doctor, run_doctor_in_userns, url_values, verdict,
+    write_doctor_config,
 };
 
 /// The doctor's arguments for `config` in `format`.
@@ -657,4 +659,514 @@ async fn doctor_notes_a_writer_lock_without_a_listener() {
         }
     }
     assert_eq!(rows(&held), expected, "the note changed an outcome");
+}
+
+/// One entry of a [`fs_snapshot`]: everything a write changes, and not the
+/// access time, which a read changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Entry {
+    kind: &'static str,
+    mode: u32,
+    size: u64,
+    inode: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    /// A file's bytes, a symlink's target; empty for a directory.
+    content: Vec<u8>,
+}
+
+/// Every entry under `root`, `root` itself included as `.`, by its path
+/// relative to `root`.
+fn fs_snapshot(root: &Path) -> std::collections::BTreeMap<String, Entry> {
+    use std::os::unix::fs::MetadataExt as _;
+    fn walk(root: &Path, path: &Path, into: &mut std::collections::BTreeMap<String, Entry>) {
+        let meta = std::fs::symlink_metadata(path).expect("metadata");
+        let kind = if meta.is_dir() {
+            "dir"
+        } else if meta.file_type().is_symlink() {
+            "symlink"
+        } else if meta.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let content = match kind {
+            "file" => std::fs::read(path).expect("read a file"),
+            "symlink" => std::fs::read_link(path)
+                .expect("read a link")
+                .into_os_string()
+                .into_encoded_bytes(),
+            _ => Vec::new(),
+        };
+        let name = path.strip_prefix(root).unwrap().display().to_string();
+        into.insert(
+            if name.is_empty() {
+                ".".to_owned()
+            } else {
+                name
+            },
+            Entry {
+                kind,
+                mode: meta.mode(),
+                size: meta.size(),
+                inode: meta.ino(),
+                mtime: (meta.mtime(), meta.mtime_nsec()),
+                ctime: (meta.ctime(), meta.ctime_nsec()),
+                content,
+            },
+        );
+        if kind == "dir" {
+            let mut children: Vec<PathBuf> = std::fs::read_dir(path)
+                .expect("list a directory")
+                .map(|entry| entry.expect("an entry").path())
+                .collect();
+            children.sort();
+            for child in children {
+                walk(root, &child, into);
+            }
+        }
+    }
+    let mut entries = std::collections::BTreeMap::new();
+    walk(root, root, &mut entries);
+    entries
+}
+
+/// Fail, naming only the entries that differ, when `after` is not
+/// `before`.
+fn assert_unchanged(
+    before: &std::collections::BTreeMap<String, Entry>,
+    after: &std::collections::BTreeMap<String, Entry>,
+    label: &str,
+) {
+    let changed: Vec<String> = before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|name| before.get(*name) != after.get(*name))
+        .map(|name| {
+            let show = |entry: Option<&Entry>| {
+                entry.map(|e| {
+                    format!(
+                        "{} mode {:o} size {} inode {} mtime {:?} ctime {:?} content {:?}",
+                        e.kind,
+                        e.mode,
+                        e.size,
+                        e.inode,
+                        e.mtime,
+                        e.ctime,
+                        String::from_utf8_lossy(&e.content)
+                            .chars()
+                            .take(80)
+                            .collect::<String>()
+                    )
+                })
+            };
+            format!(
+                "{name}:\n    before {:?}\n    after  {:?}",
+                show(before.get(name)),
+                show(after.get(name))
+            )
+        })
+        .collect();
+    assert!(
+        changed.is_empty(),
+        "{label} wrote:\n  {}",
+        changed.join("\n  ")
+    );
+}
+
+/// What a write to the database `url` would change: its schemas, every
+/// relation outside the system schemas with its kind, file node, owner and
+/// grants, every function there, and every row of every table and
+/// sequence there, which covers the ledger and `catalog_state`.
+async fn db_snapshot(url: &str) -> std::collections::BTreeMap<String, String> {
+    let mut conn = admin(url).await;
+    let mut snapshot = std::collections::BTreeMap::new();
+    let listed: Vec<(String, String)> = sqlx::query_as(
+        r"SELECT 'schema ' || nspname, nspowner::regrole::text || ' ' || coalesce(nspacl::text, '')
+            FROM pg_namespace
+          UNION ALL
+          SELECT 'relation ' || n.nspname || '.' || c.relname,
+                 c.relkind::text || ' ' || c.relfilenode::text || ' '
+                 || c.relowner::regrole::text || ' ' || coalesce(c.relacl::text, '')
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\_%'
+          UNION ALL
+          SELECT 'function ' || p.oid::regprocedure::text, md5(p.prosrc)
+            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+           WHERE n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\_%'
+          UNION ALL
+          SELECT 'database', coalesce(datacl::text, '') FROM pg_database
+           WHERE datname = current_database()",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("list the database's objects");
+    let relations: Vec<(String, String)> = sqlx::query_as(
+        r"SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname), c.relkind::text
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+           WHERE c.relkind IN ('r', 'S')
+             AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\_%'",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("list the tables and sequences");
+    for (relation, kind) in relations {
+        let read = if kind == "S" {
+            format!("SELECT last_value::text || ' ' || is_called::text FROM {relation}")
+        } else {
+            format!("SELECT string_agg(t::text, E'\\n' ORDER BY t::text) FROM {relation} t")
+        };
+        let rows: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(read))
+            .fetch_one(&mut conn)
+            .await
+            .expect("read a relation's rows");
+        snapshot.insert(format!("rows {relation}"), rows.unwrap_or_default());
+    }
+    snapshot.extend(listed);
+    conn.close().await.unwrap();
+    snapshot
+}
+
+/// Make [`LOCKLESS`] a role that holds only `CONNECT` and `SELECT` in the
+/// database `url` names, and no advisory-lock function
+/// ([`forbid_advisory_locks`]), and assert that it does: no `CREATE` or
+/// `TEMPORARY` on the database, no `CREATE` on `public`, no privilege but
+/// `SELECT` on any table there, none on any sequence, and no role
+/// attribute that grants more.
+async fn connect_and_select_only(url: &str) {
+    forbid_advisory_locks(url).await;
+    let mut conn = admin(url).await;
+    let database: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    sqlx::Executor::execute(
+        &mut conn,
+        sqlx::AssertSqlSafe(format!(
+            r#"REVOKE ALL ON DATABASE "{database}" FROM PUBLIC;
+               GRANT CONNECT ON DATABASE "{database}" TO {LOCKLESS};
+               REVOKE CREATE ON SCHEMA public FROM PUBLIC;"#
+        )),
+    )
+    .await
+    .expect("leave the lockless role CONNECT and SELECT only");
+    let held: (bool, bool, bool, bool, i64, i64, i64) = sqlx::query_as(
+        r"SELECT has_database_privilege($1, current_database(), 'CONNECT'),
+                 has_database_privilege($1, current_database(), 'CREATE')
+                   OR has_database_privilege($1, current_database(), 'TEMPORARY'),
+                 has_schema_privilege($1, 'public', 'CREATE'),
+                 EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1 AND (rolsuper
+                   OR rolcreatedb OR rolcreaterole OR rolreplication OR rolbypassrls)),
+                 (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                     AND (has_table_privilege($1, c.oid, 'INSERT')
+                       OR has_table_privilege($1, c.oid, 'UPDATE')
+                       OR has_table_privilege($1, c.oid, 'DELETE')
+                       OR has_table_privilege($1, c.oid, 'TRUNCATE')
+                       OR has_table_privilege($1, c.oid, 'REFERENCES')
+                       OR has_table_privilege($1, c.oid, 'TRIGGER'))),
+                 (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = 'public' AND c.relkind = 'S'
+                     AND (has_sequence_privilege($1, c.oid, 'USAGE')
+                       OR has_sequence_privilege($1, c.oid, 'UPDATE'))),
+                 (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = 'public' AND c.relkind = 'r'
+                     AND NOT has_table_privilege($1, c.oid, 'SELECT'))",
+    )
+    .bind(LOCKLESS)
+    .fetch_one(&mut conn)
+    .await
+    .expect("read the lockless role's privileges");
+    assert_eq!(
+        held,
+        (true, false, false, false, 0, 0, 0),
+        "{LOCKLESS} holds more than CONNECT and SELECT, or cannot read a table"
+    );
+    conn.close().await.unwrap();
+}
+
+/// An installation for [`doctor_writes_nothing`]: its state directory, the
+/// parent of `[data] path`, holds the data root, the WAL, the generated
+/// certificate, the crash-dump directory and `trawld.toml`.
+struct Installation {
+    name: &'static str,
+    dir: tempfile::TempDir,
+    fleet: String,
+    app: String,
+    catalog: Option<String>,
+}
+
+impl Installation {
+    fn dumps(&self) -> PathBuf {
+        self.dir.path().join("dumps")
+    }
+
+    /// Write the configuration of an ingest or a query-only node.
+    fn configure(&self, ingest: bool) -> PathBuf {
+        let config = DoctorConfig {
+            ingest,
+            ..DoctorConfig::in_dir(self.dir.path())
+        };
+        write_doctor_config(self.dir.path(), &config)
+    }
+
+    /// The doctor's environment: both databases as [`LOCKLESS`], and
+    /// crash-dump capture enabled on this installation's dump directory.
+    fn env(&self) -> Vec<(&'static str, OsString)> {
+        vec![
+            ("HOME", self.dir.path().as_os_str().to_owned()),
+            ("FLEET_DATABASE_URL", lockless(&self.fleet).into()),
+            ("TRAWL_DATABASE_URL", lockless(&self.app).into()),
+            ("TRAWL_CRASH_DUMP_DIR", self.dumps().into_os_string()),
+            ("TRAWL_CRASH_DUMP_RETAIN", "1".into()),
+        ]
+    }
+
+    fn planted(&self) -> Vec<String> {
+        let mut values = url_values(&lockless(&self.fleet));
+        values.extend(url_values(&lockless(&self.app)));
+        values.extend(self.catalog.clone());
+        values.push(self.dir.path().join("data").display().to_string());
+        values.push(RCGEN_SUBJECT.to_owned());
+        values
+    }
+
+    async fn db_snapshot(&self) -> [std::collections::BTreeMap<String, String>; 2] {
+        [db_snapshot(&self.fleet).await, db_snapshot(&self.app).await]
+    }
+}
+
+/// An installation before its first start: a migrated Fleet database, an
+/// empty app-state database, no data root, no certificate, and no
+/// crash-dump directory yet (capture would create one).
+async fn fresh_installation() -> Installation {
+    let fleet = migrated_fleet().await;
+    let app = common::create_app_database().await;
+    connect_and_select_only(&fleet).await;
+    connect_and_select_only(&app).await;
+    Installation {
+        name: "fresh",
+        dir: tempfile::tempdir().unwrap(),
+        fleet,
+        app,
+        catalog: None,
+    }
+}
+
+/// An installation that has run: both schemas current and conformance
+/// recorded, a data root trawld's epoch gate initialized holding parquet
+/// and its `CATALOG` marker, WAL with a pending publication marker, a
+/// pending rollup marker, the certificate trawld generates, and a
+/// crash-dump directory holding more dumps than capture would retain.
+async fn populated_installation() -> Installation {
+    use trawl_server::ingest::publication_marker::{OutputIdentity, ValidatedMarker};
+
+    let fleet = migrated_fleet().await;
+    let app = migrated_app().await;
+    let mut conn = admin(&app).await;
+    sqlx::query("UPDATE catalog_state SET conformed_at = now()")
+        .execute(&mut conn)
+        .await
+        .expect("record conformance");
+    conn.close().await.unwrap();
+    let catalog = catalog_id(&app).await;
+    connect_and_select_only(&fleet).await;
+    connect_and_select_only(&app).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let wal = data.join("wal");
+    trawl_server::epoch::ensure_current_epoch(&data, &wal, true)
+        .expect("the epoch gate initializes the data root");
+    common::seed_data_root(dir.path());
+    std::fs::write(data.join("CATALOG"), format!("{catalog}\n")).unwrap();
+
+    let batch = "nginx_1700000000000_ab12.ndjson";
+    std::fs::create_dir_all(wal.join("prod")).unwrap();
+    std::fs::write(
+        wal.join("prod").join(batch),
+        b"{\"_time\":\"2026-09-23T07:00:00Z\",\"message\":\"pending\"}\n",
+    )
+    .unwrap();
+    let marker = ValidatedMarker::new(
+        "prod",
+        "nginx",
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 23).unwrap(),
+        7,
+        vec![batch.to_owned()],
+        OutputIdentity {
+            size: 26,
+            hash: blake3::hash(b"PAR1 new output bytes PAR1"),
+        },
+    )
+    .expect("a valid publication marker");
+    std::fs::write(marker.marker_path(&wal), marker.encode()).unwrap();
+    let day = data.join("prod/2024-01-15");
+    std::fs::write(
+        day.join(".rollup-nginx"),
+        day.join("10/nginx.parquet").display().to_string(),
+    )
+    .unwrap();
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    trawl_server::tls::build_server_config(None, None, dir.path())
+        .expect("trawld generates its certificate");
+
+    let dumps = dir.path().join("dumps");
+    std::fs::create_dir(&dumps).unwrap();
+    for name in ["a.dmp", "b.dmp", "c.dmp"] {
+        std::fs::write(dumps.join(name), name).unwrap();
+    }
+    Installation {
+        name: "populated",
+        dir,
+        fleet,
+        app,
+        catalog: Some(catalog),
+    }
+}
+
+/// Every file and directory under a root with its write bits cleared, as
+/// long as this lives; the modes come back on drop, so the temporary
+/// directory can be removed even after a failed assertion.
+struct WriteProtected(Vec<(PathBuf, u32)>);
+
+impl WriteProtected {
+    fn apply(root: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+        fn walk(path: &Path, into: &mut Vec<(PathBuf, u32)>) {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            if meta.file_type().is_symlink() {
+                return;
+            }
+            if meta.is_dir() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    walk(&entry.unwrap().path(), into);
+                }
+            }
+            let mode = meta.permissions().mode() & 0o7777;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o222)).unwrap();
+            into.push((path.to_owned(), mode));
+        }
+        let mut modes = Vec::new();
+        walk(root, &mut modes);
+        Self(modes)
+    }
+}
+
+impl Drop for WriteProtected {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt as _;
+        for (path, mode) in self.0.iter().rev() {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode));
+        }
+    }
+}
+
+/// What a run over `installation` must have looked at, so a run that read
+/// nothing cannot pass for one that wrote nothing: every database row
+/// complete as [`LOCKLESS`] (an advisory-lock call is refused, and a write
+/// is refused by the read-only session and the role), and, where the data
+/// root was admitted, the rows that read under it.
+fn assert_looked(installation: &Installation, report: &Report, label: &str) {
+    database_rows_complete(report).unwrap_or_else(|why| panic!("{label}: {why}: {report:#?}"));
+    if installation.name == "fresh" || verdict(report, "server.data.root").0 == Outcome::Failed {
+        return;
+    }
+    for id in [
+        "server.data.epoch",
+        "server.data.identity",
+        "server.recovery.repin",
+    ] {
+        assert_eq!(verdict(report, id).0, Outcome::Complete, "{label}: {id}");
+    }
+    assert_eq!(
+        verdict(report, "server.recovery.publication"),
+        (Outcome::Complete, Some("pending_at_next_boot")),
+        "{label}: {report:#?}"
+    );
+}
+
+/// `trawld --doctor` writes nothing (#269 AC4, D19). Over a fresh and a
+/// populated installation, as an ingest and as a query-only node, the data
+/// root, the WAL, the state directory and the crash-dump directory keep
+/// every entry's content, mode, size, inode, modification and change time,
+/// and both databases keep their objects, grants and rows.
+///
+/// Leg 1, always: the doctor logs in as a role with only `CONNECT` and
+/// `SELECT` and no advisory-lock function, over the tree as it is (where a
+/// write would land and show) and then with every write bit cleared (where
+/// the doctor must still find what it reads). Leg 2: as root in a user
+/// namespace, over a read-only bind mount of the tree, which root cannot
+/// write through; skipped only where user namespaces are unavailable and
+/// `TRAWL_TEST_REQUIRE_USERNS` is not `1`.
+#[tokio::test]
+async fn doctor_writes_nothing() {
+    ensure_role().await;
+    let userns = Userns::for_test("doctor_writes_nothing leg 2");
+    for installation in [fresh_installation().await, populated_installation().await] {
+        let root = installation.dir.path();
+        let databases = installation.db_snapshot().await;
+        for ingest in [true, false] {
+            let config = installation.configure(ingest);
+            let label =
+                |leg: &str| format!("{} installation, ingest {ingest}, {leg}", installation.name);
+
+            let before = fs_snapshot(root);
+            let (_, report) = doctor(&config, &installation.env(), &installation.planted());
+            assert_unchanged(&before, &fs_snapshot(root), &label("as it is"));
+            assert_looked(&installation, &report, &label("as it is"));
+            if installation.name == "fresh" && ingest {
+                assert_fresh_install_rows(&report);
+            }
+
+            {
+                let _protected = WriteProtected::apply(root);
+                let before = fs_snapshot(root);
+                let (_, report) = doctor(&config, &installation.env(), &installation.planted());
+                assert_unchanged(&before, &fs_snapshot(root), &label("write-protected"));
+                assert_looked(&installation, &report, &label("write-protected"));
+            }
+
+            if let Some(userns) = &userns {
+                let planted = installation.planted();
+                let planted: Vec<&str> = planted.iter().map(String::as_str).collect();
+                let before = fs_snapshot(root);
+                let (code, stdout, stderr) = run_doctor_in_userns(
+                    userns,
+                    Some(root),
+                    &doctor_args(&config, "json"),
+                    &installation.env(),
+                );
+                assert_no_values(&stdout, &stderr, &planted);
+                let (table_code, table_out, table_err) = run_doctor_in_userns(
+                    userns,
+                    Some(root),
+                    &doctor_args(&config, "table"),
+                    &installation.env(),
+                );
+                assert_no_values(&table_out, &table_err, &planted);
+                assert_unchanged(&before, &fs_snapshot(root), &label("read-only mount"));
+                let parsed = crate::support::report(&stdout);
+                assert_eq!(i32::from(parsed.verdict().exit_code()), code);
+                assert_eq!(table_code, code, "{table_out}");
+                assert!(
+                    row(&parsed, "server.identity")
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.starts_with("uid 0")),
+                    "{parsed:#?}"
+                );
+                assert_looked(&installation, &parsed, &label("read-only mount"));
+            }
+        }
+        assert_eq!(
+            installation.db_snapshot().await,
+            databases,
+            "the {} installation's databases changed",
+            installation.name
+        );
+    }
 }
