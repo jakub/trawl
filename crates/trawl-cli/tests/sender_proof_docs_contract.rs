@@ -387,7 +387,13 @@ fn syslog_check_matches_the_device_address() {
     assert_table(
         &query,
         "syslog-check",
-        &columns(&["syslog_source_ip", "message"]),
+        &columns(&[
+            "syslog_source_ip",
+            "syslog_severity",
+            "syslog_timestamp",
+            "syslog_facility",
+            "message",
+        ]),
     );
 }
 

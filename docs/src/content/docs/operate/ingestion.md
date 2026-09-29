@@ -150,7 +150,7 @@ text, such as a rule name, and those stay in `message`.
 
    <!-- proof:syslog-check -->
    ```bash
-   trawl -p prod query "service=firewall _producer=syslog syslog_source_ip=$DEVICE last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, syslog_source_ip, message"
+   trawl -p prod query "service=firewall _producer=syslog syslog_source_ip=$DEVICE last=1d _ingested>=\"$T0\" | head 20 | table _time, _ingested, _producer, env, service, host, syslog_source_ip, syslog_severity, syslog_timestamp, syslog_facility, message"
    ```
 
    The check passes on at least one row. `last=1d` bounds the scan, and
