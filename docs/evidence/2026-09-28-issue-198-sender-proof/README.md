@@ -15,7 +15,7 @@ substitution.
 
 ## Tested commit
 
-- Commit C: `c235e9e411ce4087245beccff5a960cc68820f5a`
+- Commit C: `277eff42e101b217a39d2669a0ab47920189ec4d`
 - Result: `SUMMARY 70 passed, 0 failed`, exit status 0
 - Guard: `git diff --quiet C HEAD -- . ':!docs/evidence/2026-09-28-issue-198-sender-proof/README.md' ':!docs/evidence/2026-09-28-issue-198-sender-proof/transcript.txt'`
   exits 0 at the PR head. Any later change to another file, `run.py`
@@ -27,7 +27,7 @@ substitution.
 | --- | --- |
 | Image | `debian-13-genericcloud-amd64-20260914-2601.tar.xz`, sha512 `ba03aae0…f26a0` (full value in `run.py` and the transcript) |
 | Guest | Debian 13.7, kernel `6.12.107+deb13-cloud-amd64`, cloud-init 25.1.4 |
-| trawld, trawl | `trawld 0.9.0 (c235e9e4 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)`, and the same for `trawl`; packages `trawl-server`, `trawl-cli`, `trawl-runtime` 0.9.0-1 |
+| trawld, trawl | `trawld 0.9.0 (277eff42 2026-09-29, rustc 1.98.0, x86_64-unknown-linux-gnu)`, and the same for `trawl`; packages `trawl-server`, `trawl-cli`, `trawl-runtime` 0.9.0-1 |
 | Vector | 0.57.0, `vector_0.57.0-1_amd64.deb` from the GitHub release, sha256 `ee24ecf7…1e88e` |
 | nginx, Docker, PostgreSQL, UFW | nginx 1.26.3, Docker 26.1.5 (`docker.io` 26.1.5+dfsg1-9+deb13u1), PostgreSQL 17.11, ufw 0.36.2; `alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6` |
 | Host | Linux 7.2.5-3-omarchy, QEMU 11.1.1 with KVM, Docker 29.7.2; builder `rust:1.98-trixie@sha256:620dbcd124499c59e2406d3741574b5c5838cf9eb9656f0c3a03948f79b02959`, cargo-deb 3.8.0, cargo-zigbuild 0.23.4 |
