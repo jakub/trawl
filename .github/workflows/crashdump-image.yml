@@ -38,8 +38,7 @@ on:
       - .github/workflows/crashdump-image.yml
       - ci/crashdump-image.sh
 
-# A 60-minute build on a self-hosted runner is not worth queueing twice for the
-# same ref.
+# A long release-profile build is not worth running twice for the same ref.
 concurrency:
   group: crashdump-image-${{ github.ref }}
   cancel-in-progress: true
@@ -53,7 +52,7 @@ env:
 jobs:
   crash-dump-image:
     name: capability transition + readiness verdict
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -71,6 +70,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: crashdump-amd64-linux
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # amd64 is the runner's own architecture, so unlike dev-image.yml and
       # release.yml's cross leg there is no foreign libc to install. zig is
