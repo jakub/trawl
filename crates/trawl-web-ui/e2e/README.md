@@ -446,8 +446,8 @@ env -u NO_COLOR E2E_PORT=8168 crates/trawl-web-ui/e2e/scripts/mutation-check.sh 
 
 `NO_COLOR` is unset because the installed Trunk parses it as a boolean and rejects
 an inherited value of `1`. The runner builds each mutant, requires its target spec
-to fail and the routing control to pass, reverses the patch, and finally rebuilds
-the pristine SPA. The `web-ui-palette-mutations` CI job runs these two patches alongside
+to fail and the routing control to pass, reverses the patch, and finally deletes
+`dist/`, which still holds the last mutant. Rebuild before the next browser run. The `web-ui-palette-mutations` CI job runs these two patches alongside
 `web-ui-e2e` and uploads browser traces on failure. A failed build or
 control is not a killed mutation.
 
@@ -469,7 +469,7 @@ checkout. The script reads the named test's JSON result and requires the
 request-counter assertion itself to fail. A rendering failure elsewhere in
 the spec is not a kill. The `web-ui-health-mutation` CI job runs alongside
 `web-ui-e2e` on the same commit, and the workflow is green only when both pass.
-It builds both the mutant and restored SPA. Browser traces remain available on job failure.
+Browser traces remain available on job failure.
 
 Health cases cover health 200 and structured 503, permission-gated network
 silence and DOM, independent query permission, one shared stream across
@@ -553,7 +553,7 @@ Each uses `routing.spec.ts` as an independent passing control. The
 `web-ui-pagination-range-mutations` CI job runs alongside the full `web-ui-e2e`
 baseline, runs these three mutations and uploads failure traces. Apply or build
 failure is not a kill; the target must execute and fail, the control must pass,
-and the runner must restore both clean source and pristine app dist. Mutation
+and the runner must restore clean source and delete the mutant's app dist. Mutation
 21 remains reserved for the dedicated Atmosphere runner.
 
 ### Save editor snapshot mutation
@@ -579,11 +579,10 @@ export E2E_PORT=8164 CARGO_BUILD_JOBS=4
 (cd crates/trawl-web-ui && env -u NO_COLOR trunk build)
 (cd crates/trawl-web-ui/e2e && npx playwright test tests/settings-disposition.spec.ts)
 env -u NO_COLOR crates/trawl-web-ui/e2e/scripts/mutation-check.sh 26-save-editor-snapshot.patch
-(cd crates/trawl-web-ui/e2e && npx playwright test tests/settings-disposition.spec.ts)
 ```
 
-The mutation runner reverses the patch and rebuilds the pristine SPA before it
-returns. The final browser command verifies that restored build. The explicit
+The mutation runner reverses the patch and deletes the mutant's `dist/` before it
+returns. The explicit
 `web-ui-save-snapshot-mutation` CI job runs this sequence alongside `web-ui-e2e`,
 with separate steps for the pristine and restored assertions. A failed build,
 unattributed target failure, failed control, or dirty restored tree fails the job.

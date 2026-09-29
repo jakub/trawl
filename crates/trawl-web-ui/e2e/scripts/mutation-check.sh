@@ -38,9 +38,9 @@ MUTATIONS_DIR="$E2E_DIR/mutations"
 
 cd "$ROOT_DIR"
 
-# Every mutant and the restore rebuild the same crates, and trawl-core's
-# provenance build script watches every tracked file, so each patch
-# recompiles trawl-core, fleet-ui and trawl-web-ui. Incremental compilation
+# Every mutant rebuilds the same crates, and trawl-core's provenance build
+# script watches every tracked file, so each patch recompiles trawl-core
+# and trawl-web-ui (and fleet-ui when the patch touches it). Incremental compilation
 # lets those rebuilds reuse most of the previous compile. CI needs it set
 # here because rust-cache exports CARGO_INCREMENTAL=0 for the whole job.
 export CARGO_INCREMENTAL=1
@@ -320,13 +320,10 @@ JS
 done
 
 # dist/ is gitignored, so the clean-tree check below can't see it — and it
-# still holds the LAST mutant's trunk build. Rebuild from the now-reverted
-# sources so a later `npm run test` exercises the real SPA, not a mutant.
-echo "-- trunk build (restore pristine dist) --"
-(cd "$WEB_UI_DIR" && trunk build) || {
-  echo "mutation-check: pristine rebuild failed — dist/ may still hold a mutant build" >&2
-  exit 2
-}
+# still holds the LAST mutant's trunk build. Remove it instead of spending
+# a rebuild: the e2e harness refuses to start without dist/index.html, so a
+# later `npm run test` asks for a real build rather than testing a mutant.
+rm -rf "$WEB_UI_DIR/dist"
 
 echo
 echo "mutation-check results:"
