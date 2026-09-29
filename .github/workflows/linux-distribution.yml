@@ -118,6 +118,11 @@ jobs:
       - name: Install zig
         if: ${{ !matrix.cross }}
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        # No zig cache: its key contains the run id, so each job saved a new
+        # ~20 MB entry every run that only crowded the rust caches out of the
+        # repository's 10 GB. The zig download is cached separately, by version.
+        with:
+          use-cache: false
 
       - name: Install cross-arch dpkg libs
         if: matrix.cross
