@@ -98,9 +98,14 @@ for (const theme of ['light', 'dark'] as const) {
       for (const [name, href] of [
         ['Full query reference', 'https://trawl.sh/reference/dsl/'],
         ['Event reference', 'https://trawl.sh/reference/events/'],
+        ["Prove a sender's first event",
+          'https://trawl.sh/getting-started/vector-integration/#prove-the-first-event-arrived'],
       ]) {
-        const link = guide.getByRole('link', { name: new RegExp(name) });
+        const link = guide.getByRole('link', { name: `${name} ↗`, exact: true });
+        await expect(link).toHaveText(`${name} ↗`);
         await expect(link).toHaveAttribute('href', href);
+        await expect(link).toHaveAttribute('target', '_blank');
+        await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
         await link.scrollIntoViewIfNeeded();
         await expect(link).toBeInViewport();
       }
