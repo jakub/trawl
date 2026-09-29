@@ -1173,3 +1173,130 @@ async fn doctor_hands_sqlx_the_tls_file_bytes() {
     );
     assert!(ca.exists(), "the server put the CA back");
 }
+
+/// The nine bytes a hostile or broken database server sends for
+/// `AuthenticationMD5Password`: type `R`, length 8, method 5, and no salt.
+/// `SQLx` 0.9.0 decodes the method, then copies a four-byte salt the
+/// message does not hold, and panics.
+const MD5_WITHOUT_SALT: [u8; 9] = [0x52, 0, 0, 0, 8, 0, 0, 0, 5];
+
+/// The line the doctor's panic hook prints, and nothing else of a panic.
+const PANIC_LINE: &str = "[trawld] doctor stopped a check: an internal error occurred";
+
+/// A database server for [`doctor_contains_a_driver_panic`]. On each
+/// connection it reads one length-prefixed packet; an `SSLRequest` gets
+/// `N`, as a server without TLS answers, and the startup message after it
+/// is read the same way. The startup message gets [`MD5_WITHOUT_SALT`], and
+/// the connection is then held until the client drops it.
+fn malformed_auth_server() -> std::net::SocketAddr {
+    use std::io::{Read as _, Write as _};
+
+    fn packet(tcp: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+        let mut length = [0_u8; 4];
+        tcp.read_exact(&mut length).ok()?;
+        let mut body = vec![0_u8; (u32::from_be_bytes(length) as usize).checked_sub(4)?];
+        tcp.read_exact(&mut body).ok()?;
+        Some(body)
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for tcp in listener.incoming() {
+            let Ok(mut tcp) = tcp else { return };
+            std::thread::spawn(move || {
+                tcp.set_read_timeout(Some(std::time::Duration::from_secs(60)))
+                    .unwrap();
+                let Some(mut first) = packet(&mut tcp) else {
+                    return;
+                };
+                if first == [0x04, 0xd2, 0x16, 0x2f] {
+                    let _ = tcp.write_all(b"N");
+                    let Some(startup) = packet(&mut tcp) else {
+                        return;
+                    };
+                    first = startup;
+                }
+                // A startup message: protocol 3.0, then its fields.
+                assert_eq!(first[..4], [0, 3, 0, 0], "a startup message");
+                let _ = tcp.write_all(&MD5_WITHOUT_SALT);
+                let _ = tcp.flush();
+                let mut rest = Vec::new();
+                let _ = tcp.read_to_end(&mut rest);
+            });
+        }
+    });
+    addr
+}
+
+/// A database server that sends a message `SQLx` panics decoding
+/// ([`MD5_WITHOUT_SALT`]) costs only that database's rows: each connect
+/// check is `not_sampled`, `protocol_error`, the checks behind it are
+/// blocked, and the storage and listener checks still run, so the report
+/// renders. The Fleet URL disables TLS; the app-state URL keeps the default
+/// `sslmode`, `prefer`, whose `SSLRequest` the server declines, so both
+/// reach the decoder. The panic hook's fixed line, once per database, is
+/// all stderr holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_contains_a_driver_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = malformed_auth_server();
+    let fleet = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_fleet_db?sslmode=disable");
+    let app = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_app_db");
+    let mut values = url_values(&fleet);
+    values.extend(url_values(&app));
+    let env = [
+        ("FLEET_DATABASE_URL", OsString::from(&fleet)),
+        ("TRAWL_DATABASE_URL", OsString::from(&app)),
+    ];
+    let (code, report, stderr) = tokio::task::spawn_blocking({
+        let dir = dir.path().to_owned();
+        move || doctor(&dir, &DoctorConfig::in_dir(&dir), &env, &values)
+    })
+    .await
+    .unwrap();
+
+    for (connect, behind) in [
+        ("server.fleet.connect", &["server.fleet.schema"][..]),
+        (
+            "server.app.connect",
+            &["server.app.schema", "server.app.writer"][..],
+        ),
+    ] {
+        assert_eq!(
+            verdict(&report, connect),
+            (Outcome::NotSampled, Some("protocol_error")),
+            "{connect}: {report:#?}"
+        );
+        for id in behind {
+            assert_eq!(
+                row(&report, id).blocked_by.as_deref(),
+                Some(connect),
+                "{id}: {report:#?}"
+            );
+        }
+    }
+    // The groups after the databases ran.
+    for id in [
+        "server.data.root",
+        "server.data.epoch",
+        "server.tls.material",
+    ] {
+        assert_eq!(
+            verdict(&report, id),
+            (Outcome::Complete, Some("will_initialize")),
+            "{id}: {report:#?}"
+        );
+    }
+    assert_eq!(
+        verdict(&report, "server.listener.identity"),
+        (Outcome::NotSampled, Some("not_listening")),
+        "{report:#?}"
+    );
+    assert_eq!(code, 3, "{report:#?}\n{stderr}");
+    assert_eq!(
+        stderr.lines().collect::<Vec<_>>(),
+        [PANIC_LINE, PANIC_LINE],
+        "{stderr}"
+    );
+}

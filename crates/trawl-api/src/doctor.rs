@@ -325,6 +325,9 @@ pub mod reason {
     /// A read-only query erred, or its answer did not decode, after the
     /// connection authenticated.
     pub const QUERY_FAILED: &str = "query_failed";
+    /// The database server sent a message the driver could not decode, so
+    /// the doctor dropped the connection.
+    pub const PROTOCOL_ERROR: &str = "protocol_error";
     /// The listener address resolves to several addresses and none of them
     /// proved it serves the certificate on disk: which one trawld binds is
     /// not known.

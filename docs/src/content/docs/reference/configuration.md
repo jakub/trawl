@@ -103,6 +103,7 @@ stable codes, among them `blocked`, `permission_denied`, `timed_out`,
 | `session_not_read_only` | The database session did not start read-only with the doctor's timeouts, so the doctor sent no other query. Check the URL's `options` and `PGOPTIONS`. Connect to the database server directly, not through a pooler that drops startup options. |
 | `connection_lost` | A database connection broke after it authenticated. |
 | `query_failed` | A read-only database query returned an error after the connection authenticated. |
+| `protocol_error` | The database server sent a message the database driver could not decode. The doctor dropped that connection and still ran the other checks. Check that the URL names a PostgreSQL server. |
 | `interrupted` | The listener closed or reset the connection before the TLS handshake or the health answer was whole. |
 | `ambiguous_address` | The listener address resolves to more than one address, and none of them served the certificate on disk. Set `[server] http_addr` to the one IP address and port that trawld listens on. |
 

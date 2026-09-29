@@ -15,7 +15,11 @@
 //! `application_name` `trawld-doctor`, which is how a watcher finds the
 //! doctor's backend. Connecting and every query also run under a 5 s
 //! deadline here; a step that misses it drops the connection, and the
-//! checks after it on that database are `not_sampled`, `timed_out`.
+//! checks after it on that database are `not_sampled`, `timed_out`. Each
+//! step runs in a task of its own, so a panic in `SQLx` while it decodes
+//! what the server sent ends only that task: the connection is dropped with
+//! it, the check is `not_sampled`, `protocol_error`, and the other groups
+//! still run.
 //!
 //! Before connecting, the doctor refuses a startup field that holds a
 //! control character, since a NUL ends the field early and drops the
@@ -39,7 +43,9 @@
 //! or erred after the login proves nothing about boot and is
 //! `not_sampled`.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -185,39 +191,92 @@ impl Database {
     }
 }
 
-/// One database connection, or none once a step missed its deadline or
-/// the connect check did not complete.
-struct Session(Option<PgConnection>);
+/// Why a [`Session`] has no connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lost {
+    /// The connect check did not complete, so no step runs on it.
+    Unopened,
+    /// A step missed [`DEADLINE`], and its connection was dropped.
+    TimedOut,
+    /// A step panicked, and its connection was dropped with its task.
+    Panicked,
+}
+
+/// One step's work on a connection, boxed so it can run in a task of its
+/// own.
+type Step<'c, T> = Pin<Box<dyn Future<Output = T> + Send + 'c>>;
+
+/// Wait at most [`DEADLINE`] for `task`. A task past the deadline is
+/// aborted, which drops whatever it holds, such as a connection that may be
+/// mid-exchange. A panic inside it, such as `SQLx` decoding a malformed
+/// server message, ends only the task (`JoinError::is_panic`).
+async fn contained<T>(mut task: tokio::task::JoinHandle<T>) -> Result<T, Lost> {
+    match tokio::time::timeout(DEADLINE, &mut task).await {
+        Ok(Ok(done)) => Ok(done),
+        Ok(Err(joined)) if joined.is_panic() => Err(Lost::Panicked),
+        // Nothing but the deadline aborts the task, so this is the runtime
+        // shutting down under it.
+        Ok(Err(_)) => Err(Lost::TimedOut),
+        Err(_) => {
+            task.abort();
+            Err(Lost::TimedOut)
+        }
+    }
+}
+
+/// One database connection, or why there is none.
+struct Session(Result<PgConnection, Lost>);
 
 impl Session {
-    /// Run one step on the connection under [`DEADLINE`]. `None` when the
-    /// step missed it, and the connection is dropped, or an earlier step
-    /// on this connection already had.
-    async fn step<T>(&mut self, run: impl AsyncFnOnce(&mut PgConnection) -> T) -> Option<T> {
-        let conn = self.0.as_mut()?;
-        let done = tokio::time::timeout(DEADLINE, run(conn)).await.ok();
-        if done.is_none() {
-            // The protocol may be mid-exchange: nothing more is sent on it.
-            self.0 = None;
+    /// Run one step on the connection, in a task of its own, under
+    /// [`DEADLINE`]. When the step misses the deadline or panics, the
+    /// connection is dropped and every later step answers the same
+    /// [`Lost`] without running.
+    async fn step<T: Send + 'static>(
+        &mut self,
+        run: impl for<'c> FnOnce(&'c mut PgConnection) -> Step<'c, T> + Send + 'static,
+    ) -> Result<T, Lost> {
+        let mut conn = match std::mem::replace(&mut self.0, Err(Lost::Unopened)) {
+            Ok(conn) => conn,
+            Err(lost) => {
+                self.0 = Err(lost);
+                return Err(lost);
+            }
+        };
+        let task = tokio::spawn(async move {
+            let done = run(&mut conn).await;
+            (conn, done)
+        });
+        match contained(task).await {
+            Ok((conn, done)) => {
+                self.0 = Ok(conn);
+                Ok(done)
+            }
+            Err(lost) => {
+                // The protocol may be mid-exchange: nothing more is sent on it.
+                self.0 = Err(lost);
+                Err(lost)
+            }
         }
-        done
     }
 
     /// [`Session::step`], with `read` in its own `BEGIN READ ONLY`
     /// transaction. For the reads that open no transaction of their own;
     /// the ledger validators open a read-only snapshot themselves.
-    async fn read<T>(
+    async fn read<T: Send + 'static>(
         &mut self,
-        read: impl AsyncFnOnce(&mut PgConnection) -> Result<T, sqlx::Error>,
-    ) -> Option<Result<T, sqlx::Error>> {
-        self.step(async move |conn| read_only(conn, read).await)
-            .await
+        read: impl for<'c> FnOnce(&'c mut PgConnection) -> Step<'c, Result<T, sqlx::Error>>
+        + Send
+        + 'static,
+    ) -> Result<Result<T, sqlx::Error>, Lost> {
+        self.step(move |conn| Box::pin(read_only(conn, read))).await
     }
 
-    /// Close the connection, if there is one, under [`DEADLINE`].
+    /// Close the connection, if there is one, in a task of its own under
+    /// [`DEADLINE`].
     async fn close(self) {
-        if let Some(conn) = self.0 {
-            let _ = tokio::time::timeout(DEADLINE, conn.close()).await;
+        if let Ok(conn) = self.0 {
+            let _ = contained(tokio::spawn(conn.close())).await;
         }
     }
 }
@@ -226,7 +285,7 @@ impl Session {
 /// error from `read` wins over an error rolling back.
 async fn read_only<T>(
     conn: &mut PgConnection,
-    read: impl AsyncFnOnce(&mut PgConnection) -> Result<T, sqlx::Error>,
+    read: impl for<'c> FnOnce(&'c mut PgConnection) -> Step<'c, Result<T, sqlx::Error>>,
 ) -> Result<T, sqlx::Error> {
     let mut tx = conn.begin_with("BEGIN READ ONLY").await?;
     let read = read(&mut tx).await;
@@ -240,14 +299,16 @@ async fn read_only<T>(
 /// `application_name`, read back one `SHOW` at a time in the order of
 /// [`SESSION_SHOWN`], stopping at the first that differs.
 async fn session_took_settings(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
-    read_only(conn, async |conn| {
-        for (show, expected) in SESSION_SHOWN {
-            let shown: String = sqlx::query_scalar(show).fetch_one(&mut *conn).await?;
-            if shown != expected {
-                return Ok(false);
+    read_only(conn, |conn| {
+        Box::pin(async move {
+            for (show, expected) in SESSION_SHOWN {
+                let shown: String = sqlx::query_scalar(show).fetch_one(&mut *conn).await?;
+                if shown != expected {
+                    return Ok(false);
+                }
             }
-        }
-        Ok(true)
+            Ok(true)
+        })
     })
     .await
 }
@@ -543,7 +604,7 @@ fn parse_like<U: FromStr, T>(_from_url: fn(&U) -> Result<T, sqlx::Error>, text: 
 async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
     let check = db.connect_check();
     let Some(gate) = runner.gate(check) else {
-        return Session(None);
+        return Session(Err(Lost::Unopened));
     };
     let Ok((url, from)) = db.resolve(ctx) else {
         // server.config refuses a configuration without this URL, so a
@@ -557,7 +618,7 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
                     .lit(db.setting()),
             ),
         );
-        return Session(None);
+        return Session(Err(Lost::Unopened));
     };
     let source = match from {
         DatabaseUrlSource::Environment => Text::new(db.env_var()).lit(" from the environment"),
@@ -568,13 +629,17 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
         Ok(ready) => ready,
         Err(refused) => {
             runner.record(gate, refused.source(source));
-            return Session(None);
+            return Session(Err(Lost::Unopened));
         }
     };
     let source = password.named_after(source);
 
-    let mut conn = match tokio::time::timeout(DEADLINE, PgConnection::connect_with(&options)).await
-    {
+    let connecting = tokio::spawn(async move { PgConnection::connect_with(&options).await });
+    let conn = match contained(connecting).await {
+        Err(Lost::Panicked) => {
+            runner.record(gate, protocol_error(check).source(source));
+            return Session(Err(Lost::Unopened));
+        }
         Err(_) => {
             runner.record(
                 gate,
@@ -585,17 +650,21 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
                         "check that the database server is up and reachable from this host",
                     )),
             );
-            return Session(None);
+            return Session(Err(Lost::Unopened));
         }
         Ok(Err(error)) => {
             runner.record(gate, connect_failed(check, &error).source(source));
-            return Session(None);
+            return Session(Err(Lost::Unopened));
         }
         Ok(Ok(conn)) => conn,
     };
 
     // Nothing else is sent until the session shows it took the settings.
-    match tokio::time::timeout(DEADLINE, session_took_settings(&mut conn)).await {
+    let mut session = Session(Ok(conn));
+    match session
+        .step(|conn| Box::pin(session_took_settings(conn)))
+        .await
+    {
         Ok(Ok(true)) => {
             runner.record(
                 gate,
@@ -603,7 +672,7 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
                     .detail(Text::new("authenticated; the session is read-only"))
                     .source(source),
             );
-            Session(Some(conn))
+            session
         }
         Ok(Ok(false)) => {
             runner.record(
@@ -619,17 +688,17 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
                          server directly rather than through a pooler that drops startup options",
                     )),
             );
-            Session(Some(conn)).close().await;
-            Session(None)
+            session.close().await;
+            Session(Err(Lost::Unopened))
         }
         Ok(Err(error)) => {
             runner.record(gate, query_failed(check, &error).source(source));
-            Session(Some(conn)).close().await;
-            Session(None)
+            session.close().await;
+            Session(Err(Lost::Unopened))
         }
-        Err(_) => {
-            runner.record(gate, timed_out(check).source(source));
-            Session(None)
+        Err(lost) => {
+            runner.record(gate, lost_row(check, lost).source(source));
+            Session(Err(Lost::Unopened))
         }
     }
 }
@@ -816,6 +885,28 @@ fn timed_out(check: ServerCheck) -> Row {
         .detail(Text::new("a query on this connection ran past 5 s"))
         .next(Text::new("rerun once the database server answers promptly"))
 }
+
+/// The row for a step that panicked, or ran on a connection an earlier step
+/// lost that way: `SQLx` could not decode what the server sent.
+fn protocol_error(check: ServerCheck) -> Row {
+    Row::not_sampled(check, reason::PROTOCOL_ERROR)
+        .detail(Text::new(
+            "the database server sent a message the driver could not decode; the doctor \
+             dropped the connection",
+        ))
+        .next(Text::new(
+            "check that the URL names a PostgreSQL server, not another service or a proxy \
+             that alters the protocol",
+        ))
+}
+
+/// The row for a step that did not run to its end.
+fn lost_row(check: ServerCheck, lost: Lost) -> Row {
+    match lost {
+        Lost::Panicked => protocol_error(check),
+        Lost::TimedOut | Lost::Unopened => timed_out(check),
+    }
+}
 /// `server.fleet.schema`: the Fleet ledger is current, in one read-only
 /// snapshot. trawld's boot refuses an empty or behind Fleet schema, so
 /// both fail; `fleet-admin migrate` fixes them.
@@ -829,23 +920,23 @@ async fn fleet_schema(runner: &mut Runner, session: &mut Session) {
     };
     let run_fleet_admin = || Text::new("run fleet-admin migrate against the Fleet database");
     let row = match session
-        .step(async |conn| fleet_auth::validate_schema_on(conn).await)
+        .step(|conn| Box::pin(fleet_auth::validate_schema_on(conn)))
         .await
     {
-        None => timed_out(check),
-        Some(Ok(())) => Row::complete(check).detail(Text::new("the ledger is current")),
-        Some(Err(Fleet::Uninitialized)) => {
+        Err(lost) => lost_row(check, lost),
+        Ok(Ok(())) => Row::complete(check).detail(Text::new("the ledger is current")),
+        Ok(Err(Fleet::Uninitialized)) => {
             Row::failed(check, "the Fleet database has no schema").next(run_fleet_admin())
         }
-        Some(Err(Fleet::PendingMigration { .. })) => {
+        Ok(Err(Fleet::PendingMigration { .. })) => {
             Row::failed(check, "the Fleet schema is behind").next(run_fleet_admin())
         }
-        Some(Err(Fleet::LegacyHistory { .. })) => {
+        Ok(Err(Fleet::LegacyHistory { .. })) => {
             Row::failed(check, "the Fleet ledger is from before 1.0").next(Text::new(
                 "provision a new dedicated Fleet database and retain the old one",
             ))
         }
-        Some(Err(Fleet::UntrackedSchema)) => Row::failed(
+        Ok(Err(Fleet::UntrackedSchema)) => Row::failed(
             check,
             "the Fleet database holds objects no supported ledger tracks",
         )
@@ -853,24 +944,24 @@ async fn fleet_schema(runner: &mut Runner, session: &mut Session) {
             "check that the Fleet URL names the Fleet database; otherwise provision a new \
              dedicated one and retain this one",
         )),
-        Some(Err(Fleet::Migration(MigrateError::Dirty(_)))) => {
+        Ok(Err(Fleet::Migration(MigrateError::Dirty(_)))) => {
             Row::failed(check, "a Fleet migration is dirty").next(Text::new(
                 "restore the Fleet database from a backup taken before the failed migration",
             ))
         }
-        Some(Err(Fleet::Migration(MigrateError::VersionMissing(_)))) => {
+        Ok(Err(Fleet::Migration(MigrateError::VersionMissing(_)))) => {
             Row::failed(check, "the Fleet ledger is ahead of this binary").next(Text::new(
                 "run the fleet-admin and trawld release that applied the newer migration",
             ))
         }
-        Some(Err(Fleet::Migration(MigrateError::VersionMismatch(_)))) => {
+        Ok(Err(Fleet::Migration(MigrateError::VersionMismatch(_)))) => {
             Row::failed(check, "a Fleet migration's checksum differs").next(Text::new(
                 "check that the Fleet URL names the Fleet database this release migrated",
             ))
         }
-        Some(Err(Fleet::Migration(_))) => Row::failed(check, "the Fleet ledger does not validate")
+        Ok(Err(Fleet::Migration(_))) => Row::failed(check, "the Fleet ledger does not validate")
             .next(Text::new("run fleet-admin migrate to see why")),
-        Some(Err(Fleet::Database(error))) => query_failed(check, &error),
+        Ok(Err(Fleet::Database(error))) => query_failed(check, &error),
     };
     runner.record(gate, row);
 }
@@ -887,16 +978,10 @@ enum LockSeen {
 }
 
 impl LockSeen {
-    fn from_samples(samples: [&Option<Result<bool, sqlx::Error>>; 2]) -> Self {
-        if samples
-            .iter()
-            .any(|sample| matches!(sample, Some(Ok(true))))
-        {
+    fn from_samples(samples: [&Result<Result<bool, sqlx::Error>, Lost>; 2]) -> Self {
+        if samples.iter().any(|sample| matches!(sample, Ok(Ok(true)))) {
             Self::Held
-        } else if samples
-            .iter()
-            .all(|sample| matches!(sample, Some(Ok(false))))
-        {
+        } else if samples.iter().all(|sample| matches!(sample, Ok(Ok(false)))) {
             Self::Free
         } else {
             Self::Unknown
@@ -923,19 +1008,19 @@ async fn app_schema(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
         return;
     };
     let before = session
-        .read(async |conn| migrations::migrator_lock_held(conn).await)
+        .read(|conn| Box::pin(migrations::migrator_lock_held(conn)))
         .await;
     let ledger = session
-        .step(async |conn| migrations::validate_schema(conn).await)
+        .step(|conn| Box::pin(migrations::validate_schema(conn)))
         .await;
     let after = session
-        .read(async |conn| migrations::migrator_lock_held(conn).await)
+        .read(|conn| Box::pin(migrations::migrator_lock_held(conn)))
         .await;
 
     let ledger = match ledger {
-        None => return runner.record(gate, timed_out(check)),
-        Some(Err(refused)) => return runner.record(gate, app_refused(check, &refused)),
-        Some(Ok(ledger)) => ledger,
+        Err(lost) => return runner.record(gate, lost_row(check, lost)),
+        Ok(Err(refused)) => return runner.record(gate, app_refused(check, &refused)),
+        Ok(Ok(ledger)) => ledger,
     };
     ctx.app.ledger = Some(ledger);
     let lock = LockSeen::from_samples([&before, &after]);
@@ -949,20 +1034,20 @@ async fn app_schema(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
                 .next(Text::new("rerun once the migration finishes"))
         }
         (Ledger::Fresh | Ledger::Behind { .. }, LockSeen::Unknown) => {
-            let failed = [&before, &after]
+            // The row of the first sample that gave no answer.
+            let unanswered = [&before, &after]
                 .into_iter()
                 .find_map(|sample| match sample {
-                    Some(Err(error)) => Some(error),
-                    _ => None,
+                    Ok(Err(error)) => Some(query_failed(check, error)),
+                    Err(lost) => Some(lost_row(check, *lost)),
+                    Ok(Ok(_)) => None,
                 });
-            match failed {
-                Some(error) => query_failed(check, error),
-                None => timed_out(check),
-            }
-            .detail(Text::new(
-                "the migrator's lock could not be observed, so a running migration cannot be \
+            unanswered
+                .unwrap_or_else(|| timed_out(check))
+                .detail(Text::new(
+                    "the migrator's lock could not be observed, so a running migration cannot be \
                  ruled out",
-            ))
+                ))
         }
         (Ledger::Fresh, LockSeen::Free) => Row::complete_because(check, reason::WILL_INITIALIZE)
             .detail(Text::new(
@@ -983,20 +1068,22 @@ async fn app_schema(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
     }
 
     let read = session
-        .read(async |conn| {
-            let catalog_id = catalog::read_catalog_id(&mut *conn).await?;
-            let conformed = catalog::read_conformed(&mut *conn).await?;
-            Ok::<_, sqlx::Error>((catalog_id, conformed))
+        .read(|conn| {
+            Box::pin(async move {
+                let catalog_id = catalog::read_catalog_id(&mut *conn).await?;
+                let conformed = catalog::read_conformed(&mut *conn).await?;
+                Ok::<_, sqlx::Error>((catalog_id, conformed))
+            })
         })
         .await;
     let row = match read {
-        None => timed_out(check),
-        Some(Err(sqlx::Error::RowNotFound)) => Row::failed(check, "catalog_state holds no catalog")
+        Err(lost) => lost_row(check, lost),
+        Ok(Err(sqlx::Error::RowNotFound)) => Row::failed(check, "catalog_state holds no catalog")
             .next(Text::new(
                 "restore the app-state database from backup, or provision a new dedicated one",
             )),
-        Some(Err(error)) => query_failed(check, &error),
-        Some(Ok((catalog_id, conformed))) => {
+        Ok(Err(error)) => query_failed(check, &error),
+        Ok(Ok((catalog_id, conformed))) => {
             ctx.app.catalog = Some(CatalogFacts {
                 catalog_id: CatalogId(catalog_id),
                 conformed,
@@ -1057,18 +1144,18 @@ async fn app_writer(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
         return;
     };
     let row = match session
-        .read(async |conn| store::writer_lock_held(conn).await)
+        .read(|conn| Box::pin(store::writer_lock_held(conn)))
         .await
     {
-        None => timed_out(check),
-        Some(Err(error)) => query_failed(check, &error),
-        Some(Ok(true)) => {
+        Err(lost) => lost_row(check, lost),
+        Ok(Err(error)) => query_failed(check, &error),
+        Ok(Ok(true)) => {
             ctx.writer_lock_held = Some(true);
             Row::complete_because(check, reason::HELD).detail(Text::new(
                 "a session holds trawld's writer lock on this database; it may run on another host",
             ))
         }
-        Some(Ok(false)) => {
+        Ok(Ok(false)) => {
             ctx.writer_lock_held = Some(false);
             Row::complete_because(check, reason::NOT_OBSERVED).detail(Text::new(
                 "no session holds trawld's writer lock on this database",
@@ -1084,10 +1171,10 @@ mod tests {
 
     #[test]
     fn a_held_sample_wins_and_a_missing_one_is_unknown() {
-        let held = Some(Ok(true));
-        let free = Some(Ok(false));
-        let timed_out = None;
-        let failed = Some(Err(sqlx::Error::RowNotFound));
+        let held = Ok(Ok(true));
+        let free = Ok(Ok(false));
+        let timed_out = Err(Lost::TimedOut);
+        let failed = Ok(Err(sqlx::Error::RowNotFound));
         assert_eq!(LockSeen::from_samples([&free, &free]), LockSeen::Free);
         assert_eq!(LockSeen::from_samples([&free, &held]), LockSeen::Held);
         assert_eq!(LockSeen::from_samples([&held, &timed_out]), LockSeen::Held);
