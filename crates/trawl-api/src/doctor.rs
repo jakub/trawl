@@ -319,6 +319,22 @@ pub mod reason {
     /// With `failed`: the data root belongs to another catalog than the
     /// app-state database's.
     pub const CATALOG_IDENTITY_MISMATCH: &str = "catalog_identity_mismatch";
+    /// The database session did not take the doctor's read-only setting
+    /// and timeouts, or a startup field would have kept it from taking
+    /// them, so the doctor sent no other query.
+    pub const SESSION_NOT_READ_ONLY: &str = "session_not_read_only";
+    /// The connection broke after it authenticated.
+    pub const CONNECTION_LOST: &str = "connection_lost";
+    /// A read-only query erred, or its answer did not decode, after the
+    /// connection authenticated.
+    pub const QUERY_FAILED: &str = "query_failed";
+    /// The listener address resolves to several addresses and none of them
+    /// proved it serves the certificate on disk: which one trawld binds is
+    /// not known.
+    pub const AMBIGUOUS_ADDRESS: &str = "ambiguous_address";
+    /// An exchange broke off before it was whole, such as a TLS handshake
+    /// or a health answer cut short, and what arrived proves nothing.
+    pub const INTERRUPTED: &str = "interrupted";
 }
 
 #[cfg(test)]

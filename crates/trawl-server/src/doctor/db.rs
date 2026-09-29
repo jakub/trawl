@@ -17,6 +17,14 @@
 //! deadline here; a step that misses it drops the connection, and the
 //! checks after it on that database are `not_sampled`, `timed_out`.
 //!
+//! Before connecting, the doctor refuses a startup field that holds a
+//! control character, since a NUL ends the field early and drops the
+//! settings after it, and a password or TLS file `SQLx` would read that is
+//! not a regular file or is too large. Once connected, it reads the
+//! settings back, `default_transaction_read_only` first; a session that
+//! did not take them is `not_sampled`, `session_not_read_only`, and gets
+//! no other query. Every query runs in an explicit read-only transaction.
+//!
 //! The doctor reads `SELECT`s only: the two ledgers, `catalog_state`, and
 //! `pg_locks`. Both advisory locks it reports on, the `SQLx` migrator's
 //! and trawld's writer lock, are observed in `pg_locks`, never taken.
@@ -24,9 +32,12 @@
 //! No error's text reaches a row. Every database error maps to a fixed
 //! reason by its kind or SQLSTATE, and no row names the URL, host, user,
 //! or password; the source names the setting the URL came from and where
-//! `SQLx` found the password.
+//! `SQLx` looks for the password. A refusal the server proves, such as a
+//! failed login or a ledger boot refuses, is `failed`; a query that broke
+//! or erred after the login proves nothing about boot and is
+//! `not_sampled`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -34,6 +45,7 @@ use sqlx::postgres::{PgConnectOptions, PgConnection};
 use sqlx::{ConnectOptions as _, Connection as _};
 use trawl_api::doctor::reason;
 
+use super::fsread;
 use super::output::{Row, SelectedPath, Selection, Text};
 use super::{CatalogFacts, CatalogId, Ctx, Runner, ServerCheck};
 use crate::config::{ConfigError, DatabaseUrlSource};
@@ -64,6 +76,55 @@ const SESSION_SETTINGS: [(&str, &str); 3] = [
     ("default_transaction_read_only", "on"),
     ("statement_timeout", "5000"),
     ("lock_timeout", "1000"),
+];
+
+/// How a session shows each of [`SESSION_SETTINGS`], and the
+/// `application_name`, once it took them: the statement that reads the
+/// setting and what it shows. `default_transaction_read_only` comes first,
+/// so a writable session answers nothing else.
+const SESSION_SHOWN: [(&str, &str); 4] = [
+    ("SHOW default_transaction_read_only", "on"),
+    ("SHOW statement_timeout", "5s"),
+    ("SHOW lock_timeout", "1s"),
+    ("SHOW application_name", APPLICATION_NAME),
+];
+
+/// The most a password file may hold for the doctor to let `SQLx` read it.
+/// `SQLx` reads it whole, while parsing the URL.
+const PASSFILE_CAP: u64 = 1024 * 1024;
+
+/// A TLS file `SQLx` reads while connecting: the setting's name as the
+/// report shows it, the URL parameters that set it, the environment
+/// variable that sets it when no parameter does, and the most the doctor
+/// lets `SQLx` read.
+struct TlsFile {
+    setting: &'static str,
+    keys: &'static [&'static str],
+    env: &'static str,
+    cap: u64,
+}
+
+/// Every TLS file `SQLx` 0.9.0 reads: `options/parse.rs`,
+/// `parse_from_url`, and `options/mod.rs`, `new_without_pgpass`.
+const TLS_FILES: [TlsFile; 3] = [
+    TlsFile {
+        setting: "sslrootcert",
+        keys: &["sslrootcert", "ssl-root-cert", "ssl-ca"],
+        env: "PGSSLROOTCERT",
+        cap: fsread::cap::CERT,
+    },
+    TlsFile {
+        setting: "sslcert",
+        keys: &["sslcert", "ssl-cert"],
+        env: "PGSSLCERT",
+        cap: fsread::cap::CERT,
+    },
+    TlsFile {
+        setting: "sslkey",
+        keys: &["sslkey", "ssl-key"],
+        env: "PGSSLKEY",
+        cap: fsread::cap::KEY,
+    },
 ];
 
 /// Run this group's checks through `runner`.
@@ -136,6 +197,17 @@ impl Session {
         done
     }
 
+    /// [`Session::step`], with `read` in its own `BEGIN READ ONLY`
+    /// transaction. For the reads that open no transaction of their own;
+    /// the ledger validators open a read-only snapshot themselves.
+    async fn read<T>(
+        &mut self,
+        read: impl AsyncFnOnce(&mut PgConnection) -> Result<T, sqlx::Error>,
+    ) -> Option<Result<T, sqlx::Error>> {
+        self.step(async move |conn| read_only(conn, read).await)
+            .await
+    }
+
     /// Close the connection, if there is one, under [`DEADLINE`].
     async fn close(self) {
         if let Some(conn) = self.0 {
@@ -144,20 +216,52 @@ impl Session {
     }
 }
 
-/// Where `SQLx` found the password it will send, following its own
+/// Run `read` in a `BEGIN READ ONLY` transaction and roll it back. An
+/// error from `read` wins over an error rolling back.
+async fn read_only<T>(
+    conn: &mut PgConnection,
+    read: impl AsyncFnOnce(&mut PgConnection) -> Result<T, sqlx::Error>,
+) -> Result<T, sqlx::Error> {
+    let mut tx = conn.begin_with("BEGIN READ ONLY").await?;
+    let read = read(&mut tx).await;
+    let rollback = tx.rollback().await;
+    let value = read?;
+    rollback?;
+    Ok(value)
+}
+
+/// Whether the session took [`SESSION_SETTINGS`] and the doctor's
+/// `application_name`, read back one `SHOW` at a time in the order of
+/// [`SESSION_SHOWN`], stopping at the first that differs.
+async fn session_took_settings(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    read_only(conn, async |conn| {
+        for (show, expected) in SESSION_SHOWN {
+            let shown: String = sqlx::query_scalar(show).fetch_one(&mut *conn).await?;
+            if shown != expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })
+    .await
+}
+
+/// Where `SQLx` looks for the password it will send, following its own
 /// precedence (sqlx-postgres 0.9.0, `options/mod.rs` and
 /// `options/parse.rs`): `PgConnectOptions::new_without_pgpass` starts from
 /// `PGPASSWORD`; a password in the URL's userinfo or its `password` query
 /// parameter replaces it; only when none of these gave one does
 /// `apply_pgpass` read a password file, `PGPASSFILE` first, then
-/// `~/.pgpass` (`options/pgpass.rs`, `load_password`).
+/// `~/.pgpass` (`options/pgpass.rs`, `load_password`). Decided from the URL
+/// as given and the environment, never from what `SQLx` resolved, so the
+/// doctor does not know whether a password file held a matching line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PasswordSource {
     /// The URL carries it.
     Url,
     /// `PGPASSWORD` is set and the URL carries none.
     PgPassword,
-    /// A password file supplied it: `PGPASSFILE` when that is set, and
+    /// `SQLx` looks in a password file: `PGPASSFILE` when that is set, and
     /// `~/.pgpass`, when `home` says that file exists.
     PassFile {
         pgpassfile: Option<PathBuf>,
@@ -192,46 +296,182 @@ impl PasswordSource {
             Self::Unnamed => text.lit("; no password named"),
         }
     }
+
+    /// Whether `SQLx` reads a password file for this URL.
+    const fn reads_pass_files(&self) -> bool {
+        matches!(self, Self::PassFile { .. } | Self::Unnamed)
+    }
 }
 
-/// Parse `url` exactly as trawld's boot does, through `SQLx`, and say where
-/// the password came from. `SQLx` reads the password file while parsing, so
-/// this runs on the blocking pool: a FIFO in its place blocks a thread,
-/// not the doctor. `Err` carries nothing, so no parse error text can reach
-/// a row.
-fn parse_options(url: &str) -> Result<(PgConnectOptions, PasswordSource), ()> {
-    let options = PgConnectOptions::from_str(url).map_err(drop)?;
-    // What the password resolution ended with, in SQLx's own URL type.
-    let resolved = options.to_url_lossy();
-    let in_url = reparse_as(&resolved, url).is_some_and(|given| {
-        given.password().is_some() || given.query_pairs().any(|(key, _)| key == "password")
-    });
-    let source = if in_url {
+/// A file `SQLx` would read while connecting that the doctor does not let
+/// it read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFault {
+    file: NamedFile,
+    kind: FileFaultKind,
+    /// The most the doctor lets `SQLx` read of this file.
+    cap: u64,
+}
+
+/// Which file a [`FileFault`] is about, as the report may name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NamedFile {
+    /// The file `PGPASSFILE` names.
+    PgPassFile(PathBuf),
+    /// `~/.pgpass`.
+    HomePgPass,
+    /// A TLS file, by its setting's name. Its path comes from the URL or
+    /// the environment, so the report does not show it.
+    Tls(&'static str),
+}
+
+/// Why the doctor does not let `SQLx` read a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileFaultKind {
+    /// Not a regular file: reading a FIFO or a device may block or never
+    /// end.
+    NotRegular,
+    /// Larger than the doctor lets `SQLx` read.
+    TooLarge,
+}
+
+/// Whether `SQLx` may read `path`: a regular file of at most `cap` bytes,
+/// or nothing the doctor can stat. `SQLx` goes on without a password file
+/// it cannot open, and reports a TLS file it cannot open as a connection
+/// error, so neither is the doctor's to refuse.
+fn admissible(path: &Path, cap: u64) -> Result<(), FileFaultKind> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if !meta.is_file() {
+        Err(FileFaultKind::NotRegular)
+    } else if meta.len() > cap {
+        Err(FileFaultKind::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `value` is a PEM document rather than a path, as `SQLx` 0.9.0
+/// decides for the `PGSSL*` variables (`sqlx-core`, `net/tls/mod.rs`,
+/// `From<String> for CertificateInput`). URL parameters are always paths.
+fn is_inline_pem(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("-----BEGIN") && trimmed.ends_with("-----")
+}
+
+/// Check every file `SQLx` would read for this URL before it reads any:
+/// the password files, when `password` says `SQLx` looks in them, and each
+/// TLS file the URL's last matching parameter, or else its environment
+/// variable, names.
+fn check_files(pairs: &[(String, String)], password: &PasswordSource) -> Result<(), FileFault> {
+    let refuse = |file: NamedFile, cap: u64| move |kind| FileFault { file, kind, cap };
+    if password.reads_pass_files() {
+        if let Some(path) = std::env::var_os("PGPASSFILE").map(PathBuf::from) {
+            admissible(&path, PASSFILE_CAP)
+                .map_err(refuse(NamedFile::PgPassFile(path.clone()), PASSFILE_CAP))?;
+        }
+        if let Some(path) = home_pgpass() {
+            admissible(&path, PASSFILE_CAP).map_err(refuse(NamedFile::HomePgPass, PASSFILE_CAP))?;
+        }
+    }
+    for file in &TLS_FILES {
+        let named = pairs
+            .iter()
+            .rev()
+            .find(|(key, _)| file.keys.contains(&key.as_str()))
+            .map(|(_, value)| PathBuf::from(value))
+            .or_else(|| {
+                std::env::var(file.env)
+                    .ok()
+                    .filter(|value| !is_inline_pem(value))
+                    .map(PathBuf::from)
+            });
+        if let Some(path) = named {
+            admissible(&path, file.cap).map_err(refuse(NamedFile::Tls(file.setting), file.cap))?;
+        }
+    }
+    Ok(())
+}
+
+/// `~/.pgpass`, found as `SQLx` finds it, through `std::env::home_dir`.
+fn home_pgpass() -> Option<PathBuf> {
+    std::env::home_dir().map(|dir| dir.join(".pgpass"))
+}
+
+/// Whether every field `SQLx` sends in the startup message is free of
+/// control characters. The message is a list of NUL-terminated strings: a
+/// NUL inside `options` ends it early and moves the doctor's own settings,
+/// appended after it, out of the field the server reads them from.
+fn startup_fields_clean(options: &PgConnectOptions) -> bool {
+    [
+        Some(options.get_username()),
+        options.get_database(),
+        options.get_options(),
+        options.get_application_name(),
+    ]
+    .into_iter()
+    .flatten()
+    .all(|field| !field.chars().any(char::is_control))
+}
+
+/// Why [`prepare`] did not ready a URL for connecting.
+#[derive(Debug)]
+enum Unprepared {
+    /// `SQLx` does not parse it.
+    Unparsable,
+    /// A file `SQLx` would read is refused.
+    File(FileFault),
+    /// A startup field holds a control character.
+    ControlCharacter,
+}
+
+/// Check `url` and the files `SQLx` reads for it, then parse it exactly as
+/// trawld's boot does, through `SQLx`, and add the doctor's settings.
+/// `SQLx` reads the password file while parsing, so this runs on the
+/// blocking pool: a file swapped for a FIFO after its check blocks a
+/// thread, not the doctor. Nothing of a parse error is kept, so no parse
+/// error text can reach a row.
+fn prepare(url: &str) -> Result<(PgConnectOptions, PasswordSource), Unprepared> {
+    // The URL as SQLx's own parser reads it, before SQLx resolves anything.
+    let given = parse_like(PgConnectOptions::from_url, url).ok_or(Unprepared::Unparsable)?;
+    let pairs: Vec<(String, String)> = given
+        .query_pairs()
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    let password = if given.password().is_some() || pairs.iter().any(|(key, _)| key == "password") {
         PasswordSource::Url
     } else if std::env::var("PGPASSWORD").is_ok() {
         PasswordSource::PgPassword
-    } else if resolved.password().is_some() {
-        // SQLx finds ~/.pgpass through std::env::home_dir, so the doctor
-        // does too.
-        let home = std::env::home_dir().is_some_and(|dir| dir.join(".pgpass").exists());
-        PasswordSource::PassFile {
-            pgpassfile: std::env::var_os("PGPASSFILE").map(PathBuf::from),
-            home,
-        }
     } else {
-        PasswordSource::Unnamed
+        let pgpassfile = std::env::var_os("PGPASSFILE").map(PathBuf::from);
+        let home = home_pgpass().is_some_and(|path| path.exists());
+        if pgpassfile.is_none() && !home {
+            PasswordSource::Unnamed
+        } else {
+            PasswordSource::PassFile { pgpassfile, home }
+        }
     };
-    Ok((options, source))
+    check_files(&pairs, &password).map_err(Unprepared::File)?;
+    let options = PgConnectOptions::from_url(&given)
+        .map_err(|_| Unprepared::Unparsable)?
+        .application_name(APPLICATION_NAME)
+        .options(SESSION_SETTINGS);
+    if !startup_fields_clean(&options) {
+        return Err(Unprepared::ControlCharacter);
+    }
+    Ok((options, password))
 }
 
-/// Parse `text` as the type of `_like`. This names `SQLx`'s own URL type,
-/// which it does not re-export, without a dependency of the doctor's own:
-/// the URL the doctor inspects is parsed by the parser `SQLx` used.
-fn reparse_as<T: FromStr>(_like: &T, text: &str) -> Option<T> {
+/// Parse `text` as the URL type `from_url` takes. This names `SQLx`'s own
+/// URL type, which it does not re-export, without a dependency of the
+/// doctor's own: the URL the doctor inspects is parsed by the parser
+/// `SQLx` uses.
+fn parse_like<U: FromStr, T>(_from_url: fn(&U) -> Result<T, sqlx::Error>, text: &str) -> Option<U> {
     text.parse().ok()
 }
 
-/// `server.fleet.connect` or `server.app.connect`: resolve the URL, parse
+/// `server.fleet.connect` or `server.app.connect`: resolve the URL, check
 /// it, and connect once, read-only, within [`DEADLINE`].
 async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
     let check = db.connect_check();
@@ -257,45 +497,17 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
         DatabaseUrlSource::ConfigFile => Text::new(db.setting()).lit(" in ").path(&ctx.config_path),
     };
 
-    let parsed = tokio::time::timeout(
-        DEADLINE,
-        tokio::task::spawn_blocking(move || parse_options(&url)),
-    )
-    .await;
-    let (options, password) = match parsed {
-        Ok(Ok(Ok(parsed))) => parsed,
-        // A panic while parsing is a URL SQLx could not take either.
-        Ok(Ok(Err(())) | Err(_)) => {
-            runner.record(
-                gate,
-                Row::failed(check, "the database URL does not parse")
-                    .source(source)
-                    .next(Text::new(
-                        "write the URL as postgres://user@host:port/database",
-                    )),
-            );
-            return Session(None);
-        }
-        Err(_) => {
-            // The blocking read of a password file did not finish.
-            runner.record(
-                gate,
-                Row::not_sampled(check, reason::TIMED_OUT)
-                    .detail(Text::new("reading the password file took longer than 5 s"))
-                    .source(source)
-                    .next(Text::new(
-                        "check that PGPASSFILE or ~/.pgpass is a regular file",
-                    )),
-            );
+    let (options, password) = match prepare_within_deadline(check, url).await {
+        Ok(ready) => ready,
+        Err(refused) => {
+            runner.record(gate, refused.source(source));
             return Session(None);
         }
     };
     let source = password.named_after(source);
-    let options = options
-        .application_name(APPLICATION_NAME)
-        .options(SESSION_SETTINGS);
 
-    match tokio::time::timeout(DEADLINE, PgConnection::connect_with(&options)).await {
+    let mut conn = match tokio::time::timeout(DEADLINE, PgConnection::connect_with(&options)).await
+    {
         Err(_) => {
             runner.record(
                 gate,
@@ -306,13 +518,18 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
                         "check that the database server is up and reachable from this host",
                     )),
             );
-            Session(None)
+            return Session(None);
         }
         Ok(Err(error)) => {
             runner.record(gate, connect_failed(check, &error).source(source));
-            Session(None)
+            return Session(None);
         }
-        Ok(Ok(conn)) => {
+        Ok(Ok(conn)) => conn,
+    };
+
+    // Nothing else is sent until the session shows it took the settings.
+    match tokio::time::timeout(DEADLINE, session_took_settings(&mut conn)).await {
+        Ok(Ok(true)) => {
             runner.record(
                 gate,
                 Row::complete(check)
@@ -321,7 +538,99 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
             );
             Session(Some(conn))
         }
+        Ok(Ok(false)) => {
+            runner.record(
+                gate,
+                Row::not_sampled(check, reason::SESSION_NOT_READ_ONLY)
+                    .detail(Text::new(
+                        "the session did not take the doctor's read-only setting, timeouts and \
+                         application_name, so the doctor sent no other query",
+                    ))
+                    .source(source)
+                    .next(Text::new(
+                        "check the URL's options and PGOPTIONS, and connect to the database \
+                         server directly rather than through a pooler that drops startup options",
+                    )),
+            );
+            Session(Some(conn)).close().await;
+            Session(None)
+        }
+        Ok(Err(error)) => {
+            runner.record(gate, query_failed(check, &error).source(source));
+            Session(Some(conn)).close().await;
+            Session(None)
+        }
+        Err(_) => {
+            runner.record(gate, timed_out(check).source(source));
+            Session(None)
+        }
     }
+}
+
+/// [`prepare`] on the blocking pool under [`DEADLINE`]. The error is the
+/// connect check's row, without its source.
+async fn prepare_within_deadline(
+    check: ServerCheck,
+    url: String,
+) -> Result<(PgConnectOptions, PasswordSource), Row> {
+    let prepared =
+        tokio::time::timeout(DEADLINE, tokio::task::spawn_blocking(move || prepare(&url))).await;
+    match prepared {
+        Ok(Ok(Ok(ready))) => Ok(ready),
+        // A panic while parsing is a URL SQLx could not take either.
+        Ok(Ok(Err(Unprepared::Unparsable)) | Err(_)) => {
+            Err(
+                Row::failed(check, "the database URL does not parse").next(Text::new(
+                    "write the URL as postgres://user@host:port/database",
+                )),
+            )
+        }
+        Ok(Ok(Err(Unprepared::File(fault)))) => Err(file_refused(check, &fault)),
+        Ok(Ok(Err(Unprepared::ControlCharacter))) => Err(Row::not_sampled(
+            check,
+            reason::SESSION_NOT_READ_ONLY,
+        )
+        .detail(Text::new(
+            "the user, database or options setting holds a control character, which would keep \
+             the session from starting read-only; the doctor did not connect",
+        ))
+        .next(Text::new(
+            "remove control characters from the URL and from PGUSER, PGDATABASE and PGOPTIONS",
+        ))),
+        // Checking or reading a password or TLS file did not finish.
+        Err(_) => Err(Row::not_sampled(check, reason::TIMED_OUT)
+            .detail(Text::new(
+                "checking the password and TLS files took longer than 5 s",
+            ))
+            .next(Text::new(
+                "check that PGPASSFILE, ~/.pgpass and the TLS files are regular files",
+            ))),
+    }
+}
+
+/// The row for a file the doctor does not let `SQLx` read.
+fn file_refused(check: ServerCheck, fault: &FileFault) -> Row {
+    let named = match &fault.file {
+        NamedFile::PgPassFile(path) => {
+            Text::new("PGPASSFILE ").path(&SelectedPath::new(Selection::PgPassFile, path))
+        }
+        NamedFile::HomePgPass => Text::new("~/.pgpass"),
+        NamedFile::Tls(setting) => Text::new("the file ").lit(setting).lit(" names"),
+    };
+    let (outcome_reason, detail) = match fault.kind {
+        FileFaultKind::NotRegular => (reason::UNREADABLE, named.lit(" is not a regular file")),
+        FileFaultKind::TooLarge => (
+            reason::TOO_LARGE,
+            named.lit(" is larger than ").int(fault.cap).lit(" bytes"),
+        ),
+    };
+    Row::not_sampled(check, outcome_reason)
+        .detail(detail.lit("; the doctor did not connect"))
+        .next(
+            Text::new("make it a regular file of at most ")
+                .int(fault.cap)
+                .lit(" bytes, or unset the setting that names it"),
+        )
 }
 
 /// The row for a connection the server or the network refused.
@@ -365,6 +674,7 @@ fn connect_failed(check: ServerCheck, error: &sqlx::Error) -> Row {
 }
 
 /// The row for a query that failed on a connection that authenticated.
+/// None of these proves what boot would find, so each is `not_sampled`.
 fn query_failed(check: ServerCheck, error: &sqlx::Error) -> Row {
     match error {
         sqlx::Error::Database(db) => match db.code().as_deref() {
@@ -375,16 +685,37 @@ fn query_failed(check: ServerCheck, error: &sqlx::Error) -> Row {
             Some("42501") => Row::not_sampled(check, reason::PERMISSION_DENIED).next(Text::new(
                 "grant the role SELECT on what trawld reads, or rerun with trawld's own URL",
             )),
-            _ => Row::failed(check, "the database refused a read-only query").next(Text::new(
+            // connection_exception, and the server ending the session:
+            // admin_shutdown, crash_shutdown, cannot_connect_now, and
+            // the rest of class 57P.
+            Some(code) if code.starts_with("08") || code.starts_with("57P") => {
+                lost_connection(check)
+            }
+            _ => Row::not_sampled(check, reason::QUERY_FAILED)
+                .detail(Text::new(
+                    "the database server answered a read-only query with an error",
+                ))
+                .next(Text::new(
+                    "read the database server's log for this connection",
+                )),
+        },
+        sqlx::Error::Io(_) => lost_connection(check),
+        _ => Row::not_sampled(check, reason::QUERY_FAILED)
+            .detail(Text::new(
+                "a read-only query gave no answer the doctor reads",
+            ))
+            .next(Text::new(
                 "read the database server's log for this connection",
             )),
-        },
-        sqlx::Error::Io(_) => Row::failed(check, "the database connection broke")
-            .next(Text::new("check the database server, then rerun")),
-        _ => Row::failed(check, "a read-only query failed").next(Text::new(
-            "read the database server's log for this connection",
-        )),
     }
+}
+
+/// The row for a connection that broke, or that the server ended, after
+/// it authenticated.
+fn lost_connection(check: ServerCheck) -> Row {
+    Row::not_sampled(check, reason::CONNECTION_LOST)
+        .detail(Text::new("the connection broke after it authenticated"))
+        .next(Text::new("check the database server, then rerun"))
 }
 
 /// The row for a step that missed [`DEADLINE`], or ran on a connection an
@@ -394,7 +725,6 @@ fn timed_out(check: ServerCheck) -> Row {
         .detail(Text::new("a query on this connection ran past 5 s"))
         .next(Text::new("rerun once the database server answers promptly"))
 }
-
 /// `server.fleet.schema`: the Fleet ledger is current, in one read-only
 /// snapshot. trawld's boot refuses an empty or behind Fleet schema, so
 /// both fail; `fleet-admin migrate` fixes them.
@@ -502,13 +832,13 @@ async fn app_schema(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
         return;
     };
     let before = session
-        .step(async |conn| migrations::migrator_lock_held(conn).await)
+        .read(async |conn| migrations::migrator_lock_held(conn).await)
         .await;
     let ledger = session
         .step(async |conn| migrations::validate_schema(conn).await)
         .await;
     let after = session
-        .step(async |conn| migrations::migrator_lock_held(conn).await)
+        .read(async |conn| migrations::migrator_lock_held(conn).await)
         .await;
 
     let ledger = match ledger {
@@ -516,6 +846,7 @@ async fn app_schema(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
         Some(Err(refused)) => return runner.record(gate, app_refused(check, &refused)),
         Some(Ok(ledger)) => ledger,
     };
+    ctx.app.ledger = Some(ledger);
     let lock = LockSeen::from_samples([&before, &after]);
     let row = match (ledger, lock) {
         (Ledger::Current, _) => Row::complete(check).detail(Text::new("the ledger is current")),
@@ -561,7 +892,7 @@ async fn app_schema(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
     }
 
     let read = session
-        .step(async |conn| {
+        .read(async |conn| {
             let catalog_id = catalog::read_catalog_id(&mut *conn).await?;
             let conformed = catalog::read_conformed(&mut *conn).await?;
             Ok::<_, sqlx::Error>((catalog_id, conformed))
@@ -635,7 +966,7 @@ async fn app_writer(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
         return;
     };
     let row = match session
-        .step(async |conn| store::writer_lock_held(conn).await)
+        .read(async |conn| store::writer_lock_held(conn).await)
         .await
     {
         None => timed_out(check),
@@ -710,17 +1041,89 @@ mod tests {
     }
 
     /// A password in the userinfo or in the `password` parameter is "in
-    /// the URL", as `SQLx` reads both. The test process's own environment
-    /// decides the other sources, so only the URL cases are asserted.
+    /// the URL", as `SQLx` reads both, and an IPv6 `hostaddr` parses: the
+    /// doctor never renders the options back into a URL, which `SQLx`
+    /// 0.9.0 does with the host unbracketed and panics on. The test
+    /// process's own environment decides the other sources, so only the
+    /// URL cases are asserted.
     #[test]
     fn a_password_in_the_url_is_named_so() {
         for url in [
             "postgres://user:private-secret@127.0.0.1:1/db",
             "postgres://user@127.0.0.1:1/db?password=private-secret",
+            "postgres://user:private-secret@localhost:1/db?hostaddr=::1",
         ] {
-            let (_, source) = parse_options(url).unwrap();
+            let Ok((_, source)) = prepare(url) else {
+                panic!("{url} is not ready");
+            };
             assert_eq!(source, PasswordSource::Url, "{url}");
         }
-        assert!(parse_options("postgres://user:pw@[::1/db").is_err());
+        assert!(matches!(
+            prepare("postgres://user:pw@[::1/db"),
+            Err(Unprepared::Unparsable)
+        ));
+    }
+
+    /// A control character in any startup field stops the connection
+    /// before it is made; the password is not a startup field.
+    #[test]
+    fn a_control_character_in_a_startup_field_is_refused() {
+        for url in [
+            "postgres://user:pw@127.0.0.1:1/db?options=%00",
+            "postgres://user:pw@127.0.0.1:1/db?options=-c%20work_mem%3D64kB%00",
+            "postgres://us%01er:pw@127.0.0.1:1/db",
+            "postgres://user:pw@127.0.0.1:1/d%0Ab",
+            "postgres://user:pw@127.0.0.1:1/db?user=a%7Fb",
+        ] {
+            assert!(
+                matches!(prepare(url), Err(Unprepared::ControlCharacter)),
+                "{url}"
+            );
+        }
+        assert!(matches!(
+            prepare("postgres://user:p%00w@127.0.0.1:1/db?options=-c%20work_mem%3D64kB"),
+            Ok(..)
+        ));
+    }
+
+    /// A TLS file named in the URL that is not a regular file, or is too
+    /// large, is refused before `SQLx` reads it; the last parameter wins,
+    /// as it does in `SQLx`.
+    #[test]
+    fn a_tls_file_that_is_not_regular_or_too_large_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.pem");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(fsread::cap::CERT + 1)
+            .unwrap();
+        let small = dir.path().join("small.pem");
+        std::fs::write(&small, b"not a certificate").unwrap();
+        let url = |query: String| format!("postgres://user:pw@127.0.0.1:1/db?{query}");
+        let refused = |query: String| match prepare(&url(query)) {
+            Err(Unprepared::File(fault)) => Some((fault.file, fault.kind)),
+            _ => None,
+        };
+        assert_eq!(
+            refused(format!("sslrootcert={}", dir.path().display())),
+            Some((NamedFile::Tls("sslrootcert"), FileFaultKind::NotRegular))
+        );
+        assert_eq!(
+            refused("ssl-key=/dev/zero".to_owned()),
+            Some((NamedFile::Tls("sslkey"), FileFaultKind::NotRegular))
+        );
+        assert_eq!(
+            refused(format!("sslcert={}", big.display())),
+            Some((NamedFile::Tls("sslcert"), FileFaultKind::TooLarge))
+        );
+        assert_eq!(
+            refused(format!(
+                "ssl-ca={}&sslrootcert={}",
+                big.display(),
+                small.display()
+            )),
+            None
+        );
+        assert_eq!(refused("sslrootcert=/nonexistent/ca.pem".to_owned()), None);
     }
 }

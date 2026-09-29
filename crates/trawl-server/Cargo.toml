@@ -25,6 +25,9 @@ axum = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+# `trawld --doctor` computes the `SQLx` migrator's lock key as `SQLx` does,
+# with the same crate and version (sqlx-postgres 0.9.0 depends on it).
+crc = "3.4.0"
 duckdb = { workspace = true }
 flate2 = { workspace = true }
 fs4 = { workspace = true }

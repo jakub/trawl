@@ -117,29 +117,12 @@ pub async fn migrator_lock_held(conn: &mut PgConnection) -> Result<bool, sqlx::E
 /// `database`: `sqlx-postgres-0.9.0/src/migrate.rs`, `generate_lock_id`,
 /// is `0x3d32ad9e * (CRC-32/ISO-HDLC(current_database()) as i64)`, taken
 /// with `pg_advisory_lock($1)` in `Migrate::lock` on the connection that
-/// migrates. `fleet-admin` and trawld's boot both lock this way. The
-/// product fits an `i64`: the CRC is below 2^32 and the factor below 2^30.
+/// migrates. `fleet-admin` and trawld's boot both lock this way. The CRC
+/// comes from the `crc` crate `SQLx` itself computes it with. The product
+/// fits an `i64`: the CRC is below 2^32 and the factor below 2^30.
 fn migrator_lock_key(database: &str) -> i64 {
-    0x3d32_ad9e * i64::from(crc32_iso_hdlc(database.as_bytes()))
-}
-
-/// CRC-32/ISO-HDLC (the zlib and Ethernet CRC: reflected polynomial
-/// `0xEDB88320`, initial value and final XOR all ones), which `SQLx`
-/// computes through `crc::CRC_32_ISO_HDLC`. Bitwise: it runs once per
-/// doctor run over a database name.
-fn crc32_iso_hdlc(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 == 1 {
-                (crc >> 1) ^ 0xEDB8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
+    const CRC_IEEE: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+    0x3d32_ad9e * i64::from(CRC_IEEE.checksum(database.as_bytes()))
 }
 
 /// One applied row of `_sqlx_migrations`: version, success, checksum.
@@ -344,17 +327,17 @@ mod tests {
         ));
     }
 
-    /// The check value of CRC-32/ISO-HDLC, and the key it yields: the
-    /// live proof that it is `SQLx`'s key is `doctor_detects_real_migrator_lock`,
-    /// which takes the lock through `SQLx` itself.
+    /// The key for the CRC-32/ISO-HDLC check input, whose CRC is
+    /// `0xCBF43926`: the live proof that it is `SQLx`'s key is
+    /// `doctor_detects_real_migrator_lock`, which takes the lock through
+    /// `SQLx` itself.
     #[test]
     fn the_migrator_lock_key_is_sqlx_formula() {
-        assert_eq!(crc32_iso_hdlc(b"123456789"), 0xCBF4_3926);
-        assert_eq!(crc32_iso_hdlc(b""), 0);
         assert_eq!(
             migrator_lock_key("123456789"),
             0x3d32_ad9e * 0xCBF4_3926_i64
         );
+        assert_eq!(migrator_lock_key(""), 0);
         assert!(migrator_lock_key("trawl") > 0);
     }
 }

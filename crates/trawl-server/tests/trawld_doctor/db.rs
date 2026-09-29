@@ -32,10 +32,16 @@ const LEGACY_DIR: &str = concat!(
     "/../../scripts/schema-baseline/fixtures/trawl"
 );
 
+/// A second login role, also with the password [`SECRET`], that is a
+/// member of no role: it holds only what a test database grants it or
+/// `PUBLIC`. [`forbid_advisory_locks`] leaves it no advisory-lock function.
+const LOCKLESS: &str = "trawl_doctor_lockless";
+
 /// Make sure [`ROLE`] exists with the planted password and the admin
-/// role's privileges. Idempotent, and serialized across the test processes
-/// that share the cluster by a transaction-scoped lock on the admin
-/// connection (the test's, never the doctor's).
+/// role's privileges, and [`LOCKLESS`] with the planted password and no
+/// membership. Idempotent, and serialized across the test processes that
+/// share the cluster by a transaction-scoped lock on the admin connection
+/// (the test's, never the doctor's).
 async fn ensure_role() {
     let mut admin = PgConnection::connect(&common::admin_database_url())
         .await
@@ -45,22 +51,24 @@ async fn ensure_role() {
         .execute(&mut *tx)
         .await
         .expect("serialize role setup");
-    let exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
-            .bind(ROLE)
-            .fetch_one(&mut *tx)
-            .await
-            .expect("look up the role");
-    if !exists {
-        tx.execute(sqlx::AssertSqlSafe(format!("CREATE ROLE {ROLE} LOGIN")))
-            .await
-            .expect("create the planted role");
+    for role in [ROLE, LOCKLESS] {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+                .bind(role)
+                .fetch_one(&mut *tx)
+                .await
+                .expect("look up the role");
+        if !exists {
+            tx.execute(sqlx::AssertSqlSafe(format!("CREATE ROLE {role} LOGIN")))
+                .await
+                .expect("create the planted role");
+        }
+        tx.execute(sqlx::AssertSqlSafe(format!(
+            "ALTER ROLE {role} LOGIN NOSUPERUSER PASSWORD '{SECRET}'"
+        )))
+        .await
+        .expect("set the planted password");
     }
-    tx.execute(sqlx::AssertSqlSafe(format!(
-        "ALTER ROLE {ROLE} LOGIN PASSWORD '{SECRET}'"
-    )))
-    .await
-    .expect("set the planted password");
     let admin_role: String = sqlx::query_scalar("SELECT current_user::text")
         .fetch_one(&mut *tx)
         .await
@@ -70,8 +78,121 @@ async fn ensure_role() {
     )))
     .await
     .expect("let the planted role read what the admin role owns");
+    let memberships: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member
+         WHERE r.rolname = $1",
+    )
+    .bind(LOCKLESS)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("look up the lockless role's memberships");
+    assert_eq!(memberships, 0, "{LOCKLESS} must inherit nothing");
     tx.commit().await.expect("commit role setup");
     admin.close().await.expect("close");
+}
+
+/// The advisory-lock functions: every `pg_advisory*` and
+/// `pg_try_advisory*` function, including the unlocks.
+const ADVISORY_FUNCTIONS: &str = "SELECT oid FROM pg_proc WHERE proname ~ '^pg_(try_)?advisory'";
+
+/// In the database `url` names: revoke `EXECUTE` on every advisory-lock
+/// function from `PUBLIC`, grant it back to the admin role, which trawld
+/// runs as here, and let [`LOCKLESS`] read every table. Function
+/// privileges live in each database's own `pg_proc`, so this changes no
+/// other database. Asserts afterwards that [`LOCKLESS`] may execute none
+/// of them, so any call it makes is refused with `insufficient_privilege`.
+async fn forbid_advisory_locks(url: &str) {
+    let mut conn = admin(url).await;
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "DO $$ DECLARE f regprocedure; BEGIN
+            FOR f IN SELECT oid::regprocedure FROM pg_proc WHERE oid IN ({ADVISORY_FUNCTIONS}) LOOP
+                EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
+                EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', f, current_user);
+            END LOOP;
+        END $$"
+    )))
+    .await
+    .expect("revoke the advisory-lock functions from PUBLIC");
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {LOCKLESS}"
+    )))
+    .await
+    .expect("let the lockless role read the ledger and catalog_state");
+    let (total, allowed): (i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*), count(*) FILTER (WHERE has_function_privilege($1, oid, 'EXECUTE'))
+         FROM pg_proc WHERE oid IN ({ADVISORY_FUNCTIONS})"
+    )))
+    .bind(LOCKLESS)
+    .fetch_one(&mut conn)
+    .await
+    .expect("count the advisory-lock functions");
+    // Postgres 18 has 21: lock, lock_shared, unlock, unlock_shared,
+    // xact_lock and xact_lock_shared in both key forms, their try_
+    // forms, and unlock_all.
+    assert!(total >= 21, "only {total} advisory-lock functions found");
+    assert_eq!(allowed, 0, "{LOCKLESS} may still take an advisory lock");
+    conn.close().await.unwrap();
+}
+
+/// `url` as [`LOCKLESS`] with the planted password in it.
+fn lockless(url: &str) -> String {
+    with_login(url, LOCKLESS, Some(SECRET))
+}
+
+/// `url` with `query` added to its query string.
+fn with_query(url: &str, query: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}{query}")
+}
+
+/// The `options` parameter that puts the schema [`PROBE_SCHEMA`] first on
+/// the doctor's `search_path`, so the doctor's unqualified calls to
+/// `current_database()` reach the probe's function of that name.
+const PROBE_OPTIONS: &str = "options=-c%20search_path%3Ddoctor_probe%2Cpg_catalog%2Cpublic";
+
+/// The schema holding the probe function [`install_probe`] writes.
+const PROBE_SCHEMA: &str = "doctor_probe";
+
+/// In the database `url` names, (re)define `doctor_probe.current_database()`
+/// to run `body`, a PL/pgSQL statement list, and then return the real
+/// `current_database()`. Every role may call it. With [`PROBE_OPTIONS`]
+/// on the doctor's URL, the doctor's own lock queries call it, so `body`
+/// runs inside the doctor's session.
+async fn install_probe(url: &str, body: &str) {
+    let mut conn = admin(url).await;
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA IF NOT EXISTS {PROBE_SCHEMA};
+         GRANT USAGE ON SCHEMA {PROBE_SCHEMA} TO PUBLIC;
+         CREATE OR REPLACE FUNCTION {PROBE_SCHEMA}.current_database() RETURNS name
+         LANGUAGE plpgsql AS $$ BEGIN {body} RETURN pg_catalog.current_database(); END $$;"
+    )))
+    .await
+    .expect("install the probe function");
+    conn.close().await.unwrap();
+}
+
+/// Every database row of `report` is `complete`: what a doctor run as
+/// [`LOCKLESS`] shows when it calls no advisory-lock function. A call is
+/// refused with `insufficient_privilege`, which turns the row that made
+/// it `not_sampled`, `permission_denied`.
+fn database_rows_complete(report: &Report) -> Result<(), String> {
+    for id in [
+        "server.fleet.connect",
+        "server.fleet.schema",
+        "server.app.connect",
+        "server.app.schema",
+        "server.app.writer",
+    ] {
+        let check = row(report, id);
+        if check.outcome != Outcome::Complete {
+            return Err(format!(
+                "{id} is {:?} ({:?})",
+                check.outcome,
+                check.reason.as_deref()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `url` (an admin URL naming a test database) with its userinfo replaced
@@ -112,6 +233,7 @@ fn url_values(url: &str) -> Vec<String> {
         host.to_owned(),
         database.to_owned(),
         ROLE.to_owned(),
+        LOCKLESS.to_owned(),
     ]
 }
 
@@ -444,10 +566,15 @@ async fn writer_pid(conn: &mut PgConnection, database: &str) -> Option<i32> {
     .unwrap()
 }
 
-/// While a real trawld holds its writer lock, a watcher polling
-/// `pg_locks` back to back sees the doctor's backends on both databases
-/// and no advisory lock held or awaited by either; afterwards the same
-/// trawld session still holds the writer lock and trawld still serves.
+/// While a real trawld holds its writer lock, the doctor runs as
+/// [`LOCKLESS`] on databases where that role may execute no advisory-lock
+/// function, and every database row completes: had the doctor called one,
+/// the call would have been refused and its row would not be `complete`
+/// (`an_advisory_lock_call_fails_the_lockless_proof` is the negative
+/// control). As supporting evidence, a watcher polling `pg_locks` back to
+/// back sees the doctor's backends on both databases and no advisory lock
+/// held or awaited by either. Afterwards the same trawld session still
+/// holds the writer lock and trawld still serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_takes_no_advisory_lock() {
     use std::sync::Arc;
@@ -463,6 +590,8 @@ async fn doctor_takes_no_advisory_lock() {
     let before = writer_pid(&mut admin_conn, &app_db)
         .await
         .expect("the running trawld holds its writer lock");
+    forbid_advisory_locks(&server.fleet_db_url).await;
+    forbid_advisory_locks(&server.app_db_url).await;
 
     let stop = Arc::new(AtomicBool::new(false));
     let sampler = tokio::spawn(watch_doctor_locks(
@@ -471,14 +600,16 @@ async fn doctor_takes_no_advisory_lock() {
         Arc::clone(&stop),
     ));
     let dir = tempfile::tempdir().unwrap();
-    let fleet = planted(&server.fleet_db_url);
-    let app = planted(&server.app_db_url);
+    let fleet = lockless(&server.fleet_db_url);
+    let app = lockless(&server.app_db_url);
     let home = dir.path().to_owned();
     let (_, report, stderr) = tokio::task::spawn_blocking(move || doctor_env(&home, &fleet, &app))
         .await
         .unwrap();
     stop.store(true, Ordering::SeqCst);
     let watched = sampler.await.unwrap();
+
+    database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}\n{stderr}"));
 
     assert_eq!(
         verdict(&report, "server.app.writer"),
@@ -518,12 +649,15 @@ async fn doctor_takes_no_advisory_lock() {
     // pg_locks lists every database's locks, and every trawld takes the
     // same key: a doctor pointed at another app-state database does not
     // see this trawld's lock, which is still held.
-    let other = planted(&migrated_app().await);
-    let fleet = planted(&server.fleet_db_url);
+    let other = migrated_app().await;
+    forbid_advisory_locks(&other).await;
+    let other = lockless(&other);
+    let fleet = lockless(&server.fleet_db_url);
     let home = dir.path().to_owned();
     let (_, report, _) = tokio::task::spawn_blocking(move || doctor_env(&home, &fleet, &other))
         .await
         .unwrap();
+    database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}"));
     assert_eq!(
         verdict(&report, "server.app.writer"),
         (Outcome::Complete, Some("not_observed"))
@@ -751,4 +885,387 @@ async fn doctor_connect_refusals_fail() {
             (Outcome::Complete, None)
         );
     }
+}
+
+/// The negative control of `doctor_takes_no_advisory_lock`. On databases
+/// where [`forbid_advisory_locks`] ran, [`LOCKLESS`] calling any one of the
+/// advisory-lock functions is refused with `insufficient_privilege`
+/// (SQLSTATE 42501), so a doctor run as that role cannot take, await or
+/// release an advisory lock without the call erring. The doctor run as
+/// that role completes every database row: had it made such a call, the
+/// error would have turned the row that made it `not_sampled`.
+#[tokio::test]
+async fn an_advisory_lock_call_fails_the_lockless_proof() {
+    ensure_role().await;
+    let fleet = migrated_fleet().await;
+    let app = migrated_app().await;
+    forbid_advisory_locks(&fleet).await;
+    forbid_advisory_locks(&app).await;
+
+    for url in [&fleet, &app] {
+        let mut conn = PgConnection::connect(&lockless(url))
+            .await
+            .expect("the lockless role connects");
+        let functions: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT proname::text, pg_get_function_identity_arguments(oid)
+             FROM pg_proc WHERE oid IN ({ADVISORY_FUNCTIONS}) ORDER BY 1, 2"
+        )))
+        .fetch_all(&mut conn)
+        .await
+        .expect("list the advisory-lock functions");
+        assert!(
+            functions.len() >= 21,
+            "only {} advisory-lock functions found",
+            functions.len()
+        );
+        for (name, arguments) in functions {
+            let arguments = arguments
+                .split(", ")
+                .filter(|argument| !argument.is_empty())
+                .map(|argument| format!("1::{argument}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let call = format!("SELECT pg_catalog.{name}({arguments})");
+            let refused = conn
+                .execute(sqlx::AssertSqlSafe(call.clone()))
+                .await
+                .expect_err(&format!("{LOCKLESS} ran {call}"));
+            let code = refused
+                .as_database_error()
+                .and_then(|error| error.code().map(std::borrow::Cow::into_owned));
+            assert_eq!(code.as_deref(), Some("42501"), "{call}: {refused}");
+        }
+        conn.close().await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (_, report, stderr) = doctor_env(dir.path(), &lockless(&fleet), &lockless(&app));
+    database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}\n{stderr}"));
+}
+
+/// A query that errs or a connection that breaks after the login proves
+/// nothing about boot: each row is `not_sampled` with a closed reason, and
+/// the error's text, which here carries the planted secret, is not shown.
+#[tokio::test]
+async fn doctor_query_failures_after_login_are_not_sampled() {
+    ensure_role().await;
+    let fleet = migrated_fleet().await;
+    let app = migrated_app().await;
+    let dir = tempfile::tempdir().unwrap();
+    let probed = with_query(&planted(&app), PROBE_OPTIONS);
+
+    // Every lock query errs. The current ledger is complete whatever its
+    // lock samples show; the writer row has only the failed read. The
+    // writer query calls current_database() only for a pg_locks row that
+    // matches its other conditions, so a session of the test holds
+    // trawld's writer lock, as `writer_pid` spells its key, meanwhile.
+    install_probe(
+        &app,
+        &format!("RAISE EXCEPTION USING MESSAGE = '{SECRET} probe', ERRCODE = 'XX000';"),
+    )
+    .await;
+    let mut holder = admin(&app).await;
+    sqlx::query("SELECT pg_advisory_lock(0x0074_7261_776c_2131)")
+        .execute(&mut holder)
+        .await
+        .expect("hold trawld's writer lock");
+    let (_, report, _) = doctor_env(dir.path(), &planted(&fleet), &probed);
+    holder.close().await.unwrap();
+    assert_eq!(
+        verdict(&report, "server.app.writer"),
+        (Outcome::NotSampled, Some("query_failed")),
+        "{report:?}"
+    );
+    assert_eq!(
+        verdict(&report, "server.app.schema"),
+        (Outcome::Complete, None)
+    );
+
+    // The first lock query ends the doctor's own backend: the server
+    // reports the termination, and every read after it finds the
+    // connection gone.
+    install_probe(
+        &app,
+        "PERFORM pg_catalog.pg_terminate_backend(pg_catalog.pg_backend_pid());",
+    )
+    .await;
+    let (_, report, _) = doctor_env(dir.path(), &planted(&fleet), &probed);
+    for id in ["server.app.schema", "server.app.writer"] {
+        assert_eq!(
+            verdict(&report, id),
+            (Outcome::NotSampled, Some("connection_lost")),
+            "{id}: {report:?}"
+        );
+    }
+}
+
+/// One case of `doctor_refuses_unbounded_credential_files`.
+struct FileCase {
+    label: &'static str,
+    /// Added to the doctor's environment.
+    env: Vec<(&'static str, OsString)>,
+    /// The app-state URL, which carries no password when a password file
+    /// is to be read.
+    app_url: String,
+    reason: &'static str,
+    detail: String,
+    /// The setting holds for every connection the process makes, so the
+    /// Fleet connection is refused the same way.
+    process_wide: bool,
+}
+
+/// The cases of `doctor_refuses_unbounded_credential_files`, with their
+/// FIFOs and oversized file made in `dir`, over the planted app-state URL
+/// `app` and the same URL without a password, `bare_app`. A TLS path comes
+/// from the URL or the environment, so it is never shown.
+fn credential_file_cases(dir: &Path, app: &str, bare_app: &str) -> Vec<FileCase> {
+    use nix::sys::stat::Mode;
+
+    let fifo = dir.join("fifo");
+    nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+    nix::unistd::mkfifo(&dir.join("tls-fifo"), Mode::S_IRWXU).unwrap();
+    let big = dir.join("big");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(1024 * 1024 + 1)
+        .unwrap();
+    let home_fifo = dir.join("home");
+    std::fs::create_dir(&home_fifo).unwrap();
+    nix::unistd::mkfifo(&home_fifo.join(".pgpass"), Mode::S_IRWXU).unwrap();
+    let not_regular =
+        |named: &str| format!("{named} is not a regular file; the doctor did not connect");
+    vec![
+        FileCase {
+            label: "PGPASSFILE is a FIFO",
+            env: vec![("PGPASSFILE", fifo.clone().into_os_string())],
+            app_url: bare_app.to_owned(),
+            reason: "unreadable",
+            detail: not_regular(&format!("PGPASSFILE {}", fifo.display())),
+            process_wide: false,
+        },
+        FileCase {
+            label: "PGPASSFILE is too large",
+            env: vec![("PGPASSFILE", big.clone().into_os_string())],
+            app_url: bare_app.to_owned(),
+            reason: "too_large",
+            detail: format!(
+                "PGPASSFILE {} is larger than 1048576 bytes; the doctor did not connect",
+                big.display()
+            ),
+            process_wide: false,
+        },
+        FileCase {
+            label: "~/.pgpass is a FIFO",
+            env: vec![("HOME", home_fifo.into_os_string())],
+            app_url: bare_app.to_owned(),
+            reason: "unreadable",
+            detail: not_regular("~/.pgpass"),
+            process_wide: false,
+        },
+        FileCase {
+            label: "the URL's sslrootcert is a FIFO",
+            env: Vec::new(),
+            app_url: with_query(
+                app,
+                &format!("sslrootcert={}", dir.join("tls-fifo").display()),
+            ),
+            reason: "unreadable",
+            detail: not_regular("the file sslrootcert names"),
+            process_wide: false,
+        },
+        FileCase {
+            label: "PGSSLKEY is a device",
+            env: vec![("PGSSLKEY", "/dev/zero".into())],
+            app_url: app.to_owned(),
+            reason: "unreadable",
+            detail: not_regular("the file sslkey names"),
+            // SQLx reads PGSSLKEY for every connection.
+            process_wide: true,
+        },
+    ]
+}
+
+/// A password or TLS file `SQLx` would read that is not a regular file, or
+/// is larger than the doctor lets it read, is refused before the doctor
+/// parses the URL or connects: `not_sampled`, promptly, with the file
+/// named by its setting. Only `PGPASSFILE`'s path is shown. A file named
+/// in the environment for every connection refuses both databases.
+#[tokio::test]
+async fn doctor_refuses_unbounded_credential_files() {
+    ensure_role().await;
+    let fleet = migrated_fleet().await;
+    let app = migrated_app().await;
+    let mut values = url_values(&planted(&fleet));
+    values.extend(url_values(&planted(&app)));
+
+    let dir = tempfile::tempdir().unwrap();
+    let bare_app = with_login(&app, ROLE, None);
+    for case in credential_file_cases(dir.path(), &planted(&app), &bare_app) {
+        let label = case.label;
+        let mut env = case.env;
+        env.push(("FLEET_DATABASE_URL", planted(&fleet).into()));
+        env.push(("TRAWL_DATABASE_URL", case.app_url.clone().into()));
+        let mut planted_values = values.clone();
+        planted_values.push(case.app_url);
+        planted_values.push(dir.path().join("tls-fifo").display().to_string());
+        let started = std::time::Instant::now();
+        let (_, report, _) = doctor(
+            dir.path(),
+            &DoctorConfig::in_dir(dir.path()),
+            &env,
+            &planted_values,
+        );
+        // Both output forms ran; neither waited out a 5 s deadline.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "{label}: {:?}",
+            started.elapsed()
+        );
+        let refused = |connect: &str, schema: &str| {
+            let check = row(&report, connect);
+            assert_eq!(
+                (
+                    check.outcome,
+                    check.reason.as_deref(),
+                    check.detail.as_deref()
+                ),
+                (
+                    Outcome::NotSampled,
+                    Some(case.reason),
+                    Some(case.detail.as_str())
+                ),
+                "{label}: {connect}"
+            );
+            assert_eq!(
+                row(&report, schema).blocked_by.as_deref(),
+                Some(connect),
+                "{label}: {schema}"
+            );
+        };
+        refused("server.app.connect", "server.app.schema");
+        if case.process_wide {
+            refused("server.fleet.connect", "server.fleet.schema");
+        } else {
+            // The Fleet URL carries its password, so no password file is
+            // read for it, and it names no TLS file.
+            assert_eq!(
+                verdict(&report, "server.fleet.connect"),
+                (Outcome::Complete, None),
+                "{label}"
+            );
+        }
+    }
+}
+
+/// An IPv6 `hostaddr` connects. `SQLx` 0.9.0 panics rendering such options
+/// back into a URL, and the default panic hook prints the panic's message
+/// and location, so the doctor does neither: the rows complete and stderr
+/// stays empty.
+#[tokio::test]
+async fn doctor_takes_an_ipv6_hostaddr() {
+    ensure_role().await;
+    let fleet = migrated_fleet().await;
+    let app = migrated_app().await;
+    let dir = tempfile::tempdir().unwrap();
+    let v6 = |url: &str| with_query(&planted(url), "hostaddr=::1");
+
+    let (_, report, stderr) = doctor_env(dir.path(), &v6(&fleet), &v6(&app));
+    for id in ["server.fleet.connect", "server.app.connect"] {
+        let check = row(&report, id);
+        assert_eq!(
+            (check.outcome, check.source.as_deref()),
+            (
+                Outcome::Complete,
+                Some(if id == "server.fleet.connect" {
+                    "FLEET_DATABASE_URL from the environment; password in the URL"
+                } else {
+                    "TRAWL_DATABASE_URL from the environment; password in the URL"
+                })
+            ),
+            "{id}: {report:?}"
+        );
+    }
+    database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}"));
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// A session that does not start read-only with the doctor's timeouts is
+/// `not_sampled`, `session_not_read_only`, and the checks behind it are
+/// blocked: no query of theirs ran. A NUL in `options` would cut the
+/// doctor's own settings out of the startup message, so the doctor does
+/// not connect with one; a session the server changed after the login,
+/// here by a login event trigger, is caught when the doctor reads its
+/// settings back.
+#[tokio::test]
+async fn doctor_refuses_a_session_that_is_not_read_only() {
+    ensure_role().await;
+    let fleet = migrated_fleet().await;
+    let app = migrated_app().await;
+    let dir = tempfile::tempdir().unwrap();
+    let refused = |report: &Report, label: &str| {
+        assert_eq!(
+            verdict(report, "server.app.connect"),
+            (Outcome::NotSampled, Some("session_not_read_only")),
+            "{label}: {report:?}"
+        );
+        for id in ["server.app.schema", "server.app.writer"] {
+            assert_eq!(
+                row(report, id).blocked_by.as_deref(),
+                Some("server.app.connect"),
+                "{label}: {id}"
+            );
+        }
+        assert_eq!(
+            verdict(report, "server.fleet.schema"),
+            (Outcome::Complete, None),
+            "{label}"
+        );
+    };
+
+    for options in ["options=%00", "options=-c%20work_mem%3D64kB%00"] {
+        let url = with_query(&planted(&app), options);
+        let (_, report, _) = doctor_env(dir.path(), &planted(&fleet), &url);
+        refused(&report, options);
+    }
+
+    // A login trigger that undoes one of the doctor's settings for the
+    // doctor's sessions only.
+    let mut conn = admin(&app).await;
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "CREATE SCHEMA {PROBE_SCHEMA};
+         CREATE FUNCTION {PROBE_SCHEMA}.undo() RETURNS event_trigger
+         LANGUAGE plpgsql AS $$ BEGIN END $$;
+         CREATE EVENT TRIGGER doctor_undo ON login EXECUTE FUNCTION {PROBE_SCHEMA}.undo();"
+    )))
+    .await
+    .expect("install the login trigger");
+    for (setting, value) in [
+        ("default_transaction_read_only", "off"),
+        ("statement_timeout", "0"),
+        ("lock_timeout", "0"),
+    ] {
+        conn.execute(sqlx::AssertSqlSafe(format!(
+            "CREATE OR REPLACE FUNCTION {PROBE_SCHEMA}.undo() RETURNS event_trigger
+             LANGUAGE plpgsql AS $$ BEGIN
+                 IF current_setting('application_name') = 'trawld-doctor' THEN
+                     PERFORM set_config('{setting}', '{value}', false);
+                 END IF;
+             END $$"
+        )))
+        .await
+        .expect("set the login trigger's body");
+        let (_, report, _) = doctor_env(dir.path(), &planted(&fleet), &planted(&app));
+        refused(&report, setting);
+    }
+
+    // With the trigger doing nothing again, the same URL is read-only.
+    conn.execute(sqlx::AssertSqlSafe(format!(
+        "CREATE OR REPLACE FUNCTION {PROBE_SCHEMA}.undo() RETURNS event_trigger
+         LANGUAGE plpgsql AS $$ BEGIN END $$"
+    )))
+    .await
+    .unwrap();
+    conn.close().await.unwrap();
+    let (_, report, _) = doctor_env(dir.path(), &planted(&fleet), &planted(&app));
+    database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}"));
 }

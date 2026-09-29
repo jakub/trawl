@@ -6398,6 +6398,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap",
+ "crc",
  "crossterm 0.29.0",
  "dashmap",
  "duckdb",

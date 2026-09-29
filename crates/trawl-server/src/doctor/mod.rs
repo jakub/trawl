@@ -29,7 +29,7 @@
 //! identifier or listener address reaches the report. Every file is read
 //! through [`fsread`].
 
-use std::io::{self, Write as _};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -212,7 +212,7 @@ impl std::fmt::Debug for CatalogId {
     }
 }
 
-/// What `server.app.schema` read of `catalog_state`, inside its snapshot.
+/// What `server.app.schema` read of `catalog_state`, just after its snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogFacts {
     /// `catalog_state.catalog_id`.
@@ -224,6 +224,9 @@ pub struct CatalogFacts {
 /// What the database group learned that the storage group needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppFacts {
+    /// The ledger `server.app.schema` classified, when it read one boot
+    /// admits. Set whatever the migrator's lock showed.
+    pub ledger: Option<crate::store::migrations::Ledger>,
     /// `catalog_state`, when `server.app.schema` read it. `None` when that
     /// check did not complete, or completed on a ledger that has no
     /// catalog yet.
@@ -454,6 +457,7 @@ const USER_LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 /// thread, before any other thread exists.
 #[must_use]
 pub fn run(config: &Path, format: Option<Format>) -> u8 {
+    install_panic_hook(io::stderr);
     let format = format.unwrap_or_else(Format::detect);
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -477,6 +481,19 @@ pub fn run(config: &Path, format: Option<Format>) -> u8 {
         return 1;
     }
     report.verdict().exit_code()
+}
+
+/// The one line the doctor's panic hook prints.
+const PANIC_LINE: &str = "[trawld] doctor stopped a check: an internal error occurred";
+
+/// Replace the default panic hook, which prints the panic's message and
+/// location, with one that writes [`PANIC_LINE`] to `sink` and nothing
+/// else. A dependency's panic message can quote what it was given, such as
+/// a database URL, so no part of it reaches the output.
+fn install_panic_hook<W: Write>(sink: impl Fn() -> W + Send + Sync + 'static) {
+    std::panic::set_hook(Box::new(move |_| {
+        let _ = writeln!(sink(), "{PANIC_LINE}");
+    }));
 }
 
 /// Run every check and build the report. Nothing is rendered until the
@@ -995,9 +1012,46 @@ mod tests {
         let _ = runner.finish(target());
     }
 
+    /// A panic under the doctor's hook writes the fixed line and nothing of
+    /// its message or location. The hook is process-global, so another
+    /// test panicking meanwhile may add lines; each must be the fixed one.
+    #[test]
+    fn the_panic_hook_prints_only_a_fixed_line() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let previous = std::panic::take_hook();
+        let writer = sink.clone();
+        install_panic_hook(move || writer.clone());
+        let caught = std::panic::catch_unwind(|| {
+            panic!("postgres://user:private-secret@[::1/db");
+        });
+        std::panic::set_hook(previous);
+        assert!(caught.is_err());
+
+        let written = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(!written.is_empty(), "the hook wrote nothing");
+        for line in written.lines() {
+            assert_eq!(line, PANIC_LINE, "{written}");
+        }
+    }
+
     #[test]
     fn debug_never_shows_a_catalog_id_or_certificate() {
         let facts = AppFacts {
+            ledger: None,
             catalog: Some(CatalogFacts {
                 catalog_id: CatalogId("0b7c9d2e-private".to_owned()),
                 conformed: true,
