@@ -36,7 +36,7 @@ use std::time::Duration;
 use trawl_api::doctor::{Outcome, Report, Target, Vantage, reason};
 
 use crate::config::{Config, ConfigError};
-use crate::config_check::{LoadedFault, check_loaded};
+use crate::config_check::{LoadedFault, LogFileRefusal, check_loaded};
 
 mod db;
 pub mod fsread;
@@ -438,6 +438,11 @@ impl Runner {
 /// such as a file read past its deadline.
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
 
+/// How long the checks after parsing may take. With the file logger in use
+/// they inspect `server.log_file` and the data root's markers, path
+/// metadata a hung filesystem can stall, so they get a file read's budget.
+const VALIDATE_DEADLINE: Duration = fsread::READ_DEADLINE;
+
 /// How long the running user's name may take to look up. The password
 /// database can be a network service.
 const USER_LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
@@ -521,8 +526,9 @@ pub async fn check(config_path: &Path) -> Report {
 }
 
 /// `server.config`: read the file through the bounded reader, then run the
-/// checks `--check-config` runs. The validation text is never shown; the
-/// next action is `--check-config`, which prints it.
+/// checks `--check-config` runs, on the blocking pool under
+/// [`VALIDATE_DEADLINE`]. The validation text is never shown; the next
+/// action is `--check-config`, which prints it.
 async fn check_config(runner: &mut Runner, path: &Path, shown: &SelectedPath) -> Option<Config> {
     let gate = runner
         .gate(ServerCheck::Config)
@@ -550,9 +556,18 @@ async fn check_config(runner: &mut Runner, path: &Path, shown: &SelectedPath) ->
                     Err(ConfigError::Validation(_) | ConfigError::Io { .. }) => {
                         Err(refused("the configuration does not validate"))
                     }
-                    Ok(config) => check_loaded(&config)
-                        .map(|()| config)
-                        .map_err(|fault| loaded_fault(&fault, &explain).source(source.clone())),
+                    Ok(config) => {
+                        let validated = blocking_within(VALIDATE_DEADLINE, move || {
+                            check_loaded(&config).map(|()| config)
+                        })
+                        .await;
+                        match validated {
+                            Ok(Ok(config)) => Ok(config),
+                            Ok(Err(fault)) => Err(loaded_fault(&fault, &explain)),
+                            Err(unfinished) => Err(unfinished_validation(unfinished)),
+                        }
+                        .map_err(|row| row.source(source.clone()))
+                    }
                 },
             },
         };
@@ -597,14 +612,68 @@ fn config_read_fault(fault: fsread::ReadFault) -> Row {
     }
 }
 
+/// Why blocking work gave no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unfinished {
+    /// It was still running at the deadline, and was left behind.
+    TimedOut,
+    /// It panicked.
+    Panicked,
+}
+
+/// Run `work` on the blocking pool and wait at most `deadline` for it.
+/// Work past the deadline is left on its thread, which the runtime's
+/// bounded shutdown ([`SHUTDOWN_BUDGET`]) does not wait out.
+async fn blocking_within<T: Send + 'static>(
+    deadline: Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Unfinished> {
+    match tokio::time::timeout(deadline, tokio::task::spawn_blocking(work)).await {
+        Ok(Ok(done)) => Ok(done),
+        Ok(Err(_)) => Err(Unfinished::Panicked),
+        Err(_) => Err(Unfinished::TimedOut),
+    }
+}
+
+/// The `server.config` row for checks after parsing that gave no answer.
+fn unfinished_validation(unfinished: Unfinished) -> Row {
+    let check = ServerCheck::Config;
+    match unfinished {
+        Unfinished::TimedOut => Row::not_sampled(check, reason::TIMED_OUT).detail(Text::new(
+            "inspecting server.log_file and the data root's markers did not finish",
+        )),
+        Unfinished::Panicked => Row::not_sampled(check, reason::UNREADABLE),
+    }
+}
+
 /// The `server.config` row for a configuration that parsed but that the
 /// checks after parsing refuse, in `--check-config`'s order.
+///
+/// A `server.log_file` refusal fails the check only when it proves the
+/// destination invalid. One the running user could not inspect, or that
+/// failed to inspect for another reason, proves nothing about what trawld
+/// will see, so it is `not_sampled`.
 fn loaded_fault(fault: &LoadedFault, explain: &Text) -> Row {
     let check = ServerCheck::Config;
     match fault {
-        LoadedFault::LogFile(_) => {
-            Row::failed(check, "server.log_file does not validate").next(explain.clone())
-        }
+        LoadedFault::LogFile(error) => match LogFileRefusal::of(error) {
+            LogFileRefusal::MarkerOverlap => {
+                Row::failed(check, "server.log_file is a reserved storage marker").next(Text::new(
+                    "select a log file outside the data root's markers",
+                ))
+            }
+            LogFileRefusal::Invalid => {
+                Row::failed(check, "server.log_file does not validate").next(explain.clone())
+            }
+            LogFileRefusal::PermissionDenied => Row::not_sampled(check, reason::PERMISSION_DENIED)
+                .detail(Text::new("server.log_file could not be inspected"))
+                .next(Text::new(
+                    "rerun as the service user, which can reach its log destination",
+                )),
+            LogFileRefusal::Unobserved => Row::not_sampled(check, reason::UNREADABLE)
+                .detail(Text::new("server.log_file could not be inspected"))
+                .next(explain.clone()),
+        },
         LoadedFault::FleetUrl(_) => Row::failed(check, "no Fleet database URL is set")
             .next(Text::new("set FLEET_DATABASE_URL or [auth] database_url")),
         LoadedFault::AppUrl(_) => Row::failed(check, "no app-state database URL is set").next(
@@ -970,5 +1039,76 @@ mod tests {
             assert_eq!(row.2, Some("blocked"), "{}", row.0);
         }
         assert_eq!(report.checks().len(), ServerCheck::ALL.len());
+    }
+
+    /// Validation that outlives its deadline costs `server.config` its
+    /// answer, `not_sampled`/`timed_out`, and does not hold the run: the
+    /// wait ends at the deadline while the work is still blocked.
+    #[tokio::test]
+    async fn validation_past_its_deadline_is_timed_out() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let outcome = blocking_within(Duration::from_millis(50), move || blocked.recv()).await;
+        assert_eq!(outcome.map(|_| ()), Err(Unfinished::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // Let the abandoned thread finish, so the test runtime can drop.
+        drop(release);
+
+        let row = unfinished_validation(Unfinished::TimedOut);
+        assert_eq!(
+            (row.check(), row.outcome(), row.reason()),
+            (
+                ServerCheck::Config,
+                Outcome::NotSampled,
+                Some(reason::TIMED_OUT)
+            )
+        );
+        assert_eq!(
+            blocking_within(Duration::from_secs(5), || 7).await,
+            Ok(7),
+            "work that finishes in time answers"
+        );
+    }
+
+    /// A `server.log_file` refusal is `failed` only when it proves the
+    /// destination invalid; a denied or failed inspection is `not_sampled`.
+    #[test]
+    fn log_file_refusals_fail_only_when_proven() {
+        use std::io::{Error, ErrorKind};
+        let explain = Text::new("run trawld --check-config");
+        let row = |error: Error| {
+            let row = loaded_fault(&LoadedFault::LogFile(error), &explain);
+            (row.outcome(), row.reason())
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let overlap =
+            crate::config_check::validate_log_destination(&data.join("EPOCH"), &data).unwrap_err();
+        assert_eq!(
+            row(overlap),
+            (
+                Outcome::Failed,
+                Some("server.log_file is a reserved storage marker")
+            )
+        );
+        assert_eq!(
+            row(Error::new(ErrorKind::NotADirectory, "x")),
+            (Outcome::Failed, Some("server.log_file does not validate"))
+        );
+        assert_eq!(
+            row(Error::new(ErrorKind::PermissionDenied, "x")),
+            (Outcome::NotSampled, Some(reason::PERMISSION_DENIED))
+        );
+        for kind in [
+            ErrorKind::InvalidInput,
+            ErrorKind::TimedOut,
+            ErrorKind::NotFound,
+        ] {
+            assert_eq!(
+                row(Error::new(kind, "x")),
+                (Outcome::NotSampled, Some(reason::UNREADABLE)),
+                "{kind:?}"
+            );
+        }
     }
 }

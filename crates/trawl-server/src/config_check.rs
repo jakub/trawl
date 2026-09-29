@@ -78,6 +78,79 @@ pub fn check_loaded(config: &Config) -> Result<(), LoadedFault> {
     Ok(())
 }
 
+/// What a [`LoadedFault::LogFile`] error proves about the destination, for
+/// a caller that reports the refusal without its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFileRefusal {
+    /// It is, or resolves to, a reserved storage marker.
+    MarkerOverlap,
+    /// Its path can name no file: a component is not a directory, a name is
+    /// too long, or the symlinks loop.
+    Invalid,
+    /// The running user may not inspect a path on the way.
+    PermissionDenied,
+    /// Inspecting it failed for another reason, which proves nothing about
+    /// the destination.
+    Unobserved,
+}
+
+impl LogFileRefusal {
+    /// Classify an error from [`validate_file_log_config`].
+    #[must_use]
+    pub fn of(error: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        if let Some(inner) = error.get_ref()
+            && inner.is::<MarkerOverlap>()
+        {
+            return Self::MarkerOverlap;
+        }
+        match error.kind() {
+            ErrorKind::PermissionDenied => Self::PermissionDenied,
+            // `Other` is the resolver's own symlink limit: no OS error
+            // decodes to it.
+            ErrorKind::NotADirectory | ErrorKind::InvalidFilename | ErrorKind::Other => {
+                Self::Invalid
+            }
+            kind if is_symlink_loop(kind) => Self::Invalid,
+            _ => Self::Unobserved,
+        }
+    }
+}
+
+/// Whether `kind` is what `ELOOP` decodes to. That kind has no stable name
+/// to match on, so the errno is decoded for comparison.
+fn is_symlink_loop(kind: std::io::ErrorKind) -> bool {
+    #[cfg(unix)]
+    {
+        kind == std::io::Error::from(rustix::io::Errno::LOOP).kind()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = kind;
+        false
+    }
+}
+
+/// The refusal of a log path that is a reserved storage marker, carried in
+/// the `io::Error` so [`LogFileRefusal::of`] can tell it from a failure to
+/// inspect. `Display` and `Debug` are the message's own, as a `String`
+/// payload's are, so what boot and `--check-config` print is unchanged.
+struct MarkerOverlap(String);
+
+impl std::fmt::Display for MarkerOverlap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for MarkerOverlap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for MarkerOverlap {}
+
 const STORAGE_MARKERS: [&str; 3] = ["EPOCH", "CATALOG", "REPIN"];
 
 /// Refuse a `server.log_file` that aliases a reserved storage marker, when
@@ -139,10 +212,10 @@ fn resolve_log_destination(path: &Path) -> std::io::Result<PathBuf> {
 fn marker_log_error(marker: &Path) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        format!(
+        MarkerOverlap(format!(
             "server.log_file overlaps reserved storage marker {}; select a separate log file",
             marker.display()
-        ),
+        )),
     )
 }
 
@@ -272,6 +345,82 @@ mod tests {
         assert!(
             validate_log_destination(&data.join("EPOCH"), &tmp.path().join("data-alias")).is_err()
         );
+    }
+
+    /// A marker refusal prints exactly as the `String` error it replaced,
+    /// through `Display` and through `Debug` (what `main`'s `Termination`
+    /// prints), and only it classifies as a marker overlap.
+    #[test]
+    fn marker_refusals_print_as_before_and_classify_apart() {
+        let typed = marker_log_error(Path::new("/srv/trawl/data/EPOCH"));
+        let plain = std::io::Error::new(std::io::ErrorKind::InvalidInput, typed.to_string());
+        assert_eq!(format!("{typed:?}"), format!("{plain:?}"));
+        let boxed: Box<dyn std::error::Error> = Box::new(marker_log_error(Path::new("/x/EPOCH")));
+        let boxed_plain: Box<dyn std::error::Error> = Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            marker_log_error(Path::new("/x/EPOCH")).to_string(),
+        ));
+        assert_eq!(format!("{boxed:?}"), format!("{boxed_plain:?}"));
+        assert_eq!(format!("{boxed}"), format!("{boxed_plain}"));
+        assert_eq!(LogFileRefusal::of(&typed), LogFileRefusal::MarkerOverlap);
+        // An `EINVAL`, such as `readlink` on a link replaced after `lstat`,
+        // proves nothing.
+        assert_eq!(LogFileRefusal::of(&plain), LogFileRefusal::Unobserved);
+    }
+
+    /// Each refusal the validator produces classifies by what it proves:
+    /// an overlap and a path that can name no file are invalid, a denied
+    /// traversal and any other failure to inspect are not.
+    #[cfg(unix)]
+    #[test]
+    fn log_file_refusals_classify_by_what_they_prove() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let of = |path: &Path, data: &Path| {
+            LogFileRefusal::of(&validate_log_destination(path, data).unwrap_err())
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        assert_eq!(
+            of(&data.join("missing/../EPOCH"), &data),
+            LogFileRefusal::MarkerOverlap
+        );
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(of(&file.join("log"), &data), LogFileRefusal::Invalid);
+        let cycle = tmp.path().join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        // The resolver's own link limit, and the kernel's ELOOP from a loop
+        // on the way to the last component.
+        assert_eq!(of(&cycle, &data), LogFileRefusal::Invalid);
+        assert_eq!(
+            of(&cycle.join("server.log"), &data),
+            LogFileRefusal::Invalid
+        );
+        assert_eq!(
+            of(&tmp.path().join("n".repeat(300)), &data),
+            LogFileRefusal::Invalid
+        );
+        let blocked = tmp.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let traversal = std::fs::read_dir(&blocked);
+        let denied = validate_log_destination(&blocked.join("server.log"), &data);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Privileged runners traverse mode 000; the kind is asserted where
+        // the filesystem denies it.
+        if traversal.is_err() {
+            assert_eq!(
+                LogFileRefusal::of(&denied.unwrap_err()),
+                LogFileRefusal::PermissionDenied
+            );
+        }
+        for errno in [rustix::io::Errno::IO, rustix::io::Errno::STALE] {
+            let error = std::io::Error::new(
+                std::io::Error::from(errno).kind(),
+                "failed to validate server.log_file",
+            );
+            assert_eq!(LogFileRefusal::of(&error), LogFileRefusal::Unobserved);
+        }
     }
 
     #[cfg(unix)]

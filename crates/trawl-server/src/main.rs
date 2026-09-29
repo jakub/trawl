@@ -171,7 +171,11 @@ const DOCTOR_USAGE: &str = "Usage: trawld --doctor --config <PATH> [--format <ta
 /// No tracing subscriber and no `log` logger exist on this path, so a log
 /// line from shared code goes nowhere.
 fn doctor_main() -> u8 {
-    let matches = match Cli::command().try_get_matches() {
+    // clap's help shows an env-bound argument's current value, as
+    // `[env: NAME=value]`. The doctor's output names no value it did not
+    // select (ADR-0047), so its help names each variable without one.
+    let command = Cli::command().mut_args(|arg| arg.hide_env_values(true));
+    let matches = match command.try_get_matches() {
         Ok(matches) => matches,
         Err(error) => return doctor_usage_error(&error),
     };
@@ -194,7 +198,9 @@ fn doctor_main() -> u8 {
 
 /// Report a refused `--doctor` command line, exit status 2, without
 /// echoing any argument or environment value: clap's own message quotes
-/// the value it refused. Help and version print as clap prints them.
+/// the value it refused. Help and version print as clap prints them; the
+/// help comes from the command `doctor_main` built, which shows no
+/// environment value.
 fn doctor_usage_error(error: &clap::Error) -> u8 {
     use clap::error::ErrorKind;
     if matches!(

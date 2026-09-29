@@ -217,3 +217,145 @@ fn doctor_requires_config_flag() {
         assert_eq!(names(root.path()), ["private-secret-dir"]);
     }
 }
+
+/// clap's help shows an env-bound argument's current value, as
+/// `[env: NAME=value]`. The doctor's help, short and long, names each
+/// variable and shows no value.
+#[test]
+fn doctor_help_shows_no_environment_value() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("planted-config-value").join("trawld.toml");
+    let query_log = root.path().join("planted-query-log-value.ndjson");
+    for flag in ["-h", "--help"] {
+        let mut env = planted_env(root.path());
+        env.push(("TRAWL_CONFIG", config.clone().into_os_string()));
+        env.push(("TRAWL_QUERY_LOG", query_log.clone().into_os_string()));
+        let (code, stdout, stderr) = run_doctor(&["--doctor", flag], &env);
+        assert_eq!(code, 0, "{flag}: {stderr}");
+        for name in ["--doctor", "TRAWL_CONFIG", "TRAWL_QUERY_LOG"] {
+            assert!(
+                stdout.contains(name),
+                "{flag} no longer names {name}:\n{stdout}"
+            );
+        }
+        assert_no_values(
+            &stdout,
+            &stderr,
+            &["planted-config-value", "planted-query-log-value"],
+        );
+        assert!(names(root.path()).is_empty(), "{flag} wrote files");
+    }
+}
+
+/// `config` with `log_file` set in `[server]` and internal telemetry off,
+/// so the file logger is the one in use and `server.log_file` is
+/// validated.
+fn with_file_log(config: &Path, log_file: &Path) {
+    let document = std::fs::read_to_string(config).unwrap();
+    let document = document
+        .replacen(
+            "[server]\n",
+            &format!("[server]\nlog_file = '{}'\n", log_file.display()),
+            1,
+        )
+        .replacen("[ingest]\n", "[ingest]\ninternal_telemetry = false\n", 1);
+    std::fs::write(config, document).unwrap();
+}
+
+/// A `server.log_file` refusal fails `server.config` only when it proves
+/// the destination invalid: a reserved storage marker, or a path through a
+/// regular file. One the running user may not inspect is `not_sampled`,
+/// `permission_denied`. Either way every later check is blocked, no path
+/// the configuration names is shown, and nothing is written.
+#[cfg(unix)]
+#[test]
+fn doctor_log_file_refusals_fail_only_when_proven() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("planted-data-root");
+    let blocked = root.path().join("planted-log-dir");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let privileged = std::fs::read_dir(&blocked).is_ok();
+
+    let mut doctor = DoctorConfig::in_dir(root.path());
+    doctor.data_path.clone_from(&data);
+    let config = write_doctor_config(root.path(), &doctor);
+    let cases = [
+        (
+            data.join("EPOCH"),
+            Outcome::Failed,
+            "server.log_file is a reserved storage marker",
+            1,
+        ),
+        (
+            config.join("server.log"),
+            Outcome::Failed,
+            "server.log_file does not validate",
+            1,
+        ),
+        (
+            blocked.join("server.log"),
+            Outcome::NotSampled,
+            trawl_api::doctor::reason::PERMISSION_DENIED,
+            3,
+        ),
+    ];
+    let mut results = Vec::new();
+    for (log_file, ..) in &cases {
+        write_doctor_config(root.path(), &doctor);
+        with_file_log(&config, log_file);
+        let args: [OsString; 5] = [
+            "--doctor".into(),
+            "--config".into(),
+            config.clone().into_os_string(),
+            "--format".into(),
+            "json".into(),
+        ];
+        results.push(run_doctor(&args, &planted_env(root.path())));
+    }
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !privileged,
+        "this harness can traverse a mode 000 directory, so the denied inspection cannot be \
+         observed; run the suite as an unprivileged user"
+    );
+
+    for ((log_file, outcome, why, exit), (code, stdout, stderr)) in cases.iter().zip(results) {
+        assert_no_values(
+            &stdout,
+            &stderr,
+            &[
+                crate::support::PLANTED_FLEET_URL,
+                crate::support::PLANTED_APP_URL,
+                "planted-data-root",
+                "planted-log-dir",
+                "trawld.toml/server.log",
+                "EPOCH",
+            ],
+        );
+        let report = report(&stdout);
+        let row = &report.checks()[0];
+        assert_eq!(row.id, "server.config");
+        assert_eq!(
+            (row.outcome, row.reason.as_deref()),
+            (*outcome, Some(*why)),
+            "{log_file:?}: {stdout}"
+        );
+        for later in &report.checks()[2..] {
+            assert_eq!(
+                (later.outcome, later.reason.as_deref()),
+                (Outcome::NotSampled, Some("blocked")),
+                "{}",
+                later.id
+            );
+        }
+        assert_eq!(code, *exit, "{log_file:?}: {stderr}");
+    }
+    assert_eq!(
+        names(root.path()),
+        ["planted-log-dir", "trawld.toml"],
+        "the doctor wrote files"
+    );
+    assert!(names(&blocked).is_empty());
+}
