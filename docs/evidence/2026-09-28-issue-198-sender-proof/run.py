@@ -72,42 +72,61 @@ pipes each key from the guest straight into grep's standard input.
 # - invalid_env and env_not_allowed, Vector logs no sink error: the journal
 #   read must succeed. The 401 case, which runs first, is the control: the
 #   same pipeline must have found the 401 there, or these checks fail.
-# - first start, Vector dropped no events: the journal read must succeed and
-#   must hold at least one Vector line, or the zero count is not accepted.
+# - first start, Vector dropped no events: the journal read must succeed
+#   and hold at least one Vector line. Its control is the 401 case, which
+#   reads its own window through the same drop_extraction() and must count
+#   more than zero dropped events there (Vector 0.57 logs "Events dropped
+#   intentional=false count=N" for a non-retriable 401). The verdict is
+#   written only then; if the 401 case never runs, it is written as FAIL.
 # - the key in /etc/default/vector equals the minted key: the minted file
 #   must be non-empty, so two empty files cannot compare equal.
 # - token absence: each key's grep pipe is first proven to find that key in
 #   a control file. grep must exit 1; exit 2 (an error) fails.
 #
+# Preconditions. One run per checkout at a time, from a clean checkout
+# (--allow-dirty runs are not evidence). No SPA build is needed. The
+# guarantees below hold against this harness only: nothing here guards
+# against another program writing to target/issue-198-deb, the cargo
+# registry volume or the builder image tag.
+#
 # Host state this run owns. Nothing outside this list is written or removed.
 #
-# - $REPO/target/issue-198-vm.XXXXXX (mkdtemp): the run directory with the
-#   VM disk, keys, seed, logs, build cidfiles, transcript copy and debs/, the
-#   only package set that is hashed, copied into the guest and installed.
+# - $REPO/target (created if missing, never removed) and
+#   $REPO/target/issue-198-vm.XXXXXX (mkdtemp): the run directory with the
+#   VM disk, keys, seed, logs, build cidfiles, the stub SPA in spa/, the
+#   token checks' control files, the transcript copy and debs/, the only
+#   package set that is hashed, copied into the guest and installed.
 #   --build packages straight into it. --packages DIR copies DIR's .debs
-#   into it first. No .deb outside it is ever deleted.
+#   into it first. No .deb outside it is ever deleted. It is removed at exit
+#   unless --keep.
 # - target/issue-198-deb: a shared cargo target and runtime cache. It is
 #   used only under an exclusive flock on target/issue-198-deb/build.lock,
 #   held from the builder image through packaging. The lock file is never
 #   unlinked.
-# - the stub SPA crates/trawl-web-ui/dist/index.html: created with O_EXCL
-#   under the build lock, and only when no index.html exists. It is removed
-#   before the lock is released, and only if the path still has the inode
-#   and text this run wrote, so an index.html this run did not create
-#   survives. dist/ directories this run created are removed only if empty.
-#   crashdump-harness.sh stubs the same path without this lock. If both
-#   build at once, one build can embed the other's stub, and neither removes
-#   the other's file.
-# - Docker: the build containers are named with the run directory's unique
-#   basename and removed by the id in their cidfile, before the build lock
-#   is released. The builder image tag and the cargo registry volume are
-#   shared caches, written only under the build lock. The containers run
-#   the image id this run's `docker build` printed, not the tag.
-# - --image-cache: downloads go to a mkstemp .part file, then an atomic
-#   rename. The image extracts into a mkdtemp staging directory. If another
-#   run publishes disk.raw first, this run deletes its own staging copy. The
-#   cloud image is checked against its sha512 on the host. The Vector .deb
-#   is checked against its sha256 on the host and again in the guest.
+# - crates/trawl-web-ui/dist: never written into, and nothing under it is
+#   ever deleted. trawl-web embeds that fixed path at compile time, so the
+#   builder container gets $RUN/spa (a one-line index.html) bind-mounted
+#   read-only over it; the host's dist/ is not touched. It is the mount
+#   point, so the run creates the empty directory if it is missing, as
+#   trawl-web's build.rs would, and leaves it in place.
+# - Docker: three `docker run --rm` containers, chown (hands the cargo
+#   volume to the invoking uid), build and package. Each goes through
+#   build_container(): named with the run directory's unique basename and
+#   its step, its id written to a cidfile in the run directory. A step that
+#   ends normally is removed by --rm. A step that fails, or is cut short by
+#   a signal, is removed by the id in its cidfile before the build lock is
+#   released, so none is left writing to the shared caches. The containers
+#   run the image id this run's `docker build` printed, not the tag. The
+#   builder mounts the checkout read-write; cargo writes to
+#   CARGO_TARGET_DIR. The builder image tag and the cargo registry volume
+#   are shared by every checkout, so this checkout's build lock does not
+#   serialize them across checkouts; cargo's own registry lock does.
+# - --image-cache: created if missing. Downloads go to a mkstemp .part
+#   file, then an atomic rename; the .part is removed on failure. The image
+#   extracts into a mkdtemp staging directory. If another run publishes
+#   disk.raw first, this run deletes its own staging copy. The cloud image
+#   is checked against its sha512 on the host. The Vector .deb is checked
+#   against its sha256 on the host and again in the guest.
 # - loopback ports: the seed server binds port 0 itself. qemu must bind the
 #   SSH forward port itself, so the port is chosen by bind-and-release. If
 #   qemu reports that the forward could not be set up, the run tries a new
@@ -165,7 +184,7 @@ CARGO_VOLUME = "trawl-evidence-cargo-registry"
 BUILD_TARGET = "x86_64-unknown-linux-gnu"
 BUILD_DIR = REPO / "target/issue-198-deb"
 BUILD_LOCK = BUILD_DIR / "build.lock"
-SPA_STUB = REPO / "crates/trawl-web-ui/dist/index.html"
+SPA_DIST = REPO / "crates/trawl-web-ui/dist"
 SPA_STUB_TEXT = "<!doctype html><title>trawl</title><p>issue-198 evidence stub SPA</p>\n"
 
 # Debian 13 genericcloud, one dated serial. The sha512 is the one published in
@@ -728,6 +747,25 @@ def _poll(attempt, label: str, until) -> Polled:
     return Polled([], POLL_TRIES, reads, last_read)
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+DROP_COUNT_RE = re.compile(r"Events dropped intentional=\w+ count=(\d+)")
+
+
+def drop_extraction(journal: str) -> tuple[int, list[str]]:
+    """From `journalctl -u vector -o cat` text: the non-empty line count, and
+    every line naming 'Events dropped' once colour codes are stripped. That
+    includes Vector's "Internal log [Events dropped] is being suppressed"
+    notices, which also mean events were dropped."""
+    lines = [ANSI_RE.sub("", line) for line in journal.splitlines() if line.strip()]
+    return len(lines), [line for line in lines if "Events dropped" in line]
+
+
+def drop_count(drops: list[str]) -> int:
+    """The events Vector reports dropped in `drops`, from each line's count=N.
+    Suppression notices carry no count and add nothing."""
+    return sum(int(m.group(1)) for line in drops if (m := DROP_COUNT_RE.search(line)))
+
+
 def utc_prefix(value: object) -> str:
     """'2026-09-29 05:14:55.1+00' or '2026-09-29T05:14:55Z' -> '2026-09-29T05:14:55'."""
     return str(value).replace(" ", "T")[:19]
@@ -743,10 +781,9 @@ class Run:
         self.run_dir: Path | None = None
         self.qemu: subprocess.Popen | None = None
         self.httpd: http.server.ThreadingHTTPServer | None = None
-        # (st_dev, st_ino) of the stub SPA this run created, and the dist
-        # directories it had to create; see make_stub() and remove_stub().
-        self.stub_identity: tuple[int, int] | None = None
-        self.stub_dirs: list[Path] = []
+        # The first-start drop read, held until the 401 case has proven the
+        # same extraction; see phase_vector() and settle_first_start().
+        self.first_start: tuple[int, list[str]] | None = None
         # Set only while a build container may be running; see build_container().
         self.build_cidfile: Path | None = None
         self.guest: Guest | None = None
@@ -770,7 +807,6 @@ class Run:
         self._cleaned = True
         self.stop_httpd()
         self.remove_build_container()
-        self.remove_stub()
         if self.args.keep:
             if self.qemu is not None and self.qemu.poll() is None:
                 progress(f"--keep: VM left running, qemu pid {self.qemu.pid}")
@@ -813,55 +849,6 @@ class Run:
             self.httpd.server_close()
             self.httpd = None
             progress("stopped the seed HTTP server")
-
-    def make_stub(self) -> bool:
-        """Create the stub SPA unless an index.html exists. True if this run made it.
-
-        O_EXCL makes the existence check and the creation one step, so a file
-        another process writes meanwhile is never overwritten or claimed.
-        """
-        missing: list[Path] = []
-        parent = SPA_STUB.parent
-        while not parent.exists():
-            missing.append(parent)
-            parent = parent.parent
-        for directory in reversed(missing):
-            try:
-                directory.mkdir()
-            except FileExistsError:
-                continue
-            self.stub_dirs.append(directory)
-        try:
-            fd = os.open(SPA_STUB, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        except FileExistsError:
-            return False
-        with os.fdopen(fd, "w", encoding="utf-8") as stub:
-            stub.write(SPA_STUB_TEXT)
-            st = os.fstat(stub.fileno())
-        self.stub_identity = (st.st_dev, st.st_ino)
-        return True
-
-    def remove_stub(self) -> None:
-        """Remove the stub only if the path still holds the file this run wrote."""
-        identity, self.stub_identity = self.stub_identity, None
-        if identity is not None:
-            try:
-                st = os.stat(SPA_STUB)
-                ours = ((st.st_dev, st.st_ino) == identity
-                        and SPA_STUB.read_text(encoding="utf-8") == SPA_STUB_TEXT)
-            except FileNotFoundError:
-                ours = False
-            if ours:
-                SPA_STUB.unlink()
-                progress("removed the stub SPA this run created")
-            else:
-                progress("the stub SPA path no longer holds this run's file; left in place")
-        dirs, self.stub_dirs = self.stub_dirs, []
-        for directory in reversed(dirs):
-            try:
-                directory.rmdir()  # only if empty
-            except OSError:
-                pass
 
     # -- blocks -----------------------------------------------------------
 
@@ -951,9 +938,8 @@ class Run:
                 self.build_locked(out)
             finally:
                 # Before the lock goes: nothing of this run's may still be
-                # writing to the shared cache, and the stub must be gone.
+                # writing to the shared cache.
                 self.remove_build_container()
-                self.remove_stub()
         finally:
             os.close(lock_fd)  # releases the flock
 
@@ -986,17 +972,25 @@ RUN cargo install cargo-deb --version {CARGO_DEB_VERSION} --locked \\
             die(f"docker build -q printed no image id: {image!r}")
         host(["docker", "volume", "create", CARGO_VOLUME])
         # A fresh named volume is root-owned; the build runs as the invoking uid.
-        host(["docker", "run", "--rm", "--user", "0:0", "-v",
+        host(["docker", "run", "--rm", *self.build_container("chown"), "--user", "0:0", "-v",
               f"{CARGO_VOLUME}:/usr/local/cargo/registry", image,
               "chown", "-R", uid_gid, "/usr/local/cargo/registry"])
+        self.build_cidfile = None
 
-        # rust-embed scans the SPA dist at compile time. Nothing here touches the
-        # web UI, so a one-line placeholder stands in when no real build exists.
-        if self.make_stub():
-            T.note("STUBBED the SPA with a one-line placeholder; trawl-web in these .debs "
-                   "serves no real UI. It is removed before the build lock is released.")
-        else:
-            T.note("SPA dist present; not stubbed")
+        # rust-embed bakes crates/trawl-web-ui/dist into trawl-web at compile
+        # time, from a path fixed in trawl-web's source with no build input to
+        # redirect it. Nothing here touches the web UI, so the builder sees a
+        # one-line stub SPA from this run's directory, bind-mounted read-only
+        # over that path inside the container. The checkout's dist/ is only
+        # the mount point: created empty if missing (as trawl-web's build.rs
+        # would), never written into, and never removed.
+        assert self.run_dir is not None
+        spa = self.run_dir / "spa"
+        spa.mkdir()
+        (spa / "index.html").write_text(SPA_STUB_TEXT, encoding="utf-8")
+        SPA_DIST.mkdir(parents=True, exist_ok=True)
+        T.note("STUBBED the SPA: $RUN/spa is mounted over crates/trawl-web-ui/dist in the "
+               "builder only; trawl-web in these .debs serves no real UI")
 
         common_git = subprocess.run(
             ["git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -1005,6 +999,7 @@ RUN cargo install cargo-deb --version {CARGO_DEB_VERSION} --locked \\
         T.note(f"CARGO_TARGET_DIR {BUILD_DIR}; cargo registry cache in docker volume {CARGO_VOLUME}")
         builder = ["docker", "run", "--rm", *self.build_container("build"), "--user", uid_gid,
                    "-v", f"{REPO}:{REPO}", "-w", str(REPO),
+                   "-v", f"{spa}:{SPA_DIST}:ro",
                    "-v", f"{common_git}:{common_git}:ro",
                    "-v", f"{CARGO_VOLUME}:/usr/local/cargo/registry",
                    "-e", f"CARGO_TARGET_DIR={BUILD_DIR}", "-e", f"XDG_CACHE_HOME={BUILD_DIR}/cache",
@@ -1462,19 +1457,12 @@ journalctl -u vector --no-pager -o cat --since '{since}' | sed -e 's/\\x1b\\[[0-
   | grep -E ' (ERROR|WARN) ' | grep -v 'Failed to glob path' | cut -c1-400 | head -20 || true
 journalctl -u vector --no-pager -o cat --since '{since}' | grep -c 'Failed to glob path' || true""",
               root=True)
-        # The journal read must succeed and hold Vector's own lines; a failed
-        # or empty read would otherwise count zero drops.
-        counts = g.run(f"j=$(journalctl -u vector --since '{since}' -o cat)\n"
-                       "printf 'lines=%s\\n' \"$(printf '%s\\n' \"$j\" | grep -c . || true)\"\n"
-                       "printf 'dropped=%s\\n' \"$(printf '%s\\n' \"$j\" "
-                       "| grep -c 'Events dropped' || true)\"",
-                       root=True, echo=False).stdout
-        lines = re.search(r"lines=(\d+)", counts)
-        dropped = re.search(r"dropped=(\d+)", counts)
-        T.check("Vector dropped no events on its first start",
-                bool(lines and dropped) and int(lines.group(1)) > 0 and dropped.group(1) == "0",
-                f"{dropped.group(1) if dropped else '?'} 'Events dropped' line(s) in "
-                f"{lines.group(1) if lines else '?'} line(s) of journalctl -u vector")
+        # The verdict waits for the 401 case, whose deliberate drops must show
+        # up through this same extraction; see settle_first_start().
+        self.first_start = self.vector_drops(since)
+        lines, drops = self.first_start
+        T.note(f"first start: {len(drops)} 'Events dropped' line(s) in {lines} line(s) of "
+               "journalctl -u vector; the verdict follows the 401 case's control")
 
     # -- phase 8: history -------------------------------------------------
 
@@ -1647,6 +1635,28 @@ ss -Hltn 'sport = :1514'""", root=True)
             "| { grep -v 'has been suppressed' || true; } | cut -c1-300",
             root=True, echo=False).stdout
 
+    def vector_drops(self, since: str) -> tuple[int, list[str]]:
+        """Vector's journal line count since `since`, and its drop lines, through
+        drop_extraction(). The journal read must succeed."""
+        assert self.guest is not None
+        journal = self.guest.run(f"journalctl -u vector --since '{since}' -o cat",
+                                 root=True, echo=False, merge=False).stdout
+        return drop_extraction(journal)
+
+    def settle_first_start(self, control: bool, why: str) -> None:
+        """The first-start "no drops" verdict. It passes only when the read held
+        Vector's lines, found no drop line, and `control` says the same
+        extraction found the 401 case's drops."""
+        pending, self.first_start = self.first_start, None
+        if pending is None:
+            return
+        lines, drops = pending
+        T.check("Vector dropped no events on its first start",
+                lines > 0 and not drops and control,
+                f"{len(drops)} 'Events dropped' line(s) in {lines} line(s) of "
+                f"journalctl -u vector; {why}"
+                + (f"; first: {drops[0][:200]}" if drops else ""))
+
     def restart_vector(self, script: str) -> str:
         assert self.guest is not None
         out = self.guest.run(f"""{script}
@@ -1723,6 +1733,15 @@ systemctl is-active vector""", root=True).stdout
                 if reason is None:
                     sink_read_proven = T.check("401: Vector logs the 401 from the trawld sink",
                                                bool(re.search(r"401|Unauthorized", errors)))
+                    _, drops = self.vector_drops(since)
+                    counted = drop_count(drops)
+                    control = T.check(
+                        "401: control, the first-start drop extraction counts the rejected events",
+                        counted > 0, f"{len(drops)} 'Events dropped' line(s), count={counted} "
+                        "in total")
+                    self.settle_first_start(control, "control: the 401 case's drops counted"
+                                            if control else "unproven: the same extraction "
+                                            "counted no drops in the 401 case")
                 else:
                     after = self.rejected(reason)
                     T.check(f"{label}: trawl_ingest_events_rejected_total{{reason=\"{reason}\"}} rose",
@@ -1852,6 +1871,8 @@ sha256sum /etc/vector/vector.d/*.toml /etc/trawl/trawld.toml""", root=True)
                 T.check(f"{phase.__name__}: not implemented yet", False, str(err))
             except HarnessError as err:
                 T.check(f"{phase.__name__} completed", False, str(err))
+        # No-op once the 401 case has settled it; otherwise its control never ran.
+        self.settle_first_start(False, "unproven: the 401 case's control never ran")
         try:
             self.phase_versions()
         except HarnessError as err:
