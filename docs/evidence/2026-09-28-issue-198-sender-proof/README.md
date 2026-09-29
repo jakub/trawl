@@ -37,16 +37,32 @@ evidence setup, not a documented install path.
 ## Reproduce
 
 ```bash
-python3 docs/evidence/2026-09-28-issue-198-sender-proof/run.py --build > transcript.txt
+python3 docs/evidence/2026-09-28-issue-198-sender-proof/run.py --build \
+  > "$HOME/issue-198-transcript.txt"
 ```
+
+Send standard output to a file outside the checkout. A file inside it makes
+the tree dirty before `run.py` checks that the tree is clean. When the run
+passes, copy the file to `transcript.txt` in this directory and commit it
+separately. That commit may change only files under `docs/evidence/`, so
+the tested-commit guard above still holds.
 
 `--build` builds the three distribution `.deb` files from HEAD in the pinned
 container that `crates/trawl-server/debian/tests/crashdump-harness.sh` uses.
-The build writes to `target/issue-198-deb`. `--packages DIR` reuses built
-packages instead. `--image-cache DIR` holds the cloud image and the Vector
-package, and defaults to `~/.cache/trawl-evidence`. `--keep` leaves the VM
-running. `run.py` refuses a dirty working tree unless `--allow-dirty` is set.
-A run with `--allow-dirty` is not evidence.
+The packages go to `debs/` in the run's private directory, `$RUN`. Only that
+package set is hashed, copied into the guest, and installed. The build
+shares a cargo target and cache in `target/issue-198-deb`, and holds an
+exclusive lock on `target/issue-198-deb/build.lock` from the builder image
+through packaging. `trawl-web` embeds the SPA directory at compile time, so
+the build container gets a one-line stub SPA from `$RUN` bind-mounted
+read-only over `crates/trawl-web-ui/dist`. `run.py` never writes into
+`dist/`, so no SPA build is needed. `--packages DIR` copies the `.deb` files
+from DIR into `$RUN/debs` instead of building.
+
+`--image-cache DIR` holds the cloud image and the Vector package, and
+defaults to `~/.cache/trawl-evidence`. `--keep` leaves the VM running.
+`run.py` refuses a dirty working tree unless `--allow-dirty` is set. A run
+with `--allow-dirty` is not evidence.
 
 Standard error carries progress. The exit status is 0 when every assertion
 passed, 1 when any failed, and 2 when the run stopped early.
@@ -79,8 +95,11 @@ passed, 1 when any failed, and 2 when the run stopped early.
 
 ## Host boundary
 
-The host's Docker daemon ran only the build container. qemu ran as an
-unprivileged user with user-mode networking and one loopback port forward.
+The host's Docker daemon ran only the three build-step containers: one
+hands the cargo volume to the invoking user, one builds, one packages. qemu
+ran as an unprivileged user with user-mode networking and one loopback port
+forward.
 No host service was reconfigured, and no saved trawl CLI profile on the
-host was read. The VM, its disk, and the build output lived under
-`target/` and were removed after the run.
+host was read. The run directory `$RUN`, under `target/`, held the VM,
+its disk, and the packages, and was removed after the run. The shared
+build cache in `target/issue-198-deb` stays for later runs.
