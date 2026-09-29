@@ -112,8 +112,9 @@ class CargoRuntime(unittest.TestCase):
                 watched = [Path(line.removeprefix("cargo:rerun-if-changed="))
                            for line in result.stdout.splitlines()
                            if line.startswith("cargo:rerun-if-changed=")]
-                # A deleted loader copy must still rerun the script and be restored.
+                # A deleted runtime copy must still rerun the script and be restored.
                 self.assertIn(deps, watched)
+                self.assertIn(runtime / deps.name, watched)
                 for path in watched:
                     self.assertLess(path.stat().st_mtime, started, path)
                 if not explicit:
