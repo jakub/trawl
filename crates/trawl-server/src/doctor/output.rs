@@ -8,8 +8,8 @@
 //! A row is a [`Row`], and every string in it is built here from parts
 //! that cannot carry a value the report must not show: `&'static str`
 //! literals, integers, a [`SelectedPath`] the operator chose, the running
-//! user's [`UserName`], a [`HealthKey`], and a [`QuotedValue`] from the
-//! closed health vocabulary. No constructor takes a `String`, a `Display`,
+//! user's [`UserName`], and a [`HealthKey`]. A health value is never
+//! shown as trawld sent it. No constructor takes a `String`, a `Display`,
 //! or an error, so the `Display` or `Debug` of a database, OS, TLS or HTTP
 //! error, a database URL, a certificate name, a catalog identifier, or a
 //! listener address has no way into a row. The runner in [`super`] turns
@@ -18,7 +18,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use trawl_api::doctor::health::{is_health_key, is_quotable_value};
+use trawl_api::doctor::health::is_health_key;
 use trawl_api::doctor::{Check, Outcome, Report, Verdict};
 
 use super::ServerCheck;
@@ -160,18 +160,6 @@ impl HealthKey {
     }
 }
 
-/// A health value the report may quote ([`is_quotable_value`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QuotedValue(String);
-
-impl QuotedValue {
-    /// `value`, when the report may quote it.
-    #[must_use]
-    pub fn new(value: &str) -> Option<Self> {
-        is_quotable_value(value).then(|| Self(value.to_owned()))
-    }
-}
-
 /// Text for a row's detail, source or next action, built only from parts
 /// the report may show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,13 +204,6 @@ impl Text {
     #[must_use]
     pub fn key(mut self, key: &HealthKey) -> Self {
         self.0.push_str(&key.0);
-        self
-    }
-
-    /// Append a health value from the closed vocabulary.
-    #[must_use]
-    pub fn quoted(mut self, value: &QuotedValue) -> Self {
-        self.0.push_str(&value.0);
         self
     }
 
@@ -519,13 +500,8 @@ mod tests {
             .path(&path);
         assert_eq!(text.as_str(), "uid 1000 (trawl); /tls/cert.pem");
         assert!(HealthKey::new("Bad-Key").is_none());
-        assert!(QuotedValue::new("Weird Value").is_none());
         let key = HealthKey::new("duckdb").unwrap();
-        let value = QuotedValue::new("recovering").unwrap();
-        assert_eq!(
-            Text::new("").key(&key).lit("=").quoted(&value).as_str(),
-            "duckdb=recovering"
-        );
+        assert_eq!(Text::new("").key(&key).lit(" ok").as_str(), "duckdb ok");
     }
 
     #[test]

@@ -18,7 +18,8 @@
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
-use std::net::SocketAddr;
+use std::io;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -227,9 +228,20 @@ fn fixture_addr(server: &common::TestServer) -> SocketAddr {
 
 /// A TLS listener on loopback that answers every request with `response`,
 /// with `config` as its `rustls` server config.
-async fn tls_listener(config: rustls::ServerConfig, response: Vec<u8>) -> SocketAddr {
+fn tls_listener(config: rustls::ServerConfig, response: Vec<u8>) -> SocketAddr {
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    tls_listener_on(socket, config, response)
+}
+
+/// [`tls_listener`] on `socket`, which the caller bound.
+fn tls_listener_on(
+    socket: std::net::TcpListener,
+    config: rustls::ServerConfig,
+    response: Vec<u8>,
+) -> SocketAddr {
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
-    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    socket.set_nonblocking(true).unwrap();
+    let socket = tokio::net::TcpListener::from_std(socket).unwrap();
     let addr = socket.local_addr().unwrap();
     let response = Arc::new(response);
     tokio::spawn(async move {
@@ -280,30 +292,12 @@ async fn doctor_listener_leaf_pin_dns_cert() {
 
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = socket.local_addr().unwrap();
-    let mut server_config: trawl_server::config::ServerConfig = toml::from_str("").unwrap();
-    server_config.tls_cert_path = Some(cert.clone());
-    server_config.tls_key_path = Some(key.clone());
-    let http_config = trawl_server::state::HttpConfig {
-        max_request_body_bytes: 1 << 20,
-        max_concurrent_requests: 16,
-        shutdown_drain_secs: 1,
-        cors_allowed_origins: Vec::new(),
-        ingest_max_body_bytes: None,
-        rate_limit: trawl_server::config::RateLimitConfig::default(),
-    };
-    let state = server.state.clone();
-    let state_dir = dir.path().join("second-listener-state");
-    let serve = tokio::spawn(async move {
-        trawl_server::transport::http::serve_with_listener(
-            socket,
-            state,
-            &http_config,
-            &server_config,
-            &state_dir,
-            None,
-        )
-        .await
-    });
+    let serve = serve_trawld(
+        &server,
+        socket,
+        (&cert, &key),
+        &dir.path().join("second-listener-state"),
+    );
 
     let mut planted = operator.planted.clone();
     planted.extend(address_values(addr));
@@ -362,6 +356,181 @@ async fn doctor_listener_leaf_pin_dns_cert() {
         }
     }
     serve.abort();
+}
+
+/// A real trawld listener over `server`'s state on `socket`, serving the
+/// operator pair `tls`.
+fn serve_trawld(
+    server: &common::TestServer,
+    socket: std::net::TcpListener,
+    (cert, key): (&Path, &Path),
+    state_dir: &Path,
+) -> tokio::task::JoinHandle<Result<(), trawl_server::error::ServerError>> {
+    let mut server_config: trawl_server::config::ServerConfig = toml::from_str("").unwrap();
+    server_config.tls_cert_path = Some(cert.to_owned());
+    server_config.tls_key_path = Some(key.to_owned());
+    let http_config = trawl_server::state::HttpConfig {
+        max_request_body_bytes: 1 << 20,
+        max_concurrent_requests: 16,
+        shutdown_drain_secs: 1,
+        cors_allowed_origins: Vec::new(),
+        ingest_max_body_bytes: None,
+        rate_limit: trawl_server::config::RateLimitConfig::default(),
+    };
+    let state = server.state.clone();
+    let state_dir = state_dir.to_owned();
+    tokio::spawn(async move {
+        trawl_server::transport::http::serve_with_listener(
+            socket,
+            state,
+            &http_config,
+            &server_config,
+            &state_dir,
+            None,
+        )
+        .await
+    })
+}
+
+/// A v4 and a v6 loopback listener on one port, or `None` when this host
+/// has no IPv6 loopback.
+fn dual_loopback() -> Option<(std::net::TcpListener, std::net::TcpListener)> {
+    for _ in 0..64 {
+        let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        match std::net::TcpListener::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, port))) {
+            Ok(v6) => return Some((v4, v6)),
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrNotAvailable
+                    || error.raw_os_error() == Some(EAFNOSUPPORT) =>
+            {
+                return None;
+            }
+            Err(error) => panic!("binding [::1]: {error}"),
+        }
+    }
+    panic!("no port was free on both loopback addresses");
+}
+
+/// Linux's `EAFNOSUPPORT`: what binding an IPv6 address gives on a host
+/// with IPv6 turned off.
+const EAFNOSUPPORT: i32 = 97;
+
+/// The strings the report must not show of the loopback pair on `port`
+/// and the name that resolves to it.
+fn dual_values(port: u16) -> Vec<String> {
+    vec![
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+        format!(":{port}"),
+        "::1".to_owned(),
+    ]
+}
+
+/// A listener address that names a host is dialed at every address the
+/// name resolves to, in order, within one deadline. `localhost` resolves
+/// to `::1` and `127.0.0.1`; trawld listens on one of them and a foreign
+/// TLS listener, serving another certificate, on the other, both ways
+/// round: whichever the resolver returns first, trawld's certificate is
+/// proven and its health read. Foreign listeners on both leave unknown
+/// which address trawld binds (`ambiguous_address`); nothing on either is
+/// `not_listening`. No address is shown.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_listener_probes_every_resolved_address() {
+    let Some((v4, v6)) = dual_loopback() else {
+        eprintln!(
+            "SKIPPED doctor_listener_probes_every_resolved_address: this host has no IPv6 \
+             loopback (::1), so no name resolves to both loopback families"
+        );
+        return;
+    };
+    let port = v4.local_addr().unwrap().port();
+    let resolved: Vec<SocketAddr> = tokio::net::lookup_host(format!("localhost:{port}"))
+        .await
+        .unwrap()
+        .collect();
+    for family in [
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
+    ] {
+        assert!(
+            resolved.contains(&family),
+            "localhost resolves to {resolved:?}, not both loopback families"
+        );
+    }
+    drop((v4, v6));
+
+    let server = common::setup().await;
+    let dir = tempfile::tempdir().unwrap();
+    let operator = Pair::new("multi-private-subject", &["trawl.lab.example"]);
+    let foreign = Pair::new("foreign-private-subject", &["trawl.lab.example"]);
+    let (cert, key) = operator.write(dir.path(), "operator");
+    let tls = (cert.clone(), key.clone());
+    let mut planted = operator.planted.clone();
+    planted.extend(foreign.planted.clone());
+
+    for trawld_on_v6 in [false, true] {
+        let (v4, v6) = dual_loopback().unwrap();
+        let port = v4.local_addr().unwrap().port();
+        let (ours, theirs) = if trawld_on_v6 { (v6, v4) } else { (v4, v6) };
+        let serve = serve_trawld(
+            &server,
+            ours,
+            (&cert, &key),
+            &dir.path().join(format!("state-{trawld_on_v6}")),
+        );
+        tls_listener_on(theirs, foreign.serving(), http(200, b"{}"));
+        let config = config_for(dir.path(), format!("localhost:{port}"), tls.clone());
+        let mut planted = planted.clone();
+        planted.extend(dual_values(port));
+        let report = doctor(&config, planted_env(dir.path()), &planted).await;
+        assert!(!serve.is_finished(), "the trawld listener stopped");
+        assert_eq!(
+            outcome(&report, IDENTITY),
+            (Outcome::Complete, None),
+            "trawld on v6: {trawld_on_v6}"
+        );
+        let detail = row(&report, IDENTITY).detail.clone().unwrap_or_default();
+        assert!(
+            detail.contains("at one of the 2 addresses the listener address resolves to"),
+            "{detail}"
+        );
+        assert_eq!(outcome(&report, HEALTH), (Outcome::Complete, None));
+        assert!(
+            keyed(&report).contains(&("duckdb", Outcome::Complete, None)),
+            "{report:#?}"
+        );
+        serve.abort();
+    }
+
+    let (v4, v6) = dual_loopback().unwrap();
+    let port = v4.local_addr().unwrap().port();
+    for socket in [v4, v6] {
+        tls_listener_on(socket, foreign.serving(), http(200, b"{}"));
+    }
+    let config = config_for(dir.path(), format!("localhost:{port}"), tls.clone());
+    let mut shown = planted.clone();
+    shown.extend(dual_values(port));
+    let report = doctor(&config, planted_env(dir.path()), &shown).await;
+    assert_eq!(
+        outcome(&report, IDENTITY),
+        (Outcome::NotSampled, Some("ambiguous_address"))
+    );
+    assert_eq!(row(&report, HEALTH).blocked_by.as_deref(), Some(IDENTITY));
+
+    let (v4, v6) = dual_loopback().unwrap();
+    let port = v4.local_addr().unwrap().port();
+    drop((v4, v6));
+    let config = config_for(dir.path(), format!("localhost:{port}"), tls);
+    let mut shown = planted;
+    shown.extend(dual_values(port));
+    let report = doctor(&config, planted_env(dir.path()), &shown).await;
+    assert_eq!(
+        outcome(&report, IDENTITY),
+        (Outcome::NotSampled, Some("not_listening"))
+    );
 }
 
 /// The listener serving another certificate than the file fails the
@@ -503,7 +672,7 @@ async fn doctor_listener_refuses_the_leaf_without_its_key() {
         .unwrap()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(Presents(presented)));
-        let addr = tls_listener(config, http(200, b"{}")).await;
+        let addr = tls_listener(config, http(200, b"{}"));
         let mut planted = planted.clone();
         planted.extend(address_values(addr));
         let config = config_for(dir.path(), addr.to_string(), tls.clone());
@@ -685,7 +854,7 @@ async fn doctor_listener_health_rows() {
     let pair = Pair::new("health-private-subject", &["localhost"]);
     let tls = pair.write(dir.path(), "health");
     for case in health_cases() {
-        let addr = tls_listener(pair.serving(), case.response).await;
+        let addr = tls_listener(pair.serving(), case.response);
         let mut planted = pair.planted.clone();
         planted.extend(address_values(addr));
         planted.extend(["Private Value".to_owned(), "Bad-Key-Private".to_owned()]);
@@ -696,8 +865,8 @@ async fn doctor_listener_health_rows() {
         assert_eq!(keyed(&report), case.keyed);
     }
 
-    // The quotable unknown value is quoted; the other is not shown.
-    let addr = tls_listener(pair.serving(), http(200, DEGRADED)).await;
+    // No unknown value is shown, whatever its shape.
+    let addr = tls_listener(pair.serving(), http(200, DEGRADED));
     let config = config_for(dir.path(), addr.to_string(), tls.clone());
     let report = doctor(&config, planted_env(dir.path()), &pair.planted).await;
     let detail = |key: &str| {
@@ -706,8 +875,9 @@ async fn doctor_listener_health_rows() {
             .clone()
             .unwrap_or_default()
     };
-    assert_eq!(detail("wal"), "reported novel_state");
+    assert_eq!(detail("wal"), "the value is not shown");
     assert_eq!(detail("data_path"), "the value is not shown");
+    assert_eq!(detail("corpus"), "reported rollup_pending");
 
     // A real trawld whose DuckDB probe cannot run in time answers 503.
     let server = common::setup().await;
@@ -749,6 +919,199 @@ async fn doctor_listener_health_rows() {
         rows.contains(&("duckdb", Outcome::Complete, None)),
         "{rows:?}"
     );
+}
+
+/// An unknown health value is never shown, even one shaped like an
+/// identifier, which may still be a secret: its row fails with a fixed
+/// reason and says the value is not shown.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_listener_never_shows_an_unknown_health_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let pair = Pair::new("unknown-private-subject", &["localhost"]);
+    let tls = pair.write(dir.path(), "unknown");
+    let body = br#"{"status":"degraded","version":"0.0.0","checks":{
+        "duckdb":"ok","wal":"private_secret","corpus":"private_secret"}}"#;
+    let addr = tls_listener(pair.serving(), http(200, body));
+    let mut planted = pair.planted.clone();
+    planted.extend(address_values(addr));
+    planted.push("private_secret".to_owned());
+    let config = config_for(dir.path(), addr.to_string(), tls);
+    let report = doctor(&config, planted_env(dir.path()), &planted).await;
+    assert_eq!(outcome(&report, HEALTH), (Outcome::Complete, None));
+    assert_eq!(
+        keyed(&report),
+        [
+            ("corpus", Outcome::Failed, UNKNOWN),
+            ("duckdb", Outcome::Complete, None),
+            ("wal", Outcome::Failed, UNKNOWN),
+        ]
+    );
+    for key in ["corpus", "wal"] {
+        assert_eq!(
+            row(&report, &format!("{HEALTH}.{key}")).detail.as_deref(),
+            Some("the value is not shown")
+        );
+    }
+}
+
+/// A health answer that breaks off is not classified: whatever part of it
+/// arrived proves nothing, so the row is `not_sampled`/`interrupted` with
+/// no per-key rows, even when the part that arrived holds a whole health
+/// body. What arrived whole is still judged: a status trawld never sends
+/// fails with the body cut short, and bytes that are not HTTP fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_listener_interrupted_health_is_not_sampled() {
+    let dir = tempfile::tempdir().unwrap();
+    let pair = Pair::new("interrupted-private-subject", &["localhost"]);
+    let tls = pair.write(dir.path(), "interrupted");
+    let whole = br#"{"status":"ok","version":"0.0.0","checks":{"duckdb":"ok"}}"#;
+    let mut unterminated = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n\
+         {:x}\r\n",
+        whole.len()
+    )
+    .into_bytes();
+    unterminated.extend_from_slice(whole);
+    unterminated.extend_from_slice(b"\r\n");
+    let mut short = http(200, whole);
+    short.truncate(short.len() - 10);
+    let mut short_404 = http(404, whole);
+    short_404.truncate(short_404.len() - 10);
+
+    let interrupted = (Outcome::NotSampled, Some("interrupted"));
+    let cases = [
+        ("nothing after the handshake", Vec::new(), interrupted),
+        (
+            "a head cut short",
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n".to_vec(),
+            interrupted,
+        ),
+        ("a body cut short of its length", short, interrupted),
+        (
+            "a chunked body with no last chunk",
+            unterminated,
+            interrupted,
+        ),
+        (
+            "a status trawld never sends, its body cut short",
+            short_404,
+            (
+                Outcome::Failed,
+                Some("the health endpoint answered with a status trawld does not send"),
+            ),
+        ),
+        (
+            "bytes that are not HTTP",
+            b"SSH-2.0-OpenSSH_9.9\r\n\r\n".to_vec(),
+            (
+                Outcome::Failed,
+                Some(
+                    "the listener proved its certificate but answered with something other \
+                     than HTTP",
+                ),
+            ),
+        ),
+    ];
+    for (case, response, expected) in cases {
+        let addr = tls_listener(pair.serving(), response);
+        let mut planted = pair.planted.clone();
+        planted.extend(address_values(addr));
+        let config = config_for(dir.path(), addr.to_string(), tls.clone());
+        let report = doctor(&config, planted_env(dir.path()), &planted).await;
+        assert_eq!(
+            outcome(&report, IDENTITY),
+            (Outcome::Complete, None),
+            "{case}"
+        );
+        assert_eq!(outcome(&report, HEALTH), expected, "{case}");
+        assert!(keyed(&report).is_empty(), "{case}: {report:#?}");
+    }
+}
+
+/// What a listener in [`doctor_listener_cut_off_handshake_is_not_sampled`]
+/// does once the client's first bytes arrive.
+#[derive(Debug, Clone, Copy)]
+enum Peer {
+    /// Close the connection, sending nothing.
+    Close,
+    /// Reset the connection, sending nothing.
+    Reset,
+    /// Send these bytes, which are not TLS, and close.
+    Answer(&'static [u8]),
+}
+
+/// A plain TCP listener on loopback that reads the client's first TLS
+/// record, its hello, whole on every connection, so a close sends a FIN
+/// and not a reset, and then does what `peer` says.
+async fn cut_off_listener(peer: Peer) -> SocketAddr {
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = socket.accept().await {
+            let mut header = [0_u8; 5];
+            if stream.read_exact(&mut header).await.is_err() {
+                continue;
+            }
+            let mut hello = vec![0_u8; usize::from(u16::from_be_bytes([header[3], header[4]]))];
+            if stream.read_exact(&mut hello).await.is_err() {
+                continue;
+            }
+            match peer {
+                Peer::Close => drop(stream),
+                Peer::Reset => {
+                    stream.set_zero_linger().unwrap();
+                    drop(stream);
+                }
+                Peer::Answer(bytes) => {
+                    let _ = stream.write_all(bytes).await;
+                    let _ = stream.shutdown().await;
+                }
+            }
+        }
+    });
+    addr
+}
+
+/// A TLS handshake the listener cuts off, by a close or a reset after the
+/// client's hello with no byte in answer, proves nothing about the
+/// listener: `not_sampled`/`interrupted`. A listener that answers the
+/// hello with bytes that are not TLS still fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_listener_cut_off_handshake_is_not_sampled() {
+    let dir = tempfile::tempdir().unwrap();
+    let pair = Pair::new("cut-off-private-subject", &["localhost"]);
+    let tls = pair.write(dir.path(), "cut-off");
+    let interrupted = (Outcome::NotSampled, Some("interrupted"));
+    let cases = [
+        ("closed after the hello", Peer::Close, interrupted),
+        ("reset after the hello", Peer::Reset, interrupted),
+        (
+            "a plaintext HTTP answer to the hello",
+            Peer::Answer(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\n\r\n"),
+            (
+                Outcome::Failed,
+                Some("the listener did not complete a TLS handshake"),
+            ),
+        ),
+    ];
+    for (case, peer, expected) in cases {
+        let addr = cut_off_listener(peer).await;
+        let mut planted = pair.planted.clone();
+        planted.extend(address_values(addr));
+        let config = config_for(dir.path(), addr.to_string(), tls.clone());
+        let report = doctor(&config, planted_env(dir.path()), &planted).await;
+        assert_eq!(
+            outcome(&report, MATERIAL),
+            (Outcome::Complete, None),
+            "{case}"
+        );
+        assert_eq!(outcome(&report, IDENTITY), expected, "{case}: {report:#?}");
+        assert_eq!(
+            row(&report, HEALTH).blocked_by.as_deref(),
+            Some(IDENTITY),
+            "{case}"
+        );
+    }
 }
 
 /// With auto TLS and no generated pair yet, the doctor only opens a TCP
