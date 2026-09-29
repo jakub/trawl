@@ -6415,6 +6415,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-process",
+ "nix",
  "parking_lot",
  "rand 0.8.7",
  "ratatui",
