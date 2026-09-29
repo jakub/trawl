@@ -1,7 +1,7 @@
 //! Real-daemon startup admission, filesystem preservation, and recovery.
 //!
 //! Unlike the in-process API fixtures, these tests must execute `main` and
-//! its production connectors. The exclusive postgres-group reservation in
+//! its production connectors. The two-slot postgres-group reservation in
 //! nextest accounts for those production pools. Every database and path is
 //! fixture-owned; no daemon profile or ambient configuration is inherited.
 

@@ -31,11 +31,15 @@ max-threads = 8
 
 [[profile.default.overrides]]
 # These tests execute the daemon's production connectors to verify main's
-# boot order. Reserve the whole group for its two 8-connection pools, the
-# sole-writer session, two 1-connection fixture pools, and the competing
-# writer's lock session (20 total).
+# boot order. Each holds two 8-connection pools, the sole-writer session,
+# two 1-connection fixture pools, and the competing writer's lock session:
+# 20 connections, which is two slots of WORST_TEST_CONNECTION_CEILING (10).
+# Reserving two slots keeps the group inside the budget connection_budget.rs
+# checks. Their advisory-lock queries are scoped to the test's own
+# database, so they need no exclusive run; reserving all eight serialized
+# 23 tests into a 106 s stretch where nothing else ran.
 filter = 'package(trawl-server) & binary(startup_pg)'
-threads-required = 8
+threads-required = 2
 
 [[profile.default.overrides]]
 # The pg-touching set. trawl-server's LIBRARY tests are in it too — the
