@@ -1323,9 +1323,9 @@ runuser -u postgres -- psql -Atc "SELECT datname FROM pg_database WHERE datname 
             status = g.run(f"dpkg-query -W -f='${{Status}}' {name}", echo=False).stdout
             T.check(f"dpkg: {name} is 'install ok installed'", status == "install ok installed", status)
         version = g.run("trawld --version").stdout.strip()
-        T.check("trawld --version names the tested commit", f"({self.short_sha}" in version,
-                f"expected ({self.short_sha}")
-        self.check_not_dirty(version)
+        T.require("trawld --version names the tested commit", f"({self.short_sha}" in version,
+                  f"expected ({self.short_sha}")
+        self.check_not_dirty(version, stop=True)
         cli_version = g.run("trawl --version").stdout.strip()
         self.require_cli_build(cli_version)
 
@@ -1864,12 +1864,15 @@ sha256sum /etc/vector/vector.d/*.toml /etc/trawl/trawld.toml""", root=True)
             T.require("trawl --version is not a dirty build",
                       f"({self.short_sha}*" not in version, version)
 
-    def check_not_dirty(self, version: str) -> None:
+    def check_not_dirty(self, version: str, stop: bool = False) -> None:
+        """At provision (stop=True) a dirty trawld stops the run before any
+        recipe, exactly like the CLI check."""
         dirty_build = f"({self.short_sha}*" in version
         if dirty_build and self.args.allow_dirty:
             T.note("--allow-dirty: trawld was built from a dirty tree ('*'); not asserted")
         else:
-            T.check("trawld --version is not a dirty build", not dirty_build, version.strip())
+            (T.require if stop else T.check)("trawld --version is not a dirty build",
+                                             not dirty_build, version.strip())
 
     # -- token absence -------------------------------------------------------
 
