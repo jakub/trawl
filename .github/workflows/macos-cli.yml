@@ -118,7 +118,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
-          retention-days: ${{ github.event_name == 'pull_request' && 7 || 0 }}
+          retention-days: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 7 || 0 }}
           path: |
             trawl-*.tar.gz
             trawl-*.tar.gz.sha256

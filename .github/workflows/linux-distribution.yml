@@ -44,9 +44,11 @@ jobs:
       RELEASE_TAG: ${{ inputs.release-tag }}
       SOURCE_SHA: ${{ inputs.source-sha }}
       TOOLING_SHA: ${{ inputs.tooling-sha }}
-    # Pull-request preflights run on GitHub-hosted runners, next to CI.
-    # Release builds stay on k8s-big, where the release caches live.
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'k8s-big' }}
+    # Preflights run on GitHub-hosted runners, next to CI: pull requests,
+    # and the push to main that saves the caches they restore. Release
+    # builds (a tag push or a manual run) stay on k8s-big, where the release
+    # caches live.
+    runs-on: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'ubuntu-24.04' || 'k8s-big' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -62,10 +64,11 @@ jobs:
             build-root: target/bookworm
     steps:
       # Both SHAs are free-form inputs, and this job saves default-branch
-      # caches that later release builds restore. Refuse any commit main does
-      # not contain before a checkout can run its code. Pull-request preflights
+      # caches that later builds restore. Refuse any commit main does not
+      # contain before a checkout can run its code. Pull-request preflights
       # build unmerged commits and save no cache: on a hosted runner a
-      # per-PR copy would only evict CI's main-branch entries.
+      # per-PR copy would only evict CI's main-branch entries. The preflight
+      # push to main saves the hosted caches pull requests restore.
       - name: Refuse source or tooling that is not on main
         if: github.event_name != 'pull_request'
         env:
@@ -273,7 +276,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist-${{ matrix.target }}
-          retention-days: ${{ github.event_name == 'pull_request' && 7 || 0 }}
+          retention-days: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 7 || 0 }}
           path: |
             trawl-*.tar.gz
             trawl-*.tar.gz.sha256
@@ -283,7 +286,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: deb-${{ matrix.target }}
-          retention-days: ${{ github.event_name == 'pull_request' && 7 || 0 }}
+          retention-days: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 7 || 0 }}
           path: target/${{ matrix.target }}/debian/*.deb
           if-no-files-found: error
 
@@ -291,7 +294,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: symbols-${{ matrix.target }}
-          retention-days: ${{ github.event_name == 'pull_request' && 7 || 0 }}
+          retention-days: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 7 || 0 }}
           path: symbols/
           if-no-files-found: error
 
@@ -427,6 +430,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: trial-evidence-${{ matrix.target }}
-          retention-days: ${{ github.event_name == 'pull_request' && 7 || 0 }}
+          retention-days: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 7 || 0 }}
           path: ${{ runner.temp }}/trial-evidence
           if-no-files-found: error
