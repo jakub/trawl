@@ -204,6 +204,17 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    env:
+      # The linker skips the DWARF: it stays in .dwo files beside the
+      # objects instead of being copied into each of about 130 test
+      # binaries. The debuginfo level stays full, so the generated code and
+      # its stack frames are unchanged. Keep it full: trawl-core's 2 MiB
+      # parser stack test is calibrated against the unoptimized,
+      # full-debuginfo build (crates/trawl-core/src/parser/mod.rs), and CI
+      # is the only place that build runs. The same variable reaches the
+      # nested cargo in pg-admission-guard, so the guard reuses these
+      # artifacts instead of rebuilding them.
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     services:
       postgres:
         image: postgres:18
@@ -306,6 +317,9 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      # Each mutant relinks the trawl-server test binaries; see `test`.
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     services:
       postgres:
         image: postgres:18
@@ -445,6 +459,9 @@ jobs:
     name: trawl-web tests
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      # See `test`.
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Exercise real chart rendering in the packaging contract tests.
