@@ -36,7 +36,7 @@ pub fn check_config(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 pub enum LoadedFault {
     /// `server.log_file` aliases a reserved storage marker, or could not be
     /// resolved.
-    FileLog(std::io::Error),
+    LogFile(std::io::Error),
     /// No Fleet database URL is set.
     FleetUrl(ConfigError),
     /// No app-state database URL is set.
@@ -48,7 +48,7 @@ pub enum LoadedFault {
 impl std::fmt::Display for LoadedFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::FileLog(error) => error.fmt(f),
+            Self::LogFile(error) => error.fmt(f),
             Self::FleetUrl(error) | Self::AppUrl(error) => error.fmt(f),
             Self::Ingest => {
                 f.write_str("invalid setting at ingest: check severity_from and time_from")
@@ -64,7 +64,7 @@ impl std::error::Error for LoadedFault {}
 /// # Errors
 /// The first check that refuses the configuration.
 pub fn check_loaded(config: &Config) -> Result<(), LoadedFault> {
-    validate_file_log_config(config).map_err(LoadedFault::FileLog)?;
+    validate_file_log_config(config).map_err(LoadedFault::LogFile)?;
     config
         .auth
         .resolve_database_url()

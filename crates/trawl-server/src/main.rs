@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use clap::Parser;
+use clap::{CommandFactory as _, FromArgMatches as _, Parser};
 use tracing_subscriber::fmt;
 use tracing_subscriber::util::SubscriberInitExt;
 use trawl_server::config::Config;
@@ -34,6 +34,25 @@ struct Cli {
     #[arg(long, requires = "config")]
     check_config: bool,
 
+    /// Check, without changing anything, whether trawld will start and serve
+    /// with the config that --config names, then exit: 0 pass, 1 fail,
+    /// 3 incomplete.
+    #[arg(long, requires = "config", conflicts_with = "check_config")]
+    doctor: bool,
+
+    /// With --doctor: report format (auto-detected if omitted: table for
+    /// TTY, json for pipes).
+    // `conflicts_with` as well as `requires`: clap excuses a missing
+    // `--doctor` whenever an argument it conflicts with is present.
+    #[arg(
+        long,
+        short,
+        value_enum,
+        requires = "doctor",
+        conflicts_with = "check_config"
+    )]
+    format: Option<trawl_server::doctor::Format>,
+
     /// Path to ndjson query debug log. Overrides config `server.query_log`.
     #[arg(long, env = "TRAWL_QUERY_LOG")]
     query_log: Option<std::path::PathBuf>,
@@ -57,6 +76,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // carries no arguments, so it always reaches normal crash-dump init.
     // Both paths seal before config reads or threads. Check mode must not
     // start the monitor or create its directory, even when capture is enabled.
+    // The doctor is a check mode too (ADR-0047): the same seal, before clap
+    // or any read, and it never reaches crash-dump init either. `--doctor=`
+    // is caught as well, so a spelling clap refuses still seals first.
+    if std::env::args_os()
+        .any(|arg| arg == "--doctor" || arg.as_encoded_bytes().starts_with(b"--doctor="))
+    {
+        if trawl_crashdump::seal_for_config_check().is_err() {
+            eprintln!("[trawld] doctor refused: capability seal failed");
+            std::process::exit(1);
+        }
+        std::process::exit(i32::from(doctor_main()));
+    }
     if std::env::args_os().any(|arg| arg == "--check-config") {
         if trawl_crashdump::seal_for_config_check().is_err() {
             eprintln!("[trawld] configuration check refused: capability seal failed");
@@ -129,6 +160,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // and last, rather than an end-of-scope accident a later edit could move.
     drop(crash_dump);
     result
+}
+
+/// The usage line every `--doctor` usage error ends with.
+const DOCTOR_USAGE: &str = "Usage: trawld --doctor --config <PATH> [--format <table|json>]";
+
+/// `trawld --doctor`, in a process `main` already sealed. Returns the exit
+/// status: the report's (0, 1, 3) or 2 for a refused command line.
+///
+/// No tracing subscriber and no `log` logger exist on this path, so a log
+/// line from shared code goes nowhere.
+fn doctor_main() -> u8 {
+    let matches = match Cli::command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(error) => return doctor_usage_error(&error),
+    };
+    // ADR-0047: the doctor checks the file the operator names on its
+    // command line, never one TRAWL_CONFIG points at.
+    if matches.value_source("config") != Some(clap::parser::ValueSource::CommandLine) {
+        eprintln!(
+            "[trawld] --doctor needs --config on the command line; it does not read \
+             TRAWL_CONFIG\n{DOCTOR_USAGE}"
+        );
+        return 2;
+    }
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => return doctor_usage_error(&error),
+    };
+    let path = resolve_path(cli.config.as_deref().expect("clap requires config"));
+    trawl_server::doctor::run(&path, cli.format)
+}
+
+/// Report a refused `--doctor` command line, exit status 2, without
+/// echoing any argument or environment value: clap's own message quotes
+/// the value it refused. Help and version print as clap prints them.
+fn doctor_usage_error(error: &clap::Error) -> u8 {
+    use clap::error::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        let _ = error.print();
+        return 0;
+    }
+    let kind = error
+        .kind()
+        .as_str()
+        .unwrap_or("the command line is not valid");
+    eprintln!("[trawld] --doctor: {kind}\n{DOCTOR_USAGE}");
+    2
 }
 
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive

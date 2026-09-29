@@ -290,7 +290,7 @@ pub mod reason {
     /// Nothing accepted a connection at the listener's address, as when
     /// trawld is not running.
     pub const NOT_LISTENING: &str = "not_listening";
-    /// A file the check compares changed while the doctor read it.
+    /// A file the check reads changed while the doctor read it.
     pub const MATERIAL_CHANGED: &str = "material_changed";
     /// A migrator holds its lock while the schema is not current.
     pub const MIGRATION_IN_PROGRESS: &str = "migration_in_progress";
