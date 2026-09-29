@@ -6,19 +6,20 @@
 //!
 //! The binary target (`src/main.rs`) is a one-line shim over [`main`]; the
 //! command implementations live here so integration tests can drive them
-//! directly against a real server instead of shelling out. [`cli`] and
-//! [`schema`] are public for exactly that reason — `config` and `tui` stay
-//! private.
+//! directly against a real server instead of shelling out. [`cli`],
+//! [`doctor`] and [`schema`] are public for exactly that reason — `config`
+//! and `tui` stay private.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Mutex;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 pub mod cli;
 mod config;
+pub mod doctor;
 pub mod schema;
 mod trial;
 mod tui;
@@ -30,7 +31,9 @@ mod tui;
 #[command(name = "trawl", version, long_version = trawl_core::version::long_version(), about)]
 struct Cli {
     /// trawld HTTPS API URL (default: `https://localhost:5514`).
-    #[arg(long, env = "TRAWL_URL", global = true)]
+    // Help names each variable but never prints its value: a URL can carry
+    // credentials, and `trawl doctor` refuses these variables by name.
+    #[arg(long, env = "TRAWL_URL", hide_env_values = true, global = true)]
     url: Option<String>,
 
     /// API token (direct value).
@@ -39,12 +42,18 @@ struct Cli {
     token: Option<String>,
 
     /// Accept self-signed TLS certificates.
-    #[arg(long, env = "TRAWL_INSECURE", global = true)]
+    #[arg(long, env = "TRAWL_INSECURE", hide_env_values = true, global = true)]
     insecure: bool,
 
     /// Named profile from config file (overrides [server] settings).
     /// `trial` is reserved: it connects to the `trawl trial` installation.
-    #[arg(long, short = 'p', env = "TRAWL_PROFILE", global = true)]
+    #[arg(
+        long,
+        short = 'p',
+        env = "TRAWL_PROFILE",
+        hide_env_values = true,
+        global = true
+    )]
     profile: Option<String>,
 
     /// Config file path (default: ~/.config/trawl/config.toml).
@@ -101,6 +110,12 @@ enum Command {
         #[command(subcommand)]
         cmd: DriverSubcommand,
     },
+
+    /// Check one client connection: configuration, TLS, health, and key.
+    ///
+    /// Name the target with --url or --profile; the TRAWL_* environment is
+    /// refused. Exits 0 pass, 1 fail, 3 incomplete, 2 on a usage error.
+    Doctor(doctor::DoctorArgs),
 
     /// Run a disposable trial installation in Docker on this machine:
     /// loopback only, with sample data. `-p trial` connects to it.
@@ -394,30 +409,94 @@ pub enum CliError {
     Usage(String),
     #[error("{0}")]
     Trial(#[from] trial::TrialError),
+    /// A usage error found after parsing; it exits 2 as clap's own do.
+    #[error("{0}")]
+    Arg(Box<clap::Error>),
 }
 
 /// The binary's entry point: parse argv, run, and map errors to an exit code.
 #[tokio::main]
 pub async fn main() {
-    let args = Cli::parse();
+    let args = parse_cli();
 
-    if let Err(e) = run(args).await {
-        // Broken pipe is expected (e.g. `trawl query ... | head`), exit quietly.
-        if let CliError::Io(ref io_err) = e
-            && io_err.kind() == io::ErrorKind::BrokenPipe
-        {
-            process::exit(1);
-        }
-        eprintln!("trawl: {e}");
-        process::exit(1);
+    match run(args).await {
+        // Only `trawl doctor` returns a status other than 0.
+        Ok(0) => {}
+        Ok(status) => process::exit(i32::from(status)),
+        Err(CliError::Arg(e)) => e.exit(),
+        Err(e) => exit_on_error(&e),
     }
 }
 
-async fn run(mut args: Cli) -> Result<(), CliError> {
+/// Parse argv without letting clap read the environment for `trawl doctor`.
+///
+/// clap reads `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_INSECURE` and
+/// `TRAWL_PROFILE` while it parses, so a malformed value would fail as a
+/// clap error that quotes it, before the doctor could refuse the variable by
+/// name. The first pass therefore uses a copy of the command with every
+/// environment binding removed. When it selects `doctor`, its matches are
+/// the ones used, and the doctor refuses any of those variables that is
+/// present. Any other command is parsed again with the normal command, so
+/// it reads the environment exactly as before. A first pass that fails is
+/// reported as it stands when argv names `doctor`; help and version output
+/// come from the normal command, which never prints an environment value.
+fn parse_cli() -> Cli {
+    use clap::error::ErrorKind;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    match envless_command().try_get_matches_from(&args) {
+        Ok(matches) if matches.subcommand_name() == Some(doctor::NAME) => {
+            return Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        }
+        Err(e)
+            if !matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) && args.iter().skip(1).any(|arg| arg == doctor::NAME) =>
+        {
+            e.exit()
+        }
+        Ok(_) | Err(_) => {}
+    }
+    Cli::parse_from(args)
+}
+
+/// The command with no argument bound to an environment variable.
+fn envless_command() -> clap::Command {
+    let mut command = Cli::command();
+    let bound: Vec<clap::Id> = command
+        .get_arguments()
+        .filter(|arg| arg.get_env().is_some())
+        .map(|arg| arg.get_id().clone())
+        .collect();
+    for id in bound {
+        command = command.mut_arg(id, |arg| arg.env(None));
+    }
+    command
+}
+
+/// Report `e` and exit 1.
+fn exit_on_error(e: &CliError) -> ! {
+    // Broken pipe is expected (e.g. `trawl query ... | head`), exit quietly.
+    if let CliError::Io(io_err) = e
+        && io_err.kind() == io::ErrorKind::BrokenPipe
+    {
+        process::exit(1);
+    }
+    eprintln!("trawl: {e}");
+    process::exit(1);
+}
+
+/// Run the command and return its exit status. Every command but `doctor`
+/// returns 0 on success and an error otherwise.
+async fn run(mut args: Cli) -> Result<u8, CliError> {
     // Trial verbs run before config.toml is read: a broken client config
-    // must not block `trawl trial up` or `down`.
+    // must not block `trawl trial up` or `down`. `doctor` selects its own
+    // target and key, and never reads config.toml the way other commands do.
     let command = match args.command.take() {
-        Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await?),
+        Some(Command::Trial { cmd }) => return Ok(trial::run(&cmd).await.map(|()| 0)?),
+        Some(Command::Doctor(doctor_args)) => return doctor::run(args.into(), doctor_args).await,
         command => command,
     };
     // The driver sends to whatever TUI holds the socket and never uses the
@@ -524,10 +603,24 @@ async fn run(mut args: Cli) -> Result<(), CliError> {
             run_driver(&socket, cmd).await?;
         }
 
-        Some(Command::Trial { .. }) => unreachable!("trial verbs return before the config loads"),
+        Some(Command::Trial { .. } | Command::Doctor(_)) => {
+            unreachable!("trial and doctor return before the config loads")
+        }
     }
 
-    Ok(())
+    Ok(0)
+}
+
+impl From<Cli> for doctor::Globals {
+    fn from(args: Cli) -> Self {
+        Self {
+            url: args.url,
+            token: args.token.is_some(),
+            insecure: args.insecure,
+            profile: args.profile,
+            config: args.config,
+        }
+    }
 }
 
 /// The refusal for `trawl -p trial driver ...` (or `TRAWL_PROFILE=trial`).

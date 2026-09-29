@@ -4,7 +4,8 @@ description: Command syntax, options, defaults, and output formats for the trawl
 ---
 
 The `trawl` binary runs the terminal UI, executes queries, validates syntax,
-inspects the field catalog, and drives a running TUI over a Unix socket.
+inspects the field catalog, checks a connection, and drives a running TUI over
+a Unix socket.
 For catalog procedures, see [catalog administration](/operate/catalog/).
 
 ## Global options
@@ -24,6 +25,9 @@ Every subcommand accepts these options.
 A flag beats an environment variable, which beats the config file. Profiles and
 the `[ui]` and `[tail]` settings live in
 [client configuration](/reference/configuration/#client-configuration).
+
+[`trawl doctor`](#doctor-mode) reads these options by its own rules. It has
+no default URL, and it refuses some combinations.
 
 When `insecure` is on from the flag, `TRAWL_INSECURE`, `[server]`, or a profile,
 `trawl` writes one warning line to stderr before any other output. Stdout does
@@ -51,12 +55,18 @@ error. See [client configuration](/reference/configuration/#client-configuration
 | `TRAWL_INSECURE` | `--insecure` | Accept self-signed certificates |
 | `RUST_LOG` | `warn` | Tracing filter for the TUI log file |
 
+`trawl doctor` refuses to run when `TRAWL_PROFILE`, `TRAWL_URL`,
+`TRAWL_TOKEN`, or `TRAWL_INSECURE` is set. See
+[refused command lines](#refused-command-lines).
+
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | `0` | The command succeeded |
-| `1` | The command failed. `trawl` prints the reason to stderr, except for a broken pipe, which exits quietly |
+| `1` | The command failed. `trawl` prints the reason to stderr, except for a broken pipe, which exits quietly. For `trawl doctor`, the verdict is `fail` |
+| `2` | Usage error. The command line is not valid, or `trawl doctor` refused it. `trawl` prints the reason to stderr |
+| `3` | `trawl doctor` only. The verdict is `incomplete` |
 
 ## TUI mode
 
@@ -308,6 +318,226 @@ conflict episode raises the badge again.
 ```bash
 trawl schema ack duration --note "fix due Friday"
 ```
+
+## Doctor mode
+
+```text
+trawl doctor --url URL [--token-env NAME | --token-file PATH] [--insecure] [--web-url ORIGIN] [-f FORMAT]
+trawl doctor -p NAME [-c PATH] [--web-url ORIGIN] [-f FORMAT]
+```
+
+`trawl doctor` checks one client connection from the machine where it runs.
+It checks the configuration, the API's transport, TLS, and health, the key,
+and, with `--web-url`, the browser origin. It prints one line per check and a
+verdict, and exits with the verdict's status. It does not run a query, ingest
+an event, or sign in with a key.
+
+| Flag | Value | Default | Description |
+|------|-------|---------|-------------|
+| `--url` | `<URL>` | *(none)* | The API to check. The doctor does not read the config file |
+| `-p, --profile` | `<NAME>` | *(none)* | The CLI profile to check. `trial` checks the [trial](#the-reserved--p-trial-profile) |
+| `--token-env` | `<NAME>` | *(none)* | With `--url`, read the key from the environment variable `NAME` |
+| `--token-file` | `<PATH>` | *(none)* | With `--url`, read the key from this file |
+| `--insecure` | *(flag)* | `false` | With `--url`, turn certificate verification off. `api.tls` then fails and the doctor sends no key |
+| `-c, --config` | `<PATH>` | `~/.config/trawl/config.toml` | With `--profile`, the config file that holds the profile |
+| `--web-url` | `<ORIGIN>` | *(none)* | Also check this browser origin of `trawl-web` |
+| `-f, --format` | `table\|json` | `table` on a TTY, `json` on a pipe | Output format |
+
+```bash
+trawl doctor -p prod --web-url https://trawl.example.com
+```
+
+### Target and key
+
+Give exactly one of `--url` and `--profile`. `--url` has no default here.
+
+With `--url`, the key comes only from a source that the command line names:
+`--token-env NAME` reads the variable `NAME`, and `--token-file PATH` reads the
+file. The doctor does not read the config file, so a key saved in
+`[server].token` never goes to the URL. With no key source, `api.identity` is
+`not_configured`. `connection.config` fails, and names the source without its
+value, when the variable is unset, empty, or not UTF-8, or when the file is
+missing, unreadable, empty, not a regular file, or larger than an API key.
+
+With `--profile NAME`, the config file must exist and hold
+`[profiles.NAME]` with a `url`. When the file, the profile, or its `url` is
+missing, `connection.config` fails, names the missing source, and the doctor
+does not contact the API. With `--web-url`, the `web.*` checks still run,
+because they do not depend on the API. The key is the profile's own `token`.
+The doctor never uses `[server].token`, so a profile without `token` gives
+`api.identity` `not_configured`. `ca_cert` and `insecure` inherit from
+`[server]` as they do for every other command.
+
+`-p trial` resolves through the rules of the
+[reserved trial profile](#the-reserved--p-trial-profile): the trial's API
+address, its operator key, and its certificate as the pinned CA.
+
+### Trust
+
+With `--url`, the doctor verifies the API's certificate against the system
+roots only. No flag names a CA. To check an installation with a self-signed or
+private-CA certificate, save it in a CLI profile that sets
+[`ca_cert`](#pin-a-ca-with-ca_cert), then run `trawl doctor -p NAME`. With
+`ca_cert`, the doctor trusts only the CAs in that file.
+
+`--web-url` must be an `https` origin, or an `http` origin whose host is
+`localhost` or a loopback address such as `127.0.0.1` or `[::1]`. The doctor
+verifies the web origin's certificate against the system roots only, because
+a browser opens that origin. A private CA on the web origin is not supported:
+`web.transport` fails.
+
+### Refused command lines
+
+`trawl doctor` exits `2` and contacts nothing when:
+
+- `TRAWL_URL`, `TRAWL_PROFILE`, `TRAWL_TOKEN`, or `TRAWL_INSECURE` is set,
+  even to an empty value. The message names the variable and not its value.
+  Unset the variable, then name the target with `--url` or `--profile`.
+- `--token` is given. The doctor never takes a key's value on the command
+  line.
+- Neither `--url` nor `--profile` is given, or both are.
+- `--profile` is given with `--insecure`, `--token-env`, or `--token-file`. A
+  profile sets the URL, the key, and the trust.
+- `-c` is given with `--url`.
+- `--token-env` and `--token-file` are both given.
+- `--url` or `--web-url` carries credentials (`user@` or `user:password@`
+  before the host), a query, or a fragment. A `%3F` or `%23` in the path
+  counts as a query or a fragment. The message does not repeat the URL.
+- `--url` or `--web-url` is not an `http` or `https` URL with a host.
+- `--web-url` has a path, or uses `http` with a host that is not loopback.
+
+A profile `url` with credentials, a query, or a fragment fails
+`connection.config` instead.
+
+### Checks
+
+The doctor runs the checks in this order. When a check's prerequisite is not
+`complete`, the check is `not_sampled` with the reason `blocked`, and
+`blocked_by` names the prerequisite.
+
+| ID | Proves | Prerequisite |
+|----|--------|--------------|
+| `connection.config` | The flags or the profile resolve to a URL, a trust mode, and a key source. `source` names where they came from, such as ``CLI profile `prod` in ~/.config/trawl/config.toml`` | None |
+| `api.transport` | A connection to the API origin opens. The doctor sends one `GET /api/v1/health` with no key | `connection.config` |
+| `api.tls` | The API's certificate verifies under the trust mode that the report names: system roots or the pinned CA. An `http` URL fails with `connection is not TLS`. `insecure` fails with `certificate not verified` | `api.transport` |
+| `api.health` | The health answer parses as a Trawl health response with the status `ok`, `degraded`, or `unavailable`, a `checks` map, and a `version`. `trawld` always sends all three. An answer without the map or the version fails with `not a trawl health answer`. The answer must also come with the HTTP status that `trawld` sends for its status: HTTP 200 with `ok` or `degraded`, or HTTP 503 with `unavailable`. Any other pair fails with `status and body disagree`, and any other HTTP status fails as not a health answer. A failed `api.health` sends no key | `api.tls` |
+| `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `api.health.corpus` with `rollup_pending` or `restart_backlog` is `not_sampled` with the reason `recovering`: `trawld` is still recovering its corpus after a restart. Wait for the recovery to finish, then run the doctor again. `error`, `refusing`, and every other value are `failed` | `api.health` |
+| `api.health._invalid` | The server reported a check name that is not `[a-z][a-z0-9_]{0,63}`. This row is always `failed`, and the report does not show the names. No check name starts with `_`, so this ID cannot match a server's check | `api.health` |
+| `api.identity` | `GET /api/v1/whoami` answers HTTP 200 and accepts the key. `detail` shows the key's name, its kind, and its permissions, never the key or its prefix. The name shows at most 32 characters. The kind is `human` or `service`: any other kind fails with `the answer is not a trawl whoami response`. Only Trawl's own permission names show, such as `query` or `ingest`. Any other permission string is counted as `N unrecognized` and not shown. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail. Any other 2xx status fails with `unexpected status` | `api.health`, and a key selected |
+| `web.transport` | `GET /healthz` on `--web-url` answers HTTP 200 with the body `ok`. HTTP 429 gives `not_sampled` with the reason `rate_limited`, and `web.origin` is then `blocked` | `--web-url` given |
+| `web.origin` | `trawl-web` accepts `--web-url` as a browser origin. The doctor sends `POST /api/auth/login` with `Origin: <web-url>` and an empty `api_key`. Only `400 {"error":"bad request"}` is `complete`. `403 {"error":"cross-origin request rejected"}` fails with `origin not in public_origins`. HTTP 429 gives `not_sampled` with the reason `rate_limited`. Any other answer fails with `not a trawl-web login endpoint` | `web.transport` |
+
+The doctor sends the key only in `GET /api/v1/whoami`, and only after the
+unkeyed health request got a Trawl health answer under verified TLS. A wrong
+host, an untrusted certificate, `insecure`, or an `http` URL never receives
+the key.
+
+The report never shows the key or its prefix, even when a server echoes
+them. In every string that a server sends, such as a key's name, a health
+check's value, or the server version, each run of 8 or more of the key's
+characters shows as `[redacted]`. A health check name that holds such a run
+counts as an invalid name. Redaction finds only the key's own characters. A
+server that already holds the key can still send it in another form, such as
+base64, in the key's name. The 32-character limit on the name bounds how much
+of it the report shows.
+
+The `web.*` checks do not depend on the `api.*` checks, and they send no key.
+Without `--web-url`, the report has no `web.*` rows.
+
+Each request waits up to 10 seconds. A request with no answer in that time
+gives `not_sampled` with the reason `timed_out`. When the answer starts but its
+body does not finish in that time, the connection and the certificate are
+proved: `api.transport` and `api.tls` are `complete`, and only the check that
+reads the body is `not_sampled` with `timed_out`. When the answer starts but
+the server closes the connection before the body is complete, the connection
+and the certificate are also proved. The check that reads the body fails with
+`response body broken`, because the doctor saw the answer break. An HTTP 429
+answer gives `not_sampled` with the reason `rate_limited`. The doctor does not
+follow a redirect: the check fails with `redirect refused`. The doctor reads
+at most 64 KiB of a health or `whoami` answer, and at most 4 KiB of a `web.*`
+answer. A larger answer fails the check with `response too large`, whatever
+its status. The doctor never judges the part that it read. For example, an
+HTTP 429 answer larger than the limit fails with `response too large`. It
+does not give `rate_limited`.
+
+### Outcomes and verdict
+
+Every check has one of four outcomes.
+
+| Outcome | Meaning |
+|---------|---------|
+| `complete` | The doctor saw the check's assertion hold |
+| `failed` | The doctor saw evidence against it |
+| `not_configured` | You did not select what the check needs, such as a key |
+| `not_sampled` | The doctor could not look. `reason` says why: `blocked`, `rate_limited`, `recovering`, or `timed_out` |
+
+The verdict follows from the outcomes and sets the exit status.
+
+| Verdict | When | Exit status |
+|---------|------|-------------|
+| `pass` | Every check is `complete` or `not_configured` | `0` |
+| `fail` | At least one check is `failed` | `1` |
+| `incomplete` | No check is `failed`, and at least one is `not_sampled` | `3` |
+
+A refused command line exits `2`.
+
+### Output
+
+`table` prints the target, one line per check, the notes, and the verdict. A
+check's line holds its ID, its outcome, and then its reason, detail, source,
+blocking check, and next action when they are present.
+
+```text
+target: https://trawl.example.com:5514 (CLI profile `prod` in ~/.config/trawl/config.toml)
+connection.config           complete        trust: pinned CA from ca_cert in [profiles.prod]; key: token in [profiles.prod]; source: CLI profile `prod` in ~/.config/trawl/config.toml
+api.transport               complete
+api.tls                     complete        verified under the pinned CA
+api.health                  complete        status: unavailable; server version 1.0.0
+api.health.duckdb           failed          reported error; next: read the server's log for why duckdb reports error
+api.health.ingest_capacity  complete        reported ok
+api.identity                failed          key rejected; source: token in [profiles.prod]; next: check the key: it may be revoked, expired, or mistyped
+verdict: fail (exit 1)
+```
+
+`json` prints one document. Every key is present on every check, and a value
+that the doctor did not observe is `null`.
+
+| Key | Value |
+|-----|-------|
+| `version` | Version of the document shape. It is `1` |
+| `vantage` | Where the checks ran. It is `client` |
+| `target` | `origin`, the API origin as `scheme://host:port`, or `null` when `connection.config` failed. `source`, where the target came from |
+| `verdict` | `pass`, `fail`, or `incomplete` |
+| `checks` | The checks in the order they ran. Each has `id`, `outcome`, `reason`, `detail`, `source`, `blocked_by`, and `next_action` |
+| `notes` | Report-level notes. A note never changes an outcome |
+
+A note says, for example, that the CLI and the server versions differ, or
+that `ingest_capacity` is `ok` but the key lacks the `ingest` permission.
+
+No output holds a key, a key prefix, a response body, TLS library error text,
+or URL credentials.
+
+### Side effects
+
+The doctor sends only these requests: `GET /api/v1/health` and
+`GET /api/v1/whoami` to the API, and `GET /healthz` and
+`POST /api/auth/login` to `--web-url`. They change nothing that you
+configured, but three effects remain:
+
+- `GET /api/v1/whoami` updates the key's last-used time.
+- `GET /api/v1/whoami` counts against the key's rate limit on trawld.
+  Trawl does not rate limit the health request or `/healthz`, but a proxy
+  in front of either origin may count every request.
+- An HTTP 5xx answer that a request provokes emits its `http_failure` event.
+
+### Limits
+
+`web.origin` shows that `trawl-web` accepts its own origin. It does not show
+that `trawl-web` reaches `trawld`: the doctor runs where the client runs and
+cannot see that connection. A doctor on the server host checks it in a later
+release. Until then, sign in from a browser.
+
+The doctor does not send a test event, so it does not prove that ingest works.
 
 ## Trial mode
 

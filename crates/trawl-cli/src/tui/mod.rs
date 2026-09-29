@@ -825,7 +825,17 @@ pub async fn run(
 
     let server_version = match health_result {
         Ok(h) => {
-            tracing::info!("health check ok, server version: {:?}", h.version);
+            match h.status {
+                trawl_api::HealthStatus::Ok | trawl_api::HealthStatus::Degraded => {
+                    tracing::info!("health check ok, server version: {:?}", h.version);
+                }
+                trawl_api::HealthStatus::Unavailable => {
+                    tracing::warn!(
+                        "server reports health status unavailable, server version: {:?}",
+                        h.version
+                    );
+                }
+            }
             h.version
         }
         Err(e) => {
@@ -1012,7 +1022,10 @@ fn unavailable_result_toast() {
     assert_eq!(run_result_error_message(&conflict), SENTENCE);
 
     // Everything else still says what went wrong with the fetch.
-    let network = ClientError::Network("connection refused".to_owned());
+    let network = ClientError::Network(trawl_client::NetworkError::new(
+        trawl_client::NetworkKind::Connect,
+        "connection refused",
+    ));
     assert!(
         run_result_error_message(&network).starts_with("Failed to fetch run result:"),
         "a transport failure is a failure to fetch"
@@ -1159,7 +1172,10 @@ mod tests {
 
         apply_whoami_result(
             &mut app,
-            Err(ClientError::Network("whoami unavailable".to_owned())),
+            Err(ClientError::Network(trawl_client::NetworkError::new(
+                trawl_client::NetworkKind::Connect,
+                "whoami unavailable",
+            ))),
         );
         assert!(!app.dashboard.is_admin);
         assert_eq!(app.main_tab, MainTab::Query);

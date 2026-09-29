@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod csv;
 pub mod display;
+pub mod doctor;
 pub mod value;
 
 use crate::value::{QueryResult, SchemaColumn};
@@ -611,6 +612,23 @@ pub struct WhoAmIResponse {
     /// the key holds no recognized trawl permission.
     pub permissions: Vec<String>,
 }
+
+/// Every permission name `/whoami` can report, in the canonical order it
+/// reports them. trawld's `Permission` enum owns the vocabulary; a drift
+/// test there holds this list equal to it. A client uses it to show only
+/// names it recognizes, never an arbitrary string a server sent.
+pub const PERMISSION_NAMES: &[&str] = &[
+    "query",
+    "schema_read",
+    "validate",
+    "saved_query",
+    "export",
+    "stream",
+    "query_cancel",
+    "server_manage",
+    "ingest",
+    "schema_write",
+];
 
 // -- dashboard ---------------------------------------------------------------
 

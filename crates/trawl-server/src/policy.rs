@@ -380,6 +380,15 @@ mod tests {
         }
     }
 
+    /// trawl-api's `PERMISSION_NAMES` is what clients show; it must be this
+    /// enum's wire names, in this enum's order, or a client hides a real
+    /// permission or shows one no handler checks.
+    #[test]
+    fn api_permission_names_match_the_enum() {
+        let names: Vec<&str> = Permission::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(names, trawl_api::PERMISSION_NAMES);
+    }
+
     #[test]
     fn parse_rejects_unknown_and_dead_strings() {
         assert_eq!(Permission::parse("superuser"), None);

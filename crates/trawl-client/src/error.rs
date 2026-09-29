@@ -4,6 +4,8 @@
 
 //! Client error types.
 
+use std::fmt;
+
 use trawl_api::{ErrorCode, ErrorDetail, ErrorEnvelope};
 
 /// Errors from the trawl client library.
@@ -11,7 +13,7 @@ use trawl_api::{ErrorCode, ErrorDetail, ErrorEnvelope};
 pub enum ClientError {
     /// HTTP transport failure.
     #[error("network error: {0}")]
-    Network(String),
+    Network(NetworkError),
 
     /// Server returned a non-success status with structured error info.
     #[error("server error (HTTP {status}): {}", error.message)]
@@ -30,9 +32,85 @@ pub enum ClientError {
     /// quotes the bundle's bytes.
     #[error("invalid CA certificate: {0}")]
     InvalidCa(String),
+
+    /// A response body larger than the endpoint's cap. Only the first
+    /// `cap` bytes were read; the rest never was.
+    #[error("response too large: more than {cap} bytes")]
+    TooLarge {
+        /// The most bytes the endpoint's body may hold.
+        cap: usize,
+    },
+
+    /// A URL the client refuses to build on. The reason never quotes the
+    /// URL.
+    #[error("invalid URL: {0}")]
+    InvalidUrl(String),
+}
+
+/// What kind of transport failure a [`NetworkError`] is.
+///
+/// A typed classification, so a caller can tell an untrusted certificate
+/// from a closed port without reading the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkKind {
+    /// The TLS handshake failed because the server's certificate did not
+    /// verify under the client's trust.
+    UntrustedCertificate,
+    /// No connection opened: nothing listening, a reset, or a handshake that
+    /// failed for a reason other than the certificate.
+    Connect,
+    /// No response headers arrived within the request's deadline.
+    Timeout,
+    /// The response headers arrived, so the server answered, but its body
+    /// did not finish within the request's deadline.
+    BodyTimeout,
+    /// The response headers arrived, so the server answered, but reading
+    /// its body failed for a reason other than the deadline: the peer
+    /// closed before the declared length, or sent a malformed chunk.
+    BodyRead,
+    /// The server answered with a redirect the client refused to follow.
+    Redirect,
+    /// Any other transport failure.
+    Other,
+}
+
+/// A transport failure: its kind and a sanitized message.
+///
+/// The message names the API origin at most, never URL userinfo, paths,
+/// query parameters, a certificate, or the TLS library's reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkError {
+    /// What kind of failure this is.
+    pub kind: NetworkKind,
+    /// The sanitized, human-readable message.
+    pub message: String,
+}
+
+impl NetworkError {
+    /// A failure of `kind` described by `message`.
+    pub fn new(kind: NetworkKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for NetworkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 impl ClientError {
+    /// The kind of transport failure, if this is a network error.
+    pub fn network_kind(&self) -> Option<NetworkKind> {
+        match self {
+            Self::Network(error) => Some(error.kind),
+            _ => None,
+        }
+    }
+
     /// Get the structured error envelope (if this is a server error).
     pub fn error_envelope(&self) -> Option<&ErrorEnvelope> {
         match self {

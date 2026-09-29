@@ -69,13 +69,44 @@ different file. Name the server every time you change something.
 
 ## Fix a connection problem
 
-| Symptom | Check |
+Run `trawl doctor` first. It checks the connection step by step, from where you
+run it, and names the first step that fails. Give it the profile you use:
+
+```bash
+trawl doctor -p lab
+```
+
+With only `[server]` in the file, give the API URL instead. The doctor then
+checks everything but the key, because `--url` never reads the config file:
+
+```bash
+trawl doctor --url https://logs.example.com:5514
+```
+
+Unset `TRAWL_URL`, `TRAWL_PROFILE`, `TRAWL_TOKEN`, and `TRAWL_INSECURE`
+first, because the doctor refuses to run when one is set. To check the browser
+URL too, add `--web-url` with the browser origin. Every failed line ends with
+a next action. The table maps each check to its usual fix.
+
+| Check | If it fails |
 | --- | --- |
-| Connection refused or timed out | API host and port, network route, `trawld` running |
-| Certificate validation error | Hostname in the URL, certificate chain, your trust store |
-| Authentication rejected | Complete token, key expiry or revocation, inherited `TRAWL_TOKEN` |
-| Permission denied | The permission the action needs, such as `query` or `schema_read` |
-| A query returns no rows | Time range, service spelling, whether logs have arrived |
+| `connection.config` | Fix the source it names: the config file, the profile, its `url`, `ca_cert`, or the token file |
+| `api.transport` | Check the API host and port, the network route, and that `trawld` runs |
+| `api.tls` | Set `ca_cert` in the profile to the server's CA, as below. Check that the URL uses `https` and the hostname in the certificate. Turn `insecure` off |
+| `api.health` | Check that the URL names the `trawld` API, not the browser URL or a proxy |
+| `api.health.<key>` | Ask the operator. The server reports that subsystem as failing |
+| `api.identity` | Get a complete, unexpired, unrevoked key. A key with no permissions needs a role |
+| `web.transport` | Check the browser origin's host and port, and that its certificate is from a CA your system trusts |
+| `web.origin` | Ask the operator to add the browser origin to `trawl-web`'s `public_origins` |
+
+A line that is `not_sampled` with `blocked` waits on an earlier check. Fix
+that check first. The [CLI reference](/reference/cli/#doctor-mode) lists every
+check and outcome.
+
+The doctor does not check two problems. When an action is denied, the key
+lacks the permission that action needs, such as `query` or `schema_read`.
+When a query returns no rows, check the time range, the service spelling, and
+whether logs have arrived.
 
 For a self-signed or private-CA server, copy its CA certificate to your
 machine and set `ca_cert = "~/.config/trawl/lab-ca.pem"` under `[server]` or in

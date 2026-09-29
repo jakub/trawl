@@ -6268,6 +6268,7 @@ name = "trawl-cli"
 version = "0.9.0"
 dependencies = [
  "arboard",
+ "axum",
  "chrono",
  "clap",
  "comfy-table",
@@ -6299,6 +6300,7 @@ dependencies = [
  "trawl-core",
  "trawl-dashboard",
  "trawl-engine",
+ "trawl-web",
  "unicode-width",
  "zeroize",
 ]
