@@ -15,11 +15,14 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use sqlx::Connection as _;
 use trawl_api::doctor::{Outcome, Report};
 
+use crate::common;
 use crate::support::{
-    DoctorConfig, PLANTED_APP_URL, PLANTED_FLEET_URL, SECRET, assert_no_values, forbidden_shape,
-    planted_env, report, row, run_doctor, write_doctor_config,
+    DoctorConfig, PLANTED_APP_URL, PLANTED_FLEET_URL, SECRET, admin, assert_fresh_install_rows,
+    assert_no_values, ensure_role, forbidden_shape, migrated_app, migrated_fleet, planted,
+    planted_env, report, row, run_doctor, url_values, verdict, write_doctor_config,
 };
 
 /// The doctor's arguments for `config` in `format`.
@@ -410,4 +413,248 @@ fn doctor_usage_errors_quote_no_argument() {
         assert_eq!(code, 2, "{args:?}: {stderr}");
         assert!(stdout.is_empty(), "{args:?}: {stdout}");
     }
+}
+
+/// The subject of every certificate the shared fixture pair and trawld's
+/// own generated pair carry (rcgen's default).
+const RCGEN_SUBJECT: &str = "rcgen self signed cert";
+
+/// `catalog_state.catalog_id` of the app-state database `url`.
+async fn catalog_id(url: &str) -> String {
+    let mut conn = admin(url).await;
+    let id: String = sqlx::query_scalar("SELECT catalog_id::text FROM catalog_state")
+        .fetch_one(&mut conn)
+        .await
+        .expect("read the catalog id");
+    conn.close().await.unwrap();
+    id
+}
+
+/// A running fixture server over an installation in `dir` that trawld's
+/// own boot steps made: the epoch gate initializes the absent data root, as
+/// `main` does before anything else, the seed parquet then stands for what
+/// ingest wrote, and the fixture's boot (`boot::prepare_corpus`) runs
+/// conformance and publishes the `CATALOG` marker.
+async fn running_server(dir: &Path) -> common::TestServer {
+    trawl_server::epoch::ensure_current_epoch(&dir.join("data"), &dir.join("wal"), true)
+        .expect("the epoch gate initializes the data root");
+    let data = common::seed_data_root(dir);
+    common::setup_in_dir_with_data(dir, data, trawl_server::config::RateLimitConfig::default())
+        .await
+}
+
+/// A doctor configuration for a running fixture server in `dir`, which
+/// [`running_server`] put its data root and WAL under, and what to run the
+/// doctor with: the fixture's two databases through the planted role, and
+/// every value of the installation the report must not show.
+async fn running_installation(
+    server: &common::TestServer,
+    dir: &Path,
+) -> (PathBuf, Vec<(&'static str, OsString)>, Vec<String>) {
+    let (cert, key) = common::ensure_test_cert();
+    let addr = server
+        .url
+        .strip_prefix("https://")
+        .expect("an https fixture");
+    let config = DoctorConfig {
+        http_addr: addr.to_owned(),
+        data_path: dir.join("data"),
+        ingest: true,
+        wal_dir: Some(dir.join("wal")),
+        tls: Some((cert, key)),
+        ..DoctorConfig::in_dir(dir)
+    };
+    let path = write_doctor_config(dir, &config);
+    let fleet = planted(&server.fleet_db_url);
+    let app = planted(&server.app_db_url);
+    let mut values = url_values(&fleet);
+    values.extend(url_values(&app));
+    values.extend([
+        catalog_id(&server.app_db_url).await,
+        RCGEN_SUBJECT.to_owned(),
+        "localhost".to_owned(),
+        addr.to_owned(),
+        config.data_path.display().to_string(),
+    ]);
+    let env = vec![
+        ("HOME", dir.as_os_str().to_owned()),
+        ("FLEET_DATABASE_URL", fleet.into()),
+        ("TRAWL_DATABASE_URL", app.into()),
+    ];
+    (path, env, values)
+}
+
+/// `(id, outcome, reason)` of every row that is not `complete` or
+/// `not_configured`.
+fn open_rows(report: &Report) -> Vec<(String, Outcome, Option<String>)> {
+    report
+        .checks()
+        .iter()
+        .filter(|check| !matches!(check.outcome, Outcome::Complete | Outcome::NotConfigured))
+        .map(|check| (check.id.clone(), check.outcome, check.reason.clone()))
+        .collect()
+}
+
+/// Against a real, healthy, running trawld with both databases current, a
+/// configured certificate and ingest on, the run passes: exit 0, every row
+/// `complete` or `not_configured`, the writer lock seen held, trawld's own
+/// certificate proven and its health read, and no note (#269 AC2).
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_running_installation_passes() {
+    ensure_role().await;
+    let dir = tempfile::tempdir().unwrap();
+    let server = running_server(dir.path()).await;
+    let (config, env, planted) = running_installation(&server, dir.path()).await;
+    let (code, report) = tokio::task::spawn_blocking(move || doctor(&config, &env, &planted))
+        .await
+        .expect("the doctor run");
+
+    assert_eq!(open_rows(&report), [], "{report:#?}");
+    assert_eq!(code, 0, "{report:#?}");
+    assert_eq!(
+        verdict(&report, "server.app.writer"),
+        (Outcome::Complete, Some("held"))
+    );
+    for id in [
+        "server.data.root",
+        "server.data.epoch",
+        "server.data.identity",
+        "server.data.conformance",
+        "server.tls.material",
+        "server.listener.identity",
+        "server.listener.health",
+    ] {
+        assert_eq!(verdict(&report, id), (Outcome::Complete, None), "{id}");
+    }
+    let health_keys = report
+        .checks()
+        .iter()
+        .filter(|check| check.id.starts_with("server.listener.health."))
+        .count();
+    assert!(health_keys >= 6, "{report:#?}");
+    assert!(report.notes().is_empty(), "{:?}", report.notes());
+    assert!(!server.serve_task.is_finished(), "trawld stopped serving");
+}
+
+/// A fresh installation before its first start: an empty app-state
+/// database, a migrated Fleet database, no data root on an ingest node,
+/// auto TLS with no pair yet, and trawld not running. Nothing fails, what
+/// boot initializes is `complete`/`will_initialize`, the listener is
+/// `not_listening`, and the run is incomplete, exit 3 (#269 AC3). The same
+/// state with an empty Fleet database is `db::doctor_unmigrated_fleet_fails`.
+/// Nothing was created.
+#[tokio::test]
+async fn doctor_fresh_install_is_incomplete() {
+    ensure_role().await;
+    let fleet = planted(&migrated_fleet().await);
+    let app = planted(&common::create_app_database().await);
+    let dir = tempfile::tempdir().unwrap();
+    let config = DoctorConfig::in_dir(dir.path());
+    let path = write_doctor_config(dir.path(), &config);
+    let mut values = url_values(&fleet);
+    values.extend(url_values(&app));
+    values.push(config.data_path.display().to_string());
+    let env = vec![
+        ("HOME", dir.path().as_os_str().to_owned()),
+        ("FLEET_DATABASE_URL", fleet.into()),
+        ("TRAWL_DATABASE_URL", app.into()),
+    ];
+
+    let (code, report) = doctor(&path, &env, &values);
+    assert_fresh_install_rows(&report);
+    assert_eq!(
+        open_rows(&report),
+        [
+            (
+                "server.listener.identity".to_owned(),
+                Outcome::NotSampled,
+                Some("not_listening".to_owned())
+            ),
+            (
+                "server.listener.health".to_owned(),
+                Outcome::NotSampled,
+                Some("blocked".to_owned())
+            ),
+        ],
+        "{report:#?}"
+    );
+    assert_eq!(code, 3);
+    let mut left: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["trawld.toml"], "the doctor created files");
+}
+
+/// The note "another process may own this database" is added when trawld's
+/// writer lock is held while nothing answers at the listener's address, and
+/// it changes no outcome: the report with the lock held, taken by a real
+/// `StorageState` as trawld's boot takes it, differs from the one without
+/// only in `server.app.writer`'s reason and the note (#269 D6).
+#[tokio::test]
+async fn doctor_notes_a_writer_lock_without_a_listener() {
+    const NOTE: &str = "another process may own this database";
+    ensure_role().await;
+    let fleet = migrated_fleet().await;
+    let app = migrated_app().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = DoctorConfig::in_dir(dir.path());
+    let path = write_doctor_config(dir.path(), &config);
+    let mut values = url_values(&planted(&fleet));
+    values.extend(url_values(&planted(&app)));
+    values.push(catalog_id(&app).await);
+    let env = vec![
+        ("HOME", dir.path().as_os_str().to_owned()),
+        ("FLEET_DATABASE_URL", planted(&fleet).into()),
+        ("TRAWL_DATABASE_URL", planted(&app).into()),
+    ];
+    let rows = |report: &Report| {
+        report
+            .checks()
+            .iter()
+            .map(|check| {
+                (
+                    check.id.clone(),
+                    check.outcome,
+                    check.reason.clone(),
+                    check.blocked_by.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let (free_code, free) = doctor(&path, &env, &values);
+    assert!(free.notes().is_empty(), "{:?}", free.notes());
+    assert_eq!(
+        verdict(&free, "server.app.writer"),
+        (Outcome::Complete, Some("not_observed"))
+    );
+
+    let pool = common::app_pool(&app).await;
+    let holder = trawl_server::store::StorageState::from_pool(pool.clone())
+        .await
+        .expect("take trawld's writer lock as boot does");
+    let (held_code, held) = doctor(&path, &env, &values);
+    drop(holder);
+    pool.close().await;
+
+    assert_eq!(
+        verdict(&held, "server.app.writer"),
+        (Outcome::Complete, Some("held"))
+    );
+    assert_eq!(
+        verdict(&held, "server.listener.identity"),
+        (Outcome::NotSampled, Some("not_listening"))
+    );
+    assert_eq!(held.notes().len(), 1, "{:?}", held.notes());
+    assert!(held.notes()[0].contains(NOTE), "{:?}", held.notes());
+    assert_eq!(held_code, free_code, "the note changed the verdict");
+    let mut expected = rows(&free);
+    for row in &mut expected {
+        if row.0 == "server.app.writer" {
+            row.2 = Some("held".to_owned());
+        }
+    }
+    assert_eq!(rows(&held), expected, "the note changed an outcome");
 }

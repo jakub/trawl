@@ -739,3 +739,31 @@ pub fn verdict<'a>(report: &'a Report, id: &str) -> (Outcome, Option<&'a str>) {
     let check = row(report, id);
     (check.outcome, check.reason.as_deref())
 }
+
+/// The rows of an installation before its first start, on an ingest node
+/// with auto TLS and trawld not running (#269 AC3): boot initializes the
+/// app-state schema, creates the data root and writes its epoch, and
+/// generates the certificate, so each of those is `complete`,
+/// `will_initialize`; nothing listens yet.
+///
+/// # Panics
+/// When a row differs.
+pub fn assert_fresh_install_rows(report: &Report) {
+    for id in [
+        "server.app.schema",
+        "server.data.root",
+        "server.data.epoch",
+        "server.tls.material",
+    ] {
+        assert_eq!(
+            verdict(report, id),
+            (Outcome::Complete, Some("will_initialize")),
+            "{id}: {report:#?}"
+        );
+    }
+    assert_eq!(
+        verdict(report, "server.listener.identity"),
+        (Outcome::NotSampled, Some("not_listening")),
+        "{report:#?}"
+    );
+}

@@ -19,10 +19,10 @@ use trawl_api::doctor::{Outcome, Report};
 
 use crate::common;
 use crate::support::{
-    ADVISORY_FUNCTIONS, DoctorConfig, LOCKLESS, ROLE, SECRET, admin, assert_no_values,
-    database_rows_complete, ensure_role, forbid_advisory_locks, lockless, migrated_app,
-    migrated_fleet, planted, report, row, run_doctor, url_values, verdict, with_login,
-    write_doctor_config,
+    ADVISORY_FUNCTIONS, DoctorConfig, LOCKLESS, ROLE, SECRET, admin, assert_fresh_install_rows,
+    assert_no_values, database_rows_complete, ensure_role, forbid_advisory_locks, lockless,
+    migrated_app, migrated_fleet, planted, report, row, run_doctor, url_values, verdict,
+    with_login, write_doctor_config,
 };
 
 /// The pre-1.0 app-state migrations boot refuses to adopt.
@@ -116,6 +116,10 @@ fn doctor_env(dir: &Path, fleet: &str, app: &str) -> (i32, Report, String) {
     )
 }
 
+/// The fresh installation of `doctor_fresh_install_is_incomplete` with an
+/// empty Fleet database: the run fails on `server.fleet.schema`, whose next
+/// action is `fleet-admin migrate`, and every row that says what boot
+/// initializes says so as it does there (#269 AC3).
 #[tokio::test]
 async fn doctor_unmigrated_fleet_fails() {
     ensure_role().await;
@@ -154,6 +158,14 @@ async fn doctor_unmigrated_fleet_fails() {
         verdict(&report, "server.app.writer"),
         (Outcome::Complete, Some("not_observed"))
     );
+    assert_fresh_install_rows(&report);
+    let failed: Vec<&str> = report
+        .checks()
+        .iter()
+        .filter(|check| check.outcome == Outcome::Failed)
+        .map(|check| check.id.as_str())
+        .collect();
+    assert_eq!(failed, ["server.fleet.schema"], "{report:#?}");
 
     // Once migrated, the same Fleet database is current.
     let mut conn = admin(&fleet).await;
