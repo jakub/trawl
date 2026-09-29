@@ -354,7 +354,8 @@ refuses to run against a dirty working tree, since a patch that can't be
 cleanly reverted would strand a mutation in your tree. This is evidence
 tooling for reviewing the suite's effectiveness. The two legs of the
 `web-ui-mutations` CI job run patches 17, 20, 22–30 and 32 alongside the same
-commit's baseline E2E job.
+commit's baseline E2E job, whenever a pull request changes a crate the SPA
+compiles or a build-wide file (`ci/changed-scopes.py`).
 
 08 through 11 and 31 are focus-order sensitive: the thing they break is
 where `document.activeElement` ends up after a keypress, and a browser
