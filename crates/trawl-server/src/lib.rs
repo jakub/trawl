@@ -15,6 +15,7 @@ pub mod bus;
 pub mod capacity;
 pub mod catalog;
 pub mod config;
+pub mod config_check;
 pub mod deadline;
 pub(crate) mod env_dirs;
 pub mod epoch;
