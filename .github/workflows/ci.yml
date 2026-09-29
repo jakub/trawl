@@ -6,8 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# A new push to a pull request cancels its older run. Each push to main gets
+# its own group, so no main run is ever cancelled: a merge landing shortly
+# after another would otherwise leave the first merge with no verdict, and
+# rust-cache saves only from a finished main run. A shared group would not
+# do, even without cancel-in-progress: GitHub keeps one pending run per
+# group and cancels the older pending one when a third arrives.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:

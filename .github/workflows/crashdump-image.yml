@@ -38,9 +38,11 @@ on:
       - .github/workflows/crashdump-image.yml
       - ci/crashdump-image.sh
 
-# A long release-profile build is not worth running twice for the same ref.
+# A long release-profile build is not worth running twice for the same pull
+# request. Each push to main gets its own group, so every merge gets a
+# verdict (a shared group would still cancel a pending main run; see ci.yml).
 concurrency:
-  group: crashdump-image-${{ github.ref }}
+  group: crashdump-image-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:
