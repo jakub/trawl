@@ -297,6 +297,16 @@ fn the_key_file_is_restricted_before_the_key_is_written() {
         lines[restrict].ends_with("&&") && lines[write].ends_with("&&") && write < remove,
         "the key file copy is deleted only after the restricted write succeeds"
     );
+    assert!(
+        lines[write].contains("| sudo tee -a /etc/default/vector"),
+        "the key reaches the file through sudo tee's standard input"
+    );
+    for line in &lines[restrict..=remove] {
+        assert!(
+            !line.contains("||") && !line.contains(';'),
+            "nothing in the key-write chain tolerates a failed step: {line}"
+        );
+    }
 }
 
 #[test]
