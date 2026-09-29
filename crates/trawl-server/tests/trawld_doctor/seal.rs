@@ -218,6 +218,39 @@ fn doctor_requires_config_flag() {
     }
 }
 
+/// With HOME unset, `~` in the `--config` path expands through the
+/// password database, which can be a network service that stalls. The
+/// doctor expands it on its blocking pool under a 5 s deadline, and the
+/// identity row's lookup has 2 s, so the run returns within 10 s whatever
+/// the lookup does, with `server.config` reporting on the path it found:
+/// here, one that does not exist.
+#[test]
+fn doctor_tilde_config_without_home_returns() {
+    let missing = format!("~/.trawl-doctor-absent-{}/trawld.toml", std::process::id());
+    let args = ["--doctor", "--config", &missing, "--format", "json"];
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = run_doctor(&args, &[] as &[(&str, &str)]);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "took {elapsed:?}"
+    );
+    assert_no_values(&stdout, &stderr, &[]);
+    let report = report(&stdout);
+    let config = &report.checks()[0];
+    assert_eq!(
+        (config.id.as_str(), config.outcome, config.reason.as_deref()),
+        (
+            "server.config",
+            Outcome::Failed,
+            Some("the configuration file does not exist")
+        ),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
 /// clap's help shows an env-bound argument's current value, as
 /// `[env: NAME=value]`. The doctor's help, short and long, names each
 /// variable and shows no value.

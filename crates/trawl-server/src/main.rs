@@ -193,8 +193,11 @@ fn doctor_main(sealed: trawl_crashdump::Sealed) -> u8 {
         Ok(cli) => cli,
         Err(error) => return doctor_usage_error(&error),
     };
-    let path = resolve_path(cli.config.as_deref().expect("clap requires config"));
-    trawl_server::doctor::run(sealed, &path, cli.format)
+    // The argument as given: the doctor expands its `~` itself, under a
+    // deadline, since with HOME unset or empty the expansion asks the
+    // password database.
+    let config = cli.config.as_deref().expect("clap requires config");
+    trawl_server::doctor::run(sealed, config, cli.format)
 }
 
 /// Report a refused `--doctor` command line, exit status 2, without

@@ -30,7 +30,7 @@
 //! through [`fsread`].
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use trawl_api::doctor::{Outcome, Report, Target, Vantage, reason};
@@ -442,9 +442,13 @@ impl Runner {
 /// such as a file read past its deadline.
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
 
-/// How long the checks after parsing may take. With the file logger in use
-/// they inspect `server.log_file` and the data root's markers, path
-/// metadata a hung filesystem can stall, so they get a file read's budget.
+/// How long each blocking step of `server.config` may take: expanding `~`
+/// in the `--config` path, parsing the file (which expands `~` in its path
+/// settings), and the checks after parsing. Expanding `~` with HOME unset
+/// or empty asks the password database, which can be a network service.
+/// With the file logger in use the checks after parsing inspect
+/// `server.log_file` and the data root's markers, path metadata a hung
+/// filesystem can stall. Each gets a file read's budget.
 const VALIDATE_DEADLINE: Duration = fsread::READ_DEADLINE;
 
 /// How long the running user's name may take to look up. The password
@@ -452,13 +456,14 @@ const VALIDATE_DEADLINE: Duration = fsread::READ_DEADLINE;
 const USER_LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Run `trawld --doctor --config <config>` and return its exit status: 0
-/// pass, 1 fail, 3 incomplete (ADR-0047).
+/// pass, 1 fail, 3 incomplete (ADR-0047). `config` is the argument as
+/// given; `server.config` expands its `~`.
 ///
 /// Call on the main thread of a sealed process, before any other thread
 /// exists. `sealed` proves the seal ran: only
 /// [`trawl_crashdump::seal_for_config_check`] makes one.
 #[must_use]
-pub fn run(sealed: Sealed, config: &Path, format: Option<Format>) -> u8 {
+pub fn run(sealed: Sealed, config: &str, format: Option<Format>) -> u8 {
     install_panic_hook(io::stderr);
     let format = format.unwrap_or_else(Format::detect);
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -500,13 +505,19 @@ fn install_panic_hook<W: Write>(sink: impl Fn() -> W + Send + Sync + 'static) {
 
 /// Run every check and build the report. Nothing is rendered until the
 /// whole report exists. `sealed` proves the seal ran before the
-/// configuration is read.
-pub async fn check(sealed: Sealed, config_path: &Path) -> Report {
+/// configuration is read. `config_arg` is the `--config` argument as given.
+pub async fn check(sealed: Sealed, config_arg: &str) -> Report {
     let run_as = RunAs::current();
-    let shown = SelectedPath::new(Selection::ConfigFlag, config_path);
     let mut runner = Runner::new(run_as);
 
-    let config = check_config(sealed, &mut runner, config_path, &shown).await;
+    let (shown, config) = check_config(
+        sealed,
+        &mut runner,
+        config_arg,
+        tilde_path,
+        Config::from_toml,
+    )
+    .await;
     check_identity(&mut runner, run_as).await;
 
     if let Some(config) = config {
@@ -545,68 +556,101 @@ pub async fn check(sealed: Sealed, config_path: &Path) -> Report {
     })
 }
 
-/// `server.config`: read the file through the bounded reader, then run the
-/// checks `--check-config` runs, on the blocking pool under
-/// [`VALIDATE_DEADLINE`]. The validation text is never shown; the next
-/// action is `--check-config`, which prints it.
+/// Expand `~` in `path` as boot expands the `--config` path (`main`'s
+/// `resolve_path`). With HOME unset or empty, `~` resolves through the
+/// password database.
+fn tilde_path(path: &str) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(path).as_ref())
+}
+
+/// `server.config`: expand `~` in the `--config` argument with `expand`,
+/// read the file through the bounded reader, parse it with `parse`, then
+/// run the checks `--check-config` runs. Expanding, parsing (which expands
+/// `~` in the file's path settings) and the checks after parsing each run
+/// on the blocking pool under [`VALIDATE_DEADLINE`]. The validation text is
+/// never shown; the next action is `--check-config`, which prints it.
+///
+/// `check` passes [`tilde_path`] and [`Config::from_toml`], what boot
+/// runs. Returns the `--config` path as the report names it, expanded
+/// when the expansion finished, and the configuration when it loaded.
 async fn check_config(
     _sealed: Sealed,
     runner: &mut Runner,
-    path: &Path,
-    shown: &SelectedPath,
-) -> Option<Config> {
+    arg: &str,
+    expand: impl FnOnce(&str) -> PathBuf + Send + 'static,
+    parse: impl FnOnce(&str) -> Result<Config, ConfigError> + Send + 'static,
+) -> (SelectedPath, Option<Config>) {
     let gate = runner
         .gate(ServerCheck::Config)
         .expect("server.config has no prerequisite");
     let check = ServerCheck::Config;
-    let source = Text::new("--config ").path(shown);
+    let expanded = blocking_within(VALIDATE_DEADLINE, {
+        let arg = arg.to_owned();
+        move || expand(&arg)
+    })
+    .await;
+    let shown = SelectedPath::new(
+        Selection::ConfigFlag,
+        expanded.as_deref().unwrap_or(Path::new(arg)),
+    );
+    let source = Text::new("--config ").path(&shown);
     let explain = Text::new("run trawld --check-config --config ")
-        .path(shown)
+        .path(&shown)
         .lit(" to see why");
-    let refused = |reason: &'static str| {
-        Row::failed(check, reason)
-            .source(source.clone())
-            .next(explain.clone())
-    };
+    let refused = |reason: &'static str| Row::failed(check, reason).next(explain.clone());
 
-    let loaded =
-        match fsread::read(path.to_owned(), fsread::cap::CONFIG, fsread::Links::Follow).await {
-            Err(fault) => Err(config_read_fault(fault).source(source.clone())),
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Err(_) => Err(refused("the configuration is not UTF-8 text")),
-                Ok(text) => match Config::from_toml(&text) {
-                    Err(ConfigError::Parse { reason, .. }) => {
-                        Err(refused("the configuration does not parse").detail(Text::new(reason)))
-                    }
-                    Err(ConfigError::Validation(_) | ConfigError::Io { .. }) => {
-                        Err(refused("the configuration does not validate"))
-                    }
-                    Ok(config) => {
-                        let validated = blocking_within(VALIDATE_DEADLINE, move || {
-                            check_loaded(&config).map(|()| config)
-                        })
-                        .await;
-                        match validated {
-                            Ok(Ok(config)) => Ok(config),
-                            Ok(Err(fault)) => Err(loaded_fault(&fault, &explain)),
-                            Err(unfinished) => Err(unfinished_validation(unfinished)),
-                        }
-                        .map_err(|row| row.source(source.clone()))
-                    }
-                },
-            },
+    let loaded = async {
+        let path = expanded.map_err(|unfinished| {
+            unfinished_config(
+                unfinished,
+                "expanding ~ in the --config path did not finish",
+            )
+        })?;
+        let bytes = fsread::read(path, fsread::cap::CONFIG, fsread::Links::Follow)
+            .await
+            .map_err(config_read_fault)?;
+        let text =
+            String::from_utf8(bytes).map_err(|_| refused("the configuration is not UTF-8 text"))?;
+        let config = match blocking_within(VALIDATE_DEADLINE, move || parse(&text)).await {
+            Ok(Ok(config)) => config,
+            Ok(Err(ConfigError::Parse { reason, .. })) => {
+                return Err(refused("the configuration does not parse").detail(Text::new(reason)));
+            }
+            Ok(Err(ConfigError::Validation(_) | ConfigError::Io { .. })) => {
+                return Err(refused("the configuration does not validate"));
+            }
+            Err(unfinished) => {
+                return Err(unfinished_config(
+                    unfinished,
+                    "expanding ~ in the configuration's path settings did not finish",
+                ));
+            }
         };
+        match blocking_within(VALIDATE_DEADLINE, move || {
+            check_loaded(&config).map(|()| config)
+        })
+        .await
+        {
+            Ok(Ok(config)) => Ok(config),
+            Ok(Err(fault)) => Err(loaded_fault(&fault, &explain)),
+            Err(unfinished) => Err(unfinished_config(
+                unfinished,
+                "inspecting server.log_file and the data root's markers did not finish",
+            )),
+        }
+    }
+    .await;
     match loaded {
         Ok(config) => {
             let row = Row::complete(check)
                 .detail(Text::new("loads and validates"))
                 .source(source);
             runner.record(gate, row);
-            Some(config)
+            (shown, Some(config))
         }
         Err(row) => {
-            runner.record(gate, row);
-            None
+            runner.record(gate, row.source(source));
+            (shown, None)
         }
     }
 }
@@ -660,13 +704,12 @@ async fn blocking_within<T: Send + 'static>(
     }
 }
 
-/// The `server.config` row for checks after parsing that gave no answer.
-fn unfinished_validation(unfinished: Unfinished) -> Row {
+/// The `server.config` row for a blocking step that gave no answer;
+/// `what` says which step, when it ran out of time.
+fn unfinished_config(unfinished: Unfinished, what: &'static str) -> Row {
     let check = ServerCheck::Config;
     match unfinished {
-        Unfinished::TimedOut => Row::not_sampled(check, reason::TIMED_OUT).detail(Text::new(
-            "inspecting server.log_file and the data root's markers did not finish",
-        )),
+        Unfinished::TimedOut => Row::not_sampled(check, reason::TIMED_OUT).detail(Text::new(what)),
         Unfinished::Panicked => Row::not_sampled(check, reason::UNREADABLE),
     }
 }
@@ -1082,7 +1125,8 @@ mod tests {
         let fifo = dir.path().join("trawld.toml");
         crate::ingest::no_follow::test_support::make_fifo(&fifo);
         let sealed = trawl_crashdump::seal_for_config_check().expect("the seal");
-        let report = tokio::time::timeout(Duration::from_secs(10), check(sealed, &fifo))
+        let fifo = fifo.to_str().expect("a UTF-8 temporary path");
+        let report = tokio::time::timeout(Duration::from_secs(10), check(sealed, fifo))
             .await
             .expect("the doctor returned");
         let rows = summary(&report);
@@ -1117,7 +1161,7 @@ mod tests {
         // Let the abandoned thread finish, so the test runtime can drop.
         drop(release);
 
-        let row = unfinished_validation(Unfinished::TimedOut);
+        let row = unfinished_config(Unfinished::TimedOut, "the step did not finish");
         assert_eq!(
             (row.check(), row.outcome(), row.reason()),
             (
@@ -1131,6 +1175,121 @@ mod tests {
             Ok(7),
             "work that finishes in time answers"
         );
+    }
+
+    /// Which thread ran a step of `server.config`, and what it was given.
+    type Ran = std::sync::mpsc::Receiver<(std::thread::ThreadId, String)>;
+
+    /// A step that reports its thread and input on the returned channel,
+    /// then stalls for `stall`, far past [`STEP_DEADLINE`], unless the test
+    /// releases it first by dropping the returned sender.
+    fn stalling<T>(
+        stall: Duration,
+        answer: impl FnOnce(&str) -> T + Send + 'static,
+    ) -> (
+        impl FnOnce(&str) -> T + Send + 'static,
+        Ran,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (ran_tx, ran) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let step = move |input: &str| {
+            ran_tx
+                .send((std::thread::current().id(), input.to_owned()))
+                .unwrap();
+            let _ = released.recv_timeout(stall);
+            answer(input)
+        };
+        (step, ran, release)
+    }
+
+    /// How long a stalled step of these tests holds its thread: long enough
+    /// that a run which waited it out is plainly not bounded.
+    const STALL: Duration = Duration::from_secs(20);
+
+    /// The bound these tests hold `server.config` to. [`VALIDATE_DEADLINE`]
+    /// plus scheduling slack, well short of [`STALL`].
+    const STEP_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Run `server.config` alone with `expand` and `parse`, under
+    /// [`STEP_DEADLINE`], and return its row and the path it names.
+    async fn config_row(
+        arg: &str,
+        expand: impl FnOnce(&str) -> PathBuf + Send + 'static,
+        parse: impl FnOnce(&str) -> Result<Config, ConfigError> + Send + 'static,
+    ) -> ((Outcome, Option<String>, Option<String>), String) {
+        let sealed = trawl_crashdump::seal_for_config_check().expect("the seal");
+        let mut runner = Runner::new(run_as(false));
+        let started = std::time::Instant::now();
+        let (shown, config) = tokio::time::timeout(
+            STEP_DEADLINE,
+            check_config(sealed, &mut runner, arg, expand, parse),
+        )
+        .await
+        .expect("server.config returned within its deadline");
+        assert!(started.elapsed() < STEP_DEADLINE);
+        assert!(config.is_none());
+        let row = runner.rows.pop().expect("server.config recorded a row");
+        let check = row.into_check();
+        (
+            (check.outcome, check.reason, check.detail),
+            shown.as_shown().to_owned(),
+        )
+    }
+
+    /// Expanding `~` in the `--config` argument asks the password database
+    /// when HOME is unset or empty, so it runs on the blocking pool, off the
+    /// doctor's own thread, and a stalled expansion costs `server.config`
+    /// its answer, `not_sampled`/`timed_out`, at the deadline instead of
+    /// hanging the run. The report then names the argument as given.
+    #[tokio::test]
+    async fn config_path_expansion_is_bounded() {
+        let here = std::thread::current().id();
+        let (expand, ran, release) = stalling(STALL, |path: &str| PathBuf::from(path));
+        let (row, shown) = config_row("~/trawld.toml", expand, |_: &str| {
+            unreachable!("nothing is parsed before the path expands")
+        })
+        .await;
+        assert_eq!(
+            row,
+            (
+                Outcome::NotSampled,
+                Some(reason::TIMED_OUT.to_owned()),
+                Some("expanding ~ in the --config path did not finish".to_owned())
+            )
+        );
+        assert_eq!(shown, "~/trawld.toml");
+        let (thread, given) = ran.recv().expect("the expansion ran");
+        assert_ne!(thread, here, "the expansion ran on the doctor's thread");
+        assert_eq!(given, "~/trawld.toml");
+        drop(release);
+    }
+
+    /// Parsing expands `~` in the file's path settings, so it too runs on
+    /// the blocking pool under the deadline, and a stalled parse is
+    /// `not_sampled`/`timed_out`.
+    #[tokio::test]
+    async fn config_parse_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trawld.toml");
+        std::fs::write(&path, "[data]\npath = \"~/data\"\n").unwrap();
+        let path = path.to_str().expect("a UTF-8 temporary path").to_owned();
+        let here = std::thread::current().id();
+        let (parse, ran, release) = stalling(STALL, Config::from_toml);
+        let (row, shown) = config_row(&path, tilde_path, parse).await;
+        assert_eq!(
+            row,
+            (
+                Outcome::NotSampled,
+                Some(reason::TIMED_OUT.to_owned()),
+                Some("expanding ~ in the configuration's path settings did not finish".to_owned())
+            )
+        );
+        assert_eq!(shown, path);
+        let (thread, given) = ran.recv().expect("the parse ran");
+        assert_ne!(thread, here, "the parse ran on the doctor's thread");
+        assert_eq!(given, "[data]\npath = \"~/data\"\n");
+        drop(release);
     }
 
     /// A `server.log_file` refusal is `failed` only when it proves the
