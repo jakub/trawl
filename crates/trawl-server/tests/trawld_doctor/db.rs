@@ -1228,8 +1228,9 @@ const PANIC_LINE: &str = "[trawld] doctor stopped a check: an internal error occ
 /// connection it reads one length-prefixed packet; an `SSLRequest` gets
 /// `N`, as a server without TLS answers, and the startup message after it
 /// is read the same way. The startup message gets [`MD5_WITHOUT_SALT`], and
-/// the connection is then held until the client drops it.
-fn malformed_auth_server() -> std::net::SocketAddr {
+/// the connection is then held until the client drops it. Each startup
+/// message, without its length, is recorded as it arrives.
+fn malformed_auth_server() -> (std::net::SocketAddr, Received) {
     use std::io::{Read as _, Write as _};
 
     fn packet(tcp: &mut std::net::TcpStream) -> Option<Vec<u8>> {
@@ -1242,9 +1243,12 @@ fn malformed_auth_server() -> std::net::SocketAddr {
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let startups = Received::default();
+    let recorded = startups.clone();
     std::thread::spawn(move || {
         for tcp in listener.incoming() {
             let Ok(mut tcp) = tcp else { return };
+            let recorded = recorded.clone();
             std::thread::spawn(move || {
                 tcp.set_read_timeout(Some(std::time::Duration::from_secs(60)))
                     .unwrap();
@@ -1260,6 +1264,7 @@ fn malformed_auth_server() -> std::net::SocketAddr {
                 }
                 // A startup message: protocol 3.0, then its fields.
                 assert_eq!(first[..4], [0, 3, 0, 0], "a startup message");
+                recorded.lock().unwrap().push(first);
                 let _ = tcp.write_all(&MD5_WITHOUT_SALT);
                 let _ = tcp.flush();
                 let mut rest = Vec::new();
@@ -1267,7 +1272,7 @@ fn malformed_auth_server() -> std::net::SocketAddr {
             });
         }
     });
-    addr
+    (addr, startups)
 }
 
 /// A database server that sends a message `SQLx` panics decoding
@@ -1277,11 +1282,13 @@ fn malformed_auth_server() -> std::net::SocketAddr {
 /// renders. The Fleet URL disables TLS; the app-state URL keeps the default
 /// `sslmode`, `prefer`, whose `SSLRequest` the server declines, so both
 /// reach the decoder. The panic hook's fixed line, once per database, is
-/// all stderr holds.
+/// all stderr holds. Under `disable` the doctor's own probe reads the same
+/// server first, and its startup message is byte for byte the one `SQLx`
+/// sends after it.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_contains_a_driver_panic() {
     let dir = tempfile::tempdir().unwrap();
-    let addr = malformed_auth_server();
+    let (addr, startups) = malformed_auth_server();
     let fleet = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_fleet_db?sslmode=disable");
     let app = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_app_db");
     let mut values = url_values(&fleet);
@@ -1340,9 +1347,25 @@ async fn doctor_contains_a_driver_panic() {
         [PANIC_LINE, PANIC_LINE],
         "{stderr}"
     );
+    let startups = startups.lock().unwrap().clone();
+    let fleet_startups: Vec<&Vec<u8>> = startups
+        .iter()
+        .filter(|body| {
+            body.windows(b"planted_fleet_db".len())
+                .any(|window| window == b"planted_fleet_db")
+        })
+        .collect();
+    // Two runs, JSON and table, each with the Fleet probe, then SQLx for
+    // each database.
+    assert_eq!(startups.len(), 6, "{startups:?}");
+    assert_eq!(fleet_startups.len(), 4, "{startups:?}");
+    assert!(
+        fleet_startups.iter().all(|body| *body == fleet_startups[0]),
+        "the probe sends SQLx's startup message: {startups:?}"
+    );
 }
 
-/// The `SSLRequest` message, as the doctor and `SQLx` send it.
+/// The `SSLRequest` message, as `SQLx` sends it.
 const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
 
 /// What an HTTP server answers bytes it cannot parse as a request. `SQLx`
@@ -1350,27 +1373,65 @@ const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
 /// `TTP/` as a length of about 1.4 GB.
 const HTTP_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
 
-/// Every byte each connection to an [`http_server`] sent, recorded when the
+/// What an SSH server sends as soon as a connection opens. `SQLx` 0.9.0
+/// reads `S` as a `ParameterStatus` type and `SH-2` as a length of about
+/// 1.4 GB, and `S` is also a PostgreSQL server's answer to an `SSLRequest`.
+const SSH_BANNER: &[u8] = b"SSH-2.0-OpenSSH_9.9\r\n";
+
+/// An authentication request whose length claims 1 GiB: a type byte a
+/// PostgreSQL server does answer a startup message with, and a length none
+/// sends.
+const HUGE_AUTHENTICATION: &[u8] = &[b'R', 0x40, 0, 0, 0, 0, 0, 0, 10];
+
+/// How a [`fake_server`] speaks: `greeting` goes out as soon as a
+/// connection opens, and `answer` once the client's first bytes arrive.
+#[derive(Clone, Copy)]
+struct Speech {
+    greeting: &'static [u8],
+    answer: &'static [u8],
+}
+
+/// An HTTP server a database URL might name by accident.
+const HTTP: Speech = Speech {
+    greeting: b"",
+    answer: HTTP_400,
+};
+
+/// An SSH server, which speaks first.
+const SSH: Speech = Speech {
+    greeting: SSH_BANNER,
+    answer: b"",
+};
+
+/// A server whose first answer has a PostgreSQL type and a huge length.
+const HUGE_R: Speech = Speech {
+    greeting: b"",
+    answer: HUGE_AUTHENTICATION,
+};
+
+/// Every byte each connection to a [`fake_server`] sent, recorded when the
 /// client closes it.
 type Received = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
 
-/// Serve one connection as an HTTP server a database URL might name by
-/// accident: answer [`HTTP_400`] once the first bytes arrive, hold the
-/// connection open, and record what the client sent until it closes.
-fn http_connection<S>(mut stream: S, received: &Received)
+/// Serve one connection as `speech` says, hold it open, and record what
+/// the client sent until it closes.
+fn fake_connection<S>(mut stream: S, speech: Speech, received: &Received)
 where
     S: std::io::Read + std::io::Write + Send + 'static,
 {
     let received = received.clone();
     std::thread::spawn(move || {
+        if !speech.greeting.is_empty() {
+            let _ = stream.write_all(speech.greeting);
+        }
         let mut seen = Vec::new();
         let mut buf = [0_u8; 4096];
         loop {
             match stream.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if seen.is_empty() {
-                        let _ = stream.write_all(HTTP_400);
+                    if seen.is_empty() && !speech.answer.is_empty() {
+                        let _ = stream.write_all(speech.answer);
                     }
                     seen.extend_from_slice(&buf[..n]);
                 }
@@ -1380,16 +1441,16 @@ where
     });
 }
 
-/// Where an [`http_server`] listens.
-enum HttpAt {
+/// Where a [`fake_server`] listens.
+enum FakeAt {
     Tcp(std::net::SocketAddr),
     /// The socket directory; the socket is `.s.PGSQL.5432` in it.
     Unix(PathBuf),
 }
 
-/// An HTTP-like server on loopback TCP, or on a Unix socket in `dir` when
-/// `unix`, and what it received.
-fn http_server(dir: &Path, unix: bool) -> (HttpAt, Received) {
+/// A server that is not PostgreSQL, speaking as `speech` says, on loopback
+/// TCP, or on a Unix socket in `dir` when `unix`, and what it received.
+fn fake_server(dir: &Path, unix: bool, speech: Speech) -> (FakeAt, Received) {
     let received = Received::default();
     let at = if unix {
         let sockets = dir.join("sock");
@@ -1403,10 +1464,10 @@ fn http_server(dir: &Path, unix: bool) -> (HttpAt, Received) {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                     .unwrap();
-                http_connection(stream, &received);
+                fake_connection(stream, speech, &received);
             }
         });
-        HttpAt::Unix(sockets)
+        FakeAt::Unix(sockets)
     } else {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1417,25 +1478,91 @@ fn http_server(dir: &Path, unix: bool) -> (HttpAt, Received) {
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                     .unwrap();
-                http_connection(stream, &received);
+                fake_connection(stream, speech, &received);
             }
         });
-        HttpAt::Tcp(addr)
+        FakeAt::Tcp(addr)
     };
     (at, received)
 }
 
 /// What `received` holds once `count` connections have closed, waiting up
-/// to 10 s for the last of them.
+/// to 10 s for the last of them, then 200 ms more for any connection past
+/// `count` to show.
 fn closed_connections(received: &Received, count: usize) -> Vec<Vec<u8>> {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let seen = received.lock().unwrap().clone();
-        if seen.len() >= count || std::time::Instant::now() > until {
-            return seen;
-        }
+    while received.lock().unwrap().len() < count && std::time::Instant::now() < until {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    received.lock().unwrap().clone()
+}
+
+/// The name and value pairs of a v3.0 startup message that makes up all of
+/// `sent`, after asserting its framing: a length that counts every byte,
+/// protocol 3.0, NUL-terminated fields, and a closing NUL.
+fn startup_fields(sent: &[u8]) -> Vec<(String, String)> {
+    let length = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
+    assert_eq!(length, sent.len(), "one message and nothing else: {sent:?}");
+    assert_eq!(sent[4..8], [0, 3, 0, 0], "protocol 3.0: {sent:?}");
+    let fields = sent[8..]
+        .strip_suffix(b"\0\0")
+        .unwrap_or_else(|| panic!("a closing NUL: {sent:?}"));
+    let strings: Vec<String> = fields
+        .split(|&byte| byte == 0)
+        .map(|field| String::from_utf8(field.to_vec()).unwrap())
+        .collect();
+    assert_eq!(
+        strings.len() % 2,
+        0,
+        "names and values in pairs: {strings:?}"
+    );
+    strings
+        .chunks(2)
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect()
+}
+
+/// Assert `seen` is one connection per database the doctor probed, each
+/// carrying the doctor's startup message and nothing else: the planted
+/// role, the database, `application_name` `trawld-doctor`, and no byte of
+/// the planted secret.
+fn assert_one_startup_per_database(seen: &[Vec<u8>], databases: &[&str], label: &str) {
+    assert_eq!(
+        seen.len(),
+        databases.len(),
+        "{label}: one connection per database, and no second: {seen:?}"
+    );
+    let mut probed: Vec<String> = seen
+        .iter()
+        .map(|sent| {
+            assert!(
+                !sent
+                    .windows(SECRET.len())
+                    .any(|window| window == SECRET.as_bytes()),
+                "{label}: the password reached the server: {sent:?}"
+            );
+            let fields = startup_fields(sent);
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.as_str())
+            };
+            assert_eq!(field("user"), Some(ROLE), "{label}: {fields:?}");
+            assert_eq!(
+                field("application_name"),
+                Some("trawld-doctor"),
+                "{label}: {fields:?}"
+            );
+            assert_eq!(field("password"), None, "{label}: {fields:?}");
+            field("database").unwrap().to_owned()
+        })
+        .collect();
+    probed.sort();
+    let mut expected: Vec<String> = databases.iter().map(|db| (*db).to_owned()).collect();
+    expected.sort();
+    assert_eq!(probed, expected, "{label}");
 }
 
 /// Time one JSON doctor run with `fleet` and `app` in the environment,
@@ -1464,29 +1591,62 @@ fn timed_doctor(dir: &Path, fleet: &str, app: &str) -> (std::time::Duration, i32
     (elapsed, code, report(&stdout))
 }
 
+/// Assert both connect checks are `failed`, `not_postgres`, the run exits
+/// `1`, and it did not wait out a 5 s connect deadline, as a run that
+/// handed either URL to `SQLx` does.
+fn assert_refused_as_not_postgres(
+    report: &Report,
+    code: i32,
+    elapsed: std::time::Duration,
+    label: &str,
+) {
+    for id in ["server.fleet.connect", "server.app.connect"] {
+        let check = row(report, id);
+        assert_eq!(
+            (
+                check.outcome,
+                check.reason.as_deref(),
+                check.next_action.as_deref()
+            ),
+            (
+                Outcome::Failed,
+                Some("not_postgres"),
+                Some("check the database URL's host and port")
+            ),
+            "{label} {id}: {report:#?}"
+        );
+    }
+    assert_eq!(code, 1, "{label}: {report:#?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "{label}: took {elapsed:?}"
+    );
+}
+
 /// A URL with `sslmode` `disable` or `allow` that names an HTTP server by
 /// accident is `failed`, `not_postgres`, and the run does not wait on it:
-/// the doctor sends its own `SSLRequest`, reads the one byte `H`, and
-/// never hands the URL to `SQLx`, which would send a startup message and
-/// read `HTTP/` as a frame of about 1.4 GB. The server receives the eight
-/// bytes of the `SSLRequest` and nothing else, over a TCP host and port, a
-/// `hostaddr` that overrides an unresolvable host name, and a Unix socket.
+/// the doctor sends its own startup message, reads the header `HTTP/`,
+/// whose type `H` no PostgreSQL server answers with, and never hands the
+/// URL to `SQLx`, which would read `HTTP/` as a frame of about 1.4 GB. Each
+/// database gets one connection that carries the doctor's startup message
+/// and no password, over a TCP host and port, a `hostaddr` that overrides
+/// an unresolvable host name, and a Unix socket.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_refuses_a_server_that_is_not_postgres() {
     for shape in ["host", "hostaddr", "unix"] {
         let dir = tempfile::tempdir().unwrap();
-        let (at, received) = http_server(dir.path(), shape == "unix");
+        let (at, received) = fake_server(dir.path(), shape == "unix", HTTP);
         let url = |db: &str, mode: &str| match (&at, shape) {
-            (HttpAt::Tcp(addr), "host") => {
+            (FakeAt::Tcp(addr), "host") => {
                 format!("postgres://{ROLE}:{SECRET}@{addr}/{db}?sslmode={mode}")
             }
-            (HttpAt::Tcp(addr), _) => format!(
+            (FakeAt::Tcp(addr), _) => format!(
                 "postgres://{ROLE}:{SECRET}@planted-host.invalid:{}/{db}?sslmode={mode}\
                  &hostaddr={}",
                 addr.port(),
                 addr.ip()
             ),
-            (HttpAt::Unix(sockets), _) => format!(
+            (FakeAt::Unix(sockets), _) => format!(
                 "postgres://{ROLE}:{SECRET}@{}/{db}?sslmode={mode}",
                 sockets.to_str().unwrap().replace('/', "%2F")
             ),
@@ -1500,36 +1660,68 @@ async fn doctor_refuses_a_server_that_is_not_postgres() {
         .await
         .unwrap();
 
-        for id in ["server.fleet.connect", "server.app.connect"] {
-            let check = row(&report, id);
-            assert_eq!(
-                (
-                    check.outcome,
-                    check.reason.as_deref(),
-                    check.next_action.as_deref()
-                ),
-                (
-                    Outcome::Failed,
-                    Some("not_postgres"),
-                    Some("check the database URL's host and port")
-                ),
-                "{shape} {id}: {report:#?}"
-            );
-        }
-        assert_eq!(code, 1, "{shape}: {report:#?}");
-        // A run that handed either URL to SQLx waits out its 5 s connect
-        // deadline.
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "{shape}: took {elapsed:?}"
-        );
-        let seen = closed_connections(&received, 2);
-        assert_eq!(
-            seen,
-            [SSL_REQUEST.to_vec(), SSL_REQUEST.to_vec()],
-            "{shape}"
+        assert_refused_as_not_postgres(&report, code, elapsed, shape);
+        assert_one_startup_per_database(
+            &closed_connections(&received, 2),
+            &["planted_fleet_db", "planted_app_db"],
+            shape,
         );
     }
+}
+
+/// A server that speaks first, as SSH does, is `failed`, `not_postgres`
+/// under `sslmode` `disable` and `allow`, and promptly: its banner's `S`
+/// is what a PostgreSQL server answers an `SSLRequest` with, but no
+/// PostgreSQL server answers a startup message with it. Each database gets
+/// one connection, and `SQLx` none.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_refuses_a_server_that_speaks_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let (FakeAt::Tcp(addr), received) = fake_server(dir.path(), false, SSH) else {
+        unreachable!("a TCP server")
+    };
+    let fleet = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_fleet_db?sslmode=disable");
+    let app = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_app_db?sslmode=allow");
+    let (elapsed, code, report) = tokio::task::spawn_blocking({
+        let dir = dir.path().to_owned();
+        move || timed_doctor(&dir, &fleet, &app)
+    })
+    .await
+    .unwrap();
+
+    assert_refused_as_not_postgres(&report, code, elapsed, "ssh");
+    assert_one_startup_per_database(
+        &closed_connections(&received, 2),
+        &["planted_fleet_db", "planted_app_db"],
+        "ssh",
+    );
+}
+
+/// A first answer with a PostgreSQL type byte, `R`, and a length of 1 GiB
+/// is `failed`, `not_postgres`: the doctor reads the 5-byte header and
+/// refuses a length past 8 KiB instead of waiting for, or buffering, the
+/// body it declares.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_refuses_a_first_answer_past_its_length_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let (FakeAt::Tcp(addr), received) = fake_server(dir.path(), false, HUGE_R) else {
+        unreachable!("a TCP server")
+    };
+    let fleet = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_fleet_db?sslmode=disable");
+    let app = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_app_db?sslmode=allow");
+    let (elapsed, code, report) = tokio::task::spawn_blocking({
+        let dir = dir.path().to_owned();
+        move || timed_doctor(&dir, &fleet, &app)
+    })
+    .await
+    .unwrap();
+
+    assert_refused_as_not_postgres(&report, code, elapsed, "huge R");
+    assert_one_startup_per_database(
+        &closed_connections(&received, 2),
+        &["planted_fleet_db", "planted_app_db"],
+        "huge R",
+    );
 }
 
 /// Under the default `sslmode`, `prefer`, and under `require`, `SQLx` opens
@@ -1539,7 +1731,7 @@ async fn doctor_refuses_a_server_that_is_not_postgres() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlx_refuses_a_server_that_is_not_postgres_when_it_asks_for_tls() {
     let dir = tempfile::tempdir().unwrap();
-    let (HttpAt::Tcp(addr), received) = http_server(dir.path(), false) else {
+    let (FakeAt::Tcp(addr), received) = fake_server(dir.path(), false, HTTP) else {
         unreachable!("a TCP server")
     };
     let fleet = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_fleet_db");
@@ -1568,8 +1760,8 @@ async fn sqlx_refuses_a_server_that_is_not_postgres_when_it_asks_for_tls() {
 }
 
 /// A real PostgreSQL server under `sslmode` `disable` and `allow` answers
-/// the doctor's `SSLRequest` with `S` or `N`, whichever its TLS settings
-/// give, and every database row completes.
+/// the doctor's startup message with an authentication message, the probe
+/// ends without a password, and every database row completes.
 #[tokio::test]
 async fn doctor_takes_postgres_without_tls() {
     ensure_role().await;

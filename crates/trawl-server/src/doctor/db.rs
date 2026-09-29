@@ -24,9 +24,17 @@
 //! With `sslmode` `disable` or `allow`, `SQLx` opens with the startup
 //! message, and a server that is not PostgreSQL can answer it with bytes
 //! `SQLx` reads as a huge frame. So under those modes the doctor first
-//! dials the same target itself, sends an `SSLRequest`, and reads one byte;
-//! anything but `S` or `N` is `failed`, `not_postgres`, and `SQLx` never
-//! connects ([`speaks_postgres`]).
+//! dials the same target itself, sends the startup message `SQLx` would
+//! send, and reads the first answer's 5-byte header: a type other than
+//! `R`, `E` or `v`, or a length past 8 KiB, is `failed`, `not_postgres`,
+//! and `SQLx` never connects ([`speaks_postgres`]). The doctor sends no
+//! password on that connection. It reads the rest of the answer,
+//! half-closes, and reads until the server closes, so PostgreSQL logs no
+//! reset. On a real server the probe is one more login attempt: a
+//! challenge-first method such as SCRAM logs only the connection, `trust`
+//! or `peer` opens a brief session with the same read-only settings, and
+//! a PAM stack with a lockout module such as `pam_faillock` may count one
+//! failure per probe.
 //!
 //! Before connecting, the doctor refuses a startup field that holds a
 //! control character, since a NUL ends the field early and drops the
@@ -650,7 +658,10 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
     // trawld's state. A message that makes SQLx panic ends only its task.
     // What the doctor does guard against is a URL that names another kind
     // of server by accident, under the modes where SQLx would read that
-    // server's first answer as a frame length.
+    // server's first answer as a frame length. The guard reads only the
+    // first message of its own connection, and a server that answers it
+    // with a small, well-formed R, E or v header passes: that is no longer
+    // an accident.
     if let Some(row) = not_postgres(check, &options).await {
         runner.record(gate, row.source(source));
         return Session(Err(Lost::Unopened));
@@ -724,8 +735,15 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
     }
 }
 
-/// The `SSLRequest` message: its length, 8, then the request code 80877103.
-const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+/// The most a server's first answer may declare as its length, which
+/// counts the length field itself, for the doctor to read it. A PostgreSQL
+/// server's first answer to a startup message is an authentication request,
+/// an error, or a protocol version answer, each far smaller.
+const FIRST_ANSWER_CAP: u32 = 8 * 1024;
+
+/// The most the doctor reads after it half-closes the probe connection,
+/// while the server ends the session.
+const DRAIN_CAP: usize = 64 * 1024;
 
 /// Where `SQLx` dials for `options`: `PgStream::connect` and
 /// `PgConnectOptions::fetch_socket` in sqlx-postgres 0.9.0.
@@ -750,69 +768,162 @@ impl<'o> Dial<'o> {
     }
 }
 
-/// What a server answered the doctor's own `SSLRequest`.
+/// What a server answered the doctor's own startup message.
 #[derive(Debug)]
-enum SslAnswer {
-    /// `S` or `N`, as a PostgreSQL server answers.
+enum FirstAnswer {
+    /// A whole message of type `R` (an authentication request), `E` (an
+    /// error) or `v` (a protocol version answer), no longer than
+    /// [`FIRST_ANSWER_CAP`], as a PostgreSQL server answers.
     Postgres,
-    /// Any other byte.
+    /// Any other type byte, or a longer length.
     NotPostgres,
     /// The connection could not be opened.
     Unreachable(std::io::Error),
-    /// The connection closed or broke before the byte arrived.
+    /// The connection closed or broke before the whole answer arrived.
     Lost,
-    /// No byte within [`DEADLINE`].
+    /// No whole answer within [`DEADLINE`].
     TimedOut,
 }
 
-/// Dial where `SQLx` would for `options`, send an `SSLRequest`, and read
-/// exactly one byte back, all within [`DEADLINE`]; then close.
+/// The startup message `SQLx` 0.9.0 sends for `options`
+/// (`connection/establish.rs`, `PgConnection::establish`, and
+/// `message/startup.rs`): its length, protocol 3.0, then `user`,
+/// `database` and the same parameters in the same order, each name and
+/// value NUL-terminated, and a closing NUL. It holds no password: a
+/// PostgreSQL server asks for one only in its answer.
+fn startup_message(options: &PgConnectOptions) -> Vec<u8> {
+    let mut fields = vec![("user", options.get_username())];
+    fields.extend(
+        options
+            .get_database()
+            .map(|database| ("database", database)),
+    );
+    fields.extend([
+        ("DateStyle", "ISO, MDY"),
+        ("client_encoding", "UTF8"),
+        ("TimeZone", "UTC"),
+        // SQLx's default, which no URL parameter changes.
+        ("extra_float_digits", "2"),
+    ]);
+    fields.extend(
+        options
+            .get_application_name()
+            .map(|name| ("application_name", name)),
+    );
+    fields.extend(options.get_options().map(|value| ("options", value)));
+
+    let mut body = 196_608_u32.to_be_bytes().to_vec();
+    for (name, value) in fields {
+        for field in [name, value] {
+            body.extend_from_slice(field.as_bytes());
+            body.push(0);
+        }
+    }
+    body.push(0);
+    // A message past 4 GiB cannot come from a parsed URL; a server
+    // refuses the length it is given instead.
+    let length = u32::try_from(body.len() + 4).unwrap_or(u32::MAX);
+    let mut message = length.to_be_bytes().to_vec();
+    message.append(&mut body);
+    message
+}
+
+/// Dial where `SQLx` would for `options`, send the startup message `SQLx`
+/// would send ([`startup_message`]), and read the whole first answer, all
+/// within [`DEADLINE`].
 ///
 /// Under `sslmode` `disable`, and `allow`, which `SQLx` 0.9.0 treats as
 /// `disable` (`connection/tls.rs`, `maybe_upgrade`), `SQLx` sends the
-/// startup message first and reads the answer as a message: a type byte and
-/// a u32 length it then waits for and buffers. A URL that names an HTTP
-/// server by accident answers `HTTP/`, a frame of about 1.4 GB. A
-/// PostgreSQL server answers an `SSLRequest` with one byte, `S` or `N`,
-/// whatever its TLS settings, so one byte tells the two apart. Under every
-/// other `sslmode` `SQLx` sends an `SSLRequest` itself and refuses any
-/// other byte.
-async fn speaks_postgres(options: &PgConnectOptions) -> SslAnswer {
-    async fn ask<S>(mut stream: S) -> SslAnswer
+/// startup message first and reads the answer as a message: a type byte it
+/// checks against every backend type, then a u32 length it waits for and
+/// buffers. A URL that names another kind of server by accident gets that
+/// server's first bytes read as a frame: an HTTP server's `HTTP/` or an SSH
+/// server's `SSH-2.0` banner is a frame of about 1.4 GB. The doctor reads
+/// the same first answer under a tighter grammar: only the three types a
+/// PostgreSQL server answers a startup message with, and a length of at
+/// most [`FIRST_ANSWER_CAP`]. Under every other `sslmode` `SQLx` sends an
+/// `SSLRequest` itself and refuses any answer but `S` or `N`.
+///
+/// The doctor never answers an authentication request. Having read the
+/// answer, it half-closes the connection and reads what the server still
+/// sends, up to [`DRAIN_CAP`], until the server closes or the deadline
+/// passes; a connection closed with the server's bytes unread is reset,
+/// and PostgreSQL logs a reset.
+async fn speaks_postgres(options: &PgConnectOptions) -> FirstAnswer {
+    async fn ask<S>(mut stream: S, startup: &[u8], deadline: tokio::time::Instant) -> FirstAnswer
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-        let mut byte = [0_u8];
-        if stream.write_all(&SSL_REQUEST).await.is_err()
-            || stream.read_exact(&mut byte).await.is_err()
-        {
-            return SslAnswer::Lost;
+        let first = async {
+            let mut header = [0_u8; 5];
+            if stream.write_all(startup).await.is_err()
+                || stream.read_exact(&mut header).await.is_err()
+            {
+                return FirstAnswer::Lost;
+            }
+            let [kind, length @ ..] = header;
+            let length = u32::from_be_bytes(length);
+            if !matches!(kind, b'R' | b'E' | b'v') || !(5..=FIRST_ANSWER_CAP).contains(&length) {
+                return FirstAnswer::NotPostgres;
+            }
+            let mut body = vec![0_u8; length as usize - 4];
+            if stream.read_exact(&mut body).await.is_err() {
+                return FirstAnswer::Lost;
+            }
+            FirstAnswer::Postgres
+        };
+        let Ok(answer) = tokio::time::timeout_at(deadline, first).await else {
+            return FirstAnswer::TimedOut;
+        };
+        if matches!(answer, FirstAnswer::Postgres) {
+            let drain = async {
+                if stream.shutdown().await.is_err() {
+                    return;
+                }
+                let mut buf = [0_u8; 4096];
+                let mut drained = 0;
+                while drained < DRAIN_CAP {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => drained += read,
+                    }
+                }
+            };
+            // The answer is already whole; a drain cut short changes nothing.
+            let _ = tokio::time::timeout_at(deadline, drain).await;
         }
-        match byte[0] {
-            b'S' | b'N' => SslAnswer::Postgres,
-            _ => SslAnswer::NotPostgres,
+        answer
+    }
+
+    async fn dialed<S, C>(connect: C, startup: &[u8], deadline: tokio::time::Instant) -> FirstAnswer
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        C: Future<Output = std::io::Result<S>>,
+    {
+        match tokio::time::timeout_at(deadline, connect).await {
+            Err(_) => FirstAnswer::TimedOut,
+            Ok(Err(error)) => FirstAnswer::Unreachable(error),
+            Ok(Ok(stream)) => ask(stream, startup, deadline).await,
         }
     }
 
-    let answer = async {
-        match Dial::of(options) {
-            Dial::Tcp(host, port) => match tokio::net::TcpStream::connect((host, port)).await {
-                Ok(stream) => ask(stream).await,
-                Err(error) => SslAnswer::Unreachable(error),
-            },
-            #[cfg(unix)]
-            Dial::Unix(path) => match tokio::net::UnixStream::connect(path).await {
-                Ok(stream) => ask(stream).await,
-                Err(error) => SslAnswer::Unreachable(error),
-            },
-            #[cfg(not(unix))]
-            Dial::Unix(_) => SslAnswer::Unreachable(std::io::ErrorKind::Unsupported.into()),
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    let startup = startup_message(options);
+    match Dial::of(options) {
+        Dial::Tcp(host, port) => {
+            dialed(
+                tokio::net::TcpStream::connect((host, port)),
+                &startup,
+                deadline,
+            )
+            .await
         }
-    };
-    tokio::time::timeout(DEADLINE, answer)
-        .await
-        .unwrap_or(SslAnswer::TimedOut)
+        #[cfg(unix)]
+        Dial::Unix(path) => dialed(tokio::net::UnixStream::connect(path), &startup, deadline).await,
+        #[cfg(not(unix))]
+        Dial::Unix(_) => FirstAnswer::Unreachable(std::io::ErrorKind::Unsupported.into()),
+    }
 }
 
 /// Under `sslmode` `disable` or `allow`, ask the server [`speaks_postgres`]
@@ -826,37 +937,40 @@ async fn not_postgres(check: ServerCheck, options: &PgConnectOptions) -> Option<
     ) {
         return None;
     }
-    refused_ssl_request(check, speaks_postgres(options).await)
+    refused_first_answer(check, speaks_postgres(options).await)
 }
 
-/// The connect check's row, without its source, for an `SSLRequest` answer
-/// that stops the doctor from handing the URL to `SQLx`. `None` for a
+/// The connect check's row, without its source, for a first answer that
+/// stops the doctor from handing the URL to `SQLx`. `None` for a
 /// PostgreSQL server's answer.
-fn refused_ssl_request(check: ServerCheck, answer: SslAnswer) -> Option<Row> {
+fn refused_first_answer(check: ServerCheck, answer: FirstAnswer) -> Option<Row> {
     match answer {
-        SslAnswer::Postgres => None,
-        SslAnswer::NotPostgres => Some(
+        FirstAnswer::Postgres => None,
+        FirstAnswer::NotPostgres => Some(
             Row::failed(check, reason::NOT_POSTGRES)
                 .detail(Text::new(
-                    "the server the URL names did not answer the doctor's SSLRequest as a \
+                    "the server the URL names did not answer the doctor's startup message as a \
                      PostgreSQL server does, so the doctor did not connect",
                 ))
                 .next(Text::new("check the database URL's host and port")),
         ),
         // The same row SQLx's own connect error gives.
-        SslAnswer::Unreachable(error) => Some(connect_failed(check, &sqlx::Error::Io(error))),
-        SslAnswer::Lost => Some(
+        FirstAnswer::Unreachable(error) => Some(connect_failed(check, &sqlx::Error::Io(error))),
+        FirstAnswer::Lost => Some(
             Row::not_sampled(check, reason::CONNECTION_LOST)
                 .detail(Text::new(
-                    "the connection closed before the server answered the doctor's SSLRequest",
+                    "the connection closed before the server answered the doctor's startup \
+                     message",
                 ))
                 .next(Text::new(
                     "check the database URL's host and port, then rerun",
                 )),
         ),
-        SslAnswer::TimedOut => Some(
+        FirstAnswer::TimedOut => Some(
             Row::not_sampled(check, reason::TIMED_OUT)
-                .detail(Text::new("no answer to the doctor's SSLRequest within 5 s"))
+                .detail(Text::new(
+                    "no answer to the doctor's startup message within 5 s",
+                ))
                 .next(Text::new(
                     "check that the database server is up and reachable from this host",
                 )),
@@ -1330,11 +1444,11 @@ async fn app_writer(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
 mod tests {
     use super::*;
 
-    /// The doctor's `SSLRequest` goes where `SQLx` dials: a TCP host and
+    /// The doctor's startup message goes where `SQLx` dials: a TCP host and
     /// port, `hostaddr` in place of the host, or a Unix socket named by the
     /// URL's host or its `host` parameter.
     #[test]
-    fn the_ssl_request_dials_where_sqlx_does() {
+    fn the_startup_probe_dials_where_sqlx_does() {
         let dial = |url: &str| {
             let options = PgConnectOptions::from_str(url).unwrap();
             match Dial::of(&options) {
@@ -1358,6 +1472,44 @@ mod tests {
             dial("postgres://u@db.example/x?host=/run/pg&port=6001"),
             "unix /run/pg/.s.PGSQL.6001"
         );
+    }
+
+    /// The probe's startup message frames the fields `SQLx` sends, in its
+    /// order, and holds no password even when the URL has one.
+    #[test]
+    fn the_startup_message_carries_no_password() {
+        let options = PgConnectOptions::from_str("postgres://role:hunter2@db.example/app")
+            .unwrap()
+            .application_name(APPLICATION_NAME)
+            .options(SESSION_SETTINGS);
+        let mut expected = vec![0, 3, 0, 0];
+        for field in [
+            "user",
+            "role",
+            "database",
+            "app",
+            "DateStyle",
+            "ISO, MDY",
+            "client_encoding",
+            "UTF8",
+            "TimeZone",
+            "UTC",
+            "extra_float_digits",
+            "2",
+            "application_name",
+            APPLICATION_NAME,
+            "options",
+            options.get_options().unwrap(),
+        ] {
+            expected.extend_from_slice(field.as_bytes());
+            expected.push(0);
+        }
+        expected.push(0);
+        let length = u32::try_from(expected.len() + 4).unwrap();
+        let message = startup_message(&options);
+        assert_eq!(message[..4], length.to_be_bytes());
+        assert_eq!(message[4..], expected);
+        assert!(!message.windows(7).any(|window| window == b"hunter2"));
     }
 
     #[test]
