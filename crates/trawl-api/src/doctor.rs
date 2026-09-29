@@ -320,7 +320,8 @@ pub mod reason {
     /// and timeouts, or a startup field would have kept it from taking
     /// them, so the doctor sent no other query.
     pub const SESSION_NOT_READ_ONLY: &str = "session_not_read_only";
-    /// The connection broke after it authenticated.
+    /// The database connection broke after it authenticated, or before the
+    /// server answered the doctor's `SSLRequest`.
     pub const CONNECTION_LOST: &str = "connection_lost";
     /// A read-only query erred, or its answer did not decode, after the
     /// connection authenticated.
@@ -335,6 +336,10 @@ pub mod reason {
     /// An exchange broke off before it was whole, such as a TLS handshake
     /// or a health answer cut short, and what arrived proves nothing.
     pub const INTERRUPTED: &str = "interrupted";
+    /// With `failed`: the server a database URL names did not answer an
+    /// `SSLRequest` as a PostgreSQL server does, so the doctor did not
+    /// connect.
+    pub const NOT_POSTGRES: &str = "not_postgres";
 }
 
 #[cfg(test)]

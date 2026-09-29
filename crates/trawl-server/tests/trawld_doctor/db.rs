@@ -1341,3 +1341,242 @@ async fn doctor_contains_a_driver_panic() {
         "{stderr}"
     );
 }
+
+/// The `SSLRequest` message, as the doctor and `SQLx` send it.
+const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+
+/// What an HTTP server answers bytes it cannot parse as a request. `SQLx`
+/// reading it as a PostgreSQL message would take `H` as the type and
+/// `TTP/` as a length of about 1.4 GB.
+const HTTP_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
+
+/// Every byte each connection to an [`http_server`] sent, recorded when the
+/// client closes it.
+type Received = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+/// Serve one connection as an HTTP server a database URL might name by
+/// accident: answer [`HTTP_400`] once the first bytes arrive, hold the
+/// connection open, and record what the client sent until it closes.
+fn http_connection<S>(mut stream: S, received: &Received)
+where
+    S: std::io::Read + std::io::Write + Send + 'static,
+{
+    let received = received.clone();
+    std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if seen.is_empty() {
+                        let _ = stream.write_all(HTTP_400);
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
+        received.lock().unwrap().push(seen);
+    });
+}
+
+/// Where an [`http_server`] listens.
+enum HttpAt {
+    Tcp(std::net::SocketAddr),
+    /// The socket directory; the socket is `.s.PGSQL.5432` in it.
+    Unix(PathBuf),
+}
+
+/// An HTTP-like server on loopback TCP, or on a Unix socket in `dir` when
+/// `unix`, and what it received.
+fn http_server(dir: &Path, unix: bool) -> (HttpAt, Received) {
+    let received = Received::default();
+    let at = if unix {
+        let sockets = dir.join("sock");
+        std::fs::create_dir(&sockets).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(sockets.join(".s.PGSQL.5432")).unwrap();
+        let received = received.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+                    .unwrap();
+                http_connection(stream, &received);
+            }
+        });
+        HttpAt::Unix(sockets)
+    } else {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = received.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+                    .unwrap();
+                http_connection(stream, &received);
+            }
+        });
+        HttpAt::Tcp(addr)
+    };
+    (at, received)
+}
+
+/// What `received` holds once `count` connections have closed, waiting up
+/// to 10 s for the last of them.
+fn closed_connections(received: &Received, count: usize) -> Vec<Vec<u8>> {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let seen = received.lock().unwrap().clone();
+        if seen.len() >= count || std::time::Instant::now() > until {
+            return seen;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Time one JSON doctor run with `fleet` and `app` in the environment,
+/// asserting neither stream shows a value of either URL.
+fn timed_doctor(dir: &Path, fleet: &str, app: &str) -> (std::time::Duration, i32, Report) {
+    let mut values = url_values(fleet);
+    values.extend(url_values(app));
+    let config = write_doctor_config(dir, &DoctorConfig::in_dir(dir));
+    let env = [
+        ("HOME", dir.as_os_str().to_owned()),
+        ("FLEET_DATABASE_URL", OsString::from(fleet)),
+        ("TRAWL_DATABASE_URL", OsString::from(app)),
+    ];
+    let args = [
+        OsString::from("--doctor"),
+        OsString::from("--config"),
+        config.into_os_string(),
+        OsString::from("--format"),
+        OsString::from("json"),
+    ];
+    let started = std::time::Instant::now();
+    let (code, stdout, stderr) = run_doctor(&args, &env);
+    let elapsed = started.elapsed();
+    let values: Vec<&str> = values.iter().map(String::as_str).collect();
+    assert_no_values(&stdout, &stderr, &values);
+    (elapsed, code, report(&stdout))
+}
+
+/// A URL with `sslmode` `disable` or `allow` that names an HTTP server by
+/// accident is `failed`, `not_postgres`, and the run does not wait on it:
+/// the doctor sends its own `SSLRequest`, reads the one byte `H`, and
+/// never hands the URL to `SQLx`, which would send a startup message and
+/// read `HTTP/` as a frame of about 1.4 GB. The server receives the eight
+/// bytes of the `SSLRequest` and nothing else, over a TCP host and port, a
+/// `hostaddr` that overrides an unresolvable host name, and a Unix socket.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_refuses_a_server_that_is_not_postgres() {
+    for shape in ["host", "hostaddr", "unix"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (at, received) = http_server(dir.path(), shape == "unix");
+        let url = |db: &str, mode: &str| match (&at, shape) {
+            (HttpAt::Tcp(addr), "host") => {
+                format!("postgres://{ROLE}:{SECRET}@{addr}/{db}?sslmode={mode}")
+            }
+            (HttpAt::Tcp(addr), _) => format!(
+                "postgres://{ROLE}:{SECRET}@planted-host.invalid:{}/{db}?sslmode={mode}\
+                 &hostaddr={}",
+                addr.port(),
+                addr.ip()
+            ),
+            (HttpAt::Unix(sockets), _) => format!(
+                "postgres://{ROLE}:{SECRET}@{}/{db}?sslmode={mode}",
+                sockets.to_str().unwrap().replace('/', "%2F")
+            ),
+        };
+        let fleet = url("planted_fleet_db", "disable");
+        let app = url("planted_app_db", "allow");
+        let (elapsed, code, report) = tokio::task::spawn_blocking({
+            let dir = dir.path().to_owned();
+            move || timed_doctor(&dir, &fleet, &app)
+        })
+        .await
+        .unwrap();
+
+        for id in ["server.fleet.connect", "server.app.connect"] {
+            let check = row(&report, id);
+            assert_eq!(
+                (
+                    check.outcome,
+                    check.reason.as_deref(),
+                    check.next_action.as_deref()
+                ),
+                (
+                    Outcome::Failed,
+                    Some("not_postgres"),
+                    Some("check the database URL's host and port")
+                ),
+                "{shape} {id}: {report:#?}"
+            );
+        }
+        assert_eq!(code, 1, "{shape}: {report:#?}");
+        // A run that handed either URL to SQLx waits out its 5 s connect
+        // deadline.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "{shape}: took {elapsed:?}"
+        );
+        let seen = closed_connections(&received, 2);
+        assert_eq!(
+            seen,
+            [SSL_REQUEST.to_vec(), SSL_REQUEST.to_vec()],
+            "{shape}"
+        );
+    }
+}
+
+/// Under the default `sslmode`, `prefer`, and under `require`, `SQLx` opens
+/// with its own `SSLRequest` and refuses the byte `H`, so the same server
+/// fails the connect check promptly, having received only the `SSLRequest`:
+/// nothing was buffered toward a frame length.
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlx_refuses_a_server_that_is_not_postgres_when_it_asks_for_tls() {
+    let dir = tempfile::tempdir().unwrap();
+    let (HttpAt::Tcp(addr), received) = http_server(dir.path(), false) else {
+        unreachable!("a TCP server")
+    };
+    let fleet = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_fleet_db");
+    let app = format!("postgres://{ROLE}:{SECRET}@{addr}/planted_app_db?sslmode=require");
+    let (elapsed, code, report) = tokio::task::spawn_blocking({
+        let dir = dir.path().to_owned();
+        move || timed_doctor(&dir, &fleet, &app)
+    })
+    .await
+    .unwrap();
+
+    for id in ["server.fleet.connect", "server.app.connect"] {
+        assert_eq!(
+            row(&report, id).outcome,
+            Outcome::Failed,
+            "{id}: {report:#?}"
+        );
+    }
+    assert_eq!(code, 1, "{report:#?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "took {elapsed:?}"
+    );
+    let seen = closed_connections(&received, 2);
+    assert_eq!(seen, [SSL_REQUEST.to_vec(), SSL_REQUEST.to_vec()]);
+}
+
+/// A real PostgreSQL server under `sslmode` `disable` and `allow` answers
+/// the doctor's `SSLRequest` with `S` or `N`, whichever its TLS settings
+/// give, and every database row completes.
+#[tokio::test]
+async fn doctor_takes_postgres_without_tls() {
+    ensure_role().await;
+    let fleet = with_query(&planted(&migrated_fleet().await), "sslmode=disable");
+    let app = with_query(&planted(&migrated_app().await), "sslmode=allow");
+    let dir = tempfile::tempdir().unwrap();
+    let (_, report, stderr) = doctor_env(dir.path(), &fleet, &app);
+    database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:#?}"));
+    assert!(stderr.is_empty(), "{stderr}");
+}

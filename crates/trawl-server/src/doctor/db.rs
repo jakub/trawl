@@ -21,6 +21,13 @@
 //! it, the check is `not_sampled`, `protocol_error`, and the other groups
 //! still run.
 //!
+//! With `sslmode` `disable` or `allow`, `SQLx` opens with the startup
+//! message, and a server that is not PostgreSQL can answer it with bytes
+//! `SQLx` reads as a huge frame. So under those modes the doctor first
+//! dials the same target itself, sends an `SSLRequest`, and reads one byte;
+//! anything but `S` or `N` is `failed`, `not_postgres`, and `SQLx` never
+//! connects ([`speaks_postgres`]).
+//!
 //! Before connecting, the doctor refuses a startup field that holds a
 //! control character, since a NUL ends the field early and drops the
 //! settings after it, and a password file `SQLx` would read that is not a
@@ -641,6 +648,13 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
     // `recv_unchecked`), so a hostile server can make it reserve gigabytes.
     // trawld has the same exposure, and a server that hostile already owns
     // trawld's state. A message that makes SQLx panic ends only its task.
+    // What the doctor does guard against is a URL that names another kind
+    // of server by accident, under the modes where SQLx would read that
+    // server's first answer as a frame length.
+    if let Some(row) = not_postgres(check, &options).await {
+        runner.record(gate, row.source(source));
+        return Session(Err(Lost::Unopened));
+    }
     let connecting = tokio::spawn(async move { PgConnection::connect_with(&options).await });
     let conn = match contained(connecting).await {
         Err(Lost::Panicked) => {
@@ -707,6 +721,146 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
             runner.record(gate, lost_row(check, lost).source(source));
             Session(Err(Lost::Unopened))
         }
+    }
+}
+
+/// The `SSLRequest` message: its length, 8, then the request code 80877103.
+const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
+
+/// Where `SQLx` dials for `options`: `PgStream::connect` and
+/// `PgConnectOptions::fetch_socket` in sqlx-postgres 0.9.0.
+#[derive(Debug, PartialEq, Eq)]
+enum Dial<'o> {
+    /// A TCP host, a name or an address (`hostaddr` sets it too), and port.
+    Tcp(&'o str, u16),
+    /// A Unix socket: the socket directory's `.s.PGSQL.<port>`.
+    Unix(String),
+}
+
+impl<'o> Dial<'o> {
+    fn of(options: &'o PgConnectOptions) -> Self {
+        let port = options.get_port();
+        match options.get_socket() {
+            Some(dir) => Self::Unix(format!("{}/.s.PGSQL.{port}", dir.display())),
+            None if options.get_host().starts_with('/') => {
+                Self::Unix(format!("{}/.s.PGSQL.{port}", options.get_host()))
+            }
+            None => Self::Tcp(options.get_host(), port),
+        }
+    }
+}
+
+/// What a server answered the doctor's own `SSLRequest`.
+#[derive(Debug)]
+enum SslAnswer {
+    /// `S` or `N`, as a PostgreSQL server answers.
+    Postgres,
+    /// Any other byte.
+    NotPostgres,
+    /// The connection could not be opened.
+    Unreachable(std::io::Error),
+    /// The connection closed or broke before the byte arrived.
+    Lost,
+    /// No byte within [`DEADLINE`].
+    TimedOut,
+}
+
+/// Dial where `SQLx` would for `options`, send an `SSLRequest`, and read
+/// exactly one byte back, all within [`DEADLINE`]; then close.
+///
+/// Under `sslmode` `disable`, and `allow`, which `SQLx` 0.9.0 treats as
+/// `disable` (`connection/tls.rs`, `maybe_upgrade`), `SQLx` sends the
+/// startup message first and reads the answer as a message: a type byte and
+/// a u32 length it then waits for and buffers. A URL that names an HTTP
+/// server by accident answers `HTTP/`, a frame of about 1.4 GB. A
+/// PostgreSQL server answers an `SSLRequest` with one byte, `S` or `N`,
+/// whatever its TLS settings, so one byte tells the two apart. Under every
+/// other `sslmode` `SQLx` sends an `SSLRequest` itself and refuses any
+/// other byte.
+async fn speaks_postgres(options: &PgConnectOptions) -> SslAnswer {
+    async fn ask<S>(mut stream: S) -> SslAnswer
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut byte = [0_u8];
+        if stream.write_all(&SSL_REQUEST).await.is_err()
+            || stream.read_exact(&mut byte).await.is_err()
+        {
+            return SslAnswer::Lost;
+        }
+        match byte[0] {
+            b'S' | b'N' => SslAnswer::Postgres,
+            _ => SslAnswer::NotPostgres,
+        }
+    }
+
+    let answer = async {
+        match Dial::of(options) {
+            Dial::Tcp(host, port) => match tokio::net::TcpStream::connect((host, port)).await {
+                Ok(stream) => ask(stream).await,
+                Err(error) => SslAnswer::Unreachable(error),
+            },
+            #[cfg(unix)]
+            Dial::Unix(path) => match tokio::net::UnixStream::connect(path).await {
+                Ok(stream) => ask(stream).await,
+                Err(error) => SslAnswer::Unreachable(error),
+            },
+            #[cfg(not(unix))]
+            Dial::Unix(_) => SslAnswer::Unreachable(std::io::ErrorKind::Unsupported.into()),
+        }
+    };
+    tokio::time::timeout(DEADLINE, answer)
+        .await
+        .unwrap_or(SslAnswer::TimedOut)
+}
+
+/// Under `sslmode` `disable` or `allow`, ask the server [`speaks_postgres`]
+/// and return the connect check's row, without its source, when its answer
+/// stops the doctor. `None` under the other modes, where `SQLx` asks
+/// itself, and for a PostgreSQL server's answer.
+async fn not_postgres(check: ServerCheck, options: &PgConnectOptions) -> Option<Row> {
+    if !matches!(
+        options.get_ssl_mode(),
+        PgSslMode::Disable | PgSslMode::Allow
+    ) {
+        return None;
+    }
+    refused_ssl_request(check, speaks_postgres(options).await)
+}
+
+/// The connect check's row, without its source, for an `SSLRequest` answer
+/// that stops the doctor from handing the URL to `SQLx`. `None` for a
+/// PostgreSQL server's answer.
+fn refused_ssl_request(check: ServerCheck, answer: SslAnswer) -> Option<Row> {
+    match answer {
+        SslAnswer::Postgres => None,
+        SslAnswer::NotPostgres => Some(
+            Row::failed(check, reason::NOT_POSTGRES)
+                .detail(Text::new(
+                    "the server the URL names did not answer the doctor's SSLRequest as a \
+                     PostgreSQL server does, so the doctor did not connect",
+                ))
+                .next(Text::new("check the database URL's host and port")),
+        ),
+        // The same row SQLx's own connect error gives.
+        SslAnswer::Unreachable(error) => Some(connect_failed(check, &sqlx::Error::Io(error))),
+        SslAnswer::Lost => Some(
+            Row::not_sampled(check, reason::CONNECTION_LOST)
+                .detail(Text::new(
+                    "the connection closed before the server answered the doctor's SSLRequest",
+                ))
+                .next(Text::new(
+                    "check the database URL's host and port, then rerun",
+                )),
+        ),
+        SslAnswer::TimedOut => Some(
+            Row::not_sampled(check, reason::TIMED_OUT)
+                .detail(Text::new("no answer to the doctor's SSLRequest within 5 s"))
+                .next(Text::new(
+                    "check that the database server is up and reachable from this host",
+                )),
+        ),
     }
 }
 
@@ -1175,6 +1329,36 @@ async fn app_writer(ctx: &mut Ctx, runner: &mut Runner, session: &mut Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The doctor's `SSLRequest` goes where `SQLx` dials: a TCP host and
+    /// port, `hostaddr` in place of the host, or a Unix socket named by the
+    /// URL's host or its `host` parameter.
+    #[test]
+    fn the_ssl_request_dials_where_sqlx_does() {
+        let dial = |url: &str| {
+            let options = PgConnectOptions::from_str(url).unwrap();
+            match Dial::of(&options) {
+                Dial::Tcp(host, port) => format!("tcp {host} {port}"),
+                Dial::Unix(path) => format!("unix {path}"),
+            }
+        };
+        assert_eq!(
+            dial("postgres://u@db.example:6543/x"),
+            "tcp db.example 6543"
+        );
+        assert_eq!(
+            dial("postgres://u@db.example/x?hostaddr=192.0.2.7&port=6000"),
+            "tcp 192.0.2.7 6000"
+        );
+        assert_eq!(
+            dial("postgres://u@%2Frun%2Fpostgresql/x"),
+            "unix /run/postgresql/.s.PGSQL.5432"
+        );
+        assert_eq!(
+            dial("postgres://u@db.example/x?host=/run/pg&port=6001"),
+            "unix /run/pg/.s.PGSQL.6001"
+        );
+    }
 
     #[test]
     fn a_held_sample_wins_and_a_missing_one_is_unknown() {

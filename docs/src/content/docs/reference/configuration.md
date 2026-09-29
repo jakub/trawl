@@ -101,9 +101,10 @@ stable codes, among them `blocked`, `permission_denied`, `timed_out`,
 | Reason | Meaning |
 |--------|---------|
 | `session_not_read_only` | The database session did not start read-only with the doctor's timeouts, so the doctor sent no other query. Check the URL's `options` and `PGOPTIONS`. Connect to the database server directly, not through a pooler that drops startup options. |
-| `connection_lost` | A database connection broke after it authenticated. |
+| `connection_lost` | A database connection broke after it authenticated, or before the server answered the doctor's `SSLRequest`. |
 | `query_failed` | A read-only database query returned an error after the connection authenticated. |
 | `protocol_error` | The database server sent a message the database driver could not decode. The doctor dropped that connection and still ran the other checks. Check that the URL names a PostgreSQL server. |
+| `not_postgres` | With `failed`: under `sslmode=disable` or `allow`, the server that a database URL names did not answer the doctor's `SSLRequest` as a PostgreSQL server does, so the doctor did not connect. Check the database URL's host and port. |
 | `interrupted` | The listener closed or reset the connection before the TLS handshake or the health answer was whole. |
 | `ambiguous_address` | The listener address resolves to more than one address, and none of them served the certificate on disk. Set `[server] http_addr` to the one IP address and port that trawld listens on. |
 
@@ -176,6 +177,15 @@ database driver does not bound what a server sends, so a hostile database
 server can make the doctor reserve a large amount of memory, as it can with
 trawld. The password-file check guards against mistakes, not against a file
 that someone replaces while the doctor runs.
+
+A URL can name the wrong kind of server by mistake, such as an HTTP service.
+With `sslmode=disable` or `allow`, the database driver would read that
+server's first answer as the length of a very large message. So under those
+two modes the doctor first opens its own connection to the same address and
+sends only a PostgreSQL `SSLRequest`. A server that does not answer as
+PostgreSQL does fails the connect check with the reason `not_postgres`. Under
+every other `sslmode`, the driver sends the `SSLRequest` itself and refuses
+such a server.
 
 One side effect remains. A probe that makes the running trawld answer 503
 emits that server's `http_failure` telemetry event

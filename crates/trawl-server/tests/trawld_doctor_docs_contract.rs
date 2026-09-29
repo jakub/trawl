@@ -72,6 +72,10 @@ fn every_outcome_is_documented() {
     }
     assert_documented("`will_initialize`", "the reason code");
     assert_documented("`ran_as_root`", "the reason code");
+    assert_documented(
+        &format!("| `{}` |", trawl_api::doctor::reason::NOT_POSTGRES),
+        "the reason code",
+    );
 }
 
 #[test]
