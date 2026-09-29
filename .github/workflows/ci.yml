@@ -233,6 +233,16 @@ jobs:
         run: cargo run -p fleet-admin -- migrate
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # trawld_doctor's doctor_writes_nothing and doctor_root_run_is_incomplete
+      # run the doctor as root in an unprivileged user namespace. Ubuntu
+      # 24.04's AppArmor leaves such a namespace without capabilities, so
+      # lift that restriction for this job; the key is absent where AppArmor
+      # does not restrict user namespaces.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       # FEATURE TRAP: --no-default-features also strips fleet-auth's default
       # `keystore` feature when it is built as a selected workspace package,
       # silently compiling out its pg test files. The explicit fleet-auth/*
@@ -252,6 +262,9 @@ jobs:
           # shared service container. The #[sqlx::test] harness hardwires
           # DATABASE_URL.
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          # A doctor test that needs a user namespace fails here instead of
+          # printing SKIPPED, so a skip is never counted as a pass.
+          TRAWL_TEST_REQUIRE_USERNS: "1"
       # Membership in the `postgres` group is hand-written in
       # .config/nextest.toml; this recomputes it from the sources and fails
       # if a pg-touching test runs outside the group. It runs after the
