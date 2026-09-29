@@ -432,7 +432,7 @@ Vector started:
 | Sender | First start | Later restarts |
 | --- | --- | --- |
 | journald (`base.toml`) | Every entry of the current boot, because `current_boot_only = true` | Resumes from its checkpoint |
-| File drop-ins, such as nginx and the `/var/log` catch-all | Only lines appended after Vector finds the file, because `read_from = "end"` | Resumes from its checkpoint |
+| File drop-ins, such as nginx and the `/var/log` catch-all | For files present when Vector starts, only lines appended after that, because `read_from = "end"`. A file that appears later, such as one moved into `/var/log`, is read from its beginning | Resumes from its checkpoint |
 | Docker (`docker.toml`) | Lines written after Vector starts. Vector 0.57 `docker_logs` keeps no cursor and has no `since_now` setting | The same. Lines written while Vector was down are not collected |
 | A syslog device sending to trawld | Only what the device sends after you point it at trawld | Only what the device sends while trawld listens |
 
@@ -473,7 +473,10 @@ counts the rejection on `/metrics` instead. The rejection counter is
 | Vector logs `403` | The key lacks `trawl:ingest`. Give its role that permission, or create a key with the `trawl-ingest` role. Vector does not retry a `403`. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="invalid_env"` rises | `TRAWL_ENV` fails the env name rule: 1 to 32 characters from `a-z`, `0-9`, `_`, and `-`. `Prod` fails it. Fix `TRAWL_ENV` and restart Vector. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="env_not_allowed"` rises | `TRAWL_ENV` is not in trawld's `[ingest] envs`. Keys are not scoped to an env, so the list is the only check. Add the env to the list and restart trawld, or fix `TRAWL_ENV`. |
-| The check finds nothing, and the rejection counter rises with another `reason` | trawld answered `200` with `rejected` in the body, and Vector counted the batch as a success. The `reason` label names the rule the event broke. See the [event contract](/reference/events/). |
+| The check finds nothing, and the rejection counter rises with another `reason` | For a rule an event broke, trawld answered `200` with `rejected` in the body, and Vector counted the batch as a success. The `reason` label names the rule. See the [event contract](/reference/events/). Three reasons refuse the whole request instead, and Vector logs the status. |
+| Vector logs `503`, and `reason="hot_buffer_full"` rises | trawld's hot buffer is full. Vector retries. If it persists, check compaction and disk headroom on the [Health page](/operate/health/). |
+| Vector logs `413`, and `reason="ingest_batch_too_large"` rises | One request exceeds trawld's per-request limit. Vector drops that batch. Lower the sink's `batch.max_bytes`. |
+| Vector logs `500`, and `reason="wal_failure"` rises | trawld could not write its WAL. Vector retries. Check trawld's journal and the data directory's disk. |
 | The event arrives with `env.defaulted` in `_repairs` | The event arrived with no `env`, so trawld used `[ingest] default_env`. The shipped configuration always sends `env`, and an unset `TRAWL_ENV` sends `prod`. A custom transform dropped `.env`. Set `.env = "${TRAWL_ENV:-prod}"` in it. |
 | Vector logs a certificate verification or hostname error | trawld's generated certificate is valid only for `localhost`, `127.0.0.1`, and `::1`, so no other host can verify it. Give trawld a certificate for the `TRAWL_URL` hostname, as in [Configure TLS](/operate/access/#configure-tls). Get a private CA certificate over a channel you trust. A CA certificate fetched from the endpoint you are configuring proves nothing, because an attacker in the path serves their own. |
 | Vector logs a connection refused or timeout error | The host or port in `TRAWL_URL` is wrong, trawld is not running, or a firewall blocks the port. |
