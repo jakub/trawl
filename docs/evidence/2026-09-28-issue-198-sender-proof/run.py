@@ -82,7 +82,7 @@ CARGO_ZIGBUILD_VERSION = "0.23.4"
 ZIG_URL = "https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz"
 ZIG_SHA256 = "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
 BUILDER_IMAGE = f"trawl-evidence-builder:cargo-deb-{CARGO_DEB_VERSION}"
-BUILD_CONTAINER = "trawl-evidence-198-build"
+BUILD_CONTAINER_PREFIX = "trawl-evidence-198-build"
 CARGO_VOLUME = "trawl-evidence-cargo-registry"
 BUILD_TARGET = "x86_64-unknown-linux-gnu"
 BUILD_DIR = REPO / "target/issue-198-deb"
@@ -551,7 +551,7 @@ def expect_fields(label: str, rows: list[dict], expected: dict[str, str]) -> Non
 
 
 def poll_block(shell: ProofShell, block: Block, label: str, until=None,
-               diagnose: bool = True) -> list[dict]:
+               diagnose: bool = True) -> Polled:
     """Rerun a check block until it yields rows (and `until(rows)`), or give up.
 
     When a positive check gives up, the sink errors Vector logged meanwhile
@@ -561,18 +561,18 @@ def poll_block(shell: ProofShell, block: Block, label: str, until=None,
            f"times, {POLL_SECS}s apart, as the guide says to rerun a check)")
     T.command(f"{GUEST_USER}@{GUEST_HOSTNAME}$", block.text)
     started = time.time()
-    rows = _poll(lambda: shell.run_text(block.text, check=False, echo=False), label, until)
-    if not rows and diagnose:
+    polled = _poll(lambda: shell.run_text(block.text, check=False, echo=False), label, until)
+    if not polled.rows and diagnose:
         window = int(time.time() - started) + 60
         T.note(f"{label}: diagnostics, Vector's sink errors in the last {window}s")
         shell.guest.run(f"journalctl -u vector --since '-{window}s' -o cat "
                         "| sed -e 's/\\x1b\\[[0-9;]*m//g' | grep -E ' ERROR sink' "
                         "| grep -v 'has been suppressed' | cut -c1-300 | tail -6 || true",
                         root=True, check=False)
-    return rows
+    return polled
 
 
-def poll_query(guest: Guest, query: str, label: str, until=None) -> list[dict]:
+def poll_query(guest: Guest, query: str, label: str, until=None) -> Polled:
     """A harness query, not a doc block, rerun until it yields rows."""
     shown = f"trawl -p {PROFILE} query {shlex.quote(query)}"
     T.command(f"{GUEST_USER}@{GUEST_HOSTNAME}$", shown)
@@ -587,22 +587,52 @@ def once_query(guest: Guest, query: str) -> list[dict]:
     return json_rows(result.stdout)[0]
 
 
-def _poll(attempt, label: str, until) -> list[dict]:
+@dataclass(frozen=True)
+class Polled:
+    """What a poll saw. `reads` counts attempts whose query exited 0, so an
+    empty result can be told apart from a query that never ran."""
+
+    rows: list[dict]
+    attempts: int
+    reads: int
+    last_read: int  # attempt number of the last successful query; 0 if none
+
+
+def expect_absent(name: str, polled: Polled) -> bool:
+    """Absence holds only on a successful read: a failed query proves nothing."""
+    if polled.rows:
+        return T.check(name, False, f"{len(polled.rows)} row(s)")
+    if polled.reads == 0:
+        return T.check(name, False, f"no query succeeded in {polled.attempts} attempts")
+    return T.check(name, True, f"0 rows; {polled.reads} of {polled.attempts} queries "
+                               f"succeeded, the last on attempt {polled.last_read}")
+
+
+def _poll(attempt, label: str, until) -> Polled:
     last = ""
+    last_code = 0
+    reads = last_read = 0
     for n in range(1, POLL_TRIES + 1):
         result = attempt()
-        last = result.stdout
+        last, last_code = result.stdout, result.returncode
         rows, _ = json_rows(last)
-        if result.returncode == 0 and rows and (until is None or until(rows)):
-            T.output(last)
-            T.note(f"{label}: rows on attempt {n} of {POLL_TRIES}")
-            return rows
-        progress(f"{label}: attempt {n}/{POLL_TRIES}: no matching rows")
+        if result.returncode == 0:
+            reads, last_read = reads + 1, n
+            if rows and (until is None or until(rows)):
+                T.output(last)
+                T.note(f"{label}: rows on attempt {n} of {POLL_TRIES}")
+                return Polled(rows, n, reads, last_read)
+            progress(f"{label}: attempt {n}/{POLL_TRIES}: no matching rows")
+        else:
+            progress(f"{label}: attempt {n}/{POLL_TRIES}: query exited {result.returncode}")
         if n < POLL_TRIES:
             time.sleep(POLL_SECS)
     T.output(last or "(no output)")
-    T.note(f"{label}: no matching rows after {POLL_TRIES} attempts, {POLL_SECS}s apart")
-    return []
+    if last_code != 0:
+        T.out(f"[exit {last_code}]\n")
+    T.note(f"{label}: no matching rows after {POLL_TRIES} attempts, {POLL_SECS}s apart; "
+           f"{reads} of {POLL_TRIES} queries succeeded")
+    return Polled([], POLL_TRIES, reads, last_read)
 
 
 def utc_prefix(value: object) -> str:
@@ -621,7 +651,8 @@ class Run:
         self.qemu: subprocess.Popen | None = None
         self.httpd: http.server.ThreadingHTTPServer | None = None
         self.stub_created = False
-        self.build_started = False
+        # Set only while a build container may be running; see build_container().
+        self.build_cidfile: Path | None = None
         self.guest: Guest | None = None
         self.shell: ProofShell | None = None
         self.packages: dict[str, Path] = {}
@@ -642,9 +673,7 @@ class Run:
             return
         self._cleaned = True
         self.stop_httpd()
-        if self.build_started:
-            subprocess.run(["docker", "rm", "-f", BUILD_CONTAINER], stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+        self.remove_build_container()
         if self.stub_created and SPA_STUB.exists() and SPA_STUB.read_text() == SPA_STUB_TEXT:
             SPA_STUB.unlink()
             progress("removed the stub SPA this run created")
@@ -667,6 +696,22 @@ class Run:
         if self.run_dir is not None and self.run_dir.exists():
             shutil.rmtree(self.run_dir, ignore_errors=True)
             progress("removed the run directory")
+
+    def remove_build_container(self) -> None:
+        """Remove the build container this run created, and no other.
+
+        Docker writes the container id to the cidfile only once it has created
+        the container, so an empty or missing file means there is nothing of
+        ours to remove.
+        """
+        cidfile, self.build_cidfile = self.build_cidfile, None
+        if cidfile is None or not cidfile.exists():
+            return
+        cid = cidfile.read_text().strip()
+        if cid:
+            subprocess.run(["docker", "rm", "-f", cid], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            progress("removed the build container this run created")
 
     def stop_httpd(self) -> None:
         if self.httpd is not None:
@@ -788,8 +833,7 @@ RUN cargo install cargo-deb --version {CARGO_DEB_VERSION} --locked \\
             stdout=subprocess.PIPE, text=True, check=True).stdout.strip()
         T.redact(Path(common_git), "$GIT_COMMON_DIR")
         T.note(f"CARGO_TARGET_DIR {BUILD_DIR}; cargo registry cache in docker volume {CARGO_VOLUME}")
-        self.build_started = True
-        builder = ["docker", "run", "--rm", "--name", BUILD_CONTAINER, "--user", uid_gid,
+        builder = ["docker", "run", "--rm", *self.build_container("build"), "--user", uid_gid,
                    "-v", f"{REPO}:{REPO}", "-w", str(REPO),
                    "-v", f"{common_git}:{common_git}:ro",
                    "-v", f"{CARGO_VOLUME}:/usr/local/cargo/registry",
@@ -797,13 +841,14 @@ RUN cargo install cargo-deb --version {CARGO_DEB_VERSION} --locked \\
                    BUILDER_IMAGE]
         host(builder + ["bash", "scripts/release/build-distribution.sh", str(REPO), BUILD_TARGET,
                         str(BUILD_DIR / "runtime")], stream=True)
+        self.build_cidfile = None
 
         pkg_dir = BUILD_DIR / BUILD_TARGET / "debian"
         # A reused target dir can hold an older version's .deb; clear it so the
         # package set below is only what this run built.
         for stale in pkg_dir.glob("*.deb"):
             stale.unlink()
-        packager = ["docker", "run", "--rm", "--name", BUILD_CONTAINER, "--user", uid_gid,
+        packager = ["docker", "run", "--rm", *self.build_container("package"), "--user", uid_gid,
                     "-v", f"{REPO}:{REPO}:ro", "-v", f"{BUILD_DIR}:{BUILD_DIR}", "-w", str(REPO),
                     "-v", f"{common_git}:{common_git}:ro",
                     "-v", f"{CARGO_VOLUME}:/usr/local/cargo/registry",
@@ -813,8 +858,19 @@ RUN cargo install cargo-deb --version {CARGO_DEB_VERSION} --locked \\
                          "--binaries", str(BUILD_DIR / BUILD_TARGET / "release"),
                          "--runtime", str(BUILD_DIR / "runtime"),
                          "--output", str(pkg_dir), "--target", BUILD_TARGET], stream=True)
-        self.build_started = False
+        self.build_cidfile = None
         return pkg_dir
+
+    def build_container(self, step: str) -> list[str]:
+        """`docker run` flags that name this run's container for `step` and record its id.
+
+        The name carries the run directory's unique basename, so concurrent runs
+        never share one. Cleanup removes by the id in the cidfile, not by name.
+        """
+        assert self.run_dir is not None
+        self.build_cidfile = self.run_dir / f"{step}.cid"
+        return ["--name", f"{BUILD_CONTAINER_PREFIX}-{self.run_dir.name}-{step}",
+                "--cidfile", str(self.build_cidfile)]
 
     def collect_packages(self, pkg_dir: Path) -> None:
         debs = sorted(pkg_dir.glob("*.deb"))
@@ -1219,7 +1275,7 @@ journalctl -u vector --no-pager -o cat --since '{since}' | grep -c 'Failed to gl
 
         sh.run_block(blocks["vars"])
         rows = poll_block(sh, blocks["history-finder"], "history finder",
-                          until=lambda rs: any(r.get("service") == seed for r in rs))
+                          until=lambda rs: any(r.get("service") == seed for r in rs)).rows
         seed_rows = [r for r in rows if r.get("service") == seed]
         T.check("history finder lists the unit that ran before Vector started", bool(seed_rows),
                 f"service={seed}")
@@ -1231,17 +1287,17 @@ journalctl -u vector --no-pager -o cat --since '{since}' | grep -c 'Failed to gl
 
         T.note("the next queries are the harness's, not the guide's: one per seeded line")
         rows = poll_query(g, f'service={seed} "{seed} journald-pre" last=1d _ingested>="{vs}" '
-                             "| table _time, _ingested, service, message", "journald-pre")
+                             "| table _time, _ingested, service, message", "journald-pre").rows
         T.check("journald: the pre-start line arrived after Vector started", bool(rows))
         rows = poll_query(g, f'service=nginx "{seed}-nginx-post" last=1d _ingested>="{vs}" '
-                             "| table _time, _ingested, service, uri", "nginx-post control")
+                             "| table _time, _ingested, service, uri", "nginx-post control").rows
         T.check("nginx control: the post-start request arrived", bool(rows))
         if rows:
             rows = once_query(g, f'service=nginx "{seed}-nginx-pre" last=1d '
                                  "| table _time, _ingested, service, uri")
             T.check("nginx: the pre-start access line is absent", not rows, f"{len(rows)} row(s)")
         rows = poll_query(g, f'host={seed} "{seed} docker-post" last=1d '
-                             "| table _time, _ingested, service, host, message", "docker-post control")
+                             "| table _time, _ingested, service, host, message", "docker-post control").rows
         T.check("Docker control: the post-start line arrived", bool(rows))
         if rows:
             rows = once_query(g, f'host={seed} "{seed} docker-pre" last=1d '
@@ -1272,7 +1328,7 @@ journalctl -u vector --no-pager -o cat --since '{since}' | grep -c 'Failed to gl
         T.out("\n--- recipe: journald\n")
         marker, host_ = self.recipe_vars()
         sh.run_block(b["journald-send"])
-        rows = poll_block(sh, b["journald-check"], "journald check")
+        rows = poll_block(sh, b["journald-check"], "journald check").rows
         expect_fields("journald", rows, {"env": TRAWL_ENV, "service": marker, "host": host_,
                                          "_producer": "http", "message": marker})
 
@@ -1284,7 +1340,7 @@ journalctl -u vector --no-pager -o cat --since '{since}' | grep -c 'Failed to gl
         found = sh.run_block(b["nginx-confirm"], check=False)
         T.check("nginx-confirm: the access log holds the marker line",
                 found.returncode == 0 and marker in found.stdout)
-        rows = poll_block(sh, b["nginx-check"], "nginx check")
+        rows = poll_block(sh, b["nginx-check"], "nginx check").rows
         expect_fields("nginx", rows, {"env": TRAWL_ENV, "service": "nginx", "host": host_,
                                       "_producer": "http", "uri": f"/{marker}", "status": "404"})
 
@@ -1295,7 +1351,7 @@ journalctl -u vector --no-pager -o cat --since '{since}' | grep -c 'Failed to gl
         T.command(f"{GUEST_USER}@{GUEST_HOSTNAME}$",
                   f"sleep {DOCKER_WAIT_SECS}   # the recipe: wait about 30 seconds")
         time.sleep(DOCKER_WAIT_SECS)
-        rows = poll_block(sh, b["docker-check"], "docker check")
+        rows = poll_block(sh, b["docker-check"], "docker check").rows
         expect_fields("docker", rows, {"env": TRAWL_ENV, "service": marker, "host": marker,
                                        "_producer": "http", "message": marker})
         sh.run_block(b["docker-cleanup"])
@@ -1314,7 +1370,7 @@ journalctl -u vector --no-pager -o cat --since '{since}' | grep -c 'Failed to gl
         T.note(f"the other machine is network namespace {PEER_UFW.netns}, address "
                f"{PEER_UFW.peer_ip}; it reaches this host at {PEER_UFW.guest_ip}")
         sh.run_block(b["ufw-send"], netns=PEER_UFW.netns)
-        rows = poll_block(sh, b["ufw-check"], "ufw check")
+        rows = poll_block(sh, b["ufw-check"], "ufw check").rows
         expect_fields("ufw", rows, {"env": TRAWL_ENV, "service": "ufw", "host": GUEST_HOSTNAME,
                                     "_producer": "http", "src_ip": PEER_UFW.peer_ip,
                                     "dst_port": port})
@@ -1344,7 +1400,7 @@ ss -Hltn 'sport = :1514'""", root=True)
                "for the appliance and sends one RFC 5424 test message; this is not a doc block")
         g.run(f"""ip netns exec {PEER_DEVICE.netns} bash -c 'printf "<134>1 %s fw01 filterlog - - - test message {device_marker}\\n" \\
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/udp/{PEER_DEVICE.guest_ip}/1514'""", root=True)
-        rows = poll_block(sh, b["syslog-check"], "syslog check")
+        rows = poll_block(sh, b["syslog-check"], "syslog check").rows
         expect_fields("syslog", rows, {"env": TRAWL_ENV, "service": "firewall", "host": "fw01",
                                        "_producer": "syslog",
                                        "syslog_source_ip": PEER_DEVICE.peer_ip})
@@ -1375,7 +1431,7 @@ systemctl is-active vector""", root=True).stdout
         b = self.blocks()
         marker, host_ = self.recipe_vars()
         self.shell.run_block(b["journald-send"])
-        rows = poll_block(self.shell, b["journald-check"], f"{label} positive control")
+        rows = poll_block(self.shell, b["journald-check"], f"{label} positive control").rows
         expect_fields(f"{label}: positive control after restore", rows, {
             "env": TRAWL_ENV, "service": marker, "host": host_, "message": marker})
 
@@ -1399,8 +1455,8 @@ systemctl is-active vector""", root=True).stdout
                 since = self.restart_vector(f"sed -i '{edit}' /etc/default/vector")
                 self.recipe_vars()
                 sh.run_block(b["journald-send"])
-                rows = poll_block(sh, b["journald-check"], f"{label} check", diagnose=False)
-                T.check(f"{label}: the journald check finds nothing", not rows, f"{len(rows)} row(s)")
+                polled = poll_block(sh, b["journald-check"], f"{label} check", diagnose=False)
+                expect_absent(f"{label}: the journald check finds nothing", polled)
                 errors = g.run(f"journalctl -u vector --since '{since}' -o cat "
                                "| sed -e 's/\\x1b\\[[0-9;]*m//g' | grep -E ' ERROR sink' "
                                "| grep -v 'has been suppressed' | cut -c1-300 || true",
