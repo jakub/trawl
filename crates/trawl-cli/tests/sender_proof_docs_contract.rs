@@ -272,7 +272,13 @@ fn the_key_file_is_restricted_before_the_key_is_written() {
     let lines = block(VECTOR_GUIDE, "key-write");
     let restrict = lines
         .iter()
-        .position(|line| line.contains("install -m 0600") && line.ends_with("/etc/default/vector"))
+        .position(|line| {
+            line.contains("install -m 0600")
+                && line
+                    .trim_end_matches("&&")
+                    .trim_end()
+                    .ends_with("/etc/default/vector")
+        })
         .expect("key-write creates /etc/default/vector with mode 0600");
     let write = lines
         .iter()
@@ -282,6 +288,14 @@ fn the_key_file_is_restricted_before_the_key_is_written() {
     assert!(
         !lines[write].contains("flt_"),
         "the key is read from a file, never typed on a command line"
+    );
+    let remove = lines
+        .iter()
+        .position(|line| line.trim() == "rm vector.token")
+        .expect("key-write deletes the key file copy");
+    assert!(
+        lines[restrict].ends_with("&&") && lines[write].ends_with("&&") && write < remove,
+        "the key file copy is deleted only after the restricted write succeeds"
     );
 }
 

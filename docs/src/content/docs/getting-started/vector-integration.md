@@ -86,15 +86,17 @@ and `unifi-syslog.toml`.
 
    <!-- proof:key-write -->
    ```bash
-   sudo install -m 0600 -o root -g root /dev/null /etc/default/vector
-   printf 'TRAWL_INGEST_TOKEN=%s\n' "$(cat vector.token)" | sudo tee -a /etc/default/vector > /dev/null
-   rm vector.token
+   sudo install -m 0600 -o root -g root /dev/null /etc/default/vector &&
+     printf 'TRAWL_INGEST_TOKEN=%s\n' "$(cat vector.token)" | sudo tee -a /etc/default/vector > /dev/null &&
+     rm vector.token
    ```
 
    `install` replaces the file with an empty one, owned by root with mode
    0600, before the key is written. The key never appears on a command line:
    `printf` is a shell builtin, and `sudo tee` reads the key from its standard
-   input. The last command deletes the copy of the key file.
+   input. The commands are chained with `&&`, so the key is written only into
+   the restricted file, and the copy in `vector.token` is deleted only after
+   the write succeeds.
 
 3. Add the settings to the same file with `sudoedit /etc/default/vector`:
 
