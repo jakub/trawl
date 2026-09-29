@@ -17,10 +17,15 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Every job runs on a GitHub-hosted runner, and they share the repository's
+# 10 GB Actions cache. Each rust-cache step below saves only on main: pull
+# requests restore main's entries and never evict them with per-PR copies.
+# Jobs that compile the same thing share a key.
+
 jobs:
   vector-collector:
     name: Vector collector delivery
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -45,7 +50,7 @@ jobs:
 
   release-source:
     name: release source resolution
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -65,7 +70,7 @@ jobs:
 
   helm-template:
     name: helm template
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -89,7 +94,7 @@ jobs:
 
   deb-packaging:
     name: deb crash-dump packaging assertions
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -100,7 +105,7 @@ jobs:
 
   fmt:
     name: rustfmt
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -111,7 +116,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -121,6 +126,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --no-default-features
 
   test:
@@ -144,7 +150,7 @@ jobs:
     # .config/nextest.toml bounds pg-heavy test parallelism instead, and
     # the pg-admission-guard step below proves nothing escaped it.
     name: test
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     services:
@@ -176,6 +182,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # nextest is pinned by VERSION, not just by the action sha: the action
       # manifest at this sha ships 0.9.132, whose filterset grammar predates
       # the `group()` predicate pg-admission-guard queries with -- the guard
@@ -237,7 +244,7 @@ jobs:
     # the test job. The workflow-level RUSTFLAGS makes every mutant compile
     # under -D warnings.
     name: Server guard mutations
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
       contents: read
@@ -268,6 +275,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: server-mutations
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Same pinned nextest as the test job, for the same filterset reason.
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
         with:
@@ -279,22 +287,23 @@ jobs:
 
   msrv:
     name: msrv check
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40 # 1.94.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: msrv
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --no-default-features
 
   deny:
     name: cargo-deny
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # Binary install instead of EmbarkStudios/cargo-deny-action because
-      # that action is Docker-based and k8s-small is unprivileged (no dind).
+      # Binary install instead of EmbarkStudios/cargo-deny-action, which is a
+      # Docker container action; install-action is already pinned here.
       # cargo-deny shells out to `cargo metadata`, so we need a toolchain.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
@@ -306,7 +315,7 @@ jobs:
 
   wasm-check:
     name: wasm32 clippy (web UI + fleet-ui)
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -317,6 +326,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: wasm-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown
       # Both sides of the default-off `atmosphere` feature: the bare run is
       # the shape non-mounting consumers compile (and the one that must NOT
@@ -326,7 +336,7 @@ jobs:
 
   vendor-drift:
     name: web UI vendor bundle drift
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
@@ -348,7 +358,7 @@ jobs:
 
   trunk-build:
     name: web UI release build (trunk)
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -358,6 +368,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: trunk-build
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -407,7 +418,7 @@ jobs:
 
   trawl-web-tests:
     name: trawl-web tests
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Exercise real chart rendering in the packaging contract tests.
@@ -418,6 +429,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: trawl-web-tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # nextest
         with:
           tool: nextest@0.9.143
@@ -425,7 +437,7 @@ jobs:
 
   trawl-web-release:
     name: trawl-web release build (SPA embedded)
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -435,6 +447,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: trawl-web-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4
         with:
           name: trawl-web-ui-dist
@@ -445,7 +458,7 @@ jobs:
 
   web-ui-health-mutation:
     name: Health page request-gate mutation
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     # Mutation jobs start once trunk-build is done and run alongside the
     # web-ui-e2e shards. They build their own mutant and pristine SPAs (the
     # atmosphere job downloads trunk-build's dist). They do not wait for the
@@ -468,6 +481,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: health-mutation
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -495,7 +509,7 @@ jobs:
 
   web-ui-palette-mutations:
     name: Command palette admission and toggle mutations
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     # Browser system packages can take 15 minutes before the SPA rebuilds.
     timeout-minutes: 30
@@ -512,6 +526,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: palette-mutations
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -539,7 +554,7 @@ jobs:
 
   web-ui-save-snapshot-mutation:
     name: Save editor snapshot mutation
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     # Allow package setup plus pristine, mutated, and restored SPA checks.
     timeout-minutes: 30
@@ -556,6 +571,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: save-snapshot-mutation
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -596,7 +612,7 @@ jobs:
 
   web-ui-pagination-range-mutations:
     name: Pagination and range dialog mutations
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     timeout-minutes: 35
     permissions:
@@ -612,6 +628,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: pagination-range-mutations
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -643,7 +660,7 @@ jobs:
 
   web-ui-live-coherence-mutations:
     name: Live-mode coherence mutations
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     # Two apply/build/run cycles plus the pristine restore build.
     timeout-minutes: 35
@@ -660,6 +677,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: live-coherence-mutations
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -690,7 +708,7 @@ jobs:
 
   web-ui-filter-rail-mutation:
     name: Filter rail hand-choice mutation
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     # One apply/build/run cycle plus the pristine restore build.
     timeout-minutes: 35
@@ -707,6 +725,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: filter-rail-mutation
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -736,7 +755,7 @@ jobs:
 
   web-ui-schedule-preview-mutations:
     name: Schedule window and preview paging mutations
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     timeout-minutes: 35
     permissions:
@@ -752,6 +771,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: schedule-preview-mutations
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
@@ -782,7 +802,7 @@ jobs:
 
   web-ui-e2e:
     name: web UI browser tests (playwright ${{ matrix.shard }}/4)
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     needs: trunk-build
     # CI runs one worker per job (see playwright.config.ts), so the suite
     # is split across jobs instead, each with its own stub server.
@@ -866,7 +886,7 @@ jobs:
 
   theme-menu-captures:
     name: theme menu captures
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     needs: web-ui-e2e
     # Runs even when a shard fails, so a missing capture is reported next to
     # the failure. It only reads the shards' artifacts and uploads nothing,
@@ -891,7 +911,7 @@ jobs:
 
   theme-production:
     name: theme bootstrap and production browser evidence
-    runs-on: k8s-big
+    runs-on: ubuntu-24.04
     needs: trunk-build
     timeout-minutes: 40
     permissions:
@@ -905,7 +925,8 @@ jobs:
           toolchain: 1.98.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          shared-key: theme-production
+          shared-key: trawl-web-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
         with:
           node-version: '22'
@@ -953,7 +974,7 @@ jobs:
 
   atmosphere-mutation:
     name: atmosphere terminal-latch mutation
-    runs-on: k8s-small
+    runs-on: ubuntu-24.04
     needs: trunk-build
     timeout-minutes: 10
     # This job executes third-party code (npm packages, a CDN-fetched
@@ -1027,27 +1048,12 @@ jobs:
     # `--target x86_64-unknown-linux-gnu` makes the build independent of
     # how the tool was packaged.
     #
-    # This is also the one job here NOT on the self-hosted runners, and
-    # that is deliberate rather than accidental. Nothing is known to be
-    # wrong with k8s-small: the failure above describes the BUILD target
-    # and says nothing about that image, and the host triple there was
-    # never measured. But every step of this job is demonstrated working on
-    # `ubuntu-latest`, so it stays where the evidence is.
-    #
-    # `ubuntu-latest` rather than a pinned image, unlike the nightly below.
-    # The toolchain inputs are pinned already — the ASan runtime ships
-    # inside the pinned nightly, install-action pins cargo-fuzz — but the
-    # image's own glibc, C toolchain and linker are not, and this job does
-    # depend on all three. Needing a glibc runner is the reason it is here
-    # at all. So the claim is only the one that was tested: every step of
-    # this job is demonstrated working on `ubuntu-latest` today, and the
-    # explicit `--target` removes the dependency on how cargo-fuzz was
-    # PACKAGED, not the dependency on the image shipping a glibc toolchain.
-    # The image is left unpinned knowingly, and a future image change could
-    # in principle need attention here. docs.yml already runs on
-    # `ubuntu-latest`, so this follows the repo instead of inventing a
-    # third runner convention.
-    runs-on: ubuntu-latest
+    # The explicit `--target` removes the dependency on how cargo-fuzz was
+    # PACKAGED, not the dependency on the image shipping a glibc toolchain:
+    # the ASan runtime ships inside the pinned nightly and install-action
+    # pins cargo-fuzz, but the image's own glibc, C toolchain and linker
+    # come from the runner image this workflow pins.
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     # This job executes code the PR controls: a fuzz target running mutated
     # input through PR-authored code, and every build script in the
@@ -1075,6 +1081,7 @@ jobs:
           # every stable job here, so sharing a key would make the two sides
           # evict each other's artifacts on every run.
           shared-key: fuzz-smoke
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: crates/trawl-core/fuzz
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-fuzz
         with:

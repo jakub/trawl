@@ -105,7 +105,7 @@ despite their crash messages. The missing popup event in main CI run
 34440325872 has not been reproduced locally, so its cause remains
 unproven.
 
-The full CI suite gets 25 minutes on the shared `k8s-small` runner,
+The full CI suite gets 25 minutes on a GitHub-hosted runner,
 inside a 40-minute job budget that also covers setup, the separate BFCache
 suite and artifact upload. The BFCache CI step has a five-minute aggregate
 budget; its individual test timeouts and zero-retry policy are unchanged.
