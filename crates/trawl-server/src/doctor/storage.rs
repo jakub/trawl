@@ -775,7 +775,11 @@ fn check_conformance(ctx: &Ctx, ingest: bool, marker: Option<&str>) -> Row {
             .detail(Text::new("a query-only node reads the archive as it is"));
     }
     let recorded = ctx.app.catalog.as_ref().is_some_and(|catalog| {
-        conform::conformance_recorded(catalog.conformed, marker, &catalog.catalog_id.0)
+        conform::conformance_recorded(
+            catalog.conformed,
+            || marker.map(str::to_owned),
+            &catalog.catalog_id.0,
+        )
     });
     if recorded {
         Row::complete(check).detail(Text::new(
@@ -1379,10 +1383,15 @@ mod tests {
         assert_eq!(judge(Some("b"), None, full), J::Foreign);
         assert_eq!(judge(None, None, full), J::Unproven);
         assert_eq!(judge(None, None, empty), J::Empty);
-        assert!(conform::conformance_recorded(true, Some("a"), "a"));
-        assert!(!conform::conformance_recorded(false, Some("a"), "a"));
-        assert!(!conform::conformance_recorded(true, Some("b"), "a"));
-        assert!(!conform::conformance_recorded(true, None, "a"));
+        let marker = |id: &'static str| move || Some(id.to_owned());
+        assert!(conform::conformance_recorded(true, marker("a"), "a"));
+        assert!(!conform::conformance_recorded(
+            false,
+            || panic!("an unconformed catalog reads no marker"),
+            "a"
+        ));
+        assert!(!conform::conformance_recorded(true, marker("b"), "a"));
+        assert!(!conform::conformance_recorded(true, || None, "a"));
     }
 
     fn repin(phase: marker::RepinPhase, to_type: &str) -> marker::RepinMarker {

@@ -1008,6 +1008,64 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
+    /// An unconformed catalog goes straight to the pass without opening
+    /// `data/CATALOG`. A FIFO there would block that open until a writer
+    /// appears, so an eager read hangs boot; the pass instead replaces the
+    /// FIFO with the real marker through its staged rename.
+    #[sqlx::test]
+    async fn unconformed_boot_never_opens_the_catalog_marker(pool: sqlx::PgPool) {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let fifo = data_dir.join("CATALOG");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let store = CatalogStore::new(pool.clone());
+        assert!(!store.is_conformed().await.unwrap(), "a fresh catalog");
+
+        // The pass runs on a blocking thread, so a blocking open inside it
+        // stalls that thread only; this task keeps driving the runtime, its
+        // I/O and the timeout.
+        let (pass_store, dir) = (store.clone(), data_dir.clone());
+        let handle = tokio::runtime::Handle::current();
+        let mut pass = tokio::task::spawn_blocking(move || {
+            let cache = FieldCatalog::new();
+            handle.block_on(conform::ensure_conformance(
+                &pass_store,
+                &cache,
+                &dir,
+                &dir.join("wal"),
+                "2GB",
+            ))
+        });
+        let Ok(joined) = tokio::time::timeout(std::time::Duration::from_secs(15), &mut pass).await
+        else {
+            // Release the blocked reader so the thread ends, then fail.
+            // O_NONBLOCK: a writer open succeeds only while a reader waits,
+            // so a pass stuck anywhere else cannot hang the release.
+            let released = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(nix::libc::O_NONBLOCK)
+                .open(&fifo)
+                .map(drop);
+            if released.is_ok() {
+                let _ = pass.await;
+            }
+            panic!("boot read data/CATALOG before running the pass (release: {released:?})");
+        };
+        let summary = joined.unwrap().unwrap();
+        assert!(summary.ran, "an unconformed catalog runs the pass");
+        let file_type = std::fs::symlink_metadata(&fifo).unwrap().file_type();
+        assert!(file_type.is_file() && !file_type.is_fifo(), "{file_type:?}");
+        let marker = std::fs::read_to_string(&fifo).unwrap();
+        assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
+    }
+
     /// `_severity` is SEVERITY-pinned and sits in every parquet trawl
     /// writes, and its conform is a domain guard rather than a pass-through.
     /// Without a data-decided skip, a re-armed pass (identity mismatch, or

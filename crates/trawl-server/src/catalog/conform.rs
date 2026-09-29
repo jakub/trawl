@@ -319,8 +319,16 @@ pub fn judge_archive_identity(
 /// pair: `catalog_state.conformed_at` is set and the marker names the
 /// catalog. [`ensure_conformance`] skips the pass on it, and
 /// `trawld --doctor` reports it.
-pub fn conformance_recorded(conformed: bool, marker: Option<&str>, catalog_id: &str) -> bool {
-    conformed && marker == Some(catalog_id)
+///
+/// `marker` runs only when `conformed` is set. Boot relies on that: an
+/// unconformed catalog goes straight to the pass without opening
+/// `data/CATALOG`, so whatever sits there (a FIFO, a device) cannot stall it.
+pub fn conformance_recorded(
+    conformed: bool,
+    marker: impl FnOnce() -> Option<String>,
+    catalog_id: &str,
+) -> bool {
+    conformed && marker().as_deref() == Some(catalog_id)
 }
 
 /// Whether the data root positively holds no parquet — the only state in
@@ -391,7 +399,7 @@ pub async fn ensure_conformance(
         .is_conformed()
         .await
         .map_err(|e| format!("failed to read conformance state: {e}"))?;
-    if conformance_recorded(conformed, read_marker(data_dir).as_deref(), &catalog_id) {
+    if conformance_recorded(conformed, || read_marker(data_dir), &catalog_id) {
         // Still hydrate the cache — skipping the pass must not skip pins.
         hydrate(store, cache).await?;
         return Ok(ConformSummary {
