@@ -1,7 +1,42 @@
 name: Distribution preflight
 
+# A pull request builds and checks the release artifacts without publishing
+# them. A push to main runs the same checks after the merge, on the same
+# hosted runners, and is the only run that saves the rust caches: the
+# release builds on k8s-big save to the in-cluster cache server, which
+# hosted runners cannot read, so without this every pull request built the
+# release binaries from a cold cache.
 on:
   pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/linux-distribution.yml'
+      - '.github/workflows/macos-cli.yml'
+      - '.github/workflows/distribution-preflight.yml'
+      - 'scripts/release/**'
+      - 'Dockerfile'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      # The trial job runs the CLI, the browser proxy, and the Debian units
+      # from these crates, and follows the trial tutorial. It also reads the
+      # web UI and the shared fleet UI (sign-in form, range dialog) by
+      # selector, and the admin tools by their output text.
+      - 'crates/trawl-cli/**'
+      - 'crates/trawl-web/**'
+      - 'crates/trawl-server/debian/**'
+      - 'crates/trawl-web-ui/**'
+      - 'crates/fleet-ui/**'
+      - 'crates/fleet-admin/**'
+      - 'crates/trawl-admin/**'
+      - 'docs/src/content/docs/getting-started/first-query.md'
+      - 'crates/trawl-core/Cargo.toml'
+      - 'crates/trawl-core/build.rs'
+      - 'crates/trawl-core/build_support/**'
+      - 'crates/trawl-engine/Cargo.toml'
+      - 'crates/trawl-server/Cargo.toml'
+
+  push:
+    branches: [main]
     paths:
       - '.github/workflows/release.yml'
       - '.github/workflows/linux-distribution.yml'
@@ -32,13 +67,19 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its older run. Each push to main gets
+# its own group, so each merge finishes and saves its caches (a shared group
+# would still cancel a pending main run; see ci.yml).
 concurrency:
-  group: distribution-preflight-${{ github.event.pull_request.number }}
+  group: distribution-preflight-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   metadata:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       sha: ${{ steps.source.outputs.sha }}
       release-tag: ${{ steps.source.outputs.release-tag }}

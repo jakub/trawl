@@ -17,10 +17,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   resolve-source:
     name: resolve release source
     runs-on: k8s-small
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -44,6 +47,7 @@ jobs:
     name: prepare release chart and announcement
     needs: resolve-source
     runs-on: k8s-small
+    timeout-minutes: 10
     permissions:
       contents: read
     env:
@@ -155,6 +159,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
+    timeout-minutes: 15
     steps:
       - name: Download tarballs
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -194,6 +199,7 @@ jobs:
   publish-docs:
     needs: [resolve-source, build-docs, release]
     runs-on: k8s-small
+    timeout-minutes: 15
     permissions:
       contents: write
     concurrency:
@@ -224,6 +230,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-small
+    timeout-minutes: 20
     concurrency:
       group: gh-pages-deploy
       cancel-in-progress: false
@@ -349,6 +356,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.resolve-source.outputs.tag }}
     runs-on: k8s-big
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -393,6 +401,7 @@ jobs:
     name: publish validated Helm chart
     needs: [build-chart, docker]
     runs-on: k8s-small
+    timeout-minutes: 10
     steps:
       - name: Download the validated chart artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

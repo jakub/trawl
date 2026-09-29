@@ -152,10 +152,14 @@ class PublicationOrder(unittest.TestCase):
                     self.assertTrue(field['required'])
                     self.assertEqual(field['type'], 'string')
 
-    def test_pr_preflight_calls_both_native_checks_without_publication(self):
+    def test_preflight_calls_both_native_checks_without_publication(self):
         workflow = parse_workflow(WORKFLOW.with_name('distribution-preflight.yml'))
         triggers = workflow.get('on') or workflow.get('true')
-        self.assertEqual(set(triggers), {'pull_request'})
+        # Pull requests check the artifacts; the push to main runs the same
+        # checks and saves the hosted caches that pull requests restore.
+        self.assertEqual(set(triggers), {'pull_request', 'push'})
+        self.assertEqual(triggers['push']['branches'], ['main'])
+        self.assertEqual(triggers['push']['paths'], triggers['pull_request']['paths'])
         self.assertEqual(set(triggers['pull_request']['paths']), {
             '.github/workflows/release.yml', '.github/workflows/linux-distribution.yml',
             '.github/workflows/macos-cli.yml', '.github/workflows/distribution-preflight.yml',

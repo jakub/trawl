@@ -18,16 +18,20 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   suite:
     name: ${{ matrix.suite }}
     runs-on: k8s-big
+    timeout-minutes: 120
     strategy:
       # Both suites always run: a flake in one says nothing about the other,
       # and cancelling the survivor halves the evidence.
       fail-fast: false
-      # ... but one at a time. Unlike ci.yml's single sequential `test` job,
-      # a matrix schedules both suites concurrently, and two full workspace
+      # ... but one at a time. Unlike ci.yml's test jobs, which run on
+      # GitHub-hosted runners, this matrix would schedule both suites
+      # concurrently on the k8s-big pool, and two full workspace
       # builds + two postgres containers co-scheduled on the k8s-big pool
       # OOM the heavier runner pod ~15min in (step stuck in_progress, no
       # logs uploaded, "lost communication"). Every such death so far --
@@ -111,6 +115,7 @@ jobs:
   summary:
     name: soak summary
     runs-on: k8s-small
+    timeout-minutes: 5
     needs: [suite]
     if: always()
     steps:

@@ -6,8 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+# A new push to a pull request cancels its older run. Each push to main gets
+# its own group, so no main run is ever cancelled: a merge landing shortly
+# after another would otherwise leave the first merge with no verdict, and
+# rust-cache saves only from a finished main run. A shared group would not
+# do, even without cancel-in-progress: GitHub keeps one pending run per
+# group and cancels the older pending one when a third arrives.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:
@@ -21,6 +27,9 @@ env:
 # 10 GB Actions cache. Each rust-cache step below saves only on main: pull
 # requests restore main's entries and never evict them with per-PR copies.
 # Jobs that compile the same thing share a key.
+#
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 
 jobs:
   changes:
@@ -29,6 +38,7 @@ jobs:
     # the caches that pull requests restore warm.
     name: changed scopes
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
@@ -52,18 +62,81 @@ jobs:
             python3 ci/changed-scopes.py --all | tee -a "$GITHUB_OUTPUT"
           fi
 
-  vector-collector:
-    name: Vector collector delivery
+  repo-checks:
+    # Seven checks that each do under a minute of work, run as steps of one
+    # job. As separate jobs, each paid for its own runner, checkout and tool
+    # setup, and took one of the account's 40 concurrent job slots; a pull
+    # request that touches crates starts about 30 jobs at once. Every check
+    # step runs even when an earlier one fails (`!cancelled()`), and each has
+    # its own timeout, so one hung check cannot hide the others' results.
+    name: repository checks
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - name: Install collector TLS test tooling
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl
-      - name: Validate and exercise the Debian collector with Vector 0.57.0
+      # openssl for the collector TLS fixtures, dpkg-dev for the release
+      # source tests' Debian package checks.
+      - name: Install Debian test tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl dpkg-dev
+      # The release source tests compile the actual Cargo helper, then exercise
+      # its target and integrity boundaries with cached fixtures and no
+      # downloader on PATH. cargo-deny shells out to `cargo metadata`.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      # Binary install instead of EmbarkStudios/cargo-deny-action, which is a
+      # Docker container action; install-action is already pinned here.
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-deny
+        with:
+          tool: cargo-deny
+      # Publication DAG tests use Helm's YAML parser, avoiding another YAML
+      # dependency, and the chart render test runs Helm itself.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: '22'
+      - name: Install checksum-verified promtool 3.14.0 (CI only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/prometheus-3.14.0.linux-amd64.tar.gz"
+          curl --fail --location --retry 3 \
+            https://github.com/prometheus/prometheus/releases/download/v3.14.0/prometheus-3.14.0.linux-amd64.tar.gz \
+            --output "$archive"
+          echo "f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" prometheus-3.14.0.linux-amd64/promtool
+
+      - name: rustfmt
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: cargo fmt --all --check
+      - name: cargo-deny
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: cargo deny check
+      - name: deb crash-dump packaging assertions
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: bash crates/trawl-server/debian/tests/packaging.sh
+      - name: release source resolution
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+      # render.sh finishes in about a minute.
+      - name: helm template
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: bash chart/trawl/tests/render.sh
+        env:
+          PROMTOOL: ${{ runner.temp }}/prometheus-3.14.0.linux-amd64/promtool
+      - name: Vector collector delivery (Debian collector with Vector 0.57.0)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
         shell: bash
         run: |
           set -euo pipefail
@@ -76,79 +149,24 @@ jobs:
           tar -xzf "$fixture_dir/vector.tar.gz" -C "$fixture_dir"
           VECTOR_BIN="$fixture_dir/vector-x86_64-unknown-linux-gnu/bin/vector" \
             python3 scripts/test-vector-collector.py
-
-  release-source:
-    name: release source resolution
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - name: Install Debian package test tooling
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev
-      # Runtime tests compile the actual Cargo helper, then exercise its target
-      # and integrity boundaries with cached fixtures and no downloader on PATH.
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-      # Publication DAG tests use Helm's YAML parser, avoiding another YAML dependency.
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
-      - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
-
-  helm-template:
-    name: helm template
-    runs-on: ubuntu-24.04
-    # render.sh finishes in about a minute; a hung test must fail the check,
-    # not hold it pending for the six-hour default.
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
-      - name: Install checksum-verified promtool 3.14.0 (CI only)
-        shell: bash
+      # Last, because the rebuild writes node_modules into the vendor
+      # directories, which the checks above never expect to see.
+      - name: web UI vendor bundle drift
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
         run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/prometheus-3.14.0.linux-amd64.tar.gz"
-          curl --fail --location --retry 3 \
-            https://github.com/prometheus/prometheus/releases/download/v3.14.0/prometheus-3.14.0.linux-amd64.tar.gz \
-            --output "$archive"
-          echo "f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d  $archive" | sha256sum --check
-          tar -xzf "$archive" -C "$RUNNER_TEMP" prometheus-3.14.0.linux-amd64/promtool
-      - run: bash chart/trawl/tests/render.sh
-        env:
-          PROMTOOL: ${{ runner.temp }}/prometheus-3.14.0.linux-amd64/promtool
-
-  deb-packaging:
-    name: deb crash-dump packaging assertions
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - run: bash crates/trawl-server/debian/tests/packaging.sh
-
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-          components: rustfmt
-      - run: cargo fmt --all --check
+          (cd crates/trawl-web-ui/vendor && bash build.sh)
+          (cd crates/fleet-ui/vendor && bash build.sh)
+          git diff --exit-code \
+            crates/trawl-web-ui/vendor/codemirror.js \
+            crates/trawl-web-ui/vendor/uplot.js \
+            crates/trawl-web-ui/vendor/uplot.css \
+            crates/fleet-ui/vendor/paper-shaders.js
 
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -161,30 +179,109 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --no-default-features
 
+  test-build:
+    # The workspace tests run in three stages so that neither compiling nor
+    # testing waits for the other's leftovers:
+    #   test-build   compiles every test binary once and archives them;
+    #   test (N/3)   three jobs, each extracting that archive beside a fresh
+    #                checkout and running one slice of the tests against its
+    #                own postgres;
+    #   test-guards  runs, beside the other two, the checks that need a cargo
+    #                build but no test results: fleet-admin migrate, the
+    #                postgres admission guard and the DuckDB launcher smoke.
+    # One job used to do all of it: 3m29s of warm compile, then 5m29s of
+    # tests on four threads, then 49s of guard, on the critical path.
+    #
+    # Every compile-time path the tests bake in with env!() (CARGO_MANIFEST_DIR,
+    # CARGO_BIN_EXE_*, CARGO) points into /home/runner/work/trawl/trawl, the
+    # same checkout path on every hosted runner. The test jobs extract the
+    # archive into that checkout, so target/ lands where the binaries expect.
+    name: test build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # The linker skips the DWARF: it stays in .dwo files beside the
+      # objects instead of being copied into each of about 130 test
+      # binaries. The debuginfo level stays full, so the generated code and
+      # its stack frames are unchanged. Keep it full: trawl-core's 2 MiB
+      # parser stack test is calibrated against the unoptimized,
+      # full-debuginfo build (crates/trawl-core/src/parser/mod.rs), and CI
+      # is the only place that build runs. The archive carries the binaries
+      # but not the .dwo files, so a backtrace in a test job names functions
+      # without file and line.
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # nextest is pinned by VERSION, not just by the action sha: the action
+      # manifest at this sha ships 0.9.132, whose filterset grammar predates
+      # the `group()` predicate pg-admission-guard queries with -- the guard
+      # step failed on every run while local 0.9.143 parsed it fine. Pin the
+      # version the local gates validate.
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
+        with:
+          tool: nextest@0.9.143
+      # FEATURE TRAP: --no-default-features also strips fleet-auth's default
+      # `keystore` feature when it is built as a selected workspace package,
+      # silently compiling out its pg test files. The explicit fleet-auth/*
+      # features below re-enable them deterministically. Do NOT drop them.
+      # test-guards builds with the same selection. The archive records it,
+      # so the test jobs cannot run a different one.
+      - name: Build and archive the test binaries
+        run: >-
+          cargo nextest archive --workspace --no-default-features
+          --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+          --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+      - name: Disk and archive size
+        run: df -h / && ls -l "$RUNNER_TEMP/nextest-archive.tar.zst"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}/nextest-archive.tar.zst
+          # Already zstd; a second compression pass only costs time.
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
   test:
-    # The single workspace test job. Postgres backs the pg-based integration
-    # tests in fleet-auth, fleet-admin, AND trawl-server: every pg test runs
-    # under #[sqlx::test] (per-test ephemeral database off DATABASE_URL, so
-    # the role must have CREATEDB), and trawl-server's harness additionally
-    # creates a sibling trawl app-state database that trawld's real boot
-    # path migrates. CI uses a throwaway postgres:18 container (the default
-    # `postgres` superuser has CREATEDB); local-dev and the homelab dev/prod
-    # environments use CNPG. An explicit `fleet-admin migrate` step (below)
-    # applies the embedded fleet schema to the service container — it spells
-    # out the migration step and exercises the exact deploy-time command the
-    # helm init container runs. The trawl app-state database needs no CI
-    # migrate step: trawld auto-migrates it at boot (sole writer).
+    # Postgres backs the pg-based integration tests in fleet-auth,
+    # fleet-admin, AND trawl-server: every pg test runs under #[sqlx::test]
+    # (per-test ephemeral database off DATABASE_URL, so the role must have
+    # CREATEDB), and trawl-server's harness additionally creates a sibling
+    # trawl app-state database that trawld's real boot path migrates. CI
+    # uses a throwaway postgres:18 container (the default `postgres`
+    # superuser has CREATEDB); local-dev and the homelab dev/prod
+    # environments use CNPG. No test reads the service's own `postgres`
+    # database, so the migration of it runs in test-guards.
     #
     # Connection budget: nextest is process-per-test and sqlx pools are
     # process-local, so unbounded parallelism can exceed the server's
     # max_connections (default 100 — GH service containers can't override
     # the postgres command line). The `postgres` nextest group in
     # .config/nextest.toml bounds pg-heavy test parallelism instead, and
-    # the pg-admission-guard step below proves nothing escaped it.
-    name: test
+    # the admission guard in test-guards proves nothing escaped it. Each
+    # slice has its own server, so the budget holds per job.
+    name: test (${{ matrix.partition }}/3)
     runs-on: ubuntu-24.04
+    needs: test-build
+    timeout-minutes: 20
     permissions:
       contents: read
+    strategy:
+      # Every slice reports, so one failure does not hide another.
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3]
     services:
       postgres:
         image: postgres:18
@@ -208,65 +305,112 @@ jobs:
           persist-credentials: false
       - name: Turn off postgres durability
         run: ci/postgres-no-durability.sh ${{ job.services.postgres.id }}
-      # Exercise real chart rendering in trawl-config's packaging contracts.
+      # Exercise real chart rendering in trawl-config's and trawl-web's
+      # packaging contracts.
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      # build_provenance.rs runs the cargo that compiled it, at the path
+      # env!("CARGO") baked in, so the same toolchain must be installed here.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      # nextest is pinned by VERSION, not just by the action sha: the action
-      # manifest at this sha ships 0.9.132, whose filterset grammar predates
-      # the `group()` predicate pg-admission-guard queries with -- the guard
-      # step failed on every run while local 0.9.143 parsed it fine. Pin the
-      # version the local gates validate.
+      # Same pinned nextest as test-build, for the same filterset reason.
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
         with:
           tool: nextest@0.9.143
-      # Explicit migration step: run the operational `fleet-admin migrate`
-      # command against the service container. Spells out AC10's migration
-      # step and exercises the exact deploy-time command the helm init
-      # container runs (AC11) against a live postgres.
-      - name: Apply fleet-auth schema migrations
-        run: cargo run -p fleet-admin -- migrate
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-      # FEATURE TRAP: --no-default-features also strips fleet-auth's default
-      # `keystore` feature when it is built as a selected workspace package,
-      # silently compiling out its pg test files. The explicit fleet-auth/*
-      # features below re-enable them deterministically. Do NOT drop them.
-      # There is no skip mode: #[sqlx::test] panics loudly when DATABASE_URL
-      # is unset or unreachable, so "pg tests silently skipped" cannot
-      # produce a misleading green (the FLEET_TESTS_REQUIRED backstop died
-      # with the PgFixture in ADR-0004 slice 3 / issue #12).
-      - run: >-
-          cargo nextest run --workspace --no-default-features
-          --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
+      - uses: actions/download-artifact@cc203385981b70ca67e1cc392babf9cc229d5806 # v4
+        with:
+          name: nextest-archive
+          path: ${{ runner.temp }}
+      # slice:N/3 deals the tests out one at a time in order, so each job
+      # gets a similar share of the slow postgres tests.
+      - name: Run test slice ${{ matrix.partition }}/3
+        run: >-
+          cargo nextest run
+          --archive-file "$RUNNER_TEMP/nextest-archive.tar.zst"
+          --workspace-remap . --extract-to .
+          --partition slice:${{ matrix.partition }}/3
         env:
           # DATABASE_URL, not FLEET_DATABASE_URL: trawld's [auth] resolution
           # treats FLEET_DATABASE_URL as its highest-precedence keystore
           # override (ADR-0004 slice 3), so setting it process-wide would
           # silently repoint every fixture's per-test keystore DSN at the
           # shared service container. The #[sqlx::test] harness hardwires
-          # DATABASE_URL.
+          # DATABASE_URL. There is no skip mode: #[sqlx::test] panics loudly
+          # when DATABASE_URL is unset or unreachable, so "pg tests silently
+          # skipped" cannot produce a misleading green (the
+          # FLEET_TESTS_REQUIRED backstop died with the PgFixture in ADR-0004
+          # slice 3 / issue #12).
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+  test-guards:
+    # Checks that need the workspace test build but no test results, run
+    # beside test-build and the test slices instead of after them. This job
+    # compiles the same test binaries again from the same cache, which costs
+    # runner time but no wall time.
+    name: test guards
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # Same build settings as test-build, so both restore one cache key and
+      # the nested cargo in pg-admission-guard builds what test-build does.
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --tmpfs /var/lib/postgresql
+          --health-cmd="pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval=2s
+          --health-timeout=3s
+          --health-retries=15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
+      # test-build owns the cache and saves it; this job only reads it.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: test
+          save-if: false
+      # Same pinned nextest as test-build, for the same filterset reason.
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
+        with:
+          tool: nextest@0.9.143
+      # Explicit migration step: run the operational `fleet-admin migrate`
+      # command against the service container. Spells out AC10's migration
+      # step and exercises the exact deploy-time command the helm init
+      # container runs (AC11) against a live postgres. The trawl app-state
+      # database needs no CI migrate step: trawld auto-migrates it at boot
+      # (sole writer).
+      - name: Apply fleet-auth schema migrations
+        run: cargo run -p fleet-admin -- migrate
+        env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Membership in the `postgres` group is hand-written in
       # .config/nextest.toml; this recomputes it from the sources and fails
-      # if a pg-touching test runs outside the group. It runs after the
-      # suite on purpose: the test binaries are already built, so the guard
-      # only pays for `cargo nextest list`. Same feature selection as the
-      # run above, because a feature can compile a pg test file out.
+      # if a pg-touching test runs outside the group. Same feature selection
+      # as test-build, because a feature can compile a pg test file out.
       - name: Guard the postgres admission group
+        if: ${{ !cancelled() }}
         run: >-
           cargo xtask pg-admission-guard --
           --no-default-features
           --features fleet-auth/keystore,fleet-auth/axum,fleet-auth/fast-hash
-      # The launcher runs whatever target/debug/trawld exists, and the suite
+      # The launcher runs whatever target/debug/trawld exists, and the guard
       # above already built it, so this proves the loader path without a
       # second trawld build in another feature set (about a minute).
       - name: Smoke-test verified DuckDB development launcher
+        if: ${{ !cancelled() }}
         run: bin/trawld-dev --version
 
   server-mutations:
@@ -287,6 +431,9 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      # Each mutant relinks the trawl-server test binaries; see `test`.
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     services:
       postgres:
         image: postgres:18
@@ -329,6 +476,7 @@ jobs:
   msrv:
     name: msrv check
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40 # 1.94.0
@@ -338,25 +486,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --no-default-features
 
-  deny:
-    name: cargo-deny
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # Binary install instead of EmbarkStudios/cargo-deny-action, which is a
-      # Docker container action; install-action is already pinned here.
-      # cargo-deny shells out to `cargo metadata`, so we need a toolchain.
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-deny
-        with:
-          tool: cargo-deny
-      - run: cargo deny check
-
   wasm-check:
     name: wasm32 clippy (web UI + fleet-ui)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -375,31 +508,10 @@ jobs:
       - run: cargo clippy -p fleet-ui --target wasm32-unknown-unknown
       - run: cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere
 
-  vendor-drift:
-    name: web UI vendor bundle drift
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-      - name: Rebuild vendor bundles
-        working-directory: crates/trawl-web-ui/vendor
-        run: bash build.sh
-      - name: Rebuild fleet-ui vendor bundle
-        working-directory: crates/fleet-ui/vendor
-        run: bash build.sh
-      - name: Fail if committed bundles drifted
-        run: |
-          git diff --exit-code \
-            crates/trawl-web-ui/vendor/codemirror.js \
-            crates/trawl-web-ui/vendor/uplot.js \
-            crates/trawl-web-ui/vendor/uplot.css \
-            crates/fleet-ui/vendor/paper-shaders.js
-
   trunk-build:
     name: web UI release build (trunk)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -460,6 +572,10 @@ jobs:
   trawl-web-tests:
     name: trawl-web tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # See `test`.
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Exercise real chart rendering in the packaging contract tests.
@@ -479,6 +595,7 @@ jobs:
   trawl-web-release:
     name: trawl-web release build (SPA embedded)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: trunk-build
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
