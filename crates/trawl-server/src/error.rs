@@ -122,6 +122,20 @@ pub enum ServerError {
     #[error("ingest error: {0}")]
     Ingest(String),
 
+    /// A gzip ingest body that decompresses past `[ingest] max_body_bytes`
+    /// (413, code `ingest_error`). Decompression stopped one byte past the
+    /// limit, so the message gives the limit and no decompressed size. A
+    /// retry of the same body cannot succeed; the sender must send smaller
+    /// batches.
+    #[error(
+        "gzip body decompresses past the {limit} byte limit \
+         ([ingest] max_body_bytes); send smaller batches"
+    )]
+    IngestBodyTooLarge {
+        /// `[ingest] max_body_bytes`.
+        limit: usize,
+    },
+
     /// Rate limit exceeded (429).
     #[error("rate limit exceeded")]
     RateLimited,
@@ -462,9 +476,9 @@ impl ServerError {
             // unable to tell a capacity refusal from any other 503.
             Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
-            // `HotBufferFull`, `IngestBatchTooLarge`, `CorpusRecovering`
-            // and `HotSnapshot` render fixed text and counts, with nothing
-            // to redact.
+            // `IngestBodyTooLarge`, `HotBufferFull`, `IngestBatchTooLarge`,
+            // `CorpusRecovering` and `HotSnapshot` render fixed text and
+            // counts, with nothing to redact.
             other => other.to_string(),
         }
     }
@@ -499,7 +513,7 @@ impl ServerError {
             Self::WindowPlan(_) => "window_plan",
             Self::WindowMaterialize(_) => "window_materialize",
             Self::Timeout => "timeout",
-            Self::Ingest(_) => "ingest",
+            Self::Ingest(_) | Self::IngestBodyTooLarge { .. } => "ingest",
             Self::RateLimited => "rate_limited",
             Self::TooManyStreams => "too_many_streams",
             // An auth backend outage is the same 503 it was before the
@@ -551,6 +565,7 @@ impl ServerError {
             | Self::WindowMaterialize(_)
             | Self::Timeout
             | Self::Ingest(_)
+            | Self::IngestBodyTooLarge { .. }
             | Self::RateLimited
             | Self::TooManyStreams
             | Self::IngestBatchTooLarge { .. }
@@ -828,6 +843,14 @@ impl IntoResponse for ServerError {
             Self::Ingest(msg) => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::IngestError, msg.clone()),
+            ),
+            // 413 like the router's wire-size refusal, but inside the
+            // envelope: `ingest_error` is the code for an ingest body the
+            // server will not read, and `ingest_batch_too_large` is the hot
+            // buffer's ceiling, which this is not.
+            Self::IngestBodyTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorEnvelope::simple(ErrorCode::IngestError, self.to_string()),
             ),
             Self::BadRequest(msg) => (
                 StatusCode::BAD_REQUEST,

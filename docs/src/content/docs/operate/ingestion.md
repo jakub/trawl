@@ -58,7 +58,8 @@ trawld fills or refuses the envelope fields as follows:
 | `_severity` | Reads `severity`, `severity_text`, and `level`, first mappable. Leaves `_severity` absent when none maps. |
 
 The body limit is `[ingest] max_body_bytes`, 16M by default, and
-`Content-Encoding: gzip` is accepted. Each key gets
+`Content-Encoding: gzip` is accepted. A gzip body must also fit the limit
+once decoded, or trawld answers 413. Each key gets
 `[server.rate_limit] ingest_rpm` requests per minute on this route, 1000 by
 default. For journald and file logs, follow
 [Ship logs with Vector](/getting-started/vector-integration/).
