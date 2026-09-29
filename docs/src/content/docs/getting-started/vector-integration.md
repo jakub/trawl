@@ -288,8 +288,12 @@ This recipe needs `nginx.toml` in `/etc/vector/vector.d/`. The drop-in reads
 
    <!-- proof:nginx-confirm -->
    ```bash
-   sudo grep -F -- "$MARKER" /var/log/nginx/access.log
+   sudo sh -c 'grep -F -- "$1" /var/log/nginx/*.log' sh "$MARKER"
    ```
+
+   This searches the same files the nginx drop-in reads,
+   `/var/log/nginx/*.log`, so a virtual host with its own log file there
+   counts too.
 
    If no line appears, the event can never reach trawld. Look for these
    causes:
@@ -474,8 +478,8 @@ counts the rejection on `/metrics` instead. The rejection counter is
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="invalid_env"` rises | `TRAWL_ENV` fails the env name rule: 1 to 32 characters from `a-z`, `0-9`, `_`, and `-`. `Prod` fails it. Fix `TRAWL_ENV` and restart Vector. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="env_not_allowed"` rises | `TRAWL_ENV` is not in trawld's `[ingest] envs`. Keys are not scoped to an env, so the list is the only check. Add the env to the list and restart trawld, or fix `TRAWL_ENV`. |
 | The check finds nothing, and the rejection counter rises with another `reason` | For a rule an event broke, trawld answered `200` with `rejected` in the body, and Vector counted the batch as a success. The `reason` label names the rule. See the [event contract](/reference/events/). Three reasons refuse the whole request instead, and Vector logs the status. |
-| Vector logs `503`, and `reason="hot_buffer_full"` rises | trawld's hot buffer is full. Vector retries. If it persists, check compaction and disk headroom on the [Health page](/operate/health/). |
-| Vector logs `413` | One request is too large, and Vector drops that batch. Lower the sink's `batch.max_bytes`. If the rejection counter with `reason="ingest_batch_too_large"` rises, the request holds more than the hot buffer admits at once. If no counter rises, the body exceeds trawld's `[ingest] max_body_bytes`, as sent or once gzip is decoded. A decoded body over the limit logs `ingest_body_too_large` on trawld. |
+| Vector logs `503`, and `trawl_hot_buffer_admission_refusals_total{producer="http",kind="full"}` or the rejection counter with `reason="hot_buffer_full"` rises | trawld's hot buffer is full. A request refused before trawld parses it raises only the admission counter. Vector retries. If it persists, check compaction and disk headroom on the [Health page](/operate/health/). |
+| Vector logs `413` | One request is too large, and Vector drops that batch. Lower the sink's `batch.max_bytes`. If `trawl_hot_buffer_admission_refusals_total{producer="http",kind="oversized"}` or the rejection counter with `reason="ingest_batch_too_large"` rises, the request holds more than the hot buffer admits at once. If neither rises, the body exceeds trawld's `[ingest] max_body_bytes`, as sent or once gzip is decoded. A decoded body over the limit logs `ingest_body_too_large` on trawld. |
 | Vector logs `500`, and `reason="wal_failure"` rises | trawld could not write its WAL. Vector retries. Check trawld's journal and the data directory's disk. |
 | The event arrives with `env.defaulted` in `_repairs` | The event arrived with no `env`, so trawld used `[ingest] default_env`. The shipped configuration always sends `env`, and an unset `TRAWL_ENV` sends `prod`. A custom transform dropped `.env`. Set `.env = "${TRAWL_ENV:-prod}"` in it. |
 | Vector logs a certificate verification or hostname error | trawld's generated certificate is valid only for `localhost`, `127.0.0.1`, and `::1`, so no other host can verify it. Give trawld a certificate for the `TRAWL_URL` hostname, as in [Configure TLS](/operate/access/#configure-tls). Get a private CA certificate over a channel you trust. A CA certificate fetched from the endpoint you are configuring proves nothing, because an attacker in the path serves their own. |
