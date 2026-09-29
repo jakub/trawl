@@ -1170,3 +1170,74 @@ async fn doctor_writes_nothing() {
         );
     }
 }
+
+/// Run as root, the doctor cannot pass (#269 AC11, D16). As uid 0 in a
+/// user namespace, against the running installation of
+/// `doctor_running_installation_passes`, the one access check,
+/// `server.data.root`, is `not_sampled`/`ran_as_root`, every content check
+/// still reports and completes (the epoch, the archive's identity and
+/// conformance, both recovery checks, the certificate, the listener and its
+/// health), and so the run is incomplete, exit 3, where the same run as the
+/// test's own user exits 0. Skipped only where user namespaces are
+/// unavailable and `TRAWL_TEST_REQUIRE_USERNS` is not `1`.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_root_run_is_incomplete() {
+    let Some(userns) = Userns::for_test("doctor_root_run_is_incomplete") else {
+        return;
+    };
+    ensure_role().await;
+    let dir = tempfile::tempdir().unwrap();
+    let server = running_server(dir.path()).await;
+    let (config, env, planted) = running_installation(&server, dir.path()).await;
+    let (code, report) = tokio::task::spawn_blocking(move || {
+        let planted: Vec<&str> = planted.iter().map(String::as_str).collect();
+        let (code, stdout, stderr) =
+            run_doctor_in_userns(&userns, None, &doctor_args(&config, "json"), &env);
+        assert_no_values(&stdout, &stderr, &planted);
+        let (table_code, table_out, table_err) =
+            run_doctor_in_userns(&userns, None, &doctor_args(&config, "table"), &env);
+        assert_no_values(&table_out, &table_err, &planted);
+        assert_eq!(table_code, code, "{table_out}");
+        (code, report(&stdout))
+    })
+    .await
+    .expect("the doctor run");
+
+    assert_eq!(
+        open_rows(&report),
+        [(
+            "server.data.root".to_owned(),
+            Outcome::NotSampled,
+            Some("ran_as_root".to_owned())
+        )],
+        "{report:#?}"
+    );
+    let identity = row(&report, "server.identity").detail.clone();
+    assert!(
+        identity
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("uid 0")
+                && detail.contains("access checks are not sampled")),
+        "{identity:?}"
+    );
+    for id in [
+        "server.data.epoch",
+        "server.data.identity",
+        "server.data.conformance",
+        "server.recovery.repin",
+        "server.recovery.publication",
+        "server.tls.material",
+        "server.listener.identity",
+        "server.listener.health",
+    ] {
+        let check = row(&report, id);
+        assert_eq!(
+            (check.outcome, check.blocked_by.as_deref()),
+            (Outcome::Complete, None),
+            "{id}"
+        );
+    }
+    assert_ne!(code, 0, "a root run passed");
+    assert_eq!(code, 3, "{report:#?}");
+    assert!(!server.serve_task.is_finished(), "trawld stopped serving");
+}
