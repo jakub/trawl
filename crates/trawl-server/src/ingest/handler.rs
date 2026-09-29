@@ -601,8 +601,10 @@ fn is_gzip(headers: &HeaderMap) -> bool {
 fn decompress_gzip(data: &[u8], max_body_bytes: usize) -> Result<Vec<u8>, ServerError> {
     let decoder = flate2::read::GzDecoder::new(data);
     // Read up to limit + 1: if we get more than limit bytes, the payload
-    // exceeds the cap and we reject it before allocating further.
-    let mut decompressed = Vec::with_capacity(data.len().min(max_body_bytes));
+    // exceeds the cap and we reject it before allocating further. The
+    // buffer grows with what is actually decoded; nothing is sized from
+    // the request up front.
+    let mut decompressed = Vec::new();
     decoder
         .take(u64::try_from(max_body_bytes.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut decompressed)
