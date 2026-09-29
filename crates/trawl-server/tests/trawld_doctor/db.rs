@@ -359,6 +359,40 @@ async fn writer_pid(conn: &mut PgConnection, database: &str) -> Option<i32> {
     .unwrap()
 }
 
+/// The part of `doctor_takes_no_advisory_lock` over a fresh and a behind
+/// app-state ledger, with the Fleet database at `fleet_url` and the runs in
+/// `dir`. There the migrator's lock samples decide the row, so a sample the
+/// database refused would make `server.app.schema` `not_sampled`.
+async fn lockless_over_ledgers_that_are_not_current(fleet_url: &str, dir: &Path) {
+    use trawl_server::store::migrations::{BASELINE_VERSION, MIGRATOR};
+
+    let fresh = common::create_app_database().await;
+    let behind = common::create_app_database().await;
+    let mut conn = admin(&behind).await;
+    MIGRATOR
+        .run_to(BASELINE_VERSION, &mut conn)
+        .await
+        .expect("apply the baseline");
+    conn.close().await.unwrap();
+    for (label, app) in [("fresh", fresh), ("behind", behind)] {
+        forbid_advisory_locks(&app).await;
+        let app = lockless(&app);
+        let fleet = lockless(fleet_url);
+        let home = dir.to_owned();
+        let (_, report, stderr) =
+            tokio::task::spawn_blocking(move || doctor_env(&home, &fleet, &app))
+                .await
+                .unwrap();
+        database_rows_complete(&report)
+            .unwrap_or_else(|why| panic!("{label}: {why}: {report:?}\n{stderr}"));
+        assert_eq!(
+            verdict(&report, "server.app.schema"),
+            (Outcome::Complete, Some("will_initialize")),
+            "{label}: {report:?}"
+        );
+    }
+}
+
 /// While a real trawld holds its writer lock, the doctor runs as
 /// [`LOCKLESS`] on databases where that role may execute no advisory-lock
 /// function, and every database row completes: had the doctor called one,
@@ -368,6 +402,11 @@ async fn writer_pid(conn: &mut PgConnection, database: &str) -> Option<i32> {
 /// back sees the doctor's backends on both databases and no advisory lock
 /// held or awaited by either. Afterwards the same trawld session still
 /// holds the writer lock and trawld still serves.
+///
+/// A current ledger is `complete` whatever the migrator's lock samples
+/// show, so a refused call among those samples would change no row there.
+/// The same run over a fresh and a behind app-state ledger closes that gap:
+/// each is `complete`, `will_initialize`, only when both samples answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn doctor_takes_no_advisory_lock() {
     use std::sync::Arc;
@@ -457,6 +496,8 @@ async fn doctor_takes_no_advisory_lock() {
     );
     assert_eq!(writer_pid(&mut admin_conn, &app_db).await, Some(before));
     admin_conn.close().await.unwrap();
+
+    lockless_over_ledgers_that_are_not_current(&server.fleet_db_url, dir.path()).await;
 }
 
 /// Every app-state ledger boot refuses is `failed` with its own stable
