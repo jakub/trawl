@@ -37,8 +37,12 @@ parsed, err = parse_nginx_log(.message, "combined")
 if err == null {
   ._time = parsed.timestamp
   .src_ip = parsed.client
-  .method = parsed.method
-  .uri = parsed.path
+  # combined format keeps the request line whole; split method and path from it
+  request, err = parse_regex(string(parsed.request) ?? "", r'^(?P<method>\S+) (?P<path>\S+)')
+  if err == null {
+    .method = request.method
+    .uri = request.path
+  }
   .status = to_int(parsed.status)
   .message = .message
 
