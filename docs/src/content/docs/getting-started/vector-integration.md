@@ -179,7 +179,7 @@ The shipped sink behaves as follows:
 | Buffer | Disk, 1 GB under `/var/lib/vector`. Sources block when it is full. |
 | Retries | `5xx`, `408`, and `429`, with 1 to 30 second backoff. Other `4xx` responses drop the batch. |
 | Concurrency | Adaptive |
-| Acknowledgements | Enabled. A source advances only after trawld accepts the batch. |
+| Acknowledgements | Enabled. The journald and file sources advance only after trawld accepts the batch. Vector 0.57's `docker_logs` source does not support acknowledgements, so a Docker line in a batch that trawld refuses is lost. |
 
 ## Prove the first event arrived
 
