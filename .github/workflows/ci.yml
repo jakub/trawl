@@ -190,10 +190,12 @@ jobs:
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
-        # tmpfs data directory, as in docker-compose.dev.yml.
+        # tmpfs data directory, as in docker-compose.dev.yml. The health
+        # check asks over TCP: the image's init-time server listens only on
+        # the unix socket and is stopped before the real one starts.
         options: >-
           --tmpfs /var/lib/postgresql
-          --health-cmd="pg_isready -U postgres"
+          --health-cmd="pg_isready -h 127.0.0.1 -U postgres"
           --health-interval=2s
           --health-timeout=3s
           --health-retries=15
@@ -289,10 +291,12 @@ jobs:
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
-        # tmpfs data directory, as in docker-compose.dev.yml.
+        # tmpfs data directory, as in docker-compose.dev.yml. The health
+        # check asks over TCP: the image's init-time server listens only on
+        # the unix socket and is stopped before the real one starts.
         options: >-
           --tmpfs /var/lib/postgresql
-          --health-cmd="pg_isready -U postgres"
+          --health-cmd="pg_isready -h 127.0.0.1 -U postgres"
           --health-interval=2s
           --health-timeout=3s
           --health-retries=15

@@ -12,7 +12,10 @@
 set -euo pipefail
 
 container=$1
-pg() { docker exec "$container" psql -U postgres -v ON_ERROR_STOP=1 -tA "$@"; }
+# TCP, like the service health check: the image's init-time server listens
+# only on the unix socket and stops before the real one starts, so a socket
+# connection could land on a server that is shutting down.
+pg() { docker exec "$container" psql -h 127.0.0.1 -U postgres -v ON_ERROR_STOP=1 -tA "$@"; }
 
 # Each -c runs on its own, so ALTER SYSTEM is outside a transaction block.
 pg -c 'ALTER SYSTEM SET fsync = off' \
