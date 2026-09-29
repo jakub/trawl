@@ -7,16 +7,21 @@ import io
 import json
 from pathlib import Path
 import shutil
+import os
 import subprocess
 import tempfile
+import time
 import tomllib
 import zipfile
 
 MANIFEST = Path(__file__).with_name("duckdb-runtime.json")
 
 
-def write_atomic(path, data):
-    """Readers see a complete file even during concurrent builds."""
+def write_atomic(path, data, mtime=None):
+    """Readers see a complete file even during concurrent builds.
+
+    A replaced file gets `mtime` when one is given, set before the rename.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     # Preserve Cargo fingerprints when another feature/profile build stages
     # the same runtime, while replacing corrupted files with verified bytes.
@@ -27,9 +32,23 @@ def write_atomic(path, data):
         temporary_path = Path(temporary.name)
     try:
         temporary_path.chmod(0o644)
+        if mtime is not None:
+            os.utime(temporary_path, (mtime, mtime))
         temporary_path.replace(path)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def archived_mtime(zipped, name, ceiling):
+    """The archive entry's timestamp, as unzip would set it, never after `ceiling`.
+
+    trawl-core's build script watches the library copies it stages, and Cargo
+    reruns a build script whose watched file is newer than that script's last
+    start. A copy stamped with the time of writing would be exactly that, so
+    the next Cargo command would rerun the script and rebuild every crate above
+    trawl-core. The ceiling bounds a future-dated entry to one extra rerun.
+    """
+    return min(time.mktime(zipped.getinfo(name).date_time + (0, 0, -1)), ceiling)
 
 
 def pinned_runtime(source, target):
@@ -44,6 +63,7 @@ def pinned_runtime(source, target):
 
 
 def prepare(source, target, output, cache=None, deps=None):
+    started = time.time()
     manifest, archive, checksum = pinned_runtime(source, target)
     # Cargo profiles share a content-addressed archive cache. Release callers
     # keep the ZIP alongside their prepared runtime as before.
@@ -73,9 +93,10 @@ def prepare(source, target, output, cache=None, deps=None):
             # command owns its requested output and may repair extracted files.
             for name in (library, "duckdb.h"):
                 content = zipped.read(name)
-                write_atomic(output / name, content)
+                mtime = archived_mtime(zipped, name, started)
+                write_atomic(output / name, content, mtime)
                 if name == library and deps is not None:
-                    write_atomic(deps / library, content)
+                    write_atomic(deps / library, content, mtime)
         # DuckDB's release archives do not consistently contain the license.
         write_atomic(output / "LICENSE.duckdb", Path(__file__).with_name("duckdb-LICENSE").read_bytes())
         metadata = {"version": manifest["version"], "archive": archive, "sha256": checksum}
@@ -85,6 +106,7 @@ def prepare(source, target, output, cache=None, deps=None):
 
 def verify(source, target, runtime, deps):
     """Check an operator-provided runtime without writing to that directory."""
+    started = time.time()
     manifest, archive, checksum = pinned_runtime(source, target)
     if deps.resolve().is_relative_to(runtime.resolve()):
         raise SystemExit("DUCKDB_LIB_DIR must be separate from the Cargo loader output directory")
@@ -101,6 +123,7 @@ def verify(source, target, runtime, deps):
     library = "libduckdb.dylib" if "apple" in target else "libduckdb.so"
     with zipfile.ZipFile(io.BytesIO(data)) as zipped:
         contents = {name: zipped.read(name) for name in (library, "duckdb.h")}
+        library_mtime = archived_mtime(zipped, library, started)
     contents["LICENSE.duckdb"] = Path(__file__).with_name("duckdb-LICENSE").read_bytes()
     for name, expected in contents.items():
         if existing(name) != expected:
@@ -114,7 +137,7 @@ def verify(source, target, runtime, deps):
         raise SystemExit("DUCKDB_LIB_DIR runtime.json does not match the pinned runtime; input left unchanged")
     # Stage the bytes already checked against the ZIP, never a later reread of
     # the external library. Only the Cargo-owned loader directory is writable.
-    write_atomic(deps / library, contents[library])
+    write_atomic(deps / library, contents[library], library_mtime)
 
 
 def stage(binaries, runtime, output, target, source_sha, tooling_sha, cli_only, source, image_only=False):

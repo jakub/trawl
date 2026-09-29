@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 
@@ -99,6 +100,25 @@ class CargoRuntime(unittest.TestCase):
                 self.assertIn(f"cargo:rustc-link-search=native={runtime}", result.stdout)
                 self.assertEqual(deps.read_bytes(), target.encode())
                 self.assertEqual((runtime / deps.name).read_bytes(), target.encode())
+
+    def test_the_runs_own_writes_never_look_newer_than_its_start(self):
+        # Cargo reruns a build script, and rebuilds every crate above it, when
+        # a watched path is missing or newer than the script's last start.
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit):
+                env, runtime, deps, archive = self.runtime("x86_64-unknown-linux-gnu", explicit=explicit)
+                started = time.time()
+                result = self.run_helper(env)
+                watched = [Path(line.removeprefix("cargo:rerun-if-changed="))
+                           for line in result.stdout.splitlines()
+                           if line.startswith("cargo:rerun-if-changed=")]
+                # A deleted loader copy must still rerun the script and be restored.
+                self.assertIn(deps, watched)
+                for path in watched:
+                    self.assertLess(path.stat().st_mtime, started, path)
+                if not explicit:
+                    cache = archive.parent.parent
+                    self.assertFalse([p for p in watched if p.is_relative_to(cache)])
 
     def test_profiles_reuse_archive_and_repair_corrupted_extraction(self):
         target = "x86_64-unknown-linux-gnu"
