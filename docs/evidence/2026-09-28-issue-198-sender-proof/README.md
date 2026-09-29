@@ -16,8 +16,9 @@ substitution.
 ## Tested commit
 
 - Commit C: `TODO: full SHA`
-- Guard: `git diff --quiet C HEAD -- . ':!docs/evidence'` exits 0 at the
-  PR head. Any later change outside `docs/evidence/` needs a new run.
+- Guard: `git diff --quiet C HEAD -- . ':!docs/evidence/2026-09-28-issue-198-sender-proof/README.md' ':!docs/evidence/2026-09-28-issue-198-sender-proof/transcript.txt'`
+  exits 0 at the PR head. Any later change to another file, `run.py`
+  included, needs a new run.
 
 ## Environment
 
@@ -44,8 +45,8 @@ python3 docs/evidence/2026-09-28-issue-198-sender-proof/run.py --build \
 Send standard output to a file outside the checkout. A file inside it makes
 the tree dirty before `run.py` checks that the tree is clean. When the run
 passes, copy the file to `transcript.txt` in this directory and commit it
-separately. That commit may change only files under `docs/evidence/`, so
-the tested-commit guard above still holds.
+separately. That commit may change only `transcript.txt` and this README,
+so the tested-commit guard above still holds.
 
 `--build` builds the three distribution `.deb` files from HEAD in the pinned
 container that `crates/trawl-server/debian/tests/crashdump-harness.sh` uses.
