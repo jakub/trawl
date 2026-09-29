@@ -62,19 +62,81 @@ jobs:
             python3 ci/changed-scopes.py --all | tee -a "$GITHUB_OUTPUT"
           fi
 
-  vector-collector:
-    name: Vector collector delivery
+  repo-checks:
+    # Seven checks that each do under a minute of work, run as steps of one
+    # job. As separate jobs, each paid for its own runner, checkout and tool
+    # setup, and took one of the account's 40 concurrent job slots; a pull
+    # request that touches crates starts about 30 jobs at once. Every check
+    # step runs even when an earlier one fails (`!cancelled()`), and each has
+    # its own timeout, so one hung check cannot hide the others' results.
+    name: repository checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      - name: Install collector TLS test tooling
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl
-      - name: Validate and exercise the Debian collector with Vector 0.57.0
+      # openssl for the collector TLS fixtures, dpkg-dev for the release
+      # source tests' Debian package checks.
+      - name: Install Debian test tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl dpkg-dev
+      # The release source tests compile the actual Cargo helper, then exercise
+      # its target and integrity boundaries with cached fixtures and no
+      # downloader on PATH. cargo-deny shells out to `cargo metadata`.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
+        with:
+          toolchain: 1.98.0
+          components: rustfmt
+      # Binary install instead of EmbarkStudios/cargo-deny-action, which is a
+      # Docker container action; install-action is already pinned here.
+      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-deny
+        with:
+          tool: cargo-deny
+      # Publication DAG tests use Helm's YAML parser, avoiding another YAML
+      # dependency, and the chart render test runs Helm itself.
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: '22'
+      - name: Install checksum-verified promtool 3.14.0 (CI only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/prometheus-3.14.0.linux-amd64.tar.gz"
+          curl --fail --location --retry 3 \
+            https://github.com/prometheus/prometheus/releases/download/v3.14.0/prometheus-3.14.0.linux-amd64.tar.gz \
+            --output "$archive"
+          echo "f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" prometheus-3.14.0.linux-amd64/promtool
+
+      - name: rustfmt
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: cargo fmt --all --check
+      - name: cargo-deny
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: cargo deny check
+      - name: deb crash-dump packaging assertions
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: bash crates/trawl-server/debian/tests/packaging.sh
+      - name: release source resolution
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+      # render.sh finishes in about a minute.
+      - name: helm template
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: bash chart/trawl/tests/render.sh
+        env:
+          PROMTOOL: ${{ runner.temp }}/prometheus-3.14.0.linux-amd64/promtool
+      - name: Vector collector delivery (Debian collector with Vector 0.57.0)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
         shell: bash
         run: |
           set -euo pipefail
@@ -87,78 +149,19 @@ jobs:
           tar -xzf "$fixture_dir/vector.tar.gz" -C "$fixture_dir"
           VECTOR_BIN="$fixture_dir/vector-x86_64-unknown-linux-gnu/bin/vector" \
             python3 scripts/test-vector-collector.py
-
-  release-source:
-    name: release source resolution
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - name: Install Debian package test tooling
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dpkg-dev
-      # Runtime tests compile the actual Cargo helper, then exercise its target
-      # and integrity boundaries with cached fixtures and no downloader on PATH.
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-      # Publication DAG tests use Helm's YAML parser, avoiding another YAML dependency.
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
-      - run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
-
-  helm-template:
-    name: helm template
-    runs-on: ubuntu-24.04
-    # render.sh finishes in about a minute; a hung test must fail the check,
-    # not hold it pending for the six-hour default.
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
-      - name: Install checksum-verified promtool 3.14.0 (CI only)
-        shell: bash
+      # Last, because the rebuild writes node_modules into the vendor
+      # directories, which the checks above never expect to see.
+      - name: web UI vendor bundle drift
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
         run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/prometheus-3.14.0.linux-amd64.tar.gz"
-          curl --fail --location --retry 3 \
-            https://github.com/prometheus/prometheus/releases/download/v3.14.0/prometheus-3.14.0.linux-amd64.tar.gz \
-            --output "$archive"
-          echo "f665c6da19eb7ba399c915d30c7d9793c9b417bf8a749b504bc470678631478d  $archive" | sha256sum --check
-          tar -xzf "$archive" -C "$RUNNER_TEMP" prometheus-3.14.0.linux-amd64/promtool
-      - run: bash chart/trawl/tests/render.sh
-        env:
-          PROMTOOL: ${{ runner.temp }}/prometheus-3.14.0.linux-amd64/promtool
-
-  deb-packaging:
-    name: deb crash-dump packaging assertions
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-      - run: bash crates/trawl-server/debian/tests/packaging.sh
-
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-          components: rustfmt
-      - run: cargo fmt --all --check
+          (cd crates/trawl-web-ui/vendor && bash build.sh)
+          (cd crates/fleet-ui/vendor && bash build.sh)
+          git diff --exit-code \
+            crates/trawl-web-ui/vendor/codemirror.js \
+            crates/trawl-web-ui/vendor/uplot.js \
+            crates/trawl-web-ui/vendor/uplot.css \
+            crates/fleet-ui/vendor/paper-shaders.js
 
   clippy:
     name: clippy
@@ -355,23 +358,6 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --no-default-features
 
-  deny:
-    name: cargo-deny
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # Binary install instead of EmbarkStudios/cargo-deny-action, which is a
-      # Docker container action; install-action is already pinned here.
-      # cargo-deny shells out to `cargo metadata`, so we need a toolchain.
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
-        with:
-          toolchain: 1.98.0
-      - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # cargo-deny
-        with:
-          tool: cargo-deny
-      - run: cargo deny check
-
   wasm-check:
     name: wasm32 clippy (web UI + fleet-ui)
     runs-on: ubuntu-24.04
@@ -393,29 +379,6 @@ jobs:
       # link the vendored snippet), the second covers the backdrop itself.
       - run: cargo clippy -p fleet-ui --target wasm32-unknown-unknown
       - run: cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere
-
-  vendor-drift:
-    name: web UI vendor bundle drift
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
-        with:
-          node-version: '22'
-      - name: Rebuild vendor bundles
-        working-directory: crates/trawl-web-ui/vendor
-        run: bash build.sh
-      - name: Rebuild fleet-ui vendor bundle
-        working-directory: crates/fleet-ui/vendor
-        run: bash build.sh
-      - name: Fail if committed bundles drifted
-        run: |
-          git diff --exit-code \
-            crates/trawl-web-ui/vendor/codemirror.js \
-            crates/trawl-web-ui/vendor/uplot.js \
-            crates/trawl-web-ui/vendor/uplot.css \
-            crates/fleet-ui/vendor/paper-shaders.js
 
   trunk-build:
     name: web UI release build (trunk)
