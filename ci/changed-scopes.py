@@ -37,8 +37,17 @@ SCOPES = {
     # the crate's e2e/ directory.
     'web_mutations': ('crates/trawl-web-ui', ()),
     # server-mutations runs trawl-server's nextest filters under the
-    # workspace nextest config.
-    'server_mutations': ('crates/trawl-server', ('.config/nextest.toml',)),
+    # workspace nextest config, against the postgres the helper script
+    # configures. trawl-core's host build prepares the DuckDB runtime with
+    # scripts/release/distribution.py from the manifest and license beside
+    # it (build_support/duckdb.rs); the SPA's wasm32 build skips that.
+    'server_mutations': ('crates/trawl-server', (
+        '.config/nextest.toml',
+        'ci/postgres-no-durability.sh',
+        'scripts/release/distribution.py',
+        'scripts/release/duckdb-runtime.json',
+        'scripts/release/duckdb-LICENSE',
+    )),
 }
 
 DEPENDENCY_KINDS = ('dependencies', 'dev-dependencies', 'build-dependencies')

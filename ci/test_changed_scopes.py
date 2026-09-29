@@ -56,9 +56,14 @@ class Scopes(unittest.TestCase):
                 self.assertEqual(self.scopes(path),
                                  {'web_mutations': True, 'server_mutations': True})
 
-    def test_the_nextest_config_gates_only_the_server(self):
-        self.assertEqual(self.scopes('.config/nextest.toml'),
-                         {'web_mutations': False, 'server_mutations': True})
+    def test_server_only_inputs_outside_the_crates_gate_only_the_server(self):
+        for path in ('.config/nextest.toml', 'ci/postgres-no-durability.sh',
+                     'scripts/release/distribution.py',
+                     'scripts/release/duckdb-runtime.json',
+                     'scripts/release/duckdb-LICENSE'):
+            with self.subTest(path=path):
+                self.assertEqual(self.scopes(path),
+                                 {'web_mutations': False, 'server_mutations': True})
 
     def test_a_crate_name_prefix_is_not_the_crate(self):
         # crates/trawl-web is the browser proxy, not crates/trawl-web-ui.
