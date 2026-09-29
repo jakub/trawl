@@ -2438,19 +2438,12 @@ impl CatalogStore {
     /// marker so `DATABASE_URL` repoints and data-root restores are
     /// self-detecting).
     pub async fn catalog_id(&self) -> Result<String, StoreError> {
-        let id: String = sqlx::query_scalar("SELECT catalog_id::text FROM catalog_state")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(id)
+        Ok(read_catalog_id(&self.pool).await?)
     }
 
     /// Whether the boot conformance pass has completed for this catalog.
     pub async fn is_conformed(&self) -> Result<bool, StoreError> {
-        let conformed: bool =
-            sqlx::query_scalar("SELECT conformed_at IS NOT NULL FROM catalog_state")
-                .fetch_one(&self.pool)
-                .await?;
-        Ok(conformed)
+        Ok(read_conformed(&self.pool).await?)
     }
 
     /// Record completion of boot rewrites and service observation backfill.
@@ -2471,6 +2464,30 @@ impl CatalogStore {
             .await?;
         Ok(())
     }
+}
+
+/// `catalog_state.catalog_id`, as [`CatalogStore::catalog_id`] reads it.
+/// A `SELECT` on any executor, so `trawld --doctor` reads it on its own
+/// read-only connection, without a pool.
+///
+/// # Errors
+/// Database errors, and `RowNotFound` when `catalog_state` has no row.
+pub async fn read_catalog_id<'e>(conn: impl sqlx::PgExecutor<'e>) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar("SELECT catalog_id::text FROM catalog_state")
+        .fetch_one(conn)
+        .await
+}
+
+/// Whether `catalog_state.conformed_at` is set, as
+/// [`CatalogStore::is_conformed`] reads it. A `SELECT` on any executor, as
+/// [`read_catalog_id`].
+///
+/// # Errors
+/// Database errors, and `RowNotFound` when `catalog_state` has no row.
+pub async fn read_conformed<'e>(conn: impl sqlx::PgExecutor<'e>) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT conformed_at IS NOT NULL FROM catalog_state")
+        .fetch_one(conn)
+        .await
 }
 
 #[cfg(test)]

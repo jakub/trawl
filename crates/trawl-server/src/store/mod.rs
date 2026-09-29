@@ -68,6 +68,42 @@ pub mod migrations;
 /// `cleanup_stale_runs` stomp a live sibling's runs.
 const ADVISORY_LOCK_KEY: i64 = 0x0074_7261_776c_2131; // "trawl!1"
 
+/// Whether some session holds trawld's sole-writer lock
+/// ([`ADVISORY_LOCK_KEY`]) on the database `conn` is connected to.
+/// Observed in `pg_locks`, never taken (`trawld --doctor`, ADR-0047). A
+/// held lock says some trawld owns this database, not that it runs on this
+/// host.
+///
+/// # Errors
+/// Database errors.
+pub async fn writer_lock_held(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    advisory_lock_granted(conn, ADVISORY_LOCK_KEY).await
+}
+
+/// Whether a session holds the session- or transaction-level advisory
+/// lock `key` on the database `conn` is connected to, as `pg_locks` shows
+/// it now. A single `bigint` key appears with its high 32 bits in
+/// `classid`, its low 32 bits in `objid`, and `objsubid` 1; `pg_locks`
+/// lists every database's locks, so the row must also name this one.
+/// Waiters (`granted = false`) do not hold it.
+pub(crate) async fn advisory_lock_granted(
+    conn: &mut PgConnection,
+    key: i64,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_locks
+            WHERE locktype = 'advisory' AND granted AND objsubid = 1
+              AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+              AND classid::int8 = ($1 >> 32) & 4294967295
+              AND objid::int8 = $1 & 4294967295
+        )",
+    )
+    .bind(key)
+    .fetch_one(conn)
+    .await
+}
+
 /// Advisory lock key serialising the two transactions that change which
 /// fields the catalog pins: a repin's claim ([`RepinStore::claim`]) and pin
 /// gc's purge ([`CatalogStore::delete_pins`]).

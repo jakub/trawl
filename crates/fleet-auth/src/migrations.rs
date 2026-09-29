@@ -76,17 +76,33 @@ async fn migrate_with(pool: &PgPool, migrator: &Migrator) -> Result<(), SchemaEr
 /// One read-only snapshot prevents ledger reads spanning a concurrent commit.
 pub async fn validate_schema(pool: &PgPool) -> Result<(), SchemaError> {
     let mut conn = pool.acquire().await?.detach();
-    let result: Result<(), SchemaError> = async {
-        sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut conn)
-            .await?;
-        check_history(&mut conn, &MIGRATOR, true).await
-    }
-    .await;
-    // Closing rolls back the read-only transaction and never recycles it.
+    let result = validate_schema_on(&mut conn).await;
+    // Closing never recycles the connection, and rolls back the snapshot
+    // when validation stopped inside it.
     let close = conn.close().await;
     result?;
     close?;
+    Ok(())
+}
+
+/// [`validate_schema`] on a connection the caller owns, for a caller that
+/// has no pool, such as `trawld --doctor` (ADR-0021 ruling 3). The
+/// read-only snapshot is rolled back before this returns, so the caller
+/// gets its connection back outside any transaction; if the future is
+/// dropped part-way, the connection may still be inside the snapshot, and
+/// the caller should close it.
+///
+/// # Errors
+/// As [`validate_schema`]. A validation error wins over an error rolling
+/// the snapshot back.
+pub async fn validate_schema_on(conn: &mut PgConnection) -> Result<(), SchemaError> {
+    let mut snapshot = conn
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
+    let result = check_history(&mut snapshot, &MIGRATOR, true).await;
+    let rollback = snapshot.rollback().await;
+    result?;
+    rollback?;
     Ok(())
 }
 

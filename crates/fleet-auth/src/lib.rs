@@ -37,7 +37,7 @@ pub mod middleware;
 #[cfg(feature = "keystore")]
 pub use cache::{VerificationCache, VerificationCacheKey, VerificationCacheStats};
 #[cfg(feature = "keystore")]
-pub use migrations::{MIGRATOR, SchemaError, migrate, validate_schema};
+pub use migrations::{MIGRATOR, SchemaError, migrate, validate_schema, validate_schema_on};
 #[cfg(feature = "keystore")]
 pub use store::KeyStore;
 
