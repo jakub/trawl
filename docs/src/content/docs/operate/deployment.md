@@ -526,9 +526,47 @@ into your existing Prometheus installation. Plain rules include a matching
 HTTPS scrape example. Helm rule creation is opt-in and independent of
 ServiceMonitor creation; neither option installs a monitoring system.
 
-1. Create a human key with [Create roles and keys](/operate/access/#create-roles-and-keys).
+1. Run the server doctor on the host, as the service user and with the
+   service's environment. It checks the two databases, the data root, the
+   certificate, and trawld's own listener, and it changes nothing. The
+   [reference](/reference/configuration/#check-the-installation-with-trawld---doctor)
+   lists every check.
 
-2. Save the server in a [CLI profile](/start/connect/) with that key. When
+   On Debian, run it in a transient unit with the service's user, environment
+   file, and working directory:
+
+   ```bash
+   sudo systemd-run --pipe --wait --collect -p User=trawl -p Group=trawl -p EnvironmentFile=-/etc/default/trawld -p WorkingDirectory=/var/lib/trawl -E HOME=/var/lib/trawl trawld --doctor --config /etc/trawl/trawld.toml
+   ```
+
+   This does not reproduce the unit's sandbox: `ProtectSystem`,
+   `ProtectHome`, `PrivateTmp`, and `RestrictAddressFamilies`. A path or
+   socket that the sandbox blocks can pass here and still fail under the
+   unit.
+
+   On Helm, run it in the `trawld` container of the pod:
+
+   ```bash
+   kubectl -n trawl exec trawl-0 -c trawld -- trawld --doctor --config /etc/trawl/trawld.toml
+   ```
+
+   In the trial, run it in the `trawld` service from the trial's project:
+
+   ```bash
+   docker compose exec trawld trawld --doctor --config /var/lib/trawl/trial/trawld.toml
+   ```
+
+   From a tarball, run the same command as the `trawl` user, with the
+   environment your supervisor gives `trawld`.
+
+   Expect exit code 0. A server that has never started reports rows with the
+   reason `will_initialize` and exits with code 3, because its listener does
+   not answer yet. A row with `failed` names its next action. Do not run the
+   doctor as root: a root run cannot exit 0.
+
+2. Create a human key with [Create roles and keys](/operate/access/#create-roles-and-keys).
+
+3. Save the server in a [CLI profile](/start/connect/) with that key. When
    the API certificate is from a CA the system trusts:
 
    ```toml
@@ -555,7 +593,7 @@ ServiceMonitor creation; neither option installs a monitoring system.
 
    Then run `chmod 0600 ~/.config/trawl/config.toml`.
 
-3. Run the doctor against the profile. If the browser UI is enabled, add its
+4. Run the client doctor against the profile. If the browser UI is enabled, add its
    origin with `--web-url`:
 
    ```bash
@@ -572,9 +610,9 @@ ServiceMonitor creation; neither option installs a monitoring system.
    [CLI reference](/reference/cli/#doctor-mode) lists every check.
 
    `web.origin` shows that `trawl-web` accepts the origin. It does not show
-   that `trawl-web` reaches `trawld`. The sign-in in step 5 does.
+   that `trawl-web` reaches `trawld`. The sign-in in step 6 does.
 
-4. Run one bounded query:
+5. Run one bounded query:
 
    ```bash
    trawl -p prod query 'last=15m | head 10'
@@ -583,7 +621,7 @@ ServiceMonitor creation; neither option installs a monitoring system.
    Expect rows with `service` = `trawld`. Internal telemetry is on by default,
    so the daemon's own events appear before any sender connects.
 
-5. If the browser UI is enabled, open the origin and log in with the human
+6. If the browser UI is enabled, open the origin and log in with the human
    key. The search page loads.
 
 If a step fails, continue with [Check health and stalled work](/operate/health/).

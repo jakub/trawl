@@ -33,6 +33,150 @@ accept operator-defined names; each retention entry still requires supported
 fields. Error messages identify the setting path without printing its value
 or the surrounding configuration text.
 
+### Check the installation with `trawld --doctor`
+
+```bash
+trawld --doctor --config /etc/trawl/trawld.toml
+trawld --doctor --config /etc/trawl/trawld.toml --format json
+```
+
+`--doctor` checks, from the server host, whether trawld will start and serve
+with this configuration. It reads the configuration file and the process
+environment, connects to the two databases and to trawld's own listener, and
+prints one row per check. `--format` takes `table` (the default) or `json`.
+Both formats carry the same facts, and the JSON form is versioned.
+
+The command requires `--config PATH` on the command line. `TRAWL_CONFIG` alone
+is a usage error and exits with code 2. `--doctor` does not read another
+process's environment and does not source a systemd `EnvironmentFile`. Run it
+as the service user and with the service's environment, as
+[Verify the installation](/operate/deployment/#verify-the-installation) shows
+for each install channel. To check a server from a client host, use
+[`trawl doctor`](/reference/cli/#doctor-mode).
+
+#### Checks
+
+A check runs only when its prerequisite completed. Otherwise the check is
+`not_sampled` with the reason `blocked`, and its row names the prerequisite in
+`blocked_by`. The checks run in the order below.
+
+| Check | Asserts | Prerequisite |
+|-------|---------|--------------|
+| `server.config` | The file loads and validates as `--check-config` checks it. | none |
+| `server.identity` | Names the effective user and uid of the run. | none |
+| `server.fleet.connect` | A connection to the Fleet database authenticates. | `server.config` |
+| `server.fleet.schema` | The Fleet migration ledger is current. | `server.fleet.connect` |
+| `server.app.connect` | A connection to the app-state database authenticates. | `server.config` |
+| `server.app.schema` | trawld's boot admits the app-state migration ledger. | `server.app.connect` |
+| `server.app.writer` | Reports whether a session holds trawld's writer lock. A held lock does not prove that trawld runs on this host. | `server.app.connect` |
+| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. | `server.config` |
+| `server.data.epoch` | The data root's `EPOCH` is current, or boot initializes it. | `server.data.root` |
+| `server.data.identity` | The data root belongs to the catalog in the app-state database. | `server.data.epoch`, `server.app.schema` |
+| `server.data.conformance` | Conformance is recorded for this catalog and data root, or boot runs the pass. A query-only node reports `not_configured`. | `server.data.identity` |
+| `server.recovery.repin` | There is no repin marker, or one whose phase boot completes. | `server.data.epoch` |
+| `server.recovery.publication` | The publication and rollup markers are readable and well formed. | `server.data.epoch` |
+| `server.tls.material` | The certificate and key parse, match, and are in date, or boot generates them. | `server.config` |
+| `server.listener.identity` | The listener presents exactly the certificate on disk. | `server.tls.material` |
+| `server.listener.health` | The health endpoint answers. One row per reported check follows as `server.listener.health.<key>`. | `server.listener.identity` |
+
+The listener checks connect to trawld's own listener without sending an API
+key. They accept only the certificate that the configuration names or that
+trawld generated, and they make no claim about host names. `trawl doctor`
+proves host names from a client.
+
+#### Outcomes
+
+| Outcome | Meaning |
+|---------|---------|
+| `complete` | The doctor observed the assertion hold. |
+| `failed` | The doctor observed evidence against the assertion. Fix it before you start trawld. |
+| `not_configured` | The configuration turns off what the check needs, such as conformance on a query-only node. |
+| `not_sampled` | The doctor could not look. The `reason` field says why. |
+
+A `not_sampled` row is neither a pass nor a failure. Its reason is one of the
+stable codes, among them `blocked`, `permission_denied`, `timed_out`,
+`not_listening`, `migration_in_progress`, `unproven`, and `ran_as_root`. Only
+`trawld --doctor` reports these codes:
+
+| Reason | Meaning |
+|--------|---------|
+| `session_not_read_only` | The database session did not start read-only with the doctor's timeouts, so the doctor sent no other query. Check the URL's `options` and `PGOPTIONS`. Connect to the database server directly, not through a pooler that drops startup options. |
+| `connection_lost` | A database connection broke after it authenticated. |
+| `query_failed` | A read-only database query returned an error after the connection authenticated. |
+| `interrupted` | The listener closed or reset the connection before the TLS handshake or the health answer was whole. |
+| `ambiguous_address` | The listener address resolves to more than one address, and none of them served the certificate on disk. Set `[server] http_addr` to the one IP address and port that trawld listens on. |
+
+Some state exists only because trawld's first start creates it: an empty or
+behind app-state schema, an absent or empty data root on an ingest node, and
+an absent generated certificate. For that state the doctor asks whether the
+boot will accept it. When it will, the check is `complete` with the reason
+`will_initialize`. Every state the boot refuses is `failed`: an empty or behind
+Fleet schema (run `fleet-admin migrate`), an unsupported epoch, an owned root
+without an epoch, and a dirty, ahead, or foreign migration ledger.
+
+A fresh installation that has not started yet reports `will_initialize` rows,
+and its listener is `not_sampled` with the reason `not_listening`. It exits
+with code 3. It exits with code 1 only when something must change before the
+first start.
+
+A migrator that holds its lock while a schema is fresh or behind gives
+`not_sampled` with the reason `migration_in_progress`. A current schema is
+`complete` even while a migrator holds its lock. A dirty ledger is always
+`failed`.
+
+A catalog mismatch is `failed` on every node type. The data root belongs to
+another catalog than the app-state database. Choose one way out:
+
+- Point the app-state database at the catalog that owns the archive.
+- Restore the app-state dump and the data archive from the same backup.
+- Point `[data] path` at a new root.
+- Start trawld to adopt the archive on purpose. This is lossy when the catalog
+  already pins fields.
+
+On an ingest node the boot adopts the archive through its conformance pass
+instead of refusing it, so the doctor is stricter than the boot here. Adopting
+is a decision for you to make, not for the doctor.
+
+#### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | `pass`: every check is `complete` or `not_configured`. |
+| `1` | `fail`: at least one check is `failed`. |
+| `2` | Usage error, such as a missing `--config`. |
+| `3` | `incomplete`: no check failed, but at least one was `not_sampled`. |
+
+A failure outweighs a check that could not look. The same codes apply to
+`trawl doctor`.
+
+#### Run as root
+
+Root reads what the service user may not, so a root run cannot prove that the
+service user has access. An access check, `server.data.root`, is `not_sampled`
+with the reason `ran_as_root`. Content checks still report what they read: a
+certificate parses, an epoch is current. A check that waits on the access check
+still runs. A root run never exits `0`. Run the doctor as the service user to
+get an answer about access.
+
+#### Side effects
+
+The doctor writes nothing and takes no lock. It runs no migration and starts
+no crash-dump capture, even when `TRAWL_CRASH_DUMP_DIR` is set. It opens
+database sessions as read-only and reads only bounded amounts of data in
+bounded time. It never sends an API key and never sends an event.
+
+One side effect remains. A probe that makes the running trawld answer 503
+emits that server's `http_failure` telemetry event
+([ADR-0040](https://github.com/jakub/trawl/blob/main/docs/adr/0040-every-server-failure-names-its-request-and-stage.md)).
+
+#### What the output never contains
+
+Rows name sources such as `FLEET_DATABASE_URL from the environment`, never
+values. The output has no URLs, host names, passwords, certificate details,
+catalog identifiers, listener addresses, or driver and operating-system error
+text. It may name the configuration and credential files the run selected, and
+the running user and uid.
+
 ### Server environment variables
 
 | Variable | Description |
