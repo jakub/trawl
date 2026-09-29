@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod health;
+
 /// Version of the JSON report document. Bump it when the shape changes.
 pub const REPORT_VERSION: u32 = 1;
 
@@ -265,7 +267,11 @@ impl Verdict {
     }
 }
 
-/// Stable reason codes for a check that could not look.
+/// Stable reason codes.
+///
+/// Most say why a check could not look (`not_sampled`). The ones whose
+/// comment names another outcome say why a `complete` or `failed` check has
+/// that outcome, where the reason is part of the contract.
 pub mod reason {
     /// The target refused the probe for exceeding its rate limit.
     pub const RATE_LIMITED: &str = "rate_limited";
@@ -278,6 +284,41 @@ pub mod reason {
     /// The target is still recovering what it holds, such as trawld's
     /// corpus after a restart, and cannot answer for it yet.
     pub const RECOVERING: &str = "recovering";
+    /// Run as root, which can read what the service user may not: an
+    /// access check did not look. A check that waits on it still runs.
+    pub const RAN_AS_ROOT: &str = "ran_as_root";
+    /// Nothing accepted a connection at the listener's address, as when
+    /// trawld is not running.
+    pub const NOT_LISTENING: &str = "not_listening";
+    /// A file the check compares changed while the doctor read it.
+    pub const MATERIAL_CHANGED: &str = "material_changed";
+    /// A migrator holds its lock while the schema is not current.
+    pub const MIGRATION_IN_PROGRESS: &str = "migration_in_progress";
+    /// The evidence neither proves nor refutes the assertion, such as an
+    /// archive with no identity marker.
+    pub const UNPROVEN: &str = "unproven";
+    /// No certificate exists yet to compare the listener against.
+    pub const NO_MATERIAL: &str = "no_material";
+    /// A file the check reads exists but could not be read as one.
+    pub const UNREADABLE: &str = "unreadable";
+    /// A file the check reads is larger than the doctor reads.
+    pub const TOO_LARGE: &str = "too_large";
+    /// The check is not built yet. Present only while `trawld --doctor`
+    /// is being built; no released doctor reports it.
+    pub const NOT_IMPLEMENTED: &str = "not_implemented";
+    /// With `complete`: trawld's boot creates or brings this state current
+    /// on its next start, and accepts it as it is.
+    pub const WILL_INITIALIZE: &str = "will_initialize";
+    /// With `complete`: a well-formed recovery marker that trawld's boot
+    /// finishes on its next start.
+    pub const PENDING_AT_NEXT_BOOT: &str = "pending_at_next_boot";
+    /// With `complete`: trawld's writer lock is held by some session.
+    pub const HELD: &str = "held";
+    /// With `complete`: no session holds trawld's writer lock.
+    pub const NOT_OBSERVED: &str = "not_observed";
+    /// With `failed`: the data root belongs to another catalog than the
+    /// app-state database's.
+    pub const CATALOG_IDENTITY_MISMATCH: &str = "catalog_identity_mismatch";
 }
 
 #[cfg(test)]
