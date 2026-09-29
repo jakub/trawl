@@ -87,6 +87,14 @@ pipes each key from the guest straight into grep's standard input.
 # - token absence: each key's grep pipe is first proven to find that key in
 #   a control file. grep must exit 1; exit 2 (an error) fails.
 #
+# Build identity. trawld and trawl print `<version> (<short sha>[*] <date>,
+# ...)` for --version, where `*` marks a build from a dirty tree. Right after
+# the install, both must name HEAD's short SHA with no `*`. The package
+# version alone cannot tell a stale --packages deb from this commit's build.
+# The trawl check fails the run and stops it before any recipe, because the
+# CLI runs every proof query. Under --allow-dirty the `*` is noted, not
+# asserted.
+#
 # Preconditions. One run per checkout at a time, from a clean checkout
 # (--allow-dirty runs are not evidence). No SPA build is needed. The
 # guarantees below hold against this harness only: nothing here guards
@@ -1318,7 +1326,8 @@ runuser -u postgres -- psql -Atc "SELECT datname FROM pg_database WHERE datname 
         T.check("trawld --version names the tested commit", f"({self.short_sha}" in version,
                 f"expected ({self.short_sha}")
         self.check_not_dirty(version)
-        g.run("trawl --version")
+        cli_version = g.run("trawl --version").stdout.strip()
+        self.require_cli_build(cli_version)
 
         # -- trawld config: DSNs from the root-only env file, syslog listener.
         g.run(f"""cat {GUEST_EVIDENCE}/trawld.env >> /etc/default/trawld
@@ -1625,15 +1634,23 @@ ss -Hltn 'sport = :1514'""", root=True)
         sh.run_block(b["syslog-vars"])
         sh.run_block(b["syslog-firewall-allow"])
         device_marker = f"trawl-device-{uuid.uuid4()}"
+        # The frame's timestamp is fixed here so the expected event can name
+        # it. <134> is facility 16 (local0) and severity 6 (informational).
+        frame_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         T.note(f"SIMULATED DEVICE: namespace {PEER_DEVICE.netns} at {PEER_DEVICE.peer_ip} stands in "
                "for the appliance and sends one RFC 5424 test message; this is not a doc block")
         g.run(f"""ip netns exec {PEER_DEVICE.netns} bash -c 'printf "<134>1 %s fw01 filterlog - - - test message {device_marker}\\n" \\
-  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/udp/{PEER_DEVICE.guest_ip}/1514'""", root=True)
+  "{frame_time}" > /dev/udp/{PEER_DEVICE.guest_ip}/1514'""", root=True)
         rows = poll_block(sh, b["syslog-check"], "syslog check").rows
         expect_fields("syslog", rows, {"env": TRAWL_ENV, "service": "firewall", "host": "fw01",
                                        "_producer": "syslog",
-                                       "syslog_source_ip": PEER_DEVICE.peer_ip},
-                      contains={"message": device_marker})
+                                       "syslog_source_ip": PEER_DEVICE.peer_ip,
+                                       "syslog_severity": "6", "syslog_facility": "local0"},
+                      # syslog_timestamp prints as "YYYY-MM-DDTHH:MM:SS.000000Z"
+                      # under a VARCHAR pin and "YYYY-MM-DD HH:MM:SS" under a
+                      # TIMESTAMP pin; both carry the frame's UTC time of day.
+                      contains={"message": device_marker,
+                                "syslog_timestamp": frame_time[11:19]})
 
     # -- phase 10: negatives ------------------------------------------------
 
@@ -1833,6 +1850,19 @@ sha256sum /etc/vector/vector.d/*.toml /etc/trawl/trawld.toml""", root=True)
         self.check_not_dirty(version)
         host(["sha256sum", *[str(VECTOR_CONFIG_DIR / n) for n in VECTOR_DROP_INS]],
              shown="sha256sum " + " ".join(f"config/vector/debian/{n}" for n in VECTOR_DROP_INS))
+
+    def require_cli_build(self, version: str) -> None:
+        """The CLI that runs every proof query must be the tested commit's
+        clean build, like trawld. Otherwise a stale trawl-cli deb of the
+        same package version, passed in with --packages, could run the
+        recipes. A miss stops the run before any recipe."""
+        T.require("trawl --version names the tested commit", f"({self.short_sha}" in version,
+                  f"expected ({self.short_sha}; got {version}")
+        if f"({self.short_sha}*" in version and self.args.allow_dirty:
+            T.note("--allow-dirty: trawl was built from a dirty tree ('*'); not asserted")
+        else:
+            T.require("trawl --version is not a dirty build",
+                      f"({self.short_sha}*" not in version, version)
 
     def check_not_dirty(self, version: str) -> None:
         dirty_build = f"({self.short_sha}*" in version
