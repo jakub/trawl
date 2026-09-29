@@ -1,0 +1,42 @@
+# Precondition: the dev stack is not running.
+$ docker ps --filter name=fleet-dev --format '{{.Names}} {{.Status}}'
+(empty = none)
+$ pgrep -l 'mprocs|trawld|trawl-web|fleet-dev'
+(exit 1; 1 = no match)
+
+# Before: jakub's existing generated pair from an older trawld (legacy layout, key beside cert).
+$ ls -la ~/.trawl
+total 4
+drwxr-xr-x 1 jakub jakub   66 Sep 14 17:33 .
+drwx------ 1 jakub jakub 1656 Sep 28 11:54 ..
+drwxr-xr-x 1 jakub jakub   54 Sep 14 17:39 data
+drwxr-xr-x 1 jakub jakub   54 Sep 14 01:46 data.pre-rebase
+drwxr-xr-x 1 jakub jakub   30 Sep 14 01:42 tls
+-rw------- 1 jakub jakub  553 Sep 14 01:42 trawld.toml
+$ ls -la ~/.trawl/tls
+total 8
+drwxr-xr-x 1 jakub jakub  30 Sep 14 01:42 .
+drwxr-xr-x 1 jakub jakub  66 Sep 14 17:33 ..
+-rw-r--r-- 1 jakub jakub 566 Sep 14 01:42 cert.pem
+-rw------- 1 jakub jakub 241 Sep 14 01:42 key.pem
+
+# Back up (move, never delete). ~/.trawl/tls-key does not exist, so there is nothing to move for it.
+$ test -e ~/.trawl/tls-key; echo $?
+1
+$ test -e ~/.trawl/tls.bak-270; echo $?   (must be 1 before the move)
+1
+$ mv ~/.trawl/tls ~/.trawl/tls.bak-270
+exit 0
+
+# Clean state: no tls/ and no tls-key/ in the state directory.
+$ ls -la ~/.trawl
+total 4
+drwxr-xr-x 1 jakub jakub   82 Sep 28 11:54 .
+drwx------ 1 jakub jakub 1656 Sep 28 11:54 ..
+drwxr-xr-x 1 jakub jakub   54 Sep 14 17:39 data
+drwxr-xr-x 1 jakub jakub   54 Sep 14 01:46 data.pre-rebase
+drwxr-xr-x 1 jakub jakub   30 Sep 14 01:42 tls.bak-270
+-rw------- 1 jakub jakub  553 Sep 14 01:42 trawld.toml
+$ ls -la ~/.trawl/tls ~/.trawl/tls-key
+ls: cannot access '/home/jakub/.trawl/tls': No such file or directory
+ls: cannot access '/home/jakub/.trawl/tls-key': No such file or directory

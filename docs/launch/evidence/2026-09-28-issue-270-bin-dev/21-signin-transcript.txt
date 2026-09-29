@@ -1,0 +1,78 @@
+# Sign-in through the dev browser origin http://localhost:8081 (trunk serve proxies /api/ to trawl-web on :8090),
+# run by /tmp/j270c9b/signin.sh at 18:58:01Z while bin/dev was up. $JAR = /tmp/j270c9b/jar.txt (outside the repo).
+# Redacted: the fleet_session cookie value and the key lookup prefix in /api/v1/whoami. The API key itself never
+# appears: jq reads it from ~/.local/state/fleet/docker/dev-api-key straight into the request body.
+
+$ curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' http://localhost:8081/login
+200 text/html
+
+$ curl -sS -i http://localhost:8081/api/auth/me    # before sign-in
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+referrer-policy: no-referrer
+x-frame-options: DENY
+content-length: 24
+date: Mon, 28 Sep 2026 18:58:01 GMT
+
+{"error":"unauthorized"}
+
+$ jq -cn --rawfile k ~/.local/state/fleet/docker/dev-api-key '{api_key: ($k|rtrimstr("\n"))}' \
+  | curl -sS -i -c $JAR -H 'Content-Type: application/json' -H 'Origin: http://localhost:8081' --data-binary @- http://localhost:8081/api/auth/login
+HTTP/1.1 200 OK
+content-type: application/json
+set-cookie: fleet_session=<redacted>; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+referrer-policy: no-referrer
+x-frame-options: DENY
+content-length: 166
+date: Mon, 28 Sep 2026 18:58:01 GMT
+
+{"name":"fleet-dev-jakub","roles":["fleet-developer"],"permissions":["query","schema_read","validate","saved_query","export","stream","query_cancel","server_manage"]}
+
+$ curl -sS -i -b $JAR http://localhost:8081/api/auth/me
+HTTP/1.1 200 OK
+content-type: application/json
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'
+strict-transport-security: max-age=31536000; includeSubDomains
+x-content-type-options: nosniff
+referrer-policy: no-referrer
+x-frame-options: DENY
+content-length: 183
+date: Mon, 28 Sep 2026 18:58:01 GMT
+
+{"name":"fleet-dev-jakub","roles":["fleet-developer"],"permissions":["query","schema_read","validate","saved_query","export","stream","query_cancel","server_manage"],"exp":1790708281}
+
+$ curl -sS -i -b $JAR http://localhost:8081/api/v1/whoami
+HTTP/1.1 200 OK
+content-type: application/json
+x-content-type-options: nosniff
+strict-transport-security: max-age=63072000; includeSubDomains
+x-request-id: 01M3MP353R8BDF0YZYC26RYSE5
+content-length: 201
+date: Mon, 28 Sep 2026 18:58:01 GMT
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'
+referrer-policy: no-referrer
+x-frame-options: DENY
+
+{"prefix":"<redacted>","name":"fleet-dev-jakub","kind":"human","roles":["fleet-developer"],"permissions":["query","schema_read","validate","saved_query","export","stream","query_cancel","server_manage"]}
+
+$ Q='service=trawld last=1h "TLS certificate" | fields _time, message, cert, key | sort _time'
+$ jq -cn --arg q "$Q" '{query: $q, limit: 20}' \
+  | curl -sS -i -b $JAR -H 'Content-Type: application/json' -H 'Origin: http://localhost:8081' --data-binary @- http://localhost:8081/api/v1/query
+HTTP/1.1 200 OK
+content-type: application/json
+x-content-type-options: nosniff
+strict-transport-security: max-age=63072000; includeSubDomains
+x-request-id: 01M3MP3545YWES9SMEN21RDQCF
+content-length: 661
+date: Mon, 28 Sep 2026 18:58:01 GMT
+content-security-policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'
+referrer-policy: no-referrer
+x-frame-options: DENY
+
+{"execution":{"started_at":"2026-09-28T18:58:01.482579815Z","duration_ms":15},"columns":[{"name":"_time"},{"name":"message"},{"name":"cert"},{"name":"key"}],"rows":[["2026-09-28 18:56:03.556988","no TLS certificate configured — using auto-generated self-signed certificate",null,null],["2026-09-28 18:56:03.800042","no TLS certificate found, generating self-signed certificate",null,null],["2026-09-28 18:56:04.093617","self-signed TLS certificate generated","/home/jakub/.trawl/tls/cert.pem","/home/jakub/.trawl/tls-key/key.pem"],["2026-09-28 18:56:04.094002","TLS certificate details",null,null]],"pagination":{"limit":20,"offset":0,"returned":4,"total":4}}

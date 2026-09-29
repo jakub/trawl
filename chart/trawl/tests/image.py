@@ -26,11 +26,12 @@ def render(chart, *arguments):
 class ImageSelection(unittest.TestCase):
     def assert_images(self, result, tag):
         self.assertEqual(result.returncode, 0, result.stderr)
-        # All three application containers must use exactly the selected image.
-        # The Helm connection-test hook uses busybox and is not an app container.
+        # All four containers of the default pod (init-auth, init-tls-dir,
+        # trawld, trawl-web) must use exactly the selected image. The Helm
+        # connection-test hook uses busybox and is not an app container.
         images = re.findall(r'^\s+image: (ghcr.io/jakub/trawl:\S+)$',
                             result.stdout, re.MULTILINE)
-        self.assertEqual(images, [f"ghcr.io/jakub/trawl:{tag}"] * 3)
+        self.assertEqual(images, [f"ghcr.io/jakub/trawl:{tag}"] * 4)
 
     def test_source_requires_tag(self):
         for arguments in ((), ("--set-string", "image.tag="),

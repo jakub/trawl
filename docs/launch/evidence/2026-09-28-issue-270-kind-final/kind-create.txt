@@ -1,0 +1,42 @@
+$ kind create cluster --name trawl-270-final --image kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed --kubeconfig ~/trawl-270-kind-final-scratch/kubeconfig --wait 180s
+Creating cluster "trawl-270-final" ...
+ • Ensuring node image (kindest/node:v1.36.4) 🖼️  ...
+ ✓ Ensuring node image (kindest/node:v1.36.4) 🖼️
+ • Preparing nodes 📦   ...
+ ✓ Preparing nodes 📦 
+ • Writing configuration 📜  ...
+ ✓ Writing configuration 📜
+ • Starting control-plane 🕹️  ...
+ ✓ Starting control-plane 🕹️
+ • Installing CNI 🔌  ...
+ ✓ Installing CNI 🔌
+ • Installing StorageClass 💾  ...
+ ✓ Installing StorageClass 💾
+ • Waiting ≤ 3m0s for control-plane = Ready ⏳  ...
+ ✓ Waiting ≤ 3m0s for control-plane = Ready ⏳
+ • Ready after 19s 💚
+Set kubectl context to "kind-trawl-270-final"
+You can now use your cluster with:
+
+kubectl cluster-info --context kind-trawl-270-final --kubeconfig /home/jakub/trawl-270-kind-final-scratch/kubeconfig
+
+Thanks for using kind! 😊
+$ kind load docker-image trawl-270-kind-final:898effaa326d --name trawl-270-final
+Image: "trawl-270-kind-final:898effaa326d" with ID "sha256:ae2fbc03ec47f9a98b062101e258773ec593f33917b345d2684cff991589990d" not yet present on node "trawl-270-final-control-plane", loading...
+$ docker exec trawl-270-final-control-plane crictl images
+IMAGE                                           TAG                  IMAGE ID            SIZE
+docker.io/kindest/kindnetd                      v20260820-69b56db7   4626fe10df5b9       39.7MB
+docker.io/kindest/local-path-helper             v20260131-7181c60a   19aa6a21b42cb       2.87MB
+docker.io/kindest/local-path-provisioner        v20260820-69b56db7   c82008e2cd018       15.9MB
+docker.io/library/trawl-270-kind-final          898effaa326d         849f4bde92803       90.3MB
+registry.k8s.io/coredns/coredns                 v1.14.2              38667dd9be96c       23.3MB
+registry.k8s.io/etcd                            3.6.8-0              ee85eb1f0edd2       22.9MB
+registry.k8s.io/kube-apiserver-amd64            v1.36.4              b0f70fa6ec47e       96.8MB
+registry.k8s.io/kube-apiserver                  v1.36.4              b0f70fa6ec47e       96.8MB
+registry.k8s.io/kube-controller-manager-amd64   v1.36.4              c27613cea70f9       86MB
+registry.k8s.io/kube-controller-manager         v1.36.4              c27613cea70f9       86MB
+registry.k8s.io/kube-proxy-amd64                v1.36.4              a5280d36e1aa3       81.7MB
+registry.k8s.io/kube-proxy                      v1.36.4              a5280d36e1aa3       81.7MB
+registry.k8s.io/kube-scheduler-amd64            v1.36.4              11ce0d8bbc73b       60.8MB
+registry.k8s.io/kube-scheduler                  v1.36.4              11ce0d8bbc73b       60.8MB
+registry.k8s.io/pause                           3.10                 873ed75102791       320kB

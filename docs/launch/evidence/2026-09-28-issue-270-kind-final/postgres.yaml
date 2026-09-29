@@ -1,0 +1,44 @@
+# Disposable in-cluster PostgreSQL for one leg of the #270 kind proof.
+# The superuser password and the two owner passwords come from the
+# pg-init Secret; data lives in an emptyDir and dies with the namespace.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: pg-init, key: superuser-password}}
+          ports:
+            - containerPort: 5432
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "postgres"]}
+            periodSeconds: 2
+          volumeMounts:
+            - {name: init, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+            - {name: data, mountPath: /var/lib/postgresql}
+      volumes:
+        - name: init
+          secret: {secretName: pg-init, items: [{key: init.sql, path: init.sql}]}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  selector: {app: postgres}
+  ports:
+    - port: 5432
+      targetPort: 5432

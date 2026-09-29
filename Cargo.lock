@@ -6462,6 +6462,7 @@ dependencies = [
  "clap",
  "fleet-auth",
  "futures",
+ "libc",
  "mime_guess",
  "rcgen",
  "reqwest",

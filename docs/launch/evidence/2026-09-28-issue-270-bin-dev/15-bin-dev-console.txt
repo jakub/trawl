@@ -1,0 +1,114 @@
+# Full tmux scrollback of the bin/dev session after mprocs quit (tmux -L j270c9b capture-pane -p -J -S - -E -).
+# mprocs ran on the alternate screen, so its panes are not here; see 10-14. Blank lines dropped; nothing needed redaction.
+[+] up 1/1
+ ✔ Container fleet-dev-postgres Healthy                                                                                                                                                                                                               3.4s
+warning: ignoring `resolver.incompatible-publish-age` without `-Zmin-publish-age`
+warning: ignoring `registry.global-min-publish-age` without `-Zmin-publish-age`
+   Compiling jobserver v0.1.35
+   Compiling mio v1.2.2
+   Compiling parking_lot_core v0.9.12
+   Compiling getrandom v0.3.4
+   Compiling time v0.3.54
+   Compiling digest v0.11.3
+   Compiling rand v0.10.2
+   Compiling filetime v0.2.29
+   Compiling signal-hook v0.3.18
+   Compiling rand_chacha v0.3.1
+   Compiling process-reader v0.1.0
+   Compiling crash-context v0.8.0
+   Compiling cc v1.4.0
+   Compiling parking_lot v0.12.5
+   Compiling ahash v0.8.12
+   Compiling sha2 v0.11.0
+   Compiling hmac v0.13.0
+   Compiling md-5 v0.11.0
+   Compiling tokio v1.53.1
+   Compiling rand_core v0.9.5
+   Compiling arrow-array v58.4.0
+   Compiling hkdf v0.13.0
+   Compiling tar v0.4.46
+   Compiling signal-hook-mio v0.2.5
+   Compiling dashmap v6.2.1
+   Compiling futures-intrusive v0.5.0
+   Compiling crossterm v0.28.1
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.8.7
+   Compiling crossterm v0.29.0
+   Compiling process-backend v0.1.0
+   Compiling quanta v0.12.6
+   Compiling rand v0.9.5
+   Compiling memmap2 v0.9.11
+   Compiling comfy-table v7.1.4
+   Compiling trawl-core v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-core)
+   Compiling trawl-config v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-config)
+   Compiling rust-embed-utils v8.12.0
+   Compiling rand_xoshiro v0.7.0
+   Compiling minidump-writer v0.13.0
+   Compiling uds v0.4.2
+   Compiling parquet v59.1.0
+   Compiling ring v0.17.14
+   Compiling psm v0.1.31
+   Compiling blake3 v1.8.5
+   Compiling stacker v0.1.24
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling ratatui-widgets v0.3.2
+   Compiling asn1-rs v0.7.2
+   Compiling cookie v0.18.1
+   Compiling ratatui-crossterm v0.1.2
+   Compiling metrics-util v0.20.4
+   Compiling rust-embed-impl v8.12.0
+   Compiling yasna v0.6.0
+   Compiling minidumper v0.11.0
+   Compiling crash-handler v0.8.0
+   Compiling arrow-select v58.4.0
+   Compiling arrow-row v58.4.0
+   Compiling arrow-arith v58.4.0
+   Compiling chumsky v0.13.0
+   Compiling governor v0.10.4
+   Compiling ratatui-macros v0.7.2
+   Compiling ratatui v0.30.2
+   Compiling oid-registry v0.8.1
+   Compiling tokio-stream v0.1.19
+   Compiling der-parser v10.0.0
+   Compiling trawl-dashboard v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-dashboard)
+   Compiling tempfile v3.27.0
+   Compiling tokio-util v0.7.19
+   Compiling rust-embed v8.12.0
+   Compiling x509-parser v0.18.1
+   Compiling trawl-crashdump v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-crashdump)
+   Compiling ulid v3.0.0
+   Compiling h2 v0.4.16
+   Compiling tower v0.5.3
+   Compiling hostname v0.4.2
+   Compiling arrow-ord v58.4.0
+   Compiling arrow-string v58.4.0
+   Compiling tower-http v0.6.11
+   Compiling arrow-cast v58.4.0
+   Compiling hyper v1.11.0
+   Compiling rustls v0.23.45
+   Compiling arrow v58.4.0
+   Compiling hyper-util v0.1.20
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.14.8
+   Compiling zstd-safe v7.2.4
+   Compiling zstd v0.13.3
+   Compiling axum v0.8.9
+   Compiling metrics-exporter-prometheus v0.18.3
+   Compiling sqlx-core v0.9.0
+   Compiling ureq v3.3.0
+   Compiling tokio-rustls v0.26.4
+   Compiling rustls-platform-verifier v0.7.0
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling libduckdb-sys v1.10505.0
+   Compiling duckdb v1.10505.0
+   Compiling sqlx-postgres v0.9.0
+   Compiling sqlx-macros-core v0.9.0
+   Compiling sqlx-macros v0.9.0
+   Compiling sqlx v0.9.0
+   Compiling fleet-auth v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/fleet-auth)
+   Compiling trawl-engine v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-engine)
+   Compiling trawl-server v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-server)
+   Compiling trawl-web v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-web)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 28.35s
+Pane is dead (status 0, Mon Sep 28 11:58:52 2026)

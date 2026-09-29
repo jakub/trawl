@@ -1,0 +1,53 @@
+source_sha: 898effaa326d1b71929d516618a93c592db862ed
+image: trawl-270-kind-final:898effaa326d
+docker image id (OCI index digest): sha256:ae2fbc03ec47f9a98b062101e258773ec593f33917b345d2684cff991589990d
+platform: linux/amd64
+created: 2026-09-28T14:12:08.923927531-07:00
+label org.opencontainers.image.revision: 898effaa326d1b71929d516618a93c592db862ed
+
+kind node, containerd namespace k8s.io (kind load re-imports the index as import-<date>):
+REF                                                                                                              TYPE                                                      DIGEST                                                                  SIZE      PLATFORMS                                                                                              LABELS                                                          
+docker.io/library/trawl-270-kind-final:898effaa326d                                                              application/vnd.oci.image.index.v1+json                   sha256:ae2fbc03ec47f9a98b062101e258773ec593f33917b345d2684cff991589990d 86.1 MiB  linux/amd64                                                                                            io.cri-containerd.image=managed                                 
+import-2026-08-26@sha256:2123d119ca32eb19622df2e6279e27bc028d2c33d0e4afb46f197ca134e5f687                        application/vnd.oci.image.index.v1+json                   sha256:2123d119ca32eb19622df2e6279e27bc028d2c33d0e4afb46f197ca134e5f687 92.3 MiB  linux/amd64                                                                                            io.cri-containerd.image=managed,io.cri-containerd.pinned=pinned 
+import-2026-08-26@sha256:306a0415be3708a014f45abffffdffbf23c3625029b7b7b35c310b801205512a                        application/vnd.oci.image.index.v1+json                   sha256:306a0415be3708a014f45abffffdffbf23c3625029b7b7b35c310b801205512a 77.9 MiB  linux/amd64                                                                                            io.cri-containerd.image=managed,io.cri-containerd.pinned=pinned 
+import-2026-08-26@sha256:5d1180ec5fa02cc8ffe2244491197efc92b5afe8637dbd2267cdb3a2102cde9c                        application/vnd.oci.image.index.v1+json                   sha256:5d1180ec5fa02cc8ffe2244491197efc92b5afe8637dbd2267cdb3a2102cde9c 82.0 MiB  linux/amd64                                                                                            io.cri-containerd.image=managed,io.cri-containerd.pinned=pinned 
+import-2026-08-26@sha256:8aec479d9e6484c30cd03cc157e65ce2f661e4f5f67876aa6315686602faccdd                        application/vnd.oci.image.index.v1+json                   sha256:8aec479d9e6484c30cd03cc157e65ce2f661e4f5f67876aa6315686602faccdd 58.0 MiB  linux/amd64                                                                                            io.cri-containerd.image=managed,io.cri-containerd.pinned=pinned 
+import-2026-09-28@sha256:a0d7355a7da7d524308111d3ad67dc4fd5e8d1fa55c6157760baeafdacbad0b3                        application/vnd.oci.image.index.v1+json                   sha256:a0d7355a7da7d524308111d3ad67dc4fd5e8d1fa55c6157760baeafdacbad0b3 86.1 MiB  linux/amd64                                                                                            io.cri-containerd.image=managed                                 
+(The import-2026-08-26 entries are pinned system images that ship in the kindest/node image.)
+
+crictl inspecti (the imageID both legs' containers report):
+{"repoTags":["docker.io/library/trawl-270-kind-final:898effaa326d"],"repoDigests":["docker.io/library/import-2026-09-28@sha256:a0d7355a7da7d524308111d3ad67dc4fd5e8d1fa55c6157760baeafdacbad0b3"],"id":"sha256:849f4bde9280350301b7f7a704afb55459cacbb94b9aa299306c4c878a6f689d"}
+
+staged docker-ctx/amd64 (sha256):
+5c65ab49a220280c77e352f2f7c430bfafa76410dff8e7cb14dfdcd364075924  bin/fleet-admin
+2ea5f8f05459e037be9b819b9f68980fc287e24f12bb1792a30f950915aebf82  bin/trawl-admin
+e85ef789d5738f750cdfde8bf7aad5c5fa663e879f3f0733b43191e9bf3ad4fb  bin/trawld
+97e64a42e983a0b5f2a58b35e0d9d9244bf894199d29569ee90fc928cc29de1f  bin/trawl-web
+fc23f12e376c47be520f75221288281906e7942e8fd6f6ce4849198ba60d0405  lib/trawl/libduckdb.so
+c535f0b1cb5923de32bb363d9ebc1b161cd21474f96effbcf8de7e2ab29c1892  distribution.json
+1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5  LICENSE
+7e17fd31249fa875cb3b1c5e05c6c3e99b75509f6a2804ca176c217834de1dcb  LICENSE.duckdb
+
+distribution.json:
+{
+  "version": "1.5.5",
+  "archive": "libduckdb-linux-amd64.zip",
+  "sha256": "1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb",
+  "target": "x86_64-unknown-linux-gnu",
+  "source_sha": "898effaa326d1b71929d516618a93c592db862ed",
+  "tooling_sha": "898effaa326d1b71929d516618a93c592db862ed",
+  "platform_floor": "Debian 12"
+}
+
+builder: rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 plus python3 and curl
+SPA: trunk 0.21.14 on the host, then cargo xtask compress-web
+kind: kind v0.33.0 go1.27.0-X:nodwarf5 linux/amd64
+helm: v4.2.2+gb05881c
+kubectl: Client Version: v1.36.4
+docker: 29.7.2
+
+$ docker run --rm --entrypoint sha256sum trawl-270-kind-final:898effaa326d /usr/bin/trawld /usr/bin/trawl-web /usr/bin/fleet-admin /usr/bin/trawl-admin
+e85ef789d5738f750cdfde8bf7aad5c5fa663e879f3f0733b43191e9bf3ad4fb  /usr/bin/trawld
+97e64a42e983a0b5f2a58b35e0d9d9244bf894199d29569ee90fc928cc29de1f  /usr/bin/trawl-web
+5c65ab49a220280c77e352f2f7c430bfafa76410dff8e7cb14dfdcd364075924  /usr/bin/fleet-admin
+2ea5f8f05459e037be9b819b9f68980fc287e24f12bb1792a30f950915aebf82  /usr/bin/trawl-admin

@@ -1,0 +1,7 @@
+$ ./mkdb.sh trawl-auto
+namespace/trawl-auto created
+secrets created in trawl-auto: pg-init, fleet-db (DATABASE_URL), trawl-db (TRAWL_DATABASE_URL)
+deployment.apps/postgres created
+service/postgres created
+Waiting for deployment "postgres" rollout to finish: 0 of 1 updated replicas are available...
+deployment "postgres" successfully rolled out

@@ -1,0 +1,46 @@
+# bin/dev started in tmux at 2026-09-28T18:55:20Z (tmux -L j270c9b new-session -d -s dev -x 250 -y 140 -c <worktree> bin/dev)
+# Then, in the foreground: /tmp/j270c9b/poll-login.sh 540 (script reproduced below).
+# Each line is a status change of POST http://127.0.0.1:8090/api/auth/login with the dev API key and Origin http://localhost:8081,
+# polled every 0.5 s, plus the moment ~/.trawl/tls/cert.pem first exists. 000 = nothing listening yet (fleet-dev still building/migrating).
+
+18:55:32.937 POST /api/auth/login -> 000 
+18:56:03.699 POST /api/auth/login -> 503 {"error":"upstream certificate not available"}
+18:56:04.202 cert.pem now exists: /home/jakub/.trawl/tls/cert.pem mode=644 birth=2026-09-28 11:56:04.081332315 -0700
+18:56:04.240 POST /api/auth/login -> 200 {"name":"fleet-dev-jakub","roles":["fleet-developer"],"permissions":["query","schema_read","validate","saved_query","export","stream","query_cancel","server_manage"]}
+
+# ---- poll-login.sh ----
+#!/usr/bin/env bash
+# Poll POST /api/auth/login on the dev trawl-web backend (:8090) until 200.
+# Logs a line per status change: UTC time, HTTP status, response body with any
+# key or cookie value redacted. The key is read from the fleet-dev state file
+# each round and never printed.
+set -u
+key_file="$HOME/.local/state/fleet/docker/dev-api-key"
+deadline=$(( $(date +%s) + ${1:-540} ))
+last=""
+tls_seen=0
+while (( $(date +%s) < deadline )); do
+  if (( ! tls_seen )) && [[ -e "$HOME/.trawl/tls/cert.pem" ]]; then
+    echo "$(date -u +%T.%3N) cert.pem now exists: $(stat -c '%n mode=%a birth=%w' "$HOME/.trawl/tls/cert.pem")"
+    tls_seen=1
+  fi
+  if [[ -r "$key_file" ]]; then
+    body=$(jq -cn --rawfile k "$key_file" '{api_key: ($k | rtrimstr("\n"))}')
+    out=$(curl -sS -m 5 -o /tmp/j270c9b/poll-body -w '%{http_code}' \
+      -H 'Content-Type: application/json' -H 'Origin: http://localhost:8081' \
+      --data-binary "$body" http://127.0.0.1:8090/api/auth/login 2>/dev/null)
+    status=${out:-000}
+  else
+    status="nokeyfile"
+  fi
+  if [[ "$status" != "$last" ]]; then
+    shown=$( [[ -f /tmp/j270c9b/poll-body ]] && head -c 300 /tmp/j270c9b/poll-body | sed -E 's/(api_key|token)"[^,}]*/\1":"<redacted>"/g' )
+    echo "$(date -u +%T.%3N) POST /api/auth/login -> $status ${shown}"
+    last="$status"
+  fi
+  rm -f /tmp/j270c9b/poll-body
+  [[ "$status" == 200 ]] && exit 0
+  sleep 0.5
+done
+echo "$(date -u +%T.%3N) deadline reached, last status $last"
+exit 1

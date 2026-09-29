@@ -1,0 +1,6 @@
+# mprocs pane 'trawl-trawld', captured 2026-09-28T18:58:31Z. trawld sees a TTY under mprocs, so it runs its monitor
+# dashboard and writes no log lines to stdout (crates/trawl-server/src/main.rs, monitor_active). Its own events reach
+# Trawl through [ingest] internal_telemetry = true; 21-signin-transcript.txt queries them (service=trawld).
+ trawld v0.9.0
+ host: fractal  addr: 127.0.0.1:5514  uptime: 2m 27s  health: OK
+ q or ctrl-c to quit

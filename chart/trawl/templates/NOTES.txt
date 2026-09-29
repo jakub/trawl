@@ -30,9 +30,6 @@ Remote API clients must use a covered DNS name and trust the issuer's CA.
 
 The daemon mounts existing TLS Secret {{ .Values.tls.secretName }} in namespace {{ .Release.Namespace }}.
 It must contain tls.crt and tls.key. Remote API clients must trust its CA and use a covered name.
-{{- else if .Values.config.raw }}
-
-config.raw controls daemon TLS. The chart mounts no TLS Secret in this mode.
 {{- else }}
 
 The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:

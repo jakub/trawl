@@ -1,0 +1,29 @@
+$ bin/fleet-dev plan trawl --format human   (cwd: worktree; no ~/.config/fleet/dev.toml profile exists)
+# ls: cannot access '/home/jakub/.config/fleet': No such file or directory
+Fleet development plan
+
+Exposure: Localhost
+Database: Docker
+State scope: docker
+1Password: not required
+
+trawl (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld)
+  origin: http://localhost:8081
+  backend: localhost:8090
+  database: trawl_dev
+  process trawl-trawld: ["bin/trawld-dev"]
+    FLEET_DATABASE_URL <- fleet.database_url
+    TRAWL_DATABASE_URL <- app.database_url
+  process trawl-trawl-web: ["target/debug/trawl-web"]
+    FLEET_SESSION_AEAD_KEY <- fleet.session_aead_key
+  process trawl-web-ui: ["trunk", "serve"]
+
+Actions:
+  1. acquire global single-instance lock
+  2. prepare and validate Docker database provider
+  3. run fleet-admin migrate
+  4. run selected application migration owners
+  5. reconcile additive fleet-developer permissions and key
+  6. render private Trunk and mprocs configuration
+  7. run attached mprocs supervisor
+

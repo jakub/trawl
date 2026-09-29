@@ -181,7 +181,7 @@ assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
 assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
   "$security_enabled" trawld
 assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_enabled" trawld
-for sidecar in init-auth trawl-web; do
+for sidecar in init-auth init-tls-dir trawl-web; do
   assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
     "$security_enabled" "$sidecar"
   assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_enabled" "$sidecar"
@@ -235,7 +235,7 @@ assert_render_fails "an ingress host without publicOrigins" \
   --set-string 'ingress.hosts[0].paths[0].pathType=Prefix'
 
 # Stated origins reach both halves: the generated TOML the proxy reads,
-# and the env var that survives a config.raw replacing that TOML.
+# and the env var the chart passes to the sidecar.
 origins_config="$work_dir/origins-config.yaml"
 render_only configmap.yaml "${web_enabled[@]}" \
   --set-string 'web.publicOrigins[1]=http://localhost:8090' >"$origins_config"
@@ -249,21 +249,6 @@ render "${web_enabled[@]}" \
   --set-string 'web.publicOrigins[1]=http://localhost:8090' >"$origins_sts"
 assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
   "value: \"${web_origin},http://localhost:8090\"" "$origins_sts"
-
-# config.raw replaces the generated TOML wholesale, so the env var is the
-# only thing carrying the allowlist in that topology.
-raw_sts="$work_dir/raw-sts.yaml"
-render "${web_enabled[@]}" --set-string 'config.raw=[server]' >"$raw_sts"
-assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
-  "value: \"${web_origin}\"" "$raw_sts"
-
-raw_config="$work_dir/raw-config.yaml"
-render_only configmap.yaml "${web_enabled[@]}" \
-  --set-string 'config.raw=[server]' >"$raw_config"
-if grep -Fq 'public_origins' "$raw_config"; then
-  echo "config.raw must replace the generated TOML, allowlist included" >&2
-  exit 1
-fi
 
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"

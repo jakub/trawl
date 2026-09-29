@@ -1,0 +1,31 @@
+# Leg 2: tls.mode=certManager with a CA Issuer, trawl-web pinning the
+# Secret's ca.crt.
+image:
+  repository: trawl-270-kind
+  tag: "76ccc826530b"
+  pullPolicy: Never
+auth:
+  database:
+    existingSecret: fleet-db
+storage:
+  database:
+    existingSecret: trawl-db
+persistence:
+  enabled: true
+  size: 1Gi
+web:
+  enabled: true
+  publicOrigins:
+    - http://localhost:8090
+  allowInsecureCookies: true
+tls:
+  mode: certManager
+  certManager:
+    issuerRef:
+      name: trawl-ca-issuer
+      kind: Issuer
+      group: cert-manager.io
+    dnsNames:
+      - trawl.trawl-cm.svc.cluster.local
+      - trawl.cm.example.test
+  upstreamCa: secret

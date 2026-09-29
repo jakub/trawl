@@ -1,0 +1,135 @@
+# mprocs pane 'trawl-web-ui' (trunk serve), captured 2026-09-28T18:58:32Z; key redacted
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling serde_spanned v1.1.1
+   Compiling collection_literals v1.0.3
+   Compiling toml_parser v1.1.2+spec-1.1.0
+   Compiling html-escape v0.2.14
+   Compiling erased v0.1.2
+   Compiling const_str_slice_concat v0.1.0
+   Compiling interpolator v0.5.0
+   Compiling drain_filter_polyfill v0.1.3
+   Compiling same-file v1.0.6
+   Compiling sha2 v0.10.9
+   Compiling walkdir v2.5.0
+   Compiling toml v1.1.3+spec-1.1.0
+   Compiling regex-automata v0.4.16
+   Compiling convert_case v0.6.0
+   Compiling leptos_macro v0.8.17
+   Compiling base16 v0.2.1
+   Compiling wasm-bindgen-macro-support v0.2.126
+   Compiling synstructure v0.13.2
+   Compiling proc-macro-error2 v2.0.1
+   Compiling manyhow v0.11.4
+   Compiling const-str v1.1.0
+   Compiling base64 v0.22.1
+   Compiling pathdiff v0.2.3
+   Compiling config v0.15.25
+   Compiling uuid v1.24.0
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.19
+   Compiling async-trait v0.1.91
+   Compiling convert_case_extras v0.2.0
+   Compiling leptos v0.8.20
+   Compiling autocfg v1.5.1
+   Compiling fnv v1.0.7
+   Compiling strsim v0.11.1
+   Compiling ident_case v1.0.1
+   Compiling async-once-cell v0.5.4
+   Compiling regex v1.13.1
+   Compiling num-traits v0.2.19
+   Compiling futures-macro v0.3.33
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.6
+   Compiling derive-where v1.6.1
+   Compiling syn_derive v0.2.0
+   Compiling pin-project-internal v1.1.13
+   Compiling reactive_stores_macro v0.4.3
+   Compiling futures-util v0.3.33
+   Compiling thiserror-impl v1.0.69
+   Compiling quote-use-macros v0.8.4
+   Compiling server_fn_macro_default v0.8.5
+   Compiling typed-builder-macro v0.23.2
+   Compiling ar_archive_writer v0.5.2
+   Compiling zerofrom v0.1.8
+   Compiling quote-use v0.8.4
+   Compiling wasm_split_macros v0.2.2
+   Compiling attribute-derive-macro v0.10.5
+   Compiling yoke v0.8.3
+   Compiling darling_core v0.20.11
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling pin-project v1.1.13
+   Compiling rstml v0.12.1
+   Compiling wasm_split_helpers v0.2.3
+   Compiling tinystr v0.8.3
+   Compiling potential_utf v0.1.5
+   Compiling psm v0.1.31
+   Compiling wasm-bindgen-macro v0.2.126
+   Compiling icu_locale_core v2.2.0
+   Compiling icu_collections v2.2.0
+   Compiling stacker v0.1.24
+   Compiling attribute-derive v0.10.5
+   Compiling leptos_router v0.8.15
+   Compiling leptos-use v0.19.0
+   Compiling allocator-api2 v0.2.21
+   Compiling foldhash v0.1.5
+   Compiling typed-builder v0.23.2
+   Compiling leptos_router_macro v0.8.6
+   Compiling oco_ref v0.2.1
+   Compiling serde_qs v0.15.0
+   Compiling leptos_hot_reload v0.8.6
+   Compiling codee v0.3.5
+   Compiling leptos_config v0.8.10
+   Compiling icu_provider v2.2.0
+   Compiling hashbrown v0.15.5
+   Compiling tracing-attributes v0.1.31
+   Compiling tracing-core v0.1.36
+   Compiling trawl-core v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-core)
+   Compiling futures-executor v0.3.33
+   Compiling icu_properties v2.2.0
+   Compiling js-sys v0.3.103
+   Compiling futures v0.3.33
+   Compiling hydration_context v0.3.1
+   Compiling icu_normalizer v2.2.0
+   Compiling lazy_static v1.5.0
+   Compiling chumsky v0.13.0
+   Compiling darling_macro v0.20.11
+   Compiling console_error_panic_hook v0.1.7
+   Compiling tracing v0.1.44
+   Compiling darling v0.20.11
+   Compiling default-struct-builder v0.5.1
+   Compiling trawl-api v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-api)
+   Compiling base64ct v1.8.3
+   Compiling idna_adapter v1.2.2
+   Compiling idna v1.1.0
+   Compiling url v2.5.8
+   Compiling web-sys v0.3.103
+   Compiling wasm-bindgen-futures v0.4.76
+   Compiling chrono v0.4.45
+   Compiling gloo-timers v0.4.0
+   Compiling serde-wasm-bindgen v0.6.5
+   Compiling any_spawner v0.3.0
+   Compiling gloo-utils v0.2.0
+   Compiling gloo-utils v0.3.0
+   Compiling gloo-net v0.7.0
+   Compiling gloo-net v0.6.0
+   Compiling wasm-streams v0.5.0
+   Compiling reactive_stores v0.4.3
+   Compiling leptos_dom v0.8.8
+   Compiling leptos_server v0.8.7
+   Compiling leptos_meta v0.8.6
+   Compiling fleet-ui v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/fleet-ui)
+   Compiling trawl-web-ui v0.9.0 (/home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/crates/trawl-web-ui)
+    Finished `wasm-dev` profile [optimized] target(s) in 1m 00s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-28T18:57:07.906566Z  INFO applying new distribution
+2026-09-28T18:57:07.906994Z  INFO ✅ success
+2026-09-28T18:57:07.907469Z  INFO 📡 serving static assets at -> /
+2026-09-28T18:57:07.910187Z  INFO 📡 proxying /api/ -> http://localhost:8090/api/
+2026-09-28T18:57:07.910458Z  INFO 📡 server listening at:
+2026-09-28T18:57:07.910798Z  INFO     🏠 http://127.0.0.1:8081/
+2026-09-28T18:57:07.910801Z  INFO     🏠 http://[::1]:8081/
+2026-09-28T18:57:07.911749Z  INFO        http://localhost.:8081/

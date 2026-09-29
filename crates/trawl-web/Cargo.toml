@@ -39,6 +39,10 @@ trawl-api = { workspace = true }
 trawl-config = { workspace = true }
 zeroize = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# `O_NONBLOCK` for opening the pinned CA file without waiting on a FIFO.
+libc = { workspace = true }
+
 [dev-dependencies]
 rcgen = { workspace = true }
 tempfile = { workspace = true }

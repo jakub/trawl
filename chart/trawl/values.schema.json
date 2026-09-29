@@ -8,7 +8,9 @@
       "required": [
         "mode",
         "secretName",
-        "certManager"
+        "certManager",
+        "upstreamServerName",
+        "upstreamCa"
       ],
       "properties": {
         "mode": {
@@ -71,6 +73,39 @@
                 "pattern": "^(\\*\\.)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
               }
             }
+          }
+        },
+        "upstreamServerName": {
+          "type": "string",
+          "maxLength": 253
+        },
+        "upstreamCa": {
+          "type": "string"
+        }
+      }
+    },
+    "web": {
+      "type": "object",
+      "required": [
+        "runAsUser",
+        "extraVolumes",
+        "extraVolumeMounts"
+      ],
+      "properties": {
+        "runAsUser": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "extraVolumes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "extraVolumeMounts": {
+          "type": "array",
+          "items": {
+            "type": "object"
           }
         }
       }

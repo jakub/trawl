@@ -1,0 +1,39 @@
+
+## cert-manager v1.21.1, 2026-09-28T21:16:58Z
+$ sha256sum /home/jakub/trawl-270-kind-final-scratch/cert-manager.yaml
+5f6a499b8c1857d57f560f536e0dcc830914b45c420899fe7ad0692c8624e408  /home/jakub/trawl-270-kind-final-scratch/cert-manager.yaml
+/home/jakub/trawl-270-kind-final-scratch/cert-manager.yaml: OK
+$ kubectl --context kind-trawl-270-final -n cert-manager wait --for=condition=Available deployment --all --timeout=300s
+deployment.apps/cert-manager condition met
+deployment.apps/cert-manager-cainjector condition met
+deployment.apps/cert-manager-webhook condition met
+$ kubectl --context kind-trawl-270-final -n cert-manager get pods -o custom-columns=NAME:.metadata.name\,READY:.status.containerStatuses\[0\].ready\,IMAGE:.status.containerStatuses\[0\].imageID
+NAME                                      READY   IMAGE
+cert-manager-75b96c9588-gvcvg             true    quay.io/jetstack/cert-manager-controller@sha256:416a2d76870d996460e62bd7f521bf14fa017be9e3e904aab92163a331fcb61a
+cert-manager-cainjector-b644b66f7-l6q54   true    quay.io/jetstack/cert-manager-cainjector@sha256:ccf6b919ec0500745a47a910118f834f9636d0aac1ff221245cd2557ed8c7c98
+cert-manager-webhook-76d97df888-zdtwv     true    quay.io/jetstack/cert-manager-webhook@sha256:d8b3961b51c8c7320633f8208dc46bf88aa13804d0f7cbe48a096b2c523cee42
+
+## namespace trawl-cm with PostgreSQL
+$ /home/jakub/code/trawl/.flow-worktrees/trawl-issue-270-web-trawl-web-always-verifies-trawld/docs/launch/evidence/2026-09-28-issue-270-kind-final/mkdb.sh trawl-cm
+namespace/trawl-cm created
+secrets created in trawl-cm: pg-init, fleet-db (DATABASE_URL), trawl-db (TRAWL_DATABASE_URL)
+deployment.apps/postgres created
+service/postgres created
+Waiting for deployment "postgres" rollout to finish: 0 of 1 updated replicas are available...
+deployment "postgres" successfully rolled out
+
+## issuer chain
+issuer.cert-manager.io/selfsigned created
+certificate.cert-manager.io/trawl-ca created
+issuer.cert-manager.io/trawl-ca-issuer created
+$ kubectl --context kind-trawl-270-final -n trawl-cm wait certificate/trawl-ca --for=condition=Ready --timeout=120s
+certificate.cert-manager.io/trawl-ca condition met
+$ kubectl --context kind-trawl-270-final -n trawl-cm wait issuer/trawl-ca-issuer --for=condition=Ready --timeout=120s
+issuer.cert-manager.io/trawl-ca-issuer condition met
+$ kubectl --context kind-trawl-270-final -n trawl-cm get issuers\,certificates
+NAME                                     READY   AGE
+issuer.cert-manager.io/selfsigned        True    0s
+issuer.cert-manager.io/trawl-ca-issuer   True    0s
+
+NAME                                   READY   SECRET     AGE
+certificate.cert-manager.io/trawl-ca   True    trawl-ca   0s

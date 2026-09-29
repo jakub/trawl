@@ -7,7 +7,6 @@ postinst="$repo_root/crates/trawl-server/debian/postinst"
 service="$repo_root/crates/trawl-server/debian/trawld.service"
 web_service="$repo_root/crates/trawl-server/debian/trawl-web.service"
 default_env="$repo_root/crates/trawl-server/debian/trawld.default"
-web_default_env="$repo_root/crates/trawl-server/debian/trawl-web.default"
 packaged_config="$repo_root/crates/trawl-server/debian/trawld.toml"
 crashdump_conf="$repo_root/crates/trawl-server/debian/crashdump.conf"
 tmpfiles_conf="$repo_root/crates/trawl-server/debian/trawl.tmpfiles"
@@ -360,9 +359,11 @@ fi
 #
 # Without a pin, trawl-web checks trawld's self-signed certificate against the
 # platform roots and every sign-in fails. The package pins the file trawld
-# generates, never TRAWL_WEB_INSECURE_UPSTREAM, and trawl-web refuses to start
-# with both set. trawl-web's config tests check that the pin resolves;
-# trawl-server's tls.rs tests check that the path is the file trawld writes.
+# generates. trawl-web has no switch that skips verification (ADR-0048), so no
+# packaged file may name the removed one, not even in a comment that tells an
+# operator how to turn it on. trawl-web's config tests check that the pin
+# resolves; trawl-server's tls.rs tests check that the path is the file trawld
+# writes.
 
 web_section=$(awk '/^\[web\][[:space:]]*$/{flag=1; next} flag && /^\[/{flag=0} flag' "$packaged_config")
 if [[ -z "$web_section" ]]; then
@@ -371,8 +372,10 @@ fi
 if ! grep -Eq '^upstream_ca_path[[:space:]]*=[[:space:]]*"[^"]+"' <<<"$web_section"; then
   fail "crates/trawl-server/debian/trawld.toml does not set [web] upstream_ca_path uncommented: trawl-web would check trawld's self-signed certificate against the platform roots and every sign-in would fail"
 fi
-if grep -vE '^[[:space:]]*#' "$web_default_env" | grep -Eq 'TRAWL_WEB_INSECURE_UPSTREAM[[:space:]]*='; then
-  fail "crates/trawl-server/debian/trawl-web.default sets TRAWL_WEB_INSECURE_UPSTREAM uncommented: with the packaged upstream_ca_path, trawl-web refuses to start"
+# Split so this file does not match its own search.
+removed_switch='TRAWL_WEB_''INSECURE_UPSTREAM'
+if naming=$(cd "$repo_root" && grep -rlF -- "$removed_switch" crates/trawl-server/debian); then
+  fail "these files under crates/trawl-server/debian name the removed $removed_switch switch: ${naming//$'\n'/, }"
 fi
 
 echo "debian packaging assertions passed"

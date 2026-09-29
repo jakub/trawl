@@ -68,9 +68,10 @@ metrics-process = { workspace = true }
 
 # `ingest::no_follow` opens WAL files and markers with `O_NOFOLLOW |
 # O_NONBLOCK` on every Unix host. The Linux-only paths (the `statx` mount
-# root) take the same `fs` feature.
+# root) take the same `fs` feature. `process` for `geteuid`: trawld's
+# generated TLS directories must be its own.
 [target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["process"] }
 
 [features]
 # Exposes the pool's query-delay hook (`pool::TEST_QUERY_DELAY_MS`) to this

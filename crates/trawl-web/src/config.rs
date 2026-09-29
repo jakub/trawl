@@ -21,7 +21,9 @@
 //! treating an empty list as "allow everything" installs the vulnerability
 //! this allowlist exists to close, silently.
 
+use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use fleet_auth::{
@@ -44,28 +46,34 @@ pub const FALLBACK_UPSTREAM_URL: &str = "https://127.0.0.1:5514";
 /// Default session TTL in seconds (24h).
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
 
-/// Env var name that, when set to a non-empty value, makes the proxy's
-/// upstream HTTP client accept self-signed / invalid TLS certificates.
-///
-/// Honoured only for a loopback upstream (see [`resolve_upstream_tls`]):
-/// the proxy and trawld on one host, as the Debian package and the Helm
-/// sidecar run them. Any other upstream refuses to start.
-pub const ENV_INSECURE_UPSTREAM: &str = "TRAWL_WEB_INSECURE_UPSTREAM";
-
 /// Env var name overriding `[web] bind_addr`. Lets a listener move without
 /// editing the `trawld.toml` shared with the daemon — `bin/dev` uses it to
 /// bind an address the browser's hostname resolves to (remote dev over a
 /// tailnet) or to shift off a port collision.
 pub const ENV_BIND_ADDR: &str = "TRAWL_WEB_BIND_ADDR";
 
+/// Env var name overriding `[web] upstream_ca_path`. Lets a process pin
+/// trawld's certificate without editing the `trawld.toml` shared with the
+/// daemon — `bin/dev` uses it to pin the certificate the development
+/// trawld generates. An empty value counts as unset, as for
+/// [`ENV_BIND_ADDR`], so the file's setting applies.
+pub const ENV_UPSTREAM_CA_PATH: &str = "TRAWL_WEB_UPSTREAM_CA_PATH";
+
 /// All runtime settings the proxy needs, with defaults applied.
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub bind_addr: String,
+    /// The `https` URL the proxy reaches trawld at. Resolution refused any
+    /// other scheme, any user name or password, and any query or fragment,
+    /// so the value is safe to log.
     pub upstream_url: String,
     pub session_ttl_secs: u64,
     pub allow_insecure_cookies: bool,
     pub upstream_tls: UpstreamTls,
+    /// Where the connection to trawld goes when `[web]
+    /// upstream_connect_addr` is set. `None`: the `upstream_url` host is
+    /// resolved normally.
+    pub upstream_connect: Option<UpstreamConnect>,
     pub cookie_key: SessionKey,
     /// Parent domain for the shared `fleet_session` SSO cookie
     /// (`Domain=` attribute). `None` (unset or empty in config) means
@@ -82,16 +90,51 @@ pub struct ResolvedConfig {
 }
 
 /// How the proxy's upstream client decides whether to trust trawld's
-/// TLS certificate.
+/// TLS certificate. Both modes verify the chain and the host name
+/// (ADR-0048).
 pub enum UpstreamTls {
     /// The platform trust store.
     System,
-    /// Only the roots read from `[web] upstream_ca_path`. The chain and the
-    /// hostname are still verified; no platform or built-in root is trusted.
-    PinnedCa(Vec<reqwest::Certificate>),
-    /// No certificate verification: [`ENV_INSECURE_UPSTREAM`] is set and
-    /// the upstream host is loopback.
-    InsecureLoopback,
+    /// Only the roots read from `[web] upstream_ca_path`. No platform or
+    /// built-in root is trusted.
+    PinnedCa {
+        /// The pin file, tilde-expanded, kept so it can be read again.
+        path: PathBuf,
+        /// The certificates the file held when it was read, or `None` when
+        /// it did not exist yet: trawld writes its generated certificate
+        /// only on its first start, which may come after trawl-web's.
+        roots: Option<PinnedRoots>,
+    },
+}
+
+/// A digest of a pin file's contents and the trust anchors they parsed to.
+///
+/// The digest stays with the certificates so a later read of the file can
+/// tell whether it changed since the client was built from it. Only
+/// [`pinned_roots`] builds one.
+pub struct PinnedRoots {
+    digest: blake3::Hash,
+    certificates: Vec<reqwest::Certificate>,
+}
+
+impl PinnedRoots {
+    /// The trust anchors, in file order.
+    #[must_use]
+    pub fn certificates(&self) -> &[reqwest::Certificate] {
+        &self.certificates
+    }
+
+    /// The BLAKE3 digest of the file contents the certificates came from.
+    pub(crate) fn digest(&self) -> blake3::Hash {
+        self.digest
+    }
+}
+
+/// Shows the count only, like [`UpstreamTls`]'s `Debug`.
+impl std::fmt::Debug for PinnedRoots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} certificates>", self.certificates.len())
+    }
 }
 
 /// Hand-written so a pinned bundle shows its size, not its certificates.
@@ -99,10 +142,32 @@ impl std::fmt::Debug for UpstreamTls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::System => f.write_str("System"),
-            Self::PinnedCa(roots) => write!(f, "PinnedCa(<{} certificates>)", roots.len()),
-            Self::InsecureLoopback => f.write_str("InsecureLoopback"),
+            Self::PinnedCa { path, roots } => {
+                let mut pinned = f.debug_struct("PinnedCa");
+                pinned.field("path", path);
+                match roots {
+                    Some(roots) => pinned.field("roots", roots),
+                    None => pinned.field("roots", &format_args!("<pending>")),
+                };
+                pinned.finish()
+            }
         }
     }
+}
+
+/// A fixed socket address for the connection to trawld, from `[web]
+/// upstream_connect_addr` (ADR-0048).
+///
+/// The client dials `addr` whenever the upstream URL names `host`, and
+/// never asks a resolver for it. TLS still verifies `host`, so a sidecar can
+/// reach trawld over loopback and check that the certificate names the
+/// host in `upstream_url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamConnect {
+    /// The `upstream_url` host: a DNS name, never an IP literal.
+    pub host: String,
+    /// Where the connection goes. Its port equals the `upstream_url` port.
+    pub addr: SocketAddr,
 }
 
 /// Errors while loading or validating proxy configuration.
@@ -168,45 +233,80 @@ pub enum ConfigError {
     #[error(transparent)]
     SessionEnvOrigins(SessionRuntimeError),
 
-    /// [`ENV_INSECURE_UPSTREAM`] is set but the upstream host is not
-    /// loopback. Carries the host so the operator sees which upstream the
-    /// variable would have switched verification off for.
-    #[error(
-        "{ENV_INSECURE_UPSTREAM} is set, but the upstream host `{host}` is not loopback. \
-         The variable is honoured only for 127.0.0.0/8, ::1 or localhost: unset it, \
-         or pin trawld's CA with `[web] upstream_ca_path`"
-    )]
-    InsecureUpstreamNotLoopback { host: String },
+    /// `[web] upstream_url` cannot be used. The URL itself is never part of
+    /// the message, since the rule it broke may be that it holds a
+    /// password.
+    #[error("`[web] upstream_url` {0}")]
+    UpstreamUrl(UpstreamUrlError),
 
-    /// [`ENV_INSECURE_UPSTREAM`] is set but the upstream is loopback over
-    /// a scheme other than `https`. The variable skips certificate
-    /// verification; it never drops TLS, which would send bearer tokens
-    /// in cleartext.
-    #[error(
-        "{ENV_INSECURE_UPSTREAM} is set, but the upstream URL scheme is `{scheme}`. \
-         The variable skips certificate verification of an https upstream; \
-         it does not turn TLS off. Use an https:// upstream URL"
-    )]
-    InsecureUpstreamNotHttps { scheme: String },
-
-    /// [`ENV_INSECURE_UPSTREAM`] is set and the upstream URL has no host
-    /// that can be judged loopback. The URL itself is not echoed.
-    #[error(
-        "{ENV_INSECURE_UPSTREAM} is set, but the upstream URL does not parse as a URL \
-         with a host, so it cannot be confirmed as loopback"
-    )]
-    InsecureUpstreamUnparseable,
-
-    /// Both a pinned CA and "verify nothing" were asked for.
-    #[error(
-        "{ENV_INSECURE_UPSTREAM} is set together with `[web] upstream_ca_path`: \
-         a pinned CA and no verification contradict each other. Unset one"
-    )]
-    InsecureUpstreamWithCa,
+    /// `[web] upstream_connect_addr` cannot be used with this upstream.
+    #[error("`[web] upstream_connect_addr` {0}")]
+    UpstreamConnectAddr(ConnectAddrError),
 
     /// `[web] upstream_ca_path` cannot be used as a trust root.
     #[error("upstream CA file {path}: {reason}")]
     UpstreamCa { path: PathBuf, reason: String },
+}
+
+/// Why `[web] upstream_url` was refused. No variant carries the URL, or any
+/// part of it an operator may have put a secret in.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UpstreamUrlError {
+    /// The URL does not parse. Carries the parser's fixed reason, which
+    /// never quotes its input.
+    #[error("does not parse as a URL: {0}")]
+    Unparseable(String),
+    /// The URL carries a user name or a password.
+    #[error(
+        "carries a user name or password. trawl-web sends each signed-in user's own key \
+         to trawld, so the URL must hold no credentials: remove the part before `@`"
+    )]
+    Userinfo,
+    /// The URL carries a query or a fragment, even an empty one.
+    #[error(
+        "carries a query or fragment. trawl-web appends each request's path and query \
+         to the URL, so it must end at the path: remove the part from `?` or `#`"
+    )]
+    QueryOrFragment,
+    /// The URL is not `https`. Carries the scheme, which the parser has
+    /// already limited to letters, digits, `+`, `-` and `.`.
+    #[error(
+        "uses the `{scheme}` scheme. trawl-web verifies trawld's certificate, \
+         so the upstream must be https"
+    )]
+    NotHttps { scheme: String },
+    /// The URL names no host.
+    #[error("names no host")]
+    NoHost,
+}
+
+/// Why `[web] upstream_connect_addr` was refused. The address is not
+/// echoed; the operator has it in the file.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConnectAddrError {
+    /// Not an IP address and port.
+    #[error(
+        "is not an IP address and port, such as `127.0.0.1:5514` or `[::1]:5514`. \
+         A host name is not accepted"
+    )]
+    Malformed,
+    /// Port 0 would let the client pick the port from the URL instead.
+    #[error("needs a port other than 0")]
+    PortZero,
+    /// The upstream URL's host is an IP address, so there is no name for
+    /// TLS to verify apart from the address the connection goes to.
+    #[error(
+        "needs an `upstream_url` whose host is a DNS name. TLS verifies that name \
+         while the connection goes to this address, and the URL names an IP address"
+    )]
+    IpHost,
+    /// The URL's port and the address's port differ.
+    #[error(
+        "has port {addr_port}, but `upstream_url` has port {url_port} \
+         (443 when the URL states none). The client would ignore one of them, \
+         so use the same port in both"
+    )]
+    PortMismatch { url_port: u16, addr_port: u16 },
 }
 
 impl ResolvedConfig {
@@ -263,10 +363,19 @@ impl ResolvedConfig {
             .upstream_url
             .clone()
             .unwrap_or_else(|| default_upstream_from_server(server));
+        let checked_url = check_upstream_url(&upstream_url).map_err(ConfigError::UpstreamUrl)?;
+        let upstream_connect = web
+            .upstream_connect_addr
+            .as_deref()
+            .map(|addr| resolve_upstream_connect(&checked_url, addr))
+            .transpose()
+            .map_err(ConfigError::UpstreamConnectAddr)?;
         let upstream_tls = resolve_upstream_tls(
-            std::env::var(ENV_INSECURE_UPSTREAM).ok().as_deref(),
-            &upstream_url,
-            web.upstream_ca_path.as_deref(),
+            resolve_upstream_ca_path(
+                std::env::var_os(ENV_UPSTREAM_CA_PATH).as_deref(),
+                web.upstream_ca_path.as_deref(),
+            )?
+            .as_deref(),
         )?;
         let allow_insecure_cookies = runtime
             .secure
@@ -282,13 +391,14 @@ impl ResolvedConfig {
         };
         Ok(Self {
             bind_addr: resolve_bind_addr(
-                std::env::var(ENV_BIND_ADDR).ok().as_deref(),
+                std::env::var_os(ENV_BIND_ADDR).as_deref(),
                 web.bind_addr.as_deref(),
-            ),
+            )?,
             upstream_url,
             session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
             allow_insecure_cookies,
             upstream_tls,
+            upstream_connect,
             cookie_key,
             shared_domain,
             public_origins,
@@ -337,9 +447,8 @@ fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) 
     {
         // Both packaged deployments render one list into the config file
         // and hand the same list to the environment — the helm chart
-        // injects the variable whenever the sidecar runs, so the
-        // `config.raw` escape hatch stays covered — so warning on the
-        // variable's mere presence fires on every default install and
+        // injects the variable whenever the sidecar runs — so warning on
+        // the variable's mere presence fires on every default install and
         // teaches operators to scroll past the one line that says their
         // allowlist is not the one they wrote. Compare the two instead.
         // A configured list that does not parse counts as displaced: it
@@ -439,72 +548,166 @@ impl From<SessionRuntimeError> for ConfigError {
     }
 }
 
+/// The text of the environment override `name`, whose raw value is
+/// `value`. A value that is set but not UTF-8 is refused, naming the
+/// variable and never the value: read as unset, it would silently hand the
+/// choice back to the file.
+fn env_override<'a>(name: &str, value: Option<&'a OsStr>) -> Result<Option<&'a str>, ConfigError> {
+    value
+        .map(|value| {
+            value.to_str().ok_or_else(|| ConfigError::EnvUtf8 {
+                name: name.to_owned(),
+            })
+        })
+        .transpose()
+}
+
 /// Pick the listen address: [`ENV_BIND_ADDR`] first, then `[web] bind_addr`,
 /// then [`DEFAULT_BIND_ADDR`]. Empty values count as unset at both levels.
 ///
 /// Split from `from_parsed` so the precedence is testable without mutating
 /// process env (forbidden under `unsafe_code = "forbid"`).
-fn resolve_bind_addr(env_value: Option<&str>, configured: Option<&str>) -> String {
+///
+/// # Errors
+/// Returns [`ConfigError::EnvUtf8`] when the environment value is not UTF-8.
+fn resolve_bind_addr(
+    env_value: Option<&OsStr>,
+    configured: Option<&str>,
+) -> Result<String, ConfigError> {
     let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
-    pick(env_value)
+    Ok(pick(env_override(ENV_BIND_ADDR, env_value)?)
         .or_else(|| pick(configured))
-        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned())
+        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned()))
+}
+
+/// Pick the CA pin: [`ENV_UPSTREAM_CA_PATH`] first, then `[web]
+/// upstream_ca_path`. An empty environment value counts as unset, as for
+/// [`ENV_BIND_ADDR`]. An empty configured path is passed on and refused by
+/// [`resolve_upstream_tls`]: falling back to the platform roots would
+/// change the trust mode on a blank value.
+///
+/// Split from `from_parsed` so the precedence is testable without mutating
+/// process env (forbidden under `unsafe_code = "forbid"`).
+///
+/// # Errors
+/// Returns [`ConfigError::EnvUtf8`] when the environment value is not
+/// UTF-8. Read as unset, it would fall back to the file's pin or to the
+/// platform roots.
+fn resolve_upstream_ca_path(
+    env_value: Option<&OsStr>,
+    configured: Option<&Path>,
+) -> Result<Option<PathBuf>, ConfigError> {
+    Ok(env_override(ENV_UPSTREAM_CA_PATH, env_value)?
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| configured.map(Path::to_owned)))
+}
+
+/// Check the rules every upstream URL follows, whatever the trust mode
+/// (ADR-0048).
+///
+/// - It parses, with the parser the client dials with.
+/// - It carries no user name or password. reqwest would turn them into a
+///   Basic `Authorization` header, and the URL goes into the startup log.
+/// - It carries no query or fragment. Each request's path and query are
+///   appended to the URL as text, which would land them inside the query
+///   or fragment, and a query may hold a token the startup log would show.
+///   A path prefix is kept: the request path is appended after it.
+/// - It is `https`, since both trust modes verify trawld's certificate and
+///   a plain `http` upstream would send every user's key in cleartext.
+/// - It names a host.
+///
+/// No error quotes the URL.
+///
+/// # Errors
+/// Returns the [`UpstreamUrlError`] naming the rule that refused.
+pub fn check_upstream_url(upstream_url: &str) -> Result<reqwest::Url, UpstreamUrlError> {
+    let url = reqwest::Url::parse(upstream_url)
+        .map_err(|e| UpstreamUrlError::Unparseable(e.to_string()))?;
+    // The parser decodes no percent-encoding here and drops an empty
+    // password, so `user@`, `user:@`, `:pw@` and their percent-encoded
+    // spellings all show up in one of these two. A bare `@` or `:@` holds
+    // no credential, and the parser drops it from the URL the client dials.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(UpstreamUrlError::Userinfo);
+    }
+    // The parser keeps an empty `?` or `#` as an empty query or fragment,
+    // so those are refused too.
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(UpstreamUrlError::QueryOrFragment);
+    }
+    if url.scheme() != "https" {
+        return Err(UpstreamUrlError::NotHttps {
+            scheme: url.scheme().to_owned(),
+        });
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err(UpstreamUrlError::NoHost);
+    }
+    Ok(url)
+}
+
+/// Parse `[web] upstream_connect_addr` against the checked upstream URL
+/// (ADR-0048).
+///
+/// - The value is an IP address and port, IPv6 in brackets. A name is
+///   refused: resolving it would be the resolver answer this setting
+///   exists to replace.
+/// - The URL's host is a DNS name. TLS verifies that name while the
+///   connection goes to `addr`; with an IP literal there is nothing to
+///   verify apart from the address itself.
+/// - The ports agree. The client dials the URL's port when the URL states
+///   one and the address's port when it does not, so a mismatch would
+///   silently drop one of them. The URL's port counts as 443 when it
+///   states none, which also covers an explicit `:443` that the parser
+///   normalizes away.
+///
+/// `url` has passed [`check_upstream_url`], so it is https and names a
+/// host.
+///
+/// # Errors
+/// Returns the [`ConnectAddrError`] naming the rule that refused.
+pub fn resolve_upstream_connect(
+    url: &reqwest::Url,
+    addr: &str,
+) -> Result<UpstreamConnect, ConnectAddrError> {
+    let addr: SocketAddr = addr.parse().map_err(|_| ConnectAddrError::Malformed)?;
+    if addr.port() == 0 {
+        return Err(ConnectAddrError::PortZero);
+    }
+    // `domain` is `None` for an IPv4 or IPv6 literal.
+    let Some(host) = url.domain() else {
+        return Err(ConnectAddrError::IpHost);
+    };
+    let url_port = url.port_or_known_default().unwrap_or(443);
+    if url_port != addr.port() {
+        return Err(ConnectAddrError::PortMismatch {
+            url_port,
+            addr_port: addr.port(),
+        });
+    }
+    Ok(UpstreamConnect {
+        host: host.to_owned(),
+        addr,
+    })
 }
 
 /// Decide how the upstream client verifies trawld's certificate.
 ///
-/// `insecure_env` is the raw value of [`ENV_INSECURE_UPSTREAM`]; any
-/// non-empty value turns it on, as it always has. Split from `from_parsed`
-/// so every case is testable without mutating the process environment
-/// (forbidden under `unsafe_code = "forbid"`).
+/// No `ca_path` means the platform roots. Otherwise the file, tilde
+/// expanded, is read once:
 ///
-/// - The variable with `ca_path` refuses: the two contradict each other.
-/// - The variable is honoured only when the upstream URL's host is a
-///   loopback literal: an IPv4 address in `127.0.0.0/8`, `::1`, or the name
-///   `localhost` in any case. The decision is made on the parsed URL, by the
-///   same parser the client dials with, and never by resolving a name. That
-///   alone would not hold the boundary for `localhost`, which the client
-///   resolves when it dials; the client in this mode maps that name to
-///   `127.0.0.1` and `::1` itself and ignores proxy settings (see
-///   `state::upstream_client`), so neither a resolver answer nor a proxy
-///   can widen it. A URL that does not parse refuses.
-/// - The variable also needs an `https` upstream: it skips certificate
-///   verification, and a plain `http` upstream would send every bearer
-///   token in cleartext instead.
-/// - `ca_path` is read now, so a missing, empty or unparseable file stops
-///   startup instead of failing every request later. The upstream must be
-///   `https`, since a plain `http` upstream would never consult the pin.
+/// - Absent (`NotFound`): the pin is pending, and one `upstream_ca_pending`
+///   warning says so. trawld writes its generated certificate on its first
+///   start, which may come after trawl-web's.
+/// - Any other read error, a path that is not a regular file, a file larger
+///   than `MAX_PIN_FILE_BYTES` (1 MiB), or contents that do not parse as a
+///   certificate bundle: refused, so a broken pin stops startup instead of
+///   failing every request later.
 ///
 /// # Errors
-/// Returns a [`ConfigError`] naming the rule that refused.
-pub fn resolve_upstream_tls(
-    insecure_env: Option<&str>,
-    upstream_url: &str,
-    ca_path: Option<&Path>,
-) -> Result<UpstreamTls, ConfigError> {
-    let insecure = insecure_env.is_some_and(|value| !value.is_empty());
-    if insecure {
-        if ca_path.is_some() {
-            return Err(ConfigError::InsecureUpstreamWithCa);
-        }
-        let url = reqwest::Url::parse(upstream_url)
-            .map_err(|_| ConfigError::InsecureUpstreamUnparseable)?;
-        let host = url
-            .host_str()
-            .filter(|host| !host.is_empty())
-            .ok_or(ConfigError::InsecureUpstreamUnparseable)?;
-        if !is_loopback_host(host) {
-            return Err(ConfigError::InsecureUpstreamNotLoopback {
-                host: host.to_owned(),
-            });
-        }
-        if url.scheme() != "https" {
-            return Err(ConfigError::InsecureUpstreamNotHttps {
-                scheme: url.scheme().to_owned(),
-            });
-        }
-        return Ok(UpstreamTls::InsecureLoopback);
-    }
+/// Returns [`ConfigError::UpstreamCa`] naming the file and the reason.
+pub fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, ConfigError> {
     let Some(path) = ca_path else {
         return Ok(UpstreamTls::System);
     };
@@ -513,38 +716,94 @@ pub fn resolve_upstream_tls(
         path: path.clone(),
         reason: reason.to_owned(),
     };
-    if !reqwest::Url::parse(upstream_url).is_ok_and(|url| url.scheme() == "https") {
+    if path.as_os_str().is_empty() {
         return Err(refuse(
-            "the upstream URL is not https, so the pinned CA would never be consulted",
+            "the path is empty. Name trawld's CA file, or remove the setting to trust the platform roots",
         ));
     }
-    let pem = std::fs::read(&path).map_err(|e| refuse(&e.to_string()))?;
-    let roots = pinned_roots(&pem).map_err(refuse)?;
-    Ok(UpstreamTls::PinnedCa(roots))
+    let roots = match read_pin_file(&path) {
+        Ok(pem) => Some(pinned_roots(&pem).map_err(refuse)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                event_type = "upstream_ca_pending",
+                path = %path.display(),
+                "the pinned upstream CA file does not exist yet; trawl-web cannot reach trawld until it does"
+            );
+            None
+        }
+        Err(e) => return Err(refuse(&e.to_string())),
+    };
+    Ok(UpstreamTls::PinnedCa { path, roots })
 }
 
-/// Whether a parsed URL host is a loopback literal.
+/// The largest pin file trawl-web reads, in bytes: 1 MiB.
 ///
-/// `host` is [`reqwest::Url::host_str`]'s spelling: IPv4 already
-/// normalized to dotted-quad, IPv6 in brackets. A name other than
-/// `localhost` is never loopback here, whatever it resolves to.
-fn is_loopback_host(host: &str) -> bool {
-    let literal = host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(host);
-    literal.parse::<std::net::IpAddr>().map_or_else(
-        |_| host.eq_ignore_ascii_case("localhost"),
-        |ip| ip.is_loopback(),
-    )
+/// A pin names trawld's CA: its one generated certificate is under 1 KiB,
+/// and even a whole public root bundle is a few hundred KiB. A bigger file
+/// is not a CA bundle, and reading it whole, at startup or on every
+/// re-read, would let whoever can write the path make trawl-web allocate
+/// the file's size, past a container's memory limit.
+pub(crate) const MAX_PIN_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read the pin file at `path`, refusing anything but a regular file of at
+/// most [`MAX_PIN_FILE_BYTES`].
+///
+/// The open never waits: on unix it passes `O_NONBLOCK`, so a FIFO with
+/// no writer opens at once instead of blocking until one appears. The
+/// type and size checks run on the opened handle, so the path cannot be
+/// swapped between check and read. A FIFO, directory or device is refused
+/// with `InvalidInput`. A file over the cap is refused with `FileTooLarge`
+/// before any of it is read, and the read itself stops one byte past the
+/// cap, so a file that grows after the size check is refused too and never
+/// read whole. Reading a regular file can still stall, on a network
+/// volume for one, so callers on the async runtime run this on the
+/// blocking pool. The one reader for a pin file, at startup and on any
+/// later read.
+pub(crate) fn read_pin_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the path is not a regular file",
+        ));
+    }
+    let too_large = || {
+        std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!(
+                "the file is larger than {} MiB, too large for a CA bundle",
+                MAX_PIN_FILE_BYTES / (1024 * 1024)
+            ),
+        )
+    };
+    if metadata.len() > MAX_PIN_FILE_BYTES {
+        return Err(too_large());
+    }
+    let mut pem = Vec::new();
+    file.take(MAX_PIN_FILE_BYTES + 1).read_to_end(&mut pem)?;
+    if pem.len() as u64 > MAX_PIN_FILE_BYTES {
+        return Err(too_large());
+    }
+    Ok(pem)
 }
 
 /// Parse a PEM bundle into trust anchors, refusing one that yields none.
 ///
 /// Every certificate goes through the same root-store check the TLS stack
 /// applies when the client is built, so a bundle that passes here cannot
-/// fail there with a bare "builder error".
-fn pinned_roots(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, &'static str> {
+/// fail there with a bare "builder error". The one parser for a pin file,
+/// at startup and on any later read.
+pub(crate) fn pinned_roots(pem: &[u8]) -> Result<PinnedRoots, &'static str> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject as _;
 
@@ -555,7 +814,8 @@ fn pinned_roots(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, &'static str> {
         return Err("the file holds no PEM certificate");
     }
     let mut store = rustls::RootCertStore::empty();
-    ders.iter()
+    let certificates = ders
+        .iter()
         .map(|der| {
             store
                 .add(der.clone())
@@ -563,7 +823,11 @@ fn pinned_roots(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, &'static str> {
             reqwest::Certificate::from_der(der)
                 .map_err(|_| "a certificate in the file does not parse")
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(PinnedRoots {
+        digest: blake3::hash(pem),
+        certificates,
+    })
 }
 
 /// Build the default upstream URL from the trawld `[server].http_addr`.
@@ -675,7 +939,10 @@ fn load_key(web: &WebConfig) -> Result<SessionKey, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use super::*;
+    use crate::test_support::captured_logs;
 
     /// The origin every fixture below states as the browser-visible one.
     const TEST_ORIGIN: &str = "https://trawl.example.com";
@@ -1047,7 +1314,7 @@ session_ttl_secs = 3600
         .unwrap();
 
         let (resolved, lines) =
-            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+            captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         let resolved = resolved.unwrap();
 
         // Replacement, not a merge: the configured origins are gone.
@@ -1107,7 +1374,7 @@ session_ttl_secs = 3600
         .unwrap();
 
         let (resolved, lines) =
-            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+            captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         assert!(resolved.is_ok());
         assert!(
             !lines
@@ -1143,7 +1410,7 @@ session_ttl_secs = 3600
         .unwrap();
 
         let (resolved, lines) =
-            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+            captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         assert!(
             resolved.is_ok(),
             "the environment's list is valid, so startup proceeds"
@@ -1174,7 +1441,7 @@ session_ttl_secs = 3600
         .unwrap();
 
         let (resolved, lines) =
-            captured_resolution(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
+            captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         assert!(resolved.is_ok());
         assert!(
             !lines
@@ -1210,92 +1477,60 @@ session_ttl_secs = 3600
         assert!(message.contains("entry 1"), "got: {message}");
     }
 
-    /// Collects one formatted `field=value` line per event.
-    ///
-    /// Same shape as fleet-auth's guard-log capture: the warning is the
-    /// deliverable here, so the test reads what was recorded rather than
-    /// trusting that the code meant to record it.
-    #[derive(Clone, Default)]
-    struct CaptureLayer {
-        lines: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    struct FieldWriter<'a>(&'a mut String);
-
-    impl tracing::field::Visit for FieldWriter<'_> {
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            use std::fmt::Write as _;
-            let _ = write!(self.0, "{}={value} ", field.name());
-        }
-
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            use std::fmt::Write as _;
-            let _ = write!(self.0, "{}={value:?} ", field.name());
-        }
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
-    where
-        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-    {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut line = format!("{} ", event.metadata().level());
-            event.record(&mut FieldWriter(&mut line));
-            self.lines.lock().expect("capture mutex").push(line);
-        }
-    }
-
-    /// Serializes the capture tests against each other.
-    ///
-    /// `tracing` caches each callsite's `Interest` process-wide and
-    /// rebuilds that cache when a subscriber registers or dies. Two
-    /// capture tests running at once can leave the warning's callsite
-    /// cached as "never interested" for the thread about to emit, so the
-    /// event vanishes and the test reads "it did not warn", the exact
-    /// failure it exists to catch, arriving at random. Poisoning is
-    /// ignored on purpose: one panicking test must not cascade into the
-    /// others.
-    static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Resolve configuration under a capturing subscriber, returning the
-    /// result and every line it logged.
-    fn captured_resolution<T>(resolve: impl FnOnce() -> T) -> (T, Vec<String>) {
-        use tracing_subscriber::layer::SubscriberExt as _;
-
-        let _serialized = CAPTURE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let capture = CaptureLayer::default();
-        let lines = std::sync::Arc::clone(&capture.lines);
-        let subscriber = tracing_subscriber::registry().with(capture);
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let outcome = resolve();
-        let recorded = lines.lock().expect("capture mutex").clone();
-        (outcome, recorded)
-    }
-
     #[test]
     fn bind_addr_precedence_env_then_config_then_default() {
+        let env = |value: &str| Some(OsString::from(value));
+        let resolve = |env_value: Option<OsString>, configured| {
+            resolve_bind_addr(env_value.as_deref(), configured).unwrap()
+        };
         assert_eq!(
-            resolve_bind_addr(Some("100.87.180.64:8090"), Some("127.0.0.1:9000")),
+            resolve(env("100.87.180.64:8090"), Some("127.0.0.1:9000")),
             "100.87.180.64:8090"
         );
-        assert_eq!(
-            resolve_bind_addr(None, Some("127.0.0.1:9000")),
-            "127.0.0.1:9000"
-        );
-        assert_eq!(resolve_bind_addr(None, None), DEFAULT_BIND_ADDR);
+        assert_eq!(resolve(None, Some("127.0.0.1:9000")), "127.0.0.1:9000");
+        assert_eq!(resolve(None, None), DEFAULT_BIND_ADDR);
         // Exported-but-blank is a shell accident, not a bind request — at
         // either level.
-        assert_eq!(
-            resolve_bind_addr(Some(""), Some("127.0.0.1:9000")),
-            "127.0.0.1:9000"
-        );
-        assert_eq!(resolve_bind_addr(Some(""), Some("")), DEFAULT_BIND_ADDR);
+        assert_eq!(resolve(env(""), Some("127.0.0.1:9000")), "127.0.0.1:9000");
+        assert_eq!(resolve(env(""), Some("")), DEFAULT_BIND_ADDR);
+    }
+
+    /// An override that is set but not UTF-8 is refused, naming the
+    /// variable and never its value. Read as unset, it would silently hand
+    /// the choice back to the file: for the CA pin, possibly to the
+    /// platform roots.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_override_is_refused_naming_the_variable() {
+        use std::os::unix::ffi::OsStringExt;
+
+        const SENTINEL: &str = "s3ntinel";
+        let value = || {
+            let mut bytes = format!("/run/{SENTINEL}").into_bytes();
+            bytes.push(0xff);
+            OsString::from_vec(bytes)
+        };
+        let ca_error = resolve_upstream_ca_path(
+            Some(value().as_os_str()),
+            Some(Path::new("/etc/trawl/ca.pem")),
+        )
+        .expect_err("a non-UTF-8 CA path override must refuse");
+        let bind_error = resolve_bind_addr(Some(value().as_os_str()), Some("127.0.0.1:9000"))
+            .expect_err("a non-UTF-8 bind override must refuse");
+        for (error, name) in [
+            (ca_error, ENV_UPSTREAM_CA_PATH),
+            (bind_error, ENV_BIND_ADDR),
+        ] {
+            assert!(
+                matches!(&error, ConfigError::EnvUtf8 { name: n } if n == name),
+                "{error:?}"
+            );
+            let display = error.to_string();
+            assert!(display.contains(name), "got: {display}");
+            for rendered in [display, format!("{error:?}")] {
+                assert!(!rendered.contains(SENTINEL), "{rendered}");
+            }
+        }
     }
 
     #[test]
@@ -1403,122 +1638,317 @@ session_ttl_secs = 3600
         assert!(resolved.shared_domain.is_none());
     }
 
-    // -- upstream TLS: the loopback rule and the pinned CA -----------------
+    // -- upstream URL rules and the pinned CA (ADR-0048) -------------------
 
-    #[test]
-    fn insecure_upstream_is_honoured_for_every_loopback_literal() {
-        for upstream in [
-            "https://127.0.0.1:5514",
-            "https://127.9.9.9:5514",
-            "https://[::1]:5514",
-            "https://localhost:5514",
-            "https://LOCALHOST:5514",
-            "https://LocalHost",
-        ] {
-            let tls = resolve_upstream_tls(Some("1"), upstream, None)
-                .unwrap_or_else(|e| panic!("{upstream} is loopback: {e}"));
-            assert!(
-                matches!(tls, UpstreamTls::InsecureLoopback),
-                "{upstream} gave {tls:?}"
-            );
-        }
+    /// Resolve `web` with no runtime overrides and no `[server]`.
+    fn resolve(web: &WebConfig) -> Result<ResolvedConfig, ConfigError> {
+        let runtime = SessionRuntimeOverrides::parse(None, None, None, None, None).unwrap();
+        ResolvedConfig::from_parsed_with_runtime(web, None, runtime)
     }
 
     #[test]
-    fn insecure_upstream_refuses_a_host_that_is_not_loopback_and_names_it() {
-        for (upstream, host) in [
-            ("https://trawld:5514", "trawld"),
-            ("https://10.0.0.1:5514", "10.0.0.1"),
-            ("https://trawl.example.com", "trawl.example.com"),
-            // A name that usually resolves to loopback is still a name.
-            (
-                "https://localhost.localdomain:5514",
-                "localhost.localdomain",
-            ),
-            ("https://[::ffff:127.0.0.1]:5514", "[::ffff:7f00:1]"),
-            ("https://0.0.0.0:5514", "0.0.0.0"),
-        ] {
-            let error = resolve_upstream_tls(Some("1"), upstream, None)
-                .expect_err("a non-loopback upstream must refuse");
-            assert!(
-                matches!(&error, ConfigError::InsecureUpstreamNotLoopback { host: h } if h == host),
-                "{upstream} gave {error:?}"
-            );
-            let message = error.to_string();
-            assert!(message.contains(ENV_INSECURE_UPSTREAM), "got: {message}");
-            assert!(message.contains(&format!("`{host}`")), "got: {message}");
-        }
-    }
-
-    #[test]
-    fn insecure_upstream_refuses_a_loopback_upstream_without_tls_and_names_the_scheme() {
-        // The variable skips certificate checks; it does not drop TLS, which
-        // would put every bearer token on the wire in cleartext.
-        for (upstream, scheme) in [
-            ("http://127.0.0.1:5514", "http"),
-            ("http://[::1]:5514", "http"),
-            ("http://localhost:5514", "http"),
-            ("ws://127.0.0.1:5514", "ws"),
-        ] {
-            let error = resolve_upstream_tls(Some("1"), upstream, None)
-                .expect_err("a cleartext upstream must refuse");
-            assert!(
-                matches!(&error, ConfigError::InsecureUpstreamNotHttps { scheme: s } if s == scheme),
-                "{upstream} gave {error:?}"
-            );
-            let message = error.to_string();
-            assert!(message.contains(ENV_INSECURE_UPSTREAM), "got: {message}");
-            assert!(message.contains(&format!("`{scheme}`")), "got: {message}");
-            assert!(message.contains("https"), "got: {message}");
-        }
-    }
-
-    #[test]
-    fn insecure_upstream_refuses_an_upstream_that_does_not_parse() {
-        for upstream in ["", "not a url", "127.0.0.1:5514", "unix:/run/trawld.sock"] {
-            let error = resolve_upstream_tls(Some("1"), upstream, None)
-                .expect_err("an unparseable upstream cannot be judged loopback");
-            assert!(
-                matches!(error, ConfigError::InsecureUpstreamUnparseable),
-                "{upstream:?} gave {error:?}"
-            );
-            assert!(error.to_string().contains(ENV_INSECURE_UPSTREAM));
-        }
-    }
-
-    #[test]
-    fn insecure_upstream_keeps_its_any_non_empty_value_reading() {
-        // Any non-empty value turns it on, `0` included, as before the
-        // loopback rule; empty or absent is off.
-        for value in ["1", "true", "0"] {
-            assert!(matches!(
-                resolve_upstream_tls(Some(value), "https://127.0.0.1:5514", None),
-                Ok(UpstreamTls::InsecureLoopback)
-            ));
-            assert!(matches!(
-                resolve_upstream_tls(Some(value), "https://trawld:5514", None),
-                Err(ConfigError::InsecureUpstreamNotLoopback { .. })
-            ));
-        }
-        for value in [None, Some("")] {
-            assert!(matches!(
-                resolve_upstream_tls(value, "https://trawld:5514", None),
-                Ok(UpstreamTls::System)
-            ));
-        }
-    }
-
-    #[test]
-    fn insecure_upstream_with_a_pinned_ca_refuses() {
+    fn upstream_requires_https_all_modes() {
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, test_ca_pem()).unwrap();
-        let error = resolve_upstream_tls(Some("1"), "https://127.0.0.1:5514", Some(&ca_path))
-            .expect_err("a pin and no verification contradict each other");
-        assert!(matches!(error, ConfigError::InsecureUpstreamWithCa));
-        let message = error.to_string();
-        assert!(message.contains(ENV_INSECURE_UPSTREAM), "got: {message}");
-        assert!(message.contains("upstream_ca_path"), "got: {message}");
+        for (upstream, scheme) in [
+            ("http://127.0.0.1:5514", "http"),
+            ("http://[::1]:5514", "http"),
+            ("http://trawld:5514", "http"),
+            ("ws://127.0.0.1:5514", "ws"),
+            ("unix:/run/trawld.sock", "unix"),
+        ] {
+            // Platform roots, then a pinned CA: the rule is the same.
+            for ca in [None, Some(ca_path.clone())] {
+                let pinned = ca.is_some();
+                let web = WebConfig {
+                    upstream_url: Some(upstream.to_owned()),
+                    upstream_ca_path: ca,
+                    ..configured_web()
+                };
+                let error = resolve(&web).expect_err("a cleartext upstream must refuse");
+                assert!(
+                    matches!(
+                        &error,
+                        ConfigError::UpstreamUrl(UpstreamUrlError::NotHttps { scheme: s })
+                            if s == scheme
+                    ),
+                    "{upstream} (pinned: {pinned}) gave {error:?}"
+                );
+                let message = error.to_string();
+                assert!(message.contains("[web] upstream_url"), "got: {message}");
+                assert!(message.contains(&format!("`{scheme}`")), "got: {message}");
+                assert!(message.contains("https"), "got: {message}");
+            }
+        }
+
+        // The derived default stays https and resolves under both modes,
+        // for every shape of `[server] http_addr`.
+        for http_addr in ["0.0.0.0:5514", "[::]:5514", "127.0.0.1:5514", "[::1]:5514"] {
+            let srv = ServerConfig {
+                http_addr: http_addr.into(),
+                ..dummy_server()
+            };
+            for ca in [None, Some(ca_path.clone())] {
+                let web = WebConfig {
+                    upstream_ca_path: ca,
+                    ..configured_web()
+                };
+                let runtime = SessionRuntimeOverrides::parse(None, None, None, None, None).unwrap();
+                let resolved = ResolvedConfig::from_parsed_with_runtime(&web, Some(&srv), runtime)
+                    .unwrap_or_else(|e| panic!("{http_addr} must derive a usable upstream: {e}"));
+                assert!(
+                    resolved.upstream_url.starts_with("https://"),
+                    "{http_addr} derived {}",
+                    resolved.upstream_url
+                );
+            }
+        }
+        let resolved = resolve(&configured_web()).expect("the fallback upstream resolves");
+        assert_eq!(resolved.upstream_url, FALLBACK_UPSTREAM_URL);
+        assert!(matches!(resolved.upstream_tls, UpstreamTls::System));
+    }
+
+    #[test]
+    fn upstream_userinfo_refused_without_echo() {
+        const SENTINEL: &str = "s3ntinel";
+        // `%73` is `s`: the percent-encoded spelling of the same sentinel.
+        const ENCODED: &str = "%73%33ntinel";
+        for upstream in [
+            format!("https://{SENTINEL}@trawld:5514"),
+            format!("https://{SENTINEL}:@trawld:5514"),
+            format!("https://:{SENTINEL}@trawld:5514"),
+            format!("https://{SENTINEL}:{SENTINEL}@trawld:5514"),
+            format!("https://{ENCODED}@trawld:5514"),
+            format!("https://:{ENCODED}@trawld:5514"),
+            format!("https://{SENTINEL}@127.0.0.1:5514"),
+            // Refused as credentials before the scheme is judged, so the
+            // http refusal cannot be the one that mentions them.
+            format!("http://{SENTINEL}:{SENTINEL}@trawld:5514"),
+        ] {
+            let web = WebConfig {
+                upstream_url: Some(upstream.clone()),
+                ..configured_web()
+            };
+            let (outcome, lines) = captured_logs(|| resolve(&web));
+            let error = outcome.expect_err("a URL with credentials must refuse");
+            assert!(
+                matches!(error, ConfigError::UpstreamUrl(UpstreamUrlError::Userinfo)),
+                "{error:?}"
+            );
+            let display = error.to_string();
+            let debug = format!("{error:?}");
+            for rendered in [&display, &debug] {
+                assert!(!rendered.contains(SENTINEL), "{upstream}: {rendered}");
+                assert!(!rendered.contains(ENCODED), "{upstream}: {rendered}");
+                assert!(!rendered.contains("trawld:5514"), "{upstream}: {rendered}");
+            }
+            assert!(display.contains("[web] upstream_url"), "got: {display}");
+            assert!(
+                lines.iter().all(|line| !line.contains(SENTINEL)),
+                "{upstream}: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_query_or_fragment_refused_without_echo() {
+        const SENTINEL: &str = "s3ntinel";
+        for upstream in [
+            format!("https://trawld:5514/?token={SENTINEL}"),
+            format!("https://trawld:5514?{SENTINEL}"),
+            format!("https://trawld:5514/#{SENTINEL}"),
+            format!("https://trawld:5514/prefix?{SENTINEL}#{SENTINEL}"),
+            // Empty, but kept by the parser: appending a request path after
+            // them would still land in the query or the fragment.
+            "https://trawld:5514/?".to_owned(),
+            "https://trawld:5514/#".to_owned(),
+            // Refused before the scheme is judged, like credentials.
+            format!("http://trawld:5514/?{SENTINEL}"),
+        ] {
+            let web = WebConfig {
+                upstream_url: Some(upstream.clone()),
+                ..configured_web()
+            };
+            let (outcome, lines) = captured_logs(|| resolve(&web));
+            let error = outcome.expect_err("a URL with a query or fragment must refuse");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::UpstreamUrl(UpstreamUrlError::QueryOrFragment)
+                ),
+                "{upstream}: {error:?}"
+            );
+            let display = error.to_string();
+            for rendered in [&display, &format!("{error:?}")] {
+                assert!(!rendered.contains(SENTINEL), "{upstream}: {rendered}");
+                assert!(!rendered.contains("trawld:5514"), "{upstream}: {rendered}");
+            }
+            assert!(display.contains("[web] upstream_url"), "got: {display}");
+            assert!(
+                lines.iter().all(|line| !line.contains(SENTINEL)),
+                "{upstream}: {lines:?}"
+            );
+        }
+
+        // A path prefix is kept: each request's path is appended after it.
+        for upstream in ["https://trawld:5514/", "https://trawld:5514/prefix"] {
+            let web = WebConfig {
+                upstream_url: Some(upstream.to_owned()),
+                ..configured_web()
+            };
+            let resolved = resolve(&web).expect("a path without a query resolves");
+            assert_eq!(resolved.upstream_url, upstream);
+        }
+    }
+
+    #[test]
+    fn an_upstream_url_that_does_not_parse_refuses_without_echo() {
+        for upstream in ["", "not a url", "127.0.0.1:5514", "https://trawld:99999"] {
+            let web = WebConfig {
+                upstream_url: Some(upstream.to_owned()),
+                ..configured_web()
+            };
+            let error = resolve(&web).expect_err("an unparseable upstream must refuse");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::UpstreamUrl(UpstreamUrlError::Unparseable(_))
+                ),
+                "{upstream:?} gave {error:?}"
+            );
+            if !upstream.is_empty() {
+                assert!(!error.to_string().contains(upstream), "{error}");
+                assert!(!format!("{error:?}").contains(upstream), "{error:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_connect_addr_resolves_for_a_dns_named_upstream() {
+        for (upstream, addr, host, expected) in [
+            (
+                "https://trawl.test:5514",
+                "127.0.0.1:5514",
+                "trawl.test",
+                "127.0.0.1:5514",
+            ),
+            (
+                "https://trawl.test:5514",
+                "[::1]:5514",
+                "trawl.test",
+                "[::1]:5514",
+            ),
+            // The parser lowercases the host, and the client matches the
+            // lowercased name.
+            (
+                "https://Trawl.Lab.Example:5514",
+                "127.0.0.1:5514",
+                "trawl.lab.example",
+                "127.0.0.1:5514",
+            ),
+            // No port in the URL, or `:443` written out: both are 443.
+            (
+                "https://trawl.test",
+                "127.0.0.1:443",
+                "trawl.test",
+                "127.0.0.1:443",
+            ),
+            (
+                "https://trawl.test:443",
+                "127.0.0.1:443",
+                "trawl.test",
+                "127.0.0.1:443",
+            ),
+        ] {
+            let web = WebConfig {
+                upstream_url: Some(upstream.to_owned()),
+                upstream_connect_addr: Some(addr.to_owned()),
+                ..configured_web()
+            };
+            let resolved = resolve(&web).unwrap_or_else(|e| panic!("{upstream} via {addr}: {e}"));
+            assert_eq!(
+                resolved.upstream_connect,
+                Some(UpstreamConnect {
+                    host: host.to_owned(),
+                    addr: expected.parse().unwrap(),
+                }),
+                "{upstream} via {addr}"
+            );
+        }
+        // Unset: the host resolves normally.
+        let web = WebConfig {
+            upstream_url: Some("https://trawl.test:5514".to_owned()),
+            ..configured_web()
+        };
+        assert_eq!(resolve(&web).unwrap().upstream_connect, None);
+    }
+
+    #[test]
+    fn a_connect_addr_refuses_a_name_a_zero_port_or_a_hidden_port_mismatch() {
+        let url = check_upstream_url("https://trawl.test:5514").unwrap();
+        for addr in [
+            "",
+            "localhost:5514",
+            "trawl.test:5514",
+            "127.0.0.1",
+            "::1:5514",
+        ] {
+            assert_eq!(
+                resolve_upstream_connect(&url, addr),
+                Err(ConnectAddrError::Malformed),
+                "{addr:?}"
+            );
+        }
+        assert_eq!(
+            resolve_upstream_connect(&url, "127.0.0.1:0"),
+            Err(ConnectAddrError::PortZero)
+        );
+        // `:443` is normalized away by the parser, and the client would
+        // then dial the address's port. It still counts as a mismatch.
+        let default_port = check_upstream_url("https://trawl.test:443").unwrap();
+        let error = resolve_upstream_connect(&default_port, "127.0.0.1:5514").unwrap_err();
+        assert_eq!(
+            error,
+            ConnectAddrError::PortMismatch {
+                url_port: 443,
+                addr_port: 5514
+            }
+        );
+        let message = ConfigError::UpstreamConnectAddr(error).to_string();
+        assert!(
+            message.starts_with("`[web] upstream_connect_addr`"),
+            "got: {message}"
+        );
+        assert!(
+            message.contains("5514") && message.contains("443"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn upstream_ca_path_precedence_env_then_config() {
+        let configured = Path::new("/etc/trawl/ca.pem");
+        let env = |value: &str| Some(OsString::from(value));
+        let resolve = |env_value: Option<OsString>, configured| {
+            resolve_upstream_ca_path(env_value.as_deref(), configured).unwrap()
+        };
+        assert_eq!(
+            resolve(env("/run/dev/cert.pem"), Some(configured)),
+            Some(PathBuf::from("/run/dev/cert.pem"))
+        );
+        assert_eq!(
+            resolve(env("/run/dev/cert.pem"), None),
+            Some(PathBuf::from("/run/dev/cert.pem"))
+        );
+        assert_eq!(resolve(None, Some(configured)), Some(configured.to_owned()));
+        assert_eq!(resolve(None, None), None);
+        // Exported-but-blank is a shell accident: the file's setting holds.
+        assert_eq!(
+            resolve(env(""), Some(configured)),
+            Some(configured.to_owned())
+        );
+        assert_eq!(resolve(env(""), None), None);
     }
 
     #[test]
@@ -1526,12 +1956,60 @@ session_ttl_secs = 3600
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, format!("{}{}", test_ca_pem(), test_ca_pem())).unwrap();
-        let tls = resolve_upstream_tls(None, "https://trawld:5514", Some(&ca_path)).unwrap();
+        let tls = resolve_upstream_tls(Some(&ca_path)).unwrap();
         assert!(
-            matches!(&tls, UpstreamTls::PinnedCa(roots) if roots.len() == 2),
+            matches!(
+                &tls,
+                UpstreamTls::PinnedCa { path, roots: Some(roots) }
+                    if *path == ca_path && roots.certificates().len() == 2
+            ),
             "{tls:?}"
         );
-        assert_eq!(format!("{tls:?}"), "PinnedCa(<2 certificates>)");
+        assert_eq!(
+            format!("{tls:?}"),
+            format!("PinnedCa {{ path: {ca_path:?}, roots: <2 certificates> }}")
+        );
+    }
+
+    #[test]
+    fn a_missing_pinned_ca_file_is_pending_and_warns_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // The parent does not exist either, as before trawld's first start
+        // creates its `tls` directory.
+        let missing = dir.path().join("tls").join("cert.pem");
+        let (tls, lines) = captured_logs(|| resolve_upstream_tls(Some(&missing)));
+        let tls = tls.expect("a missing pin file is pending, not a refusal");
+        assert!(
+            matches!(&tls, UpstreamTls::PinnedCa { path, roots: None } if *path == missing),
+            "{tls:?}"
+        );
+        assert!(format!("{tls:?}").contains("roots: <pending>"), "{tls:?}");
+        let pending: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("upstream_ca_pending"))
+            .collect();
+        assert_eq!(pending.len(), 1, "{lines:?}");
+        assert!(pending[0].starts_with("WARN"), "got: {}", pending[0]);
+        assert!(
+            pending[0].contains(&missing.display().to_string()),
+            "got: {}",
+            pending[0]
+        );
+    }
+
+    #[test]
+    fn a_pinned_ca_path_is_tilde_expanded_and_kept_whole() {
+        let tls = resolve_upstream_tls(Some(Path::new("~/.trawl-c3-absent/tls/cert.pem"))).unwrap();
+        let expected =
+            PathBuf::from(shellexpand::tilde("~/.trawl-c3-absent/tls/cert.pem").as_ref());
+        assert!(
+            !expected.starts_with("~"),
+            "no home directory to expand into"
+        );
+        assert!(
+            matches!(&tls, UpstreamTls::PinnedCa { path, .. } if *path == expected),
+            "{tls:?}"
+        );
     }
 
     #[test]
@@ -1551,7 +2029,7 @@ session_ttl_secs = 3600
         ] {
             let ca_path = dir.path().join("ca.pem");
             std::fs::write(&ca_path, contents).unwrap();
-            let error = resolve_upstream_tls(None, "https://trawld:5514", Some(&ca_path))
+            let error = resolve_upstream_tls(Some(&ca_path))
                 .expect_err("an unusable bundle must stop startup");
             assert!(
                 matches!(&error, ConfigError::UpstreamCa { reason: r, .. } if r.contains(reason)),
@@ -1560,24 +2038,49 @@ session_ttl_secs = 3600
             assert!(error.to_string().contains("ca.pem"), "{error}");
         }
 
-        let missing = dir.path().join("missing.pem");
-        let error = resolve_upstream_tls(None, "https://trawld:5514", Some(&missing))
-            .expect_err("a missing file must stop startup");
-        assert!(matches!(error, ConfigError::UpstreamCa { .. }), "{error:?}");
-        assert!(error.to_string().contains("missing.pem"), "{error}");
+        // Only a file that does not exist is pending. One that exists but
+        // cannot be read refuses: a directory, a path through a file, and
+        // an empty path, which would otherwise read as "not found".
+        let through_a_file = dir.path().join("ca.pem").join("cert.pem");
+        for unreadable in [dir.path(), through_a_file.as_path(), Path::new("")] {
+            let error = resolve_upstream_tls(Some(unreadable))
+                .expect_err("an unreadable pin must stop startup");
+            assert!(
+                matches!(&error, ConfigError::UpstreamCa { .. }),
+                "{unreadable:?} gave {error:?}"
+            );
+        }
     }
 
+    /// A pin file over [`MAX_PIN_FILE_BYTES`] refuses before it is read,
+    /// whatever it holds. The file is sparse, so the test allocates nothing.
+    /// A file of exactly the cap still reads.
     #[test]
-    fn a_pinned_ca_refuses_a_plain_http_upstream() {
+    fn an_oversized_pinned_ca_file_refuses_at_resolution() {
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
         std::fs::write(&ca_path, test_ca_pem()).unwrap();
-        let error = resolve_upstream_tls(None, "http://127.0.0.1:5514", Some(&ca_path))
-            .expect_err("a pin on a plain-http upstream would never be consulted");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&ca_path)
+            .unwrap();
+
+        file.set_len(MAX_PIN_FILE_BYTES).unwrap();
+        let tls = resolve_upstream_tls(Some(&ca_path)).expect("a file at the cap reads");
         assert!(
-            matches!(&error, ConfigError::UpstreamCa { reason, .. } if reason.contains("not https")),
+            matches!(tls, UpstreamTls::PinnedCa { roots: Some(_), .. }),
+            "{tls:?}"
+        );
+
+        file.set_len(MAX_PIN_FILE_BYTES + 1).unwrap();
+        let error = resolve_upstream_tls(Some(&ca_path))
+            .expect_err("an oversized pin file must stop startup");
+        assert!(
+            matches!(&error, ConfigError::UpstreamCa { reason, .. } if reason.contains("larger than 1 MiB")),
             "{error:?}"
         );
+        let error = read_pin_file(&ca_path).expect_err("the read refuses");
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
     }
 
     #[test]
@@ -1590,34 +2093,12 @@ session_ttl_secs = 3600
             upstream_ca_path: Some(ca_path),
             ..configured_web()
         };
-        let runtime = SessionRuntimeOverrides::parse(None, None, None, None, None).unwrap();
-        // Reads the real process environment for the insecure variable,
-        // which the test runner does not set.
-        let resolved = ResolvedConfig::from_parsed_with_runtime(&web, None, runtime).unwrap();
-        assert!(matches!(resolved.upstream_tls, UpstreamTls::PinnedCa(_)));
-    }
-
-    #[test]
-    fn derived_loopback_upstreams_keep_the_insecure_variable() {
-        // The Helm sidecar: `httpAddr: 0.0.0.0:5514` with the variable set.
-        for http_addr in ["0.0.0.0:5514", "[::]:5514", "127.0.0.1:5514", "[::1]:5514"] {
-            let srv = ServerConfig {
-                http_addr: http_addr.into(),
-                ..dummy_server()
-            };
-            let upstream = default_upstream_from_server(Some(&srv));
-            assert!(
-                matches!(
-                    resolve_upstream_tls(Some("1"), &upstream, None),
-                    Ok(UpstreamTls::InsecureLoopback)
-                ),
-                "{http_addr} derived {upstream}"
-            );
-        }
-        // No `[server]` at all falls back to a loopback upstream too.
+        // Reads the real process environment for the CA override, which
+        // the test runner does not set.
+        let resolved = resolve(&web).unwrap();
         assert!(matches!(
-            resolve_upstream_tls(Some("1"), FALLBACK_UPSTREAM_URL, None),
-            Ok(UpstreamTls::InsecureLoopback)
+            resolved.upstream_tls,
+            UpstreamTls::PinnedCa { roots: Some(_), .. }
         ));
     }
 
@@ -1633,11 +2114,11 @@ session_ttl_secs = 3600
             .upstream_url
             .clone()
             .unwrap_or_else(|| default_upstream_from_server(Some(&config.server)));
-        let packaged_pin = config
-            .web
-            .upstream_ca_path
-            .as_deref()
-            .expect("the packaged trawld.toml sets [web] upstream_ca_path");
+        check_upstream_url(&upstream).expect("the Debian upstream follows the URL rules");
+        assert!(
+            config.web.upstream_ca_path.is_some(),
+            "the packaged trawld.toml sets [web] upstream_ca_path"
+        );
 
         // With trawld's certificate at the pinned path, the pin resolves. The
         // certificate here is the shape trawld generates: self-signed, with
@@ -1654,26 +2135,22 @@ session_ttl_secs = 3600
         std::fs::write(&generated, cert.pem()).unwrap();
         assert!(
             matches!(
-                resolve_upstream_tls(None, &upstream, Some(&generated)),
-                Ok(UpstreamTls::PinnedCa(roots)) if roots.len() == 1
+                resolve_upstream_tls(Some(&generated)),
+                Ok(UpstreamTls::PinnedCa { roots: Some(roots), .. }) if roots.certificates().len() == 1
             ),
             "the Debian upstream {upstream} must accept a pin"
         );
 
-        // Before trawld's first start writes it, trawl-web refuses to start
-        // and names the file.
+        // Before trawld's first start writes it, trawl-web still starts,
+        // with the pin pending.
         let missing = dir.path().join("tls").join("cert.pem");
-        let error = resolve_upstream_tls(None, &upstream, Some(&missing)).unwrap_err();
         assert!(
-            matches!(&error, ConfigError::UpstreamCa { path, .. } if *path == missing),
-            "{error:?}"
+            matches!(
+                resolve_upstream_tls(Some(&missing)),
+                Ok(UpstreamTls::PinnedCa { path, roots: None }) if path == missing
+            ),
+            "a missing generated certificate is pending"
         );
-
-        // The insecure variable beside the packaged pin refuses.
-        assert!(matches!(
-            resolve_upstream_tls(Some("1"), &upstream, Some(packaged_pin)),
-            Err(ConfigError::InsecureUpstreamWithCa)
-        ));
     }
 
     /// A self-signed CA certificate in PEM.

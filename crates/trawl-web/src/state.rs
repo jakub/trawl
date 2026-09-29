@@ -5,8 +5,8 @@
 //! Shared request-scoped state.
 //!
 //! `AppState` is cloned into every handler via axum's `State` extractor.
-//! Heavy values (reqwest client, session key) live behind `Arc` so clones
-//! are cheap.
+//! Heavy values (the upstream client, session key) live behind `Arc` so
+//! clones are cheap.
 //!
 //! `AppState` is also the single source of truth for session cookie
 //! headers: [`AppState::build_session_cookie`] (login) and
@@ -15,8 +15,8 @@
 //! set, because browsers ignore a clear directive whose
 //! `Domain`/`Path`/`SameSite` don't match issuance.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use axum::http::HeaderValue;
 use axum::http::header::InvalidHeaderValue;
@@ -24,9 +24,12 @@ use fleet_auth::{
     DEFAULT_COOKIE_NAME, PublicOrigins, SameSite, SessionKey, build_clear_cookie_header,
     build_session_cookie_header,
 };
-use reqwest::{Client, ClientBuilder};
+use reqwest::Client;
+use tokio::task::JoinHandle;
 
-use crate::config::{ResolvedConfig, UpstreamTls};
+use crate::config::ResolvedConfig;
+use crate::error::ProxyError;
+use crate::upstream::Upstream;
 
 /// Handler-visible runtime state.
 #[derive(Clone)]
@@ -36,7 +39,7 @@ pub struct AppState {
 
 struct Inner {
     cookie_key: SessionKey,
-    http: Client,
+    upstream: Upstream,
     upstream_url: String,
     session_ttl_secs: u64,
     allow_insecure_cookies: bool,
@@ -45,26 +48,28 @@ struct Inner {
 }
 
 impl AppState {
-    /// Build state from resolved config. Constructs the reqwest client
-    /// once (connection pooling + keep-alive are implicit). Installs the
+    /// Build state from resolved config. Constructs the upstream client
+    /// (connection pooling + keep-alive are implicit). Installs the
     /// rustls `ring` crypto provider on first call (idempotent — ignored
     /// if another provider is already installed).
     ///
     /// The client's certificate trust comes from
     /// [`ResolvedConfig::upstream_tls`], already validated at resolution;
-    /// see `upstream_client` for what each mode sets.
+    /// see [`crate::upstream`] for how a pinned CA is read again. Starts no
+    /// task: the caller starts the re-read with
+    /// [`Self::spawn_upstream_ca_reread`].
     ///
     /// # Errors
     /// Propagates `reqwest::Error` if the client can't be built.
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let http = upstream_client(Client::builder(), cfg.upstream_tls).build()?;
+        let upstream = Upstream::new(cfg.upstream_tls, cfg.upstream_connect)?;
 
         Ok(Self {
             inner: Arc::new(Inner {
                 cookie_key: cfg.cookie_key,
-                http,
+                upstream,
                 upstream_url: cfg.upstream_url,
                 session_ttl_secs: cfg.session_ttl_secs,
                 allow_insecure_cookies: cfg.allow_insecure_cookies,
@@ -145,9 +150,44 @@ impl AppState {
         .parse()
     }
 
+    /// The client one request uses to reach trawld, from start to end,
+    /// streamed response bodies included. A handler takes it once, after
+    /// its local checks, so a request that fails those never waits on the
+    /// pin file.
+    ///
+    /// # Errors
+    /// [`ProxyError::UpstreamCertificateUnavailable`] while a pinned CA
+    /// file has never held a usable certificate, or when no read of it
+    /// finished within [`crate::upstream::CA_READ_WAIT`].
+    pub async fn upstream_client(&self) -> Result<Client, ProxyError> {
+        self.inner.upstream.client().await
+    }
+
+    /// Start the task that reads a pinned CA file again every `interval`,
+    /// or `None` under the platform roots, where nothing can change.
+    ///
+    /// The task holds the state weakly and ends once the last `AppState`
+    /// clone is gone.
     #[must_use]
-    pub fn http(&self) -> &Client {
-        &self.inner.http
+    pub fn spawn_upstream_ca_reread(&self, interval: Duration) -> Option<JoinHandle<()>> {
+        if !self.inner.upstream.is_pinned() {
+            return None;
+        }
+        let state: Weak<Inner> = Arc::downgrade(&self.inner);
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let Some(inner) = state.upgrade() else {
+                    break;
+                };
+                inner.upstream.reread().await;
+            }
+        }))
+    }
+
+    /// Read a pinned CA file again now, as the interval task does.
+    pub async fn reread_upstream_ca(&self) {
+        self.inner.upstream.reread().await;
     }
 
     #[must_use]
@@ -166,50 +206,10 @@ impl AppState {
     }
 }
 
-/// Where the insecure-loopback client dials the name `localhost`. Port 0
-/// defers to the upstream URL's port, which reqwest always prefers.
-const LOCALHOST_ADDRS: [SocketAddr; 2] = [
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
-];
-
-/// Set the upstream trust mode on `builder`.
-///
-/// The client follows no redirect in any mode: trawld never sends one, and
-/// a followed 3xx would carry the proxy past the loopback-only rule of the
-/// insecure mode to a second host with verification off.
-///
-/// The insecure-loopback mode also fixes where it dials. Resolution
-/// accepts the name `localhost`, and the host resolver would otherwise
-/// answer for it later, from `/etc/hosts`, NSS or DNS, any of which can
-/// name another machine. So the client maps `localhost` to `127.0.0.1` and
-/// `::1` itself and never asks the resolver. The alternative, a resolver
-/// that drops non-loopback answers, still depends on the system resolver
-/// answering loopback at all; the fixed map has no such dependency, and it
-/// covers every name the mode admits, since the other spellings are IP
-/// literals that are never resolved. The mode also ignores proxy settings,
-/// such as `HTTPS_PROXY`: a proxy resolves the name on its own side, so
-/// requests with verification off would leave the machine.
-///
-/// Split from [`AppState::from_config`] so a test can pass a builder with
-/// its own resolver or proxy and see what the mode overrides.
-fn upstream_client(builder: ClientBuilder, tls: UpstreamTls) -> ClientBuilder {
-    let builder = builder.redirect(reqwest::redirect::Policy::none());
-    match tls {
-        UpstreamTls::System => builder,
-        // Only the pinned roots, hostname verification left on. A
-        // plain-http hop would skip the pin, so the client refuses one.
-        UpstreamTls::PinnedCa(roots) => builder.tls_certs_only(roots).https_only(true),
-        UpstreamTls::InsecureLoopback => builder
-            .danger_accept_invalid_certs(true)
-            .resolve_to_addrs("localhost", &LOCALHOST_ADDRS)
-            .no_proxy(),
-    }
-}
-
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
+            .field("upstream", &self.inner.upstream)
             .field("upstream_url", &self.inner.upstream_url)
             .field("session_ttl_secs", &self.inner.session_ttl_secs)
             .field("allow_insecure_cookies", &self.inner.allow_insecure_cookies)
@@ -221,113 +221,58 @@ impl std::fmt::Debug for AppState {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    use reqwest::dns::{Name, Resolve, Resolving};
-    use tokio::net::TcpListener;
 
     use super::*;
+    use crate::config::UpstreamTls;
 
-    /// A host resolver that answers nothing and counts how often it is
-    /// asked, standing in for one that would name another machine.
-    struct RefusingResolver(Arc<AtomicUsize>);
-
-    impl Resolve for RefusingResolver {
-        fn resolve(&self, _name: Name) -> Resolving {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(std::future::ready(
-                Err("the host resolver was asked".into()),
-            ))
-        }
+    #[tokio::test]
+    async fn the_platform_roots_start_no_reread_task() {
+        assert!(
+            state(false)
+                .spawn_upstream_ca_reread(Duration::from_millis(1))
+                .is_none()
+        );
     }
 
-    /// Send one request to `url` with `client` and report whether
-    /// `listener` saw a connection. The TLS handshake then fails, since
-    /// the listener speaks no TLS; only the dial matters here.
-    async fn dials(client: &Client, url: String, listener: &TcpListener) -> bool {
-        let request = tokio::spawn(client.get(url).send());
-        let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+    /// The task holds no strong reference, so dropping the state ends it.
+    #[tokio::test]
+    async fn the_reread_task_ends_with_its_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::from_config(ResolvedConfig {
+            upstream_tls: UpstreamTls::PinnedCa {
+                path: dir.path().join("absent.pem"),
+                roots: None,
+            },
+            ..config(false)
+        })
+        .unwrap();
+        let task = state
+            .spawn_upstream_ca_reread(Duration::from_millis(10))
+            .expect("a pin starts a task");
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(10), task)
             .await
-            .is_ok_and(|accept| accept.is_ok());
-        request.abort();
-        accepted
+            .expect("the task ended")
+            .expect("the task did not panic");
     }
 
-    #[tokio::test]
-    async fn insecure_loopback_dials_localhost_without_asking_the_resolver() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!(
-            "https://localhost:{}/api/v1/whoami",
-            listener.local_addr().unwrap().port()
-        );
-
-        // Control: in the verifying mode the name goes to the resolver,
-        // which refuses, so the injected resolver is the one in use.
-        let asked = Arc::new(AtomicUsize::new(0));
-        let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
-        let client = upstream_client(base, UpstreamTls::System).build().unwrap();
-        let err = client.get(&url).send().await.expect_err("nothing resolves");
-        assert!(err.is_connect(), "got: {err:?}");
-        assert_eq!(asked.load(Ordering::SeqCst), 1);
-
-        let asked = Arc::new(AtomicUsize::new(0));
-        let base = Client::builder().dns_resolver(Arc::new(RefusingResolver(asked.clone())));
-        let client = upstream_client(base, UpstreamTls::InsecureLoopback)
-            .build()
-            .unwrap();
-        assert!(
-            dials(&client, url, &listener).await,
-            "the insecure client did not dial localhost on 127.0.0.1"
-        );
-        assert_eq!(
-            asked.load(Ordering::SeqCst),
-            0,
-            "the insecure client asked the host resolver for localhost"
-        );
-    }
-
-    #[tokio::test]
-    async fn insecure_loopback_ignores_a_configured_proxy() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = Client::builder()
-            .proxy(reqwest::Proxy::all(format!("http://{}", proxy.local_addr().unwrap())).unwrap());
-        let client = upstream_client(base, UpstreamTls::InsecureLoopback)
-            .build()
-            .unwrap();
-
-        let url = format!(
-            "https://localhost:{}/api/v1/whoami",
-            upstream.local_addr().unwrap().port()
-        );
-        assert!(
-            dials(&client, url, &upstream).await,
-            "the insecure client did not dial the upstream directly"
-        );
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), proxy.accept())
-                .await
-                .is_err(),
-            "the insecure client went through the proxy"
-        );
-    }
-
-    fn state(cookie_secure: bool) -> AppState {
-        AppState::from_config(ResolvedConfig {
+    fn config(cookie_secure: bool) -> ResolvedConfig {
+        ResolvedConfig {
             bind_addr: "127.0.0.1:8090".into(),
-            upstream_url: "http://127.0.0.1:5514".into(),
+            upstream_url: "https://127.0.0.1:5514".into(),
             session_ttl_secs: 3_600,
             allow_insecure_cookies: !cookie_secure,
             upstream_tls: UpstreamTls::System,
+            upstream_connect: None,
             cookie_key: SessionKey::from_bytes([0x42; fleet_auth::KEY_LEN]),
             shared_domain: None,
             public_origins: PublicOrigins::parse(["http://127.0.0.1:8090"])
                 .expect("fixture origin parses"),
-        })
-        .unwrap()
+        }
+    }
+
+    fn state(cookie_secure: bool) -> AppState {
+        AppState::from_config(config(cookie_secure)).unwrap()
     }
 
     fn scope_attributes(header: &str) -> BTreeSet<String> {

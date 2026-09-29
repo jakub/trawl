@@ -1,0 +1,24 @@
+
+## export 76ccc826530bcb6bce0a55b320f82887bde14abd
+
+## SPA
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+2026-09-28T18:37:08.069387Z  INFO applying new distribution
+2026-09-28T18:37:08.069839Z  INFO ✅ success
+xtask: web bundle raw=4.86 MiB, gzip=1.79 MiB, brotli=1.51 MiB (budgets: gzip 4.00 MiB, brotli 2.50 MiB)
+
+## DuckDB runtime
+{
+  "version": "1.5.5",
+  "archive": "libduckdb-linux-amd64.zip",
+  "sha256": "1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb"
+}
+
+## binaries (rust:1.98.0-bookworm)
+sha256:cbc28ff495ed8f9b2a1777967fb78873e927052eee6b53ac00de3eb2a9c7818d
+   Compiling trawl-web v0.9.0 (/home/jakub/trawl-270-kind-scratch/src/crates/trawl-web)
+    Finished `release` profile [optimized] target(s) in 6.67s
+
+## stage and build trawl-270-kind:76ccc826530b
+sha256:902dc68aec727c284bc2f81cd4824ce892c0019330d1bebf5380a3fdb084e4ca
+sha256:902dc68aec727c284bc2f81cd4824ce892c0019330d1bebf5380a3fdb084e4ca linux/amd64

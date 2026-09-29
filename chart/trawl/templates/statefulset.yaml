@@ -8,6 +8,9 @@
 {{- if and .Values.web.enabled (not .Values.web.publicOrigins) -}}
 {{- fail "web.enabled=true requires web.publicOrigins: list the browser-visible origins of this deployment (scheme, host and port, matched whole), e.g. --set-string 'web.publicOrigins[0]=https://trawl.example.com'. It is never derived from ingress hosts or httpRoute hostnames." -}}
 {{- end }}
+{{- /* How the sidecar verifies trawld (ADR-0048), resolved and validated in
+     _tls.tpl. The ConfigMap reads the same helper for its [web] keys. */ -}}
+{{- $trust := include "trawl.upstreamTrust" . | fromJson }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -42,8 +45,10 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       terminationGracePeriodSeconds: {{ .Values.config.server.shutdownDrainSecs }}
-      {{- if .Values.initAuth.enabled }}
+      {{- if or .Values.initAuth.enabled $trust.dataSubPath }}
       initContainers:
+      {{- end }}
+      {{- if .Values.initAuth.enabled }}
         # Apply Fleet-auth schema migrations on every pod start when enabled.
         # sqlx tracks applied migrations. Create keys with fleet-admin as
         # described in https://trawl.sh/operate/access/#create-roles-and-keys.
@@ -61,6 +66,100 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.initAuth.resources | nindent 12 }}
+      {{- end }}
+      {{- if $trust.dataSubPath }}
+        # tls.mode=auto with the sidecar: create the directory trawl-web
+        # mounts by subPath before either app container starts. kubelet
+        # creates a missing subPath directory itself, as root, when it sets
+        # up trawl-web's mounts. Containers start in spec order without
+        # waiting for each other, so trawld may not have made it yet, and a
+        # root-owned tls/ leaves trawld unable to publish cert.pem into it.
+        # Init containers finish before kubelet prepares any app container.
+        #
+        # The shared securityContext gives this container trawld's uid and
+        # gid. It cannot take ownership of a directory another uid owns
+        # (that needs root or CAP_CHOWN), so it fails the pod here, naming
+        # the owner, rather than letting trawld crash-loop on it. Nothing
+        # else in the pod runs yet, so nothing races the check.
+        - name: init-tls-dir
+          image: {{ include "trawl.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              dir=$1
+              uid=$(id -u)
+              if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then
+                mkdir -p -m 0755 -- "$dir"
+              fi
+              if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+                echo "$0: $dir is not a directory. trawld publishes its generated certificate there; remove it so this container creates the directory." >&2
+                exit 1
+              fi
+              owner=$(stat -c %u -- "$dir")
+              if [ "$owner" != "$uid" ]; then
+                echo "$0: $dir is owned by uid $owner, not trawld's uid $uid, so trawld cannot publish its generated certificate there. Change its owner to $uid, or remove it so this container creates it." >&2
+                exit 1
+              fi
+              if [ ! -w "$dir" ] || [ ! -x "$dir" ]; then
+                echo "$0: $dir is not writable by trawld's uid $uid, so trawld cannot publish its generated certificate there. Grant the owner write and search permission." >&2
+                exit 1
+              fi
+              # An older trawld kept its private key beside the certificate.
+              # The fsGroup walk can make it readable by trawl-web, so it goes
+              # before any app container starts. Only a regular file is
+              # trawld's; anything else is refused and never followed.
+              key=$dir/key.pem
+              if [ -L "$key" ] || { [ -e "$key" ] && [ ! -f "$key" ]; }; then
+                echo "$0: $key is not a regular file. trawl-web mounts $dir, where no private key may be; remove it." >&2
+                exit 1
+              fi
+              rm -f -- "$key"
+              if [ -e "$key" ] || [ -L "$key" ]; then
+                echo "$0: could not remove the private key $key from $dir, which trawl-web mounts." >&2
+                exit 1
+              fi
+              # trawl-web runs as another uid and pins the certificate in
+              # this directory, so it must search it, and only trawld may
+              # write it. An older trawld made it 0700; the fsGroup walk
+              # makes it group-writable and setgid, a bit a numeric chmod
+              # keeps on a directory.
+              chmod 0755 -- "$dir"
+              chmod ug-s -- "$dir"
+              # A certificate trawld did not write is not one the sidecar may
+              # pin. trawld generates a new pair when the certificate is
+              # missing, so it goes. A symlink is removed, never followed.
+              # trawld's own file is kept and resealed to 0644: the fsGroup
+              # walk adds group write, and regenerating would change the
+              # certificate that ingest clients may pin.
+              cert=$dir/cert.pem
+              if [ -f "$cert" ] && [ ! -L "$cert" ] && [ "$(stat -c %u -- "$cert")" = "$uid" ]; then
+                chmod 0644 -- "$cert"
+              fi
+              if [ -L "$cert" ] || { [ -e "$cert" ] && {
+                [ ! -f "$cert" ] ||
+                [ "$(stat -c %u -- "$cert")" != "$uid" ] ||
+                [ $((0$(stat -c %a -- "$cert") & 022)) -ne 0 ]; }; }; then
+                if ! rm -f -- "$cert" || [ -e "$cert" ] || [ -L "$cert" ]; then
+                  echo "$0: could not remove $cert, which trawld did not write or another uid can change. trawl-web pins it; remove it so trawld generates a new certificate." >&2
+                  exit 1
+                fi
+              fi
+            - init-tls-dir
+            - {{ $trust.dataMountPath | quote }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: data
+              mountPath: {{ include "trawl.dataMountPath" . }}
       {{- end }}
       containers:
         - name: trawld
@@ -138,7 +237,7 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
             - name: data
-              mountPath: /var/lib/trawl
+              mountPath: {{ include "trawl.dataMountPath" . }}
             - name: tmp
               mountPath: /tmp
             - name: config
@@ -167,22 +266,15 @@ spec:
           env:
             - name: HOME
               value: /var/lib/trawl
-            # trawld serves HTTPS with a self-signed cert by default;
-            # loopback-within-pod is the only traffic path, so TLS
-            # verification buys us nothing here.
-            - name: TRAWL_WEB_INSECURE_UPSTREAM
-              value: "1"
             # The proxy's own filter — trawld's logLevel names neither
             # trawl_web nor the proxy's fleet_auth events.
             - name: RUST_LOG
               value: {{ .Values.web.logLevel | quote }}
             # The browser-origin allowlist. The same list the configmap
-            # renders into [web] public_origins, passed again here so a
-            # config.raw that replaces the generated TOML still carries it.
-            # The environment wins on read, and because the two lists are
-            # identical trawl-web logs one info line saying so; it warns
-            # only when they differ, which means something replaced one
-            # half and not the other.
+            # renders into [web] public_origins. The environment wins on
+            # read, and because the two lists are identical trawl-web logs
+            # one info line saying so; it warns only when they differ, which
+            # means something replaced one half and not the other.
             - name: FLEET_SESSION_PUBLIC_ORIGINS
               value: {{ join "," .Values.web.publicOrigins | quote }}
             {{- with .Values.web.extraEnv }}
@@ -201,7 +293,7 @@ spec:
               scheme: HTTP
             periodSeconds: 10
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- include "trawl.webSecurityContext" . | nindent 12 }}
           resources:
             {{- toYaml .Values.web.resources | nindent 12 }}
           volumeMounts:
@@ -215,6 +307,29 @@ spec:
               mountPath: /etc/trawl/web.cookie
               subPath: cookie.key
               readOnly: true
+            {{- if $trust.dataSubPath }}
+            # tls.mode=auto: the directory holding trawld's generated
+            # certificate, pinned by [web] upstream_ca_path. Never a file
+            # subPath: that binds one inode at container start, so kubelet
+            # would create a directory where a not-yet-written cert.pem
+            # belongs, and a certificate replaced by rename would never
+            # reach the sidecar. Read-only. It holds only cert.pem: trawld's
+            # key.pem is in tls-key/, outside this mount.
+            - name: data
+              mountPath: {{ $trust.dataMountPath | quote }}
+              subPath: {{ $trust.dataSubPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if $trust.caSecretName }}
+            # tls.upstreamCa=secret: only ca.crt, as a directory mount so a
+            # renewed CA reaches trawl-web's re-read without a restart.
+            - name: upstream-ca
+              mountPath: {{ $trust.caMountPath | quote }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.web.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
         {{- end }}
       volumes:
         - name: tmp
@@ -236,6 +351,22 @@ spec:
             items:
               - key: {{ .Values.web.cookieSecret.existingSecretKey | default "cookie.key" }}
                 path: cookie.key
+        {{- if $trust.caSecretName }}
+        # The TLS Secret again, projecting ca.crt alone so tls.key never
+        # reaches the sidecar. Optional: an issuer that writes no ca.crt
+        # leaves the directory empty and trawl-web answers 503 rather than
+        # the pod failing to start.
+        - name: upstream-ca
+          secret:
+            secretName: {{ $trust.caSecretName }}
+            optional: true
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+        {{- with .Values.web.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

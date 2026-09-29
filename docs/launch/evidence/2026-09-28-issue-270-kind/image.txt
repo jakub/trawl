@@ -1,0 +1,48 @@
+source_sha: 76ccc826530bcb6bce0a55b320f82887bde14abd
+image: trawl-270-kind:76ccc826530b
+docker image id (OCI index digest): sha256:902dc68aec727c284bc2f81cd4824ce892c0019330d1bebf5380a3fdb084e4ca
+platform: linux/amd64
+created: 2026-09-28T11:37:24.411209903-07:00
+label org.opencontainers.image.revision: 76ccc826530bcb6bce0a55b320f82887bde14abd
+
+kind node, containerd namespace k8s.io (kind load re-imports the index as import-<date>):
+REF  TYPE  DIGEST  SIZE  PLATFORMS  LABELS  
+docker.io/library/trawl-270-kind:76ccc826530b  application/vnd.oci.image.index.v1+json  sha256:902dc68aec727c284bc2f81cd4824ce892c0019330d1bebf5380a3fdb084e4ca 86.1 MiB  linux/amd64  io.cri-containerd.image=managed  
+import-2026-09-28@sha256:ddd4a43339357b687b4fd3b89924f7e8669dd1efb6c8667426b7b60f268e392a  application/vnd.oci.image.index.v1+json  sha256:ddd4a43339357b687b4fd3b89924f7e8669dd1efb6c8667426b7b60f268e392a 86.1 MiB  linux/amd64  io.cri-containerd.image=managed  
+
+crictl inspecti (the imageID both legs' containers report):
+{"repoTags":["docker.io/library/trawl-270-kind:76ccc826530b"],"repoDigests":["docker.io/library/import-2026-09-28@sha256:ddd4a43339357b687b4fd3b89924f7e8669dd1efb6c8667426b7b60f268e392a"],"id":"sha256:c4c5021df47b4653e2864c7eed1e428c6528b4368191768e6bcb21df36c23387"}
+
+staged docker-ctx/amd64 (sha256):
+60c1d664ec5e80a508370229dbb74d51ab7ce99054dc5c0c5967e688a0ed2485  bin/fleet-admin
+d87579c3e52b5ba2fe7997727aee1f8260ee18cb3e17d4382931a0b87003bfef  bin/trawl-admin
+75fd47cacbb92259d1df70f30cce5e2af56f74d03b77553a1ee45523ddc0553f  bin/trawld
+b62c85027bb6b1eb82e198f5513bfb0f73dab0d1d542572981b50b291a042240  bin/trawl-web
+fc23f12e376c47be520f75221288281906e7942e8fd6f6ce4849198ba60d0405  lib/trawl/libduckdb.so
+d999e7c4a13ac608f2ed8de0bf74486658ca383487bbfbb2dd772c4321bc45ff  distribution.json
+1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5  LICENSE
+7e17fd31249fa875cb3b1c5e05c6c3e99b75509f6a2804ca176c217834de1dcb  LICENSE.duckdb
+
+distribution.json:
+{
+  "version": "1.5.5",
+  "archive": "libduckdb-linux-amd64.zip",
+  "sha256": "1fb8ce388157d84a25abe685a8a2520bf00c00321821968e4bb398fd766e7abb",
+  "target": "x86_64-unknown-linux-gnu",
+  "source_sha": "76ccc826530bcb6bce0a55b320f82887bde14abd",
+  "tooling_sha": "76ccc826530bcb6bce0a55b320f82887bde14abd",
+  "platform_floor": "Debian 12"
+}
+
+builder: rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 plus python3 and curl
+SPA: trunk 0.21.14 on the host, then cargo xtask compress-web
+kind: kind v0.33.0 go1.27.0-X:nodwarf5 linux/amd64
+helm: v4.2.2+gb05881c
+kubectl: Client Version: v1.36.4
+docker: 29.7.2
+
+$ docker run --rm --entrypoint sha256sum trawl-270-kind:76ccc826530b /usr/bin/trawld /usr/bin/trawl-web /usr/bin/fleet-admin /usr/bin/trawl-admin
+75fd47cacbb92259d1df70f30cce5e2af56f74d03b77553a1ee45523ddc0553f  /usr/bin/trawld
+b62c85027bb6b1eb82e198f5513bfb0f73dab0d1d542572981b50b291a042240  /usr/bin/trawl-web
+60c1d664ec5e80a508370229dbb74d51ab7ce99054dc5c0c5967e688a0ed2485  /usr/bin/fleet-admin
+d87579c3e52b5ba2fe7997727aee1f8260ee18cb3e17d4382931a0b87003bfef  /usr/bin/trawl-admin

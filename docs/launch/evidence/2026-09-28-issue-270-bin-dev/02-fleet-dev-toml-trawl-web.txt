@@ -1,0 +1,16 @@
+$ grep -n -B2 -A12 'name = "trawl-web"' fleet-dev.toml
+36-
+37-[[processes]]
+38:name = "trawl-web"
+39-command = ["target/debug/trawl-web"]
+40-
+41-# Pin the certificate the dev trawld generates in its state directory
+42-# (default config ~/.trawl/trawld.toml, [data] path ~/.trawl/data). Until
+43-# trawld's first start writes it, trawl-web answers 503 and then loads it.
+44-[processes.env]
+45-TRAWL_WEB_UPSTREAM_CA_PATH = "~/.trawl/tls/cert.pem"
+46-
+47-[processes.resolved_env]
+48-FLEET_SESSION_AEAD_KEY = "fleet.session_aead_key"
+49-
+50-[[processes]]

@@ -1,0 +1,8 @@
+# mprocs pane 'trawl-trawl-web', captured 2026-09-28T18:56:40Z via: tmux -L j270c9b capture-pane -p -J -t dev
+# (mprocs frame and process list stripped; fleet-dev API key redacted as flt_<redacted>)
+2026-09-28T18:56:03.546514Z  WARN trawl_web::config: the environment is clearing Secure on the session cookie event_type="session_cookie_secure_downgraded" env="FLEET_SESSION_COOKIE_SECURE"
+2026-09-28T18:56:03.546602Z  WARN trawl_web::config: the pinned upstream CA file does not exist yet; trawl-web cannot reach trawld until it does event_type="upstream_ca_pending" path=/home/jakub/.trawl/tls/cert.pem
+2026-09-28T18:56:03.546634Z  INFO trawl_web: loaded config config=/home/jakub/.trawl/trawld.toml bind_addr=127.0.0.1:8090 upstream=https://127.0.0.1:5514 public_origins_count=1 public_origins=http://localhost:8081
+2026-09-28T18:56:03.546818Z  INFO trawl_web::routes: SPA fallback: embedded bundle
+2026-09-28T18:56:03.546969Z  INFO trawl_web: trawl-web listening addr=127.0.0.1:8090
+2026-09-28T18:56:04.209913Z  INFO trawl_web::upstream: loaded the pinned upstream CA file; trawl-web can reach trawld event_type="upstream_ca_loaded" path=/home/jakub/.trawl/tls/cert.pem

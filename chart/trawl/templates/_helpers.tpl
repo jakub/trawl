@@ -86,8 +86,8 @@ capability other than NET_BIND_SERVICE is what the Restricted Pod
 Security profile refuses, so an enabled install is still incompatible
 with Restricted. The chart documents that rather than enforcing it,
 because admission policy is cluster state the chart cannot read
-(ADR-0023 ruling 7, as amended). Only trawld is touched; init-auth and
-trawl-web keep the unmodified securityContext.
+(ADR-0023 ruling 7, as amended). Only trawld is touched; init-auth,
+init-tls-dir and trawl-web keep the unmodified securityContext.
 */}}
 {{- define "trawl.trawldSecurityContext" -}}
 {{- $sc := deepCopy .Values.securityContext -}}
@@ -98,3 +98,24 @@ trawl-web keep the unmodified securityContext.
 {{- end -}}
 {{- toYaml $sc -}}
 {{- end }}
+
+{{/*
+The trawl-web container's securityContext: the shared securityContext with
+the sidecar's own uid, web.runAsUser (ADR-0048). In tls.mode=auto the
+sidecar mounts trawld's tls directory to pin cert.pem. That directory holds
+only the certificate: key.pem is in tls-key/, 0600 and owned by trawld's uid.
+A separate uid keeps the key unreadable as well. The pod's runAsGroup and
+fsGroup still apply, and those are what let the sidecar read its ConfigMap
+and cookie Secret.
+*/}}
+{{- define "trawl.webSecurityContext" -}}
+{{- $sc := deepCopy (.Values.securityContext | default dict) -}}
+{{- $_ := set $sc "runAsUser" .Values.web.runAsUser -}}
+{{- toYaml $sc -}}
+{{- end }}
+
+{{/*
+Where trawld mounts its data volume. The web sidecar's certificate mount in
+tls.mode=auto is a subPath of the same volume, so both derive from this.
+*/}}
+{{- define "trawl.dataMountPath" -}}/var/lib/trawl{{- end }}

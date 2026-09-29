@@ -37,8 +37,13 @@ use trawl_web::config::ResolvedConfig;
 use trawl_web::routes;
 use trawl_web::state::AppState;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 use zeroize::Zeroizing;
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+
+use test_support::TlsUpstream;
 
 /// The deployment's configured `public_origins`: a public HTTPS origin, a
 /// loopback bind by name, and that bind's IPv6 spelling. Three entries, so
@@ -240,8 +245,8 @@ impl Route {
 /// An upstream that answers every path the routes above reach. It exists
 /// so a passing request has somewhere to land; the rejection rows assert
 /// it was never called at all.
-async fn upstream_server() -> MockServer {
-    let upstream = MockServer::start().await;
+async fn upstream_server() -> TlsUpstream {
+    let upstream = TlsUpstream::start().await;
     let whoami = json!({
         "prefix": "testtest",
         "name": "alice",
@@ -252,7 +257,7 @@ async fn upstream_server() -> MockServer {
     Mock::given(method("GET"))
         .and(path("/api/v1/whoami"))
         .respond_with(ResponseTemplate::new(200).set_body_json(whoami))
-        .mount(&upstream)
+        .mount(upstream.mock())
         .await;
     for stream in ["/api/v1/stream", "/api/v1/dashboard/stream"] {
         Mock::given(method("GET"))
@@ -262,31 +267,30 @@ async fn upstream_server() -> MockServer {
                     .set_body_string("event: data\ndata: {}\n\n")
                     .insert_header("content-type", "text/event-stream"),
             )
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
     }
     Mock::given(path("/api/v1/saved"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"saved": []})))
-        .mount(&upstream)
+        .mount(upstream.mock())
         .await;
     upstream
 }
 
-fn state_with(upstream: &MockServer, origins: &[&str]) -> AppState {
+fn state_with(upstream: &TlsUpstream, origins: &[&str]) -> AppState {
     let web = WebConfig {
-        upstream_url: Some(upstream.uri()),
         allow_insecure_cookies: true,
         public_origins: origins.iter().map(|o| (*o).to_owned()).collect(),
-        ..WebConfig::default()
+        ..upstream.web_config()
     };
     AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap()
 }
 
-fn state_for(upstream: &MockServer) -> AppState {
+fn state_for(upstream: &TlsUpstream) -> AppState {
     state_with(upstream, &ALLOWED)
 }
 
-async fn fixture() -> (MockServer, AppState, axum::Router) {
+async fn fixture() -> (TlsUpstream, AppState, axum::Router) {
     let upstream = upstream_server().await;
     let state = state_for(&upstream);
     let app = routes::build(state.clone());
@@ -348,8 +352,9 @@ fn request(route: &Route, origin: Option<&str>, credential: &Credential<'_>) -> 
 /// assertion on every rejection: the proxy attaches the session's bearer
 /// token to what it forwards, so a call made before the verdict has
 /// already handed the attacker's request the victim's credential.
-async fn upstream_calls(upstream: &MockServer) -> usize {
+async fn upstream_calls(upstream: &TlsUpstream) -> usize {
     upstream
+        .mock()
         .received_requests()
         .await
         .expect("wiremock records requests by default")
@@ -362,12 +367,12 @@ async fn upstream_calls(upstream: &MockServer) -> usize {
 /// the previous one, so a row's assertion is about that row and cannot be
 /// satisfied by what its neighbours did or did not spend.
 struct UpstreamLedger<'a> {
-    upstream: &'a MockServer,
+    upstream: &'a TlsUpstream,
     seen: usize,
 }
 
 impl<'a> UpstreamLedger<'a> {
-    fn new(upstream: &'a MockServer) -> Self {
+    fn new(upstream: &'a TlsUpstream) -> Self {
         Self { upstream, seen: 0 }
     }
 

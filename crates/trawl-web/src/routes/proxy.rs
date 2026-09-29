@@ -68,7 +68,6 @@ async fn do_forward(
     auth: Auth,
     req: Request<Body>,
 ) -> Result<Response, ProxyError> {
-    let http = state.http();
     let (parts, body) = req.into_parts();
 
     // CSRF defense already ran: `auth` is here, which means the request
@@ -80,6 +79,15 @@ async fn do_forward(
     // victim's logs. Owning the check in the extractor is what makes the
     // rule hold for every cookie route, including the next one.
     let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
+
+    let body_bytes = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
+        .await
+        .map_err(|e| ProxyError::BadRequest(format!("request body: {e}")))?;
+
+    // After every local check, so a request refused here never waits on
+    // the pin file. This one client carries the request and its streamed
+    // response body.
+    let http = state.upstream_client().await?;
 
     let mut upstream_req = http
         .request(reqwest_method(&parts.method), upstream_uri)
@@ -97,9 +105,6 @@ async fn do_forward(
         upstream_req = upstream_req.header(name.as_str(), value);
     }
 
-    let body_bytes = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
-        .await
-        .map_err(|e| ProxyError::BadRequest(format!("request body: {e}")))?;
     if !body_bytes.is_empty() {
         upstream_req = upstream_req.body(body_bytes.to_vec());
     }
@@ -150,10 +155,9 @@ pub(crate) fn clear_cookie_for_proxied_response(
 ///
 /// trawld never redirects, and the client follows no redirect (see
 /// [`AppState::from_config`]). Mirroring the 3xx would let the browser
-/// follow it instead: in the insecure-loopback mode another process can
-/// answer on the upstream port, and a `Location` naming another port on
-/// the browser's host would carry the host-scoped session cookie there,
-/// since a cookie's scope ignores the port. Every 3xx is refused, 304
+/// follow it instead: a `Location` naming another port on the browser's
+/// host would carry the host-scoped session cookie there, since a
+/// cookie's scope ignores the port. Every 3xx is refused, 304
 /// included: trawld sends no validators, so a 304 is not an answer it
 /// gives. Shared by every route that relays an upstream status.
 ///
@@ -221,22 +225,22 @@ mod tests {
     use tower::ServiceExt;
     use trawl_config::WebConfig;
     use wiremock::matchers::{bearer_token, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, ResponseTemplate};
 
     use crate::config::ResolvedConfig;
     use crate::routes;
+    use crate::test_support::TlsUpstream;
 
     /// The browser origin these fixtures answer on. The CSRF tests below
     /// send it verbatim; anything else is a foreign origin by definition,
     /// which is the whole of ADR-0016's policy.
     const TEST_ORIGIN: &str = "https://trawl.fleet.test";
 
-    fn state_pointing_at(upstream: &MockServer) -> AppState {
+    fn state_pointing_at(upstream: &TlsUpstream) -> AppState {
         let web = WebConfig {
-            upstream_url: Some(upstream.uri()),
             allow_insecure_cookies: true,
             public_origins: vec![TEST_ORIGIN.to_owned()],
-            ..WebConfig::default()
+            ..upstream.web_config()
         };
         let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
         AppState::from_config(cfg).unwrap()
@@ -253,7 +257,7 @@ mod tests {
         // path falls through to the SPA fallback and answers 200 with
         // index.html while every path below it answers the JSON 404.
         for retired_path in ["/api/intel/v1/stories", "/api", "/api/v2/query"] {
-            let upstream = MockServer::start().await;
+            let upstream = TlsUpstream::start().await;
             let app = build_app(state_pointing_at(&upstream));
 
             let request = Request::builder()
@@ -268,13 +272,18 @@ mod tests {
                 "{retired_path} must answer the API 404, not the SPA"
             );
             assert!(
-                upstream.received_requests().await.unwrap().is_empty(),
+                upstream
+                    .mock()
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .is_empty(),
                 "{retired_path} must not relay to the configured upstream"
             );
         }
     }
 
-    async fn login_and_get_cookie(app: Router, upstream: &MockServer) -> String {
+    async fn login_and_get_cookie(app: Router, upstream: &TlsUpstream) -> String {
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -284,7 +293,7 @@ mod tests {
                 "roles": ["trawl-analyst"],
                 "permissions": ["query", "schema_read", "validate", "saved_query", "export", "stream", "query_cancel"]
             })))
-            .mount(upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -305,7 +314,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_injects_bearer_and_mirrors_status() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -317,7 +326,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "columns": [{"name": "timestamp", "type": "TIMESTAMP"}]
             })))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -332,7 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_rejects_missing_cookie() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -347,7 +356,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_endpoint_is_always_404() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -372,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_preserves_upstream_4xx() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -381,7 +390,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/schema"))
             .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -399,7 +408,7 @@ mod tests {
         // trawld is a backend API — it must not set cookies in the
         // browser context. The proxy strips all Set-Cookie headers
         // from upstream responses to prevent cookie shadowing.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -413,7 +422,7 @@ mod tests {
                     .append_header("set-cookie", "two=2; Path=/")
                     .set_body_string("[]"),
             )
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -437,7 +446,7 @@ mod tests {
         // A 3xx never gets this far (`refuse_redirect`), but a navigation
         // that lands on a proxied 201 still sees its headers, so
         // `Location` is dropped whatever the status.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let app = build_app(state_pointing_at(&upstream));
         let cookie = login_and_get_cookie(app.clone(), &upstream).await;
 
@@ -448,7 +457,7 @@ mod tests {
                     .insert_header("location", "http://127.0.0.1:1/steal")
                     .set_body_string("{}"),
             )
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -482,7 +491,7 @@ mod tests {
     async fn forward_upstream_401_with_session_preserves_cookie() {
         // A proxied 401 means the upstream key is dead, but cookie clearing
         // belongs to `auth::me`, not an arbitrary proxied request.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -491,7 +500,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/schema"))
             .respond_with(ResponseTemplate::new(401))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -512,7 +521,7 @@ mod tests {
     async fn forward_upstream_403_preserves_cookie() {
         // A valid key missing either a trawl grant or this route's permission
         // may still hold grants for sibling apps. Preserve the shared cookie.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -521,7 +530,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/schema"))
             .respond_with(ResponseTemplate::new(403))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -542,14 +551,14 @@ mod tests {
     async fn forward_upstream_401_with_bearer_does_not_clear() {
         // Bearer clients hold no cookie — a clear directive would be
         // meaningless noise (and confusing for API clients).
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
         Mock::given(method("GET"))
             .and(path("/api/v1/schema"))
             .respond_with(ResponseTemplate::new(401))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -568,7 +577,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_accepts_bearer_header() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -578,7 +587,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "columns": [{"name": "host", "type": "VARCHAR"}]
             })))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -593,7 +602,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_bearer_wins_over_cookie() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -603,7 +612,7 @@ mod tests {
             .and(path("/api/v1/schema"))
             .and(bearer_token("flt_explicit"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -619,7 +628,7 @@ mod tests {
 
     #[tokio::test]
     async fn forward_rejects_empty_bearer() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -643,7 +652,7 @@ mod tests {
         // Origin validation must reject it before the victim's bearer token
         // reaches trawld. No upstream mock is mounted for the route: a 403
         // (not a forwarded 404) proves the request was blocked at the proxy.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -670,7 +679,7 @@ mod tests {
     async fn forward_allows_cookie_authed_same_origin_mutation() {
         // Same-origin POST from the SPA carries a matching Origin and must
         // pass through to upstream.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -679,7 +688,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/saved"))
             .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -700,7 +709,7 @@ mod tests {
         // Present-only semantics: a request carrying no Origin header (some
         // same-origin navigations, non-browser cookie clients) is allowed —
         // the Session extractor still validates the cookie itself.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -709,7 +718,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/saved"))
             .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -728,7 +737,7 @@ mod tests {
         // Bearer clients (CLI/API) hold no cookie and are not CSRF targets —
         // the origin guard must not apply to them even on a "cross-origin"
         // (irrelevant, header-set) POST.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
 
@@ -736,7 +745,7 @@ mod tests {
             .and(path("/api/v1/saved"))
             .and(bearer_token("flt_direct"))
             .respond_with(ResponseTemplate::new(201).set_body_string("{}"))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()

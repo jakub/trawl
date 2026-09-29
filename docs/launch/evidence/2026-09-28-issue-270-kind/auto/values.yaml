@@ -1,0 +1,19 @@
+# Leg 1: tls.mode=auto (chart default, not set here).
+image:
+  repository: trawl-270-kind
+  tag: "76ccc826530b"
+  pullPolicy: Never
+auth:
+  database:
+    existingSecret: fleet-db
+storage:
+  database:
+    existingSecret: trawl-db
+persistence:
+  enabled: true
+  size: 1Gi
+web:
+  enabled: true
+  publicOrigins:
+    - http://localhost:8090
+  allowInsecureCookies: true

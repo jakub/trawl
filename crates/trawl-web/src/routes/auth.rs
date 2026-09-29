@@ -130,7 +130,8 @@ async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyErro
         state.upstream_url().trim_end_matches('/')
     );
     let resp = state
-        .http()
+        .upstream_client()
+        .await?
         .get(&url)
         .bearer_auth(token)
         .send()
@@ -230,10 +231,11 @@ mod tests {
     use tower::ServiceExt;
     use trawl_config::WebConfig;
     use wiremock::matchers::{bearer_token, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, ResponseTemplate};
 
     use crate::config::ResolvedConfig;
     use crate::routes;
+    use crate::test_support::TlsUpstream;
 
     /// The browser origin the standalone fixtures answer on.
     const TEST_ORIGIN: &str = "https://trawl.example.com";
@@ -244,15 +246,26 @@ mod tests {
     /// allowlist.
     const SSO_ORIGIN: &str = "https://trawl.fleet.test";
 
-    fn test_state(upstream_url: String) -> AppState {
+    /// Standalone-mode state reaching the upstream `upstream` names:
+    /// a [`TlsUpstream::web_config`], or [`unreached_upstream`].
+    fn test_state(upstream: WebConfig) -> AppState {
         let web = WebConfig {
-            upstream_url: Some(upstream_url),
             allow_insecure_cookies: true,
             public_origins: vec![TEST_ORIGIN.to_owned()],
-            ..WebConfig::default()
+            ..upstream
         };
         let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
         AppState::from_config(cfg).unwrap()
+    }
+
+    /// An upstream for a test whose handler answers before any upstream
+    /// call. Nothing listens at the name, so a request that did go out
+    /// would fail rather than reach something.
+    fn unreached_upstream() -> WebConfig {
+        WebConfig {
+            upstream_url: Some("https://unused.invalid".to_owned()),
+            ..WebConfig::default()
+        }
     }
 
     /// Upstream `/whoami` body for a key with trawl capability. The
@@ -269,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_accepts_valid_api_key() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .and(bearer_token("flt_goodtoken"))
@@ -278,10 +291,10 @@ mod tests {
                 "trawl-analyst",
                 &["query", "export"],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
-        let state = test_state(upstream.uri());
+        let state = test_state(upstream.web_config());
         let app = routes::build(state);
 
         let req = Request::builder()
@@ -318,14 +331,14 @@ mod tests {
 
     #[tokio::test]
     async fn login_rejects_wrong_api_key() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(401))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
-        let state = test_state(upstream.uri());
+        let state = test_state(upstream.web_config());
         let app = routes::build(state);
 
         let req = Request::builder()
@@ -342,8 +355,8 @@ mod tests {
 
     #[tokio::test]
     async fn login_rejects_empty_api_key() {
-        // No MockServer needed — handler must fail input validation first.
-        let state = test_state("http://unused".into());
+        // No upstream needed — handler must fail input validation first.
+        let state = test_state(unreached_upstream());
         let app = routes::build(state);
 
         let req = Request::builder()
@@ -362,7 +375,7 @@ mod tests {
         // Valid key, but every grant is for a sibling app. The proxy must
         // NOT mint a session (403, no Set-Cookie) — and must NOT clear
         // anything either: the key works elsewhere in the fleet.
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
@@ -370,10 +383,10 @@ mod tests {
                 "sibling-analyst",
                 &[],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
-        let state = test_state(upstream.uri());
+        let state = test_state(upstream.web_config());
         let app = routes::build(state);
 
         let req = Request::builder()
@@ -393,7 +406,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_secure_cookie_when_insecure_disabled() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .and(bearer_token("flt_prod"))
@@ -402,14 +415,13 @@ mod tests {
                 "trawl-admin",
                 &["query", "server_manage"],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let web = WebConfig {
-            upstream_url: Some(upstream.uri()),
             allow_insecure_cookies: false,
             public_origins: vec![TEST_ORIGIN.to_owned()],
-            ..WebConfig::default()
+            ..upstream.web_config()
         };
         let state =
             AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap();
@@ -436,14 +448,13 @@ mod tests {
     // -- cookie contract ---------------------------------------------------
 
     /// State with `shared_domain` set — SSO mode.
-    fn sso_state(upstream_url: String) -> AppState {
+    fn sso_state(upstream: WebConfig) -> AppState {
         let web = WebConfig {
-            upstream_url: Some(upstream_url),
             allow_insecure_cookies: true,
             shared_domain: Some(".fleet.test".into()),
             session_ttl_secs: Some(3600),
             public_origins: vec![SSO_ORIGIN.to_owned()],
-            ..WebConfig::default()
+            ..upstream
         };
         let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
         AppState::from_config(cfg).unwrap()
@@ -451,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_cookie_carries_domain_iff_shared_domain_set() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
@@ -459,10 +470,10 @@ mod tests {
                 "trawl-analyst",
                 &["query", "export"],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
-        let app = routes::build(sso_state(upstream.uri()));
+        let app = routes::build(sso_state(upstream.web_config()));
         let req = Request::builder()
             .method("POST")
             .uri("/api/auth/login")
@@ -510,7 +521,7 @@ mod tests {
         // Browsers reject clear directives whose Domain/Path/SameSite
         // don't match the issued cookie — the clear must carry the exact
         // attribute set login used (minus lifetime).
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
@@ -518,10 +529,10 @@ mod tests {
                 "trawl-analyst",
                 &["query", "export"],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
-        let app = routes::build(sso_state(upstream.uri()));
+        let app = routes::build(sso_state(upstream.web_config()));
 
         let login_req = Request::builder()
             .method("POST")
@@ -574,7 +585,7 @@ mod tests {
         let key_bytes = [0x42u8; fleet_auth::KEY_LEN];
         std::fs::write(&key_path, key_bytes).unwrap();
 
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
@@ -582,15 +593,14 @@ mod tests {
                 "trawl-analyst",
                 &["query", "export"],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let web = WebConfig {
-            upstream_url: Some(upstream.uri()),
             allow_insecure_cookies: true,
             cookie_secret_path: Some(key_path),
             public_origins: vec![TEST_ORIGIN.to_owned()],
-            ..WebConfig::default()
+            ..upstream.web_config()
         };
         let state =
             AppState::from_config(ResolvedConfig::from_parsed(&web, None).unwrap()).unwrap();
@@ -639,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_rejects_cross_origin() {
-        let state = test_state("http://unused".into());
+        let state = test_state(unreached_upstream());
         let app = routes::build(state);
 
         let req = Request::builder()
@@ -657,7 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn logout_rejects_cross_origin_without_clearing() {
-        let state = test_state("http://unused".into());
+        let state = test_state(unreached_upstream());
         let app = routes::build(state);
 
         let req = Request::builder()
@@ -682,7 +692,7 @@ mod tests {
         // logout endpoint. Its sibling Origin is not trusted just because it
         // lives under the same parent-domain cookie: 403 with no Set-Cookie,
         // so fleet_session is not cleared fleet-wide.
-        let app = routes::build(sso_state("http://unused".into()));
+        let app = routes::build(sso_state(unreached_upstream()));
 
         let req = Request::builder()
             .method("POST")
@@ -707,7 +717,7 @@ mod tests {
         // which hyper parks in the request URI. Since ADR-0016 neither is
         // read: the configured allowlist decides, so a request carrying
         // only a matching `Origin` is accepted and clears the cookie.
-        let app = routes::build(test_state("http://unused".into()));
+        let app = routes::build(test_state(unreached_upstream()));
 
         let req = Request::builder()
             .method("POST")
@@ -730,7 +740,7 @@ mod tests {
         // `Origin` does not. The allowlist is the only input, so this is a
         // refusal: the authority in the URI is the attacker's to choose
         // as much as any header is.
-        let app = routes::build(test_state("http://unused".into()));
+        let app = routes::build(test_state(unreached_upstream()));
 
         let req = Request::builder()
             .method("POST")
@@ -745,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_allows_the_configured_origin_but_rejects_an_sso_sibling() {
-        let upstream = MockServer::start().await;
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
@@ -753,12 +763,12 @@ mod tests {
                 "trawl-analyst",
                 &["query", "export"],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         // The configured origin, standalone mode → allowed. The `host`
         // header rides along to show it changes nothing.
-        let app = routes::build(test_state(upstream.uri()));
+        let app = routes::build(test_state(upstream.web_config()));
         let req = Request::builder()
             .method("POST")
             .uri("/api/auth/login")
@@ -773,7 +783,7 @@ mod tests {
         // A sibling app under the same shared domain is a different origin
         // and must be rejected (403, no cookie): sharing a parent-domain
         // cookie is not an origin allowlist. See `origin_allowed`.
-        let app = routes::build(sso_state(upstream.uri()));
+        let app = routes::build(sso_state(upstream.web_config()));
         let req = Request::builder()
             .method("POST")
             .uri("/api/auth/login")
@@ -793,8 +803,8 @@ mod tests {
         set_cookie.split(';').next().unwrap().trim().to_string()
     }
 
-    async fn login_and_get_cookie() -> (axum::Router, MockServer, String) {
-        let upstream = MockServer::start().await;
+    async fn login_and_get_cookie() -> (axum::Router, TlsUpstream, String) {
+        let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
@@ -802,10 +812,10 @@ mod tests {
                 "trawl-analyst",
                 &["query", "export"],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
-        let state = test_state(upstream.uri());
+        let state = test_state(upstream.web_config());
         let app = routes::build(state);
 
         let req = Request::builder()
@@ -874,7 +884,7 @@ mod tests {
         assert!(!body.permissions.contains(&"server_manage".to_owned()));
 
         // Promote the principal upstream — same cookie, new role + perms.
-        upstream.reset().await;
+        upstream.mock().reset().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
@@ -882,7 +892,7 @@ mod tests {
                 "trawl-admin",
                 &["query", "export", "server_manage"],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let response = app.oneshot(me_req()).await.unwrap();
@@ -908,11 +918,11 @@ mod tests {
         // browser to drop the dead cookie.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
-        upstream.reset().await;
+        upstream.mock().reset().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(401))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -943,11 +953,11 @@ mod tests {
         // /me must 403 WITHOUT touching the shared cookie.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
-        upstream.reset().await;
+        upstream.mock().reset().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(403))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -969,7 +979,7 @@ mod tests {
         // Same as above but via the whoami-200-without-trawl-grant branch.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
-        upstream.reset().await;
+        upstream.mock().reset().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
             .respond_with(ResponseTemplate::new(200).set_body_json(whoami_body(
@@ -977,7 +987,7 @@ mod tests {
                 "sibling-analyst",
                 &[],
             )))
-            .mount(&upstream)
+            .mount(upstream.mock())
             .await;
 
         let req = Request::builder()
@@ -993,7 +1003,7 @@ mod tests {
 
     #[tokio::test]
     async fn me_rejects_missing_cookie() {
-        let state = test_state("http://unused".into());
+        let state = test_state(unreached_upstream());
         let app = routes::build(state);
 
         let req = Request::builder()
