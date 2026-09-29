@@ -168,10 +168,14 @@ The doctor writes nothing and takes no lock. It runs no migration and starts
 no crash-dump capture, even when `TRAWL_CRASH_DUMP_DIR` is set. It opens
 database sessions as read-only and reads only bounded amounts of data in
 bounded time. It never sends an API key and never sends an event. It reads
-each database TLS file once and passes its contents to the database driver,
-and it trusts the credential files you selected: its check of a password file
-guards against mistakes, not against a file that someone replaces while the
-doctor runs.
+each database TLS file once and passes its contents to the database driver.
+
+The doctor trusts what the configuration selects, as trawld does: the database
+servers that the URLs name, and the credential files that you selected. The
+database driver does not bound what a server sends, so a hostile database
+server can make the doctor reserve a large amount of memory, as it can with
+trawld. The password-file check guards against mistakes, not against a file
+that someone replaces while the doctor runs.
 
 One side effect remains. A probe that makes the running trawld answer 503
 emits that server's `http_failure` telemetry event

@@ -634,6 +634,13 @@ async fn connect(ctx: &Ctx, runner: &mut Runner, db: Database) -> Session {
     };
     let source = password.named_after(source);
 
+    // Trust posture (human decision 2026-09-29): the doctor trusts the
+    // database server trawld's configuration points at, as trawld does.
+    // SQLx waits for, and buffers, as many bytes as a server message's u32
+    // length declares (sqlx-postgres 0.9.0, `connection/stream.rs`,
+    // `recv_unchecked`), so a hostile server can make it reserve gigabytes.
+    // trawld has the same exposure, and a server that hostile already owns
+    // trawld's state. A message that makes SQLx panic ends only its task.
     let connecting = tokio::spawn(async move { PgConnection::connect_with(&options).await });
     let conn = match contained(connecting).await {
         Err(Lost::Panicked) => {
