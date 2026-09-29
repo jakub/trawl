@@ -474,6 +474,11 @@ fn changed_row(check: ServerCheck, source: &MaterialSource) -> Row {
 fn fault_row(source: &MaterialSource, fault: Fault) -> Row {
     let check = ServerCheck::TlsMaterial;
     let row = match fault {
+        Fault::Refused(UnsafeReason::OldKeyDirectory) => {
+            Row::failed(check, refusal_reason(UnsafeReason::OldKeyDirectory)).next(Text::new(
+                "remove the directory tls/key.pem under trawld's state directory",
+            ))
+        }
         Fault::Refused(why) => Row::failed(check, refusal_reason(why)).next(Text::new(
             "make tls/ and tls-key/ under trawld's state directory plain directories owned by \
              trawld's user, holding plain files, or remove them so trawld creates them",
@@ -528,6 +533,9 @@ const fn refusal_reason(why: UnsafeReason) -> &'static str {
         }
         UnsafeReason::ForeignOwner { .. } => {
             "a generated TLS directory belongs to another uid than this one, which boot refuses"
+        }
+        UnsafeReason::OldKeyDirectory => {
+            "a directory is at tls/key.pem, where an older trawld kept its key, and boot cannot remove it"
         }
     }
 }

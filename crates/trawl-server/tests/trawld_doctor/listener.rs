@@ -1199,3 +1199,39 @@ async fn doctor_listener_without_material_only_connects() {
         );
     }
 }
+
+/// A directory at `tls/key.pem`, where an older trawld kept its key, fails
+/// `server.tls.material`: boot removes that entry before it reads its pair
+/// and stops when it cannot. The doctor only looks, so the directory is
+/// still there afterwards. A regular file there is one boot removes, so the
+/// check goes on to the pair.
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_fails_a_directory_at_the_old_key_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("tls/key.pem");
+    std::fs::create_dir_all(&old).unwrap();
+    let path = write_doctor_config(dir.path(), &DoctorConfig::in_dir(dir.path()));
+    let report = doctor(&path, planted_env(dir.path()), &[]).await;
+    assert_eq!(
+        outcome(&report, MATERIAL),
+        (
+            Outcome::Failed,
+            Some(
+                "a directory is at tls/key.pem, where an older trawld kept its key, and boot \
+                 cannot remove it"
+            )
+        ),
+        "{report:#?}"
+    );
+    assert_eq!(row(&report, IDENTITY).blocked_by.as_deref(), Some(MATERIAL));
+    assert!(old.is_dir(), "the doctor removed nothing");
+
+    std::fs::remove_dir(&old).unwrap();
+    std::fs::write(&old, b"an old key").unwrap();
+    let report = doctor(&path, planted_env(dir.path()), &[]).await;
+    assert_eq!(
+        outcome(&report, MATERIAL),
+        (Outcome::Complete, Some("will_initialize"))
+    );
+    assert!(old.is_file(), "the doctor removed nothing");
+}

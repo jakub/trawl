@@ -44,6 +44,12 @@ pub enum UnsafeReason {
         /// trawld's effective uid.
         euid: u32,
     },
+    /// A directory is at `tls/key.pem`, where an older trawld kept its key.
+    /// A start removes that entry before it reads the pair, and its unlink
+    /// fails on a directory, so the start stops there. Only
+    /// [`inspect_generated_pair`] reports this: the start itself fails with
+    /// the unlink's [`TlsError::Write`].
+    OldKeyDirectory,
 }
 
 impl std::fmt::Display for UnsafeReason {
@@ -55,6 +61,10 @@ impl std::fmt::Display for UnsafeReason {
             Self::ForeignOwner { owner, euid } => {
                 write!(f, "it is owned by uid {owner}, not by trawld's uid {euid}")
             }
+            Self::OldKeyDirectory => f.write_str(
+                "it is a directory where an older trawld kept its key, which a start cannot \
+                 remove",
+            ),
         }
     }
 }
@@ -596,17 +606,21 @@ pub struct GeneratedInspection {
 ///
 /// It makes a start's checks in a start's order: each directory is opened
 /// without following a symlink and must be a directory of the right owner;
-/// then the key is judged and read, then the certificate. A directory that
-/// does not exist holds nothing, which a start creates. A read of the
+/// then the entry at the old key path, `tls/key.pem`, which a start removes,
+/// must be one its removal succeeds on; then the key is judged and read,
+/// then the certificate. A directory that does not exist holds nothing,
+/// which a start creates. A read of the
 /// certificate past `cert_max` bytes, or of the key past `key_max`, stops
 /// with [`std::io::ErrorKind::FileTooLarge`].
 ///
 /// The work is blocking; call it off the async runtime.
 ///
 /// # Errors
-/// What a start by `owner`'s uid would refuse ([`TlsError::Unsafe`]), and
-/// failures to open a directory ([`TlsError::Write`]) or read a file
-/// ([`TlsError::ReadKey`], [`TlsError::ReadCert`]).
+/// What a start by `owner`'s uid would refuse ([`TlsError::Unsafe`]),
+/// including a directory at the old key path, which the start's removal
+/// fails on ([`UnsafeReason::OldKeyDirectory`]), and failures to open a
+/// directory or look at the old key path ([`TlsError::Write`]) or to read a
+/// file ([`TlsError::ReadKey`], [`TlsError::ReadCert`]).
 pub fn inspect_generated_pair(
     state_dir: &Path,
     owner: OwnerRule,
@@ -633,6 +647,9 @@ pub fn inspect_generated_pair(
     };
     let tls_dir = open(state_dir.join(GENERATED_TLS_DIR))?;
     let key_dir = open(state_dir.join(GENERATED_KEY_DIR))?;
+    if let Some(tls_dir) = &tls_dir {
+        tls_dir.removable(GENERATED_KEY_FILE)?;
+    }
 
     let judged_euid = match owner {
         OwnerRule::Enforced(euid) => Some(euid),
@@ -969,6 +986,39 @@ impl GeneratedDir {
             let _ = (name, euid, err);
             Ok(None)
         }
+    }
+
+    /// Whether [`remove`](Self::remove) of `name` would succeed, judged from
+    /// its directory entry and removing nothing: there is no entry, or it is
+    /// anything but a directory, which the unlink refuses (`EISDIR`). The
+    /// directory's owner, which a start is, may unlink any other entry in it
+    /// once the start has set its mode. A directory there is refused with
+    /// [`UnsafeReason::OldKeyDirectory`]; a failed look is [`TlsError::Write`].
+    fn removable(&self, name: &str) -> Result<(), TlsError> {
+        #[cfg(unix)]
+        let is_dir = {
+            use rustix::fs::{AtFlags, FileType};
+            use rustix::io::Errno;
+
+            match rustix::fs::statat(&self.handle, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) => FileType::from_raw_mode(stat.st_mode) == FileType::Directory,
+                Err(Errno::NOENT) => false,
+                Err(e) => return Err(TlsError::Write(e.into())),
+            }
+        };
+        #[cfg(not(unix))]
+        let is_dir = match fs::symlink_metadata(self.path.join(name)) {
+            Ok(meta) => meta.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(TlsError::Write(e)),
+        };
+        if is_dir {
+            return Err(unsafe_path(
+                &self.path.join(name),
+                UnsafeReason::OldKeyDirectory,
+            ));
+        }
+        Ok(())
     }
 
     /// Remove the file `name`; returns whether there was one. A symlink is
@@ -1732,6 +1782,86 @@ mod tests {
                 matches!(&err, TlsError::Unsafe { path, reason: UnsafeReason::Symlink } if *path == key_dir),
                 "{err}"
             );
+        }
+    }
+
+    /// A start removes whatever an older trawld left at `tls/key.pem` before
+    /// it reads the pair, and fails when that removal fails. The doctor's
+    /// read-only inspection agrees entry by entry: absent, a regular file, a
+    /// symlink or a FIFO is removed, and the pair beside it is judged as
+    /// usual; a directory, empty or not, stops the start, and the inspection
+    /// refuses it. The inspection removes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_old_key_path_is_judged_as_a_start_removes_it() {
+        let euid = rustix::process::geteuid().as_raw();
+        let inspect = |state: &Path| {
+            let before = tree(state);
+            let found =
+                inspect_generated_pair(state, OwnerRule::Enforced(euid), u64::MAX, u64::MAX);
+            assert_eq!(tree(state), before, "the inspection changed the state");
+            found
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path();
+        assert!(build_server_config(None, None, state).unwrap().1);
+        let old = state.join(GENERATED_TLS_DIR).join(GENERATED_KEY_FILE);
+
+        // Absent: both go on to the pair, which the start loads.
+        assert!(matches!(
+            inspect(state).unwrap().pair,
+            GeneratedPair::Found { .. }
+        ));
+        assert!(!build_server_config(None, None, state).unwrap().1);
+
+        // Entries the start's unlink removes, pair and all left as it was.
+        for what in ["a regular file", "a symlink", "a FIFO"] {
+            match what {
+                "a regular file" => fs::write(&old, b"old key").unwrap(),
+                "a symlink" => std::os::unix::fs::symlink("/nonexistent", &old).unwrap(),
+                _ => rustix::fs::mknodat(
+                    rustix::fs::CWD,
+                    &old,
+                    rustix::fs::FileType::Fifo,
+                    rustix::fs::Mode::from_raw_mode(0o600),
+                    0,
+                )
+                .unwrap(),
+            }
+            let found = inspect(state).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(
+                matches!(found.pair, GeneratedPair::Found { .. }),
+                "{what}: {found:?}"
+            );
+            assert!(
+                !build_server_config(None, None, state).unwrap().1,
+                "{what}: the start loads the pair"
+            );
+            assert!(
+                fs::symlink_metadata(&old).is_err(),
+                "{what}: the start removed it"
+            );
+        }
+
+        // A directory, empty and with an entry: the start's unlink fails,
+        // and the inspection refuses what the start fails on.
+        for with_entry in [false, true] {
+            fs::create_dir(&old).unwrap();
+            if with_entry {
+                fs::write(old.join("child"), b"x").unwrap();
+            }
+            let inspected = inspect(state).expect_err("a directory at the old key path");
+            assert!(
+                matches!(&inspected, TlsError::Unsafe { path, reason: UnsafeReason::OldKeyDirectory } if *path == old),
+                "{inspected}"
+            );
+            let booted = build_server_config(None, None, state)
+                .expect_err("a start cannot remove a directory");
+            assert!(
+                matches!(&booted, TlsError::Write(e) if e.kind() == std::io::ErrorKind::IsADirectory),
+                "{booted:?}"
+            );
+            fs::remove_dir_all(&old).unwrap();
         }
     }
 
