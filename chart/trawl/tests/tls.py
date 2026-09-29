@@ -553,9 +553,16 @@ class TLS(unittest.TestCase):
         # subordinate uid. Without one this case cannot be staged unprivileged;
         # it takes the same removal branch as the group-writable certificate.
         userns = ["unshare", "--map-auto", "--map-root-user", "--"]
-        probe = subprocess.run(userns + ["true"], capture_output=True, text=True) if shutil.which("unshare") else None
-        if probe is None or probe.returncode != 0:
-            self.skipTest(f"no unprivileged user namespace: {probe.stderr.strip() if probe else 'no unshare'}")
+        # Some hosts (the Actions runner pods) hang in unshare rather than
+        # refusing, so every call is bounded and a hung probe skips.
+        if not shutil.which("unshare"):
+            self.skipTest("no unprivileged user namespace: no unshare")
+        try:
+            probe = subprocess.run(userns + ["true"], capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.skipTest("no unprivileged user namespace: unshare did not return in 10s")
+        if probe.returncode != 0:
+            self.skipTest(f"no unprivileged user namespace: {probe.stderr.strip()}")
         init = init_container(self.objects({"web": web()}), "init-tls-dir")
         with tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
             tls_dir = Path(directory) / "tls"
@@ -564,12 +571,12 @@ class TLS(unittest.TestCase):
             cert.write_text("certificate")
             cert.chmod(0o644)
             # Owned by trawld (uid 0 in the namespace): kept.
-            result = subprocess.run(userns + init["command"][:4] + [str(tls_dir)], capture_output=True, text=True)
+            result = subprocess.run(userns + init["command"][:4] + [str(tls_dir)], capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(cert.read_text(), "certificate")
-            subprocess.run(userns + ["chown", "1000", str(cert)], check=True)
+            subprocess.run(userns + ["chown", "1000", str(cert)], check=True, timeout=30)
             self.assertNotEqual(cert.stat().st_uid, os.getuid())
-            result = subprocess.run(userns + init["command"][:4] + [str(tls_dir)], capture_output=True, text=True)
+            result = subprocess.run(userns + init["command"][:4] + [str(tls_dir)], capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(cert.exists())
 
