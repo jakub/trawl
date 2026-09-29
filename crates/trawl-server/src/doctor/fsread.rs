@@ -7,28 +7,41 @@
 //!
 //! An installation the doctor inspects may hold anything at a path it
 //! reads: a FIFO nobody writes to, a symlink loop, a file of mode 000, a
-//! device, or a multi-gigabyte file. [`read_bounded`] opens with
-//! `O_NONBLOCK | O_NOCTTY | O_CLOEXEC`, so opening a FIFO or a terminal
-//! returns at once, then checks on the open descriptor that the file is a
-//! regular file no larger than the cap before it reads, reads at most one
-//! byte past the cap, and checks the descriptor again afterwards. Every
-//! failure is a [`ReadFault`], never an `io::Error`, so no OS text can
-//! reach the report.
+//! device, or a multi-gigabyte file. Opening some devices acts on them
+//! (opening `/dev/watchdog` arms a host reset), so nothing the doctor has
+//! not seen to be a regular file is ever opened for I/O. [`find_at`] first
+//! opens the path with `O_PATH | O_CLOEXEC`, which opens no file for I/O
+//! and so neither blocks on a FIFO nor reaches a device's driver, and
+//! `fstat`s that handle. Only a regular file is then opened for reading,
+//! through `/proc/self/fd/<n>` with `O_RDONLY | O_NOCTTY | O_NONBLOCK |
+//! O_CLOEXEC`, which reaches the object the handle holds, never whatever
+//! the path names by then; a second `fstat` must see the same device and
+//! inode. Where `/proc` is not mounted nothing is read.
+//!
+//! [`read_bounded`] then checks that the file is no larger than the cap
+//! before it reads, reads at most one byte past the cap, and checks the
+//! descriptor again afterwards. Every failure is a [`ReadFault`], never an
+//! `io::Error`, so no OS text can reach the report.
 //!
 //! Two link policies:
 //!
 //! - [`Links::Follow`] for the paths an operator selected (the
 //!   configuration, a certificate, a key). Those are often symlinks, as in
 //!   a Kubernetes secret mount. A loop is [`ReadFault::SymlinkLoop`].
-//! - [`Links::NoFollow`] for trawld's own markers under the data root,
-//!   opened the way the WAL reader opens them
-//!   ([`crate::ingest::no_follow::open`]). A symlink at the last component
-//!   is [`ReadFault::NotRegular`].
+//! - [`Links::NoFollow`] for trawld's own markers under the data root. The
+//!   `O_PATH` open adds `O_NOFOLLOW`, so a symlink at the last component
+//!   is the link itself, never its target, and is [`ReadFault::NotRegular`].
+//!
+//! The doctor's reads of files that boot's own readers decode (publication
+//! and rollup markers, the generated certificate and key) open through
+//! [`find_at`] too, by [`open_for_decoder`] or directly.
 //!
 //! [`read`] runs the read on the blocking pool under [`READ_DEADLINE`], so a
 //! hung filesystem costs the check its answer, not the run.
 
 use std::io::Read as _;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -78,9 +91,11 @@ pub enum ReadFault {
     SymlinkLoop,
     /// It is larger than the cap.
     TooLarge,
-    /// It changed while it was read.
+    /// It changed while it was read, or the object opened for reading is
+    /// not the one first looked at.
     Changed,
-    /// Any other failure to open or read it.
+    /// Any other failure to open or read it, `/proc` not mounted among
+    /// them.
     Io,
     /// The read did not finish within [`READ_DEADLINE`].
     TimedOut,
@@ -132,43 +147,156 @@ pub async fn read(path: PathBuf, max: u64, links: Links) -> Result<Vec<u8>, Read
     }
 }
 
-#[cfg(unix)]
-fn open(path: &Path, links: Links) -> Result<std::fs::File, ReadFault> {
-    use rustix::fs::{Mode, OFlags};
-    use rustix::io::Errno;
-    let opened = match links {
-        Links::Follow => rustix::fs::open(
-            path,
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map(std::fs::File::from)
-        .map_err(|errno| std::io::Error::from_raw_os_error(errno.raw_os_error())),
-        Links::NoFollow => crate::ingest::no_follow::open(path),
-    };
-    opened.map_err(|error| {
-        let errno = error.raw_os_error().map(Errno::from_raw_os_error);
-        match errno {
-            Some(Errno::NOENT | Errno::NOTDIR) => ReadFault::Missing,
-            Some(Errno::ACCESS | Errno::PERM) => ReadFault::PermissionDenied,
-            // A socket file refuses `open` with ENXIO.
-            Some(Errno::NXIO) => ReadFault::NotRegular,
-            // Under O_NOFOLLOW, ELOOP is also what a symlink at the last
-            // component gives. lstat tells the two apart without opening.
-            Some(Errno::LOOP)
-                if links == Links::NoFollow
-                    && std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_symlink()) =>
-            {
-                ReadFault::NotRegular
-            }
-            Some(Errno::LOOP) => ReadFault::SymlinkLoop,
-            _ => ReadFault::Io,
-        }
-    })
+/// What [`find_at`] found at a path.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub enum Found {
+    /// A regular file, open for reading: the object the `O_PATH` look
+    /// found, reached through `/proc/self/fd`.
+    Regular(std::fs::File),
+    /// Anything else, as its `O_PATH` handle, which answers `fstat` and
+    /// no I/O. It was never opened for reading.
+    Other(OwnedFd),
 }
 
-/// Off Unix there is no non-blocking open, so nothing is read.
-#[cfg(not(unix))]
+/// Why [`find_at`] found nothing it could hand back.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindFault {
+    /// The `O_PATH` open failed.
+    Look(rustix::io::Errno),
+    /// An `fstat` failed.
+    Stat,
+    /// Opening the regular file for reading through `/proc/self/fd`
+    /// failed. `ENOENT` here means `/proc` is not mounted, not that the
+    /// file is gone.
+    Reopen(rustix::io::Errno),
+    /// The object opened for reading is not the one looked at.
+    Changed,
+}
+
+/// Look at `path`, relative to `dir` when it is relative, with an `O_PATH`
+/// open (`O_NOFOLLOW` under [`Links::NoFollow`]), and open it for reading
+/// only when that handle is a regular file.
+///
+/// # Errors
+/// A [`FindFault`] naming the step that failed.
+#[cfg(target_os = "linux")]
+pub fn find_at(dir: BorrowedFd<'_>, path: &Path, links: Links) -> Result<Found, FindFault> {
+    find_at_with(dir, path, links, reopen_through_proc)
+}
+
+/// [`find_at`], reopening a regular file with `reopen`, which tests replace.
+#[cfg(target_os = "linux")]
+fn find_at_with(
+    dir: BorrowedFd<'_>,
+    path: &Path,
+    links: Links,
+    reopen: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<OwnedFd>,
+) -> Result<Found, FindFault> {
+    use std::os::fd::AsFd as _;
+
+    use rustix::fs::{FileType, Mode, OFlags};
+    let mut flags = OFlags::PATH | OFlags::CLOEXEC;
+    if links == Links::NoFollow {
+        flags |= OFlags::NOFOLLOW;
+    }
+    let handle = rustix::fs::openat(dir, path, flags, Mode::empty()).map_err(FindFault::Look)?;
+    let seen = rustix::fs::fstat(&handle).map_err(|_| FindFault::Stat)?;
+    if FileType::from_raw_mode(seen.st_mode) != FileType::RegularFile {
+        return Ok(Found::Other(handle));
+    }
+    let file = reopen(handle.as_fd()).map_err(FindFault::Reopen)?;
+    let opened = rustix::fs::fstat(&file).map_err(|_| FindFault::Stat)?;
+    if (opened.st_dev, opened.st_ino) != (seen.st_dev, seen.st_ino) {
+        return Err(FindFault::Changed);
+    }
+    Ok(Found::Regular(std::fs::File::from(file)))
+}
+
+/// Open the object `handle` holds for reading, through its
+/// `/proc/self/fd` entry: the kernel resolves that to the object, not to
+/// whatever its path names now.
+#[cfg(target_os = "linux")]
+fn reopen_through_proc(handle: BorrowedFd<'_>) -> rustix::io::Result<OwnedFd> {
+    use rustix::fs::{Mode, OFlags};
+    rustix::fs::open(
+        format!("/proc/self/fd/{}", handle.as_raw_fd()),
+        OFlags::RDONLY | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// An opener for a decoder boot shares with the doctor, such as
+/// [`crate::ingest::publication_marker::census`]: the file at `path`,
+/// never following a symlink at its last component, through [`find_at`].
+///
+/// A regular file comes back open for reading. Anything else comes back
+/// as its `O_PATH` handle, which answers the decoder's `fstat` and nothing
+/// else, so the decoder refuses it by type as it would have, and it was
+/// never opened.
+///
+/// # Errors
+/// The `errno` of the step that failed, so a decoder tells a missing file
+/// from one it may not read, as it does for its own opener.
+#[cfg(target_os = "linux")]
+pub fn open_for_decoder(path: &Path) -> std::io::Result<std::fs::File> {
+    use rustix::io::Errno;
+    match find_at(rustix::fs::CWD, path, Links::NoFollow) {
+        Ok(Found::Regular(file)) => Ok(file),
+        Ok(Found::Other(handle)) => Ok(std::fs::File::from(handle)),
+        // `/proc` not mounted is not a missing marker.
+        Err(FindFault::Reopen(Errno::NOENT)) => Err(std::io::Error::other("not reopened")),
+        Err(FindFault::Look(errno) | FindFault::Reopen(errno)) => Err(errno.into()),
+        Err(FindFault::Stat | FindFault::Changed) => Err(std::io::Error::other("not read")),
+    }
+}
+
+/// Off Linux there is no `O_PATH` open, so nothing is opened.
+#[cfg(not(target_os = "linux"))]
+pub fn open_for_decoder(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::symlink_metadata(path)?;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "the doctor opens files only on Linux",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn open(path: &Path, links: Links) -> Result<std::fs::File, ReadFault> {
+    open_with(path, links, reopen_through_proc)
+}
+
+/// [`open`], reopening with `reopen`, which tests replace.
+#[cfg(target_os = "linux")]
+fn open_with(
+    path: &Path,
+    links: Links,
+    reopen: impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<OwnedFd>,
+) -> Result<std::fs::File, ReadFault> {
+    use rustix::io::Errno;
+    match find_at_with(rustix::fs::CWD, path, links, reopen) {
+        Ok(Found::Regular(file)) => Ok(file),
+        // A directory, FIFO, socket or device, or under `NoFollow` a
+        // symlink: seen through its `O_PATH` handle, never opened.
+        Ok(Found::Other(_)) => Err(ReadFault::NotRegular),
+        Err(FindFault::Look(Errno::NOENT | Errno::NOTDIR)) => Err(ReadFault::Missing),
+        // A directory above it the running user may not search refuses the
+        // look; mode 000 passes the `O_PATH` look and refuses the read.
+        Err(
+            FindFault::Look(Errno::ACCESS | Errno::PERM)
+            | FindFault::Reopen(Errno::ACCESS | Errno::PERM),
+        ) => Err(ReadFault::PermissionDenied),
+        // `O_PATH | O_NOFOLLOW` opens a symlink at the last component as
+        // itself, so ELOOP is a loop under either policy.
+        Err(FindFault::Look(Errno::LOOP)) => Err(ReadFault::SymlinkLoop),
+        Err(FindFault::Changed) => Err(ReadFault::Changed),
+        Err(FindFault::Look(_) | FindFault::Reopen(_) | FindFault::Stat) => Err(ReadFault::Io),
+    }
+}
+
+/// Off Linux there is no `O_PATH` open, so nothing is read.
+#[cfg(not(target_os = "linux"))]
 fn open(path: &Path, _links: Links) -> Result<std::fs::File, ReadFault> {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(ReadFault::Missing),
@@ -350,6 +478,165 @@ mod tests {
             read_in_thread(PathBuf::from("/dev/zero"), 64, Links::Follow),
             Err(ReadFault::NotRegular)
         );
+    }
+
+    /// A reopen that records that it ran, then opens the handle's object
+    /// for reading as a plain open would: without `O_NONBLOCK`, so on a
+    /// FIFO with no writer it never returns.
+    #[cfg(target_os = "linux")]
+    fn recording_blocking_reopen(
+        reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl FnOnce(BorrowedFd<'_>) -> rustix::io::Result<OwnedFd> {
+        move |handle| {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            rustix::fs::open(
+                format!("/proc/self/fd/{}", handle.as_raw_fd()),
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+        }
+    }
+
+    /// Run [`open_with`] on `path` with [`recording_blocking_reopen`], on
+    /// its own thread, and return its result and whether the reopen ran.
+    #[cfg(target_os = "linux")]
+    fn open_recorded(path: PathBuf, links: Links) -> (Result<(), ReadFault>, bool) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let reached = Arc::new(AtomicBool::new(false));
+        let reopen = recording_blocking_reopen(Arc::clone(&reached));
+        let result = returns_promptly(move || open_with(&path, links, reopen).map(drop));
+        (result, reached.load(Ordering::SeqCst))
+    }
+
+    /// A character device is refused on its `O_PATH` handle's type: the
+    /// open that would reach its driver never runs. The one descriptor the
+    /// doctor ever held on it is that `O_PATH` handle.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_device_is_refused_before_it_is_opened() {
+        for device in ["/dev/null", "/dev/zero"] {
+            for links in [Links::Follow, Links::NoFollow] {
+                assert_eq!(
+                    open_recorded(PathBuf::from(device), links),
+                    (Err(ReadFault::NotRegular), false),
+                    "{device}"
+                );
+                let Ok(Found::Other(handle)) = find_at(rustix::fs::CWD, Path::new(device), links)
+                else {
+                    panic!("{device} is not a regular file");
+                };
+                let flags = rustix::fs::fcntl_getfl(&handle).unwrap();
+                assert!(
+                    flags.contains(rustix::fs::OFlags::PATH),
+                    "{device}: {flags:?}"
+                );
+            }
+        }
+    }
+
+    /// A FIFO with no writer returns at once even though the `O_PATH` step
+    /// has no `O_NONBLOCK` and the reopen here blocks: only a regular file
+    /// is ever reopened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fifo_is_refused_before_it_is_opened() {
+        use crate::ingest::no_follow::test_support::make_fifo;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("REPIN");
+        make_fifo(&fifo);
+        for links in [Links::Follow, Links::NoFollow] {
+            assert_eq!(
+                open_recorded(fifo.clone(), links),
+                (Err(ReadFault::NotRegular), false)
+            );
+        }
+        // The same reopen does reach a regular file.
+        let file = dir.path().join("EPOCH");
+        std::fs::write(&file, b"3\n").unwrap();
+        assert_eq!(open_recorded(file, Links::NoFollow), (Ok(()), true));
+    }
+
+    /// Under `NoFollow` a symlink is its own `O_PATH` handle: refused
+    /// without opening its target, even a regular file.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlink_under_no_follow_is_refused_before_its_target_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("EPOCH.real");
+        std::fs::write(&target, b"3\n").unwrap();
+        let link = dir.path().join("EPOCH");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            open_recorded(link.clone(), Links::NoFollow),
+            (Err(ReadFault::NotRegular), false)
+        );
+        assert_eq!(open_recorded(link, Links::Follow), (Ok(()), true));
+        let to_device = dir.path().join("to-device");
+        std::os::unix::fs::symlink("/dev/null", &to_device).unwrap();
+        for links in [Links::Follow, Links::NoFollow] {
+            assert_eq!(
+                open_recorded(to_device.clone(), links),
+                (Err(ReadFault::NotRegular), false)
+            );
+        }
+    }
+
+    /// The object opened for reading must be the one looked at: a reopen
+    /// that reaches another file is `Changed`, and a reopen that fails as
+    /// an unmounted `/proc` does is `Io`, not `Missing`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_reopened_object_must_be_the_one_looked_at() {
+        use rustix::fs::{Mode, OFlags};
+        let dir = tempfile::tempdir().unwrap();
+        let looked = dir.path().join("CATALOG");
+        let other = dir.path().join("other");
+        std::fs::write(&looked, b"a\n").unwrap();
+        std::fs::write(&other, b"a\n").unwrap();
+        let swapped = {
+            let other = other.clone();
+            move |_: BorrowedFd<'_>| {
+                rustix::fs::open(&other, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+            }
+        };
+        assert_eq!(
+            open_with(&looked, Links::NoFollow, swapped).map(drop),
+            Err(ReadFault::Changed)
+        );
+        let no_proc = |_: BorrowedFd<'_>| Err(rustix::io::Errno::NOENT);
+        assert_eq!(
+            open_with(&looked, Links::NoFollow, no_proc).map(drop),
+            Err(ReadFault::Io)
+        );
+    }
+
+    /// The decoders' opener hands back a regular file open for reading,
+    /// and anything else as a handle that answers `fstat` only, so the
+    /// decoder refuses it by type without it ever being opened.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_decoder_opener_opens_only_a_regular_file() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("marker");
+        std::fs::write(&file, b"body").unwrap();
+        let mut body = String::new();
+        open_for_decoder(&file)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        assert_eq!(body, "body");
+
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        for path in [PathBuf::from("/dev/null"), link, dir.path().to_owned()] {
+            let mut handle = open_for_decoder(&path).unwrap();
+            assert!(!handle.metadata().unwrap().is_file(), "{}", path.display());
+            assert!(handle.read(&mut [0; 8]).is_err(), "{}", path.display());
+        }
+        let absent = open_for_decoder(&dir.path().join("absent")).unwrap_err();
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[tokio::test]

@@ -404,13 +404,51 @@ fn current_euid() -> Option<u32> {
     }
 }
 
+/// Open `name` in `dir` as `trawld --doctor` reads a generated file:
+/// through [`crate::doctor::fsread::find_at`], so nothing but a regular
+/// file is opened for I/O. Anything else comes back as its `O_PATH`
+/// handle, which answers the caller's `fstat` and no read, so the caller
+/// refuses it by type; a symlink is `ELOOP`, as the start's `O_NOFOLLOW`
+/// open answers it.
+#[cfg(target_os = "linux")]
+fn doctor_open_at(dir: &fs::File, name: &str) -> rustix::io::Result<fs::File> {
+    use std::os::fd::AsFd as _;
+
+    use crate::doctor::fsread::{self, FindFault, Found, Links};
+    use rustix::io::Errno;
+    match fsread::find_at(dir.as_fd(), Path::new(name), Links::NoFollow) {
+        Ok(Found::Regular(file)) => Ok(file),
+        Ok(Found::Other(handle)) => match rustix::fs::fstat(&handle) {
+            Ok(stat)
+                if rustix::fs::FileType::from_raw_mode(stat.st_mode)
+                    == rustix::fs::FileType::Symlink =>
+            {
+                Err(Errno::LOOP)
+            }
+            Ok(_) => Ok(fs::File::from(handle)),
+            Err(e) => Err(e),
+        },
+        // `/proc` not mounted is not a missing file.
+        Err(FindFault::Reopen(Errno::NOENT)) => Err(Errno::NOSYS),
+        Err(FindFault::Look(e) | FindFault::Reopen(e)) => Err(e),
+        Err(FindFault::Stat | FindFault::Changed) => Err(Errno::IO),
+    }
+}
+
+/// Off Linux there is no `O_PATH` open, so the doctor opens nothing.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn doctor_open_at(_dir: &fs::File, _name: &str) -> rustix::io::Result<fs::File> {
+    Err(rustix::io::Errno::NOSYS)
+}
+
 /// How a generated file is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reader {
     /// As a start reads it: whole.
     Start,
-    /// As `trawld --doctor` reads it (#269, D15): also `O_NOCTTY`, and at
-    /// most this many bytes, past which the read fails with
+    /// As `trawld --doctor` reads it (#269, D15): opened only once an
+    /// `O_PATH` look saw a regular file ([`doctor_open_at`]), and at most
+    /// this many bytes, past which the read fails with
     /// [`std::io::ErrorKind::FileTooLarge`].
     Bounded(u64),
 }
@@ -818,15 +856,21 @@ impl GeneratedDir {
             use rustix::io::Errno;
             use std::io::Read;
 
-            // O_NONBLOCK keeps a FIFO at `name` from blocking the open before
-            // the file type below can refuse it; a regular file ignores it.
-            let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-            if let Reader::Bounded(_) = reader {
-                // A terminal at `name` does not become the doctor's.
-                flags |= OFlags::NOCTTY;
-            }
-            let mut file = match rustix::fs::openat(&self.handle, name, flags, Mode::empty()) {
-                Ok(fd) => fs::File::from(fd),
+            let opened = match reader {
+                Reader::Start => {
+                    // O_NONBLOCK keeps a FIFO at `name` from blocking the open
+                    // before the file type below can refuse it; a regular file
+                    // ignores it.
+                    let flags =
+                        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+                    rustix::fs::openat(&self.handle, name, flags, Mode::empty()).map(fs::File::from)
+                }
+                // The doctor opens nothing but a regular file for I/O, so a
+                // device at `name` is never opened (#269).
+                Reader::Bounded(_) => doctor_open_at(&self.handle, name),
+            };
+            let mut file = match opened {
+                Ok(fd) => fd,
                 Err(Errno::NOENT) => return Ok(None),
                 Err(Errno::LOOP) => return Err(unsafe_path(&path, UnsafeReason::Symlink)),
                 Err(e) => return Err(err(path, e.into())),

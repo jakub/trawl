@@ -1502,8 +1502,11 @@ pub(crate) const MAX_ROLLUP_MARKER_BYTES: u64 = 100 * (3 * 4095 + 1);
 /// and a symlink at the last component is refused, never followed. Boot
 /// awaits rollup recovery, so a file there that is not crash residue must
 /// fail the recovery, not hang the boot.
-fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
-    let file = no_follow::open(path)?;
+fn open_regular(
+    path: &Path,
+    open: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<(std::fs::File, u64)> {
+    let file = open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -1568,12 +1571,23 @@ impl std::fmt::Display for RollupMarkerError {
 /// byte past the bound. Off Unix no marker is opened, so a present one
 /// cannot be read.
 ///
-/// Boot recovery and `trawld --doctor` share it; recovery turns the error
-/// into its message.
+/// Boot recovery reads with it and `trawld --doctor` with
+/// [`read_rollup_marker_with`]; recovery turns the error into its message.
 pub(crate) fn read_rollup_marker(path: &Path) -> Result<String, RollupMarkerError> {
+    read_rollup_marker_with(path, no_follow::open)
+}
+
+/// [`read_rollup_marker`], opening the marker with `open` in place of
+/// [`no_follow::open`]. `trawld --doctor` passes its own opener, which
+/// never opens anything but a regular file for I/O; whatever `open`
+/// returns is judged by `fstat` as [`open_regular`] judges its own.
+pub(crate) fn read_rollup_marker_with(
+    path: &Path,
+    open: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
+) -> Result<String, RollupMarkerError> {
     use std::io::Read as _;
 
-    let (file, len) = open_regular(path).map_err(RollupMarkerError::Open)?;
+    let (file, len) = open_regular(path, open).map_err(RollupMarkerError::Open)?;
     if len > MAX_ROLLUP_MARKER_BYTES {
         return Err(RollupMarkerError::TooLarge);
     }
@@ -1681,7 +1695,7 @@ fn recover_rollup_markers_inner(
         // contains both that daily file and the new hourly inputs.
         // A tmp that is not a regular file is no output of this merge, and
         // is neither promoted nor quarantined.
-        let staged = match open_regular(&tmp) {
+        let staged = match open_regular(&tmp, no_follow::open) {
             Ok(staged) => Some(staged),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("failed to open rollup tmp: {e}")),

@@ -918,7 +918,8 @@ struct MarkersSeen {
 
 /// Count the rollup markers in the data root's day directories and, on an
 /// ingest node, the publication markers under the WAL root, each by the
-/// decoder boot recovers it with.
+/// decoder boot recovers it with, opened by the doctor's
+/// [`fsread::open_for_decoder`].
 ///
 /// The rollup census runs on every node type: the publication gate's boot
 /// scan registers every rollup marker on a query-only node too, and its
@@ -926,7 +927,8 @@ struct MarkersSeen {
 /// are an ingest node's, whose boot recovers them.
 fn count_markers(data_root: &Path, wal_dir: &Path, ingest: bool) -> MarkersSeen {
     let publication = if ingest {
-        publication_marker::census(wal_dir).map_or(Publications::Unlisted, Publications::Counted)
+        publication_marker::census(wal_dir, fsread::open_for_decoder)
+            .map_or(Publications::Unlisted, Publications::Counted)
     } else {
         Publications::NotCounted
     };
@@ -940,7 +942,7 @@ fn count_markers(data_root: &Path, wal_dir: &Path, ingest: bool) -> MarkersSeen 
     let mut rollups = std::collections::HashSet::new();
     seen.rollup_listed = crate::publication::scan_markers(data_root, &mut rollups).is_ok();
     for path in rollups {
-        match compaction::read_rollup_marker(&path) {
+        match compaction::read_rollup_marker_with(&path, fsread::open_for_decoder) {
             Ok(_) => seen.rollup_pending += 1,
             Err(e) if e.is_missing() => {}
             Err(e) if e.is_malformed() => seen.rollup_malformed += 1,
