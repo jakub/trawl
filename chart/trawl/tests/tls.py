@@ -554,15 +554,20 @@ class TLS(unittest.TestCase):
         # it takes the same removal branch as the group-writable certificate.
         userns = ["unshare", "--map-auto", "--map-root-user", "--"]
         # Some hosts (the Actions runner pods) hang in unshare rather than
-        # refusing, so every call is bounded and a hung probe skips.
+        # refusing, and some (GitHub's hosted runners) enter the namespace but
+        # have no subordinate uids to map, so the probe is the exact operation
+        # the test needs, chown to a mapped uid, and every call is bounded.
         if not shutil.which("unshare"):
             self.skipTest("no unprivileged user namespace: no unshare")
-        try:
-            probe = subprocess.run(userns + ["true"], capture_output=True, text=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            self.skipTest("no unprivileged user namespace: unshare did not return in 10s")
-        if probe.returncode != 0:
-            self.skipTest(f"no unprivileged user namespace: {probe.stderr.strip()}")
+        with tempfile.TemporaryDirectory(prefix="trawl-tls-probe-") as scratch:
+            target = Path(scratch) / "probe"
+            target.write_text("")
+            try:
+                probe = subprocess.run(userns + ["chown", "1000", str(target)], capture_output=True, text=True, timeout=10)
+            except subprocess.TimeoutExpired:
+                self.skipTest("no unprivileged user namespace: unshare did not return in 10s")
+            if probe.returncode != 0:
+                self.skipTest(f"no subordinate uid to chown to: {probe.stderr.strip()}")
         init = init_container(self.objects({"web": web()}), "init-tls-dir")
         with tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
             tls_dir = Path(directory) / "tls"
