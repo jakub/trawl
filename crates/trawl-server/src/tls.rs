@@ -8,6 +8,14 @@
 //! auto-generated to `{state_dir}/tls/` and persisted across restarts.
 //! The state directory is typically the parent of the data directory
 //! (e.g. `/var/lib/trawl/tls/` for the deb package).
+//!
+//! `trawld --doctor` judges the same material without acting on it (#269,
+//! D12): [`TlsSource::of`] picks the pair, [`parse_pem_pair`] and
+//! [`serving_config`] are the one path from PEM bytes to a served
+//! certificate, and [`inspect_generated_pair`] reads the generated pair
+//! through the same directory checks and reads a start makes, creating,
+//! moving, and removing nothing. Boot calls each of them, so the doctor's
+//! answer and boot's cannot drift.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,6 +27,37 @@ use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use trawl_config::{GENERATED_CERT_FILE, GENERATED_KEY_DIR, GENERATED_KEY_FILE, GENERATED_TLS_DIR};
+
+/// Why a path inside trawld's generated TLS directories is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsafeReason {
+    /// It is a symbolic link.
+    Symlink,
+    /// A generated directory is not a directory.
+    NotDirectory,
+    /// `cert.pem` or `key.pem` is not a regular file.
+    NotRegular,
+    /// A generated directory is owned by `owner`, not by trawld's `euid`.
+    ForeignOwner {
+        /// The directory's owner.
+        owner: u32,
+        /// trawld's effective uid.
+        euid: u32,
+    },
+}
+
+impl std::fmt::Display for UnsafeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Symlink => f.write_str(SYMLINK_REFUSAL),
+            Self::NotDirectory => f.write_str("it is not a directory"),
+            Self::NotRegular => f.write_str("it is not a regular file"),
+            Self::ForeignOwner { owner, euid } => {
+                write!(f, "it is owned by uid {owner}, not by trawld's uid {euid}")
+            }
+        }
+    }
+}
 
 /// TLS configuration errors.
 #[derive(Debug, thiserror::Error)]
@@ -53,7 +92,37 @@ pub enum TlsError {
     /// A path inside trawld's generated TLS directories is not what trawld
     /// made there. It is refused, never followed.
     #[error("refusing {}: {reason}", path.display())]
-    Unsafe { path: PathBuf, reason: String },
+    Unsafe { path: PathBuf, reason: UnsafeReason },
+}
+
+/// Where the listener's certificate and key come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsSource<'a> {
+    /// `[server] tls_cert_path` and `tls_key_path`: the operator's pair.
+    Configured {
+        /// The certificate chain's PEM file.
+        cert: &'a Path,
+        /// The private key's PEM file.
+        key: &'a Path,
+    },
+    /// Neither is set: the pair trawld generates under its state directory.
+    Generated,
+}
+
+impl<'a> TlsSource<'a> {
+    /// The source that `cert_path` and `key_path` select.
+    ///
+    /// # Errors
+    /// [`TlsError::Config`] when only one of them is set.
+    pub fn of(cert_path: Option<&'a Path>, key_path: Option<&'a Path>) -> Result<Self, TlsError> {
+        match (cert_path, key_path) {
+            (Some(cert), Some(key)) => Ok(Self::Configured { cert, key }),
+            (None, None) => Ok(Self::Generated),
+            _ => Err(TlsError::Config(
+                "both tls_cert_path and tls_key_path must be set, or neither".into(),
+            )),
+        }
+    }
 }
 
 /// Build a `rustls` [`ServerConfig`] from user-provided cert/key paths,
@@ -69,31 +138,57 @@ pub fn build_server_config(
     key_path: Option<&Path>,
     state_dir: &Path,
 ) -> Result<(Arc<ServerConfig>, bool), TlsError> {
-    let (cert_pem, key_pem, self_signed) = match (cert_path, key_path) {
-        (Some(cert), Some(key)) => {
+    let (cert_pem, key_pem, self_signed) = match TlsSource::of(cert_path, key_path)? {
+        TlsSource::Configured { cert, key } => {
             let (c, k) = load_pem_files(cert, key)?;
             (c, k, false)
         }
-        (None, None) => {
+        TlsSource::Generated => {
             let (c, k, generated) = load_or_generate_default(state_dir)?;
             (c, k, generated)
-        }
-        _ => {
-            return Err(TlsError::Config(
-                "both tls_cert_path and tls_key_path must be set, or neither".into(),
-            ));
         }
     };
 
     log_cert_details(&cert_pem);
 
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
+    let (certs, key) = parse_pem_pair(&cert_pem, &key_pem)?;
+    let config = serving_config(certs, key)?;
+
+    Ok((Arc::new(config), self_signed))
+}
+
+/// The certificate chain and the private key of a PEM pair, parsed the way
+/// the listener's certificate is parsed.
+///
+/// A file with no PEM certificate in it parses to an empty chain, which
+/// [`serving_config`] refuses.
+///
+/// # Errors
+/// [`TlsError::InvalidCert`] or [`TlsError::InvalidKey`] when a file is
+/// not PEM.
+pub fn parse_pem_pair(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| TlsError::InvalidCert(e.to_string()))?;
 
     let key =
-        PrivateKeyDer::from_pem_slice(&key_pem).map_err(|e| TlsError::InvalidKey(e.to_string()))?;
+        PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| TlsError::InvalidKey(e.to_string()))?;
+    Ok((certs, key))
+}
 
+/// The listener's `rustls` config for a parsed pair: TLS 1.2 and 1.3 from
+/// the ring provider, and ALPN for HTTP/2 and HTTP/1.1.
+///
+/// # Errors
+/// [`TlsError::Config`] when the chain is empty, or the key is not one
+/// `rustls` can sign with or its public half is not the leaf's.
+pub fn serving_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig, TlsError> {
     let mut config =
         ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
@@ -105,7 +200,7 @@ pub fn build_server_config(
     // Support HTTP/2 and HTTP/1.1 via ALPN negotiation.
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-    Ok((Arc::new(config), self_signed))
+    Ok(config)
 }
 
 /// Read cert and key PEM files from disk.
@@ -217,24 +312,8 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
 
     // Both are read, so a symlink at either name is refused on every start,
     // not only on the one that finds the pair complete.
-    //
-    // The key is judged by its directory entry before it is opened: a key
-    // another uid owns (root `0600` after a restore) may be unreadable to
-    // trawld, and the open would fail before its owner could be seen. That
-    // look is advisory; the check of the opened file below is the one that
-    // decides what is loaded.
-    let read_err = |path, source| TlsError::ReadKey { path, source };
-    let mut exposure = key_dir.entry_exposure(GENERATED_KEY_FILE, read_err)?;
-    let mut key = None;
-    if exposure.is_none()
-        && let Some((pem, meta)) = key_dir.read(GENERATED_KEY_FILE, read_err)?
-    {
-        exposure = metadata_exposure(&meta);
-        if exposure.is_none() {
-            key = Some(pem);
-        }
-    }
-    if let Some(reason) = exposure {
+    let key = find_generated_key(Some(&key_dir), current_euid(), Reader::Start)?;
+    if let KeyFound::Exposed(reason) = &key {
         tracing::warn!(
             event_type = "lifecycle",
             key = %key_path.display(),
@@ -242,20 +321,15 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
             "discarding a private key that may be readable outside trawld, generating a new pair"
         );
     }
-    let cert = tls_dir
-        .read(GENERATED_CERT_FILE, |path, source| TlsError::ReadCert {
-            path,
-            source,
-        })?
-        .map(|(pem, _)| pem);
-    if let (Some(c), Some(k)) = (cert, key) {
+    let cert = find_generated_cert(Some(&tls_dir), Reader::Start)?;
+    if let GeneratedPair::Found { cert_pem, key_pem } = judge_generated_pair(cert, key) {
         tracing::info!(
             event_type = "lifecycle",
             cert = %cert_path.display(),
             key = %key_path.display(),
             "loading existing self-signed TLS certificate"
         );
-        return Ok((c, k, false));
+        return Ok((cert_pem, key_pem, false));
     }
 
     tracing::info!(
@@ -316,6 +390,252 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
 }
 
+/// trawld's effective uid, which its generated directories and key must
+/// belong to. `None` where the platform has no uid.
+#[allow(clippy::unnecessary_wraps, reason = "there is no uid off unix")]
+fn current_euid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        Some(rustix::process::geteuid().as_raw())
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// How a generated file is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    /// As a start reads it: whole.
+    Start,
+    /// As `trawld --doctor` reads it (#269, D15): also `O_NOCTTY`, and at
+    /// most this many bytes, past which the read fails with
+    /// [`std::io::ErrorKind::FileTooLarge`].
+    Bounded(u64),
+}
+
+/// What a start finds at `tls-key/key.pem`.
+#[derive(Debug)]
+enum KeyFound {
+    /// No key.
+    Absent,
+    /// A key that may be readable outside trawld ([`key_exposure`]'s
+    /// reason). A start discards it and generates a new pair.
+    Exposed(String),
+    /// A key a start loads, with the metadata of the file read.
+    Read { pem: Vec<u8>, meta: fs::Metadata },
+}
+
+/// Read the generated key from `key_dir` (`None` when there is no such
+/// directory) with `reader`, judged as a start judges it: by its directory
+/// entry before it is opened, then by the opened file.
+///
+/// A key another uid owns (root `0600` after a restore) may be unreadable
+/// to trawld, and the open would fail before its owner could be seen, so
+/// the entry is judged first. That look is advisory; the check of the
+/// opened file is the one that decides what is loaded. `euid` is the uid
+/// the key must belong to; `None` judges its hard links only.
+fn find_generated_key(
+    key_dir: Option<&GeneratedDir>,
+    euid: Option<u32>,
+    reader: Reader,
+) -> Result<KeyFound, TlsError> {
+    let Some(key_dir) = key_dir else {
+        return Ok(KeyFound::Absent);
+    };
+    let read_err = |path, source| TlsError::ReadKey { path, source };
+    if let Some(reason) = key_dir.entry_exposure(GENERATED_KEY_FILE, euid, read_err)? {
+        return Ok(KeyFound::Exposed(reason));
+    }
+    match key_dir.read(GENERATED_KEY_FILE, reader, read_err)? {
+        None => Ok(KeyFound::Absent),
+        Some((pem, meta)) => Ok(match metadata_exposure(&meta, euid) {
+            Some(reason) => KeyFound::Exposed(reason),
+            None => KeyFound::Read { pem, meta },
+        }),
+    }
+}
+
+/// Read the generated certificate from `tls_dir` (`None` when there is no
+/// such directory) with `reader`, refusing what a start refuses.
+fn find_generated_cert(
+    tls_dir: Option<&GeneratedDir>,
+    reader: Reader,
+) -> Result<Option<Vec<u8>>, TlsError> {
+    let Some(tls_dir) = tls_dir else {
+        return Ok(None);
+    };
+    Ok(tls_dir
+        .read(GENERATED_CERT_FILE, reader, |path, source| {
+            TlsError::ReadCert { path, source }
+        })?
+        .map(|(pem, _)| pem))
+}
+
+/// What a start does with the generated pair it found.
+#[derive(Clone, PartialEq, Eq)]
+pub enum GeneratedPair {
+    /// Both halves are there and the key is trawld's alone: the start loads
+    /// them.
+    Found {
+        /// `tls/cert.pem`.
+        cert_pem: Vec<u8>,
+        /// `tls-key/key.pem`.
+        key_pem: Vec<u8>,
+    },
+    /// The start generates a new pair.
+    Regenerate(Regenerate),
+}
+
+/// `Debug` never shows the key.
+impl std::fmt::Debug for GeneratedPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Found { cert_pem, key_pem } => f
+                .debug_struct("Found")
+                .field("cert_pem", &format_args!("{} bytes", cert_pem.len()))
+                .field("key_pem", &format_args!("{} bytes", key_pem.len()))
+                .finish(),
+            Self::Regenerate(why) => f.debug_tuple("Regenerate").field(why).finish(),
+        }
+    }
+}
+
+/// Why a start generates a new pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Regenerate {
+    /// There is neither a certificate nor a key.
+    Absent,
+    /// There is a key but no certificate.
+    NoCertificate,
+    /// There is a certificate but no key.
+    NoKey,
+    /// The key may be readable outside trawld, for this reason.
+    KeyExposed(String),
+}
+
+/// A start loads a certificate and key it found, and generates a new pair
+/// when either is missing or the key may be exposed.
+fn judge_generated_pair(cert: Option<Vec<u8>>, key: KeyFound) -> GeneratedPair {
+    match (cert, key) {
+        (_, KeyFound::Exposed(reason)) => GeneratedPair::Regenerate(Regenerate::KeyExposed(reason)),
+        (Some(cert_pem), KeyFound::Read { pem, .. }) => GeneratedPair::Found {
+            cert_pem,
+            key_pem: pem,
+        },
+        (None, KeyFound::Absent) => GeneratedPair::Regenerate(Regenerate::Absent),
+        (None, KeyFound::Read { .. }) => GeneratedPair::Regenerate(Regenerate::NoCertificate),
+        (Some(_), KeyFound::Absent) => GeneratedPair::Regenerate(Regenerate::NoKey),
+    }
+}
+
+/// Whose the generated directories and key must be, for
+/// [`inspect_generated_pair`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerRule {
+    /// trawld runs as this uid: another owner is refused, or makes the key
+    /// exposed, exactly as a start by this uid judges it.
+    Enforced(u32),
+    /// Not judged, as in a root run, which cannot know trawld's uid: an
+    /// owner other than this uid is only recorded.
+    Observed(u32),
+}
+
+/// What [`inspect_generated_pair`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedInspection {
+    /// What a start does with the pair.
+    pub pair: GeneratedPair,
+    /// Under [`OwnerRule::Observed`]: a generated directory or the key
+    /// belongs to another uid, which that rule does not judge.
+    pub foreign_owner: bool,
+}
+
+/// Inspect the generated pair under `state_dir` as a start would find it,
+/// and act on nothing: no directory is created, re-moded, or opened for
+/// writing, and nothing is removed or renamed.
+///
+/// It makes a start's checks in a start's order: each directory is opened
+/// without following a symlink and must be a directory of the right owner;
+/// then the key is judged and read, then the certificate. A directory that
+/// does not exist holds nothing, which a start creates. A read of the
+/// certificate past `cert_max` bytes, or of the key past `key_max`, stops
+/// with [`std::io::ErrorKind::FileTooLarge`].
+///
+/// The work is blocking; call it off the async runtime.
+///
+/// # Errors
+/// What a start by `owner`'s uid would refuse ([`TlsError::Unsafe`]), and
+/// failures to open a directory ([`TlsError::Write`]) or read a file
+/// ([`TlsError::ReadKey`], [`TlsError::ReadCert`]).
+pub fn inspect_generated_pair(
+    state_dir: &Path,
+    owner: OwnerRule,
+    cert_max: u64,
+    key_max: u64,
+) -> Result<GeneratedInspection, TlsError> {
+    let mut foreign_owner = false;
+    let mut open = |path: PathBuf| -> Result<Option<GeneratedDir>, TlsError> {
+        let dir = match GeneratedDir::open_existing(&path) {
+            Err(TlsError::Write(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            opened => opened?,
+        };
+        if let Some(owned_by) = dir.owner() {
+            match owner {
+                OwnerRule::Enforced(euid) => {
+                    if let Some(reason) = foreign_owner_reason(owned_by, euid) {
+                        return Err(unsafe_path(&path, reason));
+                    }
+                }
+                OwnerRule::Observed(uid) => foreign_owner |= owned_by != uid,
+            }
+        }
+        Ok(Some(dir))
+    };
+    let tls_dir = open(state_dir.join(GENERATED_TLS_DIR))?;
+    let key_dir = open(state_dir.join(GENERATED_KEY_DIR))?;
+
+    let judged_euid = match owner {
+        OwnerRule::Enforced(euid) => Some(euid),
+        OwnerRule::Observed(_) => None,
+    };
+    let key = find_generated_key(key_dir.as_ref(), judged_euid, Reader::Bounded(key_max))?;
+    if let (OwnerRule::Observed(uid), KeyFound::Read { meta, .. }) = (owner, &key) {
+        foreign_owner |= file_owner(meta).is_some_and(|owned_by| owned_by != uid);
+    }
+    let cert = find_generated_cert(tls_dir.as_ref(), Reader::Bounded(cert_max))?;
+    Ok(GeneratedInspection {
+        pair: judge_generated_pair(cert, key),
+        foreign_owner,
+    })
+}
+
+/// The owner of the file `meta` describes, where the platform has one.
+#[allow(clippy::unnecessary_wraps, reason = "there is no owner off unix")]
+fn file_owner(meta: &fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(meta.uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+/// Why a generated directory owned by `owner` is refused to a start as
+/// `euid`, or `None` when it is that start's own.
+const fn foreign_owner_reason(owner: u32, euid: u32) -> Option<UnsafeReason> {
+    if owner == euid {
+        None
+    } else {
+        Some(UnsafeReason::ForeignOwner { owner, euid })
+    }
+}
+
 /// Why a generated key with `links` hard links, owned by uid `owner`, may be
 /// readable through something other than `tls-key/key.pem` when trawld runs
 /// as `euid`, or `None` when it is trawld's alone.
@@ -343,20 +663,17 @@ fn key_exposure(links: u64, owner: u32, euid: u32) -> Option<String> {
     }
 }
 
-/// [`key_exposure`] of the key file whose metadata is `meta`.
+/// [`key_exposure`] of the key file whose metadata is `meta`, for a start
+/// as `euid`. `None` for `euid` judges the hard links only.
 #[cfg(unix)]
-fn metadata_exposure(meta: &fs::Metadata) -> Option<String> {
+fn metadata_exposure(meta: &fs::Metadata, euid: Option<u32>) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
-    key_exposure(
-        meta.nlink(),
-        meta.uid(),
-        rustix::process::geteuid().as_raw(),
-    )
+    key_exposure(meta.nlink(), meta.uid(), euid.unwrap_or_else(|| meta.uid()))
 }
 
 #[cfg(not(unix))]
-fn metadata_exposure(_meta: &fs::Metadata) -> Option<String> {
+fn metadata_exposure(_meta: &fs::Metadata, _euid: Option<u32>) -> Option<String> {
     None
 }
 
@@ -381,6 +698,9 @@ struct GeneratedDir {
     path: PathBuf,
     #[cfg(unix)]
     handle: fs::File,
+    /// The directory's owner, read from the open handle.
+    #[cfg(unix)]
+    owner: u32,
 }
 
 impl GeneratedDir {
@@ -403,9 +723,37 @@ impl GeneratedDir {
 
         #[cfg(unix)]
         {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = Self::open_existing(path)?;
+            let euid = rustix::process::geteuid().as_raw();
+            if let Some(reason) = foreign_owner_reason(dir.owner, euid) {
+                return Err(unsafe_path(path, reason));
+            }
+            if let Some(mode) = mode {
+                dir.handle
+                    .set_permissions(fs::Permissions::from_mode(mode))
+                    .map_err(TlsError::Write)?;
+            }
+            Ok(dir)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            Self::open_existing(path)
+        }
+    }
+
+    /// Open the directory at `path` as it is, creating and changing nothing.
+    /// A symlink or anything but a directory is refused. Its owner is read
+    /// from the open handle and not judged here. A missing directory is
+    /// [`TlsError::Write`] with [`std::io::ErrorKind::NotFound`].
+    fn open_existing(path: &Path) -> Result<Self, TlsError> {
+        #[cfg(unix)]
+        {
             use rustix::fs::{Mode, OFlags};
             use rustix::io::Errno;
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            use std::os::unix::fs::MetadataExt;
 
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
             let handle = match rustix::fs::open(path, flags, Mode::empty()) {
@@ -414,47 +762,53 @@ impl GeneratedDir {
                 // open has already refused it, and the lstat only names why.
                 Err(Errno::LOOP | Errno::NOTDIR) => {
                     let reason = if fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
-                        SYMLINK_REFUSAL
+                        UnsafeReason::Symlink
                     } else {
-                        "it is not a directory"
+                        UnsafeReason::NotDirectory
                     };
-                    return Err(unsafe_path(path, reason.to_owned()));
+                    return Err(unsafe_path(path, reason));
                 }
                 Err(e) => return Err(TlsError::Write(e.into())),
             };
             let owner = handle.metadata().map_err(TlsError::Write)?.uid();
-            let euid = rustix::process::geteuid().as_raw();
-            if owner != euid {
-                return Err(unsafe_path(
-                    path,
-                    format!("it is owned by uid {owner}, not by trawld's uid {euid}"),
-                ));
-            }
-            if let Some(mode) = mode {
-                handle
-                    .set_permissions(fs::Permissions::from_mode(mode))
-                    .map_err(TlsError::Write)?;
-            }
             Ok(Self {
                 path: path.to_owned(),
                 handle,
+                owner,
             })
         }
         #[cfg(not(unix))]
         {
-            let _ = mode;
+            if let Err(e) = fs::metadata(path) {
+                return Err(TlsError::Write(e));
+            }
             Ok(Self {
                 path: path.to_owned(),
             })
         }
     }
 
-    /// Read the file `name` and the metadata of the file read, or `None`
-    /// when there is none. A symlink or anything but a regular file is
-    /// refused; any other failure is reported through `err`.
+    /// The directory's owner, where the platform has one.
+    #[allow(clippy::unnecessary_wraps, reason = "there is no owner off unix")]
+    fn owner(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            Some(self.owner)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// Read the file `name` with `reader`, and the metadata of the file
+    /// read, or `None` when there is none. A symlink or anything but a
+    /// regular file is refused; any other failure is reported through
+    /// `err`.
     fn read(
         &self,
         name: &str,
+        reader: Reader,
         err: impl FnOnce(PathBuf, std::io::Error) -> TlsError,
     ) -> Result<Option<(Vec<u8>, fs::Metadata)>, TlsError> {
         let path = self.path.join(name);
@@ -466,11 +820,15 @@ impl GeneratedDir {
 
             // O_NONBLOCK keeps a FIFO at `name` from blocking the open before
             // the file type below can refuse it; a regular file ignores it.
-            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            if let Reader::Bounded(_) = reader {
+                // A terminal at `name` does not become the doctor's.
+                flags |= OFlags::NOCTTY;
+            }
             let mut file = match rustix::fs::openat(&self.handle, name, flags, Mode::empty()) {
                 Ok(fd) => fs::File::from(fd),
                 Err(Errno::NOENT) => return Ok(None),
-                Err(Errno::LOOP) => return Err(unsafe_path(&path, SYMLINK_REFUSAL.to_owned())),
+                Err(Errno::LOOP) => return Err(unsafe_path(&path, UnsafeReason::Symlink)),
                 Err(e) => return Err(err(path, e.into())),
             };
             // fstat of the open handle: the metadata is the file's that is read.
@@ -479,11 +837,19 @@ impl GeneratedDir {
                 Err(e) => return Err(err(path, e)),
             };
             if !meta.file_type().is_file() {
-                return Err(unsafe_path(&path, "it is not a regular file".to_owned()));
+                return Err(unsafe_path(&path, UnsafeReason::NotRegular));
             }
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(|e| err(path, e))?;
-            Ok(Some((bytes, meta)))
+            let bytes = match reader {
+                Reader::Start => {
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes).map(|_| bytes)
+                }
+                Reader::Bounded(max) => read_at_most(&file, &meta, max),
+            };
+            match bytes {
+                Ok(bytes) => Ok(Some((bytes, meta))),
+                Err(e) => Err(err(path, e)),
+            }
         }
         #[cfg(not(unix))]
         {
@@ -499,22 +865,32 @@ impl GeneratedDir {
                 Err(e) => return Err(err(path, e)),
             };
             if !meta.file_type().is_file() {
-                return Err(unsafe_path(&path, "it is not a regular file".to_owned()));
+                return Err(unsafe_path(&path, UnsafeReason::NotRegular));
             }
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(|e| err(path, e))?;
-            Ok(Some((bytes, meta)))
+            let bytes = match reader {
+                Reader::Start => {
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes).map(|_| bytes)
+                }
+                Reader::Bounded(max) => read_at_most(&file, &meta, max),
+            };
+            match bytes {
+                Ok(bytes) => Ok(Some((bytes, meta))),
+                Err(e) => Err(err(path, e)),
+            }
         }
     }
 
     /// [`key_exposure`] of the file `name`, judged from its directory entry
-    /// without opening it, so a file trawld cannot read is judged too.
-    /// `None` when there is no file or nothing exposes it. A symlink or
-    /// anything but a regular file is refused, as [`read`](Self::read)
-    /// refuses it; any other failure is reported through `err`.
+    /// without opening it, so a file trawld cannot read is judged too, for a
+    /// start as `euid` (`None`: the hard links only). `None` when there is
+    /// no file or nothing exposes it. A symlink or anything but a regular
+    /// file is refused, as [`read`](Self::read) refuses it; any other
+    /// failure is reported through `err`.
     fn entry_exposure(
         &self,
         name: &str,
+        euid: Option<u32>,
         err: impl FnOnce(PathBuf, std::io::Error) -> TlsError,
     ) -> Result<Option<String>, TlsError> {
         #[cfg(unix)]
@@ -530,8 +906,8 @@ impl GeneratedDir {
             };
             match FileType::from_raw_mode(stat.st_mode) {
                 FileType::RegularFile => {}
-                FileType::Symlink => return Err(unsafe_path(&path, SYMLINK_REFUSAL.to_owned())),
-                _ => return Err(unsafe_path(&path, "it is not a regular file".to_owned())),
+                FileType::Symlink => return Err(unsafe_path(&path, UnsafeReason::Symlink)),
+                _ => return Err(unsafe_path(&path, UnsafeReason::NotRegular)),
             }
             #[allow(
                 clippy::useless_conversion,
@@ -541,12 +917,12 @@ impl GeneratedDir {
             Ok(key_exposure(
                 links,
                 stat.st_uid,
-                rustix::process::geteuid().as_raw(),
+                euid.unwrap_or(stat.st_uid),
             ))
         }
         #[cfg(not(unix))]
         {
-            let _ = (name, err);
+            let _ = (name, euid, err);
             Ok(None)
         }
     }
@@ -619,11 +995,28 @@ impl GeneratedDir {
     }
 }
 
-fn unsafe_path(path: &Path, reason: String) -> TlsError {
+fn unsafe_path(path: &Path, reason: UnsafeReason) -> TlsError {
     TlsError::Unsafe {
         path: path.to_owned(),
         reason,
     }
+}
+
+/// Read `file`, whose metadata is `meta`, to its end, or fail with
+/// [`std::io::ErrorKind::FileTooLarge`] once it holds more than `max`
+/// bytes: past the size `fstat` gave, or past `max` in what is read.
+fn read_at_most(file: &fs::File, meta: &fs::Metadata, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    if meta.len() > max {
+        return Err(std::io::ErrorKind::FileTooLarge.into());
+    }
+    let mut bytes = Vec::new();
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(std::io::ErrorKind::FileTooLarge.into());
+    }
+    Ok(bytes)
 }
 
 /// Publish `pem` as `cert.pem` in `tls_dir` so that a reader sees either no
@@ -1184,6 +1577,179 @@ mod tests {
             "the refusal names key.pem: {err}"
         );
         assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    /// Every entry under `dir` with its mode, size and modification time,
+    /// sorted; empty when `dir` does not exist.
+    #[cfg(unix)]
+    fn tree(dir: &Path) -> Vec<(PathBuf, u32, u64, std::time::SystemTime)> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut entries = Vec::new();
+        let mut pending = vec![dir.to_owned()];
+        while let Some(at) = pending.pop() {
+            let Ok(meta) = fs::symlink_metadata(&at) else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.extend(fs::read_dir(&at).unwrap().map(|e| e.unwrap().path()));
+            }
+            entries.push((at, meta.mode(), meta.len(), meta.modified().unwrap()));
+        }
+        entries.sort();
+        entries
+    }
+
+    /// The doctor's read of the generated pair agrees with what a start
+    /// does with it, state by state, and changes nothing: no directory is
+    /// created or re-moded, and no file is removed or written.
+    #[cfg(unix)]
+    #[test]
+    fn inspecting_the_generated_pair_agrees_with_boot_and_writes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let euid = rustix::process::geteuid().as_raw();
+        let inspect = |state: &Path| {
+            let before = tree(state);
+            let found =
+                inspect_generated_pair(state, OwnerRule::Enforced(euid), u64::MAX, u64::MAX);
+            assert_eq!(
+                tree(state),
+                before,
+                "the inspection changed the state directory"
+            );
+            found
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let cert_path = state.join(GENERATED_TLS_DIR).join(GENERATED_CERT_FILE);
+        let key_path = state.join(GENERATED_KEY_DIR).join(GENERATED_KEY_FILE);
+
+        // Before the first start there is nothing, and nothing is created.
+        let found = inspect(&state).unwrap();
+        assert_eq!(found.pair, GeneratedPair::Regenerate(Regenerate::Absent));
+        assert!(!state.exists());
+
+        // After it, the inspection finds exactly the pair boot generated,
+        // and leaves a mode boot would reset as it is.
+        assert!(build_server_config(None, None, &state).unwrap().1);
+        fs::set_permissions(
+            state.join(GENERATED_TLS_DIR),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let found = inspect(&state).unwrap();
+        assert_eq!(
+            found.pair,
+            GeneratedPair::Found {
+                cert_pem: fs::read(&cert_path).unwrap(),
+                key_pem: fs::read(&key_path).unwrap(),
+            }
+        );
+        assert!(!found.foreign_owner);
+        assert!(
+            !build_server_config(None, None, &state).unwrap().1,
+            "boot loads it"
+        );
+
+        // Each half missing: boot generates a new pair.
+        fs::remove_file(&cert_path).unwrap();
+        let found = inspect(&state).unwrap();
+        assert_eq!(
+            found.pair,
+            GeneratedPair::Regenerate(Regenerate::NoCertificate)
+        );
+        assert!(build_server_config(None, None, &state).unwrap().1);
+        fs::remove_file(&key_path).unwrap();
+        let found = inspect(&state).unwrap();
+        assert_eq!(found.pair, GeneratedPair::Regenerate(Regenerate::NoKey));
+        assert!(build_server_config(None, None, &state).unwrap().1);
+
+        // An exposed key: boot discards it and generates a new pair.
+        let exposed = tmp.path().join("exposed.pem");
+        fs::hard_link(&key_path, &exposed).unwrap();
+        let found = inspect(&state).unwrap();
+        assert!(
+            matches!(&found.pair, GeneratedPair::Regenerate(Regenerate::KeyExposed(why)) if why.contains("2 hard links")),
+            "{found:?}"
+        );
+        assert!(build_server_config(None, None, &state).unwrap().1);
+
+        // A symlinked key directory: boot refuses it, and so does the
+        // inspection, naming the same reason.
+        let key_dir = state.join(GENERATED_KEY_DIR);
+        let moved = tmp.path().join("moved-key-dir");
+        fs::rename(&key_dir, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &key_dir).unwrap();
+        let inspected = inspect(&state).expect_err("a symlinked key directory is refused");
+        let booted = build_server_config(None, None, &state).expect_err("boot refuses it too");
+        for err in [inspected, booted] {
+            assert!(
+                matches!(&err, TlsError::Unsafe { path, reason: UnsafeReason::Symlink } if *path == key_dir),
+                "{err}"
+            );
+        }
+    }
+
+    /// Another owner is refused as boot refuses it when the uid is
+    /// enforced, and only recorded when it is observed, as a root run
+    /// observes it. A key past its read cap stops the read.
+    #[cfg(unix)]
+    #[test]
+    fn the_owner_rule_and_the_read_cap_hold() {
+        let euid = rustix::process::geteuid().as_raw();
+        let other = euid.wrapping_add(1);
+        let tmp = tempfile::tempdir().unwrap();
+        build_server_config(None, None, tmp.path()).unwrap();
+
+        let err =
+            inspect_generated_pair(tmp.path(), OwnerRule::Enforced(other), u64::MAX, u64::MAX)
+                .expect_err("a directory another uid owns is refused");
+        assert!(
+            matches!(
+                &err,
+                TlsError::Unsafe { reason: UnsafeReason::ForeignOwner { owner, euid: enforced }, .. }
+                    if *owner == euid && *enforced == other
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains(&format!("owned by uid {euid}")),
+            "{err}"
+        );
+
+        let observed =
+            inspect_generated_pair(tmp.path(), OwnerRule::Observed(other), u64::MAX, u64::MAX)
+                .expect("an observed owner is not refused");
+        assert!(observed.foreign_owner);
+        assert!(
+            matches!(observed.pair, GeneratedPair::Found { .. }),
+            "{observed:?}"
+        );
+        let own = inspect_generated_pair(tmp.path(), OwnerRule::Observed(euid), u64::MAX, u64::MAX)
+            .unwrap();
+        assert!(!own.foreign_owner);
+
+        let err = inspect_generated_pair(tmp.path(), OwnerRule::Enforced(euid), u64::MAX, 8)
+            .expect_err("a key past the cap is not read");
+        assert!(
+            matches!(&err, TlsError::ReadKey { source, .. } if source.kind() == std::io::ErrorKind::FileTooLarge),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_source_is_both_paths_or_neither() {
+        let (cert, key) = (Path::new("/tls/cert.pem"), Path::new("/tls/key.pem"));
+        assert_eq!(
+            TlsSource::of(Some(cert), Some(key)).unwrap(),
+            TlsSource::Configured { cert, key }
+        );
+        assert_eq!(TlsSource::of(None, None).unwrap(), TlsSource::Generated);
+        for (cert, key) in [(Some(cert), None), (None, Some(key))] {
+            let err = TlsSource::of(cert, key).unwrap_err();
+            assert!(err.to_string().contains("both"), "{err}");
+        }
     }
 
     /// Names of the entries in `dir`, sorted.
