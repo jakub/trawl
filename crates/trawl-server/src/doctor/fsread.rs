@@ -47,6 +47,8 @@ pub mod cap {
     pub const REPIN: u64 = 64 * 1024;
     /// A publication marker, at the bound its own reader enforces.
     pub const PUBLICATION_MARKER: u64 = crate::ingest::publication_marker::MAX_MARKER_BYTES;
+    /// A rollup marker, at the bound its own reader enforces.
+    pub const ROLLUP_MARKER: u64 = crate::ingest::compaction::MAX_ROLLUP_MARKER_BYTES;
     /// A PEM certificate chain.
     pub const CERT: u64 = 1024 * 1024;
     /// A PEM private key.

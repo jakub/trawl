@@ -588,6 +588,52 @@ pub fn scan_claims(wal_dir: &Path) -> Result<PublicationClaims, String> {
     Ok(claims)
 }
 
+/// What one read-only pass over the WAL root found ([`census`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarkerCensus {
+    /// Some WAL root entry could not be inspected; it may be an env
+    /// holding markers.
+    pub root_incomplete: bool,
+    /// Env directories whose markers could not be listed.
+    pub unlisted_envs: usize,
+    /// Markers that read and validate. Boot recovery takes each of them on
+    /// its next start.
+    pub pending: usize,
+    /// Markers that are not a regular file, are over [`MAX_MARKER_BYTES`],
+    /// or fail parsing or confinement.
+    pub invalid: usize,
+    /// Markers that could not be opened or read.
+    pub unreadable: usize,
+}
+
+/// Count every marker under `wal_dir` by what [`read_marker`], the decoder
+/// recovery uses, makes of it. Nothing is written. A missing root holds no
+/// markers; a marker gone between listing and reading is not counted.
+///
+/// # Errors
+/// When the WAL root cannot be listed.
+pub fn census(wal_dir: &Path) -> io::Result<MarkerCensus> {
+    let mut census = MarkerCensus::default();
+    let envs = crate::env_dirs::try_list_env_dirs_observed(wal_dir, || {
+        census.root_incomplete = true;
+    })?;
+    for (_env, env_dir) in envs {
+        let Ok(markers) = list_markers(&env_dir) else {
+            census.unlisted_envs += 1;
+            continue;
+        };
+        for (_service, path) in markers {
+            match read_marker(&path) {
+                Ok(_) => census.pending += 1,
+                Err(MarkerError::Missing) => {}
+                Err(MarkerError::Invalid(_)) => census.invalid += 1,
+                Err(MarkerError::Io(_)) => census.unreadable += 1,
+            }
+        }
+    }
+    Ok(census)
+}
+
 /// Why recovery refused to act on a marker. Recovery touches nothing and the
 /// marker keeps blocking its `(env, service)`.
 #[derive(Debug, Clone, PartialEq, Eq)]

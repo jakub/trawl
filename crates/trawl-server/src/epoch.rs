@@ -18,7 +18,7 @@
 //! readers or conformance inspect the corpus.
 
 use std::io::{Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The current storage epoch, written to `data/EPOCH`.
 pub const CURRENT_EPOCH: &str = "3";
@@ -64,67 +64,260 @@ pub fn ensure_current_epoch(
     Ok(outcome)
 }
 
-fn admit_data_root(
-    data_root: &Path,
-    wal_dir: &Path,
-    ingest_enabled: bool,
-) -> Result<Outcome, String> {
-    if ingest_enabled {
-        validate_wal(wal_dir)?;
-    }
-    let Some(meta) = metadata_if_present(data_root)? else {
-        if !ingest_enabled {
-            return Ok(Outcome::ReadOnlyArchive);
-        }
-        // Compaction retires acknowledged WAL once its output is durable
-        // inside the root, so the root's own entry, and that of every
-        // ancestor created for it, must be durable first: without them a
-        // power loss drops the whole tree. A failed sync removes what it
-        // created, so the next boot creates and syncs it again. Exclusive
-        // creation does not adopt a root another process created after the
-        // absence check.
-        create_dir_all_durably(data_root, fsync_dir)
-            .map_err(|e| format!("failed to create data root {}: {e}", data_root.display()))?;
-        publish_epoch(data_root)?;
-        return Ok(Outcome::FreshRoot);
-    };
-    if !meta.is_dir() {
-        return Err(format!(
-            "data root {} is not a directory; refusing to start",
-            data_root.display()
-        ));
-    }
+/// What the boot gate will do with a data root, decided before anything is
+/// written ([`classify_data_root`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataRootState {
+    /// Absent on an ingest node: boot creates it and publishes `EPOCH`.
+    Fresh,
+    /// The existing marker names the current format.
+    Current,
+    /// Present and empty on an ingest node, but for these proven remnants
+    /// of an interrupted initial publication: boot removes them and
+    /// publishes `EPOCH`.
+    Empty {
+        /// The staged `EPOCH.next.<pid>` files boot removes first.
+        staged: Vec<PathBuf>,
+    },
+    /// On a query-only node, an absent root or an unversioned generic
+    /// archive: read as it is, never initialized.
+    ReadOnlyArchive,
+}
 
-    let marker = data_root.join(EPOCH_FILE);
-    if metadata_if_present(&marker)?.is_some() {
-        let content = std::fs::read_to_string(&marker)
-            .map_err(|e| format!("failed to read epoch marker {}: {e}", marker.display()))?;
-        if content.trim() != CURRENT_EPOCH {
-            return Err(format!(
+/// Which inspection of the data root or the WAL directory failed, for the
+/// wording of boot's refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inspected {
+    /// One path: the root, the WAL directory, the marker, or an entry.
+    Path,
+    /// Listing the WAL directory.
+    WalDir,
+    /// Listing the data root.
+    DataRoot,
+}
+
+/// Why the boot gate refuses a data root ([`classify_data_root`]). `E` is
+/// the error of the injected [`RootReader`].
+#[derive(Debug)]
+pub enum RootFault<E> {
+    /// A filesystem call failed. Filesystem errors are errors, never
+    /// evidence of an empty directory or an absent marker.
+    Inspect {
+        /// What was being inspected.
+        at: Inspected,
+        /// The path it failed on.
+        path: PathBuf,
+        /// The failure.
+        error: std::io::Error,
+    },
+    /// The `EPOCH` marker exists but could not be read.
+    ReadEpoch {
+        /// The marker.
+        path: PathBuf,
+        /// The reader's failure.
+        error: E,
+    },
+    /// A staged `EPOCH.next.<pid>` file could not be read.
+    ReadStaged {
+        /// The staged file.
+        path: PathBuf,
+        /// The reader's failure.
+        error: E,
+    },
+    /// A flat `*.ndjson` batch sits directly in the WAL directory of an
+    /// ingest node.
+    FlatWal {
+        /// The first such batch.
+        batch: PathBuf,
+    },
+    /// The data root exists and is not a directory.
+    NotADirectory,
+    /// `EPOCH` names another format.
+    UnsupportedEpoch {
+        /// The marker's content, trimmed.
+        found: String,
+    },
+    /// The root is nonempty, owned (or on an ingest node), and has no
+    /// `EPOCH`.
+    Unmarked {
+        /// On an ingest node, a staged epoch entry that is not a proven
+        /// remnant, which boot will not remove.
+        staged: Option<PathBuf>,
+    },
+}
+
+impl<E: std::fmt::Display> RootFault<E> {
+    /// Boot's refusal, word for word as the gate has always given it.
+    pub fn into_boot_message(self, data_root: &Path) -> String {
+        match self {
+            Self::Inspect {
+                at: Inspected::Path,
+                path,
+                error,
+            } => format!("failed to inspect {}: {error}", path.display()),
+            Self::Inspect {
+                at: Inspected::WalDir,
+                path,
+                error,
+            } => format!(
+                "failed to inspect WAL directory {}: {error}",
+                path.display()
+            ),
+            Self::Inspect {
+                at: Inspected::DataRoot,
+                path,
+                error,
+            } => format!("failed to inspect data root {}: {error}", path.display()),
+            Self::ReadEpoch { path, error } => {
+                format!("failed to read epoch marker {}: {error}", path.display())
+            }
+            Self::ReadStaged { path, error } => {
+                format!("failed to read staged epoch {}: {error}", path.display())
+            }
+            Self::FlatWal { batch } => format!(
+                "unsupported flat WAL batch at {}; current WAL requires environment \
+                 directories. Refusing to start without changing storage. Select a new \
+                 empty WAL directory or restore the WAL from a complete epoch-{CURRENT_EPOCH} backup",
+                batch.display()
+            ),
+            Self::NotADirectory => format!(
+                "data root {} is not a directory; refusing to start",
+                data_root.display()
+            ),
+            Self::UnsupportedEpoch { found } => format!(
                 "data root {} carries unsupported storage epoch {:?}; this trawld requires \
                  epoch {CURRENT_EPOCH}. Refusing to start without changing storage. \
                  Select new empty data and WAL directories, or restore a complete epoch-{CURRENT_EPOCH} \
                  backup. Do not relabel an incompatible corpus by editing EPOCH",
                 data_root.display(),
-                content.trim()
-            ));
+                found
+            ),
+            Self::Unmarked { staged } => {
+                let refusal = format!(
+                    "data root {} is nonempty but has no EPOCH marker; refusing to start without \
+                     changing storage. Select new empty data and WAL directories, or restore a complete \
+                     epoch-{CURRENT_EPOCH} backup including EPOCH. Unversioned generic archives require \
+                     ingest disabled and must not contain Trawl ownership markers",
+                    data_root.display()
+                );
+                match staged {
+                    Some(staged) => format!(
+                        "{refusal}. Cannot recover staged epoch entry {} automatically; inspect its type, contents, \
+                         and origin along with the data root before choosing a recovery action. Startup \
+                         has not removed or relabeled this entry",
+                        staged.display()
+                    ),
+                    None => refusal,
+                }
+            }
         }
-        return Ok(Outcome::Current);
+    }
+}
+
+/// How [`classify_data_root`] reads the two small files it opens. Boot
+/// passes [`BootReader`], the reads it has always made; the doctor passes
+/// its bounded reader.
+pub trait RootReader {
+    /// What a failed read says.
+    type Error;
+
+    /// The whole `EPOCH` marker, as text.
+    ///
+    /// # Errors
+    /// When it cannot be read as text.
+    fn epoch(&mut self, path: &Path) -> Result<String, Self::Error>;
+
+    /// A staged `EPOCH.next.<pid>` file, when it holds at most `max` bytes;
+    /// `None` when it holds more.
+    ///
+    /// # Errors
+    /// When it cannot be read.
+    fn staged(&mut self, path: &Path, max: u64) -> Result<Option<Vec<u8>>, Self::Error>;
+}
+
+/// Boot's reads: the marker whole, and a staged file up to one byte past
+/// what a remnant can hold.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BootReader;
+
+impl RootReader for BootReader {
+    type Error = std::io::Error;
+
+    fn epoch(&mut self, path: &Path) -> std::io::Result<String> {
+        std::fs::read_to_string(path)
     }
 
-    let entries = std::fs::read_dir(data_root)
-        .map_err(|e| format!("failed to inspect data root {}: {e}", data_root.display()))?;
+    fn staged(&mut self, path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
+        let mut bytes = Vec::new();
+        std::fs::File::open(path).and_then(|file| file.take(max + 1).read_to_end(&mut bytes))?;
+        Ok((bytes.len() as u64 <= max).then_some(bytes))
+    }
+}
+
+/// Decide what the boot gate does with `data_root`, writing nothing.
+///
+/// Every refusal is decided here, before [`admit_data_root`] acts: with
+/// ingest enabled the WAL is validated first, then the root, its marker and
+/// every entry. The precedence is the gate's, so boot and `trawld --doctor`
+/// reach the same answer from the same observations.
+///
+/// # Errors
+/// The [`RootFault`] boot refuses the root for.
+pub fn classify_data_root<R: RootReader>(
+    data_root: &Path,
+    wal_dir: &Path,
+    ingest_enabled: bool,
+    reader: &mut R,
+) -> Result<DataRootState, RootFault<R::Error>> {
+    if ingest_enabled {
+        validate_wal(wal_dir)?;
+    }
+    let Some(meta) = metadata_if_present(data_root)? else {
+        return Ok(if ingest_enabled {
+            DataRootState::Fresh
+        } else {
+            DataRootState::ReadOnlyArchive
+        });
+    };
+    if !meta.is_dir() {
+        return Err(RootFault::NotADirectory);
+    }
+
+    let marker = data_root.join(EPOCH_FILE);
+    if metadata_if_present(&marker)?.is_some() {
+        let content = reader
+            .epoch(&marker)
+            .map_err(|error| RootFault::ReadEpoch {
+                path: marker.clone(),
+                error,
+            })?;
+        if content.trim() != CURRENT_EPOCH {
+            return Err(RootFault::UnsupportedEpoch {
+                found: content.trim().to_owned(),
+            });
+        }
+        return Ok(DataRootState::Current);
+    }
+
+    let listing = |error| RootFault::Inspect {
+        at: Inspected::DataRoot,
+        path: data_root.to_owned(),
+        error,
+    };
+    let entries = std::fs::read_dir(data_root).map_err(listing)?;
     let mut empty = true;
     let mut owned = false;
     let mut staged_epochs = Vec::new();
     let mut refused_staging = None;
     for entry in entries {
-        let entry = entry
-            .map_err(|e| format!("failed to inspect data root {}: {e}", data_root.display()))?;
+        let entry = entry.map_err(listing)?;
         // Follow symlinks to detect dangling or inaccessible entries rather
         // than treating metadata failure as an unowned generic archive.
-        let meta = std::fs::metadata(entry.path())
-            .map_err(|e| format!("failed to inspect {}: {e}", entry.path().display()))?;
+        let meta = std::fs::metadata(entry.path()).map_err(|error| RootFault::Inspect {
+            at: Inspected::Path,
+            path: entry.path(),
+            error,
+        })?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
         owned |= matches!(name.as_ref(), "wal" | "CATALOG" | "REPIN" | "scheduled")
@@ -133,7 +326,7 @@ fn admit_data_root(
         // A PID name alone is not authority to discard an entry. An initial
         // publication can leave only a regular file containing a prefix of
         // the current marker, including zero bytes before its first write.
-        if ingest_enabled && is_staged_epoch(&entry)? {
+        if ingest_enabled && is_staged_epoch(&entry, reader)? {
             staged_epochs.push(entry.path());
         } else {
             empty = false;
@@ -143,39 +336,62 @@ fn admit_data_root(
         }
     }
     if !ingest_enabled && !owned {
-        return Ok(Outcome::ReadOnlyArchive);
+        return Ok(DataRootState::ReadOnlyArchive);
     }
     if ingest_enabled && empty {
-        // Inspect the entire root and WAL before removing any staging file.
-        // A crash during cleanup leaves either valid staging or an empty
-        // directory; both can be retried. Unlinking never follows a symlink.
-        for staged in staged_epochs {
-            std::fs::remove_file(&staged)
-                .map_err(|e| format!("failed to remove {}: {e}", staged.display()))?;
+        return Ok(DataRootState::Empty {
+            staged: staged_epochs,
+        });
+    }
+    Err(RootFault::Unmarked {
+        staged: refused_staging.filter(|_| ingest_enabled),
+    })
+}
+
+/// Classify, then act: create or initialize what the gate admits.
+fn admit_data_root(
+    data_root: &Path,
+    wal_dir: &Path,
+    ingest_enabled: bool,
+) -> Result<Outcome, String> {
+    let state = classify_data_root(data_root, wal_dir, ingest_enabled, &mut BootReader)
+        .map_err(|fault| fault.into_boot_message(data_root))?;
+    match state {
+        DataRootState::Fresh => {
+            // Compaction retires acknowledged WAL once its output is durable
+            // inside the root, so the root's own entry, and that of every
+            // ancestor created for it, must be durable first: without them a
+            // power loss drops the whole tree. A failed sync removes what it
+            // created, so the next boot creates and syncs it again. Exclusive
+            // creation does not adopt a root another process created after
+            // the absence check.
+            create_dir_all_durably(data_root, fsync_dir)
+                .map_err(|e| format!("failed to create data root {}: {e}", data_root.display()))?;
+            publish_epoch(data_root)?;
+            Ok(Outcome::FreshRoot)
         }
-        publish_epoch(data_root)?;
-        return Ok(Outcome::InitializedEmpty);
+        DataRootState::Current => Ok(Outcome::Current),
+        DataRootState::ReadOnlyArchive => Ok(Outcome::ReadOnlyArchive),
+        DataRootState::Empty { staged } => {
+            // The entire root and WAL were inspected before any staging
+            // file is removed. A crash during cleanup leaves either valid
+            // staging or an empty directory; both can be retried. Unlinking
+            // never follows a symlink.
+            for staged in staged {
+                std::fs::remove_file(&staged)
+                    .map_err(|e| format!("failed to remove {}: {e}", staged.display()))?;
+            }
+            publish_epoch(data_root)?;
+            Ok(Outcome::InitializedEmpty)
+        }
     }
-    let refusal = format!(
-        "data root {} is nonempty but has no EPOCH marker; refusing to start without \
-         changing storage. Select new empty data and WAL directories, or restore a complete \
-         epoch-{CURRENT_EPOCH} backup including EPOCH. Unversioned generic archives require \
-         ingest disabled and must not contain Trawl ownership markers",
-        data_root.display()
-    );
-    if ingest_enabled && let Some(staged) = refused_staging {
-        return Err(format!(
-            "{refusal}. Cannot recover staged epoch entry {} automatically; inspect its type, contents, \
-             and origin along with the data root before choosing a recovery action. Startup \
-             has not removed or relabeled this entry",
-            staged.display()
-        ));
-    }
-    Err(refusal)
 }
 
 /// Recognize only names and bytes an interrupted current publication writes.
-fn is_staged_epoch(entry: &std::fs::DirEntry) -> Result<bool, String> {
+fn is_staged_epoch<R: RootReader>(
+    entry: &std::fs::DirEntry,
+    reader: &mut R,
+) -> Result<bool, RootFault<R::Error>> {
     let name = entry.file_name();
     let Some(pid) = name
         .to_str()
@@ -189,57 +405,67 @@ fn is_staged_epoch(entry: &std::fs::DirEntry) -> Result<bool, String> {
     {
         return Ok(false);
     }
-    let kind = entry
-        .file_type()
-        .map_err(|e| format!("failed to inspect {}: {e}", entry.path().display()))?;
+    let kind = entry.file_type().map_err(|error| RootFault::Inspect {
+        at: Inspected::Path,
+        path: entry.path(),
+        error,
+    })?;
     if !kind.is_file() {
         return Ok(false);
     }
     let body = format!("{CURRENT_EPOCH}\n");
-    let mut bytes = Vec::new();
-    std::fs::File::open(entry.path())
-        .and_then(|file| file.take(body.len() as u64 + 1).read_to_end(&mut bytes))
-        .map_err(|e| {
-            format!(
-                "failed to read staged epoch {}: {e}",
-                entry.path().display()
-            )
+    let bytes = reader
+        .staged(&entry.path(), body.len() as u64)
+        .map_err(|error| RootFault::ReadStaged {
+            path: entry.path(),
+            error,
         })?;
-    Ok(body.as_bytes().starts_with(&bytes))
+    Ok(bytes.is_some_and(|bytes| body.as_bytes().starts_with(&bytes)))
 }
 
 /// Preserve read errors, including dangling symlinks. Only a genuinely absent
 /// path is `None`; following an existing symlink must succeed.
-fn metadata_if_present(path: &Path) -> Result<Option<std::fs::Metadata>, String> {
+///
+/// # Errors
+/// The failed inspection, as an [`Inspected::Path`] fault.
+pub(crate) fn metadata_if_present<E>(
+    path: &Path,
+) -> Result<Option<std::fs::Metadata>, RootFault<E>> {
+    let fault = |error| RootFault::Inspect {
+        at: Inspected::Path,
+        path: path.to_owned(),
+        error,
+    };
     match std::fs::symlink_metadata(path) {
-        Ok(_) => std::fs::metadata(path)
-            .map(Some)
-            .map_err(|e| format!("failed to inspect {}: {e}", path.display())),
+        Ok(_) => std::fs::metadata(path).map(Some).map_err(fault),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("failed to inspect {}: {e}", path.display())),
+        Err(e) => Err(fault(e)),
     }
 }
 
 /// Current WAL batches live under environment directories. Flat batches must
 /// not be stranded outside the compactor's scan, even beside a current root.
-fn validate_wal(wal_dir: &Path) -> Result<(), String> {
+fn validate_wal<E>(wal_dir: &Path) -> Result<(), RootFault<E>> {
     if metadata_if_present(wal_dir)?.is_none() {
         return Ok(());
     }
-    let entries = std::fs::read_dir(wal_dir)
-        .map_err(|e| format!("failed to inspect WAL directory {}: {e}", wal_dir.display()))?;
+    let listing = |error| RootFault::Inspect {
+        at: Inspected::WalDir,
+        path: wal_dir.to_owned(),
+        error,
+    };
+    let entries = std::fs::read_dir(wal_dir).map_err(listing)?;
     for entry in entries {
-        let entry = entry
-            .map_err(|e| format!("failed to inspect WAL directory {}: {e}", wal_dir.display()))?;
-        std::fs::metadata(entry.path())
-            .map_err(|e| format!("failed to inspect {}: {e}", entry.path().display()))?;
+        let entry = entry.map_err(listing)?;
+        std::fs::metadata(entry.path()).map_err(|error| RootFault::Inspect {
+            at: Inspected::Path,
+            path: entry.path(),
+            error,
+        })?;
         if entry.path().extension().is_some_and(|ext| ext == "ndjson") {
-            return Err(format!(
-                "unsupported flat WAL batch at {}; current WAL requires environment \
-                 directories. Refusing to start without changing storage. Select a new \
-                 empty WAL directory or restore the WAL from a complete epoch-{CURRENT_EPOCH} backup",
-                entry.path().display()
-            ));
+            return Err(RootFault::FlatWal {
+                batch: entry.path(),
+            });
         }
     }
     Ok(())
