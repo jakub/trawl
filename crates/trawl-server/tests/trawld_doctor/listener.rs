@@ -712,6 +712,11 @@ type Keyed = &'static [(&'static str, Outcome, Option<&'static str>)];
 /// The reason of a value no doctor knows.
 const UNKNOWN: Option<&str> = Some("reported a value this doctor does not know");
 
+/// The health check's own row for an `unavailable` answer, whatever its
+/// checks report.
+const UNAVAILABLE: (Outcome, Option<&str>) =
+    (Outcome::Failed, Some("trawld reports itself unavailable"));
+
 /// A health answer from a listener in this test, and the rows it gives.
 struct HealthCase {
     response: Vec<u8>,
@@ -779,10 +784,31 @@ fn health_cases() -> Vec<HealthCase> {
                 503,
                 br#"{"status":"unavailable","version":"0.0.0","checks":{"duckdb":"error","auth_db":"ok"}}"#,
             ),
-            (Outcome::Complete, None),
+            UNAVAILABLE,
             &[
                 ("auth_db", Outcome::Complete, None),
                 ("duckdb", Outcome::Failed, Some("reported error")),
+            ],
+        ),
+        // Unavailable with nothing that fails: no row of its own fails, so
+        // the health check's own row must.
+        case(
+            http(
+                503,
+                br#"{"status":"unavailable","version":"0.0.0","checks":{}}"#,
+            ),
+            UNAVAILABLE,
+            &[],
+        ),
+        case(
+            http(
+                503,
+                br#"{"status":"unavailable","version":"0.0.0","checks":{"duckdb":"ok","auth_db":"ok"}}"#,
+            ),
+            UNAVAILABLE,
+            &[
+                ("auth_db", Outcome::Complete, None),
+                ("duckdb", Outcome::Complete, None),
             ],
         ),
         case(
@@ -852,8 +878,10 @@ async fn trawld_with_a_pending_rollup(dir: &Path) -> common::TestServer {
 }
 
 /// Each reported health value maps as specified. A real trawld whose
-/// `DuckDB` probe fails answers 503 and keeps its body: `duckdb` fails, the
-/// rest still report. A real trawld with an unresolved rollup reports
+/// `DuckDB` probe fails answers 503, `unavailable`, which fails the health
+/// check itself, and keeps its body: `duckdb` fails, the rest still report.
+/// An `unavailable` answer fails the check even when no reported check
+/// does. A real trawld with an unresolved rollup reports
 /// `corpus` `rollup_pending`, which is `not_sampled`/`recovering`. Values
 /// and answers trawld does not send come from a listener in this test that
 /// serves with trawld's own TLS config.
@@ -897,7 +925,7 @@ async fn doctor_listener_health_rows() {
     let report = doctor_against(&server, dir.path()).await;
     held.release();
     drop(seams);
-    assert_eq!(outcome(&report, HEALTH), (Outcome::Complete, None));
+    assert_eq!(outcome(&report, HEALTH), UNAVAILABLE);
     let health = row(&report, HEALTH);
     assert!(
         health

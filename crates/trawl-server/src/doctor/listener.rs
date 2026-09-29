@@ -1298,9 +1298,11 @@ async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<
 /// The health rows for a body that arrived whole with HTTP `status`.
 ///
 /// A 200 or 503 health body keeps its rows, one per reported check, so a
-/// 503 from a failed `DuckDB` probe fails its own row. A 503
-/// `corpus_recovering` envelope is `recovering`, as the classifier maps the
-/// corpus recovery values. Anything else is not trawld's health answer.
+/// 503 from a failed `DuckDB` probe fails its own row. An `unavailable`
+/// answer, which trawld sends only with a 503, fails the check itself
+/// whatever its checks say, even when it reports none or only `ok` ones. A
+/// 503 `corpus_recovering` envelope is `recovering`, as the classifier maps
+/// the corpus recovery values. Anything else is not trawld's health answer.
 fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
     let check = ServerCheck::ListenerHealth;
     if let Some(row) = status_row(status) {
@@ -1324,11 +1326,17 @@ fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
             HealthStatus::Degraded => "degraded",
             HealthStatus::Unavailable => "unavailable",
         };
-        return (
-            Row::complete(check)
-                .detail(Text::new("status: ").lit(shown).lit("; HTTP ").int(status)),
-            keyed_rows(checks),
-        );
+        let detail = Text::new("status: ").lit(shown).lit("; HTTP ").int(status);
+        let row = if matches!(health.status, HealthStatus::Unavailable) {
+            Row::failed(check, "trawld reports itself unavailable")
+                .detail(detail)
+                .next(Text::new(
+                    "read the per-check rows and trawld's log for why it is unavailable",
+                ))
+        } else {
+            Row::complete(check).detail(detail)
+        };
+        return (row, keyed_rows(checks));
     }
     if status == 503
         && let Ok(refusal) = serde_json::from_slice::<ErrorResponse>(body)
@@ -1870,9 +1878,8 @@ mod tests {
             .collect()
     }
 
-    /// Each reported value maps as the shared classifier says, a 503 body
-    /// keeps its rows, and nothing a server sends is shown unless the
-    /// report may show it.
+    /// Each reported value maps as the shared classifier says, and nothing
+    /// a server sends is shown unless the report may show it.
     #[test]
     fn health_values_map_as_specified() {
         let body = br#"{"status":"degraded","version":"x","checks":{
@@ -1927,19 +1934,6 @@ mod tests {
             }
         }
 
-        let (row, keyed) = health_rows(
-            503,
-            br#"{"status":"unavailable","checks":{"duckdb":"error","corpus":"restart_backlog"}}"#,
-        );
-        assert_eq!(row.outcome(), Outcome::Complete);
-        assert_eq!(
-            summary(&keyed),
-            [
-                (id("corpus"), Outcome::NotSampled, Some(reason::RECOVERING)),
-                (id("duckdb"), Outcome::Failed, Some("reported error")),
-            ]
-        );
-
         let recovering = br#"{"error":{"code":"corpus_recovering","message":"not yet"}}"#;
         let (row, keyed) = health_rows(503, recovering);
         assert_eq!(
@@ -1977,6 +1971,41 @@ mod tests {
             );
             assert!(keyed.is_empty());
         }
+    }
+
+    /// An unavailable answer fails the check itself and keeps its rows,
+    /// whatever they say: failing ones, none, or only ok ones.
+    #[test]
+    fn an_unavailable_answer_fails_whatever_its_checks_say() {
+        let id = |key: &str| format!("server.listener.health.{key}");
+        let unavailable = (Outcome::Failed, Some("trawld reports itself unavailable"));
+        let (row, keyed) = health_rows(503, br#"{"status":"unavailable","checks":{}}"#);
+        assert_eq!((row.outcome(), row.reason()), unavailable);
+        assert!(keyed.is_empty());
+        let (row, keyed) = health_rows(
+            503,
+            br#"{"status":"unavailable","checks":{"duckdb":"ok","auth_db":"ok"}}"#,
+        );
+        assert_eq!((row.outcome(), row.reason()), unavailable);
+        assert_eq!(
+            summary(&keyed),
+            [
+                (id("auth_db"), Outcome::Complete, None),
+                (id("duckdb"), Outcome::Complete, None),
+            ]
+        );
+        let (row, keyed) = health_rows(
+            503,
+            br#"{"status":"unavailable","checks":{"duckdb":"error","corpus":"restart_backlog"}}"#,
+        );
+        assert_eq!((row.outcome(), row.reason()), unavailable);
+        assert_eq!(
+            summary(&keyed),
+            [
+                (id("corpus"), Outcome::NotSampled, Some(reason::RECOVERING)),
+                (id("duckdb"), Outcome::Failed, Some("reported error")),
+            ]
+        );
     }
 
     #[test]
