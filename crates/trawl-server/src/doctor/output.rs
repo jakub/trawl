@@ -18,10 +18,10 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-use trawl_api::doctor::health::is_health_key;
 use trawl_api::doctor::{Check, Outcome, Report, Verdict};
 
 use super::ServerCheck;
+use crate::handlers::HEALTH_CHECK_NAMES;
 
 /// Output format for the report, named as `trawl doctor` names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -137,26 +137,35 @@ impl UserName {
     }
 }
 
-/// A health check name the report may show ([`is_health_key`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HealthKey(String);
+/// A health check name the report may show: one of the names trawld's
+/// health endpoint reports ([`HEALTH_CHECK_NAMES`]). The set is closed, so
+/// no name a listener sends is ever shown as sent, not even one shaped like
+/// an identifier; any other name belongs to the one [`HealthKey::invalid`]
+/// row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthKey(&'static str);
 
 impl HealthKey {
     /// The last part of the one row that stands for every check name that
-    /// is not an identifier. It starts with `_`, which no check name may,
-    /// so it cannot collide with a server's check.
+    /// trawld does not report. It starts with `_`, which no check name
+    /// does, so it cannot collide with a server's check.
     pub const INVALID: &'static str = "_invalid";
 
-    /// `name`, when the report may show it.
+    /// The key for `name`, when trawld's health endpoint reports a check
+    /// of that name. The key holds this doctor's copy of the name, never
+    /// the text that arrived.
     #[must_use]
     pub fn new(name: &str) -> Option<Self> {
-        is_health_key(name).then(|| Self(name.to_owned()))
+        HEALTH_CHECK_NAMES
+            .into_iter()
+            .find(|known| *known == name)
+            .map(Self)
     }
 
-    /// The key of the row for names that are not identifiers.
+    /// The key of the row for names trawld does not report.
     #[must_use]
-    pub fn invalid() -> Self {
-        Self(Self::INVALID.to_owned())
+    pub const fn invalid() -> Self {
+        Self(Self::INVALID)
     }
 }
 
@@ -203,7 +212,7 @@ impl Text {
     /// Append a health check name.
     #[must_use]
     pub fn key(mut self, key: &HealthKey) -> Self {
-        self.0.push_str(&key.0);
+        self.0.push_str(key.0);
         self
     }
 
@@ -500,6 +509,7 @@ mod tests {
             .path(&path);
         assert_eq!(text.as_str(), "uid 1000 (trawl); /tls/cert.pem");
         assert!(HealthKey::new("Bad-Key").is_none());
+        assert!(HealthKey::new("private_secret").is_none());
         let key = HealthKey::new("duckdb").unwrap();
         assert_eq!(Text::new("").key(&key).lit(" ok").as_str(), "duckdb ok");
     }

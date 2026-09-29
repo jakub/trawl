@@ -77,7 +77,7 @@ A check runs only when its prerequisite completed. Otherwise the check is
 | `server.recovery.publication` | The publication and rollup markers are readable and well formed. | `server.data.epoch` |
 | `server.tls.material` | The certificate and key parse, match, and are in date, or boot generates them. | `server.config` |
 | `server.listener.identity` | The listener presents exactly the certificate on disk. | `server.tls.material` |
-| `server.listener.health` | The health endpoint answers. One row per reported check follows as `server.listener.health.<key>`. | `server.listener.identity` |
+| `server.listener.health` | The health endpoint answers. One row per reported check follows as `server.listener.health.<key>`. Only the checks trawld reports get a row. Any other check names share one `failed` `server.listener.health._invalid` row, which does not show them. | `server.listener.identity` |
 
 The listener checks connect to trawld's own listener without sending an API
 key. They accept only the certificate that the configuration names or that

@@ -1365,9 +1365,11 @@ fn status_row(status: u16) -> Option<Row> {
     })
 }
 
-/// One row per reported check, sorted by name. Names that are not
-/// identifiers become one `server.listener.health._invalid` row, and none
-/// of them is shown.
+/// One row per reported check, sorted by name. Names trawld's health
+/// endpoint does not report become one failed
+/// `server.listener.health._invalid` row, and none of them is shown: the
+/// report names only checks it knows, since even an identifier-shaped name
+/// may be a secret.
 fn keyed_rows(checks: &HashMap<String, String>) -> Vec<Row> {
     let mut named = BTreeMap::new();
     let mut invalid = 0_u32;
@@ -1389,7 +1391,7 @@ fn keyed_rows(checks: &HashMap<String, String>) -> Vec<Row> {
                 ServerCheck::ListenerHealth,
                 HealthKey::invalid(),
                 Outcome::Failed,
-                Some("trawld reported a check name that is not [a-z][a-z0-9_]{0,63}"),
+                Some("trawld reported a check name this doctor does not know"),
             )
             .detail(Text::new("").int(invalid).lit(" such name(s), not shown"))
             .next(Text::new(
@@ -1407,14 +1409,7 @@ fn keyed_rows(checks: &HashMap<String, String>) -> Vec<Row> {
 /// all, since even an identifier-shaped value may be a secret.
 fn key_row(name: &str, key: &HealthKey, value: &str) -> Row {
     let class = health::classify(name, value);
-    let row = |reason| {
-        Row::for_key(
-            ServerCheck::ListenerHealth,
-            key.clone(),
-            class.outcome(),
-            reason,
-        )
-    };
+    let row = |reason| Row::for_key(ServerCheck::ListenerHealth, *key, class.outcome(), reason);
     match class {
         ValueClass::Ok => row(None).detail(Text::new("reported ok")),
         // A recovering corpus is not a failure: trawld cannot yet vouch for
@@ -1883,7 +1878,9 @@ mod tests {
         let body = br#"{"status":"degraded","version":"x","checks":{
             "duckdb":"ok","auth_db":"error","ingest_capacity":"refusing",
             "corpus":"rollup_pending","wal":"recovering","data_path":"Weird Value!",
-            "storage_db":"private_secret","Bad-Key":"ok","_invalid":"ok"}}"#;
+            "storage_db":"private_secret","Bad-Key":"ok","_invalid":"ok",
+            "private_secret":"ok",
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08":"ok"}}"#;
         let (row, keyed) = health_rows(200, body);
         assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
         let id = |key: &str| format!("server.listener.health.{key}");
@@ -1909,23 +1906,20 @@ mod tests {
                     Some("reported a value this doctor does not know")
                 ),
                 (
-                    id("wal"),
-                    Outcome::Failed,
-                    Some("reported a value this doctor does not know")
-                ),
-                (
                     id("_invalid"),
                     Outcome::Failed,
-                    Some("trawld reported a check name that is not [a-z][a-z0-9_]{0,63}")
+                    Some("trawld reported a check name this doctor does not know")
                 ),
             ]
         );
-        // No unknown value is shown, not even one shaped like an identifier.
+        // No unknown value or name is shown, not even one shaped like an
+        // identifier or a fingerprint.
         let shown = format!("{keyed:?}");
-        assert!(
-            !shown.contains("Weird") && !shown.contains("Bad-Key") && !shown.contains("secret"),
-            "{shown}"
-        );
+        for hidden in ["Weird", "Bad-Key", "secret", "wal", "9f86d081", "a08"] {
+            assert!(!shown.contains(hidden), "{hidden}: {shown}");
+        }
+        let invalid = keyed.last().unwrap().clone().into_check();
+        assert_eq!(invalid.detail.as_deref(), Some("5 such name(s), not shown"));
         for row in &keyed {
             let check = row.clone().into_check();
             if check.reason.as_deref() == Some("reported a value this doctor does not know") {

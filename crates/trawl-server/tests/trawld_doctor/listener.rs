@@ -720,12 +720,21 @@ struct HealthCase {
 }
 
 /// A degraded answer with every kind of value: known good and failing,
-/// recovering, unknown but quotable, unknown and not shown, and a name that
-/// is not an identifier.
+/// recovering, unknown but quotable, and unknown and not shown. Its names
+/// trawld does not report are a name that is not an identifier, an
+/// identifier-shaped secret, and a fingerprint-shaped one.
 const DEGRADED: &[u8] = br#"{"status":"degraded","version":"0.0.0","checks":{
     "duckdb":"ok","auth_db":"error","ingest_capacity":"refusing",
-    "corpus":"rollup_pending","wal":"novel_state","data_path":"Private Value",
-    "Bad-Key-Private":"ok"}}"#;
+    "corpus":"rollup_pending","storage_db":"novel_state","data_path":"Private Value",
+    "Bad-Key-Private":"ok","private_secret":"ok",
+    "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8":"ok"}}"#;
+
+/// The names in [`DEGRADED`] that trawld does not report; none may appear.
+const UNKNOWN_NAMES: [&str; 3] = [
+    "Bad-Key-Private",
+    "private_secret",
+    "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
+];
 
 /// The answers trawld never sends, or sends only in states a fixture does
 /// not reach, and what the doctor must make of each.
@@ -744,16 +753,16 @@ fn health_cases() -> Vec<HealthCase> {
                 ("corpus", Outcome::NotSampled, Some("recovering")),
                 ("data_path", Outcome::Failed, UNKNOWN),
                 ("duckdb", Outcome::Complete, None),
-                (
+(
                     "ingest_capacity",
                     Outcome::Failed,
                     Some("reported refusing"),
                 ),
-                ("wal", Outcome::Failed, UNKNOWN),
+                ("storage_db", Outcome::Failed, UNKNOWN),
                 (
                     "_invalid",
                     Outcome::Failed,
-                    Some("trawld reported a check name that is not [a-z][a-z0-9_]{0,63}"),
+                    Some("trawld reported a check name this doctor does not know"),
                 ),
             ],
         ),
@@ -857,7 +866,8 @@ async fn doctor_listener_health_rows() {
         let addr = tls_listener(pair.serving(), case.response);
         let mut planted = pair.planted.clone();
         planted.extend(address_values(addr));
-        planted.extend(["Private Value".to_owned(), "Bad-Key-Private".to_owned()]);
+        planted.push("Private Value".to_owned());
+        planted.extend(UNKNOWN_NAMES.map(str::to_owned));
         let config = config_for(dir.path(), addr.to_string(), tls.clone());
         let report = doctor(&config, planted_env(dir.path()), &planted).await;
         assert_eq!(outcome(&report, IDENTITY), (Outcome::Complete, None));
@@ -875,7 +885,8 @@ async fn doctor_listener_health_rows() {
             .clone()
             .unwrap_or_default()
     };
-    assert_eq!(detail("wal"), "the value is not shown");
+    assert_eq!(detail("storage_db"), "the value is not shown");
+    assert_eq!(detail("_invalid"), "3 such name(s), not shown");
     assert_eq!(detail("data_path"), "the value is not shown");
     assert_eq!(detail("corpus"), "reported rollup_pending");
 
@@ -930,7 +941,7 @@ async fn doctor_listener_never_shows_an_unknown_health_value() {
     let pair = Pair::new("unknown-private-subject", &["localhost"]);
     let tls = pair.write(dir.path(), "unknown");
     let body = br#"{"status":"degraded","version":"0.0.0","checks":{
-        "duckdb":"ok","wal":"private_secret","corpus":"private_secret"}}"#;
+        "duckdb":"ok","auth_db":"private_secret","corpus":"private_secret"}}"#;
     let addr = tls_listener(pair.serving(), http(200, body));
     let mut planted = pair.planted.clone();
     planted.extend(address_values(addr));
@@ -941,12 +952,12 @@ async fn doctor_listener_never_shows_an_unknown_health_value() {
     assert_eq!(
         keyed(&report),
         [
+            ("auth_db", Outcome::Failed, UNKNOWN),
             ("corpus", Outcome::Failed, UNKNOWN),
             ("duckdb", Outcome::Complete, None),
-            ("wal", Outcome::Failed, UNKNOWN),
         ]
     );
-    for key in ["corpus", "wal"] {
+    for key in ["auth_db", "corpus"] {
         assert_eq!(
             row(&report, &format!("{HEALTH}.{key}")).detail.as_deref(),
             Some("the value is not shown")

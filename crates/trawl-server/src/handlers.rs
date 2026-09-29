@@ -592,6 +592,18 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
     )
 }
 
+/// The names of the checks `GET /api/v1/health` reports, in the order
+/// [`health`] fills them. `trawld --doctor` gives a row of its own to these
+/// names and to no other (#269).
+pub const HEALTH_CHECK_NAMES: [&str; 6] = [
+    "duckdb",
+    "auth_db",
+    "storage_db",
+    "data_path",
+    "ingest_capacity",
+    "corpus",
+];
+
 /// `GET /api/v1/health` — unauthenticated health check with subsystem probes.
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
     // Probe duckdb, the fleet keystore and the app-state store concurrently.
@@ -638,7 +650,6 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         crate::transport::failure::record_error(err);
     }
 
-    let mut checks = HashMap::with_capacity(6);
     let duckdb_healthy = duckdb_result.is_ok();
     let auth_healthy = auth_result.is_ok();
     let storage_healthy = storage_result.is_ok();
@@ -648,15 +659,21 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     let corpus_settled = corpus == "ok";
     let check_value = |healthy| String::from(if healthy { "ok" } else { "error" });
 
-    checks.insert("duckdb".into(), check_value(duckdb_healthy));
-    checks.insert("auth_db".into(), check_value(auth_healthy));
-    checks.insert("storage_db".into(), check_value(storage_healthy));
-    checks.insert("data_path".into(), check_value(data_healthy));
-    checks.insert(
-        "ingest_capacity".into(),
+    // One value per name in `HEALTH_CHECK_NAMES`, in its order. The array's
+    // type holds the two lists to the same length.
+    let values: [String; HEALTH_CHECK_NAMES.len()] = [
+        check_value(duckdb_healthy),
+        check_value(auth_healthy),
+        check_value(storage_healthy),
+        check_value(data_healthy),
         String::from(ingest_capacity_check(ingest_admitting)),
-    );
-    checks.insert("corpus".into(), String::from(corpus));
+        String::from(corpus),
+    ];
+    let checks: HashMap<String, String> = HEALTH_CHECK_NAMES
+        .into_iter()
+        .map(str::to_owned)
+        .zip(values)
+        .collect();
 
     metrics::gauge!("trawl_health_check", "subsystem" => "duckdb").set(if duckdb_healthy {
         1.0
