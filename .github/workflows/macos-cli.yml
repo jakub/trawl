@@ -32,6 +32,8 @@ on:
 permissions:
   contents: read
 
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   build:
     name: package (${{ matrix.target }})
@@ -44,6 +46,7 @@ jobs:
           - runner: macos-15-intel
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     env:
       MACOSX_DEPLOYMENT_TARGET: "15.0"
       TARGET: ${{ matrix.target }}
@@ -135,6 +138,7 @@ jobs:
     # A separate fresh runner receives the archive and verification tooling.
     # No Rust setup, source build, or DuckDB installation is performed here.
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
     env:
       TARGET: ${{ matrix.target }}
       RELEASE_TAG: ${{ inputs.release-tag }}

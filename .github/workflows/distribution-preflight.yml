@@ -36,9 +36,12 @@ concurrency:
   group: distribution-preflight-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   metadata:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       sha: ${{ steps.source.outputs.sha }}
       release-tag: ${{ steps.source.outputs.release-tag }}

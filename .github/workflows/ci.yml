@@ -27,6 +27,9 @@ env:
 # 10 GB Actions cache. Each rust-cache step below saves only on main: pull
 # requests restore main's entries and never evict them with per-PR copies.
 # Jobs that compile the same thing share a key.
+#
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 
 jobs:
   changes:
@@ -35,6 +38,7 @@ jobs:
     # the caches that pull requests restore warm.
     name: changed scopes
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
@@ -61,6 +65,7 @@ jobs:
   vector-collector:
     name: Vector collector delivery
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -86,6 +91,7 @@ jobs:
   release-source:
     name: release source resolution
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -133,6 +139,7 @@ jobs:
   deb-packaging:
     name: deb crash-dump packaging assertions
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
@@ -144,6 +151,7 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -155,6 +163,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -189,6 +198,7 @@ jobs:
     # the pg-admission-guard step below proves nothing escaped it.
     name: test
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: read
     services:
@@ -335,6 +345,7 @@ jobs:
   msrv:
     name: msrv check
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@3a8b2ad3ea1212417907ff0e1b3d0c4e121bef40 # 1.94.0
@@ -347,6 +358,7 @@ jobs:
   deny:
     name: cargo-deny
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Binary install instead of EmbarkStudios/cargo-deny-action, which is a
@@ -363,6 +375,7 @@ jobs:
   wasm-check:
     name: wasm32 clippy (web UI + fleet-ui)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -384,6 +397,7 @@ jobs:
   vendor-drift:
     name: web UI vendor bundle drift
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
@@ -406,6 +420,7 @@ jobs:
   trunk-build:
     name: web UI release build (trunk)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
@@ -466,6 +481,7 @@ jobs:
   trawl-web-tests:
     name: trawl-web tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Exercise real chart rendering in the packaging contract tests.
@@ -485,6 +501,7 @@ jobs:
   trawl-web-release:
     name: trawl-web release build (SPA embedded)
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: trunk-build
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

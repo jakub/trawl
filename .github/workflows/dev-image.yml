@@ -14,10 +14,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   dev-image:
     name: build + push arm64 dev image
     runs-on: k8s-big
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

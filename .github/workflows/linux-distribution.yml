@@ -35,6 +35,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Each job's timeout-minutes is two to three times its slowest normal run,
+# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   build:
     name: build (${{ matrix.target }})
@@ -45,6 +47,7 @@ jobs:
     # Pull-request preflights run on GitHub-hosted runners, next to CI.
     # Release builds stay on k8s-big, where the release caches live.
     runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-24.04' || 'k8s-big' }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -299,6 +302,7 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
     env:
       TARGET: ${{ matrix.target }}
       SOURCE_SHA: ${{ inputs.source-sha }}
