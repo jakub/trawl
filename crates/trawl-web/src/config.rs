@@ -1651,6 +1651,54 @@ pub(crate) const MAX_PIN_FILE_BYTES: u64 = 1024 * 1024;
 pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
+    let file = open_capped(path, cap)?;
+    let mut contents = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if contents.len() as u64 > cap {
+        return Err(too_large(cap));
+    }
+    Ok(contents)
+}
+
+/// [`read_capped_file`] for a secret: the bytes land in one [`Zeroizing`]
+/// buffer from the first byte, and every path out of the read scrubs it.
+///
+/// The buffer is allocated once, `cap + 1` bytes, before the first read,
+/// and never grown, so no reallocation leaves a copy behind; the reads go
+/// straight into it, with no intermediate buffer. An error part way
+/// through, or a file past the cap, drops the buffer here, zeroized. It
+/// suits a small cap, such as a key's: the whole buffer is allocated even
+/// for a short file.
+///
+/// # Errors
+/// As [`read_capped_file`].
+pub(crate) fn read_capped_secret(path: &Path, cap: u64) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let mut file = open_capped(path, cap)?;
+    let size = usize::try_from(cap.saturating_add(1)).map_err(|_| too_large(cap))?;
+    let mut buffer = Zeroizing::new(vec![0; size]);
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if filled as u64 > cap {
+        return Err(too_large(cap));
+    }
+    buffer.truncate(filled);
+    Ok(buffer)
+}
+
+/// Open `path` for [`read_capped_file`] and [`read_capped_secret`]: never
+/// waiting on a FIFO, refusing what is not a regular file, and refusing a
+/// file already past `cap`, each on the opened handle.
+fn open_capped(path: &Path, cap: u64) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1666,22 +1714,18 @@ pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::io::Result<Vec<u8>
             "the path is not a regular file",
         ));
     }
-    let too_large = || {
-        std::io::Error::new(
-            std::io::ErrorKind::FileTooLarge,
-            format!("the file is larger than {cap} bytes"),
-        )
-    };
     if metadata.len() > cap {
-        return Err(too_large());
+        return Err(too_large(cap));
     }
-    let mut contents = Vec::new();
-    file.take(cap.saturating_add(1))
-        .read_to_end(&mut contents)?;
-    if contents.len() as u64 > cap {
-        return Err(too_large());
-    }
-    Ok(contents)
+    Ok(file)
+}
+
+/// The capped readers' refusal of a file larger than `cap`.
+fn too_large(cap: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::FileTooLarge,
+        format!("the file is larger than {cap} bytes"),
+    )
 }
 
 /// Read the pin file at `path` through [`read_capped_file`], capped at
@@ -4250,6 +4294,20 @@ session_ttl_secs = 3600
         let error = read_capped_file(dir.path(), 1024).expect_err("a directory");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         let error = read_capped_file(&dir.path().join("absent"), 1024).expect_err("a missing file");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        // The secret reader refuses the same things, and reads into the
+        // one buffer it allocated first: one byte past the cap, never
+        // grown, so no reallocation leaves an unscrubbed copy behind.
+        let secret = read_capped_secret(&path, KEY_LEN as u64 + 1).unwrap();
+        assert_eq!(*secret, [0x42; KEY_LEN + 1]);
+        assert_eq!(secret.capacity(), KEY_LEN + 2);
+        let error = read_capped_secret(&path, KEY_LEN as u64).expect_err("past the cap");
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        let error = read_capped_secret(dir.path(), 1024).expect_err("a directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let error =
+            read_capped_secret(&dir.path().join("absent"), 1024).expect_err("a missing file");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 
         #[cfg(unix)]

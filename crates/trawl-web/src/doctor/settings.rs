@@ -14,8 +14,9 @@
 //! crate constant's variable name and fleet-auth's static reason.
 //!
 //! The cookie key is the one row that reads a file: `cookie_secret_path`,
-//! through [`read::read`] with the key's cap, its bytes wrapped in
-//! [`Zeroizing`] as they arrive. That row carries the access mark, so a
+//! through [`read::secret_len`] with the key's cap, which reads the bytes
+//! into a scrubbed buffer on the blocking thread and returns only their
+//! count. That row carries the access mark, so a
 //! root run reports its `complete` as `not_sampled`, `ran_as_root` (D12).
 //! Nothing here generates a key: no key source is `not_configured`,
 //! `ephemeral_each_start`.
@@ -26,7 +27,6 @@ use fleet_auth::{
     SessionRuntimeError,
 };
 use trawl_api::doctor::reason;
-use zeroize::Zeroizing;
 
 use super::output::{EnvName, Row, SelectedPath, Selection, Text};
 use super::read::{self, ReadFault};
@@ -295,11 +295,9 @@ async fn cookie_key(ctx: &Ctx) -> Row {
         Ok(KeySource::ConfigEnv { name }) => config_env_key(ctx, name),
         Ok(KeySource::File { path }) => {
             let shown = SelectedPath::new(Selection::CookieSecretPath, path);
-            // Only the length is judged; the bytes are scrubbed as they
-            // are dropped, here.
-            let len = read::read(path.clone(), read::cap::KEY)
-                .await
-                .map(|bytes| Zeroizing::new(bytes).len());
+            // Only the length is judged, so only the length comes back:
+            // the bytes are scrubbed on the reading thread.
+            let len = read::secret_len(path.clone(), read::cap::KEY).await;
             key_file_row(ctx, &shown, len)
         }
         Ok(KeySource::None) => Row::not_configured(check, reason::EPHEMERAL_EACH_START)

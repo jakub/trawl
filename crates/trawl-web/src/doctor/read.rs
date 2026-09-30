@@ -11,12 +11,16 @@
 //! handle, and the read stops one byte past the cap. The error comes back
 //! as a [`ReadFault`], a kind with no text, so no OS message can reach a
 //! row.
+//!
+//! A key is read by [`secret_len`] instead: the bytes stay on the blocking
+//! thread, in a buffer scrubbed on every path, and only their count comes
+//! back.
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::read_capped_file;
+use crate::config::{read_capped_file, read_capped_secret};
 
 /// How long one read may take. A hung network volume costs the check its
 /// answer, not the run.
@@ -53,7 +57,8 @@ pub enum ReadFault {
 }
 
 impl ReadFault {
-    /// The fault an error from [`read_capped_file`] stands for.
+    /// The fault an error from [`read_capped_file`] or
+    /// [`read_capped_secret`] stands for.
     fn of(error: &std::io::Error) -> Self {
         #[cfg(unix)]
         if error.raw_os_error() == Some(libc::ELOOP) {
@@ -74,15 +79,36 @@ impl ReadFault {
 ///
 /// A read that misses the deadline is left behind on its thread; the
 /// doctor's runtime shuts down with a bounded wait, so it cannot hold the
-/// run. A key read's bytes are the caller's to wrap in `Zeroizing` at
-/// once.
+/// run. Not for a key: its bytes would cross to the async side, and a
+/// late read's would be dropped unscrubbed. Use [`secret_len`].
 ///
 /// # Errors
 /// A [`ReadFault`] naming why nothing was read.
 pub async fn read(path: PathBuf, cap: u64) -> Result<Vec<u8>, ReadFault> {
-    let task = tokio::task::spawn_blocking(move || read_capped_file(&path, cap));
+    within_deadline(move || read_capped_file(&path, cap)).await
+}
+
+/// How many bytes the secret file at `path` holds, at most `cap`, read on
+/// the blocking pool under [`READ_DEADLINE`].
+///
+/// The bytes never leave the blocking thread: [`read_capped_secret`] reads
+/// them into a buffer scrubbed on every path, errors included, and only
+/// the count is returned. A read the deadline abandons finishes with a
+/// count or an error, so no late result carries key bytes.
+///
+/// # Errors
+/// A [`ReadFault`] naming why nothing was read.
+pub async fn secret_len(path: PathBuf, cap: u64) -> Result<usize, ReadFault> {
+    within_deadline(move || read_capped_secret(&path, cap).map(|bytes| bytes.len())).await
+}
+
+/// Run `read` on the blocking pool, waiting at most [`READ_DEADLINE`].
+async fn within_deadline<T: Send + 'static>(
+    read: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<T, ReadFault> {
+    let task = tokio::task::spawn_blocking(read);
     match tokio::time::timeout(READ_DEADLINE, task).await {
-        Ok(Ok(Ok(bytes))) => Ok(bytes),
+        Ok(Ok(Ok(value))) => Ok(value),
         Ok(Ok(Err(error))) => Err(ReadFault::of(&error)),
         Ok(Err(_)) => Err(ReadFault::Io),
         Err(_) => Err(ReadFault::TimedOut),
@@ -138,5 +164,45 @@ mod tests {
                 Err(ReadFault::PermissionDenied)
             );
         }
+    }
+
+    /// A key read gives the async side a length or a fault, never bytes:
+    /// the signature is the assertion, so no late result of a read the
+    /// deadline abandoned can carry key bytes. The file kinds map to the
+    /// same faults as a plain read's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_secret_read_returns_only_its_length() {
+        fn only_a_length<F: Future<Output = Result<usize, ReadFault>>>(read: F) -> F {
+            read
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
+        let key = fleet_auth::KEY_LEN;
+
+        for len in [0, key - 1, key, key + 1] {
+            std::fs::write(path("key"), vec![7; len]).unwrap();
+            assert_eq!(
+                only_a_length(secret_len(path("key"), cap::KEY)).await,
+                Ok(len)
+            );
+        }
+        std::fs::write(path("key"), vec![7; key + 2]).unwrap();
+        assert_eq!(
+            secret_len(path("key"), cap::KEY).await,
+            Err(ReadFault::TooLarge)
+        );
+        assert_eq!(
+            secret_len(path("absent"), cap::KEY).await,
+            Err(ReadFault::Missing)
+        );
+        assert_eq!(
+            secret_len(dir.path().to_owned(), cap::KEY).await,
+            Err(ReadFault::NotRegular)
+        );
+        let fifo = path("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+        assert_eq!(secret_len(fifo, cap::KEY).await, Err(ReadFault::NotRegular));
     }
 }
