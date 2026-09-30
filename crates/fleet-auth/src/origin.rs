@@ -220,6 +220,27 @@ impl Origin {
         };
         Ok(Self { scheme, host, port })
     }
+
+    /// Whether this origin names the machine it is served from.
+    ///
+    /// True for exactly three host shapes, whatever the scheme and port:
+    ///
+    /// - an IPv4 literal in `127.0.0.0/8`;
+    /// - the IPv6 literal `::1`, and no other. An IPv4-mapped address such
+    ///   as `::ffff:127.0.0.1` is a different origin to a browser, as it is
+    ///   to [`PartialEq`] here, so it does not count;
+    /// - the DNS name `localhost`. Hosts are stored lowercased, so
+    ///   `LOCALHOST` counts. `localhost.` with the root dot and
+    ///   subdomains such as `app.localhost` do not: this answers what the
+    ///   name is, not what a resolver might make of it.
+    #[must_use]
+    pub fn is_loopback(&self) -> bool {
+        match &self.host {
+            OriginHost::V4(addr) => addr.is_loopback(),
+            OriginHost::V6(addr) => *addr == Ipv6Addr::LOCALHOST,
+            OriginHost::Dns(name) => name == "localhost",
+        }
+    }
 }
 
 /// Refuse every byte that cannot appear in an origin's authority.
@@ -791,6 +812,38 @@ mod tests {
         assert_eq!(error("file://trawl.example.com"), UnsupportedScheme);
         assert_eq!(error("://trawl.example.com"), UnsupportedScheme);
         assert_eq!(error("javascript://trawl.example.com"), UnsupportedScheme);
+    }
+
+    #[test]
+    fn origin_is_loopback() {
+        for loopback in [
+            "http://127.0.0.1:8090",
+            "https://127.0.0.1",
+            "http://127.255.255.254:8090",
+            "http://[::1]:8090",
+            "http://[0:0:0:0:0:0:0:1]:8090",
+            "http://localhost:8090",
+            "https://LocalHost",
+        ] {
+            assert!(parsed(loopback).is_loopback(), "{loopback}");
+        }
+        for elsewhere in [
+            "https://trawl.example.com",
+            "http://128.0.0.1:8090",
+            "http://0.0.0.0:8090",
+            "http://10.0.0.1:8090",
+            // Mapped IPv6 is a different origin from the IPv4 it maps.
+            "http://[::ffff:127.0.0.1]:8090",
+            "http://[::]:8090",
+            "http://[::2]:8090",
+            // The name, not what a resolver makes of it.
+            "http://localhost.:8090",
+            "http://app.localhost:8090",
+            "http://localhost.example.com:8090",
+            "http://notlocalhost:8090",
+        ] {
+            assert!(!parsed(elsewhere).is_loopback(), "{elsewhere}");
+        }
     }
 
     #[test]
