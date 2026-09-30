@@ -1235,7 +1235,19 @@ impl AuthConfig {
     /// # Errors
     /// Returns [`ConfigError::Validation`] when neither source is set.
     pub fn resolve_database_url(&self) -> Result<String, ConfigError> {
-        Self::resolve_database_url_from(
+        self.resolve_database_url_with_source().map(|(url, _)| url)
+    }
+
+    /// [`Self::resolve_database_url`], also naming which source won, so
+    /// `trawld --doctor` can say where the URL came from without showing
+    /// it.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_database_url`].
+    pub fn resolve_database_url_with_source(
+        &self,
+    ) -> Result<(String, DatabaseUrlSource), ConfigError> {
+        Self::resolve_database_url_with_source_from(
             std::env::var("FLEET_DATABASE_URL").ok().as_deref(),
             self.database_url.as_deref(),
         )
@@ -1243,12 +1255,19 @@ impl AuthConfig {
 
     /// Pure resolution core, split out for testability (mutating process
     /// env in tests is forbidden under `unsafe_code = "forbid"`).
+    #[cfg(test)]
     fn resolve_database_url_from(
         env_value: Option<&str>,
         configured: Option<&str>,
     ) -> Result<String, ConfigError> {
-        let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
-        pick(env_value).or_else(|| pick(configured)).ok_or_else(|| {
+        Self::resolve_database_url_with_source_from(env_value, configured).map(|(url, _)| url)
+    }
+
+    fn resolve_database_url_with_source_from(
+        env_value: Option<&str>,
+        configured: Option<&str>,
+    ) -> Result<(String, DatabaseUrlSource), ConfigError> {
+        pick_database_url(env_value, configured).ok_or_else(|| {
             ConfigError::Validation(
                 "fleet keystore URL required: set [auth] database_url in trawld.toml \
                  or the FLEET_DATABASE_URL environment variable"
@@ -1256,6 +1275,28 @@ impl AuthConfig {
             )
         })
     }
+}
+
+/// Which setting a resolved database URL came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseUrlSource {
+    /// The environment variable (`FLEET_DATABASE_URL` or
+    /// `TRAWL_DATABASE_URL`), which wins over the file.
+    Environment,
+    /// The configuration file (`[auth]` or `[storage] database_url`).
+    ConfigFile,
+}
+
+/// The environment value, else the configured one, each only when
+/// nonempty: the precedence both database URL resolvers share.
+fn pick_database_url(
+    env_value: Option<&str>,
+    configured: Option<&str>,
+) -> Option<(String, DatabaseUrlSource)> {
+    let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
+    pick(env_value)
+        .map(|url| (url, DatabaseUrlSource::Environment))
+        .or_else(|| pick(configured).map(|url| (url, DatabaseUrlSource::ConfigFile)))
 }
 
 /// Storage settings for trawl's own app-state database (query history,
@@ -1284,7 +1325,19 @@ impl StorageConfig {
     /// # Errors
     /// Returns [`ConfigError::Validation`] when neither source is set.
     pub fn resolve_database_url(&self) -> Result<String, ConfigError> {
-        Self::resolve_database_url_from(
+        self.resolve_database_url_with_source().map(|(url, _)| url)
+    }
+
+    /// [`Self::resolve_database_url`], also naming which source won, so
+    /// `trawld --doctor` can say where the URL came from without showing
+    /// it.
+    ///
+    /// # Errors
+    /// As [`Self::resolve_database_url`].
+    pub fn resolve_database_url_with_source(
+        &self,
+    ) -> Result<(String, DatabaseUrlSource), ConfigError> {
+        Self::resolve_database_url_with_source_from(
             std::env::var("TRAWL_DATABASE_URL").ok().as_deref(),
             self.database_url.as_deref(),
         )
@@ -1292,12 +1345,19 @@ impl StorageConfig {
 
     /// Pure resolution core, split out for testability (mutating process
     /// env in tests is forbidden under `unsafe_code = "forbid"`).
+    #[cfg(test)]
     fn resolve_database_url_from(
         env_value: Option<&str>,
         configured: Option<&str>,
     ) -> Result<String, ConfigError> {
-        let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
-        pick(env_value).or_else(|| pick(configured)).ok_or_else(|| {
+        Self::resolve_database_url_with_source_from(env_value, configured).map(|(url, _)| url)
+    }
+
+    fn resolve_database_url_with_source_from(
+        env_value: Option<&str>,
+        configured: Option<&str>,
+    ) -> Result<(String, DatabaseUrlSource), ConfigError> {
+        pick_database_url(env_value, configured).ok_or_else(|| {
             ConfigError::Validation(
                 "trawl app-state database URL required: set [storage] database_url in \
                  trawld.toml or the TRAWL_DATABASE_URL environment variable"
@@ -2954,6 +3014,34 @@ path = "/data"
         let url = StorageConfig::resolve_database_url_from(Some(""), Some("postgres://toml/trawl"))
             .unwrap();
         assert_eq!(url, "postgres://toml/trawl");
+    }
+
+    /// The source is the setting that won, under the same precedence the
+    /// URL-only resolvers apply: a nonempty environment value, else the
+    /// file.
+    #[test]
+    fn resolve_names_the_winning_source() {
+        use DatabaseUrlSource::{ConfigFile, Environment};
+        for (env, file, expected) in [
+            (
+                Some("postgres://env/db"),
+                Some("postgres://toml/db"),
+                Environment,
+            ),
+            (Some("postgres://env/db"), None, Environment),
+            (None, Some("postgres://toml/db"), ConfigFile),
+            (Some(""), Some("postgres://toml/db"), ConfigFile),
+        ] {
+            let auth = AuthConfig::resolve_database_url_with_source_from(env, file).unwrap();
+            let storage = StorageConfig::resolve_database_url_with_source_from(env, file).unwrap();
+            assert_eq!(auth.1, expected, "{env:?} {file:?}");
+            assert_eq!(auth, storage);
+            assert_eq!(
+                auth.0,
+                AuthConfig::resolve_database_url_from(env, file).unwrap()
+            );
+        }
+        assert!(StorageConfig::resolve_database_url_with_source_from(Some(""), None).is_err());
     }
 
     #[test]

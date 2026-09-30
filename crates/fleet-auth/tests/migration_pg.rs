@@ -151,3 +151,38 @@ async fn runtime_connect_rejects_old_and_invalid_histories_without_writes(pool: 
     let reopened = fleet_auth::KeyStore::connect(url.as_str()).await.unwrap();
     reopened.verify_key(&token).await.unwrap();
 }
+
+/// The connection form classifies exactly as the pool form, and hands the
+/// connection back outside the snapshot: the next statement on it sees a
+/// change committed after validation returned.
+#[sqlx::test(migrations = false)]
+async fn validation_on_a_connection_matches_the_pool_form(pool: PgPool) {
+    use sqlx::{Connection as _, Executor as _};
+    let mut conn = pool.acquire().await.unwrap().detach();
+    assert!(matches!(
+        fleet_auth::validate_schema_on(&mut conn).await,
+        Err(SchemaError::Uninitialized)
+    ));
+    // The snapshot is REPEATABLE READ; outside it, a statement runs at the
+    // session default.
+    let isolation: String = sqlx::query_scalar("SELECT current_setting('transaction_isolation')")
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        isolation, "read committed",
+        "validation left its snapshot open"
+    );
+    migrate(&pool).await.unwrap();
+    fleet_auth::validate_schema_on(&mut conn).await.unwrap();
+    pool.execute("UPDATE _sqlx_migrations SET success=false")
+        .await
+        .unwrap();
+    assert!(matches!(
+        fleet_auth::validate_schema_on(&mut conn).await,
+        Err(SchemaError::Migration(sqlx::migrate::MigrateError::Dirty(
+            _
+        )))
+    ));
+    conn.close().await.unwrap();
+}

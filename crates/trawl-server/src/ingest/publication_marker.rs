@@ -381,6 +381,17 @@ fn io_error(path: &Path, operation: &str, error: &io::Error) -> MarkerError {
 /// one that grows after the `fstat` is read only up to one byte past the
 /// bound. Off Unix no marker is opened, so a present one cannot be read.
 pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
+    read_marker_with(path, no_follow::open)
+}
+
+/// [`read_marker`], opening the marker with `open` in place of
+/// [`no_follow::open`]. `trawld --doctor` passes its own opener, which
+/// never opens anything but a regular file for I/O; whatever `open`
+/// returns is judged by `fstat` as `read_marker` judges its own.
+fn read_marker_with(
+    path: &Path,
+    open: impl FnOnce(&Path) -> io::Result<std::fs::File>,
+) -> Result<ValidatedMarker, MarkerError> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -396,7 +407,7 @@ pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     validate_service(service).map_err(MarkerError::Invalid)?;
 
     let not_regular = || MarkerError::Invalid("marker is not a regular file".to_owned());
-    let file = no_follow::open(path).map_err(|e| {
+    let file = open(path).map_err(|e| {
         if no_follow::is_symlink_refusal(&e) {
             not_regular()
         } else {
@@ -586,6 +597,56 @@ pub fn scan_claims(wal_dir: &Path) -> Result<PublicationClaims, String> {
         }
     }
     Ok(claims)
+}
+
+/// What one read-only pass over the WAL root found ([`census`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarkerCensus {
+    /// Some WAL root entry could not be inspected; it may be an env
+    /// holding markers.
+    pub root_incomplete: bool,
+    /// Env directories whose markers could not be listed.
+    pub unlisted_envs: usize,
+    /// Markers that read and validate. Boot recovery takes each of them on
+    /// its next start.
+    pub pending: usize,
+    /// Markers that are not a regular file, are over [`MAX_MARKER_BYTES`],
+    /// or fail parsing or confinement.
+    pub invalid: usize,
+    /// Markers that could not be opened or read.
+    pub unreadable: usize,
+}
+
+/// Count every marker under `wal_dir` by what [`read_marker`], the decoder
+/// recovery uses, makes of it, with each marker opened by `open`. Nothing
+/// is written. A missing root holds no markers; a marker gone between
+/// listing and reading is not counted.
+///
+/// # Errors
+/// When the WAL root cannot be listed.
+pub fn census(
+    wal_dir: &Path,
+    open: impl Fn(&Path) -> io::Result<std::fs::File>,
+) -> io::Result<MarkerCensus> {
+    let mut census = MarkerCensus::default();
+    let envs = crate::env_dirs::try_list_env_dirs_observed(wal_dir, || {
+        census.root_incomplete = true;
+    })?;
+    for (_env, env_dir) in envs {
+        let Ok(markers) = list_markers(&env_dir) else {
+            census.unlisted_envs += 1;
+            continue;
+        };
+        for (_service, path) in markers {
+            match read_marker_with(&path, &open) {
+                Ok(_) => census.pending += 1,
+                Err(MarkerError::Missing) => {}
+                Err(MarkerError::Invalid(_)) => census.invalid += 1,
+                Err(MarkerError::Io(_)) => census.unreadable += 1,
+            }
+        }
+    }
+    Ok(census)
 }
 
 /// Why recovery refused to act on a marker. Recovery touches nothing and the

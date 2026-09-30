@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod health;
+
 /// Version of the JSON report document. Bump it when the shape changes.
 pub const REPORT_VERSION: u32 = 1;
 
@@ -265,7 +267,11 @@ impl Verdict {
     }
 }
 
-/// Stable reason codes for a check that could not look.
+/// Stable reason codes.
+///
+/// Most say why a check could not look (`not_sampled`). The ones whose
+/// comment names another outcome say why a `complete` or `failed` check has
+/// that outcome, where the reason is part of the contract.
 pub mod reason {
     /// The target refused the probe for exceeding its rate limit.
     pub const RATE_LIMITED: &str = "rate_limited";
@@ -278,6 +284,63 @@ pub mod reason {
     /// The target is still recovering what it holds, such as trawld's
     /// corpus after a restart, and cannot answer for it yet.
     pub const RECOVERING: &str = "recovering";
+    /// Run as root, which can read what the service user may not: an
+    /// access check did not look. A check that waits on it still runs.
+    pub const RAN_AS_ROOT: &str = "ran_as_root";
+    /// Nothing accepted a connection at the listener's address, as when
+    /// trawld is not running.
+    pub const NOT_LISTENING: &str = "not_listening";
+    /// A file the check reads changed while the doctor read it.
+    pub const MATERIAL_CHANGED: &str = "material_changed";
+    /// A migrator holds its lock while the schema is not current.
+    pub const MIGRATION_IN_PROGRESS: &str = "migration_in_progress";
+    /// The evidence neither proves nor refutes the assertion, such as an
+    /// archive with no identity marker.
+    pub const UNPROVEN: &str = "unproven";
+    /// No certificate exists yet to compare the listener against.
+    pub const NO_MATERIAL: &str = "no_material";
+    /// A file the check reads exists but could not be read as one.
+    pub const UNREADABLE: &str = "unreadable";
+    /// A file the check reads is larger than the doctor reads.
+    pub const TOO_LARGE: &str = "too_large";
+    /// With `complete`: trawld's boot creates or brings this state current
+    /// on its next start, and accepts it as it is.
+    pub const WILL_INITIALIZE: &str = "will_initialize";
+    /// With `complete`: a well-formed recovery marker that trawld's boot
+    /// finishes on its next start.
+    pub const PENDING_AT_NEXT_BOOT: &str = "pending_at_next_boot";
+    /// With `complete`: trawld's writer lock is held by some session.
+    pub const HELD: &str = "held";
+    /// With `complete`: no session holds trawld's writer lock.
+    pub const NOT_OBSERVED: &str = "not_observed";
+    /// With `failed`: the data root belongs to another catalog than the
+    /// app-state database's.
+    pub const CATALOG_IDENTITY_MISMATCH: &str = "catalog_identity_mismatch";
+    /// The database session did not take the doctor's read-only setting
+    /// and timeouts, or a startup field would have kept it from taking
+    /// them, so the doctor sent no other query.
+    pub const SESSION_NOT_READ_ONLY: &str = "session_not_read_only";
+    /// The database connection broke after it authenticated, or before the
+    /// server answered the doctor's startup message.
+    pub const CONNECTION_LOST: &str = "connection_lost";
+    /// A read-only query erred, or its answer did not decode, after the
+    /// connection authenticated.
+    pub const QUERY_FAILED: &str = "query_failed";
+    /// The database server sent a message the driver could not decode, so
+    /// the doctor dropped the connection.
+    pub const PROTOCOL_ERROR: &str = "protocol_error";
+    /// The listener address resolves to several addresses and none of them
+    /// proved it serves the certificate on disk: which one trawld binds is
+    /// not known.
+    pub const AMBIGUOUS_ADDRESS: &str = "ambiguous_address";
+    /// An exchange broke off before it was whole, such as a TLS handshake
+    /// or a health answer cut short, and what arrived proves nothing.
+    pub const INTERRUPTED: &str = "interrupted";
+    /// With `failed`: under `sslmode` `disable` or `allow`, the server a
+    /// database URL names did not answer the doctor's startup message as a
+    /// PostgreSQL server does: its first message was not of type `R`, `E`
+    /// or `v`, or declared more than 8 KiB. The doctor did not connect.
+    pub const NOT_POSTGRES: &str = "not_postgres";
 }
 
 #[cfg(test)]

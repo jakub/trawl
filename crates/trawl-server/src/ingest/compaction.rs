@@ -1495,15 +1495,18 @@ fn rollup_marker_path(day_dir: &Path, service: &str) -> PathBuf {
 /// names, so at most 100 lines. Each line is a path of at most 4095 bytes
 /// (Linux `PATH_MAX` less its terminator) written lossily, which turns each
 /// byte that is not UTF-8 into three, plus its newline.
-const MAX_ROLLUP_MARKER_BYTES: u64 = 100 * (3 * 4095 + 1);
+pub(crate) const MAX_ROLLUP_MARKER_BYTES: u64 = 100 * (3 * 4095 + 1);
 
 /// Open `path` with [`no_follow::open`], and check with `fstat` on the
 /// descriptor that it is a regular file. The open never waits on a FIFO,
 /// and a symlink at the last component is refused, never followed. Boot
 /// awaits rollup recovery, so a file there that is not crash residue must
 /// fail the recovery, not hang the boot.
-fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
-    let file = no_follow::open(path)?;
+fn open_regular(
+    path: &Path,
+    open: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
+) -> std::io::Result<(std::fs::File, u64)> {
+    let file = open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(std::io::Error::new(
@@ -1514,26 +1517,86 @@ fn open_regular(path: &Path) -> std::io::Result<(std::fs::File, u64)> {
     Ok((file, metadata.len()))
 }
 
+/// Why [`read_rollup_marker`] returned no marker. Each keeps the error that
+/// recovery's message has always carried.
+#[derive(Debug)]
+pub(crate) enum RollupMarkerError {
+    /// It could not be opened as a regular file: absent, a symlink, not a
+    /// regular file, or refused.
+    Open(std::io::Error),
+    /// It is over [`MAX_ROLLUP_MARKER_BYTES`].
+    TooLarge,
+    /// Reading it failed, or it is not UTF-8 text.
+    Read(std::io::Error),
+}
+
+impl RollupMarkerError {
+    /// Whether nothing is at the path any more.
+    pub(crate) fn is_missing(&self) -> bool {
+        matches!(self, Self::Open(e) if e.kind() == std::io::ErrorKind::NotFound)
+    }
+
+    /// Whether what is at the path can never be a marker recovery uses:
+    /// a symlink, not a regular file, over the bound, or not text. Any
+    /// other failure is one the reader may not have been allowed to look
+    /// past.
+    pub(crate) fn is_malformed(&self) -> bool {
+        match self {
+            Self::Open(e) => {
+                no_follow::is_symlink_refusal(e) || e.kind() == std::io::ErrorKind::InvalidInput
+            }
+            Self::TooLarge => true,
+            Self::Read(e) => e.kind() == std::io::ErrorKind::InvalidData,
+        }
+    }
+}
+
+/// The wording recovery has always failed a day with.
+impl std::fmt::Display for RollupMarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(e) => write!(f, "failed to open rollup marker: {e}"),
+            Self::TooLarge => write!(
+                f,
+                "rollup marker is over the {MAX_ROLLUP_MARKER_BYTES}-byte limit"
+            ),
+            Self::Read(e) => write!(f, "failed to read rollup marker: {e}"),
+        }
+    }
+}
+
 /// Read the rollup marker at `path`, opened with [`open_regular`]. A marker
 /// over [`MAX_ROLLUP_MARKER_BYTES`] is an error: one `fstat` reports is
 /// never read, and one that grows after the `fstat` is read only up to one
 /// byte past the bound. Off Unix no marker is opened, so a present one
 /// cannot be read.
-fn read_rollup_marker(path: &Path) -> Result<String, String> {
+///
+/// Boot recovery reads with it and `trawld --doctor` with
+/// [`read_rollup_marker_with`]; recovery turns the error into its message.
+pub(crate) fn read_rollup_marker(path: &Path) -> Result<String, RollupMarkerError> {
+    read_rollup_marker_with(path, no_follow::open)
+}
+
+/// [`read_rollup_marker`], opening the marker with `open` in place of
+/// [`no_follow::open`]. `trawld --doctor` passes its own opener, which
+/// never opens anything but a regular file for I/O; whatever `open`
+/// returns is judged by `fstat` as [`open_regular`] judges its own.
+pub(crate) fn read_rollup_marker_with(
+    path: &Path,
+    open: impl FnOnce(&Path) -> std::io::Result<std::fs::File>,
+) -> Result<String, RollupMarkerError> {
     use std::io::Read as _;
 
-    let (file, len) =
-        open_regular(path).map_err(|e| format!("failed to open rollup marker: {e}"))?;
-    let over_limit = || format!("rollup marker is over the {MAX_ROLLUP_MARKER_BYTES}-byte limit");
+    let (file, len) = open_regular(path, open).map_err(RollupMarkerError::Open)?;
     if len > MAX_ROLLUP_MARKER_BYTES {
-        return Err(over_limit());
+        return Err(RollupMarkerError::TooLarge);
     }
     let mut content = String::new();
     file.take(MAX_ROLLUP_MARKER_BYTES + 1)
         .read_to_string(&mut content)
-        .map_err(|e| format!("failed to read rollup marker: {e}"))?;
+        .map_err(RollupMarkerError::Read)?;
     if content.len() as u64 > MAX_ROLLUP_MARKER_BYTES {
-        return Err(over_limit());
+        return Err(RollupMarkerError::TooLarge);
     }
     Ok(content)
 }
@@ -1621,7 +1684,7 @@ fn recover_rollup_markers_inner(
         }
         let canonical = day_dir.join(format!("{service}.parquet"));
         let tmp = day_dir.join(format!("{service}.parquet.tmp"));
-        let marker_content = read_rollup_marker(&path)?;
+        let marker_content = read_rollup_marker(&path).map_err(|e| e.to_string())?;
         let hourly_files: Vec<PathBuf> = marker_content
             .lines()
             .filter(|line| !line.is_empty())
@@ -1632,7 +1695,7 @@ fn recover_rollup_markers_inner(
         // contains both that daily file and the new hourly inputs.
         // A tmp that is not a regular file is no output of this merge, and
         // is neither promoted nor quarantined.
-        let staged = match open_regular(&tmp) {
+        let staged = match open_regular(&tmp, no_follow::open) {
             Ok(staged) => Some(staged),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(format!("failed to open rollup tmp: {e}")),

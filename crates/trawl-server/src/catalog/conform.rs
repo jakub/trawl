@@ -256,24 +256,79 @@ pub async fn verify_archive_identity(
         .await
         .map_err(|e| format!("failed to read catalog identity: {e}"))?;
     let marker = read_marker(data_dir);
-    if marker.as_deref() == Some(catalog_id.as_str()) {
-        return Ok(ArchiveIdentity::Proven);
-    }
-    if archive_is_empty(data_dir) {
-        return Ok(ArchiveIdentity::Empty);
-    }
-    match marker {
-        Some(other) => Err(format!(
+    match judge_archive_identity(marker.as_deref(), Some(&catalog_id), || {
+        archive_is_empty(data_dir)
+    }) {
+        IdentityJudgement::Proven => Ok(ArchiveIdentity::Proven),
+        IdentityJudgement::Empty => Ok(ArchiveIdentity::Empty),
+        IdentityJudgement::Unproven => Ok(ArchiveIdentity::Unproven),
+        IdentityJudgement::Foreign => Err(format!(
             "the parquet archive at {} was written by a different catalog than \
              the one this node is connected to (data/{CATALOG_MARKER} = \
-             {other}, catalog_state.catalog_id = {catalog_id}), so its columns \
+             {}, catalog_state.catalog_id = {catalog_id}), so its columns \
              are not the pins /api/v1/schema would advertise. Point the app \
              database at the catalog that owns this archive, or boot once with \
              [ingest] enabled = true to run the conformance pass and adopt it",
             data_dir.display(),
+            marker.unwrap_or_default(),
         )),
-        None => Ok(ArchiveIdentity::Unproven),
     }
+}
+
+/// What the dual-sided marker says about a data root and a catalog
+/// ([`judge_archive_identity`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityJudgement {
+    /// The marker names the catalog.
+    Proven,
+    /// The archive positively holds no parquet, whatever the marker says.
+    Empty,
+    /// The archive holds parquet and carries no marker.
+    Unproven,
+    /// The archive holds parquet and its marker names another catalog.
+    Foreign,
+}
+
+/// Judge the identity of an archive from its `CATALOG` marker and the
+/// catalog's id: the one comparison the query-only boot gate
+/// ([`verify_archive_identity`]) and `trawld --doctor` share.
+///
+/// `catalog_id` is `None` for a catalog not created yet: a fresh app-state
+/// database, whose first migration draws a new random id that no marker
+/// can name. `archive_empty` walks the tree, so it runs only when the
+/// marker does not prove the pairing.
+pub fn judge_archive_identity(
+    marker: Option<&str>,
+    catalog_id: Option<&str>,
+    archive_empty: impl FnOnce() -> bool,
+) -> IdentityJudgement {
+    if marker.is_some() && marker == catalog_id {
+        return IdentityJudgement::Proven;
+    }
+    if archive_empty() {
+        return IdentityJudgement::Empty;
+    }
+    if marker.is_some() {
+        IdentityJudgement::Foreign
+    } else {
+        IdentityJudgement::Unproven
+    }
+}
+
+/// Whether conformance is recorded for exactly this (catalog, data root)
+/// pair: `catalog_state.conformed_at` is set and the marker names the
+/// catalog. [`ensure_conformance`] skips the pass on it, and
+/// `trawld --doctor` reports it.
+///
+/// `marker` runs only when `conformed` is set. Boot relies on that: an
+/// unconformed catalog goes straight to the pass without opening
+/// `data/CATALOG`, so whatever sits there (a FIFO, a device) cannot stall it.
+pub fn conformance_recorded(
+    conformed: bool,
+    marker: impl FnOnce() -> Option<String>,
+    catalog_id: &str,
+) -> bool {
+    conformed && marker().as_deref() == Some(catalog_id)
 }
 
 /// Whether the data root positively holds no parquet — the only state in
@@ -283,12 +338,12 @@ pub async fn verify_archive_identity(
 /// hold the whole corpus, so it reads as standing data. That is conservative
 /// where it matters (a foreign marker still refuses) and costs nothing where
 /// it does not (an unmarked archive warns either way).
-fn archive_is_empty(data_dir: &Path) -> bool {
+pub(crate) fn archive_is_empty(data_dir: &Path) -> bool {
     if !data_dir.is_dir() {
         return true;
     }
-    let (files, errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
-    if let Some((path, e)) = errors.into_iter().next() {
+    let walk = walk_archive(data_dir);
+    if let Some((path, e)) = walk.failure {
         tracing::warn!(
             event_type = "catalog_identity_walk_failed",
             file = %path.display(),
@@ -298,7 +353,29 @@ fn archive_is_empty(data_dir: &Path) -> bool {
         );
         return false;
     }
-    files.is_empty()
+    !walk.parquet
+}
+
+/// What one walk of a data root for parquet saw ([`walk_archive`]).
+#[derive(Debug)]
+pub(crate) struct ArchiveWalk {
+    /// Whether the walk found a parquet file.
+    pub(crate) parquet: bool,
+    /// The first path the walk could not enumerate, and why. With it set,
+    /// `parquet: false` says only that the enumerable part holds none.
+    pub(crate) failure: Option<crate::metrics::WalkError>,
+}
+
+/// Walk the data root for parquet the way [`archive_is_empty`] does, and
+/// keep what it saw apart from what it could not see. Boot reads a failed
+/// walk as standing data; `trawld --doctor` reads it as a look that did not
+/// finish, unless the walk found parquet anyway.
+pub(crate) fn walk_archive(data_dir: &Path) -> ArchiveWalk {
+    let (files, errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
+    ArchiveWalk {
+        parquet: !files.is_empty(),
+        failure: errors.into_iter().next(),
+    }
 }
 
 /// Run the boot conformance pass unless the dual-sided identity says it
@@ -322,7 +399,7 @@ pub async fn ensure_conformance(
         .is_conformed()
         .await
         .map_err(|e| format!("failed to read conformance state: {e}"))?;
-    if conformed && read_marker(data_dir).as_deref() == Some(catalog_id.as_str()) {
+    if conformance_recorded(conformed, || read_marker(data_dir), &catalog_id) {
         // Still hydrate the cache — skipping the pass must not skip pins.
         hydrate(store, cache).await?;
         return Ok(ConformSummary {
@@ -530,10 +607,29 @@ async fn record_boot_conflicts(store: &CatalogStore, conflicts: &[FieldConflict]
 }
 
 /// Read the data-root marker, if present.
+///
+/// Boot collapses every read error into absence, as it always has: an
+/// unreadable marker proves nothing, so it reads like a missing one. On an
+/// ingest node the pass then re-runs and publishing the marker afterwards
+/// surfaces a real fault; a query-only node warns that the archive is
+/// unproven. `trawld --doctor` keeps the typed error instead, through
+/// [`read_marker_with`], so it can say it could not look.
 fn read_marker(data_dir: &Path) -> Option<String> {
-    std::fs::read_to_string(data_dir.join(CATALOG_MARKER))
+    read_marker_with(data_dir, |path| std::fs::read_to_string(path).map(Some))
         .ok()
-        .map(|s| s.trim().to_owned())
+        .flatten()
+}
+
+/// Read the data-root marker with `read`, which returns the file's text, or
+/// `None` when there is none. The identity is the text trimmed.
+///
+/// # Errors
+/// Whatever `read` returns.
+pub fn read_marker_with<E>(
+    data_dir: &Path,
+    read: impl FnOnce(&Path) -> Result<Option<String>, E>,
+) -> Result<Option<String>, E> {
+    Ok(read(&data_dir.join(CATALOG_MARKER))?.map(|s| s.trim().to_owned()))
 }
 
 /// Publish the marker through the shared staged-write idiom

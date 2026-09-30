@@ -90,6 +90,31 @@ pub struct RepinMarker {
     pub phase: RepinPhase,
 }
 
+impl RepinPhase {
+    /// Whether a query-only node refuses to boot over a marker in this
+    /// phase. A `building` marker leaves the live corpus untouched, so the
+    /// node serves; past it, the corpus may be half-swapped, and only the
+    /// ingest node may finish the job.
+    #[must_use]
+    pub const fn query_only_refuses(self) -> bool {
+        match self {
+            Self::Building => false,
+            Self::Cutover | Self::Cleanup => true,
+        }
+    }
+}
+
+impl RepinMarker {
+    /// The target pin, parsed from its catalog spelling (`from_catalog`,
+    /// matching what the marker writes: the physical parse has no
+    /// `SEVERITY` spelling). `None` for a spelling no canonical type has,
+    /// which recovery of a `cutover` or `cleanup` marker refuses.
+    #[must_use]
+    pub fn target_type(&self) -> Option<trawl_core::schema::CanonicalType> {
+        trawl_core::schema::CanonicalType::from_catalog(&self.to_type)
+    }
+}
+
 /// The shadow sibling root for a data root.
 #[must_use]
 pub fn shadow_root(data_dir: &Path) -> PathBuf {
@@ -279,9 +304,18 @@ pub fn read_marker(data_dir: &Path) -> Result<Option<RepinMarker>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
     };
-    serde_json::from_str(&raw)
+    parse_marker(&raw)
         .map(Some)
         .map_err(|e| format!("failed to parse {}: {e}", path.display()))
+}
+
+/// Parse a marker's text: the one decoder boot recovery and
+/// `trawld --doctor` share.
+///
+/// # Errors
+/// When the text is not a marker document.
+pub fn parse_marker(raw: &str) -> Result<RepinMarker, serde_json::Error> {
+    serde_json::from_str(raw)
 }
 
 /// Write (or rewrite) the marker through the shared staged-write idiom

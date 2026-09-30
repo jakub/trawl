@@ -8,10 +8,15 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use clap::Parser;
+use clap::{CommandFactory as _, FromArgMatches as _, Parser};
 use tracing_subscriber::fmt;
 use tracing_subscriber::util::SubscriberInitExt;
 use trawl_server::config::Config;
+#[cfg(unix)]
+use trawl_server::config_check::validate_log_identity;
+use trawl_server::config_check::{
+    check_config, validate_file_log_config, validate_log_destination,
+};
 use trawl_server::error::join_failure_text;
 use trawl_server::state::AppState;
 use trawl_server::telemetry::{self, WalHandle, WalLayer};
@@ -28,6 +33,25 @@ struct Cli {
     /// Validate an explicitly selected config and exit without starting services.
     #[arg(long, requires = "config")]
     check_config: bool,
+
+    /// Check, without changing anything, whether trawld will start and serve
+    /// with the config that --config names, then exit: 0 pass, 1 fail,
+    /// 3 incomplete.
+    #[arg(long, requires = "config", conflicts_with = "check_config")]
+    doctor: bool,
+
+    /// With --doctor: report format (auto-detected if omitted: table for
+    /// TTY, json for pipes).
+    // `conflicts_with` as well as `requires`: clap excuses a missing
+    // `--doctor` whenever an argument it conflicts with is present.
+    #[arg(
+        long,
+        short,
+        value_enum,
+        requires = "doctor",
+        conflicts_with = "check_config"
+    )]
+    format: Option<trawl_server::doctor::Format>,
 
     /// Path to ndjson query debug log. Overrides config `server.query_log`.
     #[arg(long, env = "TRAWL_QUERY_LOG")]
@@ -52,6 +76,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // carries no arguments, so it always reaches normal crash-dump init.
     // Both paths seal before config reads or threads. Check mode must not
     // start the monitor or create its directory, even when capture is enabled.
+    // The doctor is a check mode too (ADR-0047): the same seal, before clap
+    // or any read, and it never reaches crash-dump init either. `--doctor=`
+    // is caught as well, so a spelling clap refuses still seals first.
+    if std::env::args_os()
+        .any(|arg| arg == "--doctor" || arg.as_encoded_bytes().starts_with(b"--doctor="))
+    {
+        let Ok(sealed) = trawl_crashdump::seal_for_config_check() else {
+            eprintln!("[trawld] doctor refused: capability seal failed");
+            std::process::exit(1);
+        };
+        std::process::exit(i32::from(doctor_main(sealed)));
+    }
     if std::env::args_os().any(|arg| arg == "--check-config") {
         if trawl_crashdump::seal_for_config_check().is_err() {
             eprintln!("[trawld] configuration check refused: capability seal failed");
@@ -126,17 +162,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-/// Validate local configuration only. Database URLs are required, but no
-/// network connectivity, credentials, or stored data contents are inspected.
-/// File-log validation reads path metadata to detect marker aliases.
-fn check_config(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_file(path)?;
-    validate_file_log_config(&config)?;
-    config.auth.resolve_database_url()?;
-    config.storage.resolve_database_url()?;
-    trawl_server::ingest::producer::Derivation::resolve(&config.ingest)
-        .map_err(|_| "invalid setting at ingest: check severity_from and time_from")?;
-    Ok(())
+/// The usage line every `--doctor` usage error ends with.
+const DOCTOR_USAGE: &str = "Usage: trawld --doctor --config <PATH> [--format <table|json>]";
+
+/// `trawld --doctor`, in a process `main` already sealed, as `sealed`
+/// proves. Returns the exit status: the report's (0, 1, 3) or 2 for a
+/// refused command line.
+///
+/// No tracing subscriber and no `log` logger exist on this path, so a log
+/// line from shared code goes nowhere.
+fn doctor_main(sealed: trawl_crashdump::Sealed) -> u8 {
+    // clap's help shows an env-bound argument's current value, as
+    // `[env: NAME=value]`. The doctor's output names no value it did not
+    // select (ADR-0047), so its help names each variable without one.
+    let command = Cli::command().mut_args(|arg| arg.hide_env_values(true));
+    let matches = match command.try_get_matches() {
+        Ok(matches) => matches,
+        Err(error) => return doctor_usage_error(&error),
+    };
+    // ADR-0047: the doctor checks the file the operator names on its
+    // command line, never one TRAWL_CONFIG points at.
+    if matches.value_source("config") != Some(clap::parser::ValueSource::CommandLine) {
+        eprintln!(
+            "[trawld] --doctor needs --config on the command line; it does not read \
+             TRAWL_CONFIG\n{DOCTOR_USAGE}"
+        );
+        return 2;
+    }
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => return doctor_usage_error(&error),
+    };
+    // The argument as given: the doctor expands its `~` itself, under a
+    // deadline, since with HOME unset or empty the expansion asks the
+    // password database.
+    let config = cli.config.as_deref().expect("clap requires config");
+    trawl_server::doctor::run(sealed, config, cli.format)
+}
+
+/// Report a refused `--doctor` command line, exit status 2, without
+/// echoing any argument or environment value: clap's own message quotes
+/// the value it refused. Help and version print as clap prints them; the
+/// help comes from the command `doctor_main` built, which shows no
+/// environment value.
+fn doctor_usage_error(error: &clap::Error) -> u8 {
+    use clap::error::ErrorKind;
+    if matches!(
+        error.kind(),
+        ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+    ) {
+        let _ = error.print();
+        return 0;
+    }
+    let kind = error
+        .kind()
+        .as_str()
+        .unwrap_or("the command line is not valid");
+    eprintln!("[trawld] --doctor: {kind}\n{DOCTOR_USAGE}");
+    2
 }
 
 #[allow(clippy::too_many_lines)] // lifecycle orchestration is cohesive
@@ -726,136 +809,6 @@ fn warn_retention_envs_without_dir(config: &Config, on_disk: &[String]) {
     }
 }
 
-const STORAGE_MARKERS: [&str; 3] = ["EPOCH", "CATALOG", "REPIN"];
-
-fn validate_file_log_config(config: &Config) -> std::io::Result<()> {
-    if !config.internal_telemetry_enabled()
-        && let Some(path) = &config.server.log_file
-    {
-        validate_log_destination(path, &config.data.base_dir())?;
-    }
-    Ok(())
-}
-
-/// Resolve existing aliases and missing suffixes without creating anything.
-/// Resolve symlinks before `..`, including dangling links to future markers.
-fn resolve_log_destination(path: &std::path::Path) -> std::io::Result<PathBuf> {
-    fn resolve(path: &std::path::Path, links: u8) -> std::io::Result<PathBuf> {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_symlink() => {
-                if links == 40 {
-                    return Err(std::io::Error::other(
-                        "too many symlinks in log or storage path",
-                    ));
-                }
-                let target = std::fs::read_link(path)?;
-                resolve(&path.parent().unwrap_or(path).join(target), links + 1)
-            }
-            Ok(_) => std::fs::canonicalize(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let Some(parent) = path.parent() else {
-                    return Err(error);
-                };
-                let mut resolved = resolve(parent, links)?;
-                match path.components().next_back() {
-                    Some(std::path::Component::Normal(name)) => resolved.push(name),
-                    Some(std::path::Component::ParentDir) => {
-                        resolved.pop();
-                    }
-                    Some(std::path::Component::CurDir) => {}
-                    _ => return Err(error),
-                }
-                // Collapsing a missing `child/..` can reveal an existing
-                // symlink at the resulting path. Resolve that alias too.
-                if resolved == path {
-                    Ok(resolved)
-                } else {
-                    resolve(&resolved, links)
-                }
-            }
-            Err(error) => Err(error),
-        }
-    }
-    resolve(&std::env::current_dir()?.join(path), 0)
-}
-
-fn marker_log_error(marker: &std::path::Path) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        format!(
-            "server.log_file overlaps reserved storage marker {}; select a separate log file",
-            marker.display()
-        ),
-    )
-}
-
-fn validate_log_destination(
-    path: &std::path::Path,
-    data_root: &std::path::Path,
-) -> std::io::Result<PathBuf> {
-    let with_context = |error: std::io::Error| {
-        std::io::Error::new(
-            error.kind(),
-            format!(
-                "failed to validate server.log_file {}: {error}",
-                path.display()
-            ),
-        )
-    };
-    let resolved = resolve_log_destination(path).map_err(with_context)?;
-    for name in STORAGE_MARKERS {
-        let marker = data_root.join(name);
-        let resolved_marker = resolve_log_destination(&marker).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to inspect reserved storage marker {} while validating server.log_file {}: {error}",
-                    marker.display(),
-                    path.display()
-                ),
-            )
-        })?;
-        if resolved == resolved_marker {
-            return Err(marker_log_error(&marker));
-        }
-    }
-    #[cfg(unix)]
-    match std::fs::metadata(&resolved) {
-        Ok(metadata) => validate_log_identity(&metadata, data_root)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(with_context(error)),
-    }
-    Ok(resolved)
-}
-
-#[cfg(unix)]
-fn validate_log_identity(
-    metadata: &std::fs::Metadata,
-    data_root: &std::path::Path,
-) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-    for name in STORAGE_MARKERS {
-        let marker = data_root.join(name);
-        match std::fs::metadata(&marker) {
-            Ok(other) if metadata.dev() == other.dev() && metadata.ino() == other.ino() => {
-                return Err(marker_log_error(&marker));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "failed to inspect reserved storage marker {}: {error}",
-                        marker.display()
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 struct FileLog {
     path: PathBuf,
     data_root: PathBuf,
@@ -1100,92 +1053,6 @@ fn resolve_path(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn log_destination_rejects_marker_aliases_and_keeps_normal_paths() {
-        use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(data.join("nested")).unwrap();
-        let alias = tmp.path().join("alias");
-        symlink("data/nested", &alias).unwrap();
-        let log_link = tmp.path().join("server.log");
-        for marker in STORAGE_MARKERS {
-            symlink(format!("data/{marker}"), &log_link).unwrap();
-            for path in [
-                log_link.clone(),
-                tmp.path().join("missing/../server.log"),
-                alias.join(format!("../{marker}")),
-                data.join(format!("missing/../{marker}")),
-            ] {
-                let error = validate_log_destination(&path, &data).unwrap_err();
-                assert!(
-                    error.to_string().contains("reserved storage marker"),
-                    "{error}"
-                );
-                assert!(!data.join(marker).exists());
-                assert!(!data.join("missing").exists());
-            }
-            std::fs::remove_file(&log_link).unwrap();
-            std::fs::write(data.join(marker), b"marker bytes").unwrap();
-            std::fs::hard_link(data.join(marker), &log_link).unwrap();
-            assert!(validate_log_destination(&log_link, &data).is_err());
-            let opened = std::fs::File::open(&log_link).unwrap();
-            assert!(validate_log_identity(&opened.metadata().unwrap(), &data).is_err());
-            assert_eq!(std::fs::read(&log_link).unwrap(), b"marker bytes");
-            std::fs::remove_file(log_link.clone()).unwrap();
-            std::fs::remove_file(data.join(marker)).unwrap();
-        }
-        for path in [
-            data.join("server.log"),
-            data.join("logs/EPOCH"),
-            tmp.path().join("EPOCH"),
-        ] {
-            assert!(validate_log_destination(&path, &data).is_ok());
-            assert!(!path.exists());
-        }
-        symlink("data", tmp.path().join("data-alias")).unwrap();
-        assert!(
-            validate_log_destination(&data.join("EPOCH"), &tmp.path().join("data-alias")).is_err()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn log_destination_resolution_errors_do_not_change_storage() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        let cycle = tmp.path().join("cycle");
-        symlink("cycle", &cycle).unwrap();
-        assert!(validate_log_destination(&cycle, &data).is_err());
-        assert!(!data.exists());
-        let file = tmp.path().join("file");
-        std::fs::write(&file, b"preserve").unwrap();
-        let path = file.join("log");
-        let error = validate_log_destination(&path, &data).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
-        assert!(error.to_string().contains("server.log_file"));
-        assert!(error.to_string().contains(&path.display().to_string()));
-        assert_eq!(std::fs::read(&file).unwrap(), b"preserve");
-        assert!(!data.exists());
-        let blocked = tmp.path().join("blocked");
-        std::fs::create_dir(&blocked).unwrap();
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let traversal = std::fs::read_dir(&blocked);
-        let result = validate_log_destination(&blocked.join("server.log"), &data);
-        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
-        // Privileged runners can traverse mode 000. Where the filesystem
-        // denies traversal, resolution must preserve that error.
-        if traversal.is_err() {
-            assert_eq!(
-                result.unwrap_err().kind(),
-                std::io::ErrorKind::PermissionDenied
-            );
-        }
-        assert!(!data.exists());
-    }
 
     #[test]
     fn prepare_data_root_refuses_epoch_or_wal_before_repin_cleanup() {

@@ -131,6 +131,37 @@ fn the_daemon_execs_nothing() {
         root.display()
     );
 
+    // `trawld --doctor` runs in the sealed process too, and its code lives
+    // in its own directory: the walk must reach every file of it.
+    let doctor = root.join("doctor");
+    let doctor_files: Vec<&PathBuf> = sources.iter().filter(|p| p.starts_with(&doctor)).collect();
+    for name in [
+        "mod.rs",
+        "output.rs",
+        "fsread.rs",
+        "db.rs",
+        "storage.rs",
+        "listener.rs",
+    ] {
+        assert!(
+            doctor_files.contains(&&doctor.join(name)),
+            "source walk infrastructure failure: src/doctor/{name} is not scanned"
+        );
+    }
+    let on_disk = std::fs::read_dir(&doctor)
+        .unwrap_or_else(|error| panic!("cannot list {}: {error}", doctor.display()))
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "rs"))
+        })
+        .count();
+    assert_eq!(
+        doctor_files.len(),
+        on_disk,
+        "source walk infrastructure failure: not every src/doctor/*.rs is scanned"
+    );
+
     let mut violations = Vec::new();
     for path in &sources {
         let source = std::fs::read_to_string(path)

@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::time::Duration;
 
+use trawl_api::doctor::health::{self, ValueClass, is_health_key, is_quotable_value};
 use trawl_api::doctor::{Check, Outcome, reason};
 use trawl_api::{HealthResponse, HealthStatus, WhoAmIResponse};
 use trawl_client::{ClientError, NetworkKind, TlsTrust};
@@ -54,23 +55,6 @@ pub const API_HEALTH_INVALID_KEY: &str = "api.health._invalid";
 
 /// The deadline for each request the doctor sends.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// A check name the report may show: `[a-z][a-z0-9_]{0,63}`.
-fn is_health_key(name: &str) -> bool {
-    (1..=64).contains(&name.len())
-        && name.as_bytes()[0].is_ascii_lowercase()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-}
-
-/// A check value the report may quote: `[a-z0-9_]{1,32}`.
-fn is_quotable_value(value: &str) -> bool {
-    (1..=32).contains(&value.len())
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-}
 
 pub(super) fn row(id: &str, outcome: Outcome) -> Check {
     Check {
@@ -691,40 +675,39 @@ fn health_rows(checks: &HashMap<String, String>, secret: Option<&str>) -> Vec<Ch
     rows
 }
 
-/// The health check that trawld reports while its corpus recovers after a
-/// restart (ADR-0041). Only this key has values beyond `ok`, `error`, and
-/// `refusing`.
-const CORPUS_KEY: &str = "corpus";
-
+/// One `api.health.<name>` row. The value's meaning comes from the
+/// classifier every doctor shares ([`health::classify`]); the wording is
+/// this CLI's.
 fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
-    let id = format!("{API_HEALTH_KEY_PREFIX}{name}");
-    match value {
-        "ok" => Check {
+    let class = health::classify(name, value);
+    let check = row(&format!("{API_HEALTH_KEY_PREFIX}{name}"), class.outcome());
+    match class {
+        ValueClass::Ok => Check {
             detail: Some("reported ok".to_owned()),
-            ..row(&id, Outcome::Complete)
+            ..check
         },
         // A recovering corpus is not a failure: the server cannot yet vouch
         // for what it holds, so the doctor could not look (ADR-0047).
-        "rollup_pending" | "restart_backlog" if name == CORPUS_KEY => with_next(
+        ValueClass::Recovering => with_next(
             Check {
                 detail: Some(format!("reported {value}")),
-                ..with_reason(row(&id, Outcome::NotSampled), reason::RECOVERING)
+                ..with_reason(check, reason::RECOVERING)
             },
             "wait for trawld to finish recovery, then rerun",
         ),
-        "error" | "refusing" => with_next(
-            with_reason(row(&id, Outcome::Failed), format!("reported {value}")),
+        ValueClass::Refused => with_next(
+            with_reason(check, format!("reported {value}")),
             format!("read the server's log for why {name} reports {value}"),
         ),
-        other if is_quotable_value(other) && !holds_key(other, secret) => with_next(
+        ValueClass::Unknown if is_quotable_value(value) && !holds_key(value, secret) => with_next(
             with_reason(
-                row(&id, Outcome::Failed),
-                format!("reported {other}, a value this CLI does not know"),
+                check,
+                format!("reported {value}, a value this CLI does not know"),
             ),
             format!("read the server's log for {name}, or update this CLI"),
         ),
-        _ => with_next(
-            with_reason(row(&id, Outcome::Failed), "unrecognized value"),
+        ValueClass::Unknown => with_next(
+            with_reason(check, "unrecognized value"),
             format!("read the server's log for {name}"),
         ),
     }

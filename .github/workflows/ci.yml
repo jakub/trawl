@@ -321,6 +321,16 @@ jobs:
         with:
           name: nextest-archive
           path: ${{ runner.temp }}
+      # trawld_doctor's doctor_writes_nothing and doctor_root_run_is_incomplete
+      # run the doctor as root in an unprivileged user namespace. Ubuntu
+      # 24.04's AppArmor leaves such a namespace without capabilities, so
+      # lift that restriction for this job; the key is absent where AppArmor
+      # does not restrict user namespaces.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       # slice:N/3 deals the tests out one at a time in order, so each job
       # gets a similar share of the slow postgres tests.
       - name: Run test slice ${{ matrix.partition }}/3
@@ -341,6 +351,9 @@ jobs:
           # FLEET_TESTS_REQUIRED backstop died with the PgFixture in ADR-0004
           # slice 3 / issue #12).
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          # A doctor test that needs a user namespace fails here instead of
+          # printing SKIPPED, so a skip is never counted as a pass.
+          TRAWL_TEST_REQUIRE_USERNS: "1"
 
   test-guards:
     # Checks that need the workspace test build but no test results, run

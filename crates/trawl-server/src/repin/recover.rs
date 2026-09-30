@@ -23,8 +23,6 @@
 
 use std::path::Path;
 
-use trawl_core::schema::CanonicalType;
-
 use crate::catalog::FieldCatalog;
 use crate::repin::cutover::{swap_envs, sweep_dir, sweep_pre_swap_staging};
 use crate::repin::marker::{
@@ -101,26 +99,24 @@ pub fn recover_filesystem(
     };
 
     if !ingest_enabled {
-        return match marker.phase {
-            RepinPhase::Building => {
-                tracing::warn!(
-                    event_type = "repin_recovery_deferred",
-                    job_id = marker.job_id,
-                    "repin marker (phase=building) found on a query-only \
-                     node — the live corpus is untouched, so serving is \
-                     safe; boot the owning ingest node to reconcile the job"
-                );
-                Ok(None)
-            }
-            RepinPhase::Cutover | RepinPhase::Cleanup => Err(format!(
+        if marker.phase.query_only_refuses() {
+            return Err(format!(
                 "a repin job (id={}, field={:?}) died mid-cutover on this \
                  data root and this node runs with ingest disabled, so it \
                  must not repair the half-swapped corpus — and serving one \
                  would silently promote mixed types. Boot once with \
                  [ingest] enabled = true to complete the recovery",
                 marker.job_id, marker.field
-            )),
-        };
+            ));
+        }
+        tracing::warn!(
+            event_type = "repin_recovery_deferred",
+            job_id = marker.job_id,
+            "repin marker (phase=building) found on a query-only \
+             node — the live corpus is untouched, so serving is \
+             safe; boot the owning ingest node to reconcile the job"
+        );
+        return Ok(None);
     }
 
     let (action, swept) = match marker.phase {
@@ -189,12 +185,12 @@ pub async fn reconcile_store(
                     .map_err(|e| format!("failed to fail recovered repin job: {e}"))?;
             }
             RecoveredAction::CompletedCutover | RecoveredAction::SweptCleanup => {
-                // `from_catalog`, matching what the marker writes
+                // [`RepinMarker::target_type`]: `from_catalog`, matching what the marker writes
                 // (`to.as_catalog()`): the physical parse (`from_duckdb`)
                 // has no `SEVERITY` spelling, so it would refuse a severity
                 // cutover marker. This path must never refuse — the corpus
                 // is already half-swapped.
-                let to = CanonicalType::from_catalog(&marker.to_type).ok_or_else(|| {
+                let to = marker.target_type().ok_or_else(|| {
                     format!("repin marker names non-canonical type {:?}", marker.to_type)
                 })?;
                 let outcome = storage

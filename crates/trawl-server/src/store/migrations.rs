@@ -13,6 +13,26 @@ use sqlx::{
 pub const BASELINE_VERSION: i64 = 20_260_913_000_001;
 const LEGACY_VERSIONS: &[i64] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
 
+/// The embedded migrations. Boot applies them through [`migrate`];
+/// [`validate_schema`] compares a ledger with them and changes nothing.
+pub static MIGRATOR: Migrator = sqlx::migrate!();
+
+/// Where a ledger that boot admits stands against the embedded migrations.
+/// Every ledger boot refuses is a [`SchemaError`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ledger {
+    /// No history and no application objects: boot creates the schema.
+    Fresh,
+    /// Every applied migration is embedded and intact, and `pending`
+    /// embedded migrations are not applied yet: boot applies them.
+    Behind {
+        /// How many embedded migrations the ledger lacks.
+        pending: usize,
+    },
+    /// Every embedded migration is applied, and nothing else is.
+    Current,
+}
+
 /// Schema admission, validation, and execution failures remain distinguishable.
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
@@ -47,7 +67,9 @@ async fn migrate_with(pool: &PgPool, migrator: &Migrator) -> Result<(), SchemaEr
     let mut conn = pool.acquire().await?.detach();
     let result: Result<(), SchemaError> = async {
         conn.lock().await?;
-        check_history(&mut conn, migrator).await?;
+        // Every ledger boot admits, fresh, behind or current, is brought
+        // current the same way.
+        let _: Ledger = check_history(&mut conn, migrator).await?;
         migrator.run_direct(None, &mut conn, false).await?;
         Ok(())
     }
@@ -58,11 +80,78 @@ async fn migrate_with(pool: &PgPool, migrator: &Migrator) -> Result<(), SchemaEr
     Ok(())
 }
 
-async fn check_history(conn: &mut PgConnection, migrator: &Migrator) -> Result<(), SchemaError> {
+/// Classify the app-state ledger as boot would admit it, in one read-only
+/// snapshot, without taking the migrator's lock or changing anything
+/// (`trawld --doctor`, ADR-0047). The snapshot is rolled back before this
+/// returns; if the future is dropped part-way, the connection may still be
+/// inside it, and the caller should close it.
+///
+/// # Errors
+/// Every ledger boot refuses, as [`migrate`] reports it, and database
+/// errors. A classification error wins over an error rolling the snapshot
+/// back.
+pub async fn validate_schema(conn: &mut PgConnection) -> Result<Ledger, SchemaError> {
+    let mut snapshot = conn
+        .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .await?;
+    let ledger = check_history(&mut snapshot, &MIGRATOR).await;
+    let rollback = snapshot.rollback().await;
+    let ledger = ledger?;
+    rollback?;
+    Ok(ledger)
+}
+
+/// Whether some session holds the `SQLx` migrator's advisory lock on the
+/// database `conn` is connected to. Observed in `pg_locks`, never taken.
+///
+/// # Errors
+/// Database errors.
+pub async fn migrator_lock_held(conn: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut *conn)
+        .await?;
+    super::advisory_lock_granted(conn, migrator_lock_key(&database)).await
+}
+
+/// The advisory lock key `SQLx` 0.9.0's Postgres migrator takes for
+/// `database`: `sqlx-postgres-0.9.0/src/migrate.rs`, `generate_lock_id`,
+/// is `0x3d32ad9e * (CRC-32/ISO-HDLC(current_database()) as i64)`, taken
+/// with `pg_advisory_lock($1)` in `Migrate::lock` on the connection that
+/// migrates. `fleet-admin` and trawld's boot both lock this way. The CRC
+/// comes from the `crc` crate `SQLx` itself computes it with. The product
+/// fits an `i64`: the CRC is below 2^32 and the factor below 2^30.
+fn migrator_lock_key(database: &str) -> i64 {
+    const CRC_IEEE: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISO_HDLC);
+    0x3d32_ad9e * i64::from(CRC_IEEE.checksum(database.as_bytes()))
+}
+
+/// One applied row of `_sqlx_migrations`: version, success, checksum.
+type AppliedRow = (i64, bool, Vec<u8>);
+
+/// What the ledger holds, as [`check_history`] reads it.
+enum Observed {
+    /// No history rows. `untracked` says whether the database holds
+    /// application relations, functions, or types all the same.
+    Empty { untracked: bool },
+    /// The history rows, by version.
+    Applied(Vec<AppliedRow>),
+}
+
+/// Read the ledger, then classify it. Shared by boot ([`migrate`], under the
+/// migrator's lock) and [`validate_schema`] (in a read-only snapshot).
+async fn check_history(
+    conn: &mut PgConnection,
+    migrator: &Migrator,
+) -> Result<Ledger, SchemaError> {
+    let observed = observe_history(conn).await?;
+    classify_history(&observed, migrator)
+}
+
+async fn observe_history(conn: &mut PgConnection) -> Result<Observed, sqlx::Error> {
     let has_ledger: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
         .fetch_one(&mut *conn)
         .await?;
-    let history: Vec<(i64, bool, Vec<u8>)> = if has_ledger {
+    let history: Vec<AppliedRow> = if has_ledger {
         sqlx::query_as("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&mut *conn)
             .await?
@@ -93,12 +182,26 @@ async fn check_history(conn: &mut PgConnection, migrator: &Migrator) -> Result<(
         )
         .fetch_one(&mut *conn)
         .await?;
-        if nonempty {
-            return Err(SchemaError::UntrackedSchema);
-        }
-        return Ok(());
+        return Ok(Observed::Empty {
+            untracked: nonempty,
+        });
     }
-    for (version, success, checksum) in &history {
+    Ok(Observed::Applied(history))
+}
+
+/// Classify what [`observe_history`] read. Pure, so boot and the doctor
+/// cannot disagree about a ledger: the refusals come first, in boot's
+/// order, and only a ledger boot admits is `Fresh`, `Behind` or `Current`.
+/// "Behind" means embedded versions are missing after every applied row
+/// validated; an applied version the binary does not embed ("ahead") is
+/// refused.
+fn classify_history(observed: &Observed, migrator: &Migrator) -> Result<Ledger, SchemaError> {
+    let history = match observed {
+        Observed::Empty { untracked: true } => return Err(SchemaError::UntrackedSchema),
+        Observed::Empty { untracked: false } => return Ok(Ledger::Fresh),
+        Observed::Applied(history) => history,
+    };
+    for (version, success, checksum) in history {
         if LEGACY_VERSIONS.contains(version) {
             return Err(SchemaError::LegacyHistory { version: *version });
         }
@@ -118,6 +221,123 @@ async fn check_history(conn: &mut PgConnection, migrator: &Migrator) -> Result<(
     {
         return Err(SchemaError::UntrackedSchema);
     }
+    // Boot's runner applies up migrations only, so only those can pend.
+    let pending = migrator
+        .iter()
+        .filter(|migration| !migration.migration_type.is_down_migration())
+        .filter(|migration| {
+            !history
+                .iter()
+                .any(|(version, ..)| *version == migration.version)
+        })
+        .count();
+    Ok(if pending == 0 {
+        Ledger::Current
+    } else {
+        Ledger::Behind { pending }
+    })
+}
 
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every embedded migration as a ledger row that validates.
+    fn applied(migrator: &Migrator) -> Vec<AppliedRow> {
+        migrator
+            .iter()
+            .map(|m| (m.version, true, m.checksum.to_vec()))
+            .collect()
+    }
+
+    fn classify(rows: Vec<AppliedRow>) -> Result<Ledger, SchemaError> {
+        classify_history(&Observed::Applied(rows), &MIGRATOR)
+    }
+
+    /// A ledger whose every row validates is behind by exactly the
+    /// embedded migrations it lacks, and current when it lacks none. A gap
+    /// counts the same as a missing tail.
+    #[test]
+    fn check_history_classifies_behind() {
+        let all = applied(&MIGRATOR);
+        assert!(
+            all.len() >= 2,
+            "the test needs a migration past the baseline"
+        );
+        assert_eq!(all[0].0, BASELINE_VERSION);
+        assert_eq!(classify(all.clone()).unwrap(), Ledger::Current);
+        assert_eq!(
+            classify(all[..1].to_vec()).unwrap(),
+            Ledger::Behind {
+                pending: all.len() - 1
+            }
+        );
+        let mut gap = all.clone();
+        gap.remove(1);
+        assert_eq!(classify(gap).unwrap(), Ledger::Behind { pending: 1 });
+        assert_eq!(
+            classify_history(&Observed::Empty { untracked: false }, &MIGRATOR).unwrap(),
+            Ledger::Fresh
+        );
+    }
+
+    /// The refusals come before "behind": a ledger that lacks migrations
+    /// and also holds a row boot refuses is refused, as boot refuses it.
+    #[test]
+    fn check_history_refusals_win_over_behind() {
+        let baseline = applied(&MIGRATOR)[..1].to_vec();
+        let with = |row: AppliedRow| {
+            let mut rows = baseline.clone();
+            rows.push(row);
+            rows.sort_by_key(|(version, ..)| *version);
+            rows
+        };
+        assert!(matches!(
+            classify(with((29_990_101_000_001, true, vec![0]))),
+            Err(SchemaError::Migration(MigrateError::VersionMissing(
+                29_990_101_000_001
+            )))
+        ));
+        assert!(matches!(
+            classify(with((17, true, vec![0]))),
+            Err(SchemaError::LegacyHistory { version: 17 })
+        ));
+        let mut dirty = baseline.clone();
+        dirty[0].1 = false;
+        assert!(matches!(
+            classify(dirty),
+            Err(SchemaError::Migration(MigrateError::Dirty(
+                BASELINE_VERSION
+            )))
+        ));
+        let mut tampered = baseline.clone();
+        tampered[0].2 = vec![0];
+        assert!(matches!(
+            classify(tampered),
+            Err(SchemaError::Migration(MigrateError::VersionMismatch(
+                BASELINE_VERSION
+            )))
+        ));
+        // Applied rows past the baseline without the baseline itself.
+        let past = applied(&MIGRATOR)[1..].to_vec();
+        assert!(matches!(classify(past), Err(SchemaError::UntrackedSchema)));
+        assert!(matches!(
+            classify_history(&Observed::Empty { untracked: true }, &MIGRATOR),
+            Err(SchemaError::UntrackedSchema)
+        ));
+    }
+
+    /// The key for the CRC-32/ISO-HDLC check input, whose CRC is
+    /// `0xCBF43926`: the live proof that it is `SQLx`'s key is
+    /// `doctor_detects_real_migrator_lock`, which takes the lock through
+    /// `SQLx` itself.
+    #[test]
+    fn the_migrator_lock_key_is_sqlx_formula() {
+        assert_eq!(
+            migrator_lock_key("123456789"),
+            0x3d32_ad9e * 0xCBF4_3926_i64
+        );
+        assert_eq!(migrator_lock_key(""), 0);
+        assert!(migrator_lock_key("trawl") > 0);
+    }
 }

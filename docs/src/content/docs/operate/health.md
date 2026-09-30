@@ -16,6 +16,12 @@ the [event reference](/reference/events/#declared-fields).
 
 ## Check the server
 
+To check an installation from the server host, before or after the first start, run
+[`trawld --doctor`](/reference/configuration/#check-the-installation-with-trawld---doctor)
+as the service user. It checks the databases, the data root, the certificate,
+and the listener without changing anything. To check a running server from a
+client, run `trawl doctor` (see the [CLI reference](/reference/cli/#doctor-mode)).
+
 For warnings about reported discards, persistence failures, compaction
 failures, and quarantined files, use [Respond to operational alerts](/operate/operational-alerts/).
 Those rules complement serving checks; they do not detect silent stalls or

@@ -25,6 +25,9 @@ axum = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+# `trawld --doctor` computes the `SQLx` migrator's lock key as `SQLx` does,
+# with the same crate and version (sqlx-postgres 0.9.0 depends on it).
+crc = "3.4.0"
 duckdb = { workspace = true }
 flate2 = { workspace = true }
 fs4 = { workspace = true }
@@ -38,6 +41,9 @@ parking_lot = { workspace = true }
 rand = { workspace = true }
 hyper-util = { workspace = true }
 rcgen = { workspace = true }
+# `trawld --doctor` probes its own listener. The workspace build carries no
+# TLS provider; the doctor installs ring and pins the leaf itself.
+reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 dashmap = { workspace = true }
@@ -69,9 +75,12 @@ metrics-process = { workspace = true }
 # `ingest::no_follow` opens WAL files and markers with `O_NOFOLLOW |
 # O_NONBLOCK` on every Unix host. The Linux-only paths (the `statx` mount
 # root) take the same `fs` feature. `process` for `geteuid`: trawld's
-# generated TLS directories must be its own.
+# generated TLS directories must be its own. `trawld --doctor` reads its
+# files and checks access (`accessat`) through the same `fs` feature, and
+# names the user it ran as through nix's `user` feature (`getpwuid_r`).
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["process"] }
+nix = { workspace = true }
 
 [features]
 # Exposes the pool's query-delay hook (`pool::TEST_QUERY_DELAY_MS`) to this
@@ -94,7 +103,6 @@ trawl-client = { workspace = true }
 # CLI features, including clipboard support, for this server-side test.
 trawl-cli = { workspace = true }
 insta = { workspace = true }
-reqwest = { workspace = true }
 # `tests/span_context.rs` probes the `log` bridge the way sqlx's statement
 # logger does. Already in the graph through sqlx and tracing-log.
 log = { workspace = true }
