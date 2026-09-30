@@ -526,7 +526,7 @@ async fn check_config(runner: &mut Runner, arg: &Path) -> (SelectedPath, Option<
             }
         })?;
         let sources = blocking_within(VALIDATE_DEADLINE, move || {
-            let runtime = RuntimeParts::from_process_env();
+            let runtime = RuntimeParts::from_process_env().find_home(&config.web);
             Sources::resolve(&config.web, Some(&config.server), runtime)
         })
         .await

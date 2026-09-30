@@ -350,7 +350,8 @@ impl ResolvedConfig {
     /// absent — pass `None` in tests that don't need that resolution.
     ///
     /// Observes the process environment once, refuses any invalid
-    /// `FLEET_SESSION_*` value before anything else, and then runs
+    /// `FLEET_SESSION_*` value before anything else, finds the home
+    /// directory only when a selected path starts with `~`, and then runs
     /// [`Sources::resolve`] and [`Self::from_sources`].
     ///
     /// # Errors
@@ -362,7 +363,7 @@ impl ResolvedConfig {
         web: &WebConfig,
         server: Option<&ServerConfig>,
     ) -> Result<Self, ConfigError> {
-        let runtime = RuntimeParts::from_whole_parse(RuntimeEnv::from_process())?;
+        let runtime = startup_parts(web, RuntimeEnv::from_process(), process_home)?;
         Self::from_sources(Sources::resolve(web, server, runtime))
     }
 
@@ -378,7 +379,7 @@ impl ResolvedConfig {
         runtime: SessionRuntimeOverrides,
     ) -> Result<Self, ConfigError> {
         let (_, host) = RuntimeEnv::from_process().split();
-        let runtime = RuntimeParts::from_overrides(runtime, false, host);
+        let runtime = RuntimeParts::from_overrides(runtime, false, host).find_home(web);
         Self::from_sources(Sources::resolve(web, server, runtime))
     }
 
@@ -443,8 +444,8 @@ impl ResolvedConfig {
     }
 }
 
-/// The raw values of every environment variable resolution reads, and the
-/// home directory `~` expands to, taken in one observation.
+/// The raw values of every environment variable resolution reads, taken in
+/// one observation, and the home directory `~` expands to, once known.
 ///
 /// `None` is an unset variable. Fields are public so a caller that cannot
 /// set process variables, a test among them, can state them.
@@ -467,22 +468,20 @@ pub struct RuntimeEnv {
     /// [`ENV_HTTP_ADDR`].
     pub http_addr: Option<OsString>,
     /// The home directory `~` expands to in `[web] cookie_secret_path` and
-    /// the pin path. `None`: there is none, and `~` stays as written.
+    /// the pin path. `None`: none is known yet. [`RuntimeParts::find_home`]
+    /// looks it up when a selected path needs it; without that, `~` stays
+    /// as written.
     pub home: Option<String>,
 }
 
 impl RuntimeEnv {
-    /// Read each variable from the process environment, once, and find the
-    /// home directory as [`shellexpand::tilde`] finds it.
+    /// Read each variable from the process environment, once.
     ///
     /// The `cookie_secret_env` variable is not among them: its name comes
     /// from the file, and [`key_from_env`] reads it only when the key is
-    /// actually loaded.
-    ///
-    /// When `HOME` is unset or empty, finding the home directory asks the
-    /// user database, which can block on a network name service. This is
-    /// the one place resolution does that, so [`Sources::resolve`] stays
-    /// pure.
+    /// actually loaded. The home directory is not looked up here either:
+    /// `home` is `None`, and [`RuntimeParts::find_home`] finds it once the
+    /// file shows whether a selected path needs it.
     #[must_use]
     pub fn from_process() -> Self {
         let read = std::env::var_os;
@@ -495,7 +494,7 @@ impl RuntimeEnv {
             bind_addr: read(ENV_BIND_ADDR),
             upstream_ca_path: read(ENV_UPSTREAM_CA_PATH),
             http_addr: read(ENV_HTTP_ADDR),
-            home: process_home(),
+            home: None,
         }
     }
 
@@ -559,7 +558,7 @@ struct HostEnv {
 /// The home directory [`shellexpand::tilde`] expands `~` to: `HOME` when
 /// it is set and not empty, else the user database's entry, and `None`
 /// when neither gives one or it is not UTF-8. May block (see
-/// [`RuntimeEnv::from_process`]).
+/// [`RuntimeParts::find_home`]).
 fn process_home() -> Option<String> {
     // Asking the library itself keeps startup's expansion exactly as it was.
     // `tilde` returns an owned string only when it found a home directory
@@ -568,6 +567,28 @@ fn process_home() -> Option<String> {
         Cow::Owned(home) => Some(home),
         Cow::Borrowed(_) => None,
     }
+}
+
+/// Startup's observation: the whole parse of `env`, and then, only when
+/// a selected path needs it, the home directory from `lookup`. An invalid
+/// `FLEET_SESSION_*` variable refuses before anything is looked up.
+fn startup_parts(
+    web: &WebConfig,
+    env: RuntimeEnv,
+    lookup: impl FnOnce() -> Option<String>,
+) -> Result<RuntimeParts, ConfigError> {
+    Ok(RuntimeParts::from_whole_parse(env)?.find_home_with(web, lookup))
+}
+
+/// Whether [`shellexpand::tilde`] would look up the home directory to
+/// expand `path`: it starts with `~` alone or `~/`. Looks nothing up.
+fn wants_home(path: &Path) -> bool {
+    let mut wants = false;
+    let _ = shellexpand::tilde_with_context(&path.to_string_lossy(), || {
+        wants = true;
+        None::<&str>
+    });
+    wants
 }
 
 /// `path` with a leading `~` replaced by `home`, or unchanged when `home`
@@ -595,10 +616,53 @@ pub struct RuntimeParts {
 
 impl RuntimeParts {
     /// Read the process environment once and parse each `FLEET_SESSION_*`
-    /// variable on its own: the doctor's observation.
+    /// variable on its own: the doctor's observation. It finds no home
+    /// directory; follow it with [`Self::find_home`].
     #[must_use]
     pub fn from_process_env() -> Self {
         Self::from_each_variable(RuntimeEnv::from_process())
+    }
+
+    /// Find the home directory `~` expands to, as [`shellexpand::tilde`]
+    /// finds it, but only when no home is known yet and a path that
+    /// [`Sources::resolve`] would select for `web` needs one: the
+    /// `cookie_secret_path` key file when it is the key source, or the pin
+    /// from [`ENV_UPSTREAM_CA_PATH`] or the file, starting with `~` alone
+    /// or `~/`.
+    ///
+    /// When `HOME` is unset or empty, the lookup asks the user database,
+    /// which can block on a network name service: call this where a
+    /// blocking call is acceptable. Resolution looks nothing up itself, so
+    /// [`Sources::resolve`] stays pure.
+    #[must_use]
+    pub fn find_home(self, web: &WebConfig) -> Self {
+        self.find_home_with(web, process_home)
+    }
+
+    /// [`Self::find_home`] with `lookup` in place of the process's home.
+    fn find_home_with(mut self, web: &WebConfig, lookup: impl FnOnce() -> Option<String>) -> Self {
+        if self.host.home.is_none() && self.selects_tilde_path(web) {
+            self.host.home = lookup();
+        }
+        self
+    }
+
+    /// Whether the key file or the pin resolution selects for `web` wants
+    /// the home directory. Mirrors the selection in [`resolve_key_source`]
+    /// and [`select_upstream_ca_path`].
+    fn selects_tilde_path(&self, web: &WebConfig) -> bool {
+        let key_file = match self.key {
+            Ok(None) if web.cookie_secret_env.is_none() => web.cookie_secret_path.as_deref(),
+            _ => None,
+        };
+        let pin = select_upstream_ca_path(
+            self.host.upstream_ca_path.as_deref(),
+            web.upstream_ca_path.as_deref(),
+        )
+        .ok()
+        .flatten()
+        .map(|(path, _)| path);
+        key_file.is_some_and(wants_home) || pin.as_deref().is_some_and(wants_home)
     }
 
     /// Parse each `FLEET_SESSION_*` variable in `env` on its own, through
@@ -1487,7 +1551,7 @@ pub(crate) fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls
 
 /// The pin file `ca_path` names, tilde-expanded against this process's
 /// home directory. Reads no file, but finding the home directory may block
-/// (see [`RuntimeEnv::from_process`]). [`Sources::resolve`] expands with
+/// (see [`RuntimeParts::find_home`]). [`Sources::resolve`] expands with
 /// the home directory it is given instead.
 ///
 /// # Errors
@@ -3176,7 +3240,7 @@ session_ttl_secs = 3600
             &tilde,
             None,
             RuntimeEnv {
-                home: RuntimeEnv::from_process().home,
+                home: process_home(),
                 ..RuntimeEnv::default()
             },
         );
@@ -3595,7 +3659,7 @@ session_ttl_secs = 3600
                 PathBuf::from("/c2-home/tls/cert.pem")
             )
         );
-        let startup_home = RuntimeEnv::from_process().home;
+        let startup_home = process_home();
         assert!(startup_home.is_some(), "no home directory to expand into");
         assert_eq!(
             paths(None),
@@ -3610,6 +3674,227 @@ session_ttl_secs = 3600
                 PathBuf::from(shellexpand::tilde("~/web.cookie").as_ref()),
                 PathBuf::from(shellexpand::tilde("~/tls/cert.pem").as_ref())
             )
+        );
+    }
+
+    /// The home directory is looked up only when a selected key or pin path
+    /// starts with `~`, as startup's `shellexpand::tilde` did, and at most
+    /// once. The lookup stands in for the user-database query that `HOME`
+    /// unset or empty would make.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one table row per selection")]
+    fn the_home_is_looked_up_only_for_a_selected_tilde_path() {
+        struct Case {
+            name: &'static str,
+            key_path: Option<&'static str>,
+            secret_env: Option<&'static str>,
+            ca_path: Option<&'static str>,
+            env: RuntimeEnv,
+            asks: bool,
+            key: Option<&'static str>,
+            pin: Option<&'static str>,
+        }
+        let fleet_key = SessionKey::from_bytes([0x42; KEY_LEN]).to_base64url();
+        let case = |name| Case {
+            name,
+            key_path: None,
+            secret_env: None,
+            ca_path: None,
+            env: RuntimeEnv::default(),
+            asks: false,
+            key: None,
+            pin: None,
+        };
+        let cases = [
+            case("nothing to expand"),
+            Case {
+                key_path: Some("/abs/web.cookie"),
+                ca_path: Some("/abs/cert.pem"),
+                key: Some("/abs/web.cookie"),
+                pin: Some("/abs/cert.pem"),
+                ..case("absolute paths")
+            },
+            Case {
+                key_path: Some("~other/web.cookie"),
+                ca_path: Some("~other/cert.pem"),
+                key: Some("~other/web.cookie"),
+                pin: Some("~other/cert.pem"),
+                ..case("another user's ~ is not expanded")
+            },
+            Case {
+                key_path: Some("~/web.cookie"),
+                env: RuntimeEnv {
+                    aead_key: os(fleet_key.as_str()),
+                    ..RuntimeEnv::default()
+                },
+                ..case("a Fleet key outranks the key file")
+            },
+            Case {
+                key_path: Some("~/web.cookie"),
+                env: RuntimeEnv {
+                    aead_key: os("not-base64"),
+                    ..RuntimeEnv::default()
+                },
+                ..case("an invalid Fleet key fails before the key file")
+            },
+            Case {
+                key_path: Some("~/web.cookie"),
+                secret_env: Some("TRAWL_TEST_C2_NEVER_SET"),
+                ..case("cookie_secret_env outranks the key file")
+            },
+            Case {
+                ca_path: Some("~/cert.pem"),
+                env: RuntimeEnv {
+                    upstream_ca_path: os("/abs/env-cert.pem"),
+                    ..RuntimeEnv::default()
+                },
+                pin: Some("/abs/env-cert.pem"),
+                ..case("the CA variable outranks the file's pin")
+            },
+            Case {
+                key_path: Some("~/web.cookie"),
+                env: RuntimeEnv {
+                    home: Some("/stated".into()),
+                    ..RuntimeEnv::default()
+                },
+                key: Some("/stated/web.cookie"),
+                ..case("a stated home is used as it is")
+            },
+            Case {
+                key_path: Some("~/web.cookie"),
+                asks: true,
+                key: Some("/found/web.cookie"),
+                ..case("the selected key file")
+            },
+            Case {
+                env: RuntimeEnv {
+                    upstream_ca_path: os("~/env-cert.pem"),
+                    ..RuntimeEnv::default()
+                },
+                asks: true,
+                pin: Some("/found/env-cert.pem"),
+                ..case("the CA variable's pin")
+            },
+            Case {
+                ca_path: Some("~"),
+                env: RuntimeEnv {
+                    upstream_ca_path: os(""),
+                    ..RuntimeEnv::default()
+                },
+                asks: true,
+                pin: Some("/found"),
+                ..case("the file's pin under an empty CA variable")
+            },
+            Case {
+                key_path: Some("~/web.cookie"),
+                ca_path: Some("~/cert.pem"),
+                asks: true,
+                key: Some("/found/web.cookie"),
+                pin: Some("/found/cert.pem"),
+                ..case("both paths, one lookup")
+            },
+        ];
+        for case in cases {
+            let web = WebConfig {
+                cookie_secret_path: case.key_path.map(PathBuf::from),
+                cookie_secret_env: case.secret_env.map(str::to_owned),
+                upstream_ca_path: case.ca_path.map(PathBuf::from),
+                ..configured_web()
+            };
+            let asked = std::cell::Cell::new(0_u32);
+            let parts = RuntimeParts::from_each_variable(case.env).find_home_with(&web, || {
+                asked.set(asked.get() + 1);
+                Some("/found".to_owned())
+            });
+            assert_eq!(asked.get(), u32::from(case.asks), "{}", case.name);
+            let sources = Sources::resolve(&web, None, parts);
+            let key = match &sources.cookie_key {
+                Ok(KeySource::File { path }) => Some(path.clone()),
+                _ => None,
+            };
+            let pin = match &sources.upstream {
+                Ok(UpstreamPlan {
+                    trust: TrustSource::Pinned { path, .. },
+                    ..
+                }) => Some(path.clone()),
+                _ => None,
+            };
+            assert_eq!(key, case.key.map(PathBuf::from), "{}", case.name);
+            assert_eq!(pin, case.pin.map(PathBuf::from), "{}", case.name);
+        }
+
+        // No home found: `~` stays as written, as `shellexpand::tilde` leaves it.
+        let web = WebConfig {
+            cookie_secret_path: Some("~/web.cookie".into()),
+            ..configured_web()
+        };
+        let parts =
+            RuntimeParts::from_each_variable(RuntimeEnv::default()).find_home_with(&web, || None);
+        let sources = Sources::resolve(&web, None, parts);
+        assert!(
+            matches!(&sources.cookie_key, Ok(KeySource::File { path })
+                if *path == Path::new("~/web.cookie")),
+            "{sources:?}"
+        );
+    }
+
+    /// Startup refuses an invalid `FLEET_SESSION_*` variable before it looks
+    /// for a home directory, even when a selected path starts with `~`, so
+    /// a slow user database cannot delay the refusal. The error is the whole
+    /// parse's own.
+    #[test]
+    fn startup_refuses_a_fleet_variable_before_looking_up_the_home() {
+        let web = WebConfig {
+            cookie_secret_path: Some("~/web.cookie".into()),
+            upstream_ca_path: Some("~/cert.pem".into()),
+            ..configured_web()
+        };
+        let invalid: [fn() -> RuntimeEnv; 4] = [
+            || RuntimeEnv {
+                aead_key: os("not-base64"),
+                ..RuntimeEnv::default()
+            },
+            || RuntimeEnv {
+                cookie_secure: os("maybe"),
+                ..RuntimeEnv::default()
+            },
+            || RuntimeEnv {
+                cookie_path: os("/other"),
+                ..RuntimeEnv::default()
+            },
+            || RuntimeEnv {
+                public_origins: Some(std::os::unix::ffi::OsStringExt::from_vec(vec![0xff])),
+                ..RuntimeEnv::default()
+            },
+        ];
+        for env in invalid {
+            let asked = std::cell::Cell::new(0_u32);
+            let refused = startup_parts(&web, env(), || {
+                asked.set(asked.get() + 1);
+                Some("/found".to_owned())
+            })
+            .map(|_| ())
+            .expect_err("startup refuses");
+            let whole = RuntimeParts::from_whole_parse(env())
+                .map(|_| ())
+                .expect_err("the whole parse refuses");
+            assert_eq!(refused.to_string(), whole.to_string());
+            assert_eq!(asked.get(), 0, "{refused}");
+        }
+
+        // A valid environment reaches the lookup, after the parse.
+        let asked = std::cell::Cell::new(0_u32);
+        let parts = startup_parts(&web, RuntimeEnv::default(), || {
+            asked.set(asked.get() + 1);
+            Some("/found".to_owned())
+        })
+        .expect("startup parses");
+        assert_eq!(asked.get(), 1);
+        let sources = Sources::resolve(&web, None, parts);
+        assert!(
+            matches!(&sources.cookie_key, Ok(KeySource::File { path })
+                if *path == Path::new("/found/web.cookie")),
+            "{sources:?}"
         );
     }
 
