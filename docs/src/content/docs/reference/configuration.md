@@ -250,7 +250,7 @@ A check runs only when its prerequisites completed. Otherwise the check is
 
 | Check | Asserts | Prerequisite |
 |-------|---------|--------------|
-| `proxy.config` | The file reads and parses as the whole `trawld.toml` schema, and the listen address resolves, as at startup. A file that does not parse fails this check and exits with code 1, not 2. | none |
+| `proxy.config` | The file reads and parses as the whole `trawld.toml` schema, and the listen address is a `host:port` that resolves, as at startup. A file that does not parse, or a listen address that does not resolve, fails this check and exits with code 1, not 2. | none |
 | `proxy.identity` | Names the effective user and uid of the run. | none |
 | `proxy.public_origins` | A non-empty list of valid browser origins resolves. The row says whether the list came from `[web] public_origins` or from `FLEET_SESSION_PUBLIC_ORIGINS`, and whether the variable replaced the file's list. An empty list or an invalid entry fails. | `proxy.config` |
 | `proxy.cookie_settings` | The session cookie's domain, path, `Secure` flag, and lifetime resolve. The row names the source of each. With `Secure` off, the check fails when any public origin is not loopback. Loopback hosts are `localhost`, `127.0.0.0/8`, and `[::1]`. | `proxy.config`, `proxy.public_origins` |
@@ -339,9 +339,10 @@ Run the doctor as the service user to get an answer about access.
 The doctor never binds the listen address, never generates a session key, and
 writes nothing. It logs no configuration value, touches no database, and
 reads each file once: the configuration, the cookie key file, and the CA file.
-Each read has a size limit and a time limit. Because the doctor never binds the
-listen address, an address that another process holds passes here and still
-stops `trawl-web` at startup.
+Each read has a size limit and a time limit. A host name in the listen address
+resolves through the system resolver, as at startup, within a time limit.
+Because the doctor never binds the listen address, an address that another
+process holds passes here and still stops `trawl-web` at startup.
 
 It sends one request to trawld, `GET /api/v1/health`, with no API key, no
 `Authorization` header, and no cookie. It follows no redirect, does not retry,

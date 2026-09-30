@@ -10,8 +10,9 @@
 //! before anything of startup runs. The doctor reads the `--config` file
 //! and the process environment, resolves them through
 //! [`Sources::resolve`], which has no side effect, and asks trawld's
-//! health endpoint through the production client. It never binds the
-//! listen address, never generates a session key, and writes nothing.
+//! health endpoint through the production client. It resolves the listen
+//! address as startup's listener does but never binds it, never generates
+//! a session key, and writes nothing.
 //!
 //! The checks and their prerequisites are data ([`WebCheck`]). One
 //! [`Runner`] visits them in [`WebCheck::ALL`] order: a check whose
@@ -32,14 +33,15 @@
 //! [`read`].
 
 use std::io::{self, Write};
+use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use trawl_api::doctor::{Outcome, Report, Target, Vantage, reason};
 
 use crate::config::{
-    ConfigError, CookieSettings, KeySource, Origins, PinnedRoots, RuntimeParts, Sources,
-    UpstreamPlan,
+    ConfigError, CookieSettings, KeySource, Origins, PinnedRoots, RuntimeParts, SettingSource,
+    Sources, UpstreamPlan,
 };
 
 pub mod output;
@@ -374,6 +376,11 @@ const SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
 /// in their own bounded reads ([`read`]).
 const VALIDATE_DEADLINE: Duration = read::READ_DEADLINE;
 
+/// How long resolving the listen address may take: a file read's budget.
+/// A host name resolves through the system resolver, which can be a
+/// network service.
+const LISTEN_RESOLVE_DEADLINE: Duration = read::READ_DEADLINE;
+
 /// How long the running user's name may take to look up. The password
 /// database can be a network service.
 const USER_LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
@@ -478,8 +485,11 @@ fn tilde_path(path: &Path) -> PathBuf {
 /// `proxy.config`: expand `~` in the `--config` argument, read the file
 /// through the bounded reader, parse it as the whole schema, observe the
 /// environment once, and resolve the sources as startup does. Expanding
-/// runs on the blocking pool under [`VALIDATE_DEADLINE`]. Resolving looks
-/// nothing up: the key and pin paths stay as written until their reads.
+/// runs on the blocking pool under [`VALIDATE_DEADLINE`]. Resolving the
+/// sources looks nothing up: the key and pin paths stay as written until
+/// their reads. The selected listen address then resolves as startup's
+/// listener resolves it ([`listen_addr_resolves`]), on the blocking pool
+/// under [`LISTEN_RESOLVE_DEADLINE`], and is never bound.
 ///
 /// The row owns the file's read and parse and the listen address; every
 /// other component's error stays in its slot for its own row. Returns the
@@ -528,9 +538,21 @@ async fn check_config(runner: &mut Runner, arg: &Path) -> (SelectedPath, Option<
             Some(&config.server),
             RuntimeParts::from_process_env(),
         );
-        match &sources.bind_addr {
-            Ok(listen_at) => Ok((listen_at.from, sources)),
-            Err(error) => Err(bind_addr_fault(error)),
+        let listen_at = match &sources.bind_addr {
+            Ok(listen_at) => listen_at.clone(),
+            Err(error) => return Err(bind_addr_fault(error)),
+        };
+        let resolved = blocking_within(LISTEN_RESOLVE_DEADLINE, move || {
+            listen_addr_resolves(&listen_at.addr)
+        })
+        .await
+        .map_err(|unfinished| {
+            unfinished_config(unfinished, "resolving the listen address did not finish")
+        })?;
+        if resolved {
+            Ok((listen_at.from, sources))
+        } else {
+            Err(unresolved_listen_addr(listen_at.from))
         }
     }
     .await;
@@ -591,6 +613,31 @@ fn bind_addr_fault(error: &ConfigError) -> Row {
         ),
         _ => row,
     }
+}
+
+/// Whether `addr` resolves to at least one socket address, as startup's
+/// `TcpListener::bind` resolves it before binding: a literal `ip:port` or
+/// `[ipv6]:port` parses, and a `host:port` asks the system resolver.
+/// Startup fails before serving on text that is neither, on a port out of
+/// range, and on a name with no address. Nothing is bound or connected.
+/// Blocking: call it on the blocking pool.
+fn listen_addr_resolves(addr: &str) -> bool {
+    addr.to_socket_addrs()
+        .is_ok_and(|mut found| found.next().is_some())
+}
+
+/// The `proxy.config` row for a selected listen address that does not
+/// resolve, naming where it came from. Neither the address nor the
+/// resolver's error is shown: both quote the operator's text.
+fn unresolved_listen_addr(from: SettingSource) -> Row {
+    Row::failed(
+        WebCheck::Config,
+        "the listen address is not a host:port that resolves",
+    )
+    .detail(Text::new("the listen address comes from ").setting(from))
+    .next(Text::new(
+        "set it to a host and a port from 0 to 65535, such as a loopback address and a free port",
+    ))
 }
 
 /// Why blocking work gave no answer.
@@ -1157,8 +1204,13 @@ mod tests {
 
     /// The read-only items the doctor uses from [`GUARDED_MODULES`]. The
     /// doctor reads files through `read::read` and the upstream through
-    /// reqwest, so it names none directly.
-    const ALLOWED_ITEMS: [(&str, &str); 0] = [];
+    /// reqwest, so it names none of those directly.
+    const ALLOWED_ITEMS: [(&str, &str); 1] = [
+        // Name resolution only, as startup's listener resolves the listen
+        // address before it binds: it opens no listener and connects
+        // nothing beyond what the system resolver does.
+        ("net", "ToSocketAddrs"),
+    ];
 
     /// A token of the code the guard reads: a word (identifier or keyword)
     /// or one punctuation character. A literal is the single `"` token.

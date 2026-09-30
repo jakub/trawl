@@ -157,6 +157,119 @@ fn web_doctor_never_binds() {
     }
 }
 
+/// `proxy.config` owns "the listen address resolves" (D3): startup hands
+/// the selected address to its listener, which resolves it as
+/// `ToSocketAddrs` does, so an address that does not resolve fails the
+/// check, exit 1, from the file or from `TRAWL_WEB_BIND_ADDR`, naming its
+/// source and echoing neither the value nor a resolver's message. A
+/// literal address, bracketed IPv6 and a name such as `localhost` resolve
+/// and stay complete. The doctor still binds none of them.
+#[test]
+fn web_doctor_listen_address_must_resolve() {
+    let home = tempfile::tempdir().unwrap();
+    let not_resolving = "the listen address is not a host:port that resolves";
+    let from_env = |value: &str| {
+        let mut env = home_env(home.path());
+        env.push(("TRAWL_WEB_BIND_ADDR", value.into()));
+        env
+    };
+
+    // (label, [web] bind_addr, TRAWL_WEB_BIND_ADDR, the source named)
+    let failing: [(&str, Option<&str>, Option<&str>, &str); 4] = [
+        (
+            "not an address, in the file",
+            Some("not-an-address"),
+            None,
+            "the config file",
+        ),
+        (
+            "not an address, from the environment over a valid file",
+            Some("127.0.0.1:0"),
+            Some("not-an-address"),
+            "TRAWL_WEB_BIND_ADDR",
+        ),
+        (
+            "a host without a port",
+            None,
+            Some("private-listen-host"),
+            "TRAWL_WEB_BIND_ADDR",
+        ),
+        (
+            "a port out of range",
+            Some("127.0.0.1:65536"),
+            None,
+            "the config file",
+        ),
+    ];
+    for (label, file, env_value, named) in failing {
+        let mut fixture = WebDoctorConfig::in_dir(home.path());
+        fixture.bind_addr = file.map(str::to_owned);
+        let config = write_config(home.path(), &fixture);
+        let mut planted = fixture.planted();
+        planted.extend(env_value.map(str::to_owned));
+        let env = env_value.map_or_else(|| home_env(home.path()), from_env);
+
+        let before = fs_snapshot(home.path());
+        let (code, report) = doctor(&config, &env, &planted);
+        assert_unchanged(&before, &fs_snapshot(home.path()), label);
+        assert_eq!(
+            verdict(&report, "proxy.config"),
+            (Outcome::Failed, Some(not_resolving)),
+            "{label}: {report:?}"
+        );
+        assert_eq!(code, 1, "{label}");
+        let config_row = row(&report, "proxy.config");
+        assert_eq!(
+            config_row.detail.as_deref(),
+            Some(format!("the listen address comes from {named}").as_str()),
+            "{label}"
+        );
+        assert_blocked_by_config(&report, label);
+    }
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|held| held.local_addr())
+        .expect("find a free port")
+        .port();
+    let localhost = format!("localhost:{port}");
+    let ipv6 = format!("[::1]:{port}");
+    let resolving: [(&str, Option<&str>, Option<&str>, &str); 3] = [
+        (
+            "a literal address with port 0",
+            Some("127.0.0.1:0"),
+            None,
+            "the config file",
+        ),
+        (
+            "localhost from the environment",
+            None,
+            Some(&localhost),
+            "TRAWL_WEB_BIND_ADDR",
+        ),
+        ("bracketed IPv6", Some(&ipv6), None, "the config file"),
+    ];
+    for (label, file, env_value, named) in resolving {
+        let mut fixture = WebDoctorConfig::in_dir(home.path());
+        fixture.bind_addr = file.map(str::to_owned);
+        let config = write_config(home.path(), &fixture);
+        let mut planted = fixture.planted();
+        planted.extend(env_value.map(str::to_owned));
+        let env = env_value.map_or_else(|| home_env(home.path()), from_env);
+
+        let (_, report) = doctor(&config, &env, &planted);
+        assert_eq!(
+            verdict(&report, "proxy.config"),
+            (Outcome::Complete, None),
+            "{label}: {report:?}"
+        );
+        assert_eq!(
+            row(&report, "proxy.config").detail.as_deref(),
+            Some(format!("parses; the listen address comes from {named}").as_str()),
+            "{label}"
+        );
+    }
+}
+
 /// Write `bytes` as `dir/trawld.toml` and return its path.
 fn write_document(dir: &Path, bytes: &[u8]) -> std::path::PathBuf {
     let path = dir.join("trawld.toml");
