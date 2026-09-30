@@ -140,7 +140,7 @@ fn missed(check: ServerCheck, missed: Missed) -> Row {
 /// What the running user may do with a directory, from `accessat` with the
 /// effective ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Access {
+pub(super) enum Access {
     /// Everything asked for.
     Granted,
     /// Reading or searching it is denied.
@@ -157,9 +157,10 @@ enum Access {
     NotAsked,
 }
 
-/// What `server.data.root` saw at the configured path.
+/// What `server.data.root` saw at the configured path, or what
+/// [`observe_created`] saw at another directory boot creates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RootSeen {
+pub(super) enum RootSeen {
     /// A directory, and what the running user may do with it.
     Directory(Access),
     /// Nothing. For an ingest node, what the running user may do with the
@@ -185,7 +186,7 @@ enum RootSeen {
 impl RootSeen {
     /// Whether what was seen is one boot uses or creates, as far as the
     /// doctor asked: access not asked about holds.
-    const fn holds(self) -> bool {
+    pub(super) const fn holds(self) -> bool {
         matches!(
             self,
             Self::Directory(Access::Granted | Access::NotAsked)
@@ -374,6 +375,14 @@ fn observe_root(data_root: &Path, ingest: bool, ask_access: bool) -> RootSeen {
         Err(RootFault::Inspect { error, .. }) => inspect_seen(error.kind(), is_symlink(data_root)),
         Err(_) => RootSeen::Unreadable,
     }
+}
+
+/// Look at `dir`, a directory boot writes and creates when it is absent,
+/// as [`observe_root`] looks at an ingest node's root: what the running
+/// user may do with it, or, when it is absent, with the nearest directory
+/// above it that exists, reached by the same walk.
+pub(super) fn observe_created(dir: &Path) -> RootSeen {
+    observe_root(dir, true, true)
 }
 
 /// What a failed inspection of the data root says. `linked` says the path

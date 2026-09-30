@@ -48,8 +48,10 @@ use trawl_api::{ErrorCode, ErrorResponse, HealthResponse, HealthStatus};
 
 use super::fsread::{self, Links, ReadFault};
 use super::output::{HealthKey, Row, SelectedPath, Selection, Text};
+use super::storage::{self, Access, RootSeen};
 use super::{Ctx, Der, Runner, ServerCheck};
 use crate::tls::{self, GeneratedPair, OwnerRule, Regenerate, TlsError, TlsSource, UnsafeReason};
+use trawl_config::{GENERATED_KEY_DIR, GENERATED_TLS_DIR};
 
 /// This group's checks, in [`ServerCheck::ALL`] order; the graph test in
 /// [`super`] reads this list.
@@ -381,9 +383,98 @@ async fn check_material(
         row = changed_row(check, source);
     } else if let Some(leaf) = leaf {
         ctx.tls.leaf = Some(Der(leaf));
+    } else if let (Material::WillGenerate(_), MaterialSource::Generated { state_dir, .. }) =
+        (&observed.material, source)
+        // A root run's access proves nothing about the service user's, and
+        // its owner facet already says so.
+        && !ctx.run_as.root
+        && let Some(refused) = generation_row(state_dir.clone()).await
+    {
+        row = refused.source(source.text());
     }
     runner.record(gate, row);
     Some(observed)
+}
+
+/// When a start would generate a pair: the row that says it cannot create
+/// or write what it generates into, or `None` when it can. The start
+/// creates `tls/` and `tls-key/` under `state_dir`, creating `state_dir`
+/// first when it is absent, and writes into both. Each directory that
+/// exists is one the inspection opened as a directory this uid owns, and
+/// the start re-modes it before it writes, so only a read-only filesystem
+/// stops it there. Each absent one needs W and X on the nearest directory
+/// above it that exists, reached as `server.data.root` reaches the data
+/// root's.
+async fn generation_row(state_dir: PathBuf) -> Option<Row> {
+    let check = ServerCheck::TlsMaterial;
+    let dirs = [GENERATED_TLS_DIR, GENERATED_KEY_DIR].map(|name| state_dir.join(name));
+    let observe =
+        tokio::task::spawn_blocking(move || dirs.map(|dir| storage::observe_created(&dir)));
+    match tokio::time::timeout(fsread::READ_DEADLINE, observe).await {
+        Err(_) => Some(Row::not_sampled(check, reason::TIMED_OUT)),
+        Ok(Err(_)) => Some(Row::not_sampled(check, reason::UNREADABLE)),
+        Ok(Ok(seen)) => seen.into_iter().find_map(generation_fault),
+    }
+}
+
+/// The `server.tls.material` row for what was seen at one generated TLS
+/// directory a start creates or writes, or `None` when the start can.
+fn generation_fault(seen: RootSeen) -> Option<Row> {
+    let check = ServerCheck::TlsMaterial;
+    let access = || {
+        Text::new(
+            "give the service user write access to trawld's state directory, the parent of \
+             [data] path, or run as it",
+        )
+    };
+    let point = || Text::new("point [data] path below a directory trawld can create");
+    let row = match seen {
+        // The start re-modes a directory it owns before it writes there.
+        RootSeen::Directory(Access::Granted | Access::NoWrite) => return None,
+        seen if seen.holds() => return None,
+        RootSeen::Absent(Some(Access::NoRead | Access::NoWrite)) => Row::failed(
+            check,
+            "the running user cannot create a generated TLS directory in the directory above it",
+        )
+        .next(access()),
+        RootSeen::Directory(Access::ReadOnlyFs) | RootSeen::Absent(Some(Access::ReadOnlyFs)) => {
+            Row::failed(
+                check,
+                "trawld's generated TLS directories are on a read-only filesystem",
+            )
+            .next(Text::new(
+                "mount trawld's state directory read-write, or set [server] tls_cert_path and \
+                 tls_key_path",
+            ))
+        }
+        RootSeen::NotADirectory => Row::failed(check, refusal_reason(UnsafeReason::NotDirectory)),
+        RootSeen::Dangling => Row::failed(check, refusal_reason(UnsafeReason::Symlink)),
+        RootSeen::AncestorNotADirectory => Row::failed(
+            check,
+            "a parent of trawld's generated TLS directories is not a directory",
+        )
+        .next(point()),
+        RootSeen::AncestorDangling => Row::failed(
+            check,
+            "a parent of trawld's generated TLS directories is a symlink to nothing",
+        )
+        .next(point()),
+        RootSeen::Denied => Row::failed(
+            check,
+            "the running user cannot reach trawld's generated TLS directories",
+        )
+        .next(Text::new(
+            "give the service user search access to every directory above trawld's state \
+             directory",
+        )),
+        RootSeen::Vanished => Row::not_sampled(check, reason::MATERIAL_CHANGED).next(Text::new(
+            "rerun once trawld's state directory stops changing",
+        )),
+        RootSeen::Directory(_) | RootSeen::Absent(_) | RootSeen::Unreadable => {
+            Row::not_sampled(check, reason::UNREADABLE)
+        }
+    };
+    Some(row)
 }
 
 /// The row for what one read found, and the leaf when the pair is one boot
@@ -1455,6 +1546,7 @@ fn key_row(name: &str, key: &HealthKey, value: &str) -> Row {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Mutex;
 
     use rustls::pki_types::PrivateKeyDer;
@@ -2028,5 +2120,131 @@ mod tests {
         let shown = format!("{observed:?}");
         assert!(!shown.contains("private"), "{shown}");
         assert!(shown.contains("12 bytes"), "{shown}");
+    }
+
+    /// Whether the running user writes a directory its mode forbids, as
+    /// root or a holder of `CAP_DAC_OVERRIDE` does.
+    #[cfg(unix)]
+    fn writes_mode_0500(tmp: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        let probe = tmp.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let privileged = std::fs::create_dir(probe.join("x")).is_ok();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        privileged
+    }
+
+    /// One state of [`a_start_that_cannot_create_its_pair_fails`]: its
+    /// name, the state directory, what to plant there, the directory to
+    /// seal, and the reason an unprivileged run fails.
+    type StateCase = (
+        &'static str,
+        &'static str,
+        fn(&Path),
+        &'static str,
+        Option<&'static str>,
+    );
+
+    /// When a start would generate a pair, `server.tls.material` fails
+    /// what stops the start from creating or writing `tls/` and `tls-key/`,
+    /// and each state is checked against boot's own start. A directory the
+    /// start owns is re-moded before it writes, so its mode bits stop
+    /// nothing; an absent one needs the directory above it writable. A
+    /// privileged user may do everything its modes forbid; the test asserts
+    /// whichever the running user is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_start_that_cannot_create_its_pair_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let privileged = writes_mode_0500(tmp.path());
+        let create = Some(
+            "the running user cannot create a generated TLS directory in the directory above it",
+        );
+        let set_mode = |path: &Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let cases: [StateCase; 5] = [
+            ("a writable state directory", "state", |_| {}, "", None),
+            (
+                "an unwritable state directory",
+                "state",
+                |state| std::fs::create_dir(state).unwrap(),
+                "state",
+                create,
+            ),
+            (
+                "a state directory absent below an unwritable parent",
+                "sealed/state",
+                |state| std::fs::create_dir(state.parent().unwrap()).unwrap(),
+                "sealed",
+                create,
+            ),
+            (
+                "unwritable generated directories in an unwritable state directory",
+                "state",
+                |state| {
+                    for name in [GENERATED_TLS_DIR, GENERATED_KEY_DIR] {
+                        std::fs::create_dir_all(state.join(name)).unwrap();
+                        std::fs::set_permissions(
+                            state.join(name),
+                            std::fs::Permissions::from_mode(0o500),
+                        )
+                        .unwrap();
+                    }
+                },
+                "state",
+                None,
+            ),
+            (
+                "a missing key directory in an unwritable state directory",
+                "state",
+                |state| std::fs::create_dir_all(state.join(GENERATED_TLS_DIR)).unwrap(),
+                "state",
+                create,
+            ),
+        ];
+        for (name, state, plant, sealed, denied) in cases {
+            let case = tempfile::tempdir().unwrap();
+            let state = case.path().join(state);
+            plant(&state);
+            let sealed = case.path().join(sealed);
+            if sealed != case.path() {
+                set_mode(&sealed, 0o500);
+            }
+            let row = generation_row(state.clone()).await;
+            let boot = tls::build_server_config(None, None, &state).is_ok();
+            if sealed != case.path() {
+                set_mode(&sealed, 0o700);
+            }
+            let expected = denied.filter(|_| !privileged);
+            assert_eq!(
+                row.as_ref().map(|row| (row.outcome(), row.reason())),
+                expected.map(|why| (Outcome::Failed, Some(why))),
+                "{name}"
+            );
+            assert_eq!(boot, expected.is_none(), "{name}: boot disagrees");
+        }
+
+        // What refuses the start whoever runs it.
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &dangling).unwrap();
+        for (state, why) in [
+            (
+                file.clone(),
+                "a parent of trawld's generated TLS directories is not a directory",
+            ),
+            (
+                dangling.clone(),
+                "a parent of trawld's generated TLS directories is a symlink to nothing",
+            ),
+        ] {
+            let row = generation_row(state.clone()).await.expect("a refusal");
+            assert_eq!((row.outcome(), row.reason()), (Outcome::Failed, Some(why)));
+            assert!(tls::build_server_config(None, None, &state).is_err());
+        }
     }
 }

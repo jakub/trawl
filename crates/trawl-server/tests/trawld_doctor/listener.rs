@@ -1235,3 +1235,51 @@ async fn doctor_fails_a_directory_at_the_old_key_path() {
     );
     assert!(old.is_file(), "the doctor removed nothing");
 }
+
+/// With auto TLS and no generated pair yet, a state directory the running
+/// user cannot write fails `server.tls.material`: the start that generates
+/// the pair cannot create `tls/` or `tls-key/` in it. A user who writes a
+/// directory its mode forbids sees `will_initialize`. Nothing is created.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_fails_a_pair_the_start_cannot_create() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    let config = DoctorConfig {
+        data_path: state.join("data"),
+        ingest: false,
+        ..DoctorConfig::in_dir(dir.path())
+    };
+    let path = write_doctor_config(dir.path(), &config);
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let privileged = std::fs::create_dir(state.join("probe")).is_ok();
+    let report = doctor(&path, planted_env(dir.path()), &[]).await;
+    if privileged {
+        std::fs::remove_dir(state.join("probe")).unwrap();
+    }
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if privileged {
+        assert_eq!(
+            outcome(&report, MATERIAL),
+            (Outcome::Complete, Some("will_initialize"))
+        );
+    } else {
+        assert_eq!(
+            outcome(&report, MATERIAL),
+            (
+                Outcome::Failed,
+                Some(
+                    "the running user cannot create a generated TLS directory in the directory \
+                     above it"
+                )
+            ),
+            "{report:#?}"
+        );
+        assert_eq!(row(&report, IDENTITY).blocked_by.as_deref(), Some(MATERIAL));
+    }
+    for generated in ["tls", "tls-key"] {
+        assert!(!state.join(generated).exists(), "{generated} was created");
+    }
+}
