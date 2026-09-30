@@ -610,7 +610,9 @@ async fn doctor_identity_over_an_unwalked_archive() {
 /// outside its data root is one boot creates or writes at its start, so
 /// `server.data.root` fails when the running user cannot write it, or
 /// cannot create it in the directory above it, and never names it. A user
-/// who may write a directory its mode forbids sees each state complete.
+/// who may write a directory its mode forbids without being root sees each
+/// state complete. A run as euid 0 asks nothing about access, so each state
+/// is `not_sampled`/`ran_as_root`.
 #[cfg(unix)]
 #[tokio::test]
 async fn doctor_wal_outside_the_data_root() {
@@ -642,12 +644,21 @@ async fn doctor_wal_outside_the_data_root() {
         if let Some(sealed) = &sealed {
             std::fs::set_permissions(sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
+        let root = nix::unistd::geteuid().is_root();
         let privileged = reads_mode_000(dir.path());
         let run = doctor(dir.path(), &config, &dbs).await;
         if let Some(sealed) = &sealed {
             std::fs::set_permissions(sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         match denied {
+            _ if root => {
+                assert_eq!(
+                    run.outcome(CHECK),
+                    (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
+                    "{name}"
+                );
+                assert_ne!(run.code, 1, "{name}: {:?}", run.report.checks());
+            }
             Some(why) if !privileged => {
                 assert_eq!(run.outcome(CHECK), (Outcome::Failed, Some(why)), "{name}");
                 assert_eq!(run.code, 1, "{name}");
