@@ -51,11 +51,12 @@ pub mod cap {
 /// Why a file was not read. No variant carries text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadFault {
-    /// Nothing exists at the path, or a component of it is not a directory.
+    /// Nothing exists at the path.
     Missing,
     /// The running user may not open it.
     PermissionDenied,
-    /// It is not a regular file: a directory, FIFO, socket or device.
+    /// It is not a regular file: a directory, FIFO, socket or device, or a
+    /// path through a regular file, as `ca.pem/` or `ca.pem/x` is.
     NotRegular,
     /// It is larger than the cap.
     TooLarge,
@@ -72,13 +73,17 @@ impl ReadFault {
     /// [`read_capped_secret`] stands for.
     fn of(error: &std::io::Error) -> Self {
         #[cfg(unix)]
-        if error.raw_os_error() == Some(libc::ELOOP) {
-            return Self::SymlinkLoop;
+        match error.raw_os_error() {
+            Some(libc::ELOOP) => return Self::SymlinkLoop,
+            // A Unix socket, which an `O_NONBLOCK` open refuses with this
+            // code rather than a kind.
+            Some(libc::ENXIO) => return Self::NotRegular,
+            _ => {}
         }
         match error.kind() {
-            ErrorKind::NotFound | ErrorKind::NotADirectory => Self::Missing,
+            ErrorKind::NotFound => Self::Missing,
+            ErrorKind::NotADirectory | ErrorKind::InvalidInput => Self::NotRegular,
             ErrorKind::PermissionDenied => Self::PermissionDenied,
-            ErrorKind::InvalidInput => Self::NotRegular,
             ErrorKind::FileTooLarge => Self::TooLarge,
             _ => Self::Io,
         }
@@ -194,8 +199,14 @@ mod tests {
         assert_eq!(read(path("absent"), 10).await, Err(ReadFault::Missing));
         assert_eq!(
             read(path("ok").join("below"), 10).await,
-            Err(ReadFault::Missing)
+            Err(ReadFault::NotRegular)
         );
+        assert_eq!(
+            read(dir.path().join("ok/"), 10).await,
+            Err(ReadFault::NotRegular)
+        );
+        let _socket = std::os::unix::net::UnixListener::bind(path("sock")).unwrap();
+        assert_eq!(read(path("sock"), 10).await, Err(ReadFault::NotRegular));
         assert_eq!(
             read(dir.path().to_owned(), 10).await,
             Err(ReadFault::NotRegular)
