@@ -741,19 +741,24 @@ pub fn healthy_answer() -> wiremock::ResponseTemplate {
     }))
 }
 
+/// Answer `GET /api/v1/health` on `mock` with `answer`.
+pub async fn serve_health(mock: &wiremock::MockServer, answer: wiremock::ResponseTemplate) {
+    use wiremock::matchers::{method, path};
+
+    wiremock::Mock::given(method("GET"))
+        .and(path("/api/v1/health"))
+        .respond_with(answer)
+        .mount(mock)
+        .await;
+}
+
 /// A real rustls upstream serving [`healthy_answer`], under a fresh CA
 /// whose subject is [`PLANTED_CA_SUBJECT`]. Point `upstream_url` at its
 /// `url()` and pin its `ca_path()`, and both upstream checks pass.
 pub async fn healthy_upstream() -> crate::test_support::TlsUpstream {
-    use wiremock::matchers::{method, path};
-
     let ca = crate::test_support::TestCa::named(PLANTED_CA_SUBJECT);
     let upstream = crate::test_support::TlsUpstream::issued_by(&ca).await;
-    wiremock::Mock::given(method("GET"))
-        .and(path("/api/v1/health"))
-        .respond_with(healthy_answer())
-        .mount(upstream.mock())
-        .await;
+    serve_health(upstream.mock(), healthy_answer()).await;
     upstream
 }
 

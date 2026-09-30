@@ -21,12 +21,11 @@ use std::sync::Arc;
 
 use trawl_api::doctor::health::HEALTH_CHECK_NAMES;
 use trawl_api::doctor::{Outcome, Report, reason};
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{MockServer, ResponseTemplate};
 
 use crate::support::{
-    Observed, SECRET, WebDoctorConfig, home_env, report, row, run_web_doctor, verdict,
-    write_config, write_key,
+    Observed, PLANTED_CA_SUBJECT, SECRET, WebDoctorConfig, healthy_answer, healthy_upstream,
+    home_env, report, row, run_web_doctor, serve_health, verdict, write_config, write_key,
 };
 use crate::test_support::{LOOPBACK_SANS, TestCa, TlsFront, TlsUpstream};
 
@@ -44,27 +43,6 @@ const UPSTREAM_NAME: &str = "upstream.private-secret.test";
 const OTHER_NAME: &str = "elsewhere.private-secret.test";
 
 const HEALTH_PATH: &str = "/api/v1/health";
-
-/// trawld's healthy answer: every check it reports, `ok`, and a version.
-fn healthy() -> ResponseTemplate {
-    let checks: serde_json::Map<String, serde_json::Value> = HEALTH_CHECK_NAMES
-        .iter()
-        .map(|name| ((*name).to_owned(), "ok".into()))
-        .collect();
-    ResponseTemplate::new(200).set_body_json(serde_json::json!({
-        "status": "ok",
-        "version": "1.0.0",
-        "checks": checks,
-    }))
-}
-
-async fn serve_health(mock: &MockServer, answer: ResponseTemplate) {
-    Mock::given(method("GET"))
-        .and(path(HEALTH_PATH))
-        .respond_with(answer)
-        .mount(mock)
-        .await;
-}
 
 /// A test's home directory and its configuration, with the planted values
 /// every run checks the output for.
@@ -87,7 +65,7 @@ impl Setup {
             home,
             config,
             env: Vec::new(),
-            planted: [CA_SUBJECT, LEAF_SUBJECT]
+            planted: [CA_SUBJECT, PLANTED_CA_SUBJECT, LEAF_SUBJECT]
                 .into_iter()
                 .chain(LOOPBACK_SANS)
                 .map(str::to_owned)
@@ -223,10 +201,8 @@ fn assert_health_failed(code: i32, report: &Report, why: &str) {
 /// passes, in both forms, and each run is one connection and one request.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_pinned_upstream_passes() {
-    let ca = TestCa::named(CA_SUBJECT);
-    let upstream = TlsUpstream::issued_by(&ca).await;
-    serve_health(upstream.mock(), healthy()).await;
-    let mut setup = Setup::pinned(upstream.url(), &ca);
+    let upstream = healthy_upstream().await;
+    let mut setup = Setup::pinned(upstream.url(), upstream.front().ca());
     let key = setup.home.path().join("secrets/cookie.key");
     setup.config.cookie_secret_path = Some(write_key(&key, 32));
 
@@ -237,7 +213,7 @@ async fn web_doctor_pinned_upstream_passes() {
         (Outcome::Complete, None)
     );
     let trust = row(&report, "proxy.upstream.trust");
-    let ca_path = ca.path().to_string_lossy();
+    let ca_path = upstream.ca_path().to_string_lossy();
     assert!(
         trust
             .detail
@@ -264,7 +240,7 @@ async fn web_doctor_pinned_upstream_passes() {
 async fn web_doctor_connect_addr_passes() {
     let ca = TestCa::named(CA_SUBJECT);
     let mock = MockServer::start().await;
-    serve_health(&mock, healthy()).await;
+    serve_health(&mock, healthy_answer()).await;
     let front = TlsFront::issued_by(&ca, *mock.address(), &[UPSTREAM_NAME]).await;
     let mut setup = Setup::pinned(format!("https://{UPSTREAM_NAME}:{}", front.port()), &ca);
     setup.config.upstream_connect_addr = Some(format!("127.0.0.1:{}", front.port()));
@@ -294,7 +270,7 @@ async fn web_doctor_connect_addr_passes() {
 async fn web_doctor_wrong_name_fails_once() {
     let ca = TestCa::named(CA_SUBJECT);
     let mock = MockServer::start().await;
-    serve_health(&mock, healthy()).await;
+    serve_health(&mock, healthy_answer()).await;
     let front = TlsFront::issued_by(&ca, *mock.address(), &[OTHER_NAME]).await;
     let mut setup = Setup::pinned(front.url(), &ca);
     setup.plant(OTHER_NAME);
@@ -321,10 +297,8 @@ const ENV_KEY: &str = "ZG9jdG9yLXByb2JlLWFub255bW91cy1rZXktMzJieXQ=";
 /// a trailing slash. It sends exactly `GET /api/v1/health`, once.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_probe_is_anonymous() {
-    let ca = TestCa::named(CA_SUBJECT);
-    let upstream = TlsUpstream::issued_by(&ca).await;
-    serve_health(upstream.mock(), healthy()).await;
-    let mut setup = Setup::pinned(format!("{}/", upstream.url()), &ca);
+    let upstream = healthy_upstream().await;
+    let mut setup = Setup::pinned(format!("{}/", upstream.url()), upstream.front().ca());
     let key = setup.home.path().join("secrets/cookie.key");
     setup.config.cookie_secret_path = Some(write_key(&key, 32));
     setup
@@ -345,14 +319,12 @@ async fn web_doctor_probe_is_anonymous() {
 /// names sees no connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_userinfo_refused() {
-    let ca = TestCa::named(CA_SUBJECT);
-    let upstream = TlsUpstream::issued_by(&ca).await;
-    serve_health(upstream.mock(), healthy()).await;
+    let upstream = healthy_upstream().await;
     let url = format!(
         "https://doctor:{SECRET}@127.0.0.1:{}",
         upstream.front().port()
     );
-    let setup = Setup::pinned(url, &ca);
+    let setup = Setup::pinned(url, upstream.front().ca());
 
     let (code, report) = setup.run().await;
     assert_eq!(code, 1, "{report:?}");
@@ -389,7 +361,7 @@ async fn web_doctor_redirect_refused() {
             .insert_header("location", format!("{}{HEALTH_PATH}", elsewhere.url())),
     )
     .await;
-    serve_health(elsewhere.mock(), healthy()).await;
+    serve_health(elsewhere.mock(), healthy_answer()).await;
     let mut setup = Setup::pinned(upstream.url(), &ca);
     setup.plant(elsewhere.url());
 
