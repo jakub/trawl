@@ -71,7 +71,7 @@ A check runs only when its prerequisite completed. Otherwise the check is
 | `server.app.connect` | A connection to the app-state database authenticates. | `server.config` |
 | `server.app.schema` | trawld's boot admits the app-state migration ledger. | `server.app.connect` |
 | `server.app.writer` | Reports whether a session holds trawld's writer lock. A held lock does not prove that trawld runs on this host. | `server.app.connect` |
-| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node, the same holds for the WAL directory, even when `[ingest] wal_dir` names a path inside the data root: the running user can read and write it, or create it in the nearest directory above it that exists. | `server.config` |
+| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node, the same holds for the WAL directory, even when `[ingest] wal_dir` names a path inside the data root: the running user can read and write it, or create it in the nearest directory above it that exists. The access check covers the directories trawld writes and the directory where it creates them. It does not cover every parent directory that boot opens to sync. | `server.config` |
 | `server.data.epoch` | The data root's `EPOCH` is current, or boot initializes it. | `server.data.root` |
 | `server.data.identity` | The data root belongs to the catalog in the app-state database. | `server.data.epoch`, `server.app.schema` |
 | `server.data.conformance` | Conformance is recorded for this catalog and data root, or boot runs the pass. A query-only node reports `not_configured`. | `server.data.identity` |
