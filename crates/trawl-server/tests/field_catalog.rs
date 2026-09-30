@@ -1012,6 +1012,7 @@ mod boot {
     /// `data/CATALOG`. A FIFO there would block that open until a writer
     /// appears, so an eager read hangs boot; the pass instead replaces the
     /// FIFO with the real marker through its staged rename.
+    #[cfg(unix)]
     #[sqlx::test]
     async fn unconformed_boot_never_opens_the_catalog_marker(pool: sqlx::PgPool) {
         use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
