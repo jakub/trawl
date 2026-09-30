@@ -726,6 +726,9 @@ pub fn write_ca(path: &Path) -> PathBuf {
     path.to_owned()
 }
 
+/// The path of trawld's health endpoint, the one request the doctor sends.
+pub const HEALTH_PATH: &str = "/api/v1/health";
+
 /// trawld's healthy answer to `GET /api/v1/health`: `status: ok`, every
 /// check trawld reports `ok`, and a version.
 pub fn healthy_answer() -> wiremock::ResponseTemplate {
@@ -739,6 +742,36 @@ pub fn healthy_answer() -> wiremock::ResponseTemplate {
         "version": "1.0.0",
         "checks": checks,
     }))
+}
+
+/// Every request `mock` saw is the anonymous probe: exactly
+/// `GET /api/v1/health`, no query, and no `Authorization`, `Cookie` or
+/// `Proxy-Authorization` header in any spelling. There are `expected` of
+/// them.
+pub async fn assert_anonymous_probes(mock: &wiremock::MockServer, expected: usize) {
+    let requests = mock.received_requests().await.expect("recording on");
+    assert_eq!(
+        requests.len(),
+        expected,
+        "{:?}",
+        requests
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect::<Vec<_>>()
+    );
+    for request in &requests {
+        assert_eq!(request.method.as_str(), "GET");
+        assert_eq!(request.url.path(), HEALTH_PATH);
+        assert_eq!(request.url.query(), None);
+        for (name, _) in &request.headers {
+            for credential in ["authorization", "cookie", "proxy-authorization"] {
+                assert!(
+                    !name.as_str().eq_ignore_ascii_case(credential),
+                    "the probe sent {name}"
+                );
+            }
+        }
+    }
 }
 
 /// Answer `GET /api/v1/health` on `mock` with `answer`.

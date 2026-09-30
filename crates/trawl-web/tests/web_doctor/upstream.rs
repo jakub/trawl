@@ -24,9 +24,9 @@ use trawl_api::doctor::{Outcome, Report, reason};
 use wiremock::{MockServer, ResponseTemplate};
 
 use crate::support::{
-    Observed, PLANTED_CA_SUBJECT, SECRET, WebDoctorConfig, doctor, healthy_answer,
-    healthy_upstream, home_env, report, row, run_web_doctor, serve_health, verdict, write_config,
-    write_key,
+    HEALTH_PATH, Observed, PLANTED_CA_SUBJECT, SECRET, WebDoctorConfig, assert_anonymous_probes,
+    doctor, healthy_answer, healthy_upstream, home_env, report, row, run_web_doctor, serve_health,
+    verdict, write_config, write_key,
 };
 use crate::test_support::{LOOPBACK_SANS, TestCa, TlsFront, TlsUpstream};
 
@@ -42,8 +42,6 @@ const UPSTREAM_NAME: &str = "upstream.private-secret.test";
 
 /// A DNS name no test's URL uses.
 const OTHER_NAME: &str = "elsewhere.private-secret.test";
-
-const HEALTH_PATH: &str = "/api/v1/health";
 
 /// A test's home directory and its configuration, with the planted values
 /// every run checks the output for.
@@ -118,36 +116,6 @@ fn args(config: &Path, format: &str) -> [OsString; 5] {
         "--format".into(),
         format.into(),
     ]
-}
-
-/// Every request `mock` saw is the anonymous probe: exactly
-/// `GET /api/v1/health`, no query, and no `Authorization`, `Cookie` or
-/// `Proxy-Authorization` header in any spelling. There are `expected` of
-/// them.
-async fn assert_anonymous_probes(mock: &MockServer, expected: usize) {
-    let requests = mock.received_requests().await.expect("recording on");
-    assert_eq!(
-        requests.len(),
-        expected,
-        "{:?}",
-        requests
-            .iter()
-            .map(|r| format!("{} {}", r.method, r.url.path()))
-            .collect::<Vec<_>>()
-    );
-    for request in &requests {
-        assert_eq!(request.method.as_str(), "GET");
-        assert_eq!(request.url.path(), HEALTH_PATH);
-        assert_eq!(request.url.query(), None);
-        for (name, _) in &request.headers {
-            for credential in ["authorization", "cookie", "proxy-authorization"] {
-                assert!(
-                    !name.as_str().eq_ignore_ascii_case(credential),
-                    "the probe sent {name}"
-                );
-            }
-        }
-    }
 }
 
 /// Every row passed or was not configured; trust and health completed, and

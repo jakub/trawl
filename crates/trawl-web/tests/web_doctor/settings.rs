@@ -20,9 +20,9 @@ use std::path::{Path, PathBuf};
 use trawl_api::doctor::{Outcome, Report};
 
 use crate::support::{
-    PLANTED_CA_SUBJECT, PLANTED_KEY, PLANTED_ORIGIN, Userns, WebDoctorConfig, assert_unchanged,
-    doctor, doctor_args, fs_snapshot, healthy_upstream, home_env, report, row,
-    run_web_doctor_in_userns, verdict, write_config, write_key,
+    PLANTED_CA_SUBJECT, PLANTED_KEY, PLANTED_ORIGIN, Userns, WebDoctorConfig,
+    assert_anonymous_probes, assert_unchanged, doctor, doctor_args, fs_snapshot, healthy_upstream,
+    home_env, report, row, run_web_doctor_in_userns, verdict, write_config, write_key,
 };
 
 /// A doctor run's environment.
@@ -581,6 +581,7 @@ async fn web_doctor_root_run_is_incomplete() {
     for case in &cases {
         root_run(&userns, &upstream.url(), upstream.ca_path(), case);
     }
+    assert_anonymous_probes(upstream.mock(), cases.len()).await;
 }
 
 /// One case of [`web_doctor_root_run_is_incomplete`], as root in `userns`,
