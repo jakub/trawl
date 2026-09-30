@@ -15,7 +15,11 @@
 //!
 //! Each accepted connection maps to one upstream connection, so wiremock
 //! sees every request the proxy sends, and its request log and
-//! expectation counts hold as they would without the relay.
+//! expectation counts hold as they would without the relay. wiremock's
+//! log keeps each request's method, path and headers, in a header map
+//! whose names match without regard to case. The front itself counts the
+//! connections it accepted and the handshakes that failed, which a request
+//! log cannot show: a refused certificate never becomes a request.
 //!
 //! Keep the fixture alive for the whole test. Dropping it stops the relay
 //! and deletes the CA file, and the proxy may read that file after
@@ -31,6 +35,8 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -59,10 +65,16 @@ impl TestCa {
     /// A fresh CA. Shared through `Arc`, so fronts it issues for keep its
     /// file alive.
     pub fn generate() -> Arc<Self> {
+        Self::named("trawl-web test CA")
+    }
+
+    /// A fresh CA whose subject's common name is `common_name`, so a test
+    /// can plant a value in it that no output may show.
+    pub fn named(common_name: &str) -> Arc<Self> {
         let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
         params
             .distinguished_name
-            .push(DnType::CommonName, "trawl-web test CA");
+            .push(DnType::CommonName, common_name);
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         let issuer = CertifiedIssuer::self_signed(params, KeyPair::generate().expect("CA key"))
@@ -122,11 +134,34 @@ impl std::fmt::Debug for TestCa {
 ///
 /// A connection whose handshake fails is dropped and never reaches the
 /// target, so a test that expects a refused certificate sees no request
-/// there.
+/// there. The front counts both: [`TlsFront::connections`] and
+/// [`TlsFront::handshake_failures`].
 pub struct TlsFront {
     addr: SocketAddr,
     ca: Arc<TestCa>,
+    counts: Arc<FrontCounts>,
     accept: JoinHandle<()>,
+}
+
+/// What a [`TlsFront`] has seen.
+#[derive(Debug, Default)]
+struct FrontCounts {
+    /// Connections accepted.
+    connections: AtomicUsize,
+    /// Accepted connections whose TLS handshake did not complete.
+    handshake_failures: AtomicUsize,
+    /// Accepted connections whose handshake or relay is still running.
+    open: AtomicUsize,
+}
+
+/// Marks one accepted connection finished when its task ends, however it
+/// ends.
+struct OpenConnection(Arc<FrontCounts>);
+
+impl Drop for OpenConnection {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl TlsFront {
@@ -150,15 +185,22 @@ impl TlsFront {
             .await
             .expect("bind the TLS front");
         let addr = listener.local_addr().expect("TLS front address");
+        let counts = Arc::new(FrontCounts::default());
+        let seen = Arc::clone(&counts);
         let accept = tokio::spawn(async move {
             // The relays belong to this task, so aborting it on drop ends
             // every open connection too.
             let mut relays = JoinSet::new();
             while let Ok((client, _)) = listener.accept().await {
                 while relays.try_join_next().is_some() {}
+                seen.connections.fetch_add(1, Ordering::SeqCst);
+                seen.open.fetch_add(1, Ordering::SeqCst);
+                let open = OpenConnection(Arc::clone(&seen));
                 let acceptor = acceptor.clone();
+                // `open` moves into the task and is dropped when it ends.
                 relays.spawn(async move {
                     let Ok(mut tls) = acceptor.accept(client).await else {
+                        open.0.handshake_failures.fetch_add(1, Ordering::SeqCst);
                         return;
                     };
                     let Ok(mut plain) = TcpStream::connect(target).await else {
@@ -171,7 +213,37 @@ impl TlsFront {
         Self {
             addr,
             ca: Arc::clone(ca),
+            counts,
             accept,
+        }
+    }
+
+    /// How many connections the front has accepted.
+    pub fn connections(&self) -> usize {
+        self.counts.connections.load(Ordering::SeqCst)
+    }
+
+    /// How many accepted connections ended before their TLS handshake
+    /// completed, such as a client refusing the front's certificate.
+    pub fn handshake_failures(&self) -> usize {
+        self.counts.handshake_failures.load(Ordering::SeqCst)
+    }
+
+    /// Wait until every connection the front accepted has finished, its
+    /// handshake failed or its relay ended, so the counts no longer move
+    /// for connections already made. Call it after the client is gone.
+    ///
+    /// # Panics
+    /// When a connection is still open after 10 s.
+    pub async fn settle(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.counts.open.load(Ordering::SeqCst) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "a connection to the TLS front is still open: {:?}",
+                self.counts
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
@@ -218,6 +290,7 @@ impl std::fmt::Debug for TlsFront {
         f.debug_struct("TlsFront")
             .field("addr", &self.addr)
             .field("ca", &self.ca)
+            .field("counts", &self.counts)
             .finish_non_exhaustive()
     }
 }
