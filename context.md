@@ -54,6 +54,10 @@ _Avoid_: mode, pipeline config
 The single step every event passes through at ingest, regardless of producer. It captures `_raw`, enforces the namespace rules, and fills the envelope.
 _Avoid_: normalization, sanitization, the door
 
+**Ingest preview**:
+Canonicalization of a bounded sample as one producer would do it, for a collector address the caller names, with nothing stored, counted, or logged. It shows what each event would become. It promises nothing about admission, durability, or the deployment.
+_Avoid_: dry run (repin's records job state), test ingest, simulation, preview (alone; that is a read-only net run)
+
 **Visible**:
 An event is visible when a query can return it — it is in the hot buffer or in a finished parquet file. An event that is only in the WAL is safe on disk but not visible yet.
 _Avoid_: queryable, searchable, live
