@@ -564,9 +564,53 @@ ServiceMonitor creation; neither option installs a monitoring system.
    not answer yet. A row with `failed` names its next action. Do not run the
    doctor as root: a root run cannot exit 0.
 
-2. Create a human key with [Create roles and keys](/operate/access/#create-roles-and-keys).
+2. If the browser UI is enabled, run the web proxy doctor where `trawl-web`
+   runs, as its service user and with its environment. It checks the proxy's
+   configuration and session cookie key, and it sends one health request to
+   `trawld` through the proxy's own client. It changes nothing. The
+   [reference](/reference/configuration/#check-the-web-proxy-with-trawl-web---doctor)
+   lists every check.
 
-3. Save the server in a [CLI profile](/start/connect/) with that key. When
+   On Debian, run it in a transient unit with the service's user, group, and
+   environment file:
+
+   ```bash
+   sudo systemd-run --pipe --wait --collect -p User=trawl-web -p Group=trawl -p EnvironmentFile=-/etc/default/trawl-web trawl-web --doctor --config /etc/trawl/trawld.toml
+   ```
+
+   This does not reproduce the unit's sandbox: `ProtectSystem`,
+   `ProtectHome`, `PrivateTmp`, `InaccessiblePaths`, and
+   `RestrictAddressFamilies`. A path or socket that the sandbox blocks can
+   pass here and still fail under the unit.
+
+   On Helm, run it in the `trawl-web` container of the pod. `kubectl exec`
+   gives the doctor the container's environment, including
+   `FLEET_SESSION_PUBLIC_ORIGINS`, and its mounted cookie key:
+
+   ```bash
+   kubectl -n trawl exec trawl-0 -c trawl-web -- trawl-web --doctor --config /etc/trawl/trawld.toml
+   ```
+
+   In the trial, run it in the `trawl-web` service from the trial's project:
+
+   ```bash
+   docker compose exec trawl-web trawl-web --doctor --config /var/lib/trawl/trial/web.toml
+   ```
+
+   From a tarball, run the same command as the user that runs `trawl-web`,
+   with the environment your supervisor gives it.
+
+   Expect exit code 0. With no persistent cookie key, `proxy.cookie_key` is
+   `not_configured` and the run can still exit 0, but every restart of
+   `trawl-web` ends all sessions. When `upstream_ca_path` names the
+   certificate that `trawld` generates, as the Debian package configures, the
+   file does not exist before `trawld` first starts. The run then reports
+   `ca_not_present` and exits with code 3. Start `trawld` and run the doctor
+   again. Do not run the doctor as root: a root run cannot exit 0.
+
+3. Create a human key with [Create roles and keys](/operate/access/#create-roles-and-keys).
+
+4. Save the server in a [CLI profile](/start/connect/) with that key. When
    the API certificate is from a CA the system trusts:
 
    ```toml
@@ -593,7 +637,7 @@ ServiceMonitor creation; neither option installs a monitoring system.
 
    Then run `chmod 0600 ~/.config/trawl/config.toml`.
 
-4. Run the client doctor against the profile. If the browser UI is enabled, add its
+5. Run the client doctor against the profile. If the browser UI is enabled, add its
    origin with `--web-url`:
 
    ```bash
@@ -609,10 +653,21 @@ ServiceMonitor creation; neither option installs a monitoring system.
    has its own `failed` line. Each failed line names its next action. The
    [CLI reference](/reference/cli/#doctor-mode) lists every check.
 
-   `web.origin` shows that `trawl-web` accepts the origin. It does not show
-   that `trawl-web` reaches `trawld`. The sign-in in step 6 does.
+   `web.origin` shows that `trawl-web` accepts the origin. Together, the three
+   doctors cover the browser path:
 
-5. Run one bounded query:
+   - `trawl doctor --web-url` shows that the origin reaches `trawl-web` and
+     that `trawl-web` accepts it as a public origin.
+   - `trawl-web --doctor`, in step 2, shows that `trawl-web` reaches `trawld`
+     with a verified certificate, and whether `trawl-web` has a persistent
+     session key.
+   - `trawld --doctor`, in step 1, shows that `trawld` can serve what
+     `trawl-web` forwards: its databases, its data root, and its listener.
+
+   None of them sends a key through `trawl-web`, so none of them signs in. The
+   sign-in in step 7 does.
+
+6. Run one bounded query:
 
    ```bash
    trawl -p prod query 'last=15m | head 10'
@@ -621,7 +676,7 @@ ServiceMonitor creation; neither option installs a monitoring system.
    Expect rows with `service` = `trawld`. Internal telemetry is on by default,
    so the daemon's own events appear before any sender connects.
 
-6. If the browser UI is enabled, open the origin and log in with the human
+7. If the browser UI is enabled, open the origin and log in with the human
    key. The search page loads.
 
 If a step fails, continue with [Check health and stalled work](/operate/health/).

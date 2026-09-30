@@ -360,9 +360,12 @@ impl std::fmt::Debug for Upstream {
 /// `pinned` certificates replace the platform roots, with host-name
 /// verification left on. `None` trusts the platform roots.
 ///
-/// Takes a builder so a test can pass one with its own resolver or proxy
-/// and see what the rules override.
-fn upstream_client(
+/// Takes a builder so a caller can add settings the rules leave alone. A
+/// test passes one with its own resolver or proxy and sees what the rules
+/// override; the doctor passes one with its timeouts, no retries and no
+/// connection pool, and so probes trawld through the same rules the
+/// proxy's requests use.
+pub(crate) fn upstream_client(
     builder: ClientBuilder,
     pinned: Option<&[Certificate]>,
     connect: Option<&UpstreamConnect>,

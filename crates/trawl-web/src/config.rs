@@ -20,18 +20,32 @@
 //! from `bind_addr` guesses at what the browser's address bar says, and
 //! treating an empty list as "allow everything" installs the vulnerability
 //! this allowlist exists to close, silently.
+//!
+//! Resolution runs in two steps, so `trawl-web --doctor` can inspect a
+//! configuration without the side effects of starting on it:
+//!
+//! 1. [`Sources::resolve`] is pure. From the parsed file and one
+//!    observation of the environment ([`RuntimeParts`]), it selects every
+//!    setting and records where each came from, one result per component.
+//!    It reads no file, logs nothing, and generates no key.
+//! 2. [`ResolvedConfig::from_sources`] is startup's step. It fails on the
+//!    first component error in startup's order, reads the key and pin
+//!    files, logs the warnings that carry configured values, and generates
+//!    an ephemeral key when no key source is configured.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use fleet_auth::{
-    ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN, ENV_SESSION_COOKIE_SECURE,
-    ENV_SESSION_PUBLIC_ORIGINS, KEY_LEN, PublicOrigins, PublicOriginsError, RuntimeCookieDomain,
-    SessionKey, SessionRuntimeError, SessionRuntimeOverrides,
+    ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN, ENV_SESSION_COOKIE_PATH,
+    ENV_SESSION_COOKIE_SECURE, ENV_SESSION_PUBLIC_ORIGINS, KEY_LEN, PublicOrigins,
+    PublicOriginsError, RuntimeCookieDomain, SessionKey, SessionRuntimeError,
+    SessionRuntimeOverrides,
 };
 use trawl_config::{Config, ServerConfig, WebConfig};
+use zeroize::Zeroizing;
 
 /// Default bind address for the proxy HTTP listener.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
@@ -58,6 +72,11 @@ pub const ENV_BIND_ADDR: &str = "TRAWL_WEB_BIND_ADDR";
 /// trawld generates. An empty value counts as unset, as for
 /// [`ENV_BIND_ADDR`], so the file's setting applies.
 pub const ENV_UPSTREAM_CA_PATH: &str = "TRAWL_WEB_UPSTREAM_CA_PATH";
+
+/// Env var name overriding trawld's `[server] http_addr`, which
+/// [`ServerConfig::resolve_http_addr`] reads. trawl-web derives its default
+/// upstream from the same address, so it reads the variable too.
+pub const ENV_HTTP_ADDR: &str = "TRAWL_HTTP_ADDR";
 
 /// All runtime settings the proxy needs, with defaults applied.
 #[derive(Debug)]
@@ -203,11 +222,6 @@ pub enum ConfigError {
         reason: &'static str,
     },
 
-    #[error(
-        "no cookie secret configured: set `web.cookie_secret_path` or `web.cookie_secret_env` in config.toml (a random key will otherwise be generated on every startup, invalidating sessions)"
-    )]
-    NoKey,
-
     /// The configured browser-origin allowlist is empty or unusable.
     ///
     /// The wrapped error names the rule (empty list, which entry failed to
@@ -312,9 +326,12 @@ pub enum ConnectAddrError {
 impl ResolvedConfig {
     /// Load and resolve settings from a config file path.
     ///
+    /// Reads the file, parses it as the whole schema, and resolves it
+    /// through [`Self::from_parsed`].
+    ///
     /// # Errors
-    /// Returns `ConfigError` variants for read/parse failures or unusable
-    /// cookie-key configuration.
+    /// Returns `ConfigError` variants for read/parse failures, an invalid
+    /// environment override, or a setting that does not resolve.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
             path: path.to_owned(),
@@ -331,79 +348,796 @@ impl ResolvedConfig {
     /// to derive the default upstream URL when `web.upstream_url` is
     /// absent — pass `None` in tests that don't need that resolution.
     ///
+    /// Observes the process environment once, refuses any invalid
+    /// `FLEET_SESSION_*` value before anything else, and then runs
+    /// [`Sources::resolve`] and [`Self::from_sources`].
+    ///
     /// # Errors
     /// Returns a [`ConfigError`] when a common Fleet runtime override is
-    /// invalid or an explicitly configured production key cannot be loaded.
-    /// Returns [`ConfigError::NoKey`] when neither `FLEET_SESSION_AEAD_KEY`
-    /// nor a `[web]` cookie-secret source is configured, since cookies would
-    /// not survive a restart.
+    /// invalid, a setting does not resolve, or an explicitly configured
+    /// production key or pinned CA cannot be loaded. No key source at all
+    /// is not an error: an ephemeral key is generated, with a warning.
     pub fn from_parsed(
         web: &WebConfig,
         server: Option<&ServerConfig>,
     ) -> Result<Self, ConfigError> {
-        let runtime = SessionRuntimeOverrides::from_process_env().map_err(ConfigError::from)?;
-        Self::from_parsed_with_runtime(web, server, runtime)
+        Self::startup(web, server, RuntimeEnv::from_process(), expand_tilde)
     }
 
+    /// Startup from one observation of the environment, `env`, with
+    /// `expand` standing in for [`expand_tilde`]: the whole parse of the
+    /// `FLEET_SESSION_*` variables, which refuses first, then
+    /// [`Sources::resolve`] and [`Self::from_sources_with`].
+    fn startup(
+        web: &WebConfig,
+        server: Option<&ServerConfig>,
+        env: RuntimeEnv,
+        expand: impl FnMut(&Path) -> PathBuf,
+    ) -> Result<Self, ConfigError> {
+        let runtime = RuntimeParts::from_whole_parse(env)?;
+        Self::from_sources_with(Sources::resolve(web, server, runtime), expand)
+    }
+
+    /// Resolve with `runtime` standing in for the `FLEET_SESSION_*`
+    /// variables, which a test cannot set. The other variables are read
+    /// from the process, as startup reads them. The whole parse does not
+    /// report whether `FLEET_SESSION_COOKIE_PATH` was set, and nothing here
+    /// uses it, so it counts as unset.
+    #[cfg(test)]
     fn from_parsed_with_runtime(
         web: &WebConfig,
         server: Option<&ServerConfig>,
         runtime: SessionRuntimeOverrides,
     ) -> Result<Self, ConfigError> {
-        warn_on_runtime_override(web, &runtime);
-        // The environment REPLACES the file's list, never merges with it: a
-        // merged allowlist would keep a stale config entry authorizing an
-        // origin the operator believes they moved away from.
-        let public_origins = match runtime.public_origins {
-            Some(from_environment) => from_environment,
-            None => PublicOrigins::parse(&web.public_origins)?,
-        };
-        let cookie_key = runtime.key.map_or_else(|| load_key(web), Ok)?;
-        let upstream_url = web
-            .upstream_url
-            .clone()
-            .unwrap_or_else(|| default_upstream_from_server(server));
-        let checked_url = check_upstream_url(&upstream_url).map_err(ConfigError::UpstreamUrl)?;
-        let upstream_connect = web
-            .upstream_connect_addr
-            .as_deref()
-            .map(|addr| resolve_upstream_connect(&checked_url, addr))
-            .transpose()
-            .map_err(ConfigError::UpstreamConnectAddr)?;
-        let upstream_tls = resolve_upstream_tls(
-            resolve_upstream_ca_path(
-                std::env::var_os(ENV_UPSTREAM_CA_PATH).as_deref(),
-                web.upstream_ca_path.as_deref(),
-            )?
-            .as_deref(),
-        )?;
-        let allow_insecure_cookies = runtime
-            .secure
-            .map_or(web.allow_insecure_cookies, |secure| !secure);
-        let shared_domain = match runtime.domain {
-            RuntimeCookieDomain::PreserveConfigured => {
-                // Empty string == unset == standalone mode, so an operator can
-                // "comment out" SSO by blanking the value.
-                web.shared_domain.clone().filter(|s| !s.is_empty())
-            }
-            RuntimeCookieDomain::HostOnly => None,
-            RuntimeCookieDomain::Explicit(domain) => Some(domain),
-        };
-        Ok(Self {
-            bind_addr: resolve_bind_addr(
-                std::env::var_os(ENV_BIND_ADDR).as_deref(),
-                web.bind_addr.as_deref(),
-            )?,
-            upstream_url,
-            session_ttl_secs: web.session_ttl_secs.unwrap_or(DEFAULT_SESSION_TTL_SECS),
-            allow_insecure_cookies,
-            upstream_tls,
-            upstream_connect,
+        let (_, host) = RuntimeEnv::from_process().split();
+        let runtime = RuntimeParts::from_overrides(runtime, false, host);
+        Self::from_sources(Sources::resolve(web, server, runtime))
+    }
+
+    /// Turn resolved sources into the running configuration: startup's
+    /// step, and the only place the side effects of resolution happen.
+    ///
+    /// Fails on the first component error in startup's order: public
+    /// origins, cookie key, upstream (URL, connect address, CA path, then
+    /// the pin file itself), cookie settings, bind address. Along the way
+    /// it logs the warnings that carry configured values, reads the
+    /// `cookie_secret_env` variable or the `cookie_secret_path` file, reads
+    /// the pinned CA file (logging `upstream_ca_pending` when it does not
+    /// exist yet), and generates an ephemeral key, with a warning, when no
+    /// key source is configured.
+    ///
+    /// A `~` in the key file's path and in the pin's path is expanded by
+    /// [`expand_tilde`] at the step that reads that file, and nowhere else,
+    /// as startup always expanded them. So the home directory is looked up,
+    /// which with `HOME` unset or empty asks the user database, only once
+    /// every earlier step has passed, and never for a path that is not read.
+    ///
+    /// The doctor never calls this.
+    ///
+    /// # Errors
+    /// Returns the first component's [`ConfigError`], or the error from
+    /// reading the key or the pin.
+    pub fn from_sources(sources: Sources) -> Result<Self, ConfigError> {
+        Self::from_sources_with(sources, expand_tilde)
+    }
+
+    /// [`Self::from_sources`] with `expand` in place of [`expand_tilde`],
+    /// so a test can see when, and for which path, `~` is expanded.
+    fn from_sources_with(
+        sources: Sources,
+        mut expand: impl FnMut(&Path) -> PathBuf,
+    ) -> Result<Self, ConfigError> {
+        warn_on_runtime_override(&sources);
+        let Sources {
+            public_origins,
             cookie_key,
-            shared_domain,
+            cookie_settings,
+            upstream,
+            bind_addr,
+            configured,
+        } = sources;
+        let public_origins = public_origins?.origins;
+        let cookie_key = cookie_key?;
+        if !matches!(cookie_key, KeySource::FleetEnv(_)) {
+            warn_on_ambiguous_key(&configured);
+        }
+        let cookie_key = match cookie_key {
+            KeySource::FleetEnv(key) => key,
+            KeySource::ConfigEnv { name } => key_from_env(&name)?,
+            KeySource::File { path } => SessionKey::from_file(&expand(&path))
+                .map_err(|e| ConfigError::KeyFile(e.to_string()))?,
+            KeySource::None => ephemeral_key(),
+        };
+        let upstream = upstream?;
+        let upstream_tls = match upstream.trust {
+            TrustSource::System => UpstreamTls::System,
+            TrustSource::Pinned { path, .. } => load_pin(refuse_empty_pin(expand(&path))?)?,
+        };
+        let cookie_settings = cookie_settings?;
+        let bind_addr = bind_addr?;
+        Ok(Self {
+            bind_addr: bind_addr.addr,
+            upstream_url: upstream.url,
+            session_ttl_secs: cookie_settings.ttl_secs,
+            allow_insecure_cookies: !cookie_settings.secure,
+            upstream_tls,
+            upstream_connect: upstream.connect,
+            cookie_key,
+            shared_domain: cookie_settings.shared_domain,
             public_origins,
         })
     }
+}
+
+/// The raw values of every environment variable resolution reads, taken in
+/// one observation.
+///
+/// `None` is an unset variable. Fields are public so a caller that cannot
+/// set process variables, a test among them, can state them.
+#[derive(Default)]
+pub struct RuntimeEnv {
+    /// [`ENV_SESSION_AEAD_KEY`].
+    pub aead_key: Option<OsString>,
+    /// [`ENV_SESSION_COOKIE_DOMAIN`].
+    pub cookie_domain: Option<OsString>,
+    /// [`ENV_SESSION_COOKIE_PATH`].
+    pub cookie_path: Option<OsString>,
+    /// [`ENV_SESSION_COOKIE_SECURE`].
+    pub cookie_secure: Option<OsString>,
+    /// [`ENV_SESSION_PUBLIC_ORIGINS`].
+    pub public_origins: Option<OsString>,
+    /// [`ENV_BIND_ADDR`].
+    pub bind_addr: Option<OsString>,
+    /// [`ENV_UPSTREAM_CA_PATH`].
+    pub upstream_ca_path: Option<OsString>,
+    /// [`ENV_HTTP_ADDR`].
+    pub http_addr: Option<OsString>,
+}
+
+impl RuntimeEnv {
+    /// Read each variable from the process environment, once.
+    ///
+    /// The `cookie_secret_env` variable is not among them: its name comes
+    /// from the file, and [`key_from_env`] reads it only when the key is
+    /// actually loaded. Nor is `HOME`: `~` expands where each file is
+    /// read, as [`ResolvedConfig::from_sources`] describes.
+    #[must_use]
+    pub fn from_process() -> Self {
+        let read = std::env::var_os;
+        Self {
+            aead_key: read(ENV_SESSION_AEAD_KEY),
+            cookie_domain: read(ENV_SESSION_COOKIE_DOMAIN),
+            cookie_path: read(ENV_SESSION_COOKIE_PATH),
+            cookie_secure: read(ENV_SESSION_COOKIE_SECURE),
+            public_origins: read(ENV_SESSION_PUBLIC_ORIGINS),
+            bind_addr: read(ENV_BIND_ADDR),
+            upstream_ca_path: read(ENV_UPSTREAM_CA_PATH),
+            http_addr: read(ENV_HTTP_ADDR),
+        }
+    }
+
+    /// The five `FLEET_SESSION_*` values in the order fleet-auth reads and
+    /// parses them (key, domain, path, secure, origins), and the rest.
+    fn split(self) -> ([Option<OsString>; 5], HostEnv) {
+        (
+            [
+                self.aead_key,
+                self.cookie_domain,
+                self.cookie_path,
+                self.cookie_secure,
+                self.public_origins,
+            ],
+            HostEnv {
+                bind_addr: self.bind_addr,
+                upstream_ca_path: self.upstream_ca_path,
+                http_addr: self.http_addr,
+            },
+        )
+    }
+}
+
+/// Names which variables are set, never a value.
+impl std::fmt::Debug for RuntimeEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let set = [
+            (ENV_SESSION_AEAD_KEY, &self.aead_key),
+            (ENV_SESSION_COOKIE_DOMAIN, &self.cookie_domain),
+            (ENV_SESSION_COOKIE_PATH, &self.cookie_path),
+            (ENV_SESSION_COOKIE_SECURE, &self.cookie_secure),
+            (ENV_SESSION_PUBLIC_ORIGINS, &self.public_origins),
+            (ENV_BIND_ADDR, &self.bind_addr),
+            (ENV_UPSTREAM_CA_PATH, &self.upstream_ca_path),
+            (ENV_HTTP_ADDR, &self.http_addr),
+        ];
+        f.debug_struct("RuntimeEnv")
+            .field(
+                "set",
+                &set.iter()
+                    .filter(|(_, value)| value.is_some())
+                    .map(|(name, _)| *name)
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// The variables resolution reads that are not `FLEET_SESSION_*`, raw.
+struct HostEnv {
+    bind_addr: Option<OsString>,
+    upstream_ca_path: Option<OsString>,
+    http_addr: Option<OsString>,
+}
+
+/// `path` with a leading `~` expanded as startup has always expanded it,
+/// by [`shellexpand::tilde`]: to `HOME` when it is set and not empty, else
+/// to the user database's home directory, and left as written when neither
+/// gives one. May block: with `HOME` unset or empty, the user database can
+/// be a network service. Call it only at the step that reads the file.
+pub(crate) fn expand_tilde(path: &Path) -> PathBuf {
+    PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).into_owned())
+}
+
+/// The environment's part in resolution: each `FLEET_SESSION_*` variable
+/// parsed on its own, with its own result, and the other variables raw.
+///
+/// The field types are those of [`SessionRuntimeOverrides`], each wrapped
+/// in its own `Result`, so one invalid variable fails only the component
+/// it feeds.
+pub struct RuntimeParts {
+    key: Result<Option<SessionKey>, ConfigError>,
+    domain: Result<RuntimeCookieDomain, ConfigError>,
+    /// Whether [`ENV_SESSION_COOKIE_PATH`] is set. Its only accepted value
+    /// is `/`, the path trawl-web always uses.
+    path_set: Result<bool, ConfigError>,
+    secure: Result<Option<bool>, ConfigError>,
+    public_origins: Result<Option<PublicOrigins>, ConfigError>,
+    host: HostEnv,
+}
+
+impl RuntimeParts {
+    /// Read the process environment once and parse each `FLEET_SESSION_*`
+    /// variable on its own: the doctor's observation.
+    #[must_use]
+    pub fn from_process_env() -> Self {
+        Self::from_each_variable(RuntimeEnv::from_process())
+    }
+
+    /// Parse each `FLEET_SESSION_*` variable in `env` on its own, through
+    /// the shared fleet-auth parser with every other variable absent.
+    ///
+    /// Each variable gets exactly the result the whole parse would give
+    /// it. What differs from [`Self::from_whole_parse`] is only that an
+    /// invalid variable does not stop the others from being judged.
+    #[must_use]
+    pub fn from_each_variable(env: RuntimeEnv) -> Self {
+        let ([key, domain, path, secure, origins], host) = env.split();
+        let parse_one = |name, value: Option<OsString>, slot: usize| {
+            value
+                .map(|value| {
+                    let value = value
+                        .into_string()
+                        .map_err(|_| SessionRuntimeError::NotUnicode { name })?;
+                    let mut args: [Option<String>; 5] = Default::default();
+                    args[slot] = Some(value);
+                    let [key, domain, path, secure, origins] = args;
+                    SessionRuntimeOverrides::parse(key, domain, path, secure, origins)
+                })
+                .transpose()
+                .map_err(ConfigError::from)
+        };
+        Self {
+            key: parse_one(ENV_SESSION_AEAD_KEY, key, 0).map(|o| o.and_then(|o| o.key)),
+            domain: parse_one(ENV_SESSION_COOKIE_DOMAIN, domain, 1)
+                .map(|o| o.map_or(RuntimeCookieDomain::PreserveConfigured, |o| o.domain)),
+            path_set: parse_one(ENV_SESSION_COOKIE_PATH, path, 2).map(|o| o.is_some()),
+            secure: parse_one(ENV_SESSION_COOKIE_SECURE, secure, 3)
+                .map(|o| o.and_then(|o| o.secure)),
+            public_origins: parse_one(ENV_SESSION_PUBLIC_ORIGINS, origins, 4)
+                .map(|o| o.and_then(|o| o.public_origins)),
+            host,
+        }
+    }
+
+    /// Parse the `FLEET_SESSION_*` variables in `env` together, as
+    /// fleet-auth's `SessionRuntimeOverrides::from_process_env` does:
+    /// startup's observation.
+    ///
+    /// A value that is not UTF-8 refuses first, in the order key, domain,
+    /// path, secure, origins; then the first value that does not parse, in
+    /// the parser's order.
+    ///
+    /// # Errors
+    /// Returns the first invalid variable's [`ConfigError`].
+    pub fn from_whole_parse(env: RuntimeEnv) -> Result<Self, ConfigError> {
+        let ([key, domain, path, secure, origins], host) = env.split();
+        let path_set = path.is_some();
+        let text = |name, value: Option<OsString>| {
+            value
+                .map(|value| {
+                    value
+                        .into_string()
+                        .map_err(|_| SessionRuntimeError::NotUnicode { name })
+                })
+                .transpose()
+        };
+        let overrides = SessionRuntimeOverrides::parse(
+            text(ENV_SESSION_AEAD_KEY, key)?,
+            text(ENV_SESSION_COOKIE_DOMAIN, domain)?,
+            text(ENV_SESSION_COOKIE_PATH, path)?,
+            text(ENV_SESSION_COOKIE_SECURE, secure)?,
+            text(ENV_SESSION_PUBLIC_ORIGINS, origins)?,
+        )?;
+        Ok(Self::from_overrides(overrides, path_set, host))
+    }
+
+    /// Parts from a whole parse that succeeded.
+    fn from_overrides(overrides: SessionRuntimeOverrides, path_set: bool, host: HostEnv) -> Self {
+        Self {
+            key: Ok(overrides.key),
+            domain: Ok(overrides.domain),
+            path_set: Ok(path_set),
+            secure: Ok(overrides.secure),
+            public_origins: Ok(overrides.public_origins),
+            host,
+        }
+    }
+}
+
+/// Says which parts are set and which failed, never a value.
+impl std::fmt::Debug for RuntimeParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn part<T>(result: &Result<T, ConfigError>, set: impl FnOnce(&T) -> bool) -> &'static str {
+            match result {
+                Ok(value) if set(value) => "set",
+                Ok(_) => "unset",
+                Err(_) => "invalid",
+            }
+        }
+        f.debug_struct("RuntimeParts")
+            .field("key", &part(&self.key, Option::is_some))
+            .field(
+                "domain",
+                &part(&self.domain, |d| {
+                    !matches!(d, RuntimeCookieDomain::PreserveConfigured)
+                }),
+            )
+            .field("path", &part(&self.path_set, |set| *set))
+            .field("secure", &part(&self.secure, Option::is_some))
+            .field(
+                "public_origins",
+                &part(&self.public_origins, Option::is_some),
+            )
+            .field("bind_addr", &self.host.bind_addr.is_some())
+            .field("upstream_ca_path", &self.host.upstream_ca_path.is_some())
+            .field("http_addr", &self.host.http_addr.is_some())
+            .finish()
+    }
+}
+
+/// Where a resolved setting came from.
+///
+/// Every variant is safe to print: environment names are this crate's or
+/// fleet-auth's constants, never operator text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingSource {
+    /// Stated in the config file.
+    File,
+    /// Set by the named environment variable.
+    Environment(&'static str),
+    /// The upstream URL, derived from `[server] http_addr` in the config
+    /// file, or from that setting's default when the file leaves it out.
+    DerivedFromFile,
+    /// The upstream URL, derived from trawld's listen-address override,
+    /// the named variable ([`ENV_HTTP_ADDR`]).
+    DerivedFromEnvironment(&'static str),
+    /// Neither the file nor the environment sets it; the built-in default
+    /// applies.
+    Default,
+}
+
+/// Every component of the proxy's configuration, resolved without side
+/// effects, each with its own result and the source it came from.
+///
+/// Built only by [`Sources::resolve`]. Startup hands it to
+/// [`ResolvedConfig::from_sources`]; the doctor reads the components.
+pub struct Sources {
+    /// The browser-origin allowlist (ADR-0016).
+    pub public_origins: Result<Origins, ConfigError>,
+    /// The selected cookie key source. Only an environment key is already
+    /// loaded; the others are selections that nothing has read yet.
+    pub cookie_key: Result<KeySource, ConfigError>,
+    /// The session cookie's attributes and lifetime.
+    pub cookie_settings: Result<CookieSettings, ConfigError>,
+    /// The upstream URL, connect address and trust source. The pinned CA
+    /// file is named, not read.
+    pub upstream: Result<UpstreamPlan, ConfigError>,
+    /// The proxy's listen address.
+    pub bind_addr: Result<BindAddr, ConfigError>,
+    /// The configured values the startup warnings compare with the
+    /// environment. Private, so only [`ResolvedConfig::from_sources`]
+    /// reaches them.
+    configured: Configured,
+}
+
+impl Sources {
+    /// Select every setting from the parsed file and `runtime`, recording
+    /// where each came from.
+    ///
+    /// Pure: no file is read, nothing is logged, no key is generated, and
+    /// neither the `cookie_secret_env` variable nor the home directory is
+    /// looked up. The key and pin paths are kept as written: a `~` in them
+    /// expands where the file is read (see [`ResolvedConfig::from_sources`]).
+    /// Precedence is startup's, and a selected source that is invalid fails
+    /// its component with no fallback to the next source.
+    #[must_use]
+    pub fn resolve(web: &WebConfig, server: Option<&ServerConfig>, runtime: RuntimeParts) -> Self {
+        let RuntimeParts {
+            key,
+            domain,
+            path_set,
+            secure,
+            public_origins,
+            host,
+        } = runtime;
+        Self {
+            public_origins: resolve_origins(web, public_origins),
+            cookie_key: resolve_key_source(web, key),
+            cookie_settings: resolve_cookie_settings(web, path_set, secure, domain),
+            upstream: resolve_upstream(web, server, &host),
+            bind_addr: select_bind_addr(host.bind_addr.as_deref(), web.bind_addr.as_deref())
+                .map(|(addr, from)| BindAddr { addr, from }),
+            configured: Configured {
+                cookie_secret_env: web.cookie_secret_env.clone(),
+                cookie_secret_path: web.cookie_secret_path.clone(),
+                allow_insecure_cookies: web.allow_insecure_cookies,
+                shared_domain: web.shared_domain.clone(),
+                public_origins: web.public_origins.clone(),
+            },
+        }
+    }
+}
+
+/// Shows each component's source and shape: no URL, host, origin, domain,
+/// variable name or key.
+impl std::fmt::Debug for Sources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        /// A component's `Debug`, or `Err` with the error left out: its
+        /// text can quote configured values.
+        struct Part<'a, T>(&'a Result<T, ConfigError>);
+        impl<T: std::fmt::Debug> std::fmt::Debug for Part<'_, T> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self.0 {
+                    Ok(value) => value.fmt(f),
+                    Err(_) => f.write_str("Err(<config error>)"),
+                }
+            }
+        }
+        f.debug_struct("Sources")
+            .field("public_origins", &Part(&self.public_origins))
+            .field("cookie_key", &Part(&self.cookie_key))
+            .field("cookie_settings", &Part(&self.cookie_settings))
+            .field("upstream", &Part(&self.upstream))
+            .field("bind_addr", &Part(&self.bind_addr))
+            .finish_non_exhaustive()
+    }
+}
+
+/// The configured values the startup warnings compare with the
+/// environment.
+struct Configured {
+    cookie_secret_env: Option<String>,
+    cookie_secret_path: Option<PathBuf>,
+    allow_insecure_cookies: bool,
+    shared_domain: Option<String>,
+    public_origins: Vec<String>,
+}
+
+/// The resolved browser-origin allowlist and where it came from.
+pub struct Origins {
+    /// The allowlist in force.
+    pub origins: PublicOrigins,
+    /// The file or the environment.
+    pub from: OriginsFrom,
+}
+
+/// Shows the count and source, never an origin.
+impl std::fmt::Debug for Origins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Origins")
+            .field("count", &self.origins.iter().count())
+            .field("from", &self.from)
+            .finish()
+    }
+}
+
+/// Where the allowlist came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginsFrom {
+    /// `[web] public_origins` in the config file.
+    File,
+    /// [`ENV_SESSION_PUBLIC_ORIGINS`], which replaces the file's list
+    /// whenever it is set, even to the same origins.
+    Environment {
+        /// How many entries the file's list held. Replaced by presence,
+        /// not by a difference in content; 0 when the file lists none.
+        replaced_file_entries: usize,
+    },
+}
+
+/// The selected cookie key source, in startup's precedence:
+/// [`ENV_SESSION_AEAD_KEY`], then `[web] cookie_secret_env`, then `[web]
+/// cookie_secret_path`, then none.
+pub enum KeySource {
+    /// [`ENV_SESSION_AEAD_KEY`], already parsed.
+    FleetEnv(SessionKey),
+    /// The variable `[web] cookie_secret_env` names; not read yet
+    /// ([`key_from_env`] reads it). `name` is operator text: an operator
+    /// may have pasted the key itself here, so it is not printed as is.
+    ConfigEnv {
+        /// The configured variable name.
+        name: String,
+    },
+    /// `[web] cookie_secret_path`; not read yet.
+    File {
+        /// The path as written: a `~` in it expands where the file is read.
+        path: PathBuf,
+    },
+    /// No source: startup generates an ephemeral key, so sessions end
+    /// with the process.
+    None,
+}
+
+/// Names the kind only: no key, variable name or path.
+impl std::fmt::Debug for KeySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::FleetEnv(_) => "FleetEnv",
+            Self::ConfigEnv { .. } => "ConfigEnv",
+            Self::File { .. } => "File",
+            Self::None => "None",
+        })
+    }
+}
+
+/// The session cookie's attributes and lifetime, each with its source.
+pub struct CookieSettings {
+    /// Whether the cookie carries `Secure`.
+    pub secure: bool,
+    /// [`ENV_SESSION_COOKIE_SECURE`], the file (`allow_insecure_cookies =
+    /// true`), or the default (Secure on).
+    pub secure_from: SettingSource,
+    /// The shared SSO domain (`Domain=`), or `None` for a host-only
+    /// cookie. Operator text: not for output.
+    pub shared_domain: Option<String>,
+    /// [`ENV_SESSION_COOKIE_DOMAIN`], the file (`[web] shared_domain`,
+    /// non-empty), or the default (host-only).
+    pub domain_from: SettingSource,
+    /// [`ENV_SESSION_COOKIE_PATH`] or the default. Either way the path is
+    /// `/`, the only one Fleet sessions accept.
+    pub path_from: SettingSource,
+    /// The session lifetime, in seconds.
+    pub ttl_secs: u64,
+    /// `[web] session_ttl_secs` or the default.
+    pub ttl_from: SettingSource,
+}
+
+/// Shows whether a shared domain is set, never the domain.
+impl std::fmt::Debug for CookieSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CookieSettings")
+            .field("secure", &self.secure)
+            .field("secure_from", &self.secure_from)
+            .field("shared_domain", &self.shared_domain.is_some())
+            .field("domain_from", &self.domain_from)
+            .field("path_from", &self.path_from)
+            .field("ttl_secs", &self.ttl_secs)
+            .field("ttl_from", &self.ttl_from)
+            .finish()
+    }
+}
+
+/// The upstream URL, where the connection goes, and what it trusts.
+pub struct UpstreamPlan {
+    /// The URL as configured or derived, which passed
+    /// [`check_upstream_url`]. The value is not for output.
+    pub url: String,
+    /// `url`, parsed.
+    pub checked_url: reqwest::Url,
+    /// `[web] upstream_url`, or derived from `[server] http_addr` or
+    /// [`ENV_HTTP_ADDR`], or the fallback.
+    pub url_from: SettingSource,
+    /// `[web] upstream_connect_addr`, checked against `url`.
+    pub connect: Option<UpstreamConnect>,
+    /// The platform roots or a pinned CA file.
+    pub trust: TrustSource,
+}
+
+/// Shows sources only: no URL, host or address.
+impl std::fmt::Debug for UpstreamPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamPlan")
+            .field("url_from", &self.url_from)
+            .field("connect", &self.connect.is_some())
+            .field("trust", &self.trust)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How the upstream certificate is to be verified, before any file is
+/// read.
+#[derive(Clone, PartialEq, Eq)]
+pub enum TrustSource {
+    /// The platform trust store.
+    System,
+    /// The CA file at `path`, not empty; not read yet.
+    Pinned {
+        /// The path as written: a `~` in it expands where the file is read.
+        path: PathBuf,
+        /// [`ENV_UPSTREAM_CA_PATH`] or `[web] upstream_ca_path`.
+        from: SettingSource,
+    },
+}
+
+/// Shows the mode and source, not the path.
+impl std::fmt::Debug for TrustSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => f.write_str("System"),
+            Self::Pinned { from, .. } => f.debug_struct("Pinned").field("from", from).finish(),
+        }
+    }
+}
+
+/// The listen address and where it came from.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BindAddr {
+    /// The address, unparsed, as startup binds it. Operator text: not for
+    /// output.
+    pub addr: String,
+    /// [`ENV_BIND_ADDR`], `[web] bind_addr`, or the default.
+    pub from: SettingSource,
+}
+
+/// Shows the source only, not the address.
+impl std::fmt::Debug for BindAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BindAddr")
+            .field("from", &self.from)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The allowlist: the environment's when [`ENV_SESSION_PUBLIC_ORIGINS`] is
+/// set, whether or not it parses, and the file's otherwise.
+fn resolve_origins(
+    web: &WebConfig,
+    from_environment: Result<Option<PublicOrigins>, ConfigError>,
+) -> Result<Origins, ConfigError> {
+    // The environment REPLACES the file's list, never merges with it: a
+    // merged allowlist would keep a stale config entry authorizing an
+    // origin the operator believes they moved away from.
+    match from_environment? {
+        Some(origins) => Ok(Origins {
+            origins,
+            from: OriginsFrom::Environment {
+                replaced_file_entries: web.public_origins.len(),
+            },
+        }),
+        None => Ok(Origins {
+            origins: PublicOrigins::parse(&web.public_origins)?,
+            from: OriginsFrom::File,
+        }),
+    }
+}
+
+/// Select the key source in startup's precedence. An invalid
+/// [`ENV_SESSION_AEAD_KEY`] fails the component rather than falling back.
+fn resolve_key_source(
+    web: &WebConfig,
+    from_environment: Result<Option<SessionKey>, ConfigError>,
+) -> Result<KeySource, ConfigError> {
+    if let Some(key) = from_environment? {
+        return Ok(KeySource::FleetEnv(key));
+    }
+    // Both configured sources set: the variable wins, and startup warns.
+    Ok(if let Some(name) = &web.cookie_secret_env {
+        KeySource::ConfigEnv { name: name.clone() }
+    } else if let Some(path) = &web.cookie_secret_path {
+        KeySource::File { path: path.clone() }
+    } else {
+        KeySource::None
+    })
+}
+
+/// The cookie's attributes: each `FLEET_SESSION_*` variable, when set,
+/// overrides only its own setting. An invalid one fails the component, in
+/// the parser's order: path, secure, domain.
+fn resolve_cookie_settings(
+    web: &WebConfig,
+    path_set: Result<bool, ConfigError>,
+    secure: Result<Option<bool>, ConfigError>,
+    domain: Result<RuntimeCookieDomain, ConfigError>,
+) -> Result<CookieSettings, ConfigError> {
+    let path_from = if path_set? {
+        SettingSource::Environment(ENV_SESSION_COOKIE_PATH)
+    } else {
+        SettingSource::Default
+    };
+    let (secure, secure_from) = match secure? {
+        Some(secure) => (
+            secure,
+            SettingSource::Environment(ENV_SESSION_COOKIE_SECURE),
+        ),
+        None if web.allow_insecure_cookies => (false, SettingSource::File),
+        None => (true, SettingSource::Default),
+    };
+    let (shared_domain, domain_from) = match domain? {
+        RuntimeCookieDomain::PreserveConfigured => {
+            // Empty string == unset == standalone mode, so an operator can
+            // "comment out" SSO by blanking the value.
+            match web.shared_domain.clone().filter(|s| !s.is_empty()) {
+                Some(domain) => (Some(domain), SettingSource::File),
+                None => (None, SettingSource::Default),
+            }
+        }
+        RuntimeCookieDomain::HostOnly => {
+            (None, SettingSource::Environment(ENV_SESSION_COOKIE_DOMAIN))
+        }
+        RuntimeCookieDomain::Explicit(domain) => (
+            Some(domain),
+            SettingSource::Environment(ENV_SESSION_COOKIE_DOMAIN),
+        ),
+    };
+    let (ttl_secs, ttl_from) = match web.session_ttl_secs {
+        Some(ttl) => (ttl, SettingSource::File),
+        None => (DEFAULT_SESSION_TTL_SECS, SettingSource::Default),
+    };
+    Ok(CookieSettings {
+        secure,
+        secure_from,
+        shared_domain,
+        domain_from,
+        path_from,
+        ttl_secs,
+        ttl_from,
+    })
+}
+
+/// The upstream URL and its rules, the connect address, and the trust
+/// source, in startup's order. The pin file is named as written, not read.
+fn resolve_upstream(
+    web: &WebConfig,
+    server: Option<&ServerConfig>,
+    host: &HostEnv,
+) -> Result<UpstreamPlan, ConfigError> {
+    let (url, url_from) = match &web.upstream_url {
+        Some(url) => (url.clone(), SettingSource::File),
+        None => derive_upstream(server, host.http_addr.as_deref()),
+    };
+    let checked_url = check_upstream_url(&url).map_err(ConfigError::UpstreamUrl)?;
+    let connect = web
+        .upstream_connect_addr
+        .as_deref()
+        .map(|addr| resolve_upstream_connect(&checked_url, addr))
+        .transpose()
+        .map_err(ConfigError::UpstreamConnectAddr)?;
+    let trust = match select_upstream_ca_path(
+        host.upstream_ca_path.as_deref(),
+        web.upstream_ca_path.as_deref(),
+    )? {
+        None => TrustSource::System,
+        Some((path, from)) => TrustSource::Pinned {
+            path: refuse_empty_pin(path)?,
+            from,
+        },
+    };
+    Ok(UpstreamPlan {
+        url,
+        checked_url,
+        url_from,
+        connect,
+        trust,
+    })
 }
 
 /// Announce every runtime override that displaces deployed configuration.
@@ -411,39 +1145,51 @@ impl ResolvedConfig {
 /// The `FLEET_SESSION_*` variables exist for `fleet-dev`, but this is the
 /// production binary and it reads them unconditionally. Silently clearing
 /// `Secure` or swapping the cookie key out from under a configured deployment
-/// is exactly the accident `load_key` already warns about for the far less
-/// dangerous env-versus-path ambiguity.
-fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) {
-    if runtime.key.is_some()
-        && (web.cookie_secret_env.is_some() || web.cookie_secret_path.is_some())
+/// is exactly the accident [`warn_on_ambiguous_key`] already warns about
+/// for the far less dangerous env-versus-path ambiguity.
+///
+/// Reads which component the environment supplied from `sources`, and the
+/// configured values it displaced from `sources.configured`.
+fn warn_on_runtime_override(sources: &Sources) {
+    let configured = &sources.configured;
+    if matches!(sources.cookie_key, Ok(KeySource::FleetEnv(_)))
+        && (configured.cookie_secret_env.is_some() || configured.cookie_secret_path.is_some())
     {
         tracing::warn!(
             event_type = "session_key_runtime_override",
             env = ENV_SESSION_AEAD_KEY,
-            cookie_secret_env = ?web.cookie_secret_env,
-            cookie_secret_path = ?web.cookie_secret_path,
+            cookie_secret_env = ?configured.cookie_secret_env,
+            cookie_secret_path = ?configured.cookie_secret_path,
             "FLEET_SESSION_AEAD_KEY overrides the configured cookie secret"
         );
     }
-    if runtime.secure == Some(false) && !web.allow_insecure_cookies {
-        tracing::warn!(
-            event_type = "session_cookie_secure_downgraded",
-            env = ENV_SESSION_COOKIE_SECURE,
-            "the environment is clearing Secure on the session cookie"
-        );
+    if let Ok(settings) = &sources.cookie_settings {
+        if matches!(settings.secure_from, SettingSource::Environment(_))
+            && !settings.secure
+            && !configured.allow_insecure_cookies
+        {
+            tracing::warn!(
+                event_type = "session_cookie_secure_downgraded",
+                env = ENV_SESSION_COOKIE_SECURE,
+                "the environment is clearing Secure on the session cookie"
+            );
+        }
+        if matches!(settings.domain_from, SettingSource::Environment(_))
+            && configured.shared_domain.is_some()
+        {
+            tracing::warn!(
+                event_type = "session_cookie_domain_override",
+                env = ENV_SESSION_COOKIE_DOMAIN,
+                configured = ?configured.shared_domain,
+                "the environment overrides the configured shared cookie domain"
+            );
+        }
     }
-    if !matches!(runtime.domain, RuntimeCookieDomain::PreserveConfigured)
-        && web.shared_domain.is_some()
-    {
-        tracing::warn!(
-            event_type = "session_cookie_domain_override",
-            env = ENV_SESSION_COOKIE_DOMAIN,
-            configured = ?web.shared_domain,
-            "the environment overrides the configured shared cookie domain"
-        );
-    }
-    if let Some(from_environment) = &runtime.public_origins
-        && !web.public_origins.is_empty()
+    if let Ok(Origins {
+        origins: from_environment,
+        from: OriginsFrom::Environment { .. },
+    }) = &sources.public_origins
+        && !configured.public_origins.is_empty()
     {
         // Both packaged deployments render one list into the config file
         // and hand the same list to the environment — the helm chart
@@ -453,7 +1199,7 @@ fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) 
         // allowlist is not the one they wrote. Compare the two instead.
         // A configured list that does not parse counts as displaced: it
         // could never have been in force, and that is worth saying.
-        let displaced = !PublicOrigins::parse(&web.public_origins)
+        let displaced = !PublicOrigins::parse(&configured.public_origins)
             .is_ok_and(|configured| same_origins(&configured, from_environment));
         // The override's origins are printed because they parsed: each is
         // at most a serialized origin's worth of ASCII, and the point of
@@ -468,7 +1214,7 @@ fn warn_on_runtime_override(web: &WebConfig, runtime: &SessionRuntimeOverrides) 
             tracing::warn!(
                 event_type = "session_public_origins_override",
                 env = ENV_SESSION_PUBLIC_ORIGINS,
-                configured_entries = web.public_origins.len(),
+                configured_entries = configured.public_origins.len(),
                 origins_count,
                 origins = %origins,
                 "the environment replaces the configured browser-origin allowlist"
@@ -565,42 +1311,69 @@ fn env_override<'a>(name: &str, value: Option<&'a OsStr>) -> Result<Option<&'a s
 /// Pick the listen address: [`ENV_BIND_ADDR`] first, then `[web] bind_addr`,
 /// then [`DEFAULT_BIND_ADDR`]. Empty values count as unset at both levels.
 ///
-/// Split from `from_parsed` so the precedence is testable without mutating
-/// process env (forbidden under `unsafe_code = "forbid"`).
+/// Takes the environment value as an argument so the precedence is
+/// testable without mutating process env (forbidden under `unsafe_code =
+/// "forbid"`).
 ///
 /// # Errors
 /// Returns [`ConfigError::EnvUtf8`] when the environment value is not UTF-8.
+fn select_bind_addr(
+    env_value: Option<&OsStr>,
+    configured: Option<&str>,
+) -> Result<(String, SettingSource), ConfigError> {
+    let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
+    if let Some(addr) = pick(env_override(ENV_BIND_ADDR, env_value)?) {
+        return Ok((addr, SettingSource::Environment(ENV_BIND_ADDR)));
+    }
+    Ok(match pick(configured) {
+        Some(addr) => (addr, SettingSource::File),
+        None => (DEFAULT_BIND_ADDR.to_owned(), SettingSource::Default),
+    })
+}
+
+/// [`select_bind_addr`]'s address alone.
+#[cfg(test)]
 fn resolve_bind_addr(
     env_value: Option<&OsStr>,
     configured: Option<&str>,
 ) -> Result<String, ConfigError> {
-    let pick = |v: Option<&str>| v.filter(|s| !s.is_empty()).map(str::to_owned);
-    Ok(pick(env_override(ENV_BIND_ADDR, env_value)?)
-        .or_else(|| pick(configured))
-        .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_owned()))
+    select_bind_addr(env_value, configured).map(|(addr, _)| addr)
 }
 
 /// Pick the CA pin: [`ENV_UPSTREAM_CA_PATH`] first, then `[web]
 /// upstream_ca_path`. An empty environment value counts as unset, as for
 /// [`ENV_BIND_ADDR`]. An empty configured path is passed on and refused by
-/// [`resolve_upstream_tls`]: falling back to the platform roots would
-/// change the trust mode on a blank value.
+/// [`refuse_empty_pin`]: falling back to the platform roots would change the
+/// trust mode on a blank value.
 ///
-/// Split from `from_parsed` so the precedence is testable without mutating
-/// process env (forbidden under `unsafe_code = "forbid"`).
+/// Takes the environment value as an argument so the precedence is
+/// testable without mutating process env (forbidden under `unsafe_code =
+/// "forbid"`).
 ///
 /// # Errors
 /// Returns [`ConfigError::EnvUtf8`] when the environment value is not
 /// UTF-8. Read as unset, it would fall back to the file's pin or to the
 /// platform roots.
+fn select_upstream_ca_path(
+    env_value: Option<&OsStr>,
+    configured: Option<&Path>,
+) -> Result<Option<(PathBuf, SettingSource)>, ConfigError> {
+    if let Some(path) = env_override(ENV_UPSTREAM_CA_PATH, env_value)?.filter(|v| !v.is_empty()) {
+        return Ok(Some((
+            PathBuf::from(path),
+            SettingSource::Environment(ENV_UPSTREAM_CA_PATH),
+        )));
+    }
+    Ok(configured.map(|path| (path.to_owned(), SettingSource::File)))
+}
+
+/// [`select_upstream_ca_path`]'s path alone.
+#[cfg(test)]
 fn resolve_upstream_ca_path(
     env_value: Option<&OsStr>,
     configured: Option<&Path>,
 ) -> Result<Option<PathBuf>, ConfigError> {
-    Ok(env_override(ENV_UPSTREAM_CA_PATH, env_value)?
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| configured.map(Path::to_owned)))
+    select_upstream_ca_path(env_value, configured).map(|picked| picked.map(|(path, _)| path))
 }
 
 /// Check the rules every upstream URL follows, whatever the trust mode
@@ -692,10 +1465,40 @@ pub fn resolve_upstream_connect(
     })
 }
 
-/// Decide how the upstream client verifies trawld's certificate.
+/// Decide how the upstream client verifies trawld's certificate, as
+/// startup does: no `ca_path` means the platform roots, and otherwise the
+/// path is expanded by [`expand_tilde`], refused by [`refuse_empty_pin`]
+/// when empty, and read once by [`load_pin`]. Startup itself takes the
+/// path from [`Sources`].
 ///
-/// No `ca_path` means the platform roots. Otherwise the file, tilde
-/// expanded, is read once:
+/// # Errors
+/// Returns [`ConfigError::UpstreamCa`] naming the file and the reason.
+#[cfg(test)]
+pub(crate) fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, ConfigError> {
+    match ca_path {
+        None => Ok(UpstreamTls::System),
+        Some(path) => load_pin(refuse_empty_pin(expand_tilde(path))?),
+    }
+}
+
+/// `path`, unless it is empty.
+///
+/// # Errors
+/// Returns [`ConfigError::UpstreamCa`] when the path is empty: falling back
+/// to the platform roots would change the trust mode on a blank value, and
+/// reading it would report a missing file.
+fn refuse_empty_pin(path: PathBuf) -> Result<PathBuf, ConfigError> {
+    if path.as_os_str().is_empty() {
+        return Err(ConfigError::UpstreamCa {
+            path,
+            reason: "the path is empty. Name trawld's CA file, or remove the setting to trust the platform roots"
+                .to_owned(),
+        });
+    }
+    Ok(path)
+}
+
+/// Read the pin file at `path` once, as startup does.
 ///
 /// - Absent (`NotFound`): the pin is pending, and one `upstream_ca_pending`
 ///   warning says so. trawld writes its generated certificate on its first
@@ -705,22 +1508,16 @@ pub fn resolve_upstream_connect(
 ///   certificate bundle: refused, so a broken pin stops startup instead of
 ///   failing every request later.
 ///
+/// Startup's step: it logs. The doctor reads the pin through
+/// [`read_capped_file`] and parses it with [`pinned_roots`] instead.
+///
 /// # Errors
 /// Returns [`ConfigError::UpstreamCa`] naming the file and the reason.
-pub fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, ConfigError> {
-    let Some(path) = ca_path else {
-        return Ok(UpstreamTls::System);
-    };
-    let path = PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).into_owned());
+fn load_pin(path: PathBuf) -> Result<UpstreamTls, ConfigError> {
     let refuse = |reason: &str| ConfigError::UpstreamCa {
         path: path.clone(),
         reason: reason.to_owned(),
     };
-    if path.as_os_str().is_empty() {
-        return Err(refuse(
-            "the path is empty. Name trawld's CA file, or remove the setting to trust the platform roots",
-        ));
-    }
     let roots = match read_pin_file(&path) {
         Ok(pem) => Some(pinned_roots(&pem).map_err(refuse)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -745,8 +1542,8 @@ pub fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, Confi
 /// the file's size, past a container's memory limit.
 pub(crate) const MAX_PIN_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Read the pin file at `path`, refusing anything but a regular file of at
-/// most [`MAX_PIN_FILE_BYTES`].
+/// Read the file at `path`, refusing anything but a regular file of at
+/// most `cap` bytes.
 ///
 /// The open never waits: on unix it passes `O_NONBLOCK`, so a FIFO with
 /// no writer opens at once instead of blocking until one appears. The
@@ -757,11 +1554,62 @@ pub(crate) const MAX_PIN_FILE_BYTES: u64 = 1024 * 1024;
 /// cap, so a file that grows after the size check is refused too and never
 /// read whole. Reading a regular file can still stall, on a network
 /// volume for one, so callers on the async runtime run this on the
-/// blocking pool. The one reader for a pin file, at startup and on any
-/// later read.
-pub(crate) fn read_pin_file(path: &Path) -> std::io::Result<Vec<u8>> {
+/// blocking pool.
+///
+/// Errors keep the kind the open or read produced, so a caller can tell
+/// `NotFound` from `PermissionDenied`; their text is the OS's, or one of
+/// the two fixed refusals above.
+pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
+    let file = open_capped(path, cap)?;
+    let mut contents = Vec::new();
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if contents.len() as u64 > cap {
+        return Err(too_large(cap));
+    }
+    Ok(contents)
+}
+
+/// [`read_capped_file`] for a secret: the bytes land in one [`Zeroizing`]
+/// buffer from the first byte, and every path out of the read scrubs it.
+///
+/// The buffer is allocated once, `cap + 1` bytes, before the first read,
+/// and never grown, so no reallocation leaves a copy behind; the reads go
+/// straight into it, with no intermediate buffer. An error part way
+/// through, or a file past the cap, drops the buffer here, zeroized. It
+/// suits a small cap, such as a key's: the whole buffer is allocated even
+/// for a short file.
+///
+/// # Errors
+/// As [`read_capped_file`].
+pub(crate) fn read_capped_secret(path: &Path, cap: u64) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let mut file = open_capped(path, cap)?;
+    let size = usize::try_from(cap.saturating_add(1)).map_err(|_| too_large(cap))?;
+    let mut buffer = Zeroizing::new(vec![0; size]);
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if filled as u64 > cap {
+        return Err(too_large(cap));
+    }
+    buffer.truncate(filled);
+    Ok(buffer)
+}
+
+/// Open `path` for [`read_capped_file`] and [`read_capped_secret`]: never
+/// waiting on a FIFO, refusing what is not a regular file, and refusing a
+/// file already past `cap`, each on the opened handle.
+fn open_capped(path: &Path, cap: u64) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -777,24 +1625,38 @@ pub(crate) fn read_pin_file(path: &Path) -> std::io::Result<Vec<u8>> {
             "the path is not a regular file",
         ));
     }
-    let too_large = || {
-        std::io::Error::new(
-            std::io::ErrorKind::FileTooLarge,
-            format!(
-                "the file is larger than {} MiB, too large for a CA bundle",
-                MAX_PIN_FILE_BYTES / (1024 * 1024)
-            ),
-        )
-    };
-    if metadata.len() > MAX_PIN_FILE_BYTES {
-        return Err(too_large());
+    if metadata.len() > cap {
+        return Err(too_large(cap));
     }
-    let mut pem = Vec::new();
-    file.take(MAX_PIN_FILE_BYTES + 1).read_to_end(&mut pem)?;
-    if pem.len() as u64 > MAX_PIN_FILE_BYTES {
-        return Err(too_large());
-    }
-    Ok(pem)
+    Ok(file)
+}
+
+/// The capped readers' refusal of a file larger than `cap`.
+fn too_large(cap: u64) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::FileTooLarge,
+        format!("the file is larger than {cap} bytes"),
+    )
+}
+
+/// Read the pin file at `path` through [`read_capped_file`], capped at
+/// [`MAX_PIN_FILE_BYTES`]. A file over the cap is refused with a message
+/// naming the cap in MiB. The one reader for a pin file, at startup and
+/// on any later read.
+pub(crate) fn read_pin_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_capped_file(path, MAX_PIN_FILE_BYTES).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::FileTooLarge {
+            std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                format!(
+                    "the file is larger than {} MiB, too large for a CA bundle",
+                    MAX_PIN_FILE_BYTES / (1024 * 1024)
+                ),
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// Parse a PEM bundle into trust anchors, refusing one that yields none.
@@ -830,7 +1692,8 @@ pub(crate) fn pinned_roots(pem: &[u8]) -> Result<PinnedRoots, &'static str> {
     })
 }
 
-/// Build the default upstream URL from the trawld `[server].http_addr`.
+/// Derive the default upstream URL from trawld's `[server].http_addr`, and
+/// say where it came from.
 ///
 /// Trawld always speaks HTTPS (it auto-generates a self-signed cert if
 /// none is configured), so we always produce an `https://` URL.
@@ -838,15 +1701,24 @@ pub(crate) fn pinned_roots(pem: &[u8]) -> Result<PinnedRoots, &'static str> {
 /// loopback — the proxy reaches trawld on the same host, never across
 /// the wire. IPv6 literals are wrapped in brackets per RFC 3986.
 ///
-/// Reads the address through [`ServerConfig::resolve_http_addr`] rather than
-/// the raw field: trawld honours `TRAWL_HTTP_ADDR`, and a proxy still aiming
-/// at the file's port would talk to nothing.
-fn default_upstream_from_server(server: Option<&ServerConfig>) -> String {
+/// The address follows [`ServerConfig::resolve_http_addr`]'s rule rather
+/// than the raw field: trawld honours [`ENV_HTTP_ADDR`], and a proxy still
+/// aiming at the file's port would talk to nothing. The variable's value,
+/// `http_addr_env`, is an argument so this stays pure. The rule itself is
+/// trawl-config's [`ServerConfig::http_addr_override`]; like
+/// `resolve_http_addr`, a value that is not UTF-8 counts as unset.
+fn derive_upstream(
+    server: Option<&ServerConfig>,
+    http_addr_env: Option<&OsStr>,
+) -> (String, SettingSource) {
     let Some(srv) = server else {
-        return FALLBACK_UPSTREAM_URL.to_owned();
+        return (FALLBACK_UPSTREAM_URL.to_owned(), SettingSource::Default);
     };
-
-    let resolved = srv.resolve_http_addr();
+    let (resolved, from) =
+        match ServerConfig::http_addr_override(http_addr_env.and_then(OsStr::to_str)) {
+            Some(addr) => (addr, SettingSource::DerivedFromEnvironment(ENV_HTTP_ADDR)),
+            None => (srv.http_addr.as_str(), SettingSource::DerivedFromFile),
+        };
     let addr = resolved.trim();
     let (host, port_suffix) = split_addr(addr);
     let is_ipv6 = host.contains(':');
@@ -855,11 +1727,18 @@ fn default_upstream_from_server(server: Option<&ServerConfig>) -> String {
         other => other,
     };
     // RFC 3986 requires IPv6 literals in URLs to be bracketed.
-    if is_ipv6 && host != "127.0.0.1" {
+    let url = if is_ipv6 && host != "127.0.0.1" {
         format!("https://[{host}]{port_suffix}")
     } else {
         format!("https://{host}{port_suffix}")
-    }
+    };
+    (url, from)
+}
+
+/// [`derive_upstream`]'s URL, with [`ENV_HTTP_ADDR`] read from the process.
+#[cfg(test)]
+fn default_upstream_from_server(server: Option<&ServerConfig>) -> String {
+    derive_upstream(server, std::env::var_os(ENV_HTTP_ADDR).as_deref()).0
 }
 
 /// Split "host:port" / "[ipv6]:port" / bare host into
@@ -884,57 +1763,66 @@ fn split_addr(addr: &str) -> (&str, &str) {
     })
 }
 
-fn load_key(web: &WebConfig) -> Result<SessionKey, ConfigError> {
-    // Both sources set → env wins silently by policy. That's a config
-    // shape that's easy to set accidentally (e.g. an env var from a
-    // secrets provider unexpectedly overlaps with a path configured
-    // in the TOML), so emit a loud warning naming both identifiers.
-    if web.cookie_secret_env.is_some() && web.cookie_secret_path.is_some() {
+/// Load the cookie key from the environment variable `name`, the one `[web]
+/// cookie_secret_env` names: base64 of 32 bytes.
+///
+/// Reads that one variable from the process. Logs nothing and generates
+/// nothing, so the doctor calls it as startup does.
+///
+/// # Errors
+/// [`ConfigError::EnvMissing`] when the variable is unset,
+/// [`ConfigError::EnvUtf8`] when it is not UTF-8, and
+/// [`ConfigError::EnvKey`] when it is not a key. Each names the variable,
+/// never its value.
+pub(crate) fn key_from_env(name: &str) -> Result<SessionKey, ConfigError> {
+    // Distinguish "var unset" from "var set but not UTF-8": the
+    // former is a config mistake (wrong name, forgotten export),
+    // the latter is an encoding issue. One shared "not valid UTF-8"
+    // error would point operators at the wrong problem.
+    let raw = match std::env::var(name) {
+        Ok(v) => Zeroizing::new(v),
+        Err(std::env::VarError::NotPresent) => {
+            return Err(ConfigError::EnvMissing {
+                name: name.to_owned(),
+            });
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::EnvUtf8 {
+                name: name.to_owned(),
+            });
+        }
+    };
+    SessionKey::from_base64(&raw).map_err(|_| ConfigError::EnvKey {
+        name: name.to_owned(),
+    })
+}
+
+/// Warn when both configured key sources are set.
+///
+/// Both set → env wins silently by policy. That's a config shape that's
+/// easy to set accidentally (e.g. an env var from a secrets provider
+/// unexpectedly overlaps with a path configured in the TOML), so emit a
+/// loud warning naming both identifiers.
+fn warn_on_ambiguous_key(configured: &Configured) {
+    if configured.cookie_secret_env.is_some() && configured.cookie_secret_path.is_some() {
         tracing::warn!(
             event_type = "session_key_ambiguous",
-            cookie_secret_env = ?web.cookie_secret_env,
-            cookie_secret_path = ?web.cookie_secret_path,
+            cookie_secret_env = ?configured.cookie_secret_env,
+            cookie_secret_path = ?configured.cookie_secret_path,
             "both cookie_secret_env and cookie_secret_path are set; env takes precedence"
         );
     }
+}
 
-    if let Some(ref env_name) = web.cookie_secret_env {
-        // Distinguish "var unset" from "var set but not UTF-8": the
-        // former is a config mistake (wrong name, forgotten export),
-        // the latter is an encoding issue. One shared "not valid UTF-8"
-        // error would point operators at the wrong problem.
-        let raw = match std::env::var(env_name) {
-            Ok(v) => v,
-            Err(std::env::VarError::NotPresent) => {
-                return Err(ConfigError::EnvMissing {
-                    name: env_name.clone(),
-                });
-            }
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ConfigError::EnvUtf8 {
-                    name: env_name.clone(),
-                });
-            }
-        };
-        return SessionKey::from_base64(&raw).map_err(|_| ConfigError::EnvKey {
-            name: env_name.clone(),
-        });
-    }
-
-    if let Some(ref path) = web.cookie_secret_path {
-        let expanded = shellexpand::tilde(&path.to_string_lossy()).into_owned();
-        return SessionKey::from_file(Path::new(&expanded))
-            .map_err(|e| ConfigError::KeyFile(e.to_string()));
-    }
-
-    // No source configured — generate one but loudly warn. Sessions won't
-    // survive a proxy restart, so this is only reasonable for dev.
+/// No source configured — generate one but loudly warn. Sessions won't
+/// survive a proxy restart, so this is only reasonable for dev.
+fn ephemeral_key() -> SessionKey {
     tracing::warn!(
         event_type = "session_key_ephemeral",
         key_len = KEY_LEN,
         "no cookie_secret configured; generated an ephemeral key. sessions will not survive restart."
     );
-    Ok(SessionKey::generate())
+    SessionKey::generate()
 }
 
 #[cfg(test)]
@@ -2175,5 +3063,1187 @@ session_ttl_secs = 3600
         };
         let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
         let _ = resolved.cookie_key; // successfully loaded
+    }
+
+    // -- sources without side effects (the doctor's resolver) ---------------
+
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "fills the Option fields of RuntimeEnv"
+    )]
+    fn os(value: &str) -> Option<OsString> {
+        Some(OsString::from(value))
+    }
+
+    /// A comparable rendering of every component, values included.
+    fn summary(sources: &Sources) -> Vec<String> {
+        fn part<T>(result: &Result<T, ConfigError>, show: impl FnOnce(&T) -> String) -> String {
+            match result {
+                Ok(value) => show(value),
+                Err(error) => format!("err: {error}"),
+            }
+        }
+        vec![
+            part(&sources.public_origins, |o| {
+                format!("{:?} {}", o.from, summarize_origins(&o.origins).1)
+            }),
+            part(&sources.cookie_key, |key| match key {
+                KeySource::FleetEnv(key) => format!("fleet {}", key.to_base64url().as_str()),
+                KeySource::ConfigEnv { name } => format!("env {name}"),
+                KeySource::File { path } => format!("file {}", path.display()),
+                KeySource::None => "none".to_owned(),
+            }),
+            part(&sources.cookie_settings, |s| {
+                format!(
+                    "{} {:?} {:?} {:?} {:?} {} {:?}",
+                    s.secure,
+                    s.secure_from,
+                    s.shared_domain,
+                    s.domain_from,
+                    s.path_from,
+                    s.ttl_secs,
+                    s.ttl_from
+                )
+            }),
+            part(&sources.upstream, |u| {
+                let pin = match &u.trust {
+                    TrustSource::Pinned { path, .. } => path.display().to_string(),
+                    TrustSource::System => String::new(),
+                };
+                format!(
+                    "{} {} {:?} {:?} {:?} {pin}",
+                    u.url, u.checked_url, u.url_from, u.connect, u.trust
+                )
+            }),
+            part(&sources.bind_addr, |b| format!("{} {:?}", b.addr, b.from)),
+        ]
+    }
+
+    /// Every selection resolution can make names its source, and making it
+    /// reads no file, logs nothing, and generates no key: the key file and
+    /// the pin below do not exist, the `cookie_secret_env` variable is not
+    /// set, and every environment override that startup warns about is
+    /// present, yet no line is logged.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one assertion group per selection")]
+    fn sources_name_every_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_key = dir.path().join("absent").join("web.cookie");
+        let missing_pin = dir.path().join("absent").join("cert.pem");
+        let fleet_key = SessionKey::from_bytes([0x42; KEY_LEN]).to_base64url();
+        let resolve = |web: &WebConfig, server: Option<&ServerConfig>, env: RuntimeEnv| {
+            let (sources, lines) = captured_logs(|| {
+                Sources::resolve(web, server, RuntimeParts::from_each_variable(env))
+            });
+            assert!(lines.is_empty(), "resolution logged: {lines:?}");
+            sources
+        };
+        let srv = ServerConfig {
+            http_addr: "127.0.0.1:8080".into(),
+            ..dummy_server()
+        };
+
+        // Cookie key, in startup's precedence, with no fallback past an
+        // invalid selected source.
+        let both = WebConfig {
+            cookie_secret_env: Some("TRAWL_TEST_C2_NEVER_SET".into()),
+            cookie_secret_path: Some(missing_key.clone()),
+            ..configured_web()
+        };
+        let sources = resolve(
+            &both,
+            None,
+            RuntimeEnv {
+                aead_key: os(fleet_key.as_str()),
+                ..RuntimeEnv::default()
+            },
+        );
+        assert!(matches!(&sources.cookie_key, Ok(KeySource::FleetEnv(key))
+                if key.to_base64url().as_str() == fleet_key.as_str()));
+        let sources = resolve(
+            &both,
+            None,
+            RuntimeEnv {
+                aead_key: os("not-base64"),
+                ..RuntimeEnv::default()
+            },
+        );
+        assert!(
+            matches!(&sources.cookie_key, Err(ConfigError::EnvKey { name })
+                if name == ENV_SESSION_AEAD_KEY),
+            "{sources:?}"
+        );
+        let sources = resolve(&both, None, RuntimeEnv::default());
+        assert!(
+            matches!(&sources.cookie_key, Ok(KeySource::ConfigEnv { name })
+                if name == "TRAWL_TEST_C2_NEVER_SET")
+        );
+        let path_only = WebConfig {
+            cookie_secret_path: Some(missing_key.clone()),
+            ..configured_web()
+        };
+        let sources = resolve(&path_only, None, RuntimeEnv::default());
+        assert!(
+            matches!(&sources.cookie_key, Ok(KeySource::File { path }) if *path == missing_key)
+        );
+        // A `~` is kept as written: it expands where the file is read.
+        let tilde = WebConfig {
+            cookie_secret_path: Some("~/.trawl-c2-absent/web.cookie".into()),
+            ..configured_web()
+        };
+        let sources = resolve(&tilde, None, RuntimeEnv::default());
+        assert!(matches!(&sources.cookie_key, Ok(KeySource::File { path })
+                if *path == Path::new("~/.trawl-c2-absent/web.cookie")));
+        let sources = resolve(&configured_web(), None, RuntimeEnv::default());
+        assert!(matches!(sources.cookie_key, Ok(KeySource::None)));
+
+        // Public origins: the environment replaces the file by presence,
+        // even with the same list, and an invalid one does not fall back.
+        let two = WebConfig {
+            public_origins: vec![TEST_ORIGIN.to_owned(), "http://localhost:8090".to_owned()],
+            ..WebConfig::default()
+        };
+        let origins_env = |value: &str| RuntimeEnv {
+            public_origins: os(value),
+            ..RuntimeEnv::default()
+        };
+        let from = |sources: &Sources| {
+            sources
+                .public_origins
+                .as_ref()
+                .map(|o| (o.from, o.origins.iter().count()))
+                .map_err(ToString::to_string)
+        };
+        assert_eq!(
+            from(&resolve(&two, None, RuntimeEnv::default())),
+            Ok((OriginsFrom::File, 2))
+        );
+        assert_eq!(
+            from(&resolve(&two, None, origins_env("http://localhost:8081"))),
+            Ok((
+                OriginsFrom::Environment {
+                    replaced_file_entries: 2
+                },
+                1
+            ))
+        );
+        assert_eq!(
+            from(&resolve(&configured_web(), None, origins_env(TEST_ORIGIN))),
+            Ok((
+                OriginsFrom::Environment {
+                    replaced_file_entries: 1
+                },
+                1
+            ))
+        );
+        assert_eq!(
+            from(&resolve(
+                &WebConfig::default(),
+                None,
+                origins_env("http://localhost:8081")
+            )),
+            Ok((
+                OriginsFrom::Environment {
+                    replaced_file_entries: 0
+                },
+                1
+            ))
+        );
+        let sources = resolve(&two, None, origins_env("not-an-origin"));
+        assert!(
+            matches!(
+                sources.public_origins,
+                Err(ConfigError::SessionEnvOrigins(_))
+            ),
+            "{sources:?}"
+        );
+        let sources = resolve(&WebConfig::default(), None, RuntimeEnv::default());
+        assert!(matches!(
+            sources.public_origins,
+            Err(ConfigError::PublicOrigins {
+                source: PublicOriginsError::Empty
+            })
+        ));
+
+        // Cookie settings: each variable overrides only its own setting.
+        let settings = |sources: Sources| sources.cookie_settings.unwrap();
+        let s = settings(resolve(&configured_web(), None, RuntimeEnv::default()));
+        assert!(s.secure);
+        assert_eq!(s.secure_from, SettingSource::Default);
+        assert_eq!(s.shared_domain, None);
+        assert_eq!(s.domain_from, SettingSource::Default);
+        assert_eq!(s.path_from, SettingSource::Default);
+        assert_eq!(
+            (s.ttl_secs, s.ttl_from),
+            (DEFAULT_SESSION_TTL_SECS, SettingSource::Default)
+        );
+        let from_file = WebConfig {
+            allow_insecure_cookies: true,
+            shared_domain: Some(".fleet.example".into()),
+            session_ttl_secs: Some(3600),
+            ..configured_web()
+        };
+        let s = settings(resolve(&from_file, None, RuntimeEnv::default()));
+        assert!(!s.secure);
+        assert_eq!(s.secure_from, SettingSource::File);
+        assert_eq!(s.shared_domain.as_deref(), Some(".fleet.example"));
+        assert_eq!(s.domain_from, SettingSource::File);
+        assert_eq!((s.ttl_secs, s.ttl_from), (3600, SettingSource::File));
+        let blank_domain = WebConfig {
+            shared_domain: Some(String::new()),
+            ..configured_web()
+        };
+        let s = settings(resolve(&blank_domain, None, RuntimeEnv::default()));
+        assert_eq!(
+            (s.shared_domain, s.domain_from),
+            (None, SettingSource::Default)
+        );
+        let s = settings(resolve(
+            &from_file,
+            None,
+            RuntimeEnv {
+                cookie_secure: os("true"),
+                cookie_domain: os(""),
+                cookie_path: os("/"),
+                ..RuntimeEnv::default()
+            },
+        ));
+        assert!(s.secure);
+        assert_eq!(
+            s.secure_from,
+            SettingSource::Environment(ENV_SESSION_COOKIE_SECURE)
+        );
+        assert_eq!(s.shared_domain, None, "an empty variable forces host-only");
+        assert_eq!(
+            s.domain_from,
+            SettingSource::Environment(ENV_SESSION_COOKIE_DOMAIN)
+        );
+        assert_eq!(
+            s.path_from,
+            SettingSource::Environment(ENV_SESSION_COOKIE_PATH)
+        );
+        let s = settings(resolve(
+            &from_file,
+            None,
+            RuntimeEnv {
+                cookie_domain: os(".new.example"),
+                ..RuntimeEnv::default()
+            },
+        ));
+        assert_eq!(s.shared_domain.as_deref(), Some(".new.example"));
+        let sources = resolve(
+            &configured_web(),
+            None,
+            RuntimeEnv {
+                cookie_path: os("/app"),
+                ..RuntimeEnv::default()
+            },
+        );
+        assert!(
+            matches!(&sources.cookie_settings, Err(ConfigError::SessionEnvValue { name, .. })
+                if *name == ENV_SESSION_COOKIE_PATH),
+            "{sources:?}"
+        );
+
+        // Upstream URL: the file, trawld's address (its override first),
+        // or the fallback.
+        let url_from = |sources: &Sources| {
+            let upstream = sources.upstream.as_ref().unwrap();
+            (upstream.url.clone(), upstream.url_from)
+        };
+        let explicit = WebConfig {
+            upstream_url: Some("https://trawld.internal:9000".into()),
+            ..configured_web()
+        };
+        assert_eq!(
+            url_from(&resolve(&explicit, Some(&srv), RuntimeEnv::default())),
+            (
+                "https://trawld.internal:9000".to_owned(),
+                SettingSource::File
+            )
+        );
+        let http_addr = |value: &str| RuntimeEnv {
+            http_addr: os(value),
+            ..RuntimeEnv::default()
+        };
+        assert_eq!(
+            url_from(&resolve(
+                &configured_web(),
+                Some(&srv),
+                http_addr("0.0.0.0:9999")
+            )),
+            (
+                "https://127.0.0.1:9999".to_owned(),
+                SettingSource::DerivedFromEnvironment(ENV_HTTP_ADDR)
+            )
+        );
+        assert_eq!(
+            url_from(&resolve(&configured_web(), Some(&srv), http_addr(""))),
+            (
+                "https://127.0.0.1:8080".to_owned(),
+                SettingSource::DerivedFromFile
+            )
+        );
+        assert_eq!(
+            url_from(&resolve(&configured_web(), None, http_addr("0.0.0.0:9999"))),
+            (FALLBACK_UPSTREAM_URL.to_owned(), SettingSource::Default)
+        );
+
+        // Trust: the pin is named, never read, and an empty path refuses.
+        let trust = |sources: Sources| sources.upstream.map(|u| u.trust);
+        let pinned_in_file = WebConfig {
+            upstream_ca_path: Some(missing_pin.clone()),
+            ..configured_web()
+        };
+        assert_eq!(
+            trust(resolve(&pinned_in_file, None, RuntimeEnv::default())).unwrap(),
+            TrustSource::Pinned {
+                path: missing_pin.clone(),
+                from: SettingSource::File
+            }
+        );
+        let other_pin = dir.path().join("other.pem");
+        let ca_env = |value: &OsStr| RuntimeEnv {
+            upstream_ca_path: Some(value.to_owned()),
+            ..RuntimeEnv::default()
+        };
+        assert_eq!(
+            trust(resolve(
+                &pinned_in_file,
+                None,
+                ca_env(other_pin.as_os_str())
+            ))
+            .unwrap(),
+            TrustSource::Pinned {
+                path: other_pin,
+                from: SettingSource::Environment(ENV_UPSTREAM_CA_PATH)
+            }
+        );
+        assert_eq!(
+            trust(resolve(&pinned_in_file, None, ca_env(OsStr::new("")))).unwrap(),
+            TrustSource::Pinned {
+                path: missing_pin,
+                from: SettingSource::File
+            }
+        );
+        assert_eq!(
+            trust(resolve(&configured_web(), None, RuntimeEnv::default())).unwrap(),
+            TrustSource::System
+        );
+        let empty_pin = WebConfig {
+            upstream_ca_path: Some(PathBuf::new()),
+            ..configured_web()
+        };
+        assert!(matches!(
+            trust(resolve(&empty_pin, None, RuntimeEnv::default())),
+            Err(ConfigError::UpstreamCa { .. })
+        ));
+        let connected = WebConfig {
+            upstream_url: Some("https://trawl.test:5514".into()),
+            upstream_connect_addr: Some("127.0.0.1:5514".into()),
+            ..configured_web()
+        };
+        let sources = resolve(&connected, None, RuntimeEnv::default());
+        assert_eq!(
+            sources.upstream.unwrap().connect,
+            Some(UpstreamConnect {
+                host: "trawl.test".to_owned(),
+                addr: "127.0.0.1:5514".parse().unwrap(),
+            })
+        );
+
+        // Bind address: the variable, the file, or the default.
+        let bind = |web: &WebConfig, env: RuntimeEnv| resolve(web, None, env).bind_addr.unwrap();
+        let bound = WebConfig {
+            bind_addr: Some("127.0.0.1:9000".into()),
+            ..configured_web()
+        };
+        assert_eq!(
+            bind(
+                &bound,
+                RuntimeEnv {
+                    bind_addr: os("0.0.0.0:9091"),
+                    ..RuntimeEnv::default()
+                }
+            ),
+            BindAddr {
+                addr: "0.0.0.0:9091".into(),
+                from: SettingSource::Environment(ENV_BIND_ADDR)
+            }
+        );
+        assert_eq!(
+            bind(&bound, RuntimeEnv::default()),
+            BindAddr {
+                addr: "127.0.0.1:9000".into(),
+                from: SettingSource::File
+            }
+        );
+        assert_eq!(
+            bind(&configured_web(), RuntimeEnv::default()),
+            BindAddr {
+                addr: DEFAULT_BIND_ADDR.into(),
+                from: SettingSource::Default
+            }
+        );
+    }
+
+    /// `Sources` and its parts show sources and shapes, never the URL, a
+    /// host, an origin, the shared domain, the key, its variable's name or
+    /// path, the pin path or the listen address, whichever source each came
+    /// from.
+    #[test]
+    fn sources_debug_shows_no_configured_value() {
+        const SENTINEL: &str = "s3ntinel";
+        let fleet_key = SessionKey::from_bytes([0x42; KEY_LEN]).to_base64url();
+        let web = WebConfig {
+            public_origins: vec![format!("https://{SENTINEL}.example")],
+            upstream_url: Some(format!("https://{SENTINEL}.internal:5514")),
+            upstream_connect_addr: Some("127.0.0.9:5514".into()),
+            upstream_ca_path: Some(format!("/{SENTINEL}/ca.pem").into()),
+            shared_domain: Some(format!(".{SENTINEL}.example")),
+            cookie_secret_env: Some(SENTINEL.into()),
+            bind_addr: Some(format!("{SENTINEL}.bind:9000")),
+            ..WebConfig::default()
+        };
+        // The upstream derived from the server's address, and the key read
+        // from a file.
+        let derived = WebConfig {
+            upstream_url: None,
+            upstream_connect_addr: None,
+            cookie_secret_env: None,
+            cookie_secret_path: Some(format!("/{SENTINEL}/web.cookie").into()),
+            ..web.clone()
+        };
+        let server = ServerConfig {
+            http_addr: format!("{SENTINEL}.srv:5514"),
+            ..dummy_server()
+        };
+        let cases = [
+            (&web, None, RuntimeEnv::default()),
+            (
+                &web,
+                None,
+                RuntimeEnv {
+                    aead_key: os(fleet_key.as_str()),
+                    ..RuntimeEnv::default()
+                },
+            ),
+            (
+                &web,
+                None,
+                RuntimeEnv {
+                    public_origins: os(&format!("https://{SENTINEL}.example,{SENTINEL}")),
+                    ..RuntimeEnv::default()
+                },
+            ),
+            (
+                &web,
+                None,
+                RuntimeEnv {
+                    bind_addr: os(&format!("{SENTINEL}.env:9091")),
+                    upstream_ca_path: os(&format!("/{SENTINEL}/env-ca.pem")),
+                    ..RuntimeEnv::default()
+                },
+            ),
+            (&derived, Some(&server), RuntimeEnv::default()),
+            (
+                &derived,
+                Some(&server),
+                RuntimeEnv {
+                    http_addr: os(&format!("{SENTINEL}.env:5514")),
+                    ..RuntimeEnv::default()
+                },
+            ),
+        ];
+        for (web, server, env) in cases {
+            let env_debug = format!("{env:?}");
+            let parts = RuntimeParts::from_each_variable(env);
+            let parts_debug = format!("{parts:?}");
+            let sources = Sources::resolve(web, server, parts);
+            assert!(sources.bind_addr.is_ok(), "{sources:?}");
+            assert!(sources.upstream.is_ok(), "{sources:?}");
+            for rendered in [env_debug, parts_debug, format!("{sources:?}")] {
+                assert!(!rendered.contains(SENTINEL), "{rendered}");
+                assert!(!rendered.contains(fleet_key.as_str()), "{rendered}");
+                assert!(!rendered.contains("127.0.0.9"), "{rendered}");
+            }
+        }
+    }
+
+    /// `Sources::resolve` keeps the key and pin paths as written and looks
+    /// nothing up, whatever home directory the process has.
+    #[test]
+    fn resolve_keeps_tilde_paths_as_written() {
+        let web = WebConfig {
+            cookie_secret_path: Some("~/web.cookie".into()),
+            ..configured_web()
+        };
+        let sources = Sources::resolve(
+            &web,
+            None,
+            RuntimeParts::from_each_variable(RuntimeEnv {
+                upstream_ca_path: os("~/tls/cert.pem"),
+                ..RuntimeEnv::default()
+            }),
+        );
+        assert!(
+            matches!(&sources.cookie_key, Ok(KeySource::File { path })
+                if *path == Path::new("~/web.cookie")),
+            "{sources:?}"
+        );
+        assert!(
+            matches!(&sources.upstream, Ok(UpstreamPlan {
+                    trust: TrustSource::Pinned { path, .. },
+                    ..
+                }) if *path == Path::new("~/tls/cert.pem")),
+            "{sources:?}"
+        );
+    }
+
+    /// Startup expands `~` exactly where it always did: in the key file's
+    /// path as the key is read, and in the pin's path as the pin is read,
+    /// each after every earlier check passed. So an error that comes
+    /// earlier in startup's order is returned before any home directory is
+    /// looked up, however many `~` paths the configuration holds; with
+    /// `HOME` unset, that lookup can wait on the user database. `expand`
+    /// records each path it is asked for and expands against a stated home.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one table row per error startup returns"
+    )]
+    fn startup_expands_tilde_only_where_each_file_is_read() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        struct Case {
+            name: String,
+            web: WebConfig,
+            env: RuntimeEnv,
+            /// The error startup returns, as its text.
+            error: String,
+            /// The paths expanded before it, in order.
+            expanded: Vec<&'static str>,
+        }
+        /// A `FLEET_SESSION_*` variable, the environment holding a value in
+        /// it alone, and a value it refuses.
+        type Fleet = (
+            &'static str,
+            fn(Option<OsString>) -> RuntimeEnv,
+            &'static str,
+        );
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("cookie.key"), [0x24; KEY_LEN]).unwrap();
+        std::fs::write(home.path().join("ca.pem"), test_ca_pem()).unwrap();
+        let home_dir = home.path().to_str().unwrap().to_owned();
+        let startup = |web: &WebConfig, env: RuntimeEnv| {
+            let mut asked = Vec::new();
+            let result = ResolvedConfig::startup(web, None, env, |path: &Path| {
+                asked.push(path.to_owned());
+                let text = path.to_string_lossy();
+                PathBuf::from(
+                    shellexpand::tilde_with_context(&text, || Some(home_dir.as_str())).into_owned(),
+                )
+            });
+            (result, asked)
+        };
+        let tilde_paths = WebConfig {
+            cookie_secret_path: Some("~/cookie.key".into()),
+            upstream_ca_path: Some("~/ca.pem".into()),
+            ..configured_web()
+        };
+        let not_utf8 = || Some(OsString::from_vec(vec![b'/', 0xff]));
+
+        let mut cases = vec![
+            Case {
+                name: "an invalid origin, before the key file".into(),
+                web: WebConfig {
+                    public_origins: vec!["not-an-origin".into()],
+                    ..tilde_paths.clone()
+                },
+                env: RuntimeEnv::default(),
+                error: String::new(),
+                expanded: vec![],
+            },
+            Case {
+                name: "a missing cookie_secret_env variable, before the pin".into(),
+                web: WebConfig {
+                    cookie_secret_env: Some("TRAWL_TEST_C2_NEVER_SET".into()),
+                    ..tilde_paths.clone()
+                },
+                env: RuntimeEnv::default(),
+                error: ConfigError::EnvMissing {
+                    name: "TRAWL_TEST_C2_NEVER_SET".into(),
+                }
+                .to_string(),
+                expanded: vec![],
+            },
+            Case {
+                name: "an upstream URL that is not https, after the key file".into(),
+                web: WebConfig {
+                    upstream_url: Some("http://trawld:5514".into()),
+                    ..tilde_paths.clone()
+                },
+                env: RuntimeEnv::default(),
+                error: String::new(),
+                expanded: vec!["~/cookie.key"],
+            },
+            Case {
+                name: "a connect address that is not an address, before the pin".into(),
+                web: WebConfig {
+                    upstream_url: Some("https://trawld:5514".into()),
+                    upstream_connect_addr: Some("trawld".into()),
+                    cookie_secret_path: None,
+                    ..tilde_paths.clone()
+                },
+                env: RuntimeEnv::default(),
+                error: String::new(),
+                expanded: vec![],
+            },
+            Case {
+                name: "a CA path variable that is not UTF-8, before the pin".into(),
+                web: tilde_paths.clone(),
+                env: RuntimeEnv {
+                    upstream_ca_path: not_utf8(),
+                    ..RuntimeEnv::default()
+                },
+                error: ConfigError::EnvUtf8 {
+                    name: ENV_UPSTREAM_CA_PATH.into(),
+                }
+                .to_string(),
+                expanded: vec!["~/cookie.key"],
+            },
+            Case {
+                name: "a listen address that is not UTF-8, after both files".into(),
+                web: tilde_paths.clone(),
+                env: RuntimeEnv {
+                    bind_addr: not_utf8(),
+                    ..RuntimeEnv::default()
+                },
+                error: ConfigError::EnvUtf8 {
+                    name: ENV_BIND_ADDR.into(),
+                }
+                .to_string(),
+                expanded: vec!["~/cookie.key", "~/ca.pem"],
+            },
+        ];
+        // Every invalid `FLEET_SESSION_*` variable refuses first, with the
+        // whole parse's own error.
+        let fleet: [Fleet; 5] = [
+            (
+                ENV_SESSION_AEAD_KEY,
+                |v| RuntimeEnv {
+                    aead_key: v,
+                    ..RuntimeEnv::default()
+                },
+                "not-base64",
+            ),
+            (
+                ENV_SESSION_COOKIE_DOMAIN,
+                |v| RuntimeEnv {
+                    cookie_domain: v,
+                    ..RuntimeEnv::default()
+                },
+                "bad domain",
+            ),
+            (
+                ENV_SESSION_COOKIE_PATH,
+                |v| RuntimeEnv {
+                    cookie_path: v,
+                    ..RuntimeEnv::default()
+                },
+                "/other",
+            ),
+            (
+                ENV_SESSION_COOKIE_SECURE,
+                |v| RuntimeEnv {
+                    cookie_secure: v,
+                    ..RuntimeEnv::default()
+                },
+                "maybe",
+            ),
+            (
+                ENV_SESSION_PUBLIC_ORIGINS,
+                |v| RuntimeEnv {
+                    public_origins: v,
+                    ..RuntimeEnv::default()
+                },
+                "not-an-origin",
+            ),
+        ];
+        for (name, env, invalid) in fleet {
+            for (how, value) in [("invalid", os(invalid)), ("not UTF-8", not_utf8())] {
+                let error = RuntimeParts::from_whole_parse(env(value.clone()))
+                    .map(|_| ())
+                    .expect_err("the whole parse refuses")
+                    .to_string();
+                cases.push(Case {
+                    name: format!("{name} {how}"),
+                    web: tilde_paths.clone(),
+                    env: env(value),
+                    error,
+                    expanded: vec![],
+                });
+            }
+        }
+
+        for case in cases {
+            let (result, asked) = startup(&case.web, case.env);
+            let error = result.map(|_| ()).expect_err(&case.name).to_string();
+            let expected = if case.error.is_empty() {
+                // The component's own error, as resolution records it.
+                let sources = Sources::resolve(
+                    &case.web,
+                    None,
+                    RuntimeParts::from_each_variable(RuntimeEnv::default()),
+                );
+                [
+                    sources.public_origins.as_ref().err(),
+                    sources.upstream.as_ref().err(),
+                ]
+                .into_iter()
+                .flatten()
+                .next()
+                .unwrap_or_else(|| panic!("{}: no component error", case.name))
+                .to_string()
+            } else {
+                case.error
+            };
+            assert_eq!(error, expected, "{}", case.name);
+            let expanded: Vec<PathBuf> = case.expanded.iter().map(PathBuf::from).collect();
+            assert_eq!(asked, expanded, "{}: {error}", case.name);
+        }
+
+        // With every check passing, both paths expand, key first, and the
+        // files at the expanded paths are the ones read.
+        let (result, asked) = startup(&tilde_paths, RuntimeEnv::default());
+        let resolved = result.expect("startup resolves");
+        assert_eq!(
+            asked,
+            [PathBuf::from("~/cookie.key"), PathBuf::from("~/ca.pem")]
+        );
+        assert_eq!(
+            resolved.cookie_key.to_base64url().as_str(),
+            SessionKey::from_bytes([0x24; KEY_LEN])
+                .to_base64url()
+                .as_str()
+        );
+        assert!(
+            matches!(&resolved.upstream_tls, UpstreamTls::PinnedCa { path, roots: Some(_) }
+                if *path == home.path().join("ca.pem")),
+            "{:?}",
+            resolved.upstream_tls
+        );
+
+        // The expansion startup uses is `shellexpand::tilde`'s, unchanged:
+        // the pin below does not exist, so startup keeps its expanded path.
+        let pin = "~/.trawl-c2-absent/tls/cert.pem";
+        let expected = PathBuf::from(shellexpand::tilde(pin).as_ref());
+        assert!(
+            !expected.starts_with("~"),
+            "no home directory to expand into"
+        );
+        assert_eq!(expand_tilde(Path::new(pin)), expected);
+        let mut asked = Vec::new();
+        let resolved = ResolvedConfig::startup(
+            &WebConfig {
+                upstream_ca_path: Some(pin.into()),
+                ..configured_web()
+            },
+            None,
+            RuntimeEnv::default(),
+            |path: &Path| {
+                asked.push(path.to_owned());
+                expand_tilde(path)
+            },
+        )
+        .expect("a missing pin is pending");
+        assert_eq!(asked, [PathBuf::from(pin)]);
+        assert!(
+            matches!(&resolved.upstream_tls, UpstreamTls::PinnedCa { path, roots: None }
+                if *path == expected),
+            "{:?}",
+            resolved.upstream_tls
+        );
+    }
+
+    /// Each variable parsed alone gets the result the whole parse gives it:
+    /// when the whole parse succeeds, every part holds its value, and when
+    /// it fails, its error is the first failing part's, in the parser's
+    /// order (key, path, secure, domain, origins).
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one table row per case")]
+    fn runtime_parts_agree_with_the_whole_parse() {
+        type Observed = (
+            Result<Option<String>, String>,
+            Result<RuntimeCookieDomain, String>,
+            Result<bool, String>,
+            Result<Option<bool>, String>,
+            Result<Option<Vec<String>>, String>,
+        );
+        fn observed(parts: &RuntimeParts) -> Observed {
+            let err = |e: &ConfigError| e.to_string();
+            (
+                parts
+                    .key
+                    .as_ref()
+                    .map(|k| k.as_ref().map(|k| k.to_base64url().to_string()))
+                    .map_err(err),
+                parts.domain.as_ref().cloned().map_err(err),
+                parts.path_set.as_ref().copied().map_err(err),
+                parts.secure.as_ref().copied().map_err(err),
+                parts
+                    .public_origins
+                    .as_ref()
+                    .map(|o| {
+                        o.as_ref()
+                            .map(|o| o.iter().map(ToString::to_string).collect())
+                    })
+                    .map_err(err),
+            )
+        }
+        fn env(row: [Option<&str>; 5]) -> RuntimeEnv {
+            let [
+                aead_key,
+                cookie_domain,
+                cookie_path,
+                cookie_secure,
+                public_origins,
+            ] = row.map(|value| value.map(OsString::from));
+            RuntimeEnv {
+                aead_key,
+                cookie_domain,
+                cookie_path,
+                cookie_secure,
+                public_origins,
+                ..RuntimeEnv::default()
+            }
+        }
+
+        let key = SessionKey::from_bytes([0x07; KEY_LEN]).to_base64url();
+        let key = Some(key.as_str());
+        let rows: [[Option<&str>; 5]; 13] = [
+            [None; 5],
+            [
+                key,
+                Some(""),
+                Some("/"),
+                Some("true"),
+                Some("https://a.example"),
+            ],
+            [
+                key,
+                Some(".fleet.example"),
+                None,
+                Some("false"),
+                Some("http://localhost:8090,https://b.example:443"),
+            ],
+            [Some("not-base64"), None, None, None, None],
+            [None, Some("bad domain"), None, None, None],
+            [None, None, Some("/app"), None, None],
+            [None, None, None, Some("yes"), None],
+            [None, None, None, None, Some("not-an-origin")],
+            [None, None, None, None, Some("")],
+            [
+                None,
+                None,
+                None,
+                None,
+                Some("https://a.example,https://a.example:443"),
+            ],
+            // Several invalid at once: the whole parse names the first in
+            // its order, each part its own.
+            [
+                Some("not-base64"),
+                Some("bad domain"),
+                Some("/app"),
+                Some("yes"),
+                Some(""),
+            ],
+            [None, Some("bad domain"), Some("/app"), Some("yes"), None],
+            [key, Some("bad domain"), None, Some("yes"), Some("x")],
+        ];
+        for row in rows {
+            let each = RuntimeParts::from_each_variable(env(row));
+            let seen = observed(&each);
+            let whole = SessionRuntimeOverrides::parse(
+                row[0].map(str::to_owned),
+                row[1].map(str::to_owned),
+                row[2].map(str::to_owned),
+                row[3].map(str::to_owned),
+                row[4].map(str::to_owned),
+            );
+            match whole {
+                Ok(overrides) => {
+                    let expected: Observed = (
+                        Ok(overrides.key.as_ref().map(|k| k.to_base64url().to_string())),
+                        Ok(overrides.domain.clone()),
+                        Ok(row[2].is_some()),
+                        Ok(overrides.secure),
+                        Ok(overrides
+                            .public_origins
+                            .as_ref()
+                            .map(|o| o.iter().map(ToString::to_string).collect())),
+                    );
+                    assert_eq!(seen, expected, "{row:?}");
+                    let startup = RuntimeParts::from_whole_parse(env(row))
+                        .unwrap_or_else(|e| panic!("{row:?}: {e}"));
+                    assert_eq!(observed(&startup), expected, "{row:?}");
+                }
+                Err(error) => {
+                    let expected = ConfigError::from(error).to_string();
+                    let first = [
+                        seen.0.as_ref().err(),
+                        seen.2.as_ref().err(),
+                        seen.3.as_ref().err(),
+                        seen.1.as_ref().err(),
+                        seen.4.as_ref().err(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .next();
+                    assert_eq!(first, Some(&expected), "{row:?}: {seen:?}");
+                    let startup = RuntimeParts::from_whole_parse(env(row))
+                        .expect_err("the whole parse refuses");
+                    assert_eq!(startup.to_string(), expected, "{row:?}");
+                }
+            }
+        }
+    }
+
+    /// A value that is not UTF-8 refuses the whole parse before any value
+    /// is parsed, as fleet-auth's `from_process_env` does, and fails only
+    /// its own part when each variable is parsed alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_fleet_variable_refuses_first_and_alone() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let not_utf8 = || Some(OsString::from_vec(vec![b'/', 0xff]));
+        let env = || RuntimeEnv {
+            aead_key: os("not-base64"),
+            cookie_domain: not_utf8(),
+            cookie_secure: os("true"),
+            ..RuntimeEnv::default()
+        };
+        let error = RuntimeParts::from_whole_parse(env()).expect_err("refuses");
+        assert!(
+            matches!(&error, ConfigError::EnvUtf8 { name } if name == ENV_SESSION_COOKIE_DOMAIN),
+            "{error:?}"
+        );
+        let each = RuntimeParts::from_each_variable(env());
+        assert!(matches!(&each.key, Err(ConfigError::EnvKey { .. })));
+        assert!(
+            matches!(&each.domain, Err(ConfigError::EnvUtf8 { name }) if name == ENV_SESSION_COOKIE_DOMAIN)
+        );
+        assert!(matches!(each.secure, Ok(Some(true))));
+        assert!(matches!(each.path_set, Ok(false)));
+    }
+
+    /// Startup and the doctor run one resolver. Given the same file and the
+    /// same valid environment, the whole parse and the per-variable parse
+    /// select the same values from the same sources, and startup's
+    /// `from_sources` runs on exactly those values. An invalid variable
+    /// stops startup with the error the doctor's matching component
+    /// carries, and fails only that component.
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one resolver, compared end to end")]
+    fn startup_and_doctor_share_resolve() {
+        /// The environment for one case, given the Fleet key to use.
+        type EnvFor = fn(&str) -> RuntimeEnv;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("web.cookie");
+        std::fs::write(&key_path, [0x24; KEY_LEN]).unwrap();
+        let ca_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_path, test_ca_pem()).unwrap();
+        let fleet_key = SessionKey::from_bytes([0x42; KEY_LEN]).to_base64url();
+        let srv = ServerConfig {
+            http_addr: "0.0.0.0:5514".into(),
+            ..dummy_server()
+        };
+        let file = WebConfig {
+            public_origins: vec![TEST_ORIGIN.to_owned()],
+            cookie_secret_path: Some(key_path),
+            shared_domain: Some(".fleet.example".into()),
+            session_ttl_secs: Some(3600),
+            upstream_url: Some("https://trawl.test:5514/prefix".into()),
+            upstream_connect_addr: Some("127.0.0.1:5514".into()),
+            upstream_ca_path: Some(ca_path.clone()),
+            bind_addr: Some("127.0.0.1:9000".into()),
+            ..WebConfig::default()
+        };
+        let cases: [(&str, WebConfig, EnvFor); 3] = [
+            ("file only", file.clone(), |_| RuntimeEnv::default()),
+            ("every override", file, |key| RuntimeEnv {
+                aead_key: os(key),
+                cookie_domain: os(""),
+                cookie_path: os("/"),
+                cookie_secure: os("false"),
+                public_origins: os("http://localhost:8081"),
+                bind_addr: os("0.0.0.0:9091"),
+                upstream_ca_path: None,
+                http_addr: os("127.0.0.1:6000"),
+            }),
+            ("derived upstream", configured_web(), |key| RuntimeEnv {
+                aead_key: os(key),
+                http_addr: os("[::1]:6000"),
+                ..RuntimeEnv::default()
+            }),
+        ];
+        for (case, web, env) in cases {
+            let startup = Sources::resolve(
+                &web,
+                Some(&srv),
+                RuntimeParts::from_whole_parse(env(fleet_key.as_str())).unwrap(),
+            );
+            let doctor = Sources::resolve(
+                &web,
+                Some(&srv),
+                RuntimeParts::from_each_variable(env(fleet_key.as_str())),
+            );
+            let selected = summary(&startup);
+            assert_eq!(selected, summary(&doctor), "{case}");
+
+            let settings = startup.cookie_settings.as_ref().unwrap();
+            let (secure, shared_domain, ttl_secs) = (
+                settings.secure,
+                settings.shared_domain.clone(),
+                settings.ttl_secs,
+            );
+            let upstream = startup.upstream.as_ref().unwrap();
+            let (url, connect, pinned) = (
+                upstream.url.clone(),
+                upstream.connect.clone(),
+                matches!(upstream.trust, TrustSource::Pinned { .. }),
+            );
+            let bind = startup.bind_addr.as_ref().unwrap().addr.clone();
+            let origins = startup.public_origins.as_ref().unwrap().origins.clone();
+            let key = match startup.cookie_key.as_ref().unwrap() {
+                KeySource::FleetEnv(_) => fleet_key.to_string(),
+                KeySource::File { .. } => SessionKey::from_bytes([0x24; KEY_LEN])
+                    .to_base64url()
+                    .to_string(),
+                other => panic!("{case}: {other:?}"),
+            };
+
+            let resolved =
+                ResolvedConfig::from_sources(startup).unwrap_or_else(|e| panic!("{case}: {e}"));
+            assert_eq!(resolved.bind_addr, bind, "{case}");
+            assert_eq!(resolved.upstream_url, url, "{case}");
+            assert_eq!(resolved.upstream_connect, connect, "{case}");
+            assert_eq!(
+                matches!(
+                    resolved.upstream_tls,
+                    UpstreamTls::PinnedCa { roots: Some(_), .. }
+                ),
+                pinned,
+                "{case}"
+            );
+            assert_eq!(resolved.session_ttl_secs, ttl_secs, "{case}");
+            assert_eq!(resolved.allow_insecure_cookies, !secure, "{case}");
+            assert_eq!(resolved.shared_domain, shared_domain, "{case}");
+            assert_eq!(resolved.public_origins, origins, "{case}");
+            assert_eq!(resolved.cookie_key.to_base64url().as_str(), key, "{case}");
+        }
+
+        // A component error reaches startup unchanged, in startup's order.
+        let broken = WebConfig {
+            upstream_url: Some("http://trawld:5514".into()),
+            bind_addr: Some("127.0.0.1:9000".into()),
+            ..WebConfig::default()
+        };
+        let sources = Sources::resolve(
+            &broken,
+            None,
+            RuntimeParts::from_whole_parse(RuntimeEnv::default()).unwrap(),
+        );
+        let upstream_error = sources
+            .upstream
+            .as_ref()
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        let origins_error = sources
+            .public_origins
+            .as_ref()
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        let error = ResolvedConfig::from_sources(sources).expect_err("both refuse");
+        assert_eq!(error.to_string(), origins_error, "origins come first");
+        assert_ne!(origins_error, upstream_error);
+
+        // An invalid variable stops startup; the doctor fails only the
+        // component it feeds, with the same error.
+        let bad_key = || RuntimeEnv {
+            aead_key: os("not-base64"),
+            ..RuntimeEnv::default()
+        };
+        let startup = RuntimeParts::from_whole_parse(bad_key()).expect_err("startup refuses");
+        let doctor = Sources::resolve(
+            &configured_web(),
+            None,
+            RuntimeParts::from_each_variable(bad_key()),
+        );
+        assert_eq!(
+            doctor
+                .cookie_key
+                .as_ref()
+                .map(|_| ())
+                .unwrap_err()
+                .to_string(),
+            startup.to_string()
+        );
+        assert!(doctor.public_origins.is_ok());
+        assert!(doctor.cookie_settings.is_ok());
+        assert!(doctor.upstream.is_ok());
+        assert!(doctor.bind_addr.is_ok());
+    }
+
+    /// The capped reader refuses a file past its cap, a directory and a
+    /// FIFO with no writer, the last without waiting, and keeps the kind of
+    /// an open error.
+    #[test]
+    fn read_capped_file_refuses_past_its_cap_and_never_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web.cookie");
+        std::fs::write(&path, [0x42; KEY_LEN + 1]).unwrap();
+        assert_eq!(
+            read_capped_file(&path, KEY_LEN as u64 + 1).unwrap().len(),
+            KEY_LEN + 1
+        );
+        let error = read_capped_file(&path, KEY_LEN as u64).expect_err("past the cap");
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        let error = read_capped_file(dir.path(), 1024).expect_err("a directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let error = read_capped_file(&dir.path().join("absent"), 1024).expect_err("a missing file");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        // The secret reader refuses the same things, and reads into the
+        // one buffer it allocated first: one byte past the cap, never
+        // grown, so no reallocation leaves an unscrubbed copy behind.
+        let secret = read_capped_secret(&path, KEY_LEN as u64 + 1).unwrap();
+        assert_eq!(*secret, [0x42; KEY_LEN + 1]);
+        assert_eq!(secret.capacity(), KEY_LEN + 2);
+        let error = read_capped_secret(&path, KEY_LEN as u64).expect_err("past the cap");
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        let error = read_capped_secret(dir.path(), 1024).expect_err("a directory");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        let error =
+            read_capped_secret(&dir.path().join("absent"), 1024).expect_err("a missing file");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("fifo");
+            let status = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .expect("run mkfifo");
+            assert!(status.success(), "mkfifo: {status}");
+            let error = read_capped_file(&fifo, 1024).expect_err("a FIFO");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 }
