@@ -197,17 +197,18 @@ impl RootSeen {
 
 /// `server.data.root`: the root is a directory, or boot creates it, and the
 /// running user may read it and, on an ingest node, write it. On an ingest
-/// node whose WAL directory is outside the data root, the same holds for
-/// the WAL directory, which boot creates when it is absent. The only access
+/// node the same holds for the effective WAL directory, which boot creates
+/// when it is absent, wherever it is: a path under the data root may leave
+/// it through `..` or a symlink, and access to the root proves nothing
+/// about a child that exists. The row reports the root's failure first and
+/// looks at the WAL directory only when the root holds. The only access
 /// check. Unless `ask_access`, as in a root run, only the structural half
 /// is evaluated: each directory is a directory, or absent below a directory
 /// boot could create it in. When that holds the row is `not_sampled`,
 /// reason `ran_as_root`, and the checks that wait on it still look.
 async fn check_root(data_root: PathBuf, wal_dir: PathBuf, ingest: bool, ask_access: bool) -> Row {
     let check = ServerCheck::DataRoot;
-    // A WAL directory inside the data root is what the root's own access
-    // covers; boot creates one outside it on its own.
-    let wal_dir = (ingest && !wal_dir.starts_with(&data_root)).then_some(wal_dir);
+    let wal_dir = ingest.then_some(wal_dir);
     let observed = look(move || {
         let root = observe_root(&data_root, ingest, ask_access);
         let wal = wal_dir
@@ -224,8 +225,8 @@ async fn check_root(data_root: PathBuf, wal_dir: PathBuf, ingest: bool, ask_acce
     }
 }
 
-/// The `server.data.root` row for what was seen at a WAL directory outside
-/// the data root, or `None` when it [holds](RootSeen::holds). Boot creates
+/// The `server.data.root` row for what was seen at the WAL directory, or
+/// `None` when it [holds](RootSeen::holds). Boot creates
 /// it as it creates the data root, so it is judged the same way: R, W and
 /// X on it, or W and X on the nearest directory above it.
 fn wal_row(seen: RootSeen) -> Option<Row> {
@@ -1788,8 +1789,8 @@ mod tests {
         }
     }
 
-    /// `server.data.root` over `data_root`, with the WAL directory inside
-    /// it where the root's own access covers it.
+    /// `server.data.root` over `data_root`, with the WAL directory at its
+    /// default place inside it.
     async fn root_check(data_root: PathBuf, ingest: bool, ask_access: bool) -> Row {
         let wal_dir = data_root.join("wal");
         check_root(data_root, wal_dir, ingest, ask_access).await
@@ -1887,9 +1888,12 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).unwrap();
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // The WAL directory sits beside the root: a real root run looks it
+        // up through a root it may enter, and this run is not root.
+        let wal = tmp.path().join("wal");
         let mut rows = Vec::new();
         for ingest in [false, true] {
-            rows.push(root_check(data.clone(), ingest, false).await);
+            rows.push(check_root(data.clone(), wal.clone(), ingest, false).await);
         }
         rows.push(root_check(sealed.join("data"), true, false).await);
         let asked = root_check(data.clone(), false, true).await;
@@ -2070,5 +2074,76 @@ mod tests {
         for wal in [file.join("wal"), dangling.join("wal")] {
             assert!(!boot_creates_wal(&wal), "boot created {wal:?}");
         }
+    }
+
+    /// A WAL path that starts with the data root is judged on its own: `..`
+    /// or a symlink takes it out of the root, and a child that exists has
+    /// its own modes. When the root fails too, the row reports the root's
+    /// failure once. A privileged user may do everything the modes forbid;
+    /// the test asserts whichever the running user is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wal_directory_under_the_root_path_is_judged_on_its_own() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let privileged = privileged_over(&tmp);
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let unwritable = tmp.path().join("unwritable");
+        std::fs::create_dir(&unwritable).unwrap();
+        let sealed = tmp.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        let child = data.join("wal");
+        std::fs::create_dir(&child).unwrap();
+        let link = data.join("link");
+        std::os::unix::fs::symlink(&unwritable, &link).unwrap();
+        let write = "the running user cannot write the WAL directory";
+        let cases = [
+            ("escapes through ..", data.join("../unwritable"), write),
+            (
+                "absent, escapes through ..",
+                data.join("../sealed/wal"),
+                "the running user cannot create the WAL directory in the directory above it",
+            ),
+            ("a symlink under the root", link.clone(), write),
+            ("an unwritable child of the root", child.clone(), write),
+        ];
+        for dir in [&unwritable, &sealed, &child] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let mut seen = Vec::new();
+        for (name, wal, _) in &cases {
+            let asked = check_root(data.clone(), wal.clone(), true, true).await;
+            let root_run = check_root(data.clone(), wal.clone(), true, false).await;
+            seen.push((*name, asked, root_run));
+        }
+        // The data root fails as well: its failure is the row's.
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let both = check_root(data.clone(), data.join("../unwritable"), true, true).await;
+        for dir in [&data, &unwritable, &sealed, &child] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        for ((name, asked, root_run), (_, _, why)) in seen.into_iter().zip(cases) {
+            let expected = if privileged {
+                (Outcome::Complete, None)
+            } else {
+                (Outcome::Failed, Some(why))
+            };
+            assert_eq!((asked.outcome(), asked.reason()), expected, "{name}");
+            assert_eq!(
+                (root_run.outcome(), root_run.reason()),
+                (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
+                "{name}"
+            );
+        }
+        let expected = if privileged {
+            (Outcome::Complete, None)
+        } else {
+            (
+                Outcome::Failed,
+                Some("the running user cannot write the data root"),
+            )
+        };
+        assert_eq!((both.outcome(), both.reason()), expected, "{both:?}");
     }
 }
