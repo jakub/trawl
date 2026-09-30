@@ -358,3 +358,41 @@ fn web_doctor_root_identity_is_not_sampled() {
     assert_eq!(i32::from(report.verdict().exit_code()), run.code);
     assert!(run.stderr.is_empty(), "{}", run.stderr);
 }
+
+/// With HOME unset, `~` in the `--config` path, and the home directory the
+/// key and CA paths expand against, come from the password database, which
+/// can be a network service that stalls. The doctor looks both up on its
+/// blocking pool under a 5 s deadline each, and the identity row's lookup
+/// has 2 s, so the run returns within 15 s whatever the lookup does, with
+/// `proxy.config` reporting on the path it found: here, one that does not
+/// exist.
+#[test]
+fn web_doctor_tilde_config_without_home_returns() {
+    let missing = format!(
+        "~/.trawl-web-doctor-absent-{}/trawld.toml",
+        std::process::id()
+    );
+    let started = std::time::Instant::now();
+    let run = run_web_doctor(
+        &["--doctor", "--config", &missing, "--format", "json"],
+        &[] as &[(&str, &str)],
+        &[],
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(15),
+        "took {elapsed:?}"
+    );
+    let report = report(&run.stdout);
+    assert_eq!(
+        verdict(&report, "proxy.config"),
+        (
+            Outcome::Failed,
+            Some("the configuration file does not exist")
+        ),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    assert!(run.stderr.is_empty(), "{}", run.stderr);
+}
