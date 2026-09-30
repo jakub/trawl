@@ -207,8 +207,12 @@ fn web_doctor_listen_name_lookup_is_never_complete() {
                 .unwrap_or_else(|| panic!("{label}: no proxy.config row: {}", run.stdout));
             let outcome = config_line.split_whitespace().nth(1);
             assert!(
-                matches!(outcome, Some("failed" | "not_sampled")),
-                "{label}: {config_line}"
+                matches!(
+                    (outcome, run.code),
+                    (Some("failed"), 1) | (Some("not_sampled"), 3)
+                ),
+                "{label}: exit {} with {config_line}",
+                run.code
             );
         }
     }
