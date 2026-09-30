@@ -34,6 +34,8 @@ ENV.pop("VECTOR_CONFIG", None)
 ENV.pop("VECTOR_CONFIG_DIR", None)
 ENV.pop("VAR", None)
 ENV.pop("TRAWL_SUPPRESS_HOMELAB_NOISE", None)
+# Marker shape used by the sender proof recipes in the Vector guide.
+MARKER = "trawl-check-00000000-0000-4000-8000-000000000198"
 
 
 def load(tcp):
@@ -93,6 +95,18 @@ def fixtures(suppress):
             message='192.0.2.1 - alice [15/Jan/2024:10:30:45 +0000] "GET /test HTTP/1.1" 404 42 "-" "fixture"')
     for service in ("fail2ban", "mysql", "postgresql", "redis"):
         add(service, service, service)
+    # Sender proof recipes: each marker event must arrive under the identity
+    # the guide tells the operator to query.
+    add("journald", "proof-journald", MARKER, message=MARKER, _SYSTEMD_UNIT=f"{MARKER}.service")
+    add("nginx", "proof-nginx", "nginx", "warn", file="/var/log/nginx/access.log",
+        message=f'10.198.1.2 - - [28/Sep/2026:10:30:45 +0000] "GET /{MARKER} HTTP/1.1" 404 153 "-" "curl/8.14.1"')
+    add("docker", "proof-docker", MARKER, message=MARKER, container_name="/" + MARKER,
+        image="alpine", stream="stdout")
+    add("journald", "proof-ufw", "ufw", "warn", SYSLOG_IDENTIFIER="kernel", PRIORITY="4",
+        _TRANSPORT="kernel",
+        message="[UFW BLOCK] IN=enp1s0 OUT= MAC=52:54:00:12:34:56:52:54:00:65:43:21:08:00 "
+                "SRC=10.198.1.2 DST=10.198.1.1 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=31337 DF "
+                "PROTO=TCP SPT=41234 DPT=4919 WINDOW=64240 RES=0x00 SYN URGP=0")
     return events, expected
 
 
@@ -252,8 +266,22 @@ def run(tcp, suppress, tls="http"):
                     assert event["env"] == "prod", event
                     if name.endswith("-parsed"):
                         assert event["status"] == 404 and event["user_name"] == "alice", event
+                        assert (event["method"], event["uri"]) == ("GET", "/test"), event
                     if name == "ufw":
                         assert event["protocol"] == "tcp" and event["dst_port"] == 443, event
+                    if name == "proof-journald":
+                        assert event["message"] == MARKER, event
+                        assert event["host"] == "fixture-host", event
+                    if name == "proof-nginx":
+                        assert (event["method"], event["uri"]) == ("GET", "/" + MARKER), event
+                        assert MARKER in event["message"], event
+                    if name == "proof-docker":
+                        assert (event["host"], event["message"]) == (MARKER, MARKER), event
+                        assert event["container_name"] == MARKER, event
+                    if name == "proof-ufw":
+                        assert (event["src_ip"], event["dst_ip"]) == ("10.198.1.2", "10.198.1.1"), event
+                        assert event["dst_port"] == 4919 and type(event["dst_port"]) is int, event
+                        assert event["src_port"] == 41234 and event["protocol"] == "tcp", event
                     if name == "docker-swarm":
                         assert event["host"] == "stack", event
                     if name.startswith("unifi-"):

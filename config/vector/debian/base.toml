@@ -7,6 +7,9 @@
 #      VECTOR_CONFIG_DIR=/etc/vector/vector.d
 #      TRAWL_URL=https://trawl.internal:5514
 #      TRAWL_INGEST_TOKEN=<token>
+#      TRAWL_ENV=prod
+#      (TRAWL_ENV must be listed in trawld's [ingest] envs; trawld rejects any
+#      other env. The templates send "prod" when TRAWL_ENV is unset.)
 #      VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true
 #      (Vector 0.57 and later do not expand environment variables in config files unless
 #      this is set or vector runs with --dangerously-allow-env-var-interpolation)

@@ -326,6 +326,7 @@ async fn parse_request(
     let envs = Arc::clone(&state.ingest.envs);
     let default_env = Arc::clone(&state.ingest.default_env);
     let derivation = Arc::clone(&state.ingest.derivation);
+    let max_body_bytes = state.ingest.max_body_bytes;
     tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
         let _dispatch = tracing::dispatcher::set_default(&dispatch);
         let _span = span.enter();
@@ -342,7 +343,7 @@ async fn parse_request(
         };
         let t0 = std::time::Instant::now();
         let raw = if compressed {
-            decompress_gzip(&body, body.len())?
+            decompress_gzip(&body, max_body_bytes)?
         } else {
             body.to_vec()
         };
@@ -588,26 +589,36 @@ fn is_gzip(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("gzip"))
 }
 
-/// Maximum decompression ratio (compressed → decompressed). Prevents
-/// gzip bombs from exhausting memory: a 16 MB payload can expand to at
-/// most 160 MB.
-const MAX_DECOMPRESSION_RATIO: usize = 10;
-
-/// Decompress gzip body with a size cap to prevent decompression bombs.
-fn decompress_gzip(data: &[u8], wire_bytes: usize) -> Result<Vec<u8>, ServerError> {
-    let limit = wire_bytes.saturating_mul(MAX_DECOMPRESSION_RATIO);
+/// Decompress a gzip body, refusing one that decompresses past
+/// `max_body_bytes` (`[ingest] max_body_bytes`, the same limit the wire
+/// body is held to).
+///
+/// The bound is on decompressed size, not on the wire-to-decompressed
+/// ratio: repetitive log batches routinely expand past 20x, and a ratio cap
+/// refused them with a 400 the sender does not retry. Decoding reads at
+/// most `max_body_bytes + 1` bytes, so a gzip bomb costs no more memory
+/// than the largest body trawld accepts.
+fn decompress_gzip(data: &[u8], max_body_bytes: usize) -> Result<Vec<u8>, ServerError> {
     let decoder = flate2::read::GzDecoder::new(data);
     // Read up to limit + 1: if we get more than limit bytes, the payload
-    // exceeds the cap and we reject it before allocating further.
-    let mut decompressed = Vec::with_capacity(data.len().min(limit));
+    // exceeds the cap and we reject it before allocating further. The
+    // buffer grows with what is actually decoded; nothing is sized from
+    // the request up front.
+    let mut decompressed = Vec::new();
     decoder
-        .take(u64::try_from(limit + 1).unwrap_or(u64::MAX))
+        .take(u64::try_from(max_body_bytes.saturating_add(1)).unwrap_or(u64::MAX))
         .read_to_end(&mut decompressed)
         .map_err(|e| ServerError::Ingest(format!("gzip decompression failed: {e}")))?;
-    if decompressed.len() > limit {
-        return Err(ServerError::Ingest(format!(
-            "decompressed body exceeds {limit} byte limit (ratio > {MAX_DECOMPRESSION_RATIO}x)",
-        )));
+    if decompressed.len() > max_body_bytes {
+        tracing::warn!(
+            event_type = "ingest_body_too_large",
+            wire_bytes = data.len(),
+            max_body_bytes,
+            "refused a gzip ingest body that decompresses past max_body_bytes"
+        );
+        return Err(ServerError::IngestBodyTooLarge {
+            limit: max_body_bytes,
+        });
     }
     Ok(decompressed)
 }
@@ -1402,5 +1413,87 @@ mod tests {
         assert_eq!(parsed.reject_counts.get(RejectReason::ServiceNotString), 1);
         assert_eq!(parsed.reject_counts.total(), 5);
         assert_eq!(total_accepted(&parsed), 1);
+    }
+
+    // --- gzip decompression bound ---
+
+    /// `len` bytes of ndjson lines of one repetitive shape: journald-like JSON
+    /// compresses far past 10x, as Vector's batches do.
+    fn repetitive_ndjson(len: usize) -> Vec<u8> {
+        let line = br#"{"service":"sshd","message":"session opened for user root by (uid=0)","_SYSTEMD_UNIT":"ssh.service"}"#;
+        let mut body = Vec::with_capacity(len);
+        while body.len() < len {
+            body.extend_from_slice(line);
+            body.push(b'\n');
+        }
+        body.truncate(len);
+        body
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A body that expands ~25x is accepted while its decompressed size
+    /// stays under the limit: the wire-to-decompressed ratio is not a limit.
+    #[test]
+    fn gzip_expanding_far_past_ten_times_is_accepted_under_the_limit() {
+        let raw = repetitive_ndjson(64 * 1024);
+        let wire = gzip(&raw);
+        assert!(
+            raw.len() >= 25 * wire.len(),
+            "fixture expands only {}x",
+            raw.len() / wire.len()
+        );
+        let decompressed = decompress_gzip(&wire, 1024 * 1024).unwrap();
+        assert_eq!(decompressed, raw);
+    }
+
+    /// A body that decompresses to exactly the limit is accepted.
+    #[test]
+    fn gzip_decompressing_to_exactly_the_limit_is_accepted() {
+        let raw = repetitive_ndjson(4096);
+        let decompressed = decompress_gzip(&gzip(&raw), raw.len()).unwrap();
+        assert_eq!(decompressed.len(), raw.len());
+    }
+
+    /// One byte past the limit is 413 `ingest_error`, and decompression
+    /// stops at limit + 1: the stream below is truncated after its first
+    /// 64 KiB, so reading it to the end would fail as a broken stream (400)
+    /// instead.
+    #[tokio::test]
+    async fn gzip_decompressing_past_the_limit_is_413_and_stops_early() {
+        use axum::response::IntoResponse as _;
+        use std::io::Write as _;
+
+        let limit = 4096;
+        let raw = repetitive_ndjson(1024 * 1024);
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw[..64 * 1024]).unwrap();
+        encoder.flush().unwrap();
+        let prefix = encoder.get_ref().len();
+        encoder.write_all(&raw[64 * 1024..]).unwrap();
+        let mut wire = encoder.finish().unwrap();
+        wire.truncate(prefix);
+        // The truncated stream is broken when read to the end.
+        assert!(decompress_gzip(&wire, usize::MAX / 2).is_err());
+
+        // Exactly limit + 1 decompressed bytes, from a complete stream.
+        let over = decompress_gzip(&gzip(&raw[..=limit]), limit).unwrap_err();
+        let response = over.into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "ingest_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains(&limit.to_string()), "{message}");
+
+        let early = decompress_gzip(&wire, limit).unwrap_err().into_response();
+        assert_eq!(early.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

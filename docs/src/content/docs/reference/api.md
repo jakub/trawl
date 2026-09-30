@@ -73,7 +73,7 @@ Every error that trawld itself produces has this body:
 | `validation_error` | 400 | The DSL parses but fails semantic checks: unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
 | `result_too_large` | 400 | The result exceeded `max_result_rows` |
 | `bad_request` | 400 | Malformed input. Also the code on every 409, which has no code of its own. |
-| `ingest_error` | 400 | An ingest body that cannot be read |
+| `ingest_error` | 400, 413 | An ingest body that cannot be read. 413 when a gzip body decodes past `[ingest] max_body_bytes` |
 | `ingest_batch_too_large` | 413 | An ingest request holds more events or bytes than external producers may place in the hot buffer, so it can never be admitted |
 | `auth_error` | 401 | Authentication failed |
 | `forbidden` | 403 | The key lacks a permission |
@@ -128,7 +128,7 @@ Every instant is RFC 3339 in UTC. Catalog, repin, pin reclamation, and schedule 
 | `[server] max_request_body_bytes` | `"128K"` | Every route except `/api/v1/ingest` |
 | `[ingest] max_body_bytes` | `"16M"` | `/api/v1/ingest` |
 
-Both accept sizes such as `"128K"` and `"1M"`. A body over the limit is refused with 413. A gzip ingest body may expand to at most 10 times its wire size.
+Both accept sizes such as `"128K"` and `"1M"`. A body over the limit is refused with 413. A gzip ingest body is held to `[ingest] max_body_bytes` twice: once as sent, and once decoded. trawld stops decoding one byte past the limit and answers 413 `ingest_error`.
 
 ### Query timeout
 
@@ -472,8 +472,9 @@ events are counted.
 
 | Status | Code | When |
 |--------|------|------|
-| 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, a gzip body that fails to decode, or a gzip body that expands past 10 times its wire size |
+| 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, or a gzip body that fails to decode |
 | 413 | none | The body exceeds `[ingest] max_body_bytes` |
+| 413 | `ingest_error` | A gzip body decodes to more than `[ingest] max_body_bytes`. No `Retry-After`. Send smaller batches |
 | 413 | `ingest_batch_too_large` | The request holds more than 15/16 of `hot_buffer_max_events` or `hot_buffer_max_bytes`, or a cap of 0 or 1 admits no request. No `Retry-After`. Split the batch |
 | 429 | `rate_limited` | The key's ingest bucket is empty |
 | 500 | `internal_error` | A group's WAL write failed. Other groups in the request may still have been accepted. |

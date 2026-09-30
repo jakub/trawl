@@ -236,7 +236,7 @@ you onto the step you do yourself.
 | Minted the `trial-operator` and `trial-ingest` keys | [Create roles and keys](/operate/access/#create-roles-and-keys): personal keys for people, service keys for senders |
 | Served the browser at `http://127.0.0.1:18090` with insecure cookies | [Set the browser origin](/operate/access/#set-the-browser-origin) behind an HTTPS reverse proxy |
 | Resolved `-p trial` from its directory | Save the server as a [profile](/start/connect/#keep-more-than-one-server-in-profiles) in `~/.config/trawl/config.toml` |
-| Loaded 2000 sample events | [Connect your log sources](/operate/ingestion/) |
+| Loaded 2000 sample events | [Connect a sender](/operate/ingestion/) and [prove that its first event arrived](/getting-started/vector-integration/#prove-the-first-event-arrived) |
 | Started nothing at boot | `sudo systemctl enable --now trawld trawl-web` after the databases are set |
 
 Nothing carries over. The installation starts with empty databases and an
