@@ -952,12 +952,22 @@ impl std::fmt::Debug for TrustSource {
 }
 
 /// The listen address and where it came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BindAddr {
-    /// The address, unparsed, as startup binds it.
+    /// The address, unparsed, as startup binds it. Operator text: not for
+    /// output.
     pub addr: String,
     /// [`ENV_BIND_ADDR`], `[web] bind_addr`, or the default.
     pub from: SettingSource,
+}
+
+/// Shows the source only, not the address.
+impl std::fmt::Debug for BindAddr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BindAddr")
+            .field("from", &self.from)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The allowlist: the environment's when [`ENV_SESSION_PUBLIC_ORIGINS`] is
@@ -3399,7 +3409,9 @@ session_ttl_secs = 3600
     }
 
     /// `Sources` and its parts show sources and shapes, never the URL, a
-    /// host, an origin, the shared domain, the key or its variable's name.
+    /// host, an origin, the shared domain, the key, its variable's name or
+    /// path, the pin path or the listen address, whichever source each came
+    /// from.
     #[test]
     fn sources_debug_shows_no_configured_value() {
         const SENTINEL: &str = "s3ntinel";
@@ -3411,23 +3423,66 @@ session_ttl_secs = 3600
             upstream_ca_path: Some(format!("/{SENTINEL}/ca.pem").into()),
             shared_domain: Some(format!(".{SENTINEL}.example")),
             cookie_secret_env: Some(SENTINEL.into()),
+            bind_addr: Some(format!("{SENTINEL}.bind:9000")),
             ..WebConfig::default()
         };
-        for env in [
-            RuntimeEnv::default(),
-            RuntimeEnv {
-                aead_key: os(fleet_key.as_str()),
-                ..RuntimeEnv::default()
-            },
-            RuntimeEnv {
-                public_origins: os(&format!("https://{SENTINEL}.example,{SENTINEL}")),
-                ..RuntimeEnv::default()
-            },
-        ] {
+        // The upstream derived from the server's address, and the key read
+        // from a file.
+        let derived = WebConfig {
+            upstream_url: None,
+            upstream_connect_addr: None,
+            cookie_secret_env: None,
+            cookie_secret_path: Some(format!("/{SENTINEL}/web.cookie").into()),
+            ..web.clone()
+        };
+        let server = ServerConfig {
+            http_addr: format!("{SENTINEL}.srv:5514"),
+            ..dummy_server()
+        };
+        let cases = [
+            (&web, None, RuntimeEnv::default()),
+            (
+                &web,
+                None,
+                RuntimeEnv {
+                    aead_key: os(fleet_key.as_str()),
+                    ..RuntimeEnv::default()
+                },
+            ),
+            (
+                &web,
+                None,
+                RuntimeEnv {
+                    public_origins: os(&format!("https://{SENTINEL}.example,{SENTINEL}")),
+                    ..RuntimeEnv::default()
+                },
+            ),
+            (
+                &web,
+                None,
+                RuntimeEnv {
+                    bind_addr: os(&format!("{SENTINEL}.env:9091")),
+                    upstream_ca_path: os(&format!("/{SENTINEL}/env-ca.pem")),
+                    ..RuntimeEnv::default()
+                },
+            ),
+            (&derived, Some(&server), RuntimeEnv::default()),
+            (
+                &derived,
+                Some(&server),
+                RuntimeEnv {
+                    http_addr: os(&format!("{SENTINEL}.env:5514")),
+                    ..RuntimeEnv::default()
+                },
+            ),
+        ];
+        for (web, server, env) in cases {
             let env_debug = format!("{env:?}");
             let parts = RuntimeParts::from_each_variable(env);
             let parts_debug = format!("{parts:?}");
-            let sources = Sources::resolve(&web, None, parts);
+            let sources = Sources::resolve(web, server, parts);
+            assert!(sources.bind_addr.is_ok(), "{sources:?}");
+            assert!(sources.upstream.is_ok(), "{sources:?}");
             for rendered in [env_debug, parts_debug, format!("{sources:?}")] {
                 assert!(!rendered.contains(SENTINEL), "{rendered}");
                 assert!(!rendered.contains(fleet_key.as_str()), "{rendered}");
