@@ -11,7 +11,8 @@
 //! rows: the upstream rows belong to the upstream group. Where a test needs
 //! the run not to fail on the upstream, it pins a CA file that does not
 //! exist, so the upstream is incomplete (`ca_not_present`) and nothing is
-//! dialled.
+//! dialled. The root-run test needs every other row complete instead, so
+//! it pins a healthy upstream ([`healthy_upstream`]).
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -19,8 +20,9 @@ use std::path::{Path, PathBuf};
 use trawl_api::doctor::{Outcome, Report};
 
 use crate::support::{
-    PLANTED_KEY, PLANTED_ORIGIN, Userns, WebDoctorConfig, assert_unchanged, doctor, doctor_args,
-    fs_snapshot, home_env, report, row, run_web_doctor_in_userns, verdict, write_config, write_key,
+    PLANTED_CA_SUBJECT, PLANTED_KEY, PLANTED_ORIGIN, Userns, WebDoctorConfig, assert_unchanged,
+    doctor, doctor_args, fs_snapshot, healthy_upstream, home_env, report, row,
+    run_web_doctor_in_userns, verdict, write_config, write_key,
 };
 
 /// A doctor run's environment.
@@ -534,16 +536,21 @@ struct RootCase {
     expect: (Outcome, Option<&'static str>),
 }
 
-/// Run as root, the key file's readability is `not_sampled`,
-/// `ran_as_root`, and the run cannot exit 0 (AC9, D12), even for a file
-/// no other user could open. A content failure still fails, and a key
-/// from the environment is content, so it stays `complete`. HOME is
-/// mounted read-only for each run.
-#[test]
-fn web_doctor_root_run_is_incomplete() {
+/// Run as root, `proxy.identity` and the key file's readability are
+/// `not_sampled`, `ran_as_root`, and the run cannot exit 0 (AC9, D12),
+/// even for a file no other user could open. A content failure still
+/// fails, and a key from the environment is content, so it stays
+/// `complete`. HOME is mounted read-only for each run.
+///
+/// Every case pins a real rustls upstream serving a healthy answer, so
+/// every row but identity and the key completes: with a key from the
+/// environment, root alone is what keeps the run from exiting 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn web_doctor_root_run_is_incomplete() {
     let Some(userns) = Userns::for_test("web_doctor_root_run_is_incomplete") else {
         return;
     };
+    let upstream = healthy_upstream().await;
     let ran_as_root = (Outcome::NotSampled, Some("ran_as_root"));
     let cases = [
         RootCase {
@@ -571,59 +578,88 @@ fn web_doctor_root_run_is_incomplete() {
             expect: (Outcome::Complete, None),
         },
     ];
-    for RootCase {
+    for case in &cases {
+        root_run(&userns, &upstream.url(), upstream.ca_path(), case);
+    }
+}
+
+/// One case of [`web_doctor_root_run_is_incomplete`], as root in `userns`,
+/// with the upstream at `upstream_url` pinned to `upstream_ca`.
+fn root_run(userns: &Userns, upstream_url: &str, upstream_ca: &Path, case: &RootCase) {
+    let &RootCase {
         label,
         file,
         fleet_env,
         expect,
-    } in cases
-    {
-        let home = tempfile::tempdir().unwrap();
-        let key_path = home.path().join("lib").join("web.cookie");
-        let mut fixture = WebDoctorConfig::in_dir(home.path());
-        if let Some((len, mode)) = file {
-            write_key_with_mode(&key_path, len, mode);
-            fixture.cookie_secret_path = Some(key_path.clone());
-        }
-        let config = write_config(home.path(), &fixture);
-        let key = planted_key_base64();
-        let mut env = home_env(home.path());
-        if fleet_env {
-            env.push(("FLEET_SESSION_AEAD_KEY", OsString::from(&key)));
-        }
-        let mut planted_owned = fixture.planted();
-        planted_owned.push(key);
-        let planted: Vec<&str> = planted_owned.iter().map(String::as_str).collect();
+    } = case;
+    let home = tempfile::tempdir().unwrap();
+    let key_path = home.path().join("lib").join("web.cookie");
+    let mut fixture = WebDoctorConfig::in_dir(home.path());
+    fixture.upstream_url = Some(upstream_url.to_owned());
+    fixture.upstream_ca_path = Some(upstream_ca.to_owned());
+    if let Some((len, mode)) = file {
+        write_key_with_mode(&key_path, len, mode);
+        fixture.cookie_secret_path = Some(key_path.clone());
+    }
+    let config = write_config(home.path(), &fixture);
+    let key = planted_key_base64();
+    let mut env = home_env(home.path());
+    if fleet_env {
+        env.push(("FLEET_SESSION_AEAD_KEY", OsString::from(&key)));
+    }
+    let mut planted_owned = fixture.planted();
+    planted_owned.push(key);
+    planted_owned.push(PLANTED_CA_SUBJECT.to_owned());
+    let planted: Vec<&str> = planted_owned.iter().map(String::as_str).collect();
 
-        let before = fs_snapshot(home.path());
-        let run = run_web_doctor_in_userns(
-            &userns,
+    let before = fs_snapshot(home.path());
+    // The upstream is served on the runtime's other workers while this
+    // one waits on the doctor.
+    let run = tokio::task::block_in_place(|| {
+        run_web_doctor_in_userns(
+            userns,
             Some(home.path()),
             &doctor_args(&config, "json"),
             &env,
             &planted,
-        );
-        assert_unchanged(&before, &fs_snapshot(home.path()), label);
-        assert!(run.stderr.is_empty(), "{label}: {}", run.stderr);
-        let report = report(&run.stdout);
-        let key_row = row(&report, "proxy.cookie_key");
-        assert_eq!(
-            (key_row.outcome, key_row.reason.as_deref()),
-            expect,
+        )
+    });
+    assert_unchanged(&before, &fs_snapshot(home.path()), label);
+    assert!(run.stderr.is_empty(), "{label}: {}", run.stderr);
+    let report = report(&run.stdout);
+    assert_eq!(
+        verdict(&report, "proxy.identity"),
+        (Outcome::NotSampled, Some("ran_as_root")),
+        "{label}: {report:?}"
+    );
+    let key_row = row(&report, "proxy.cookie_key");
+    assert_eq!(
+        (key_row.outcome, key_row.reason.as_deref()),
+        expect,
+        "{label}: {key_row:?}"
+    );
+    if file.is_some() {
+        assert!(
+            key_row
+                .source
+                .as_deref()
+                .is_some_and(|source| source.contains(&key_path.display().to_string())),
             "{label}: {key_row:?}"
         );
-        if file.is_some() {
-            assert!(
-                key_row
-                    .source
-                    .as_deref()
-                    .is_some_and(|source| source.contains(&key_path.display().to_string())),
-                "{label}: {key_row:?}"
-            );
-        }
-        assert_ne!(run.code, 0, "{label}: {}", run.stdout);
-        assert_eq!(i32::from(report.verdict().exit_code()), run.code, "{label}");
     }
+    for check in report.checks() {
+        if check.id != "proxy.identity" && check.id != "proxy.cookie_key" {
+            assert_eq!(check.outcome, Outcome::Complete, "{label}: {check:?}");
+        }
+    }
+    assert_eq!(
+        verdict(&report, "proxy.upstream.health"),
+        (Outcome::Complete, None),
+        "{label}: the upstream was reached"
+    );
+    let expected_code = if expect.0 == Outcome::Failed { 1 } else { 3 };
+    assert_eq!(run.code, expected_code, "{label}: {}", run.stdout);
+    assert_eq!(i32::from(report.verdict().exit_code()), run.code, "{label}");
 }
 
 /// One `proxy.cookie_settings` case.

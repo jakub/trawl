@@ -726,6 +726,37 @@ pub fn write_ca(path: &Path) -> PathBuf {
     path.to_owned()
 }
 
+/// trawld's healthy answer to `GET /api/v1/health`: `status: ok`, every
+/// check trawld reports `ok`, and a version.
+pub fn healthy_answer() -> wiremock::ResponseTemplate {
+    let checks: serde_json::Map<String, serde_json::Value> =
+        trawl_api::doctor::health::HEALTH_CHECK_NAMES
+            .iter()
+            .map(|name| ((*name).to_owned(), "ok".into()))
+            .collect();
+    wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "status": "ok",
+        "version": "1.0.0",
+        "checks": checks,
+    }))
+}
+
+/// A real rustls upstream serving [`healthy_answer`], under a fresh CA
+/// whose subject is [`PLANTED_CA_SUBJECT`]. Point `upstream_url` at its
+/// `url()` and pin its `ca_path()`, and both upstream checks pass.
+pub async fn healthy_upstream() -> crate::test_support::TlsUpstream {
+    use wiremock::matchers::{method, path};
+
+    let ca = crate::test_support::TestCa::named(PLANTED_CA_SUBJECT);
+    let upstream = crate::test_support::TlsUpstream::issued_by(&ca).await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/api/v1/health"))
+        .respond_with(healthy_answer())
+        .mount(upstream.mock())
+        .await;
+    upstream
+}
+
 /// The environment of a doctor run in `home`: `HOME` alone.
 pub fn home_env(home: &Path) -> Vec<(&'static str, OsString)> {
     vec![("HOME", home.as_os_str().to_owned())]
