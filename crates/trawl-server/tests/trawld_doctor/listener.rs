@@ -758,7 +758,7 @@ fn health_cases() -> Vec<HealthCase> {
                 ("corpus", Outcome::NotSampled, Some("recovering")),
                 ("data_path", Outcome::Failed, UNKNOWN),
                 ("duckdb", Outcome::Complete, None),
-(
+                (
                     "ingest_capacity",
                     Outcome::Failed,
                     Some("reported refusing"),
