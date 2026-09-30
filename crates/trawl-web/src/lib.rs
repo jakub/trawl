@@ -25,6 +25,7 @@ pub const DEFAULT_LOG_FILTER: &str = "trawl_web=info,fleet_auth=info";
 
 pub mod assets;
 pub mod config;
+pub mod doctor;
 pub mod error;
 pub mod middleware;
 pub mod routes;
