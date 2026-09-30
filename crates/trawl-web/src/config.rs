@@ -33,6 +33,7 @@
 //!    files, logs the warnings that carry configured values, and generates
 //!    an ephemeral key when no key source is configured.
 
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
@@ -442,8 +443,8 @@ impl ResolvedConfig {
     }
 }
 
-/// The raw values of every environment variable resolution reads, taken in
-/// one observation.
+/// The raw values of every environment variable resolution reads, and the
+/// home directory `~` expands to, taken in one observation.
 ///
 /// `None` is an unset variable. Fields are public so a caller that cannot
 /// set process variables, a test among them, can state them.
@@ -465,14 +466,23 @@ pub struct RuntimeEnv {
     pub upstream_ca_path: Option<OsString>,
     /// [`ENV_HTTP_ADDR`].
     pub http_addr: Option<OsString>,
+    /// The home directory `~` expands to in `[web] cookie_secret_path` and
+    /// the pin path. `None`: there is none, and `~` stays as written.
+    pub home: Option<String>,
 }
 
 impl RuntimeEnv {
-    /// Read each variable from the process environment, once.
+    /// Read each variable from the process environment, once, and find the
+    /// home directory as [`shellexpand::tilde`] finds it.
     ///
     /// The `cookie_secret_env` variable is not among them: its name comes
     /// from the file, and [`key_from_env`] reads it only when the key is
     /// actually loaded.
+    ///
+    /// When `HOME` is unset or empty, finding the home directory asks the
+    /// user database, which can block on a network name service. This is
+    /// the one place resolution does that, so [`Sources::resolve`] stays
+    /// pure.
     #[must_use]
     pub fn from_process() -> Self {
         let read = std::env::var_os;
@@ -485,6 +495,7 @@ impl RuntimeEnv {
             bind_addr: read(ENV_BIND_ADDR),
             upstream_ca_path: read(ENV_UPSTREAM_CA_PATH),
             http_addr: read(ENV_HTTP_ADDR),
+            home: process_home(),
         }
     }
 
@@ -503,12 +514,14 @@ impl RuntimeEnv {
                 bind_addr: self.bind_addr,
                 upstream_ca_path: self.upstream_ca_path,
                 http_addr: self.http_addr,
+                home: self.home,
             },
         )
     }
 }
 
-/// Names which variables are set, never a value.
+/// Names which variables are set and whether a home directory is known,
+/// never a value.
 impl std::fmt::Debug for RuntimeEnv {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let set = [
@@ -529,15 +542,38 @@ impl std::fmt::Debug for RuntimeEnv {
                     .map(|(name, _)| *name)
                     .collect::<Vec<_>>(),
             )
+            .field("home", &self.home.is_some())
             .finish()
     }
 }
 
-/// The variables resolution reads that are not `FLEET_SESSION_*`, raw.
+/// The variables resolution reads that are not `FLEET_SESSION_*`, raw, and
+/// the home directory.
 struct HostEnv {
     bind_addr: Option<OsString>,
     upstream_ca_path: Option<OsString>,
     http_addr: Option<OsString>,
+    home: Option<String>,
+}
+
+/// The home directory [`shellexpand::tilde`] expands `~` to: `HOME` when
+/// it is set and not empty, else the user database's entry, and `None`
+/// when neither gives one or it is not UTF-8. May block (see
+/// [`RuntimeEnv::from_process`]).
+fn process_home() -> Option<String> {
+    // Asking the library itself keeps startup's expansion exactly as it was.
+    // `tilde` returns an owned string only when it found a home directory
+    // to substitute, and for `~` alone that string is the directory.
+    match shellexpand::tilde("~") {
+        Cow::Owned(home) => Some(home),
+        Cow::Borrowed(_) => None,
+    }
+}
+
+/// `path` with a leading `~` replaced by `home`, or unchanged when `home`
+/// is `None`. Looks nothing up.
+fn expand_tilde(path: &Path, home: Option<&str>) -> PathBuf {
+    PathBuf::from(shellexpand::tilde_with_context(&path.to_string_lossy(), || home).into_owned())
 }
 
 /// The environment's part in resolution: each `FLEET_SESSION_*` variable
@@ -673,6 +709,7 @@ impl std::fmt::Debug for RuntimeParts {
             .field("bind_addr", &self.host.bind_addr.is_some())
             .field("upstream_ca_path", &self.host.upstream_ca_path.is_some())
             .field("http_addr", &self.host.http_addr.is_some())
+            .field("home", &self.host.home.is_some())
             .finish()
     }
 }
@@ -727,9 +764,9 @@ impl Sources {
     /// where each came from.
     ///
     /// Pure: no file is read, nothing is logged, no key is generated, and
-    /// the `cookie_secret_env` variable is not read. The one lookup beyond
-    /// the arguments is the home directory, for tilde expansion of the key
-    /// and pin paths, as at startup. Precedence is startup's, and a
+    /// neither the `cookie_secret_env` variable nor the home directory is
+    /// looked up. A `~` in the key and pin paths expands to the home
+    /// directory `runtime` carries. Precedence is startup's, and a
     /// selected source that is invalid fails its component with no
     /// fallback to the next source.
     #[must_use]
@@ -744,7 +781,7 @@ impl Sources {
         } = runtime;
         Self {
             public_origins: resolve_origins(web, public_origins),
-            cookie_key: resolve_key_source(web, key),
+            cookie_key: resolve_key_source(web, key, host.home.as_deref()),
             cookie_settings: resolve_cookie_settings(web, path_set, secure, domain),
             upstream: resolve_upstream(web, server, &host),
             bind_addr: select_bind_addr(host.bind_addr.as_deref(), web.bind_addr.as_deref())
@@ -995,9 +1032,11 @@ fn resolve_origins(
 
 /// Select the key source in startup's precedence. An invalid
 /// [`ENV_SESSION_AEAD_KEY`] fails the component rather than falling back.
+/// A `~` in the file path expands to `home`.
 fn resolve_key_source(
     web: &WebConfig,
     from_environment: Result<Option<SessionKey>, ConfigError>,
+    home: Option<&str>,
 ) -> Result<KeySource, ConfigError> {
     if let Some(key) = from_environment? {
         return Ok(KeySource::FleetEnv(key));
@@ -1007,7 +1046,7 @@ fn resolve_key_source(
         KeySource::ConfigEnv { name: name.clone() }
     } else if let Some(path) = &web.cookie_secret_path {
         KeySource::File {
-            path: PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).into_owned()),
+            path: expand_tilde(path, home),
         }
     } else {
         KeySource::None
@@ -1069,7 +1108,8 @@ fn resolve_cookie_settings(
 }
 
 /// The upstream URL and its rules, the connect address, and the trust
-/// source, in startup's order. The pin file is named, not read.
+/// source, in startup's order. The pin file is named, not read, and a `~`
+/// in its path expands to the home directory `host` carries.
 fn resolve_upstream(
     web: &WebConfig,
     server: Option<&ServerConfig>,
@@ -1092,7 +1132,7 @@ fn resolve_upstream(
     )? {
         None => TrustSource::System,
         Some((path, from)) => TrustSource::Pinned {
-            path: pin_path(&path)?,
+            path: pin_path_from(&path, host.home.as_deref())?,
             from,
         },
     };
@@ -1445,14 +1485,34 @@ pub(crate) fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls
     }
 }
 
-/// The pin file `ca_path` names, tilde-expanded. Reads nothing.
+/// The pin file `ca_path` names, tilde-expanded against this process's
+/// home directory. Reads no file, but finding the home directory may block
+/// (see [`RuntimeEnv::from_process`]). [`Sources::resolve`] expands with
+/// the home directory it is given instead.
+///
+/// # Errors
+/// Returns [`ConfigError::UpstreamCa`] when the path is empty, as
+/// [`pin_path_from`] does.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "a helper for code outside resolution, which only tests call so far"
+    )
+)]
+pub(crate) fn pin_path(ca_path: &Path) -> Result<PathBuf, ConfigError> {
+    pin_path_from(ca_path, process_home().as_deref())
+}
+
+/// The pin file `ca_path` names, with a leading `~` expanded to `home`.
+/// Looks nothing up.
 ///
 /// # Errors
 /// Returns [`ConfigError::UpstreamCa`] when the path is empty: falling back
 /// to the platform roots would change the trust mode on a blank value, and
 /// reading it would report a missing file.
-pub(crate) fn pin_path(ca_path: &Path) -> Result<PathBuf, ConfigError> {
-    let path = PathBuf::from(shellexpand::tilde(&ca_path.to_string_lossy()).into_owned());
+fn pin_path_from(ca_path: &Path, home: Option<&str>) -> Result<PathBuf, ConfigError> {
+    let path = expand_tilde(ca_path, home);
     if path.as_os_str().is_empty() {
         return Err(ConfigError::UpstreamCa {
             path,
@@ -3113,7 +3173,14 @@ session_ttl_secs = 3600
             ..configured_web()
         };
         let expanded = PathBuf::from(shellexpand::tilde("~/.trawl-c2-absent/web.cookie").as_ref());
-        let sources = resolve(&tilde, None, RuntimeEnv::default());
+        let sources = resolve(
+            &tilde,
+            None,
+            RuntimeEnv {
+                home: RuntimeEnv::from_process().home,
+                ..RuntimeEnv::default()
+            },
+        );
         assert!(matches!(&sources.cookie_key, Ok(KeySource::File { path }) if *path == expanded));
         let sources = resolve(&configured_web(), None, RuntimeEnv::default());
         assert!(matches!(sources.cookie_key, Ok(KeySource::None)));
@@ -3472,6 +3539,7 @@ session_ttl_secs = 3600
                 Some(&server),
                 RuntimeEnv {
                     http_addr: os(&format!("{SENTINEL}.env:5514")),
+                    home: Some(format!("/{SENTINEL}-home")),
                     ..RuntimeEnv::default()
                 },
             ),
@@ -3489,6 +3557,61 @@ session_ttl_secs = 3600
                 assert!(!rendered.contains("127.0.0.9"), "{rendered}");
             }
         }
+    }
+
+    /// `Sources::resolve` expands `~` in the key and pin paths from the home
+    /// directory its [`RuntimeEnv`] carries, and looks up none of its own:
+    /// with none supplied, `~` stays as written although this process has a
+    /// home. Startup captures the home that `shellexpand::tilde` would use.
+    #[test]
+    fn resolve_expands_tilde_from_the_supplied_home() {
+        let web = WebConfig {
+            cookie_secret_path: Some("~/web.cookie".into()),
+            upstream_ca_path: Some("~/tls/cert.pem".into()),
+            ..configured_web()
+        };
+        let paths = |home: Option<&str>| {
+            let env = RuntimeEnv {
+                home: home.map(str::to_owned),
+                ..RuntimeEnv::default()
+            };
+            let sources = Sources::resolve(&web, None, RuntimeParts::from_each_variable(env));
+            let Ok(KeySource::File { path: key }) = &sources.cookie_key else {
+                panic!("{sources:?}");
+            };
+            let Ok(UpstreamPlan {
+                trust: TrustSource::Pinned { path: pin, .. },
+                ..
+            }) = &sources.upstream
+            else {
+                panic!("{sources:?}");
+            };
+            (key.clone(), pin.clone())
+        };
+
+        assert_eq!(
+            paths(Some("/c2-home")),
+            (
+                PathBuf::from("/c2-home/web.cookie"),
+                PathBuf::from("/c2-home/tls/cert.pem")
+            )
+        );
+        let startup_home = RuntimeEnv::from_process().home;
+        assert!(startup_home.is_some(), "no home directory to expand into");
+        assert_eq!(
+            paths(None),
+            (
+                PathBuf::from("~/web.cookie"),
+                PathBuf::from("~/tls/cert.pem")
+            )
+        );
+        assert_eq!(
+            paths(startup_home.as_deref()),
+            (
+                PathBuf::from(shellexpand::tilde("~/web.cookie").as_ref()),
+                PathBuf::from(shellexpand::tilde("~/tls/cert.pem").as_ref())
+            )
+        );
     }
 
     /// Each variable parsed alone gets the result the whole parse gives it:
@@ -3708,6 +3831,7 @@ session_ttl_secs = 3600
                 bind_addr: os("0.0.0.0:9091"),
                 upstream_ca_path: None,
                 http_addr: os("127.0.0.1:6000"),
+                home: None,
             }),
             ("derived upstream", configured_web(), |key| RuntimeEnv {
                 aead_key: os(key),
