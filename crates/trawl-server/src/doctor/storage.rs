@@ -167,6 +167,9 @@ enum RootSeen {
     NotADirectory,
     /// A directory above it is not a directory.
     AncestorNotADirectory,
+    /// A directory above it is a symlink to nothing, which boot's create
+    /// path meets as an existing entry and refuses.
+    AncestorDangling,
     /// A symlink to nothing.
     Dangling,
     /// Something that was there at the first look and gone at the second.
@@ -221,6 +224,10 @@ fn root_row(seen: RootSeen, ingest: bool) -> Row {
             .next(detail("point [data] path at a directory")),
         RootSeen::AncestorNotADirectory => {
             Row::failed(check, "a parent of the data root is not a directory")
+                .next(detail("point [data] path at a directory trawld can create"))
+        }
+        RootSeen::AncestorDangling => {
+            Row::failed(check, "a parent of the data root is a symlink to nothing")
                 .next(detail("point [data] path at a directory trawld can create"))
         }
         RootSeen::Dangling => Row::failed(check, "the data root is a symlink to nothing")
@@ -311,6 +318,12 @@ fn is_symlink(path: &Path) -> bool {
 /// For an absent root on an ingest node: whether the running user may
 /// create entries in the nearest directory above it that exists, asked
 /// only when `ask_access`.
+///
+/// Each ancestor is looked at without following its final symlink, so an
+/// ancestor that exists as a symlink to nothing is not mistaken for one
+/// boot creates: boot's exclusive create meets it as an existing entry and
+/// refuses. A symlink to a directory counts as that directory, as boot
+/// follows it.
 fn nearest_ancestor(data_root: &Path, ask_access: bool) -> RootSeen {
     let mut current = data_root;
     loop {
@@ -318,20 +331,23 @@ fn nearest_ancestor(data_root: &Path, ask_access: bool) -> RootSeen {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
         };
-        match std::fs::metadata(parent) {
-            Ok(meta) if meta.is_dir() => {
+        match epoch::metadata_if_present::<std::convert::Infallible>(parent) {
+            Ok(Some(meta)) if meta.is_dir() => {
                 return RootSeen::Absent(Some(if ask_access {
                     write_access(parent)
                 } else {
                     Access::NotAsked
                 }));
             }
-            Ok(_) => return RootSeen::AncestorNotADirectory,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && parent != current => {
-                current = parent;
+            Ok(Some(_)) => return RootSeen::AncestorNotADirectory,
+            Ok(None) if parent != current => current = parent,
+            Err(RootFault::Inspect { error, .. }) => {
+                return match inspect_seen(error.kind(), is_symlink(parent)) {
+                    RootSeen::Dangling => RootSeen::AncestorDangling,
+                    seen => seen,
+                };
             }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return RootSeen::Denied,
-            Err(_) => return RootSeen::Unreadable,
+            Ok(None) | Err(_) => return RootSeen::Unreadable,
         }
     }
 }
@@ -1708,6 +1724,56 @@ mod tests {
         );
         let row = check_root(file.join("data"), true, true).await;
         assert_eq!(row.outcome(), Outcome::Failed, "{row:?}");
+    }
+
+    /// Above an absent root, an ancestor that is a symlink to nothing is
+    /// not one boot creates: boot's exclusive create meets the symlink as
+    /// an existing entry and refuses, so the row fails. A symlink to a
+    /// directory counts as that directory, and boot creates the root
+    /// through it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_absent_root_below_a_dangling_symlink_fails_as_boot_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let link = tmp.path().join("state");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
+        let data = link.join("data");
+        for ask_access in [false, true] {
+            let row = check_root(data.clone(), true, ask_access).await;
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (
+                    Outcome::Failed,
+                    Some("a parent of the data root is a symlink to nothing")
+                ),
+                "ask_access {ask_access}"
+            );
+        }
+        let before = tree(tmp.path());
+        let boot = epoch::ensure_current_epoch(&data, &wal, true);
+        assert!(
+            boot.as_ref()
+                .is_err_and(|message| message.starts_with("failed to create data root")),
+            "{boot:?}"
+        );
+        assert_eq!(tree(tmp.path()), before, "boot's refusal wrote");
+
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let linked = tmp.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let data = linked.join("data");
+        let row = check_root(data.clone(), true, true).await;
+        assert_eq!(
+            (row.outcome(), row.reason()),
+            (Outcome::Complete, Some(reason::WILL_INITIALIZE))
+        );
+        assert_eq!(
+            epoch::ensure_current_epoch(&data, &wal, true),
+            Ok(epoch::Outcome::FreshRoot)
+        );
+        assert!(real.join("data").is_dir());
     }
 
     /// Unless the doctor asks about access, as in a root run, a structure
