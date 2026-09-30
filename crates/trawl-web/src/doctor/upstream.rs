@@ -10,7 +10,9 @@
 //! query or fragment, or names no host, a connect address that does not
 //! fit it, and a pin path that is empty or not UTF-8. Each is a fixed
 //! sentence, and no request is sent. With a pinned CA it reads the file
-//! once through [`read`] and parses it with the production parser; the
+//! once through [`read::read_selected`], which expands `~` in the path on
+//! the reading thread, and parses it with the production parser. The row
+//! shows the path as written. The
 //! roots go to the probe through [`Ctx::pinned_roots`], so the probe
 //! trusts exactly what was checked, and the file is never read twice. A
 //! pin that does not exist yet is `not_sampled`, reason `ca_not_present`:
@@ -109,9 +111,10 @@ async fn check_trust(ctx: &mut Ctx) -> Row {
             .detail(dials(Text::new("trusts the platform roots")))
             .source(url_from),
         TrustSource::Pinned { path, from } => {
+            // Shown as written; `~` expands on the reading thread.
             let shown = SelectedPath::new(Selection::UpstreamCaPath, path);
             let source = url_from.lit("; CA: ").setting(*from);
-            let row = match read::read(path.clone(), read::cap::CA).await {
+            let row = match read::read_selected(path.clone(), read::cap::CA).await {
                 Ok(bytes) => match pinned_roots(&bytes) {
                     Ok(roots) => {
                         let count = u32::try_from(roots.certificates().len()).unwrap_or(u32::MAX);

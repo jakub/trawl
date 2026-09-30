@@ -15,12 +15,21 @@
 //! A key is read by [`secret_len`] instead: the bytes stay on the blocking
 //! thread, in a buffer scrubbed on every path, and only their count comes
 //! back.
+//!
+//! The key file and the pinned CA are read at the path the operator wrote,
+//! by [`secret_len`] and [`read_selected`]: `~` in it is expanded on the
+//! reading thread, just before the read and under the same deadline, by
+//! [`expand_tilde`], as startup expands it just before its own read. With
+//! `HOME` unset or empty that expansion asks the user database, which can
+//! stall, so the deadline bounds it too. When no home directory is found,
+//! the `~` stays as written, as at startup, and the read reports what it
+//! finds there.
 
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::config::{read_capped_file, read_capped_secret};
+use crate::config::{expand_tilde, read_capped_file, read_capped_secret};
 
 /// How long one read may take. A hung network volume costs the check its
 /// answer, not the run.
@@ -88,8 +97,21 @@ pub async fn read(path: PathBuf, cap: u64) -> Result<Vec<u8>, ReadFault> {
     within_deadline(move || read_capped_file(&path, cap)).await
 }
 
+/// [`read`] for a path as the operator wrote it in the configuration or
+/// the environment: `~` is expanded on the reading thread, under the same
+/// deadline, just before the read.
+///
+/// # Errors
+/// A [`ReadFault`] naming why nothing was read.
+pub async fn read_selected(path: PathBuf, cap: u64) -> Result<Vec<u8>, ReadFault> {
+    within_deadline(move || read_capped_file(&expand_tilde(&path), cap)).await
+}
+
 /// How many bytes the secret file at `path` holds, at most `cap`, read on
 /// the blocking pool under [`READ_DEADLINE`].
+///
+/// `path` is as the operator wrote it: `~` is expanded on the reading
+/// thread, under the same deadline, just before the read.
 ///
 /// The bytes never leave the blocking thread: [`read_capped_secret`] reads
 /// them into a buffer scrubbed on every path, errors included, and only
@@ -99,7 +121,8 @@ pub async fn read(path: PathBuf, cap: u64) -> Result<Vec<u8>, ReadFault> {
 /// # Errors
 /// A [`ReadFault`] naming why nothing was read.
 pub async fn secret_len(path: PathBuf, cap: u64) -> Result<usize, ReadFault> {
-    within_deadline(move || read_capped_secret(&path, cap).map(|bytes| bytes.len())).await
+    within_deadline(move || read_capped_secret(&expand_tilde(&path), cap).map(|bytes| bytes.len()))
+        .await
 }
 
 /// Run `read` on the blocking pool, waiting at most [`READ_DEADLINE`].

@@ -368,12 +368,10 @@ impl Runner {
 /// such as a file read past its deadline.
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
 
-/// How long each blocking step of `proxy.config` besides the file read may
-/// take: expanding `~` in the `--config` path, and observing the
-/// environment and resolving the sources, which finds the home directory
-/// `~` expands to in the key and pin paths. With HOME unset or empty
-/// finding it asks the password database, which can be a network service.
-/// Each gets a file read's budget.
+/// How long expanding `~` in the `--config` path may take: a file read's
+/// budget. With HOME unset or empty the expansion asks the password
+/// database, which can be a network service. The key and pin paths expand
+/// in their own bounded reads ([`read`]).
 const VALIDATE_DEADLINE: Duration = read::READ_DEADLINE;
 
 /// How long the running user's name may take to look up. The password
@@ -479,9 +477,9 @@ fn tilde_path(path: &Path) -> PathBuf {
 
 /// `proxy.config`: expand `~` in the `--config` argument, read the file
 /// through the bounded reader, parse it as the whole schema, observe the
-/// environment once, and resolve the sources as startup does. Expanding,
-/// and observing with resolving, each run on the blocking pool under
-/// [`VALIDATE_DEADLINE`].
+/// environment once, and resolve the sources as startup does. Expanding
+/// runs on the blocking pool under [`VALIDATE_DEADLINE`]. Resolving looks
+/// nothing up: the key and pin paths stay as written until their reads.
 ///
 /// The row owns the file's read and parse and the listen address; every
 /// other component's error stays in its slot for its own row. Returns the
@@ -525,17 +523,11 @@ async fn check_config(runner: &mut Runner, arg: &Path) -> (SelectedPath, Option<
                 Row::failed(check, "the configuration does not parse").next(fix.clone())
             }
         })?;
-        let sources = blocking_within(VALIDATE_DEADLINE, move || {
-            let runtime = RuntimeParts::from_process_env().find_home(&config.web);
-            Sources::resolve(&config.web, Some(&config.server), runtime)
-        })
-        .await
-        .map_err(|unfinished| {
-            unfinished_config(
-                unfinished,
-                "expanding ~ in the key and CA paths did not finish",
-            )
-        })?;
+        let sources = Sources::resolve(
+            &config.web,
+            Some(&config.server),
+            RuntimeParts::from_process_env(),
+        );
         match &sources.bind_addr {
             Ok(listen_at) => Ok((listen_at.from, sources)),
             Err(error) => Err(bind_addr_fault(error)),

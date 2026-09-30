@@ -359,13 +359,12 @@ fn web_doctor_root_identity_is_not_sampled() {
     assert!(run.stderr.is_empty(), "{}", run.stderr);
 }
 
-/// With HOME unset, `~` in the `--config` path, and the home directory the
-/// key and CA paths expand against, come from the password database, which
-/// can be a network service that stalls. The doctor looks both up on its
-/// blocking pool under a 5 s deadline each, and the identity row's lookup
-/// has 2 s, so the run returns within 15 s whatever the lookup does, with
-/// `proxy.config` reporting on the path it found: here, one that does not
-/// exist.
+/// With HOME unset, the home directory `~` in the `--config` path expands
+/// to comes from the password database, which can be a network service
+/// that stalls. The doctor expands the path on its blocking pool under a
+/// 5 s deadline, and the identity row's lookup has 2 s, so the run returns
+/// within 15 s whatever the lookup does, with `proxy.config` reporting on
+/// the path it found: here, one that does not exist.
 #[test]
 fn web_doctor_tilde_config_without_home_returns() {
     let missing = format!(
@@ -394,5 +393,88 @@ fn web_doctor_tilde_config_without_home_returns() {
         run.stdout
     );
     assert_eq!(run.code, 1, "{}", run.stdout);
+    assert!(run.stderr.is_empty(), "{}", run.stderr);
+}
+
+/// `~` in the key and CA paths expands where each file is read, as at
+/// startup: the key file and the pinned CA under HOME are found through
+/// `~`, and each row shows the path as the configuration writes it.
+#[test]
+fn web_doctor_expands_tilde_where_each_file_is_read() {
+    let home = tempfile::tempdir().unwrap();
+    write_key(&home.path().join("lib").join("web.cookie"), 32);
+    write_ca(&home.path().join("tls").join("ca.pem"));
+    let mut fixture = WebDoctorConfig::in_dir(home.path());
+    fixture.cookie_secret_path = Some("~/lib/web.cookie".into());
+    fixture.upstream_ca_path = Some("~/tls/ca.pem".into());
+    let config = write_config(home.path(), &fixture);
+
+    let (_, report) = doctor(&config, &home_env(home.path()), &fixture.planted());
+    assert_eq!(
+        verdict(&report, "proxy.cookie_key"),
+        (Outcome::Complete, None)
+    );
+    let key = row(&report, "proxy.cookie_key");
+    assert!(
+        key.source
+            .as_deref()
+            .is_some_and(|source| source.contains("~/lib/web.cookie")),
+        "{key:?}"
+    );
+    assert_eq!(
+        verdict(&report, "proxy.upstream.trust"),
+        (Outcome::Complete, None)
+    );
+    let trust = row(&report, "proxy.upstream.trust");
+    assert!(
+        trust
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("~/tls/ca.pem")),
+        "{trust:?}"
+    );
+}
+
+/// With HOME unset, expanding `~` in the key and CA paths asks the password
+/// database, inside each file's bounded read. The run returns whatever the
+/// lookup does: each row reports what its read found at the expanded path,
+/// or at the path as written when no home was found, or that the read ran
+/// out of time.
+#[test]
+fn web_doctor_tilde_paths_without_home_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let absent = format!("~/.trawl-web-doctor-absent-{}", std::process::id());
+    let mut fixture = WebDoctorConfig::in_dir(dir.path());
+    fixture.cookie_secret_path = Some(format!("{absent}/web.cookie").into());
+    fixture.upstream_ca_path = Some(format!("{absent}/ca.pem").into());
+    let config = write_config(dir.path(), &fixture);
+    let planted = fixture.planted();
+    let planted: Vec<&str> = planted.iter().map(String::as_str).collect();
+
+    let started = std::time::Instant::now();
+    let run = run_web_doctor(
+        &doctor_args(&config, "json"),
+        &[] as &[(&str, &str)],
+        &planted,
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "took {elapsed:?}"
+    );
+    let report = report(&run.stdout);
+    let timed_out = (Outcome::NotSampled, Some("timed_out"));
+    let key = verdict(&report, "proxy.cookie_key");
+    assert!(
+        key == (Outcome::Failed, Some("the key file does not exist")) || key == timed_out,
+        "{}",
+        run.stdout
+    );
+    let trust = verdict(&report, "proxy.upstream.trust");
+    assert!(
+        trust == (Outcome::NotSampled, Some("ca_not_present")) || trust == timed_out,
+        "{}",
+        run.stdout
+    );
     assert!(run.stderr.is_empty(), "{}", run.stderr);
 }

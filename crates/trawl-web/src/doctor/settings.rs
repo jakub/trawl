@@ -14,9 +14,10 @@
 //! crate constant's variable name and fleet-auth's static reason.
 //!
 //! The cookie key is the one row that reads a file: `cookie_secret_path`,
-//! through [`read::secret_len`] with the key's cap, which reads the bytes
-//! into a scrubbed buffer on the blocking thread and returns only their
-//! count. That row carries the access mark, so a
+//! through [`read::secret_len`] with the key's cap, which expands `~` in
+//! the path, reads the bytes into a scrubbed buffer on the blocking thread
+//! and returns only their count. The row shows the path as written, the
+//! form the operator finds in the file. That row carries the access mark, so a
 //! root run reports its `complete` as `not_sampled`, `ran_as_root` (D12).
 //! Nothing here generates a key: no key source is `not_configured`,
 //! `ephemeral_each_start`.
@@ -294,6 +295,7 @@ async fn cookie_key(ctx: &Ctx) -> Row {
             .source(Text::new(ENV_SESSION_AEAD_KEY)),
         Ok(KeySource::ConfigEnv { name }) => config_env_key(ctx, name),
         Ok(KeySource::File { path }) => {
+            // Shown as written; `~` expands on the reading thread.
             let shown = SelectedPath::new(Selection::CookieSecretPath, path);
             // Only the length is judged, so only the length comes back:
             // the bytes are scrubbed on the reading thread.
