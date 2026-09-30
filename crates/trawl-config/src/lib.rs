@@ -174,9 +174,20 @@ impl ServerConfig {
     /// Pure resolution core, split out for testability (mutating process
     /// env in tests is forbidden under `unsafe_code = "forbid"`).
     fn resolve_http_addr_from(env_value: Option<&str>, configured: &str) -> String {
-        env_value
-            .filter(|s| !s.is_empty())
-            .map_or_else(|| configured.to_owned(), str::to_owned)
+        Self::http_addr_override(env_value).map_or_else(|| configured.to_owned(), str::to_owned)
+    }
+
+    /// The `TRAWL_HTTP_ADDR` rule on its own: `env_value` replaces `[server]
+    /// http_addr` unless it is unset or empty, and `None` means the
+    /// configured address applies.
+    ///
+    /// trawl-web observes the variable itself and needs to know which of the
+    /// two applied, so it calls this rather than
+    /// [`Self::resolve_http_addr`]. The caller turns the variable into text
+    /// first; both callers treat a value that is not UTF-8 as unset.
+    #[must_use]
+    pub fn http_addr_override(env_value: Option<&str>) -> Option<&str> {
+        env_value.filter(|s| !s.is_empty())
     }
 }
 

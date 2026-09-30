@@ -1685,8 +1685,9 @@ pub(crate) fn pinned_roots(pem: &[u8]) -> Result<PinnedRoots, &'static str> {
 /// The address follows [`ServerConfig::resolve_http_addr`]'s rule rather
 /// than the raw field: trawld honours [`ENV_HTTP_ADDR`], and a proxy still
 /// aiming at the file's port would talk to nothing. The variable's value,
-/// `http_addr_env`, is an argument so this stays pure; like that function,
-/// a value that is empty or not UTF-8 counts as unset.
+/// `http_addr_env`, is an argument so this stays pure. The rule itself is
+/// trawl-config's [`ServerConfig::http_addr_override`]; like
+/// `resolve_http_addr`, a value that is not UTF-8 counts as unset.
 fn derive_upstream(
     server: Option<&ServerConfig>,
     http_addr_env: Option<&OsStr>,
@@ -1694,13 +1695,11 @@ fn derive_upstream(
     let Some(srv) = server else {
         return (FALLBACK_UPSTREAM_URL.to_owned(), SettingSource::Default);
     };
-    let (resolved, from) = match http_addr_env
-        .and_then(OsStr::to_str)
-        .filter(|s| !s.is_empty())
-    {
-        Some(addr) => (addr, SettingSource::DerivedFromEnvironment(ENV_HTTP_ADDR)),
-        None => (srv.http_addr.as_str(), SettingSource::DerivedFromFile),
-    };
+    let (resolved, from) =
+        match ServerConfig::http_addr_override(http_addr_env.and_then(OsStr::to_str)) {
+            Some(addr) => (addr, SettingSource::DerivedFromEnvironment(ENV_HTTP_ADDR)),
+            None => (srv.http_addr.as_str(), SettingSource::DerivedFromFile),
+        };
     let addr = resolved.trim();
     let (host, port_suffix) = split_addr(addr);
     let is_ipv6 = host.contains(':');
