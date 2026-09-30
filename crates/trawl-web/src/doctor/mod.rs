@@ -537,7 +537,7 @@ async fn check_config(runner: &mut Runner, arg: &Path) -> (SelectedPath, Option<
             )
         })?;
         match &sources.bind_addr {
-            Ok(bind) => Ok((bind.from, sources)),
+            Ok(listen_at) => Ok((listen_at.from, sources)),
             Err(error) => Err(bind_addr_fault(error)),
         }
     }
@@ -1111,39 +1111,239 @@ mod tests {
         ("upstream.rs", include_str!("upstream.rs")),
     ];
 
-    /// `source` without its test module and without full-line comments:
-    /// the code the doctor runs. A test may write its fixtures, and a
-    /// comment may name what the code must not call.
-    fn runtime_code(source: &str) -> String {
-        let code = source
-            .split_once("\n#[cfg(test)]\nmod tests {")
-            .map_or(source, |(code, _)| code);
-        code.lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n")
+    /// Words the doctor's code must not contain (D15), in any path or
+    /// import: startup's configuration, state, key generation and log
+    /// setup; listeners and sockets; and every call that creates, writes,
+    /// moves or removes a file. A macro such as `write!` is not a call of
+    /// the same name: it formats into the sink it is given.
+    const FORBIDDEN_WORDS: [&str; 30] = [
+        "ResolvedConfig",
+        "AppState",
+        "from_sources",
+        "generate",
+        "tracing_subscriber",
+        "TcpListener",
+        "TcpSocket",
+        "UdpSocket",
+        "UnixListener",
+        "UnixDatagram",
+        "bind",
+        "listen",
+        "socket",
+        "OpenOptions",
+        "create",
+        "create_new",
+        "create_dir",
+        "create_dir_all",
+        "write",
+        "write_all",
+        "write_at",
+        "set_len",
+        "set_permissions",
+        "rename",
+        "copy",
+        "hard_link",
+        "symlink",
+        "remove_file",
+        "remove_dir",
+        "remove_dir_all",
+    ];
+
+    /// Modules whose items the doctor names only as `module::Item` with the
+    /// pair in [`ALLOWED_ITEMS`]: the file system and the network, in
+    /// `std`, `tokio` or any other crate. A grouped import, a rename, a
+    /// glob or the module alone is refused, so no spelling reaches an item
+    /// that is not listed.
+    const GUARDED_MODULES: [&str; 2] = ["fs", "net"];
+
+    /// The read-only items the doctor uses from [`GUARDED_MODULES`]. The
+    /// doctor reads files through `read::read` and the upstream through
+    /// reqwest, so it names none directly.
+    const ALLOWED_ITEMS: [(&str, &str); 0] = [];
+
+    /// A token of the code the guard reads: a word (identifier or keyword)
+    /// or one punctuation character. A literal is the single `"` token.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Token {
+        Word(String),
+        Punct(char),
+    }
+
+    /// The tokens of `source`, without comments and with every string,
+    /// byte-string, raw-string and character literal reduced to one `"`,
+    /// so text in a comment or literal neither trips the scan nor hides a
+    /// brace from it. A raw identifier `r#name` is the word `name`.
+    fn tokens(source: &str) -> Vec<Token> {
+        /// The index just past the `quote` that closes a literal whose body
+        /// starts at `i`, honouring backslash escapes.
+        fn closed(chars: &[char], mut i: usize, quote: char) -> usize {
+            while let Some(&c) = chars.get(i) {
+                match c {
+                    '\\' => i += 2,
+                    c if c == quote => return i + 1,
+                    _ => i += 1,
+                }
+            }
+            i
+        }
+        let chars: Vec<char> = source.chars().collect();
+        let at = |i: usize| chars.get(i).copied();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(c) = at(i) {
+            if c == '/' && at(i + 1) == Some('/') {
+                while at(i).is_some_and(|c| c != '\n') {
+                    i += 1;
+                }
+            } else if c == '/' && at(i + 1) == Some('*') {
+                // Block comments nest.
+                let mut depth = 0_usize;
+                while i < chars.len() {
+                    if at(i) == Some('/') && at(i + 1) == Some('*') {
+                        depth += 1;
+                        i += 2;
+                    } else if at(i) == Some('*') && at(i + 1) == Some('/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if c == '"' {
+                out.push(Token::Punct('"'));
+                i = closed(&chars, i + 1, '"');
+            } else if c == '\'' {
+                // A character literal, or else a lifetime or label.
+                if at(i + 1) == Some('\\') {
+                    out.push(Token::Punct('"'));
+                    i = closed(&chars, i + 1, '\'');
+                } else if at(i + 2) == Some('\'') {
+                    out.push(Token::Punct('"'));
+                    i += 3;
+                } else {
+                    out.push(Token::Punct('\''));
+                    i += 1;
+                }
+            } else if c.is_alphabetic() || c == '_' {
+                let start = i;
+                while at(i).is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                let hashes = chars[i..].iter().take_while(|&&c| c == '#').count();
+                match (word.as_str(), at(i)) {
+                    ("r" | "br" | "cr", Some('"' | '#')) if at(i + hashes) == Some('"') => {
+                        let close: Vec<char> = std::iter::once('"')
+                            .chain(std::iter::repeat_n('#', hashes))
+                            .collect();
+                        out.push(Token::Punct('"'));
+                        i = (i + hashes + 1..chars.len())
+                            .find(|&j| chars[j..].starts_with(&close))
+                            .map_or(chars.len(), |j| j + close.len());
+                    }
+                    // A raw identifier: the next pass reads its name.
+                    ("r", Some('#')) if hashes == 1 => i += 1,
+                    ("b" | "c", Some('"')) => {
+                        out.push(Token::Punct('"'));
+                        i = closed(&chars, i + 1, '"');
+                    }
+                    ("b", Some('\'')) => {
+                        out.push(Token::Punct('"'));
+                        i = closed(&chars, i + 1, '\'');
+                    }
+                    _ => out.push(Token::Word(word)),
+                }
+            } else {
+                if !c.is_whitespace() {
+                    out.push(Token::Punct(c));
+                }
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The tokens of `source` without each `#[cfg(test)] mod tests { .. }`
+    /// module, which ends at its matching brace: the code the doctor runs.
+    /// Code after a test module stays in the scan. A test may write its
+    /// fixtures.
+    fn runtime_tokens(source: &str) -> Vec<Token> {
+        let head = [
+            Token::Punct('#'),
+            Token::Punct('['),
+            Token::Word("cfg".into()),
+            Token::Punct('('),
+            Token::Word("test".into()),
+            Token::Punct(')'),
+            Token::Punct(']'),
+            Token::Word("mod".into()),
+            Token::Word("tests".into()),
+            Token::Punct('{'),
+        ];
+        let all = tokens(source);
+        let mut code = Vec::new();
+        let mut i = 0;
+        while i < all.len() {
+            if all[i..].starts_with(&head) {
+                let mut depth = 0_usize;
+                i += head.len() - 1;
+                while let Some(token) = all.get(i) {
+                    i += 1;
+                    match token {
+                        Token::Punct('{') => depth += 1,
+                        Token::Punct('}') => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                code.push(all[i].clone());
+                i += 1;
+            }
+        }
+        code
+    }
+
+    /// What `source`'s runtime code names that D15 forbids: each forbidden
+    /// word, and each file-system or network path that is not a listed
+    /// `module::Item`.
+    fn violations(source: &str) -> Vec<String> {
+        let code = runtime_tokens(source);
+        let mut found = Vec::new();
+        for (i, token) in code.iter().enumerate() {
+            let Token::Word(word) = token else { continue };
+            let word = word.as_str();
+            if FORBIDDEN_WORDS.contains(&word) && code.get(i + 1) != Some(&Token::Punct('!')) {
+                found.push(word.to_owned());
+            }
+            if GUARDED_MODULES.contains(&word) {
+                let item = match (code.get(i + 1), code.get(i + 2), code.get(i + 3)) {
+                    (Some(Token::Punct(':')), Some(Token::Punct(':')), Some(Token::Word(item))) => {
+                        Some(item.as_str())
+                    }
+                    _ => None,
+                };
+                if !item.is_some_and(|item| ALLOWED_ITEMS.contains(&(word, item))) {
+                    found.push(format!("{word}::{}", item.unwrap_or("{..}")));
+                }
+            }
+        }
+        found
     }
 
     /// The doctor's code names none of startup's side effects (D15): the
     /// running configuration or state, its only constructor, key
-    /// generation, a listener, a socket, or a write. Names are split so
-    /// this test does not trip on itself.
+    /// generation, log setup, a listener, a socket, or a file write, and
+    /// reaches the file system and the network only through listed items.
     #[test]
     fn the_doctor_reaches_no_startup_side_effect() {
-        let forbidden = [
-            ["Resolved", "Config"].concat(),
-            ["App", "State"].concat(),
-            ["from_", "sources"].concat(),
-            ["SessionKey::", "generate"].concat(),
-            ["generate", "()"].concat(),
-            ["Tcp", "Listener"].concat(),
-            ["Udp", "Socket"].concat(),
-            ["fs::", "write"].concat(),
-            ["Open", "Options"].concat(),
-            ["File::", "create"].concat(),
-            ["create_", "dir"].concat(),
-            ["tracing_", "subscriber"].concat(),
-        ];
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/doctor");
         let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
             .expect("list src/doctor")
@@ -1163,21 +1363,84 @@ mod tests {
         );
 
         for (name, source) in DOCTOR_SOURCES {
-            let code = runtime_code(source);
-            for word in &forbidden {
-                assert!(
-                    !code.contains(word.as_str()),
-                    "src/doctor/{name} names {word}"
-                );
-            }
+            assert_eq!(
+                violations(source),
+                Vec::<String>::new(),
+                "src/doctor/{name} names a startup side effect"
+            );
         }
 
         // The scan sees code and skips tests and comments.
         let planted = "fn f() {\n    // AppState is fine here\n    let s = App\
                        State::new();\n}\n#[cfg(test)]\nmod tests {\n    fs::write(x);\n}\n";
-        let code = runtime_code(planted);
-        assert!(code.contains(&["App", "State::new"].concat()));
-        assert!(!code.contains("is fine"));
-        assert!(!code.contains(&["fs::", "write"].concat()));
+        assert_eq!(violations(planted), ["AppState"]);
+    }
+
+    /// Each way around a text scan that review named is caught: code after
+    /// the test module, grouped and aliased imports of the file system and
+    /// the network, and a write spelled without its module. Comments,
+    /// literals, macros and the test module itself are not code the doctor
+    /// runs, and stay out of the scan.
+    #[test]
+    fn the_guard_sees_through_every_spelling() {
+        let caught = [
+            (
+                "code after the test module",
+                "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() {\n        let _ = \"}\";\n    }\n}\n\nfn later() {\n    std::fs::write(p, b).ok();\n}\n",
+            ),
+            (
+                "a grouped write import",
+                "use std::fs::{write};\nfn f() {\n    write(p, b).ok();\n}\n",
+            ),
+            (
+                "the module imported as self",
+                "use std::fs::{self};\nfn f() {\n    fs::write(p, b).ok();\n}\n",
+            ),
+            (
+                "a grouped listener import",
+                "use std::net::{TcpListener as L};\n",
+            ),
+            ("both modules in one group", "use std::{fs, net};\n"),
+            (
+                "the module renamed",
+                "use tokio::fs as disk;\nasync fn f() {\n    disk::File::open(p).await.ok();\n}\n",
+            ),
+            (
+                "a create call on its own",
+                "fn f(o: &mut Opts) {\n    o.create(true);\n}\n",
+            ),
+            ("a raw identifier", "fn f() {\n    r#write(p, b);\n}\n"),
+            (
+                "a write from another module",
+                "fn f() {\n    rustix::io::write(fd, b).ok();\n}\n",
+            ),
+            (
+                "a socket syscall",
+                "fn f() {\n    unsafe { libc::socket(2, 1, 0) };\n}\n",
+            ),
+            (
+                "startup's state",
+                "fn f() {\n    let s = AppState::new();\n}\n",
+            ),
+        ];
+        for (name, planted) in caught {
+            assert!(!violations(planted).is_empty(), "missed {name}");
+        }
+
+        let clean = "use std::io::Write as _;\n\
+                     // std::fs::write and AppState in a comment\n\
+                     /* a block comment: TcpListener { */\n\
+                     fn f(out: &mut impl std::io::Write, k: &KeySource) -> std::io::Result<()> {\n    \
+                         let _ = (k, '}', b'{', \"std::fs::write\", r#\"create(\"}\"#);\n    \
+                         writeln!(out, \"write the key\")?;\n    \
+                         write!(out, \"{}\", 1)\n\
+                     }\n\
+                     #[cfg(test)]\n\
+                     mod tests {\n    \
+                         fn t() {\n        \
+                             std::fs::write(\"x\", b\"}\").unwrap();\n    \
+                         }\n\
+                     }\n";
+        assert_eq!(violations(clean), Vec::<String>::new());
     }
 }
