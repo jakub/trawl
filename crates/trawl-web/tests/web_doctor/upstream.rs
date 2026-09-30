@@ -24,8 +24,9 @@ use trawl_api::doctor::{Outcome, Report, reason};
 use wiremock::{MockServer, ResponseTemplate};
 
 use crate::support::{
-    Observed, PLANTED_CA_SUBJECT, SECRET, WebDoctorConfig, healthy_answer, healthy_upstream,
-    home_env, report, row, run_web_doctor, serve_health, verdict, write_config, write_key,
+    Observed, PLANTED_CA_SUBJECT, SECRET, WebDoctorConfig, doctor, healthy_answer,
+    healthy_upstream, home_env, report, row, run_web_doctor, serve_health, verdict, write_config,
+    write_key,
 };
 use crate::test_support::{LOOPBACK_SANS, TestCa, TlsFront, TlsUpstream};
 
@@ -433,4 +434,35 @@ async fn web_doctor_ca_not_present_is_incomplete() {
         (Outcome::NotSampled, Some(reason::BLOCKED))
     );
     assert_eq!(health.blocked_by.as_deref(), Some("proxy.upstream.trust"));
+}
+
+/// With no pin, building the probe's client loads the platform's roots,
+/// from `SSL_CERT_FILE` when it is set. There it names a FIFO with no
+/// writer, as a CA bundle on a stalled mount would hold the read: the
+/// doctor bounds that load, trust still reports the platform roots, the
+/// probe could not look, and the run is incomplete, exit 3. The FIFO's
+/// path is planted: the report does not name it.
+#[cfg(unix)]
+#[test]
+fn web_doctor_platform_roots_stall_is_incomplete() {
+    let home = tempfile::tempdir().expect("home");
+    let config = WebDoctorConfig::in_dir(home.path());
+    let config_path = write_config(home.path(), &config);
+    let bundle = home.path().join("stalled-private-secret-bundle.pem");
+    nix::unistd::mkfifo(&bundle, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
+    let mut env = home_env(home.path());
+    env.push(("SSL_CERT_FILE", bundle.as_os_str().to_owned()));
+    let mut planted = config.planted();
+    planted.push(bundle.to_string_lossy().into_owned());
+
+    let (code, report) = doctor(&config_path, &env, &planted);
+    assert_eq!(code, 3, "{report:?}");
+    assert_eq!(
+        verdict(&report, "proxy.upstream.trust"),
+        (Outcome::Complete, None)
+    );
+    assert_eq!(
+        verdict(&report, "proxy.upstream.health"),
+        (Outcome::NotSampled, Some(reason::TIMED_OUT))
+    );
 }

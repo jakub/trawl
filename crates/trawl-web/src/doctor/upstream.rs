@@ -22,7 +22,13 @@
 //! the production client rules ([`upstream_client`]): https only, no
 //! redirect, no proxy, the connect address, the pinned roots only. The
 //! doctor adds its own timeouts, no retry and no idle pool, so the probe is
-//! one request on one connection. The status is judged first: a redirect is
+//! one request on one connection. Under the platform roots, building that
+//! client loads them, as startup's does: `SSL_CERT_FILE`, `SSL_CERT_DIR` or
+//! the system store, read synchronously. The build runs on the blocking
+//! pool under [`CLIENT_DEADLINE`], so a bundle on a stalled mount costs the
+//! probe its answer, `timed_out`, and not the run. Trust still reports the
+//! platform roots as the configured trust (D5): whether they load is the
+//! probe's first step. The status is judged first: a redirect is
 //! refused without reading where it points, and any status but 200 or 503
 //! fails without reading the body. The body is read in chunks up to
 //! [`BODY_MAX`] and judged by [`health::judge`], the judge every doctor
@@ -43,7 +49,7 @@ use trawl_api::doctor::{Outcome, reason};
 
 use super::output::{HealthKey, Row, SelectedPath, Selection, Text};
 use super::read::{self, ReadFault};
-use super::{Ctx, Runner, WebCheck};
+use super::{Ctx, Runner, Unfinished, WebCheck, blocking_within};
 use crate::config::{
     ConfigError, ConnectAddrError, ENV_UPSTREAM_CA_PATH, PinnedRoots, TrustSource, UpstreamPlan,
     UpstreamUrlError, pinned_roots,
@@ -66,6 +72,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// A backstop past [`REQUEST_TIMEOUT`], around the send and the body read
 /// together, so no step of the probe can hold the run.
 const PROBE_DEADLINE: Duration = Duration::from_secs(11);
+
+/// How long building the probe's client may take: a file read's budget.
+/// Under the platform roots the build reads them, from `SSL_CERT_FILE`,
+/// `SSL_CERT_DIR` or the system store, and a stalled mount or a FIFO there
+/// would hold it; [`PROBE_DEADLINE`] starts only once the client exists.
+const CLIENT_DEADLINE: Duration = read::READ_DEADLINE;
 
 /// Run the group's checks, each through the runner's gate.
 pub(super) async fn run(runner: &mut Runner, ctx: &mut Ctx) {
@@ -289,16 +301,9 @@ async fn check_health(ctx: &Ctx) -> (Row, Vec<Row>) {
 /// Send the probe and judge what came back.
 async fn probe(plan: &UpstreamPlan, pinned: Option<&[reqwest::Certificate]>) -> (Row, Vec<Row>) {
     let check = WebCheck::UpstreamHealth;
-    let builder = Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .retry(reqwest::retry::never())
-        .pool_max_idle_per_host(0);
-    let Ok(client) = upstream_client(builder, pinned, plan.connect.as_ref()).build() else {
-        return (
-            Row::failed(check, "no upstream client can be built from this trust"),
-            Vec::new(),
-        );
+    let client = match build_client(plan, pinned).await {
+        Ok(client) => client,
+        Err(row) => return (row, Vec::new()),
     };
     // `check_upstream_url` refused any credential before trust completed,
     // so the probe cannot carry one; this holds that line where the request
@@ -349,6 +354,49 @@ async fn probe(plan: &UpstreamPlan, pinned: Option<&[reqwest::Certificate]>) -> 
     tokio::time::timeout(PROBE_DEADLINE, exchange)
         .await
         .unwrap_or_else(|_| (timed_out_row(), Vec::new()))
+}
+
+/// The probe's client: the production rules ([`upstream_client`]) over
+/// the doctor's timeouts, built on the blocking pool under
+/// [`CLIENT_DEADLINE`]. Under the platform roots the build loads them
+/// synchronously, as startup's does, so it must not run on the doctor's
+/// one runtime thread unbounded.
+async fn build_client(
+    plan: &UpstreamPlan,
+    pinned: Option<&[reqwest::Certificate]>,
+) -> Result<Client, Row> {
+    let check = WebCheck::UpstreamHealth;
+    let pinned = pinned.map(<[reqwest::Certificate]>::to_vec);
+    let connect = plan.connect.clone();
+    let built = blocking_within(CLIENT_DEADLINE, move || {
+        let builder = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .retry(reqwest::retry::never())
+            .pool_max_idle_per_host(0);
+        upstream_client(builder, pinned.as_deref(), connect.as_ref()).build()
+    })
+    .await;
+    match built {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(_)) => Err(Row::failed(
+            check,
+            "no upstream client can be built from this trust",
+        )),
+        Err(Unfinished::TimedOut) => {
+            let row = Row::not_sampled(check, reason::TIMED_OUT).detail(Text::new(
+                "loading the trusted roots for the probe did not finish in time",
+            ));
+            Err(match plan.trust {
+                TrustSource::System => row.next(Text::new(
+                    "check that the system certificate store, and SSL_CERT_FILE or \
+                     SSL_CERT_DIR when set, can be read without waiting",
+                )),
+                TrustSource::Pinned { .. } => row,
+            })
+        }
+        Err(Unfinished::Panicked) => Err(Row::not_sampled(check, reason::UNREADABLE)),
+    }
 }
 
 fn timed_out_row() -> Row {
