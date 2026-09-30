@@ -218,6 +218,149 @@ catalog identifiers, listener addresses, or driver and operating-system error
 text. It may name the configuration and credential files the run selected, and
 the running user and uid.
 
+### Check the web proxy with `trawl-web --doctor`
+
+```bash
+trawl-web --doctor --config /etc/trawl/trawld.toml
+trawl-web --doctor --config /etc/trawl/trawld.toml --format json
+```
+
+`--doctor` checks, from where the web proxy runs, whether `trawl-web` will
+start with this configuration, keep browser sessions across a restart, and
+reach trawld with a verified certificate. It reads the configuration file and
+the process environment, sends one health request to trawld through the
+proxy's own client, and prints one row per check. `--format` takes `table` or
+`json`. Without `--format`, the doctor prints a table when standard output is
+a terminal and JSON otherwise. The JSON form is the versioned report that
+`trawld --doctor` prints, with `vantage` set to `web`.
+
+The command requires `--config PATH` on the command line. `TRAWL_CONFIG`
+alone is a usage error and exits with code 2. `--doctor` does not read another
+process's environment and does not source a systemd `EnvironmentFile`. Run it
+as the service user and with the service's environment, as
+[Verify the installation](/operate/deployment/#verify-the-installation) shows
+for each install channel. `trawl-web --doctor` does not check trawld's
+databases, data, or listener certificate. `trawld --doctor` checks those.
+
+#### Checks
+
+A check runs only when its prerequisites completed. Otherwise the check is
+`not_sampled` with the reason `blocked`, and its row names the prerequisite in
+`blocked_by`. The checks run in the order below.
+
+| Check | Asserts | Prerequisite |
+|-------|---------|--------------|
+| `proxy.config` | The file reads and parses as the whole `trawld.toml` schema, and the listen address resolves, as at startup. A file that does not parse fails this check and exits with code 1, not 2. | none |
+| `proxy.identity` | Names the effective user and uid of the run. | none |
+| `proxy.public_origins` | A non-empty list of valid browser origins resolves. The row says whether the list came from `[web] public_origins` or from `FLEET_SESSION_PUBLIC_ORIGINS`, and whether the variable replaced the file's list. An empty list or an invalid entry fails. | `proxy.config` |
+| `proxy.cookie_settings` | The session cookie's domain, path, `Secure` flag, and lifetime resolve. The row names the source of each. With `Secure` off, the check fails when any public origin is not loopback. Loopback hosts are `localhost`, `127.0.0.0/8`, and `[::1]`. | `proxy.config`, `proxy.public_origins` |
+| `proxy.cookie_key` | A persistent cookie key source is selected and usable. The row names the source: `FLEET_SESSION_AEAD_KEY`, the variable that `cookie_secret_env` names, or the `cookie_secret_path` file. A `cookie_secret_path` file of exactly 32 bytes that the running user can read is `complete`. A file of another length, or a variable that is unset or does not hold a base64 key, fails. A file that the running user cannot read is `not_sampled` with the reason `permission_denied`. With no source, the check is `not_configured` with the reason `ephemeral_each_start`. | `proxy.config` |
+| `proxy.upstream.trust` | The upstream URL is `https` and carries no user name or password, `upstream_connect_addr` suits it, and the trust resolves. The trust is the platform trust store, or the `upstream_ca_path` file when it parses as PEM certificates. A CA file that does not exist yet is `not_sampled` with the reason `ca_not_present`. A CA file that the running user cannot read is `not_sampled` with the reason `permission_denied`. | `proxy.config` |
+| `proxy.upstream.health` | `GET /api/v1/health` to trawld, through the proxy's own client and `upstream_connect_addr`, verifies trawld's certificate and returns trawld's health answer. An `unavailable` answer fails this row, whatever the reported checks say. One row per reported check follows as `proxy.upstream.health.<key>`. Only the checks trawld reports get a row. Any other check names share one `failed` `proxy.upstream.health._invalid` row, which does not show them. | `proxy.upstream.trust` |
+
+The health request takes the same path from `trawl-web` to trawld as a
+signed-in browser request. It trusts only what `proxy.upstream.trust` resolved,
+and it checks the host name in `upstream_url`. The doctor reports each way the
+request can fail:
+
+- The connection is refused: `failed` with the reason `connection_refused`.
+- trawld's certificate does not verify: `failed` with the reason
+  `certificate_not_trusted`.
+- The answer is a redirect: `failed` with the reason `redirect_refused`.
+- The TLS handshake fails for another reason: `failed`, with a sentence that
+  says so.
+- The answer has another HTTP status, such as 502 from a proxy in between:
+  `failed`, naming the status. The doctor never reports such an answer as a
+  certificate problem.
+- The connection or the answer takes too long: `not_sampled` with the reason
+  `timed_out`.
+- trawld's corpus is still recovering after a restart: `not_sampled` with the
+  reason `recovering`.
+
+#### Outcomes
+
+| Outcome | Meaning |
+|---------|---------|
+| `complete` | The doctor observed the assertion hold. |
+| `failed` | The doctor observed evidence against the assertion. |
+| `not_configured` | The configuration selects no persistent cookie key, so sessions end at each restart of `trawl-web`. |
+| `not_sampled` | The doctor could not look. The `reason` field says why. |
+
+A `not_sampled` row is neither a pass nor a failure. Its reason is one of the
+stable codes, among them `blocked`, `permission_denied`, `timed_out`,
+`too_large`, `unreadable`, `recovering`, `ca_not_present`, and `ran_as_root`.
+Only `trawl-web --doctor` reports these codes:
+
+| Reason | Meaning |
+|--------|---------|
+| `ca_not_present` | With `not_sampled`: the `upstream_ca_path` file does not exist yet. trawld writes its certificate at its first start. Start trawld, then run the doctor again. Until the file appears, `trawl-web` answers requests that need trawld with 503. |
+| `ephemeral_each_start` | With `not_configured`: no cookie key source is selected, so `trawl-web` generates a new key at each start and every earlier session ends. Set `cookie_secret_path` so sessions survive restarts. |
+| `connection_refused` | With `failed`: the upstream address refused the connection, as when trawld does not run or listens elsewhere. Check that trawld runs, and check `upstream_url` and `upstream_connect_addr`. |
+| `certificate_not_trusted` | With `failed`: trawld's certificate did not verify under the trust that `proxy.upstream.trust` resolved. The CA does not sign it, or it does not name the host in `upstream_url`. The doctor does not retry. |
+| `redirect_refused` | With `failed`: the upstream answered with a redirect. The doctor does not follow it and sends nothing to its target. trawld's health endpoint does not redirect, so `upstream_url` or `upstream_connect_addr` reaches another server. |
+
+A run with no cookie key source can exit with code 0, because
+`not_configured` is not a failure. When `upstream_ca_path` names the
+certificate that trawld generates, as the Debian package configures, the file
+does not exist before trawld's first start. `proxy.upstream.trust` is then
+`not_sampled` with the reason `ca_not_present`, `proxy.upstream.health` is
+`blocked`, and the run exits with code 3.
+
+#### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | `pass`: every check is `complete` or `not_configured`. |
+| `1` | `fail`: at least one check is `failed`. |
+| `2` | Usage error, such as `--config` missing from the command line. |
+| `3` | `incomplete`: no check failed, but at least one was `not_sampled`. |
+
+A failure outweighs a check that could not look. The same codes apply to
+`trawld --doctor` and `trawl doctor`.
+
+#### Run as root
+
+Root reads what the service user may not, so a root run cannot prove that
+`trawl-web`'s user can read its files. In a root run, `proxy.identity` is
+`not_sampled` with the reason `ran_as_root`. This differs from
+`trawld --doctor`, whose identity row stays `complete`. So a root run of
+`trawl-web --doctor` never exits `0`, even when the key comes from the
+environment and the trust is the platform trust store.
+
+With a `cookie_secret_path` file, a root run reports `proxy.cookie_key` as
+`not_sampled` with the reason `ran_as_root` where it would be `complete`. The
+check still fails when the file's content is wrong, such as a key that is not
+32 bytes. A key from the environment is content, so its row does not change.
+Run the doctor as the service user to get an answer about access.
+
+#### Side effects
+
+The doctor never binds the listen address, never generates a session key, and
+writes nothing. It logs no configuration value, touches no database, and
+reads each file once: the configuration, the cookie key file, and the CA file.
+Each read has a size limit and a time limit.
+
+It sends one request to trawld, `GET /api/v1/health`, with no API key, no
+`Authorization` header, and no cookie. It follows no redirect, does not retry,
+and ignores proxy variables such as `HTTPS_PROXY`. It reads at most 64 KiB of
+the answer, and the connection and the answer each have a time limit. When
+`upstream_url` carries a user name or password, `proxy.upstream.trust` fails
+and the doctor sends no request.
+
+One other side effect remains. A health request that makes the running trawld
+answer 503 emits that server's `http_failure` telemetry event
+([ADR-0040](https://github.com/jakub/trawl/blob/main/docs/adr/0040-every-server-failure-names-its-request-and-stage.md)).
+
+#### What the output never contains
+
+Rows name sources such as `FLEET_SESSION_PUBLIC_ORIGINS` or the config file,
+never values. The output has no origins, host names, upstream URL, listen
+address, certificate subjects or alternative names, key bytes, or TOML and
+operating-system error text. It may name the configuration, cookie key, and CA
+files the run selected, and the running user and uid. It names the variable
+that `cookie_secret_env` selects only when that name is a plain variable name
+that does not decode as a key.
+
 ### Server environment variables
 
 | Variable | Description |
