@@ -534,8 +534,9 @@ configured, but three effects remain:
 
 `web.origin` shows that `trawl-web` accepts its own origin. It does not show
 that `trawl-web` reaches `trawld`: the doctor runs where the client runs and
-cannot see that connection. A doctor on the server host checks it in a later
-release. Until then, sign in from a browser.
+cannot see that connection. `trawl-web --doctor`, run where the web proxy runs,
+checks it. See
+[Check the web proxy with `trawl-web --doctor`](/reference/configuration/#check-the-web-proxy-with-trawl-web---doctor).
 
 The doctor does not send a test event, so it does not prove that ingest works.
 

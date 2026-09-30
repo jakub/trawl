@@ -288,7 +288,8 @@ request can fail:
 
 A `not_sampled` row is neither a pass nor a failure. Its reason is one of the
 stable codes, among them `blocked`, `permission_denied`, `timed_out`,
-`too_large`, `unreadable`, `recovering`, `ca_not_present`, and `ran_as_root`.
+`too_large`, `interrupted`, `unreadable`, `recovering`, `ca_not_present`, and
+`ran_as_root`.
 Only `trawl-web --doctor` reports these codes:
 
 | Reason | Meaning |
