@@ -1105,10 +1105,13 @@ mod tests {
 
     /// Words the doctor's code must not contain (D15), in any path or
     /// import: startup's configuration, state, key generation and log
-    /// setup; listeners and sockets; and every call that creates, writes,
-    /// moves or removes a file. A macro such as `write!` is not a call of
-    /// the same name: it formats into the sink it is given.
-    const FORBIDDEN_WORDS: [&str; 30] = [
+    /// setup; listeners and sockets; every call that creates, writes,
+    /// moves or removes a file; and `macro_rules`. A macro such as `write!`
+    /// is not a call of the same name: it formats into the sink it is
+    /// given. `macro_rules!` is refused with its `!`: the doctor declares
+    /// no macro, and one could rewrite what the scan reads, such as
+    /// unwrapping a test module into running code.
+    const FORBIDDEN_WORDS: [&str; 31] = [
         "ResolvedConfig",
         "AppState",
         "from_sources",
@@ -1139,7 +1142,11 @@ mod tests {
         "remove_file",
         "remove_dir",
         "remove_dir_all",
+        "macro_rules",
     ];
+
+    /// The one forbidden word refused even as a macro: it defines macros.
+    const MACRO_DEFINITION: &str = "macro_rules";
 
     /// Modules whose items the doctor names only as `module::Item` with the
     /// pair in [`ALLOWED_ITEMS`]: the file system and the network, in
@@ -1262,6 +1269,11 @@ mod tests {
     /// module, which ends at its matching brace: the code the doctor runs.
     /// Code after a test module stays in the scan. A test may write its
     /// fixtures.
+    ///
+    /// Only a test module at the top level of the file is left out: one
+    /// that starts inside any `(`, `[` or `{`, such as a macro call's
+    /// arguments, is scanned like any other code, since a macro can turn
+    /// it into running code.
     fn runtime_tokens(source: &str) -> Vec<Token> {
         let head = [
             Token::Punct('#'),
@@ -1277,9 +1289,11 @@ mod tests {
         ];
         let all = tokens(source);
         let mut code = Vec::new();
+        // How deep in `(`, `[` and `{` the scan is, outside test modules.
+        let mut nesting = 0_usize;
         let mut i = 0;
         while i < all.len() {
-            if all[i..].starts_with(&head) {
+            if nesting == 0 && all[i..].starts_with(&head) {
                 let mut depth = 0_usize;
                 i += head.len() - 1;
                 while let Some(token) = all.get(i) {
@@ -1296,6 +1310,11 @@ mod tests {
                     }
                 }
             } else {
+                match all[i] {
+                    Token::Punct('(' | '[' | '{') => nesting += 1,
+                    Token::Punct(')' | ']' | '}') => nesting = nesting.saturating_sub(1),
+                    _ => {}
+                }
                 code.push(all[i].clone());
                 i += 1;
             }
@@ -1312,7 +1331,8 @@ mod tests {
         for (i, token) in code.iter().enumerate() {
             let Token::Word(word) = token else { continue };
             let word = word.as_str();
-            if FORBIDDEN_WORDS.contains(&word) && code.get(i + 1) != Some(&Token::Punct('!')) {
+            let called_as_macro = code.get(i + 1) == Some(&Token::Punct('!'));
+            if FORBIDDEN_WORDS.contains(&word) && (!called_as_macro || word == MACRO_DEFINITION) {
                 found.push(word.to_owned());
             }
             if GUARDED_MODULES.contains(&word) {
@@ -1334,6 +1354,26 @@ mod tests {
     /// running configuration or state, its only constructor, key
     /// generation, log setup, a listener, a socket, or a file write, and
     /// reaches the file system and the network only through listed items.
+    ///
+    /// Threat model. This is a drift guard against honest mistakes by the
+    /// people who write this crate: a later change that imports a write,
+    /// reaches for `ResolvedConfig`, or binds a socket, in whatever
+    /// spelling came naturally. It reads tokens, not a parsed crate, so it
+    /// is not a scanner for deliberately obfuscated code, and it does not
+    /// try to be: code written to hide a write from it (a macro from
+    /// another crate, a `cfg` trick, a build script) is out of its scope,
+    /// and the answer to such code is review, not another guard rule. Its
+    /// rules close the spellings review has shown to be plausible slips:
+    /// grouped and renamed imports, raw identifiers, code after the test
+    /// module, and a test module that a macro could unwrap, which is why
+    /// `macro_rules` is refused and only a top-level test module is left
+    /// out of the scan.
+    ///
+    /// The behavioral proof that the doctor never binds, never generates a
+    /// key and never writes is not this guard. It is the subprocess tests,
+    /// which run the real binary against filesystem snapshots:
+    /// `web_doctor_never_binds` and `web_doctor_generates_no_key` in
+    /// `tests/web_doctor/`.
     #[test]
     fn the_doctor_reaches_no_startup_side_effect() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/doctor");
@@ -1414,10 +1454,30 @@ mod tests {
                 "startup's state",
                 "fn f() {\n    let s = AppState::new();\n}\n",
             ),
+            (
+                "a macro that unwraps a test module",
+                "macro_rules! hide {\n    (#[cfg(test)] mod tests { $($body:tt)* }) => { $($body)* };\n}\n\
+                 hide! {\n    #[cfg(test)]\n    mod tests {\n        \
+                 fn f() {\n            std::fs::write(p, b).ok();\n        }\n    }\n}\n",
+            ),
         ];
         for (name, planted) in caught {
             assert!(!violations(planted).is_empty(), "missed {name}");
         }
+
+        // A test module inside another item or a macro call is scanned: a
+        // macro from elsewhere could unwrap it too.
+        for nested in [
+            "other::unwrap! {\n    #[cfg(test)]\n    mod tests {\n        fn f() {\n            std::fs::write(p, b).ok();\n        }\n    }\n}\n",
+            "other::unwrap!(#[cfg(test)] mod tests { fn f() { std::fs::write(p, b).ok(); } });\n",
+            "mod inner {\n    #[cfg(test)]\n    mod tests {\n        fn f() {\n            std::fs::write(p, b).ok();\n        }\n    }\n}\n",
+        ] {
+            assert_eq!(violations(nested), ["fs::write", "write"], "{nested}");
+        }
+        assert_eq!(
+            violations("macro_rules! m {\n    () => {};\n}\n"),
+            ["macro_rules"]
+        );
 
         let clean = "use std::io::Write as _;\n\
                      // std::fs::write and AppState in a comment\n\
