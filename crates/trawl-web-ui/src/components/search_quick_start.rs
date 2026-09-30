@@ -89,6 +89,7 @@ pub fn SearchQuickStart(on_run: Callback<&'static str>) -> impl IntoView {
                 <div class="qs-links">
                     <a href="https://trawl.sh/reference/dsl/" target="_blank" rel="noopener noreferrer">"Full query reference ↗"</a>
                     <a href="https://trawl.sh/reference/events/" target="_blank" rel="noopener noreferrer">"Event reference ↗"</a>
+                    <a href="https://trawl.sh/getting-started/vector-integration/#prove-the-first-event-arrived" target="_blank" rel="noopener noreferrer">"Prove a sender's first event ↗"</a>
                 </div>
             </div>
         </div>

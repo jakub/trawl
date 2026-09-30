@@ -270,6 +270,10 @@ pub struct IngestState {
     /// only when compaction drains, so a shorter hint only adds refused
     /// work.
     pub retry_after_secs: u64,
+    /// `[ingest] max_body_bytes`. The router refuses a wire body over it,
+    /// and the handler refuses a gzip body that decompresses past it, so
+    /// one request never holds more than this much body in memory.
+    pub max_body_bytes: usize,
 }
 
 /// Parse `[ingest] trusted_relays` CIDRs, boot-fatally.
@@ -754,6 +758,7 @@ impl AppState {
                 derivation,
                 repin_coordinator: repin_coordinator.clone(),
                 retry_after_secs: config.ingest.compaction_interval_secs,
+                max_body_bytes: config.ingest.max_body_bytes,
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),

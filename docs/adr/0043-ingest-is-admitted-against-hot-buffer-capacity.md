@@ -35,7 +35,7 @@ When the hot buffer reaches its caps, it evicts its oldest batches. Those events
 
 **Wait for capacity**, rejected: a wait while holding the gate deadlocks the only drainer, and a wait before the gate still pins a blocking worker.
 
-**Reserve before parsing, from the wire size**, rejected: it is an estimate, and gzip makes it wrong by up to 10×.
+**Reserve before parsing, from the wire size**, rejected: it is an estimate, and gzip makes it wrong by up to 10×. _Amended 2026-09-29:_ the factor has no fixed bound. The 10× decompression cap refused real log batches, so a gzip body is now held only to `[ingest] max_body_bytes` once decoded.
 
 **Keep eviction as a last resort**, rejected: it brings back acknowledged rows that no query can see.
 

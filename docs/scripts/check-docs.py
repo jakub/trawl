@@ -88,6 +88,31 @@ for relative in ('monitoring/prometheus/trawl.rules.yml',
 if rule_inventories[0] != rule_inventories[1]:
     errors.append('Plain and Helm alert/runbook inventories differ')
 
+# The browser UI links into the published site with string literals. Every
+# mention must be one whole literal, so a URL assembled at runtime fails here
+# instead of escaping the check.
+ui_links = 0
+for path in sorted((ROOT / 'crates/trawl-web-ui/src').rglob('*.rs')):
+    source = path.read_text()
+    relative = path.relative_to(ROOT)
+    literals = list(re.finditer(r'"(https://trawl\.sh(?:/[^"\s{}]*)?)"', source))
+    if len(literals) != source.count('https://trawl.sh'):
+        errors.append(f'{relative}: trawl.sh URL is not a whole string literal; update the checker for the source shape')
+    for literal in literals:
+        href = literal[1]
+        line = source[:literal.start()].count('\n') + 1
+        target = urlsplit(href)
+        destination = DIST / unquote(target.path).lstrip('/')
+        if destination.is_dir() or not destination.suffix:
+            destination /= 'index.html'
+        if destination not in pages:
+            errors.append(f'{relative}:{line}: page is not built: {href}')
+        elif target.fragment and unquote(target.fragment) not in pages[destination].ids:
+            errors.append(f'{relative}:{line}: anchor is missing: {href}')
+        ui_links += 1
+if not ui_links:
+    errors.append('crates/trawl-web-ui/src: no trawl.sh links found; update the checker for the source shape')
+
 toml_blocks = 0
 for path in (DOCS / 'src/content/docs').rglob('*'):
     if path.suffix not in ('.md', '.mdx'):
@@ -120,4 +145,4 @@ if errors:
     print('\n'.join(sorted(set(errors))), file=sys.stderr)
     sys.exit(1)
 print(f'Checked {len(pages)} HTML pages, {links} local links, {toml_blocks} TOML blocks, '
-      f'{rule_links} rule runbook links, and {len(stage_names)} DSL stages.')
+      f'{rule_links} rule runbook links, {ui_links} browser UI links, and {len(stage_names)} DSL stages.')
