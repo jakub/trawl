@@ -93,8 +93,14 @@ fn walk(path: &Path, skip: &[PathBuf], files: &mut Vec<PathBuf>) {
     if skip.iter().any(|skipped| skipped == path) {
         return;
     }
-    let metadata =
-        std::fs::symlink_metadata(path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+    // Tests running beside this one create and delete scratch directories
+    // under `crates/`. A path that vanishes mid-walk was never part of the
+    // tree, so it is skipped rather than failed.
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!("stat {}: {e}", path.display()),
+    };
     if metadata.is_file() {
         files.push(path.to_owned());
         return;
@@ -106,8 +112,12 @@ fn walk(path: &Path, skip: &[PathBuf], files: &mut Vec<PathBuf>) {
     {
         return;
     }
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
-        .unwrap_or_else(|e| panic!("list {}: {e}", path.display()))
+    let listing = match std::fs::read_dir(path) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => panic!("list {}: {e}", path.display()),
+    };
+    let mut entries: Vec<PathBuf> = listing
         .map(|entry| entry.expect("a directory entry").path())
         .collect();
     entries.sort();
@@ -149,7 +159,12 @@ fn insecure_upstream_switch_is_gone() {
 
     let mut hits = Vec::new();
     for file in &files {
-        let bytes = std::fs::read(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        let bytes = match std::fs::read(file) {
+            Ok(bytes) => bytes,
+            // Deleted by a concurrent test after the walk listed it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("read {}: {e}", file.display()),
+        };
         // A NUL byte marks a binary file, as git decides it.
         if bytes.contains(&0) {
             continue;
