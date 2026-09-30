@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use trawl_api::doctor::Outcome;
+use trawl_api::doctor::{Outcome, reason};
 
 use crate::support::{
     CHECK_IDS, Userns, WebDoctorConfig, assert_unchanged, doctor, doctor_args, fs_snapshot,
@@ -154,6 +154,63 @@ fn web_doctor_never_binds() {
     match listener.accept() {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
         other => panic!("something connected to the held listen port: {other:?}"),
+    }
+}
+
+/// A well-formed name reaches the resolver, so a check that only parses
+/// the address would call it complete. RFC 6761 reserves names under
+/// `.invalid.`: no lookup of one returns an address. The name is absolute
+/// (trailing dot) so no search domain is appended to it. How fast the lookup
+/// gives up depends on the host's resolver (systemd-resolved takes longer
+/// than the doctor's deadline), so the row is either a failed lookup or a
+/// timed-out one, and never complete. Each output format runs on its own,
+/// since a cold lookup and a cached one may land on different sides of the
+/// deadline.
+#[test]
+fn web_doctor_listen_name_lookup_is_never_complete() {
+    let home = tempfile::tempdir().unwrap();
+    let not_resolving = "the listen address is not a host:port that resolves";
+    let mut fixture = WebDoctorConfig::in_dir(home.path());
+    fixture.bind_addr = Some("doctor-check.invalid.:8080".to_owned());
+    let config = write_config(home.path(), &fixture);
+    let planted = fixture.planted();
+    let planted: Vec<&str> = planted.iter().map(String::as_str).collect();
+    let env = home_env(home.path());
+
+    for format in ["json", "table"] {
+        let label = format!("a well-formed name that does not resolve ({format})");
+        let before = fs_snapshot(home.path());
+        let run = run_web_doctor(&doctor_args(&config, format), &env, &planted);
+        assert_unchanged(&before, &fs_snapshot(home.path()), &label);
+        assert!(run.stderr.is_empty(), "{label}: {}", run.stderr);
+        assert!(run.code == 1 || run.code == 3, "{label}: exit {}", run.code);
+        if format == "json" {
+            let parsed = report(&run.stdout);
+            assert_eq!(i32::from(parsed.verdict().exit_code()), run.code, "{label}");
+            let seen = verdict(&parsed, "proxy.config");
+            assert!(
+                seen == (Outcome::Failed, Some(not_resolving))
+                    || seen == (Outcome::NotSampled, Some(reason::TIMED_OUT)),
+                "{label}: {parsed:?}"
+            );
+            assert_blocked_by_config(&parsed, &label);
+        } else {
+            assert!(
+                run.stdout.contains(&format!("(exit {})", run.code)),
+                "{label}: {}",
+                run.stdout
+            );
+            let config_line = run
+                .stdout
+                .lines()
+                .find(|line| line.starts_with("proxy.config "))
+                .unwrap_or_else(|| panic!("{label}: no proxy.config row: {}", run.stdout));
+            let outcome = config_line.split_whitespace().nth(1);
+            assert!(
+                matches!(outcome, Some("failed" | "not_sampled")),
+                "{label}: {config_line}"
+            );
+        }
     }
 }
 
