@@ -43,8 +43,10 @@ trawld --doctor --config /etc/trawl/trawld.toml --format json
 `--doctor` checks, from the server host, whether trawld will start and serve
 with this configuration. It reads the configuration file and the process
 environment, connects to the two databases and to trawld's own listener, and
-prints one row per check. `--format` takes `table` (the default) or `json`.
-Both formats carry the same facts, and the JSON form is versioned.
+prints one row per check. `--format` takes `table` or `json`. Without
+`--format`, the doctor prints a table when standard output is a terminal and
+JSON otherwise. Both formats carry the same facts, and the JSON form is
+versioned.
 
 The command requires `--config PATH` on the command line. `TRAWL_CONFIG` alone
 is a usage error and exits with code 2. `--doctor` does not read another
@@ -69,13 +71,13 @@ A check runs only when its prerequisite completed. Otherwise the check is
 | `server.app.connect` | A connection to the app-state database authenticates. | `server.config` |
 | `server.app.schema` | trawld's boot admits the app-state migration ledger. | `server.app.connect` |
 | `server.app.writer` | Reports whether a session holds trawld's writer lock. A held lock does not prove that trawld runs on this host. | `server.app.connect` |
-| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. | `server.config` |
+| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node whose `[ingest] wal_dir` is outside the data root, the same holds for the WAL directory: the running user can read and write it, or create it in the nearest directory above it that exists. | `server.config` |
 | `server.data.epoch` | The data root's `EPOCH` is current, or boot initializes it. | `server.data.root` |
 | `server.data.identity` | The data root belongs to the catalog in the app-state database. | `server.data.epoch`, `server.app.schema` |
 | `server.data.conformance` | Conformance is recorded for this catalog and data root, or boot runs the pass. A query-only node reports `not_configured`. | `server.data.identity` |
 | `server.recovery.repin` | There is no repin marker, or one whose phase boot completes. | `server.data.epoch` |
-| `server.recovery.publication` | The publication and rollup markers are readable and well formed. | `server.data.epoch` |
-| `server.tls.material` | The certificate and key parse, match, and are in date, or boot generates them. A directory at `tls/key.pem`, where an older trawld kept its key, fails the check, because boot cannot remove it. | `server.config` |
+| `server.recovery.publication` | The publication and rollup markers are readable and well-formed. | `server.data.epoch` |
+| `server.tls.material` | The certificate and key parse, match, and are in date, or boot generates them. A directory at `tls/key.pem`, where an older trawld kept its key, fails the check, because boot cannot remove it. When boot would generate the pair, the check also fails if the running user cannot create `tls/` or `tls-key/` in the directory above it, or if either directory is on a read-only filesystem. | `server.config` |
 | `server.listener.identity` | The listener presents exactly the certificate on disk. | `server.tls.material` |
 | `server.listener.health` | The health endpoint answers, and trawld does not report itself `unavailable`. An `unavailable` answer fails this row, whatever the reported checks say. One row per reported check follows as `server.listener.health.<key>`. Only the checks trawld reports get a row. Any other check names share one `failed` `server.listener.health._invalid` row, which does not show them. | `server.listener.identity` |
 
@@ -155,12 +157,15 @@ A failure outweighs a check that could not look. The same codes apply to
 
 Root reads what the service user may not, so a root run cannot prove that the
 service user has access. An access check, `server.data.root`, is `not_sampled`
-with the reason `ran_as_root`. It still fails when the data root is not a
-directory, or is absent and cannot be created there. It does not ask what the
-running user may do with the data root, and so does not report a read-only
-filesystem. Content checks still report what they read: a
-certificate parses, an epoch is current. A check that waits on the access check
-still runs. A root run never exits `0`. Run the doctor as the service user to
+with the reason `ran_as_root`. It still fails when the data root, or a WAL
+directory outside it, is not a directory, or is absent and cannot be created
+there. It does not ask what the running user may do with either directory, and
+so does not report a read-only filesystem. In a root run, `server.tls.material`
+does not ask whether the running user can create or write `tls/` and
+`tls-key/`. It reports `ran_as_root` when a generated directory or the key
+belongs to another uid, because a root run cannot know which user trawld runs
+as. Content checks still report what they read: a certificate parses, an epoch
+is current. A check that waits on the access check still runs. A root run never exits `0`. Run the doctor as the service user to
 get an answer about access.
 
 #### Side effects
