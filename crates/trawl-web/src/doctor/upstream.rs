@@ -10,9 +10,10 @@
 //! query or fragment, or names no host, a connect address that does not
 //! fit it, and a pin path that is empty or not UTF-8. Each is a fixed
 //! sentence, and no request is sent. With a pinned CA it reads the file
-//! once through [`read::read_selected`], which expands `~` in the path on
-//! the reading thread, and parses it with the production parser. The row
-//! shows the path as written. The
+//! once through [`read::read_pin`], which expands `~` in the path on the
+//! reading thread, and parses it with the production parser. A pin that
+//! expands to an empty path fails as an empty pin does, as startup refuses
+//! both alike. The row shows the path as written. The
 //! roots go to the probe through [`Ctx::pinned_roots`], so the probe
 //! trusts exactly what was checked, and the file is never read twice. A
 //! pin that does not exist yet is `not_sampled`, reason `ca_not_present`:
@@ -48,7 +49,7 @@ use trawl_api::doctor::health::{self, BODY_MAX, Health, KeyAnswer, Reported};
 use trawl_api::doctor::{Outcome, reason};
 
 use super::output::{HealthKey, Row, SelectedPath, Selection, Text};
-use super::read::{self, ReadFault};
+use super::read::{self, PinFault, ReadFault};
 use super::{Ctx, Runner, Unfinished, WebCheck, blocking_within};
 use crate::config::{
     ConfigError, ConnectAddrError, ENV_UPSTREAM_CA_PATH, PinnedRoots, TrustSource, UpstreamPlan,
@@ -126,7 +127,7 @@ async fn check_trust(ctx: &mut Ctx) -> Row {
             // Shown as written; `~` expands on the reading thread.
             let shown = SelectedPath::new(Selection::UpstreamCaPath, path);
             let source = url_from.lit("; CA: ").setting(*from);
-            let row = match read::read_selected(path.clone(), read::cap::CA).await {
+            let row = match read::read_pin(path.clone()).await {
                 Ok(bytes) => match pinned_roots(&bytes) {
                     Ok(roots) => {
                         let count = u32::try_from(roots.certificates().len()).unwrap_or(u32::MAX);
@@ -144,7 +145,7 @@ async fn check_trust(ctx: &mut Ctx) -> Row {
                             "point upstream_ca_path at trawld's CA certificate, in PEM",
                         )),
                 },
-                Err(fault) => pin_fault(fault, &shown),
+                Err(fault) => pin_fault(fault, &shown, &ctx.config_path),
             };
             row.source(source)
         }
@@ -152,9 +153,20 @@ async fn check_trust(ctx: &mut Ctx) -> Row {
 }
 
 /// The trust row for a pinned CA file the bounded reader did not read.
-fn pin_fault(fault: ReadFault, shown: &SelectedPath) -> Row {
+/// `config` is the `--config` path, which an empty pin's fix names.
+fn pin_fault(fault: PinFault, shown: &SelectedPath, config: &SelectedPath) -> Row {
     let check = WebCheck::UpstreamTrust;
     let fix = || Text::new("point upstream_ca_path at trawld's CA certificate, a regular file");
+    let fault = match fault {
+        PinFault::Empty => {
+            return empty_pin(config).detail(
+                Text::new("")
+                    .path(shown)
+                    .lit(" expands to an empty path: this user's home directory is empty"),
+            );
+        }
+        PinFault::Read(fault) => fault,
+    };
     match fault {
         // trawld writes its generated certificate on its first start, which
         // may come after trawl-web's; the proxy starts and waits for it.
@@ -218,10 +230,9 @@ fn upstream_fault(error: &ConfigError, config: &SelectedPath) -> Row {
         }
         ConfigError::UpstreamConnectAddr(addr) => {
             let row = match addr {
-                ConnectAddrError::Malformed => Row::failed(
-                    check,
-                    "upstream_connect_addr is not an IP address and port",
-                ),
+                ConnectAddrError::Malformed => {
+                    Row::failed(check, "upstream_connect_addr is not an IP address and port")
+                }
                 ConnectAddrError::PortZero => {
                     Row::failed(check, "upstream_connect_addr has port 0")
                 }
@@ -245,9 +256,7 @@ fn upstream_fault(error: &ConfigError, config: &SelectedPath) -> Row {
             };
             row.next(fix("correct upstream_connect_addr in "))
         }
-        ConfigError::UpstreamCa { .. } => Row::failed(check, "upstream_ca_path is empty").next(
-            fix("name trawld's CA file, or remove upstream_ca_path to trust the platform roots, in "),
-        ),
+        ConfigError::UpstreamCa { .. } => empty_pin(config),
         ConfigError::EnvUtf8 { .. } => Row::failed(
             check,
             "the upstream CA path from the environment is not UTF-8 text",
@@ -269,6 +278,17 @@ fn upstream_fault(error: &ConfigError, config: &SelectedPath) -> Row {
             Row::failed(check, "the upstream settings do not resolve")
         }
     }
+}
+
+/// The trust row for an empty pin, as written or as `~` expanded it:
+/// startup refuses both alike rather than fall back to the platform roots.
+fn empty_pin(config: &SelectedPath) -> Row {
+    Row::failed(WebCheck::UpstreamTrust, "upstream_ca_path is empty").next(
+        Text::new(
+            "name trawld's CA file, or remove upstream_ca_path to trust the platform roots, in ",
+        )
+        .path(config),
+    )
 }
 
 // -- proxy.upstream.health ---------------------------------------------------
@@ -773,6 +793,39 @@ mod tests {
             summary(&checks(health_rows(503, disagrees)))[0].2,
             Some("the health status and the HTTP status disagree")
         );
+    }
+
+    /// A pin that `~` expands to an empty path fails as an empty pin in the
+    /// slot does, with the same reason and fix, as startup refuses both
+    /// alike; it is not a CA that trawld has yet to write.
+    #[test]
+    fn an_empty_expanded_pin_fails_as_an_empty_pin() {
+        let config = SelectedPath::new(
+            Selection::ConfigFlag,
+            std::path::Path::new("/etc/trawl/trawld.toml"),
+        );
+        let shown = SelectedPath::new(Selection::UpstreamCaPath, std::path::Path::new("~"));
+        let expanded = pin_fault(PinFault::Empty, &shown, &config).into_check();
+        let in_slot = upstream_fault(
+            &ConfigError::UpstreamCa {
+                path: std::path::PathBuf::new(),
+                reason: String::new(),
+            },
+            &config,
+        )
+        .into_check();
+        assert_eq!(expanded.outcome, Outcome::Failed);
+        assert_eq!(
+            (expanded.outcome, expanded.reason.as_deref()),
+            (in_slot.outcome, in_slot.reason.as_deref())
+        );
+        assert_eq!(
+            expanded.reason.as_deref(),
+            Some("upstream_ca_path is empty")
+        );
+        assert_eq!(expanded.next_action, in_slot.next_action);
+        let missing = pin_fault(PinFault::Read(ReadFault::Missing), &shown, &config).into_check();
+        assert_eq!(missing.reason.as_deref(), Some(reason::CA_NOT_PRESENT));
     }
 
     /// Every slot error names its rule in a fixed sentence and quotes

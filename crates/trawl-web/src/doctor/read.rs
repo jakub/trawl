@@ -17,16 +17,18 @@
 //! back.
 //!
 //! The key file and the pinned CA are read at the path the operator wrote,
-//! by [`secret_len`] and [`read_selected`]: `~` in it is expanded on the
+//! by [`secret_len`] and [`read_pin`]: `~` in it is expanded on the
 //! reading thread, just before the read and under the same deadline, by
 //! [`expand_tilde`], as startup expands it just before its own read. With
 //! `HOME` unset or empty that expansion asks the user database, which can
 //! stall, so the deadline bounds it too. When no home directory is found,
 //! the `~` stays as written, as at startup, and the read reports what it
-//! finds there.
+//! finds there. A pin that expands to an empty path, as `~` does for a
+//! user whose home directory is empty, is refused before any read, as
+//! startup refuses it ([`PinFault::Empty`]).
 
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::config::{expand_tilde, read_capped_file, read_capped_secret};
@@ -83,6 +85,17 @@ impl ReadFault {
     }
 }
 
+/// Why the pinned CA was not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinFault {
+    /// The path expanded to an empty one: `~` for a user whose home
+    /// directory is empty. Startup refuses it as it refuses an empty pin,
+    /// rather than read a path that names no file.
+    Empty,
+    /// The file was not read.
+    Read(ReadFault),
+}
+
 /// Read the regular file at `path`, at most `cap` bytes, on the blocking
 /// pool under [`READ_DEADLINE`].
 ///
@@ -97,14 +110,36 @@ pub async fn read(path: PathBuf, cap: u64) -> Result<Vec<u8>, ReadFault> {
     within_deadline(move || read_capped_file(&path, cap)).await
 }
 
-/// [`read`] for a path as the operator wrote it in the configuration or
-/// the environment: `~` is expanded on the reading thread, under the same
-/// deadline, just before the read.
+/// [`read`] for the pinned CA at `path`, as the operator wrote it in the
+/// configuration or the environment, at most [`cap::CA`] bytes: `~` is
+/// expanded on the reading thread, under the same deadline, just before
+/// the read, and an empty expansion is refused as startup refuses it.
 ///
 /// # Errors
-/// A [`ReadFault`] naming why nothing was read.
-pub async fn read_selected(path: PathBuf, cap: u64) -> Result<Vec<u8>, ReadFault> {
-    within_deadline(move || read_capped_file(&expand_tilde(&path), cap)).await
+/// A [`PinFault`] naming why nothing was read.
+pub async fn read_pin(path: PathBuf) -> Result<Vec<u8>, PinFault> {
+    read_pin_expanded_by(path, expand_tilde).await
+}
+
+/// [`read_pin`] with `expand` in place of [`expand_tilde`], so a test can
+/// give the empty expansion no real home lookup can be made to return.
+async fn read_pin_expanded_by(
+    path: PathBuf,
+    expand: impl FnOnce(&Path) -> PathBuf + Send + 'static,
+) -> Result<Vec<u8>, PinFault> {
+    let read = within_deadline(move || {
+        let expanded = expand(&path);
+        if expanded.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        read_capped_file(&expanded, cap::CA).map(Some)
+    })
+    .await;
+    match read {
+        Ok(Some(bytes)) => Ok(bytes),
+        Ok(None) => Err(PinFault::Empty),
+        Err(fault) => Err(PinFault::Read(fault)),
+    }
 }
 
 /// How many bytes the secret file at `path` holds, at most `cap`, read on
@@ -187,6 +222,32 @@ mod tests {
                 Err(ReadFault::PermissionDenied)
             );
         }
+    }
+
+    /// A pin that expands to an empty path is refused before any read, as
+    /// startup's `refuse_empty_pin` refuses it, and not reported as a
+    /// missing file. The real lookup cannot be made to return an empty
+    /// home, so the expansion is injected; an empty path as given takes the
+    /// production expansion. A pin that expands to a file reads it.
+    #[tokio::test]
+    async fn an_empty_expanded_pin_is_refused() {
+        assert_eq!(
+            read_pin_expanded_by(PathBuf::from("~"), |_| PathBuf::new()).await,
+            Err(PinFault::Empty)
+        );
+        assert_eq!(read_pin(PathBuf::new()).await, Err(PinFault::Empty));
+
+        let dir = tempfile::tempdir().unwrap();
+        let pem = dir.path().join("ca.pem");
+        std::fs::write(&pem, b"pem").unwrap();
+        assert_eq!(
+            read_pin_expanded_by(PathBuf::from("~/ca.pem"), move |_| pem).await,
+            Ok(b"pem".to_vec())
+        );
+        assert_eq!(
+            read_pin(dir.path().join("absent.pem")).await,
+            Err(PinFault::Read(ReadFault::Missing))
+        );
     }
 
     /// A key read gives the async side a length or a fault, never bytes:
