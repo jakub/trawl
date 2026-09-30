@@ -593,16 +593,9 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
 }
 
 /// The names of the checks `GET /api/v1/health` reports, in the order
-/// [`health`] fills them. `trawld --doctor` gives a row of its own to these
-/// names and to no other (#269).
-pub const HEALTH_CHECK_NAMES: [&str; 6] = [
-    "duckdb",
-    "auth_db",
-    "storage_db",
-    "data_path",
-    "ingest_capacity",
-    "corpus",
-];
+/// [`health`] fills them. They live in `trawl-api`, so every doctor gives a
+/// row of its own to these names and to no other (#269).
+pub use trawl_api::doctor::health::HEALTH_CHECK_NAMES;
 
 /// `GET /api/v1/health` — unauthenticated health check with subsystem probes.
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {

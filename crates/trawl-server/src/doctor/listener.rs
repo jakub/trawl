@@ -31,7 +31,6 @@
 //! no proxy, no redirect, no retry, no key, and one bounded time for all
 //! addresses. The group fills [`Ctx::tls`] and [`Ctx::listener_refused`].
 
-use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -42,9 +41,9 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{CertificateError, DigitallySignedStruct, SignatureScheme};
-use trawl_api::doctor::health::{self, ValueClass};
+use trawl_api::HealthStatus;
+use trawl_api::doctor::health::{self, Health, KeyAnswer, Reported};
 use trawl_api::doctor::{Outcome, reason};
-use trawl_api::{ErrorCode, ErrorResponse, HealthResponse, HealthStatus};
 
 use super::fsread::{self, Links, ReadFault};
 use super::output::{HealthKey, Row, SelectedPath, Selection, Text};
@@ -72,9 +71,9 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 /// How long a listener address that names a host may take to resolve.
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The most bytes of the health answer the doctor reads. trawld's answer is
-/// a few hundred.
-const HEALTH_BODY_MAX: usize = 64 * 1024;
+/// The most bytes of the health answer the doctor reads, as every doctor
+/// reads it.
+const HEALTH_BODY_MAX: usize = health::BODY_MAX;
 
 /// The endpoint the probe reads.
 const HEALTH_PATH: &str = "/api/v1/health";
@@ -1319,14 +1318,7 @@ async fn check_health(runner: &mut Runner, answer: Option<Answer>) {
             ) {
                 (Ok(body), _) => health_rows(status, &body),
                 (Err(_), Some(row)) => (row, Vec::new()),
-                (Err(BodyFault::TooLarge), None) => (
-                    Row::not_sampled(check, reason::TOO_LARGE).detail(
-                        Text::new("the doctor reads at most ")
-                            .int(u32::try_from(HEALTH_BODY_MAX).unwrap_or(u32::MAX))
-                            .lit(" bytes of the health answer"),
-                    ),
-                    Vec::new(),
-                ),
+                (Err(BodyFault::TooLarge), None) => (too_large_row(), Vec::new()),
                 (Err(BodyFault::TimedOut), None) => (
                     Row::not_sampled(check, reason::TIMED_OUT)
                         .detail(Text::new("the health answer did not arrive in time")),
@@ -1394,7 +1386,8 @@ async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<
     }
 }
 
-/// The health rows for a body that arrived whole with HTTP `status`.
+/// The health rows for a body that arrived whole with HTTP `status`, as
+/// the judge every doctor shares reads it ([`health::judge`]).
 ///
 /// A 200 or 503 health body keeps its rows, one per reported check, so a
 /// 503 from a failed `DuckDB` probe fails its own row. An `unavailable`
@@ -1404,44 +1397,26 @@ async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<
 /// the corpus recovery values. Anything else is not trawld's health answer.
 fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
     let check = ServerCheck::ListenerHealth;
-    if let Some(row) = status_row(status) {
-        return (row, Vec::new());
-    }
-    if let Ok(health) = serde_json::from_slice::<HealthResponse>(body)
-        && let Some(checks) = &health.checks
-    {
-        let agrees = matches!(
-            (status, &health.status),
-            (200, HealthStatus::Ok | HealthStatus::Degraded) | (503, HealthStatus::Unavailable)
-        );
-        if !agrees {
-            return (
-                Row::failed(check, "the health status and the HTTP status disagree"),
-                Vec::new(),
-            );
+    match health::judge(status, body) {
+        health::Answer::Health(health) => {
+            let shown = match health.status() {
+                HealthStatus::Ok => "ok",
+                HealthStatus::Degraded => "degraded",
+                HealthStatus::Unavailable => "unavailable",
+            };
+            let detail = Text::new("status: ").lit(shown).lit("; HTTP ").int(status);
+            let row = if health.outcome() == Outcome::Failed {
+                Row::failed(check, "trawld reports itself unavailable")
+                    .detail(detail)
+                    .next(Text::new(
+                        "read the per-check rows and trawld's log for why it is unavailable",
+                    ))
+            } else {
+                Row::complete(check).detail(detail)
+            };
+            (row, keyed_rows(&health))
         }
-        let shown = match health.status {
-            HealthStatus::Ok => "ok",
-            HealthStatus::Degraded => "degraded",
-            HealthStatus::Unavailable => "unavailable",
-        };
-        let detail = Text::new("status: ").lit(shown).lit("; HTTP ").int(status);
-        let row = if matches!(health.status, HealthStatus::Unavailable) {
-            Row::failed(check, "trawld reports itself unavailable")
-                .detail(detail)
-                .next(Text::new(
-                    "read the per-check rows and trawld's log for why it is unavailable",
-                ))
-        } else {
-            Row::complete(check).detail(detail)
-        };
-        return (row, keyed_rows(checks));
-    }
-    if status == 503
-        && let Ok(refusal) = serde_json::from_slice::<ErrorResponse>(body)
-        && refusal.error.code == ErrorCode::CorpusRecovering
-    {
-        return (
+        health::Answer::Recovering => (
             Row::not_sampled(check, reason::RECOVERING)
                 .detail(Text::new(
                     "trawld answered corpus_recovering: its corpus is still recovering after a \
@@ -1449,27 +1424,46 @@ fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
                 ))
                 .next(Text::new("wait for trawld to finish recovery, then rerun")),
             Vec::new(),
-        );
+        ),
+        health::Answer::Status(status) => (status_failure(status), Vec::new()),
+        health::Answer::TooLarge => (too_large_row(), Vec::new()),
+        health::Answer::Disagrees => (
+            Row::failed(check, "the health status and the HTTP status disagree"),
+            Vec::new(),
+        ),
+        health::Answer::Foreign => (
+            Row::failed(check, "the health answer is not trawld's health body").next(Text::new(
+                "check that trawld, and not another service, listens at the configured address",
+            )),
+            Vec::new(),
+        ),
     }
-    (
-        Row::failed(check, "the health answer is not trawld's health body").next(Text::new(
-            "check that trawld, and not another service, listens at the configured address",
-        )),
-        Vec::new(),
-    )
 }
 
 /// The failed health row for an HTTP `status` trawld's health endpoint
 /// never sends, whatever the body; `None` for 200 and 503.
 fn status_row(status: u16) -> Option<Row> {
-    (!matches!(status, 200 | 503)).then(|| {
-        Row::failed(
-            ServerCheck::ListenerHealth,
-            "the health endpoint answered with a status trawld does not send",
-        )
-        .detail(Text::new("HTTP ").int(status))
-        .next(Text::new(NOT_TRAWLD))
-    })
+    (!health::is_health_http_status(status)).then(|| status_failure(status))
+}
+
+/// The failed health row for the HTTP `status`, one trawld's health
+/// endpoint never sends.
+fn status_failure(status: u16) -> Row {
+    Row::failed(
+        ServerCheck::ListenerHealth,
+        "the health endpoint answered with a status trawld does not send",
+    )
+    .detail(Text::new("HTTP ").int(status))
+    .next(Text::new(NOT_TRAWLD))
+}
+
+/// The health row for an answer larger than the doctor reads.
+fn too_large_row() -> Row {
+    Row::not_sampled(ServerCheck::ListenerHealth, reason::TOO_LARGE).detail(
+        Text::new("the doctor reads at most ")
+            .int(u32::try_from(HEALTH_BODY_MAX).unwrap_or(u32::MAX))
+            .lit(" bytes of the health answer"),
+    )
 }
 
 /// One row per reported check, sorted by name. Names trawld's health
@@ -1477,21 +1471,9 @@ fn status_row(status: u16) -> Option<Row> {
 /// `server.listener.health._invalid` row, and none of them is shown: the
 /// report names only checks it knows, since even an identifier-shaped name
 /// may be a secret.
-fn keyed_rows(checks: &HashMap<String, String>) -> Vec<Row> {
-    let mut named = BTreeMap::new();
-    let mut invalid = 0_u32;
-    for (name, value) in checks {
-        match HealthKey::new(name) {
-            Some(key) => {
-                named.insert(name.as_str(), (key, value.as_str()));
-            }
-            None => invalid = invalid.saturating_add(1),
-        }
-    }
-    let mut rows: Vec<Row> = named
-        .into_iter()
-        .map(|(name, (key, value))| key_row(name, &key, value))
-        .collect();
+fn keyed_rows(health: &Health) -> Vec<Row> {
+    let mut rows: Vec<Row> = health.checks().iter().map(key_row).collect();
+    let invalid = health.unknown_names();
     if invalid > 0 {
         rows.push(
             Row::for_key(
@@ -1509,38 +1491,43 @@ fn keyed_rows(checks: &HashMap<String, String>) -> Vec<Row> {
     rows
 }
 
-/// The row for the check `name`, shown as `key`, that reported `value`.
+/// The row for one reported check.
 ///
 /// No value a server sends is shown as sent: a known value is named by a
 /// literal of this doctor's, and a value it does not know is not shown at
 /// all, since even an identifier-shaped value may be a secret.
-fn key_row(name: &str, key: &HealthKey, value: &str) -> Row {
-    let class = health::classify(name, value);
-    let row = |reason| Row::for_key(ServerCheck::ListenerHealth, *key, class.outcome(), reason);
-    match class {
-        ValueClass::Ok => row(None).detail(Text::new("reported ok")),
+fn key_row(answer: &KeyAnswer) -> Row {
+    let key = HealthKey::new(answer.name())
+        .expect("the judge names only checks trawld's health endpoint reports");
+    let row = |reason| Row::for_key(ServerCheck::ListenerHealth, key, answer.outcome(), reason);
+    match answer.value() {
+        Reported::Ok => row(None).detail(Text::new("reported ok")),
         // A recovering corpus is not a failure: trawld cannot yet vouch for
         // what it holds, so the doctor could not look (ADR-0047).
-        ValueClass::Recovering => row(Some(reason::RECOVERING))
-            .detail(Text::new(match value {
-                "rollup_pending" => "reported rollup_pending",
-                "restart_backlog" => "reported restart_backlog",
-                _ => "reported a recovery value",
+        recovering @ (Reported::RollupPending | Reported::RestartBacklog) => {
+            row(Some(reason::RECOVERING))
+                .detail(Text::new(if recovering == Reported::RollupPending {
+                    "reported rollup_pending"
+                } else {
+                    "reported restart_backlog"
+                }))
+                .next(Text::new("wait for trawld to finish recovery, then rerun"))
+        }
+        refused @ (Reported::Error | Reported::Refusing) => {
+            row(Some(if refused == Reported::Refusing {
+                "reported refusing"
+            } else {
+                "reported error"
             }))
-            .next(Text::new("wait for trawld to finish recovery, then rerun")),
-        ValueClass::Refused => row(Some(if value == "refusing" {
-            "reported refusing"
-        } else {
-            "reported error"
-        }))
-        .next(
-            Text::new("read trawld's log for why ")
-                .key(key)
-                .lit(" fails"),
-        ),
-        ValueClass::Unknown => row(Some("reported a value this doctor does not know"))
+            .next(
+                Text::new("read trawld's log for why ")
+                    .key(&key)
+                    .lit(" fails"),
+            )
+        }
+        Reported::Unknown => row(Some("reported a value this doctor does not know"))
             .detail(Text::new("the value is not shown"))
-            .next(Text::new("read trawld's log for ").key(key)),
+            .next(Text::new("read trawld's log for ").key(&key)),
     }
 }
 

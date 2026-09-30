@@ -81,7 +81,8 @@ pub(super) fn with_next(mut check: Check, next: impl Into<String>) -> Check {
 /// The private witness and the only two constructors of an HTTP client
 /// aimed at the API.
 mod witness {
-    use trawl_api::{HealthResponse, HealthStatus};
+    use trawl_api::HealthResponse;
+    use trawl_api::doctor::health::status_agrees;
     use trawl_client::{ClientError, HttpClient, TlsTrust};
 
     use super::super::resolve::{CheckedUrl, Connection, Key, Scheme};
@@ -208,10 +209,7 @@ mod witness {
             if health.checks.is_none() || health.version.is_none() {
                 return Err(NotTrawl::Unsigned);
             }
-            if !matches!(
-                (http_status, &health.status),
-                (200, HealthStatus::Ok | HealthStatus::Degraded) | (503, HealthStatus::Unavailable)
-            ) {
+            if !status_agrees(http_status, &health.status) {
                 return Err(NotTrawl::Disagrees);
             }
             Ok((

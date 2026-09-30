@@ -341,6 +341,21 @@ pub mod reason {
     /// PostgreSQL server does: its first message was not of type `R`, `E`
     /// or `v`, or declared more than 8 KiB. The doctor did not connect.
     pub const NOT_POSTGRES: &str = "not_postgres";
+    /// A certificate the configuration pins does not exist yet, as before
+    /// trawld's first start writes it.
+    pub const CA_NOT_PRESENT: &str = "ca_not_present";
+    /// With `not_configured`: no key is selected, so each start makes a new
+    /// one and every earlier session ends.
+    pub const EPHEMERAL_EACH_START: &str = "ephemeral_each_start";
+    /// With `failed`: the address was refused a connection, as when nothing
+    /// listens there.
+    pub const CONNECTION_REFUSED: &str = "connection_refused";
+    /// With `failed`: the server's certificate did not verify under the
+    /// trust the configuration selects.
+    pub const CERTIFICATE_NOT_TRUSTED: &str = "certificate_not_trusted";
+    /// With `failed`: the answer was a redirect, which the doctor does not
+    /// follow.
+    pub const REDIRECT_REFUSED: &str = "redirect_refused";
 }
 
 #[cfg(test)]
