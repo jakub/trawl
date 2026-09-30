@@ -659,7 +659,8 @@ ServiceMonitor creation; neither option installs a monitoring system.
    - `trawl doctor --web-url` shows that the origin reaches `trawl-web` and
      that `trawl-web` accepts it as a public origin.
    - `trawl-web --doctor`, in step 2, shows that `trawl-web` reaches `trawld`
-     with a verified certificate and has a persistent session key.
+     with a verified certificate, and whether `trawl-web` has a persistent
+     session key.
    - `trawld --doctor`, in step 1, shows that `trawld` can serve what
      `trawl-web` forwards: its databases, its data root, and its listener.
 

@@ -36,7 +36,7 @@ struct Cli {
     config: PathBuf,
 
     /// Check, without starting the proxy or changing anything, whether
-    /// trawl-web will start, keep sessions, and reach trawld with the
+    /// trawl-web can start, keep sessions, and reach trawld with the
     /// config that --config names on the command line, then exit: 0 pass,
     /// 1 fail, 3 incomplete.
     #[arg(long)]

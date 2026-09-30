@@ -225,7 +225,7 @@ trawl-web --doctor --config /etc/trawl/trawld.toml
 trawl-web --doctor --config /etc/trawl/trawld.toml --format json
 ```
 
-`--doctor` checks, from where the web proxy runs, whether `trawl-web` will
+`--doctor` checks, from where the web proxy runs, whether `trawl-web` can
 start with this configuration, keep browser sessions across a restart, and
 reach trawld with a verified certificate. It reads the configuration file and
 the process environment, sends one health request to trawld through the
@@ -339,7 +339,9 @@ Run the doctor as the service user to get an answer about access.
 The doctor never binds the listen address, never generates a session key, and
 writes nothing. It logs no configuration value, touches no database, and
 reads each file once: the configuration, the cookie key file, and the CA file.
-Each read has a size limit and a time limit.
+Each read has a size limit and a time limit. Because the doctor never binds the
+listen address, an address that another process holds passes here and still
+stops `trawl-web` at startup.
 
 It sends one request to trawld, `GET /api/v1/health`, with no API key, no
 `Authorization` header, and no cookie. It follows no redirect, does not retry,
