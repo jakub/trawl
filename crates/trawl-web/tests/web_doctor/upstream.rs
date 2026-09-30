@@ -234,27 +234,44 @@ async fn web_doctor_connect_addr_passes() {
 
 /// A leaf for another name, from the pinned CA: the trust itself resolves,
 /// and the probe fails on the certificate, once. One connection, one failed
-/// handshake, no retry, no request.
+/// handshake, no retry, no request. The URL's name is checked whether it is
+/// an IP literal or a DNS name dialled through `upstream_connect_addr`.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_wrong_name_fails_once() {
-    let ca = TestCa::named(CA_SUBJECT);
-    let mock = MockServer::start().await;
-    serve_health(&mock, healthy_answer()).await;
-    let front = TlsFront::issued_by(&ca, *mock.address(), &[OTHER_NAME]).await;
-    let mut setup = Setup::pinned(front.url(), &ca);
-    setup.plant(OTHER_NAME);
+    for through_connect_addr in [false, true] {
+        let ca = TestCa::named(CA_SUBJECT);
+        let mock = MockServer::start().await;
+        serve_health(&mock, healthy_answer()).await;
+        let front = TlsFront::issued_by(&ca, *mock.address(), &[OTHER_NAME]).await;
+        let mut setup = if through_connect_addr {
+            let url = format!("https://{UPSTREAM_NAME}:{}", front.port());
+            let mut setup = Setup::pinned(url, &ca);
+            setup.config.upstream_connect_addr = Some(format!("127.0.0.1:{}", front.port()));
+            setup.plant(UPSTREAM_NAME);
+            setup
+        } else {
+            Setup::pinned(front.url(), &ca)
+        };
+        setup.plant(OTHER_NAME);
+        let label = if through_connect_addr {
+            "a DNS name through upstream_connect_addr"
+        } else {
+            "an IP literal"
+        };
 
-    let (code, report) = setup.run().await;
-    assert_eq!(
-        verdict(&report, "proxy.upstream.trust"),
-        (Outcome::Complete, None)
-    );
-    assert_health_failed(code, &report, reason::CERTIFICATE_NOT_TRUSTED);
+        let (code, report) = setup.run().await;
+        assert_eq!(
+            verdict(&report, "proxy.upstream.trust"),
+            (Outcome::Complete, None),
+            "{label}"
+        );
+        assert_health_failed(code, &report, reason::CERTIFICATE_NOT_TRUSTED);
 
-    front.settle().await;
-    assert_eq!(front.connections(), 1, "{front:?}");
-    assert_eq!(front.handshake_failures(), 1, "{front:?}");
-    assert_anonymous_probes(&mock, 0).await;
+        front.settle().await;
+        assert_eq!(front.connections(), 1, "{label}: {front:?}");
+        assert_eq!(front.handshake_failures(), 1, "{label}: {front:?}");
+        assert_anonymous_probes(&mock, 0).await;
+    }
 }
 
 /// A session key in the environment, as fleet-dev sets it; it carries
