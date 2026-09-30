@@ -95,7 +95,7 @@ impl Run {
 
 /// Write `config` into `dir`, run the doctor on it with JSON output, and
 /// check both streams for every planted value: the database URLs, both
-/// catalog ids, and the data root's own path.
+/// catalog ids, the data root's own path, and a configured WAL directory's.
 async fn doctor(dir: &Path, config: &DoctorConfig, dbs: &Databases) -> Run {
     let path = write_doctor_config(dir, config);
     let args: Vec<OsString> = vec![
@@ -110,17 +110,19 @@ async fn doctor(dir: &Path, config: &DoctorConfig, dbs: &Databases) -> Run {
         .await
         .expect("the doctor run");
     let data = config.data_path.to_string_lossy().into_owned();
-    assert_no_values(
-        &stdout,
-        &stderr,
-        &[
-            &dbs.fleet,
-            &dbs.app,
-            &dbs.catalog_id,
-            FOREIGN_CATALOG,
-            &data,
-        ],
-    );
+    let wal = config
+        .wal_dir
+        .as_ref()
+        .map(|wal| wal.to_string_lossy().into_owned());
+    let mut planted = vec![
+        dbs.fleet.as_str(),
+        &dbs.app,
+        &dbs.catalog_id,
+        FOREIGN_CATALOG,
+        &data,
+    ];
+    planted.extend(wal.as_deref());
+    assert_no_values(&stdout, &stderr, &planted);
     Run {
         code,
         report: report(&stdout),
@@ -599,6 +601,60 @@ async fn doctor_identity_over_an_unwalked_archive() {
             } else if !privileged {
                 assert_ne!(run.code, 1, "{label}: {:?}", run.report.checks());
                 assert_ne!(run.code, 0, "{label}");
+            }
+        }
+    }
+}
+
+/// `doctor_wal_outside_the_data_root`: an ingest node's WAL directory
+/// outside its data root is one boot creates or writes at its start, so
+/// `server.data.root` fails when the running user cannot write it, or
+/// cannot create it in the directory above it, and never names it. A user
+/// who may write a directory its mode forbids sees each state complete.
+#[cfg(unix)]
+#[tokio::test]
+async fn doctor_wal_outside_the_data_root() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const CHECK: &str = "server.data.root";
+    let dbs = migrated_databases().await;
+    for (name, wal, sealed, denied) in [
+        ("writable", "spool/wal", None, None),
+        (
+            "unwritable",
+            "spool/wal",
+            Some("spool/wal"),
+            Some("the running user cannot write the WAL directory"),
+        ),
+        (
+            "absent under an unwritable parent",
+            "spool/wal",
+            Some("spool"),
+            Some("the running user cannot create the WAL directory in the directory above it"),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DoctorConfig {
+            wal_dir: Some(dir.path().join(wal)),
+            ..current_ingest_root(dir.path())
+        };
+        std::fs::create_dir_all(dir.path().join(sealed.unwrap_or(wal))).unwrap();
+        let sealed = sealed.map(|sealed| dir.path().join(sealed));
+        if let Some(sealed) = &sealed {
+            std::fs::set_permissions(sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        }
+        let privileged = reads_mode_000(dir.path());
+        let run = doctor(dir.path(), &config, &dbs).await;
+        if let Some(sealed) = &sealed {
+            std::fs::set_permissions(sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        match denied {
+            Some(why) if !privileged => {
+                assert_eq!(run.outcome(CHECK), (Outcome::Failed, Some(why)), "{name}");
+                assert_eq!(run.code, 1, "{name}");
+            }
+            _ => {
+                assert_eq!(run.outcome(CHECK), (Outcome::Complete, None), "{name}");
+                assert_ne!(run.code, 1, "{name}: {:?}", run.report.checks());
             }
         }
     }

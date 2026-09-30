@@ -73,9 +73,11 @@ pub(super) async fn run(ctx: &mut Ctx, runner: &mut Runner) {
             continue;
         };
         let row = match check {
-            ServerCheck::DataRoot => check_root(data_root.clone(), ingest, !ctx.run_as.root)
-                .await
-                .source(data_source(ctx)),
+            ServerCheck::DataRoot => {
+                check_root(data_root.clone(), wal_dir.clone(), ingest, !ctx.run_as.root)
+                    .await
+                    .source(storage_source(ctx))
+            }
             ServerCheck::DataEpoch => check_epoch(data_root.clone(), wal_dir.clone(), ingest)
                 .await
                 .source(storage_source(ctx)),
@@ -180,18 +182,96 @@ enum RootSeen {
     Unreadable,
 }
 
+impl RootSeen {
+    /// Whether what was seen is one boot uses or creates, as far as the
+    /// doctor asked: access not asked about holds.
+    const fn holds(self) -> bool {
+        matches!(
+            self,
+            Self::Directory(Access::Granted | Access::NotAsked)
+                | Self::Absent(None | Some(Access::Granted | Access::NotAsked))
+        )
+    }
+}
+
 /// `server.data.root`: the root is a directory, or boot creates it, and the
-/// running user may read it and, on an ingest node, write it. The only
-/// access check. Unless `ask_access`, as in a root run, only the structural
-/// half is evaluated: the root is a directory, or absent below a directory
+/// running user may read it and, on an ingest node, write it. On an ingest
+/// node whose WAL directory is outside the data root, the same holds for
+/// the WAL directory, which boot creates when it is absent. The only access
+/// check. Unless `ask_access`, as in a root run, only the structural half
+/// is evaluated: each directory is a directory, or absent below a directory
 /// boot could create it in. When that holds the row is `not_sampled`,
 /// reason `ran_as_root`, and the checks that wait on it still look.
-async fn check_root(data_root: PathBuf, ingest: bool, ask_access: bool) -> Row {
+async fn check_root(data_root: PathBuf, wal_dir: PathBuf, ingest: bool, ask_access: bool) -> Row {
     let check = ServerCheck::DataRoot;
-    match look(move || observe_root(&data_root, ingest, ask_access)).await {
-        Ok(seen) => root_row(seen, ingest),
+    // A WAL directory inside the data root is what the root's own access
+    // covers; boot creates one outside it on its own.
+    let wal_dir = (ingest && !wal_dir.starts_with(&data_root)).then_some(wal_dir);
+    let observed = look(move || {
+        let root = observe_root(&data_root, ingest, ask_access);
+        let wal = wal_dir
+            .filter(|_| root.holds())
+            .map(|wal_dir| observe_root(&wal_dir, true, ask_access));
+        (root, wal)
+    })
+    .await;
+    match observed {
+        Ok((root, wal)) => wal
+            .and_then(wal_row)
+            .unwrap_or_else(|| root_row(root, ingest)),
         Err(why) => missed(check, why),
     }
+}
+
+/// The `server.data.root` row for what was seen at a WAL directory outside
+/// the data root, or `None` when it [holds](RootSeen::holds). Boot creates
+/// it as it creates the data root, so it is judged the same way: R, W and
+/// X on it, or W and X on the nearest directory above it.
+fn wal_row(seen: RootSeen) -> Option<Row> {
+    let check = ServerCheck::DataRoot;
+    let access = || Text::new("give the service user access to the WAL directory, or run as it");
+    let point = || Text::new("point [ingest] wal_dir at a directory trawld can create");
+    let row = match seen {
+        seen if seen.holds() => return None,
+        RootSeen::Directory(Access::NoRead) => {
+            Row::failed(check, "the running user cannot read the WAL directory").next(access())
+        }
+        RootSeen::Directory(Access::NoWrite) => {
+            Row::failed(check, "the running user cannot write the WAL directory").next(access())
+        }
+        RootSeen::Absent(Some(Access::NoRead | Access::NoWrite)) => Row::failed(
+            check,
+            "the running user cannot create the WAL directory in the directory above it",
+        )
+        .next(access()),
+        RootSeen::Directory(Access::ReadOnlyFs) | RootSeen::Absent(Some(Access::ReadOnlyFs)) => {
+            Row::failed(check, "the WAL directory is on a read-only filesystem").next(Text::new(
+                "an ingest node writes its WAL directory: mount it read-write, or disable ingest",
+            ))
+        }
+        RootSeen::NotADirectory => Row::failed(check, "the WAL directory is not a directory")
+            .next(Text::new("point [ingest] wal_dir at a directory")),
+        RootSeen::AncestorNotADirectory => {
+            Row::failed(check, "a parent of the WAL directory is not a directory").next(point())
+        }
+        RootSeen::AncestorDangling => Row::failed(
+            check,
+            "a parent of the WAL directory is a symlink to nothing",
+        )
+        .next(point()),
+        RootSeen::Dangling => Row::failed(check, "the WAL directory is a symlink to nothing")
+            .next(Text::new("point [ingest] wal_dir at a directory")),
+        RootSeen::Denied => Row::failed(check, "the running user cannot reach the WAL directory")
+            .next(Text::new(
+                "give the service user search access to every directory above the WAL directory",
+            )),
+        RootSeen::Vanished => Row::not_sampled(check, reason::MATERIAL_CHANGED)
+            .next(Text::new("rerun once the WAL directory stops changing")),
+        RootSeen::Directory(_) | RootSeen::Absent(_) | RootSeen::Unreadable => {
+            Row::not_sampled(check, reason::UNREADABLE)
+        }
+    };
+    Some(row)
 }
 
 /// The `server.data.root` row for what was seen at the configured path.
@@ -1699,30 +1779,37 @@ mod tests {
         }
     }
 
+    /// `server.data.root` over `data_root`, with the WAL directory inside
+    /// it where the root's own access covers it.
+    async fn root_check(data_root: PathBuf, ingest: bool, ask_access: bool) -> Row {
+        let wal_dir = data_root.join("wal");
+        check_root(data_root, wal_dir, ingest, ask_access).await
+    }
+
     #[tokio::test]
     async fn the_root_is_absent_created_or_a_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("state/data");
-        let row = check_root(data.clone(), true, true).await;
+        let row = root_check(data.clone(), true, true).await;
         assert_eq!(
             (row.outcome(), row.reason()),
             (Outcome::Complete, Some(reason::WILL_INITIALIZE))
         );
-        let row = check_root(data.clone(), false, true).await;
+        let row = root_check(data.clone(), false, true).await;
         assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
         std::fs::create_dir_all(&data).unwrap();
         for ingest in [false, true] {
-            let row = check_root(data.clone(), ingest, true).await;
+            let row = root_check(data.clone(), ingest, true).await;
             assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
         }
         let file = tmp.path().join("file");
         std::fs::write(&file, b"x").unwrap();
-        let row = check_root(file.clone(), true, true).await;
+        let row = root_check(file.clone(), true, true).await;
         assert_eq!(
             (row.outcome(), row.reason()),
             (Outcome::Failed, Some("the data root is not a directory"))
         );
-        let row = check_root(file.join("data"), true, true).await;
+        let row = root_check(file.join("data"), true, true).await;
         assert_eq!(row.outcome(), Outcome::Failed, "{row:?}");
     }
 
@@ -1740,7 +1827,7 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
         let data = link.join("data");
         for ask_access in [false, true] {
-            let row = check_root(data.clone(), true, ask_access).await;
+            let row = root_check(data.clone(), true, ask_access).await;
             assert_eq!(
                 (row.outcome(), row.reason()),
                 (
@@ -1764,7 +1851,7 @@ mod tests {
         let linked = tmp.path().join("linked");
         std::os::unix::fs::symlink(&real, &linked).unwrap();
         let data = linked.join("data");
-        let row = check_root(data.clone(), true, true).await;
+        let row = root_check(data.clone(), true, true).await;
         assert_eq!(
             (row.outcome(), row.reason()),
             (Outcome::Complete, Some(reason::WILL_INITIALIZE))
@@ -1793,10 +1880,10 @@ mod tests {
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
         let mut rows = Vec::new();
         for ingest in [false, true] {
-            rows.push(check_root(data.clone(), ingest, false).await);
+            rows.push(root_check(data.clone(), ingest, false).await);
         }
-        rows.push(check_root(sealed.join("data"), true, false).await);
-        let asked = check_root(data.clone(), false, true).await;
+        rows.push(root_check(sealed.join("data"), true, false).await);
+        let asked = root_check(data.clone(), false, true).await;
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
         for row in rows {
@@ -1813,7 +1900,7 @@ mod tests {
         let file = tmp.path().join("file");
         std::fs::write(&file, b"x").unwrap();
         for path in [file.clone(), file.join("data")] {
-            let row = check_root(path, true, false).await;
+            let row = root_check(path, true, false).await;
             assert_eq!(row.outcome(), Outcome::Failed, "{row:?}");
         }
     }
@@ -1843,8 +1930,8 @@ mod tests {
         std::fs::create_dir(&data).unwrap();
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o500)).unwrap();
         let privileged = std::fs::File::create(data.join("probe")).is_ok();
-        let ingest = check_root(data.clone(), true, true).await;
-        let query = check_root(data.clone(), false, true).await;
+        let ingest = root_check(data.clone(), true, true).await;
+        let query = root_check(data.clone(), false, true).await;
         std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(query.outcome(), Outcome::Complete);
         if privileged {
@@ -1857,6 +1944,122 @@ mod tests {
                     Some("the running user cannot write the data root")
                 )
             );
+        }
+    }
+
+    /// Whether boot can create in the WAL directory what its first write
+    /// needs: the create `WalWriter::ensure_dir` makes, then the
+    /// environment directory the first write makes, without their
+    /// directory syncs.
+    fn boot_creates_wal(wal_dir: &Path) -> bool {
+        epoch::create_dir_all_durably(&wal_dir.join("prod"), |_| Ok(())).is_ok()
+    }
+
+    /// A WAL directory outside the data root is judged as the root is:
+    /// boot creates it at its start, so the running user must read, write
+    /// and search it, or create it in the nearest directory above it. Each
+    /// state is checked against boot's own create. A privileged user may
+    /// do everything its modes forbid; the test asserts whichever the
+    /// running user is. A query-only node never looks at it, and a root run
+    /// asks only about its structure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wal_directory_outside_the_root_is_judged_as_the_root_is() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let privileged = privileged_over(&tmp);
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let sealed = tmp.path().join("sealed");
+        std::fs::create_dir(&sealed).unwrap();
+        let unwritable = tmp.path().join("unwritable");
+        std::fs::create_dir(&unwritable).unwrap();
+        let writable = tmp.path().join("writable");
+        std::fs::create_dir(&writable).unwrap();
+        let cases = [
+            ("writable", writable.clone(), None),
+            (
+                "absent under a writable parent",
+                tmp.path().join("spool/wal"),
+                None,
+            ),
+            (
+                "unwritable",
+                unwritable.clone(),
+                Some("the running user cannot write the WAL directory"),
+            ),
+            (
+                "absent under an unwritable parent",
+                sealed.join("spool/wal"),
+                Some("the running user cannot create the WAL directory in the directory above it"),
+            ),
+        ];
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut seen = Vec::new();
+        for (name, wal, _) in &cases {
+            let asked = check_root(data.clone(), wal.clone(), true, true).await;
+            let root_run = check_root(data.clone(), wal.clone(), true, false).await;
+            let query = check_root(data.clone(), wal.clone(), false, true).await;
+            seen.push((*name, asked, root_run, query, boot_creates_wal(wal)));
+        }
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for ((name, asked, root_run, query, boot), (_, _, denied)) in seen.into_iter().zip(cases) {
+            let expected = match denied {
+                Some(why) if !privileged => (Outcome::Failed, Some(why)),
+                _ => (Outcome::Complete, None),
+            };
+            assert_eq!((asked.outcome(), asked.reason()), expected, "{name}");
+            assert_eq!(
+                boot,
+                expected.0 == Outcome::Complete,
+                "{name}: boot disagrees"
+            );
+            assert_eq!(
+                (root_run.outcome(), root_run.reason()),
+                (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
+                "{name}"
+            );
+            assert_eq!(
+                (query.outcome(), query.reason()),
+                (Outcome::Complete, None),
+                "{name}"
+            );
+        }
+
+        // What boot's create refuses whoever runs it fails even when access
+        // is not asked about.
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let dangling = tmp.path().join("dangling");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &dangling).unwrap();
+        for (wal, why) in [
+            (file.clone(), "the WAL directory is not a directory"),
+            (
+                file.join("wal"),
+                "a parent of the WAL directory is not a directory",
+            ),
+            (
+                dangling.clone(),
+                "the WAL directory is a symlink to nothing",
+            ),
+            (
+                dangling.join("wal"),
+                "a parent of the WAL directory is a symlink to nothing",
+            ),
+        ] {
+            for ask_access in [false, true] {
+                let row = check_root(data.clone(), wal.clone(), true, ask_access).await;
+                assert_eq!(
+                    (row.outcome(), row.reason()),
+                    (Outcome::Failed, Some(why)),
+                    "ask_access {ask_access}"
+                );
+            }
+        }
+        for wal in [file.join("wal"), dangling.join("wal")] {
+            assert!(!boot_creates_wal(&wal), "boot created {wal:?}");
         }
     }
 }
