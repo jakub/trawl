@@ -357,6 +357,22 @@ fn reads_mode_000(dir: &Path) -> bool {
     privileged
 }
 
+/// Whether the running user writes a directory of mode 0500 anyway: root,
+/// or a holder of `CAP_DAC_OVERRIDE`. `CAP_DAC_READ_SEARCH` alone passes
+/// [`reads_mode_000`] but not this, and the doctor's write checks go by
+/// this one.
+#[cfg(unix)]
+fn writes_mode_0500(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    let probe = dir.join("write-probe");
+    std::fs::create_dir(&probe).unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let privileged = std::fs::create_dir(probe.join("x")).is_ok();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(&probe).unwrap();
+    privileged
+}
+
 /// `doctor_recovery_markers`: a malformed publication or rollup marker is
 /// `failed`, an unreadable one is `not_sampled`/`unreadable`, and
 /// well-formed pending ones are `complete`/`pending_at_next_boot`.
@@ -645,7 +661,7 @@ async fn doctor_wal_outside_the_data_root() {
             std::fs::set_permissions(sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
         let root = nix::unistd::geteuid().is_root();
-        let privileged = reads_mode_000(dir.path());
+        let privileged = writes_mode_0500(dir.path());
         let run = doctor(dir.path(), &config, &dbs).await;
         if let Some(sealed) = &sealed {
             std::fs::set_permissions(sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
