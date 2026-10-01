@@ -6,6 +6,7 @@
 
 use std::io::Read as _;
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,9 +20,10 @@ use indexmap::IndexMap;
 
 use crate::error::ServerError;
 use crate::hot_buffer::{Charge, Refusal, Reservation};
-use crate::ingest::envelope::{self, EnvelopeContext, RejectReason};
+use crate::ingest::body::{EventOutcome, EventReport, HttpRequestContext, visit_events};
+use crate::ingest::envelope::{EnvelopeContext, RejectReason};
 use crate::ingest::pipeline::{BatchKey, PipelineWriter, ServiceBatch};
-use crate::ingest::producer::{Producer, ProducerKind};
+use crate::ingest::producer::ProducerKind;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
 use trawl_api::{IngestEventError, IngestResponse};
@@ -104,16 +106,11 @@ impl ParsedEvents {
         }
     }
 
-    /// Canonicalize one parsed object and either batch it or record the
-    /// rejection. Shared by the ndjson and JSON-array parse paths.
-    fn add_event(
-        &mut self,
-        index: usize,
-        obj: &serde_json::Map<String, serde_json::Value>,
-        ctx: &EnvelopeContext<'_>,
-    ) {
-        match envelope::canonicalize(obj, ctx) {
-            Ok(canonical) => {
+    /// Take one position's outcome from the shared step: batch an accepted
+    /// event, record a rejected one. Never stops the visit.
+    fn record(&mut self, report: EventReport<'_>) -> ControlFlow<()> {
+        match report.outcome {
+            EventOutcome::Accepted(canonical) => {
                 for code in &canonical.repairs {
                     *self
                         .repairs
@@ -129,14 +126,14 @@ impl ParsedEvents {
                 let key = (canonical.env, canonical.service);
                 self.batches.entry(key).or_default().push(canonical.obj);
             }
-            Err(rejection) => {
-                self.errors.push(IngestEventError {
-                    index,
-                    message: rejection.message,
-                });
-                self.reject_counts.increment(rejection.reason);
+            EventOutcome::Rejected {
+                reason, message, ..
+            } => {
+                self.errors.push(event_error(report.index, reason, message));
+                self.reject_counts.increment(reason);
             }
         }
+        ControlFlow::Continue(())
     }
 
     /// The hot-buffer charge of every valid event, across all groups: what
@@ -316,34 +313,14 @@ async fn parse_request(
     dispatch: tracing::Dispatch,
     span: tracing::Span,
 ) -> Result<Parsed, ServerError> {
-    // Capture request-scoped context before moving into the blocking task.
-    let arrival_instant = chrono::Utc::now();
-    let arrival = arrival_instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    let peer_ip = crate::syslog::canonical_peer(peer_addr.ip());
-    let peer_host = peer_ip.to_string();
-    let peer_is_trusted_relay = state
-        .ingest
-        .trusted_relays
-        .iter()
-        .any(|c| c.contains(peer_ip));
-    let envs = Arc::clone(&state.ingest.envs);
-    let default_env = Arc::clone(&state.ingest.default_env);
-    let derivation = Arc::clone(&state.ingest.derivation);
+    // One arrival instant and one peer reading for the whole request,
+    // captured before moving into the blocking task.
+    let request = HttpRequestContext::new(&state.ingest, peer_addr.ip());
     let max_body_bytes = state.ingest.max_body_bytes;
     tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
         let _dispatch = tracing::dispatcher::set_default(&dispatch);
         let _span = span.enter();
-        let ctx = EnvelopeContext {
-            arrival: &arrival,
-            arrival_instant,
-            envs: envs.as_ref(),
-            default_env: default_env.as_ref(),
-            producer: Producer::Http {
-                peer_host: &peer_host,
-                peer_is_trusted_relay,
-            },
-            derivation: derivation.as_ref(),
-        };
+        let ctx = request.envelope();
         let t0 = std::time::Instant::now();
         let raw = if compressed {
             decompress_gzip(&body, max_body_bytes)?
@@ -351,10 +328,6 @@ async fn parse_request(
             body.to_vec()
         };
         let decompress_ms = t0.elapsed().as_millis();
-
-        if raw.is_empty() {
-            return Err(ServerError::Ingest("empty request body".into()));
-        }
 
         let t1 = std::time::Instant::now();
         let events = parse_events(&raw, &ctx)?;
@@ -434,12 +407,13 @@ fn write_wal_batches(
                     "WAL write failed for service group"
                 );
                 let event_count = batch.maps.len();
-                parsed.errors.push(IngestEventError {
-                    index: 0,
-                    message: format!(
-                        "WAL write failed for service '{svc}': {e} ({event_count} events lost)"
-                    ),
-                });
+                // The filesystem error stays in the log line above: this
+                // message is client-facing text and names no path.
+                parsed.errors.push(event_error(
+                    0,
+                    RejectReason::WalFailure,
+                    format!("WAL write failed for service '{svc}' ({event_count} events lost)"),
+                ));
                 parsed
                     .reject_counts
                     .increment_by(RejectReason::WalFailure, event_count as u64);
@@ -626,104 +600,32 @@ fn decompress_gzip(data: &[u8], max_body_bytes: usize) -> Result<Vec<u8>, Server
     Ok(decompressed)
 }
 
-/// Parse events from either ndjson or JSON array format.
-///
-/// Returns parsed events grouped by `(env, service)` with canonical maps
-/// and ndjson bytes. The ndjson bytes are always ndjson regardless of
-/// input format, ready for the WAL.
+/// One per-event error, as both ingest routes report it: the position, the
+/// reason's wire code and the human-readable message.
+fn event_error(index: usize, reason: RejectReason, message: String) -> IngestEventError {
+    IngestEventError {
+        index,
+        reason: reason.as_str().to_owned(),
+        message,
+    }
+}
+
+/// Parse and canonicalize a body through the shared step, grouping the
+/// accepted events by `(env, service)` with canonical maps and ndjson
+/// bytes. The ndjson bytes are always ndjson regardless of input format,
+/// ready for the WAL.
 fn parse_events(data: &[u8], ctx: &EnvelopeContext<'_>) -> Result<ParsedEvents, ServerError> {
-    let text = std::str::from_utf8(data)
-        .map_err(|e| ServerError::Ingest(format!("body is not valid UTF-8: {e}")))?;
-
-    let trimmed = text.trim_start();
-
-    // Detect format: JSON array (vector batches) vs ndjson (line-delimited).
-    if trimmed.starts_with('[') {
-        parse_json_array(trimmed, ctx)
-    } else {
-        Ok(parse_ndjson(trimmed, ctx))
-    }
-}
-
-/// Parse a JSON array of events (vector's default batch format).
-///
-/// Groups events by `(env, service)`, converting to ndjson per group for
-/// WAL storage. Invalid events are accumulated as per-event errors rather
-/// than aborting the entire batch — valid events are still accepted.
-fn parse_json_array(text: &str, ctx: &EnvelopeContext<'_>) -> Result<ParsedEvents, ServerError> {
-    let parsed: serde_json::Value = serde_json::from_str(text)
-        .map_err(|e| ServerError::Ingest(format!("invalid JSON array: {e}")))?;
-
-    let arr = parsed
-        .as_array()
-        .ok_or_else(|| ServerError::Ingest("expected JSON array".into()))?;
-
-    if arr.is_empty() {
-        return Err(ServerError::Ingest("empty event array".into()));
-    }
-
     let mut events = ParsedEvents::new();
-
-    for (i, event) in arr.iter().enumerate() {
-        let Some(obj) = event.as_object() else {
-            events.errors.push(IngestEventError {
-                index: i,
-                message: "expected JSON object".into(),
-            });
-            events.reject_counts.increment(RejectReason::NotObject);
-            continue;
-        };
-        events.add_event(i, obj, ctx);
-    }
-
+    // `record` never breaks, so the visit always reaches the end.
+    let _: ControlFlow<()> = visit_events(data, ctx, |report| events.record(report))?;
     Ok(events)
-}
-
-/// Parse ndjson (newline-delimited JSON objects).
-///
-/// Groups events by `(env, service)`, re-serializing to ndjson per group
-/// for consistent WAL bytes (trimmed, one object per line). Invalid lines
-/// are accumulated as per-event errors rather than aborting the batch.
-fn parse_ndjson(text: &str, ctx: &EnvelopeContext<'_>) -> ParsedEvents {
-    let mut events = ParsedEvents::new();
-
-    for (i, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let parsed: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(e) => {
-                events.errors.push(IngestEventError {
-                    index: i,
-                    message: format!("invalid JSON: {e}"),
-                });
-                events.reject_counts.increment(RejectReason::InvalidJson);
-                continue;
-            }
-        };
-
-        let Some(obj) = parsed.as_object() else {
-            events.errors.push(IngestEventError {
-                index: i,
-                message: "expected JSON object".into(),
-            });
-            events.reject_counts.increment(RejectReason::NotObject);
-            continue;
-        };
-
-        events.add_event(i, obj, ctx);
-    }
-
-    events
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ingest::compaction;
+    use crate::ingest::producer::Producer;
 
     const ARRIVAL: &str = "2026-01-01T00:00:00.000000Z";
 

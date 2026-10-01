@@ -5,6 +5,7 @@
 //! Log ingestion pipeline: canonicalize → WAL → parquet compaction, shared
 //! by the HTTP handler, the syslog listener and internal telemetry.
 
+pub(crate) mod body;
 pub mod compaction;
 pub(crate) mod coverage_proof;
 pub mod envelope;

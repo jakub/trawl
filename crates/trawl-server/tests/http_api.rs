@@ -1815,6 +1815,8 @@ async fn ingest_unlisted_env_rejected_per_event() {
     let body: trawl_api::IngestResponse = resp.json().await.unwrap();
     assert_eq!(body.accepted, 1);
     assert_eq!(body.rejected, 1);
+    assert_eq!(body.errors[0].index, 0);
+    assert_eq!(body.errors[0].reason, "env_not_allowed");
     assert!(
         body.errors[0].message.contains("nope"),
         "the typed reason names the env: {}",
@@ -1959,6 +1961,7 @@ async fn ingest_partial_success() {
     assert_eq!(body.rejected, 1);
     assert_eq!(body.errors.len(), 1);
     assert_eq!(body.errors[0].index, 1);
+    assert_eq!(body.errors[0].reason, "invalid_json");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1983,7 +1986,19 @@ async fn ingest_all_rejected_per_event() {
     let body: trawl_api::IngestResponse = resp.json().await.unwrap();
     assert_eq!(body.accepted, 0);
     assert_eq!(body.rejected, 3);
-    assert_eq!(body.errors.len(), 3);
+    let errors: Vec<_> = body
+        .errors
+        .iter()
+        .map(|e| (e.index, e.reason.as_str()))
+        .collect();
+    assert_eq!(
+        errors,
+        [
+            (0, "missing_service"),
+            (1, "missing_service"),
+            (2, "missing_service")
+        ]
+    );
 }
 
 // -- rate limit tests --------------------------------------------------------
