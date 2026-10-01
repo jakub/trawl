@@ -162,7 +162,9 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
         | ErrorCode::InternalError
         | ErrorCode::ServiceUnavailable
         | ErrorCode::HotBufferFull
-        | ErrorCode::IngestBatchTooLarge => Kept::Summary,
+        | ErrorCode::IngestBatchTooLarge
+        | ErrorCode::PreviewTooLarge
+        | ErrorCode::UnsupportedEncoding => Kept::Summary,
     }
 }
 
@@ -200,7 +202,7 @@ mod tests {
     /// Every wire code, spelled out. The match in `kept_as` has no
     /// wildcard, so a new code already fails to compile there; this list
     /// makes the test say how each existing code is kept.
-    const EVERY_CODE: [(ErrorCode, Kept); 17] = [
+    const EVERY_CODE: [(ErrorCode, Kept); 19] = [
         (ErrorCode::ParseError, Kept::Query),
         (ErrorCode::ValidationError, Kept::Query),
         (ErrorCode::ExecutionError, Kept::Summary),
@@ -218,6 +220,8 @@ mod tests {
         (ErrorCode::HotBufferFull, Kept::Summary),
         (ErrorCode::IngestBatchTooLarge, Kept::Summary),
         (ErrorCode::CorpusRecovering, Kept::Recovering),
+        (ErrorCode::PreviewTooLarge, Kept::Summary),
+        (ErrorCode::UnsupportedEncoding, Kept::Summary),
     ];
 
     #[test]

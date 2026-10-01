@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub mod csv;
 pub mod display;
 pub mod doctor;
+pub mod ingest_preview;
 pub mod value;
 
 use crate::value::{QueryResult, SchemaColumn};
@@ -139,6 +140,12 @@ pub enum ErrorCode {
     /// written before a restart, or an interrupted storage rollup is
     /// unresolved (ADR-0041). The failure record's cause kind says which.
     CorpusRecovering,
+    /// An ingest preview sample holds more events than one preview reads
+    /// (413). The sample is refused whole, never truncated (ADR-0049).
+    PreviewTooLarge,
+    /// The request body carries a `Content-Encoding` this route does not
+    /// decode (415).
+    UnsupportedEncoding,
 }
 
 /// Source location within a query string.
@@ -2528,6 +2535,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::CorpusRecovering).unwrap(),
             "\"corpus_recovering\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::PreviewTooLarge).unwrap(),
+            "\"preview_too_large\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::UnsupportedEncoding).unwrap(),
+            "\"unsupported_encoding\""
         );
     }
 
