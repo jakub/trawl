@@ -7,9 +7,13 @@
 //! The report's contract (input order, per-position outcomes, the echoed
 //! header, sender dependence), its access and bounds (permission, body
 //! limit, the 500-position cap, encodings, the disabled route, the rate
-//! class), and `Cache-Control: no-store` on what the route answers.
+//! class), `Cache-Control: no-store` on what the route answers, and parity
+//! with real ingest: the same body through both routes, compared against
+//! the WAL. A preview never takes a repairs metric label either.
 
 mod common;
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
     TestServer, roles, setup, setup_in_dir_with_ingest, setup_with_rate_limit,
@@ -23,6 +27,8 @@ use trawl_api::ingest_preview::{
 };
 use trawl_client::HttpClient;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::ingest::envelope::{RejectReason, RepairCode};
+use trawl_server::metrics::OVERFLOW_SERVICE_LABEL;
 
 /// The fixture's interactive `max_request_body_bytes`.
 const INTERACTIVE_BODY_LIMIT: usize = 128 * 1024;
@@ -753,4 +759,287 @@ async fn preview_spends_the_interactive_rate_bucket() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+// -- parity with real ingest ----------------------------------------------------
+
+/// Repair codes only a profile producer (syslog, trawld) can earn: the
+/// HTTP door has a peer to fill `host` from or refuse behind, takes
+/// `service` as sent, and asserts no slot.
+const UNREACHABLE_REPAIRS: [&str; 3] = [
+    "host.omitted",
+    "service.from_profile",
+    "field.producer_asserted",
+];
+
+/// Reject reasons storage decides after canonicalization, which the
+/// preview never reaches: a failed WAL write and the hot buffer's two
+/// admission refusals.
+const UNREACHABLE_REJECTS: [&str; 3] = ["wal_failure", "hot_buffer_full", "ingest_batch_too_large"];
+
+/// One sample covering every repair the HTTP door can make on a server
+/// with no trusted relay, every per-event reject but the relay one, and
+/// the index rule (a blank line). Each event that should be accepted
+/// carries a unique `id`, the only key the WAL is matched on.
+///
+/// Times sit far from the plausibility window's edges: an hour ago for a
+/// plausible time, 2001 for an implausible one.
+fn plain_differential_body() -> String {
+    let recent = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let long_name = "k".repeat(300);
+    let lines = [
+        json!({"id": "clean", "service": "diff", "env": "prod", "host": "h1",
+               "_time": recent, "severity": "info", "message": "clean"}),
+        json!({"id": "filled", "service": "diff", "message": "host, env and time filled"}),
+        json!({"id": "old", "service": "diff", "host": "h1", "_time": "2001-02-03T04:05:06Z"}),
+        json!({"id": "bad-time", "service": "diff", "host": "h1", "timestamp": "not a time",
+               "level": "gold"}),
+        json!({"id": "raw", "service": "diff", "host": "h1", "_raw": "r".repeat(70_000)}),
+        json!({"id": "prefix", "service": "diff", "host": "h1", "_custom": "v", "_": "gone"}),
+        json!({"id": "prefix-collision", "service": "diff", "host": "h1", "_dup": "a", "dup": "b"}),
+        json!({"id": "too-long", "service": "diff", "host": "h1", long_name: 1}),
+        json!({"id": "folded", "service": "diff", "host": "h1", "Ctx": {"a": [1, 2]},
+               "Level": "warn"}),
+        json!({"id": "collision", "service": "diff-other", "host": "h1", "FOO": 1, "foo": 2}),
+        json!({"message": "no service"}),
+        json!({"service": 5}),
+        json!({"service": ""}),
+        json!({"service": "s".repeat(129)}),
+        json!({"service": "bad svc"}),
+        json!({"service": "diff", "env": "Not An Env"}),
+        json!({"service": "diff", "env": "staging"}),
+        json!(42),
+    ];
+    let mut body: Vec<String> = lines.iter().map(Value::to_string).collect();
+    body.insert(3, String::new());
+    body.push("not json".to_owned());
+    body.join("\n")
+}
+
+/// Every `*.ndjson` line under the server's WAL directory, keyed by `id`.
+fn wal_events_by_id(server: &TestServer) -> BTreeMap<String, serde_json::Map<String, Value>> {
+    let dir = server
+        .state
+        .ingest
+        .wal_writer
+        .as_ref()
+        .expect("ingest is enabled")
+        .dir()
+        .to_path_buf();
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "ndjson") {
+                for line in std::fs::read_to_string(&path).unwrap().lines() {
+                    let event: serde_json::Map<String, Value> = serde_json::from_str(line).unwrap();
+                    let id = event["id"]
+                        .as_str()
+                        .expect("every event has an id")
+                        .to_owned();
+                    assert!(
+                        out.insert(id.clone(), event).is_none(),
+                        "{id} twice in the WAL"
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Send `body` through real ingest (from 127.0.0.1) and through the
+/// preview with `peer_ip=127.0.0.1` on the same server, and require the
+/// same result: every accepted event equal to its WAL line field by field,
+/// and the same rejected `(index, reason, message)` set. Returns the
+/// repair codes and reject reasons the sample covered.
+async fn assert_preview_matches_ingest(
+    server: &TestServer,
+    body: &str,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let response = raw_client()
+        .post(format!("{}/api/v1/ingest", server.url))
+        .bearer_auth(&server.ingest_token)
+        .header("content-type", "application/x-ndjson")
+        .body(body.to_owned())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let ingest: trawl_api::IngestResponse = response.json().await.unwrap();
+    let report = preview_ok(server, "?peer_ip=127.0.0.1", body).await;
+    assert_eq!(report.peer.ip, "127.0.0.1", "the peer real ingest saw");
+    assert_eq!(
+        (report.accepted, report.rejected),
+        (ingest.accepted, ingest.rejected)
+    );
+
+    let mut wal = wal_events_by_id(server);
+    let mut repairs = BTreeSet::new();
+    let mut rejects = BTreeSet::new();
+    let mut preview_errors = BTreeSet::new();
+    for event in &report.events {
+        match event {
+            PreviewEvent::Accepted {
+                event,
+                repairs: codes,
+                lineage,
+                ..
+            } => {
+                let id = event["id"].as_str().unwrap();
+                let mut stored = wal
+                    .remove(id)
+                    .unwrap_or_else(|| panic!("{id} is not in the WAL"));
+                let mut previewed = event.clone();
+                assert_eq!(previewed["_ingested"], report.arrival.as_str());
+                for map in [&mut stored, &mut previewed] {
+                    map.remove("_ingested").expect("both stamp arrival");
+                }
+                if let TimeLineage::Arrival { .. } = lineage.time {
+                    // Each route's own arrival filled `_time`.
+                    assert_eq!(event["_time"], report.arrival.as_str(), "{id}");
+                    for map in [&mut stored, &mut previewed] {
+                        map.remove("_time").expect("arrival filled it");
+                    }
+                }
+                assert_eq!(previewed, stored, "{id}: preview and WAL differ");
+                repairs.extend(codes.iter().cloned());
+            }
+            PreviewEvent::Rejected {
+                index,
+                reason,
+                message,
+                ..
+            } => {
+                preview_errors.insert((*index, reason.clone(), message.clone()));
+                rejects.insert(reason.clone());
+            }
+        }
+    }
+    assert!(
+        wal.is_empty(),
+        "WAL lines the preview did not accept: {wal:?}"
+    );
+    let ingest_errors: BTreeSet<_> = ingest
+        .errors
+        .into_iter()
+        .map(|e| (e.index, e.reason, e.message))
+        .collect();
+    assert_eq!(preview_errors, ingest_errors, "the rejections differ");
+    (repairs, rejects)
+}
+
+/// AC4: the preview's accepted events equal the WAL lines real ingest
+/// wrote for the same body, field by field, and its rejections equal real
+/// ingest's, across every repair code and canonicalization reject reason
+/// the HTTP door can reach. The relay rejection needs a relay server, so it
+/// is a second leg on one.
+#[tokio::test(flavor = "multi_thread")]
+async fn preview_matches_real_ingest_wal_field_by_field() {
+    let plain = setup().await;
+    let (mut repairs, mut rejects) =
+        assert_preview_matches_ingest(&plain, &plain_differential_body()).await;
+
+    let relay = setup_with_trusted_relays(&["127.0.0.1/32"]).await;
+    let relay_body = [
+        json!({"id": "relayed", "service": "diff", "host": "origin"}),
+        json!({"service": "diff", "message": "no host behind a relay"}),
+    ]
+    .map(|line| line.to_string())
+    .join("\n");
+    let (relay_repairs, relay_rejects) = assert_preview_matches_ingest(&relay, &relay_body).await;
+    repairs.extend(relay_repairs);
+    rejects.extend(relay_rejects);
+
+    let all_repairs: BTreeSet<String> = RepairCode::ALL
+        .iter()
+        .map(|code| code.as_str().to_owned())
+        .collect();
+    let unreachable: BTreeSet<String> = UNREACHABLE_REPAIRS.map(str::to_owned).into();
+    assert!(repairs.is_disjoint(&unreachable), "{repairs:?}");
+    assert_eq!(
+        &repairs | &unreachable,
+        all_repairs,
+        "every repair code is covered or named unreachable"
+    );
+
+    let all_rejects: BTreeSet<String> = RejectReason::ALL
+        .iter()
+        .map(|reason| reason.as_str().to_owned())
+        .collect();
+    let unreachable: BTreeSet<String> = UNREACHABLE_REJECTS.map(str::to_owned).into();
+    assert!(rejects.is_disjoint(&unreachable), "{rejects:?}");
+    assert_eq!(
+        &rejects | &unreachable,
+        all_rejects,
+        "every reject reason is covered or named unreachable"
+    );
+}
+
+// -- the repairs label set ------------------------------------------------------
+
+/// A preview never admits a service name to the bounded repairs label set
+/// (ADR-0009's cap of 256): after 300 previews of distinct invented
+/// services, each with a repair, a real ingest of a new service still gets
+/// its own `trawl_ingest_repairs_total` label, not the overflow one.
+///
+/// The set is process-wide. Under nextest this test is its own process;
+/// under `cargo test` the other tests here admit only a handful of names,
+/// far from the cap, so 300 leaked previews would still cross it.
+#[tokio::test(flavor = "multi_thread")]
+async fn previewed_services_never_take_a_repair_label() {
+    const PREVIEWED: usize = 300;
+    let server = setup_with_rate_limit(RateLimitConfig {
+        default_rpm: 0,
+        ingest_rpm: 0,
+    })
+    .await;
+    for n in 0..PREVIEWED {
+        // No env and no host: `env.defaulted` and `host.from_peer`.
+        let body = json!({"service": format!("invented-{n}")}).to_string();
+        let report = preview_ok(&server, "?peer_ip=10.0.0.1", &body).await;
+        let (_, repairs, _) = accepted(&report.events[0]);
+        assert!(!repairs.is_empty(), "preview {n} carried a repair");
+    }
+
+    let response = raw_client()
+        .post(format!("{}/api/v1/ingest", server.url))
+        .bearer_auth(&server.ingest_token)
+        .body(json!({"service": "label-probe", "message": "m"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let metrics = raw_client()
+        .get(format!("{}/metrics", server.url))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let repairs: Vec<&str> = metrics
+        .lines()
+        .filter(|line| line.starts_with("trawl_ingest_repairs_total"))
+        .collect();
+    assert!(
+        repairs
+            .iter()
+            .any(|line| line.contains("service=\"label-probe\"")
+                && line.contains("code=\"env.defaulted\"")),
+        "the new service has its own label: {repairs:#?}"
+    );
+    let overflow = format!("service=\"{OVERFLOW_SERVICE_LABEL}\"");
+    assert!(
+        !repairs.iter().any(|line| line.contains(&overflow)),
+        "{repairs:#?}"
+    );
+    assert!(
+        !metrics.contains("invented-"),
+        "no previewed service reached /metrics"
+    );
 }
