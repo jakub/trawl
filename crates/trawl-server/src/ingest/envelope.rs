@@ -616,7 +616,10 @@ fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -
 }
 
 /// Stamp what the producer asserts over the payload, returning whether any
-/// payload value was displaced (ADR-0013).
+/// payload value was displaced (ADR-0013). Each displaced payload value is
+/// recorded in `changes` as a drop earning `field.producer_asserted`: the
+/// payload's value is gone from its slot (it stays in `_raw`), whether the
+/// assertion replaced it or emptied the slot.
 ///
 /// Runs after the reserved-prefix strip and before the validators, so a
 /// stripped `_service` has already landed on its bare slot and the
@@ -637,12 +640,27 @@ fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -
 ///   `host: null` displaces nothing, being absence itself;
 /// - `message: None` asserts nothing at all (the payload is the message,
 ///   as for telemetry), so whatever the payload carries stands.
-fn apply_assertions(out: &mut Map<String, Value>, asserted: &Asserted<'_>) -> bool {
-    let mut displaced = claim_slot(out, trawl_core::schema::ENV, Some(asserted.env));
-    displaced |= claim_slot(out, trawl_core::schema::SERVICE, Some(asserted.service));
-    displaced |= claim_slot(out, trawl_core::schema::HOST, asserted.host);
+fn apply_assertions(
+    out: &mut Map<String, Value>,
+    asserted: &Asserted<'_>,
+    changes: &mut Vec<FieldChange>,
+) -> bool {
+    let mut claim = |key: &str, value: Option<&str>| {
+        let displaced = claim_slot(out, key, value);
+        if displaced {
+            changes.push(FieldChange {
+                field: key.to_owned(),
+                kind: FieldChangeKind::Dropped,
+                code: Some(RepairCode::ProducerAsserted),
+            });
+        }
+        displaced
+    };
+    let mut displaced = claim(trawl_core::schema::ENV, Some(asserted.env));
+    displaced |= claim(trawl_core::schema::SERVICE, Some(asserted.service));
+    displaced |= claim(trawl_core::schema::HOST, asserted.host);
     if let Some(message) = asserted.message {
-        displaced |= claim_slot(out, trawl_core::schema::MESSAGE, Some(message));
+        displaced |= claim(trawl_core::schema::MESSAGE, Some(message));
     }
     displaced
 }
@@ -1136,7 +1154,7 @@ pub fn canonicalize(
         for code in asserted.repairs {
             push_repair(&mut repairs, *code);
         }
-        if apply_assertions(&mut out, asserted) {
+        if apply_assertions(&mut out, asserted, &mut changes) {
             push_repair(&mut repairs, RepairCode::ProducerAsserted);
         }
     }
@@ -3008,6 +3026,44 @@ mod tests {
     }
 
     #[test]
+    fn producer_assertions_record_each_displaced_payload_value() {
+        // Overwritten and emptied slots are both drops: the payload's
+        // value is gone from the event (it stays in `_raw`).
+        let a = asserted("prod", "trawld", None, Some("asserted"), &[]);
+        let c = canon_profile(
+            r#"{"service":"nginx","host":"web01","env":"lab","message":"boom"}"#,
+            Producer::Trawld(a),
+        );
+        let dropped = |field: &str| {
+            change(
+                field,
+                FieldChangeKind::Dropped,
+                Some(RepairCode::ProducerAsserted),
+            )
+        };
+        assert_eq!(
+            c.lineage.fields,
+            vec![
+                dropped("env"),
+                dropped("service"),
+                dropped("host"),
+                dropped("message")
+            ]
+        );
+        assert_eq!(c.obj["service"], "trawld");
+        assert_eq!(c.obj["env"], "prod");
+        assert!(!c.obj.contains_key("host"));
+
+        // An identical value or a null displaces nothing.
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(
+            r#"{"service":"unifi","host":null,"env":"lab","msg":"x"}"#,
+            Producer::Syslog(a),
+        );
+        assert_eq!(c.lineage.fields, vec![dropped("env")]);
+    }
+
+    #[test]
     fn host_absent_is_reported_on_accepted_events() {
         assert!(!canon(r#"{"service":"s","host":"h"}"#).host_absent);
         // A stripped `_host` lands on the bare slot before the check.
@@ -3059,12 +3115,12 @@ mod tests {
             | RepairCode::ReservedPrefixCollision
             | RepairCode::FieldNameTooLong
             | RepairCode::FieldNameCaseFolded
-            | RepairCode::FieldNameCaseCollision => true,
+            | RepairCode::FieldNameCaseCollision
+            | RepairCode::ProducerAsserted => true,
             RepairCode::HostFromPeer
             | RepairCode::EnvDefaulted
             | RepairCode::TimeFromIngest
             | RepairCode::TimeOutOfRange
-            | RepairCode::ProducerAsserted
             | RepairCode::HostOmitted
             | RepairCode::ServiceFromProfile => false,
         }
@@ -3092,8 +3148,37 @@ mod tests {
             format!(r#"{{"service":"s","_raw":"{long_raw}"}}"#),
             format!(r#"{{"Service":"s","_X":{{"a":1}},"{long_name}":1,"_raw":"{long_raw}"}}"#),
         ];
-        for json in &fixtures {
-            let c = canon(json);
+        // Profile doors: displaced and emptied asserted slots, plus an
+        // identical value and a null that displace nothing.
+        let trawld = asserted("prod", "trawld", Some("box"), None, &[]);
+        let syslog = asserted("prod", "unifi", Some("gw"), Some("link down"), &[]);
+        let hostless = asserted("prod", "unifi", None, None, &[]);
+        let profile_fixtures = [
+            (
+                r#"{"service":"nginx","host":"web01","env":"lab","message":"boom"}"#,
+                Producer::Trawld(trawld),
+            ),
+            (
+                r#"{"service":"unifi","host":"gw","message":"other","_service":"x"}"#,
+                Producer::Syslog(syslog),
+            ),
+            (
+                r#"{"service":"unifi","host":"gw","env":"prod","message":"link down"}"#,
+                Producer::Syslog(syslog),
+            ),
+            (
+                r#"{"host":"whatever","msg":"x"}"#,
+                Producer::Syslog(hostless),
+            ),
+            (r#"{"host":null,"msg":"x"}"#, Producer::Syslog(hostless)),
+        ];
+        let http = fixtures
+            .iter()
+            .map(|json| (json.as_str(), canon(json), true));
+        let profile = profile_fixtures
+            .into_iter()
+            .map(|(json, producer)| (json, canon_profile(json, producer), false));
+        for (json, c, is_http) in http.chain(profile) {
             let label = &json[..json.len().min(80)];
             for change in &c.lineage.fields {
                 if let Some(code) = change.code {
@@ -3126,11 +3211,13 @@ mod tests {
             if c.repairs.contains(&RepairCode::TimeOutOfRange) {
                 assert!(matches!(c.lineage.time, TimeSource::Field(_)), "{label}");
             }
-            assert_eq!(
-                c.repairs.contains(&RepairCode::HostFromPeer),
-                c.host_absent,
-                "{label}: the HTTP door fills exactly the absent hosts"
-            );
+            if is_http {
+                assert_eq!(
+                    c.repairs.contains(&RepairCode::HostFromPeer),
+                    c.host_absent,
+                    "{label}: the HTTP door fills exactly the absent hosts"
+                );
+            }
         }
     }
 
