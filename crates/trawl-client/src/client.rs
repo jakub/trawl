@@ -15,10 +15,10 @@ use crate::types::{
     CancelResponse, CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse,
     ClearHistoryResponse, DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldAck,
     FieldValuesResponse, GcPinsResponse, HealthResponse, HistoryResponse, IngestResponse,
-    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, QueriesResponse, QueryResponse,
-    RepinStatusResponse, ReportRunResponse, ReportRunSummary, RunsStatsResponse,
-    SavedQueryResponse, ScheduleResponse, SchemaResponse, ServiceSchemaResponse, StatsResponse,
-    ValidationResponse, WhoAmIResponse,
+    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, PreviewResponse,
+    QueriesResponse, QueryResponse, RepinStatusResponse, ReportRunResponse, ReportRunSummary,
+    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse, ServiceSchemaResponse,
+    StatsResponse, ValidationResponse, WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
@@ -836,6 +836,45 @@ impl HttpClient {
 
         let resp = check_status(resp).await?;
         resp.json().await.map_err(body_read_error)
+    }
+
+    /// Preview what ingest would do to a sample, storing nothing of it
+    /// (`POST /api/v1/ingest/preview`, needs `server_manage`; ADR-0049).
+    ///
+    /// `body` goes out exactly as given: NDJSON or a JSON array, never
+    /// parsed, split, re-encoded or compressed here, so the server reads
+    /// the bytes a sender would post. No `Content-Type` is claimed: the
+    /// server tells NDJSON from an array by the bytes themselves. `peer_ip` is the sender's address as
+    /// trawld would see it; left out, the server canonicalizes against its
+    /// documentation placeholder and says so in the report.
+    ///
+    /// The route answers exactly `200`; any other status is a
+    /// [`ClientError::Server`]. A body that does not decode as a report is
+    /// a [`ClientError::Parse`] that never quotes the body: it carries
+    /// sample values.
+    pub async fn ingest_preview(
+        &self,
+        body: Vec<u8>,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> Result<PreviewResponse, ClientError> {
+        let url = self.endpoint("/api/v1/ingest/preview");
+        let mut req = self
+            .client
+            .post(&url)
+            .header("Authorization", self.auth_header_value())
+            .body(body);
+        if let Some(ip) = peer_ip {
+            req = req.query(&[("peer_ip", ip.to_string())]);
+        }
+        let resp = req.send().await.map_err(sanitize_reqwest_error)?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(body_read_error)?;
+        if status != reqwest::StatusCode::OK {
+            return Err(server_error(status.as_u16(), &bytes));
+        }
+        serde_json::from_slice(&bytes).map_err(|_| {
+            ClientError::Parse("response is not valid JSON for an ingest preview".into())
+        })
     }
 
     /// Export query results in the specified format.
@@ -1755,6 +1794,116 @@ mod tests {
                 "{line}: {err:?}"
             );
         }
+    }
+
+    async fn preview_answered_with(
+        body: Vec<u8>,
+        peer_ip: Option<std::net::IpAddr>,
+        response: Vec<u8>,
+    ) -> (Result<PreviewResponse, ClientError>, String) {
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        tokio::join!(
+            client.ingest_preview(body, peer_ip),
+            serve_once(listener, response)
+        )
+    }
+
+    const PREVIEW_BODY: &[u8] = br#"{"producer":"http","peer":{"ip":"10.0.0.7","given":true,"trusted_relay":false},"arrival":"2026-10-01T00:00:00.000000Z","derivation":{"time_from":["_time"],"severity_from":[]},"accepted":0,"rejected":1,"events":[{"outcome":"rejected","index":0,"reason":"invalid_json","message":"invalid JSON","host_depends_on_sender":false}]}"#;
+
+    /// The sample leaves byte for byte, blank lines, a bad line and the
+    /// missing final newline included, and the peer rides the query string.
+    #[tokio::test]
+    async fn ingest_preview_sends_the_sample_unmodified() {
+        let sample = b"{\"service\":\"api\"}\n\n  not json\r\n{\"b\":1}".to_vec();
+        let peer: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        let (result, request) = preview_answered_with(
+            sample.clone(),
+            Some(peer),
+            http_response("200 OK", "application/json", PREVIEW_BODY),
+        )
+        .await;
+        let report = result.expect("a 200 report decodes");
+        assert_eq!(report.rejected, 1);
+        assert_eq!(report.peer.ip, "10.0.0.7");
+        assert!(
+            request.starts_with("POST /api/v1/ingest/preview?peer_ip=10.0.0.7 HTTP/1.1\r\n"),
+            "{request}"
+        );
+        let head_end = request.find("\r\n\r\n").unwrap() + 4;
+        let head = request[..head_end].to_ascii_lowercase();
+        assert!(head.contains("\r\nauthorization: bearer tok\r\n"), "{head}");
+        assert!(!head.contains("content-encoding"), "{head}");
+        assert_eq!(&request.as_bytes()[head_end..], &sample[..]);
+    }
+
+    /// Without a peer the query string is absent, not empty: the server
+    /// refuses an empty `peer_ip` and uses its placeholder only when the
+    /// parameter is missing.
+    #[tokio::test]
+    async fn ingest_preview_without_a_peer_sends_no_query() {
+        let (result, request) = preview_answered_with(
+            b"{}\n".to_vec(),
+            None,
+            http_response("200 OK", "application/json", PREVIEW_BODY),
+        )
+        .await;
+        result.expect("a 200 report decodes");
+        assert!(
+            request.starts_with("POST /api/v1/ingest/preview HTTP/1.1\r\n"),
+            "{request}"
+        );
+    }
+
+    /// A non-200 is a server error carrying the status; the 404 a server
+    /// without ingest answers is how the CLI tells that case apart.
+    #[tokio::test]
+    async fn ingest_preview_non_200_is_a_server_error() {
+        let envelope = br#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#;
+        for (line, code) in [
+            ("404 Not Found", 404),
+            ("403 Forbidden", 403),
+            ("202 Accepted", 202),
+        ] {
+            let (result, _) = preview_answered_with(
+                b"{}\n".to_vec(),
+                None,
+                http_response(line, "application/json", envelope),
+            )
+            .await;
+            let err = result.expect_err("only a 200 is a report");
+            assert!(
+                matches!(err, ClientError::Server { status, .. } if status == code),
+                "{line}: {err:?}"
+            );
+        }
+    }
+
+    /// A 200 that is not a report never quotes the body: it carries the
+    /// sample's values.
+    #[tokio::test]
+    async fn ingest_preview_undecodable_report_is_a_quiet_parse_error() {
+        let (result, _) = preview_answered_with(
+            b"{}\n".to_vec(),
+            None,
+            http_response(
+                "200 OK",
+                "application/json",
+                br#"{"producer":"http","events":"canary-secret"}"#,
+            ),
+        )
+        .await;
+        let err = result.expect_err("not a report");
+        assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+        assert!(!err.to_string().contains("canary"), "{err}");
     }
 
     /// Only a 503 carrying a health body is kept. A 502 is an error whatever
