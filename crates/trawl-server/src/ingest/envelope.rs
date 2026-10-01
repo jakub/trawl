@@ -225,34 +225,42 @@ pub struct Rejection {
 
 /// How an accepted event's `_time` was decided, recorded as
 /// [`derive_time`] decided it.
+///
+/// Sources are positions in the profile's `time_from` list
+/// ([`Derivation::time_from`]), not names, so recording a decision on the
+/// ingest hot path copies nothing. [`Derivation::time_field`] names them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimeSource {
-    /// The first present source in the profile's `time_from` list parsed;
-    /// `_time` is its canonical spelling.
-    Field(String),
-    /// Arrival time filled `_time` (`time.from_ingest`). `unparseable` names
+    /// The first present source parsed; `_time` is its canonical spelling.
+    Field(usize),
+    /// Arrival time filled `_time` (`time.from_ingest`). `unparseable` is
     /// the first present source when one claimed the derivation and failed
     /// to parse (a JSON `null` included); `None` means no source was present.
-    Arrival { unparseable: Option<String> },
+    Arrival { unparseable: Option<usize> },
 }
 
 /// How an accepted event's `_severity` was decided, recorded as
 /// [`derive_severity`] decided it.
+///
+/// Sources are positions in the profile's `severity_from` list
+/// ([`Derivation::severity_from`]), not names, so recording a decision
+/// allocates nothing unless a present source failed to map.
+/// [`Derivation::severity_field`] names them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeveritySource {
-    /// `field` mapped and fed `_severity`. `skipped_unmappable` lists the
-    /// earlier sources that were present but mapped to nothing, in the
-    /// order the derivation consulted them.
+    /// The source at `index` mapped and fed `_severity`.
+    /// `skipped_unmappable` lists the earlier sources that were present but
+    /// mapped to nothing, in the order the derivation consulted them.
     Field {
-        field: String,
-        skipped_unmappable: Vec<String>,
+        index: usize,
+        skipped_unmappable: Vec<usize>,
     },
     /// No source in the profile's `severity_from` list was present.
     Missing,
     /// Sources were present and none mapped, so `_severity` was omitted
     /// (the `trawl_severity_unmapped_total` signal). `sources` lists them
     /// in consultation order.
-    Unmapped { sources: Vec<String> },
+    Unmapped { sources: Vec<usize> },
 }
 
 /// What one canonicalization step did to one field.
@@ -590,28 +598,26 @@ fn resolve_env(
 /// the number a query computes from a raw `level` is the number derivation
 /// would have stored for it.
 fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -> SeveritySource {
-    // Borrowed from the profile's list until the decision is made, so the
-    // common one-source event allocates only its answer.
-    let mut skipped: Vec<&str> = Vec::new();
-    for source in sources {
+    // Positions, not names: an event whose first present source maps
+    // allocates nothing for its lineage (an empty `Vec` is free).
+    let mut skipped: Vec<usize> = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
         let Some(value) = out.get(&source.field) else {
             continue;
         };
         if let Some(number) = trawl_core::severity::reading(value, source.dialect) {
             out.insert(trawl_core::schema::SEVERITY.into(), json!(number));
             return SeveritySource::Field {
-                field: source.field.clone(),
-                skipped_unmappable: skipped.into_iter().map(str::to_owned).collect(),
+                index,
+                skipped_unmappable: skipped,
             };
         }
-        skipped.push(&source.field);
+        skipped.push(index);
     }
     if skipped.is_empty() {
         SeveritySource::Missing
     } else {
-        SeveritySource::Unmapped {
-            sources: skipped.into_iter().map(str::to_owned).collect(),
-        }
+        SeveritySource::Unmapped { sources: skipped }
     }
 }
 
@@ -1017,9 +1023,10 @@ fn derive_time(
         .derivation
         .time_from(ctx.producer.kind())
         .iter()
-        .find_map(|source| out.get(&source.field).cloned().map(|v| (&source.field, v)));
+        .enumerate()
+        .find_map(|(index, source)| out.get(&source.field).cloned().map(|v| (index, v)));
     out.remove(trawl_core::schema::TIME);
-    let Some((field, v)) = time_input else {
+    let Some((index, v)) = time_input else {
         return (
             ctx.arrival.to_owned(),
             Some(RepairCode::TimeFromIngest),
@@ -1036,14 +1043,14 @@ fn derive_time(
             (
                 dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
                 repair,
-                TimeSource::Field(field.clone()),
+                TimeSource::Field(index),
             )
         }
         None => (
             ctx.arrival.to_owned(),
             Some(RepairCode::TimeFromIngest),
             TimeSource::Arrival {
-                unparseable: Some(field.clone()),
+                unparseable: Some(index),
             },
         ),
     }
@@ -2840,11 +2847,32 @@ mod tests {
         FieldChangeKind::Renamed { to: to.to_owned() }
     }
 
+    /// The position of `field` in the HTTP door's default `time_from` list.
+    fn time_at(field: &str) -> usize {
+        let sources = default_derivation().time_from(producer::ProducerKind::Http);
+        sources.iter().position(|s| s.field == field).unwrap()
+    }
+
+    /// The position of `field` in the HTTP door's default `severity_from`
+    /// list.
+    fn severity_at(field: &str) -> usize {
+        let sources = default_derivation().severity_from(producer::ProducerKind::Http);
+        sources.iter().position(|s| s.field == field).unwrap()
+    }
+
     #[test]
     fn time_lineage_names_the_parsed_source() {
         let c = canon(r#"{"service":"s","timestamp":"2025-12-31T23:00:00Z"}"#);
-        assert_eq!(c.lineage.time, TimeSource::Field("timestamp".into()));
+        assert_eq!(c.lineage.time, TimeSource::Field(time_at("timestamp")));
         assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
+        let TimeSource::Field(index) = c.lineage.time else {
+            unreachable!()
+        };
+        assert_eq!(
+            default_derivation().time_field(producer::ProducerKind::Http, index),
+            "timestamp",
+            "the preview names the position through the same derivation"
+        );
     }
 
     #[test]
@@ -2855,7 +2883,7 @@ mod tests {
         assert_eq!(
             c.lineage.time,
             TimeSource::Arrival {
-                unparseable: Some("_time".into())
+                unparseable: Some(time_at("_time"))
             }
         );
         assert_eq!(c.obj["_time"], ARRIVAL);
@@ -2866,7 +2894,7 @@ mod tests {
         assert_eq!(
             c.lineage.time,
             TimeSource::Arrival {
-                unparseable: Some("_time".into())
+                unparseable: Some(time_at("_time"))
             }
         );
     }
@@ -2884,19 +2912,35 @@ mod tests {
         assert_eq!(
             c.lineage.severity,
             SeveritySource::Field {
-                field: "level".into(),
-                skipped_unmappable: vec!["severity".into(), "severity_text".into()],
+                index: severity_at("level"),
+                skipped_unmappable: vec![severity_at("severity"), severity_at("severity_text")],
             }
         );
         assert_eq!(c.obj["_severity"], 13);
         assert!(!c.severity_unmapped());
+
+        // The preview names the positions through the same derivation.
+        let SeveritySource::Field {
+            index,
+            skipped_unmappable,
+        } = &c.lineage.severity
+        else {
+            unreachable!()
+        };
+        let name =
+            |i: &usize| default_derivation().severity_field(producer::ProducerKind::Http, *i);
+        assert_eq!(name(index), "level");
+        assert_eq!(
+            skipped_unmappable.iter().map(name).collect::<Vec<_>>(),
+            ["severity", "severity_text"]
+        );
 
         // The first source mapping skips nothing.
         let c = canon(r#"{"service":"s","severity":17,"level":"debug"}"#);
         assert_eq!(
             c.lineage.severity,
             SeveritySource::Field {
-                field: "severity".into(),
+                index: severity_at("severity"),
                 skipped_unmappable: Vec::new(),
             }
         );
@@ -2912,7 +2956,7 @@ mod tests {
         assert_eq!(
             unmapped.lineage.severity,
             SeveritySource::Unmapped {
-                sources: vec!["severity".into(), "level".into()],
+                sources: vec![severity_at("severity"), severity_at("level")],
             }
         );
         assert!(unmapped.severity_unmapped());
