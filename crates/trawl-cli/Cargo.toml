@@ -48,11 +48,20 @@ clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 axum = { workspace = true }
+# `tests/preview_ingest.rs` boots a real trawld in-process, as
+# trawl-server's own fixture does: the server crate, its keystore, its
+# postgres driver and its metrics recorder. All four are already in the
+# workspace graph through trawl-server. `fast-hash` is fleet-auth's
+# test-cost argon2id, as trawl-server's own tests use it.
+fleet-auth = { workspace = true, features = ["fast-hash"] }
 insta = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio-rustls = { workspace = true }
+trawl-server = { workspace = true }
 trawl-web = { workspace = true }
 
 [package.metadata.deb]

@@ -63,6 +63,7 @@ filter = '''
     | binary(doctor_pg) | binary(trawld_doctor) | binary(ingest_preview)))
   | (package(fleet-auth) & kind(test))
   | (package(fleet-admin) & kind(test))
+  | (package(trawl-cli) & binary(preview_ingest))
 '''
 test-group = 'postgres'
 # A hung pg test must become a NAMED failure before anything upstream (the
