@@ -55,7 +55,7 @@ The single step every event passes through at ingest, regardless of producer. It
 _Avoid_: normalization, sanitization, the door
 
 **Ingest preview**:
-Canonicalization of a bounded sample as one producer would do it, for a collector address the caller names, with nothing stored, counted, or logged. It shows what each event would become. It promises nothing about admission, durability, or the deployment.
+Canonicalization of a bounded sample as one producer would do it, with nothing stored, counted, or logged. It shows what each event would become. It promises nothing about admission, durability, or the deployment.
 _Avoid_: dry run (repin's records job state), test ingest, simulation, preview (alone; that is a read-only net run)
 
 **Visible**:
