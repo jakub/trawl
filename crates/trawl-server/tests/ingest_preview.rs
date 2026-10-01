@@ -624,8 +624,10 @@ async fn ingest_disabled_answers_404() {
     assert_eq!(resp.status(), 404);
 }
 
-/// Every response class the route itself produces is no-store. A 401 from
-/// the shared auth layer is not the route's.
+/// Every response to the preview is no-store, whichever layer answers it:
+/// the handler, the body limit's `Content-Length` refusal, the auth
+/// layer's 401 or the grant layer's 403. Another route on the same router
+/// is not given the header.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_preview_response_is_no_store() {
     let server = setup().await;
@@ -654,6 +656,43 @@ async fn every_preview_response_is_no_store() {
         .unwrap();
     assert_eq!(resp.status(), 415);
     assert_no_store(&resp, "415");
+
+    // A sized body (reqwest sends `Content-Length` for a `String`) is
+    // refused by the router's body limit on the header alone, before any
+    // extractor reads it.
+    let oversized = "x".repeat(INTERACTIVE_BODY_LIMIT + 1);
+    let resp = post_preview(&server, admin, "", oversized).await;
+    assert_eq!(resp.status(), 413, "body-limit 413");
+    assert_no_store(&resp, "body-limit 413");
+
+    // A key with no trawl grant at all is refused by the grant layer.
+    let resp = post_preview(&server, &server.coastwatch_only_token, "", "{}").await;
+    let (status, code, _) = error_of(resp, "grant-layer 403").await;
+    assert_eq!((status, code.as_str()), (403, "forbidden"));
+
+    // No token at all is the auth layer's 401.
+    let resp = raw_client()
+        .post(format!("{}/api/v1/ingest/preview", server.url))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert_no_store(&resp, "401");
+
+    // A neighbour on the same router keeps its own caching headers.
+    let resp = raw_client()
+        .get(format!("{}/api/v1/whoami", server.url))
+        .bearer_auth(admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get(reqwest::header::CACHE_CONTROL),
+        None,
+        "whoami is not the preview"
+    );
 }
 
 /// A key holding both `server_manage` and `ingest` spends the interactive
