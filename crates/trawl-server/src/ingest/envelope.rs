@@ -28,104 +28,97 @@ use serde_json::{Map, Value, json};
 use crate::ingest::pipeline;
 use crate::ingest::producer::{self, Asserted, Derivation, Producer};
 
-/// What the server changed about an accepted event — a closed enum, same
-/// principle as ADR-0006's "roles are data, permissions are code": codes
-/// are code, so `_repairs` cannot become a junk drawer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepairCode {
-    /// `host` was missing; filled from the sender IP.
-    HostFromPeer,
-    /// `env` was missing; filled from `default_env`.
-    EnvDefaulted,
-    /// `_time` was missing or unparseable; used arrival time.
-    TimeFromIngest,
-    /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
-    TimeOutOfRange,
-    /// a value exceeded the length cap (`_raw`).
-    FieldTruncated,
-    /// a field name arrived in trawl's `_` namespace and is not a slot the
-    /// sender may propose (ADR-0013 §5). The leading underscore run was
-    /// stripped and the value stored under the bare remainder
-    /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`); a name with no
-    /// remainder at all (`_`, `___`) was dropped. Nothing is lost either
-    /// way — `_raw` carries the original name and value.
-    ReservedPrefix,
-    /// stripping a reserved prefix produced a name the same event already
-    /// carries bare, so the prefixed loser was dropped (the case-collision
-    /// precedent). Its value stays findable in `_raw`.
-    ReservedPrefixCollision,
-    /// a field's name exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
-    /// the field was dropped (its value stays findable in `_raw`).
-    FieldNameTooLong,
-    /// a field's name carried ASCII uppercase and was folded to lowercase —
-    /// `DuckDB` identifiers are ASCII case-insensitive, so the lowercase
-    /// form is the one spelling every downstream layer (catalog, parquet,
-    /// hot snapshot) agrees on. The original spelling stays in `_raw`.
-    FieldNameCaseFolded,
-    /// two field names in one event differed only in ASCII case — one
-    /// column as far as `DuckDB` is concerned — so the losing key was
-    /// dropped (its value stays findable in `_raw`). The exact-lowercase
-    /// spelling wins when present; otherwise the ASCII-lexicographically
-    /// first variant does.
-    FieldNameCaseCollision,
-    /// a payload key named a slot the producer asserts (`env`, `service`,
-    /// `host`, `message`) and carried a different value, so the assertion
-    /// won (ADR-0013). Identity is protected by precedence, not by a
-    /// namespace: telemetry's own fields are ordinary sender vocabulary,
-    /// and the displaced value stays findable in `_raw`. An identical
-    /// value is not a collision and earns no code, and neither is a JSON
-    /// `null`, which is absence rather than a competing claim.
-    ProducerAsserted,
-    /// the producer had no honest `host` to assert, so the event was kept
-    /// with `host` absent (ADR-0013). Reached by a hostname-less syslog
-    /// frame behind a trusted relay and by a failed hostname lookup for
-    /// trawld: absent but honest beats both the peer-fill lie and dropping
-    /// the event. The HTTP door never gets here, since an HTTP sender can
-    /// be rejected and resend.
-    HostOmitted,
-    /// the producer could not derive a usable `service` from the frame
-    /// and fell back to its profile's configured default (a syslog
-    /// APP-NAME that fails the service charset). The original stays
-    /// findable in `_raw`.
-    ServiceFromProfile,
+// Declares a wire-coded enum together with its `ALL` list and `as_str`
+// from one `Variant => "wire.code"` list, so `ALL` is complete by
+// construction: a variant cannot exist without being listed and labelled.
+macro_rules! wire_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident => $wire:literal, )+
+        }
+    ) => {
+        $(#[$meta])*
+        pub enum $name {
+            $( $(#[$vmeta])* $variant, )+
+        }
+
+        impl $name {
+            /// The wire/metric label spelling.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $wire, )+
+                }
+            }
+
+            /// Every variant, in declaration order, for exhaustive iteration.
+            pub const ALL: &'static [Self] = &[ $( Self::$variant, )+ ];
+        }
+    };
 }
 
-impl RepairCode {
-    /// The wire/metric label spelling of the code.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::HostFromPeer => "host.from_peer",
-            Self::EnvDefaulted => "env.defaulted",
-            Self::TimeFromIngest => "time.from_ingest",
-            Self::TimeOutOfRange => "time.out_of_range",
-            Self::FieldTruncated => "field.truncated",
-            Self::ReservedPrefix => "field.reserved_prefix",
-            Self::ReservedPrefixCollision => "field.reserved_prefix_collision",
-            Self::FieldNameTooLong => "field.name_too_long",
-            Self::FieldNameCaseFolded => "field.name_case_folded",
-            Self::FieldNameCaseCollision => "field.name_case_collision",
-            Self::ProducerAsserted => "field.producer_asserted",
-            Self::HostOmitted => "host.omitted",
-            Self::ServiceFromProfile => "service.from_profile",
-        }
+wire_enum! {
+    /// What the server changed about an accepted event — a closed enum, same
+    /// principle as ADR-0006's "roles are data, permissions are code": codes
+    /// are code, so `_repairs` cannot become a junk drawer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RepairCode {
+        /// `host` was missing; filled from the sender IP.
+        HostFromPeer => "host.from_peer",
+        /// `env` was missing; filled from `default_env`.
+        EnvDefaulted => "env.defaulted",
+        /// `_time` was missing or unparseable; used arrival time.
+        TimeFromIngest => "time.from_ingest",
+        /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
+        TimeOutOfRange => "time.out_of_range",
+        /// a value exceeded the length cap (`_raw`).
+        FieldTruncated => "field.truncated",
+        /// a field name arrived in trawl's `_` namespace and is not a slot the
+        /// sender may propose (ADR-0013 §5). The leading underscore run was
+        /// stripped and the value stored under the bare remainder
+        /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`); a name with no
+        /// remainder at all (`_`, `___`) was dropped. Nothing is lost either
+        /// way — `_raw` carries the original name and value.
+        ReservedPrefix => "field.reserved_prefix",
+        /// stripping a reserved prefix produced a name the same event already
+        /// carries bare, so the prefixed loser was dropped (the case-collision
+        /// precedent). Its value stays findable in `_raw`.
+        ReservedPrefixCollision => "field.reserved_prefix_collision",
+        /// a field's name exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
+        /// the field was dropped (its value stays findable in `_raw`).
+        FieldNameTooLong => "field.name_too_long",
+        /// a field's name carried ASCII uppercase and was folded to lowercase —
+        /// `DuckDB` identifiers are ASCII case-insensitive, so the lowercase
+        /// form is the one spelling every downstream layer (catalog, parquet,
+        /// hot snapshot) agrees on. The original spelling stays in `_raw`.
+        FieldNameCaseFolded => "field.name_case_folded",
+        /// two field names in one event differed only in ASCII case — one
+        /// column as far as `DuckDB` is concerned — so the losing key was
+        /// dropped (its value stays findable in `_raw`). The exact-lowercase
+        /// spelling wins when present; otherwise the ASCII-lexicographically
+        /// first variant does.
+        FieldNameCaseCollision => "field.name_case_collision",
+        /// a payload key named a slot the producer asserts (`env`, `service`,
+        /// `host`, `message`) and carried a different value, so the assertion
+        /// won (ADR-0013). Identity is protected by precedence, not by a
+        /// namespace: telemetry's own fields are ordinary sender vocabulary,
+        /// and the displaced value stays findable in `_raw`. An identical
+        /// value is not a collision and earns no code, and neither is a JSON
+        /// `null`, which is absence rather than a competing claim.
+        ProducerAsserted => "field.producer_asserted",
+        /// the producer had no honest `host` to assert, so the event was kept
+        /// with `host` absent (ADR-0013). Reached by a hostname-less syslog
+        /// frame behind a trusted relay and by a failed hostname lookup for
+        /// trawld: absent but honest beats both the peer-fill lie and dropping
+        /// the event. The HTTP door never gets here, since an HTTP sender can
+        /// be rejected and resend.
+        HostOmitted => "host.omitted",
+        /// the producer could not derive a usable `service` from the frame
+        /// and fell back to its profile's configured default (a syslog
+        /// APP-NAME that fails the service charset). The original stays
+        /// findable in `_raw`.
+        ServiceFromProfile => "service.from_profile",
     }
-
-    /// Every code, in declaration order, for exhaustive iteration.
-    pub const ALL: &'static [Self] = &[
-        Self::HostFromPeer,
-        Self::EnvDefaulted,
-        Self::TimeFromIngest,
-        Self::TimeOutOfRange,
-        Self::FieldTruncated,
-        Self::ReservedPrefix,
-        Self::ReservedPrefixCollision,
-        Self::FieldNameTooLong,
-        Self::FieldNameCaseFolded,
-        Self::FieldNameCaseCollision,
-        Self::ProducerAsserted,
-        Self::HostOmitted,
-        Self::ServiceFromProfile,
-    ];
 }
 
 impl fmt::Display for RepairCode {
@@ -134,72 +127,36 @@ impl fmt::Display for RepairCode {
     }
 }
 
-/// Why an event was rejected — used as a prometheus label value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RejectReason {
-    MissingService,
-    /// `service` present but not a JSON string — type-specific, never
-    /// conflated with [`Self::MissingService`].
-    ServiceNotString,
-    EmptyService,
-    ServiceTooLong,
-    InvalidChars,
-    /// `env` present but not a string, or failing the env charset.
-    InvalidEnv,
-    /// `env` valid in shape but not in the configured allowlist —
-    /// repairing it into `default_env` would misfile data in the wrong
-    /// path root permanently.
-    EnvNotAllowed,
-    /// `host` missing and the peer is a configured trusted relay: filling
-    /// from the peer would stamp the relay's address as the origin.
-    HostMissingFromRelay,
-    NotObject,
-    InvalidJson,
-    WalFailure,
-    /// A valid event in an HTTP request the hot buffer refused for lack of
-    /// free space (503 `hot_buffer_full`, ADR-0043). Nothing was written.
-    HotBufferFull,
-    /// A valid event in an HTTP request larger than the hot buffer admits
-    /// for one request (413 `ingest_batch_too_large`, ADR-0043).
-    IngestBatchTooLarge,
-}
-
-impl RejectReason {
-    /// The prometheus label spelling of the reason.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::MissingService => "missing_service",
-            Self::ServiceNotString => "service_not_string",
-            Self::EmptyService => "empty_service",
-            Self::ServiceTooLong => "service_too_long",
-            Self::InvalidChars => "invalid_chars",
-            Self::InvalidEnv => "invalid_env",
-            Self::EnvNotAllowed => "env_not_allowed",
-            Self::HostMissingFromRelay => "host_missing_from_relay",
-            Self::NotObject => "not_object",
-            Self::InvalidJson => "invalid_json",
-            Self::WalFailure => "wal_failure",
-            Self::HotBufferFull => "hot_buffer_full",
-            Self::IngestBatchTooLarge => "ingest_batch_too_large",
-        }
+wire_enum! {
+    /// Why an event was rejected — used as a prometheus label value.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum RejectReason {
+        MissingService => "missing_service",
+        /// `service` present but not a JSON string — type-specific, never
+        /// conflated with [`Self::MissingService`].
+        ServiceNotString => "service_not_string",
+        EmptyService => "empty_service",
+        ServiceTooLong => "service_too_long",
+        InvalidChars => "invalid_chars",
+        /// `env` present but not a string, or failing the env charset.
+        InvalidEnv => "invalid_env",
+        /// `env` valid in shape but not in the configured allowlist —
+        /// repairing it into `default_env` would misfile data in the wrong
+        /// path root permanently.
+        EnvNotAllowed => "env_not_allowed",
+        /// `host` missing and the peer is a configured trusted relay: filling
+        /// from the peer would stamp the relay's address as the origin.
+        HostMissingFromRelay => "host_missing_from_relay",
+        NotObject => "not_object",
+        InvalidJson => "invalid_json",
+        WalFailure => "wal_failure",
+        /// A valid event in an HTTP request the hot buffer refused for lack of
+        /// free space (503 `hot_buffer_full`, ADR-0043). Nothing was written.
+        HotBufferFull => "hot_buffer_full",
+        /// A valid event in an HTTP request larger than the hot buffer admits
+        /// for one request (413 `ingest_batch_too_large`, ADR-0043).
+        IngestBatchTooLarge => "ingest_batch_too_large",
     }
-
-    /// Every reason, for exhaustive metric/summary iteration.
-    pub const ALL: &'static [Self] = &[
-        Self::MissingService,
-        Self::ServiceNotString,
-        Self::EmptyService,
-        Self::ServiceTooLong,
-        Self::InvalidChars,
-        Self::InvalidEnv,
-        Self::EnvNotAllowed,
-        Self::HostMissingFromRelay,
-        Self::NotObject,
-        Self::InvalidJson,
-        Self::WalFailure,
-        Self::HotBufferFull,
-        Self::IngestBatchTooLarge,
-    ];
 }
 
 impl fmt::Display for RejectReason {
@@ -3266,84 +3223,14 @@ mod tests {
     }
 
     #[test]
-    fn repair_code_all_lists_every_code() {
-        // Exhaustive with no wildcard arm: a new code fails to compile
-        // here until it is listed below and in `RepairCode::ALL`.
-        let every = [
-            RepairCode::HostFromPeer,
-            RepairCode::EnvDefaulted,
-            RepairCode::TimeFromIngest,
-            RepairCode::TimeOutOfRange,
-            RepairCode::FieldTruncated,
-            RepairCode::ReservedPrefix,
-            RepairCode::ReservedPrefixCollision,
-            RepairCode::FieldNameTooLong,
-            RepairCode::FieldNameCaseFolded,
-            RepairCode::FieldNameCaseCollision,
-            RepairCode::ProducerAsserted,
-            RepairCode::HostOmitted,
-            RepairCode::ServiceFromProfile,
-        ];
-        for code in every {
-            match code {
-                RepairCode::HostFromPeer
-                | RepairCode::EnvDefaulted
-                | RepairCode::TimeFromIngest
-                | RepairCode::TimeOutOfRange
-                | RepairCode::FieldTruncated
-                | RepairCode::ReservedPrefix
-                | RepairCode::ReservedPrefixCollision
-                | RepairCode::FieldNameTooLong
-                | RepairCode::FieldNameCaseFolded
-                | RepairCode::FieldNameCaseCollision
-                | RepairCode::ProducerAsserted
-                | RepairCode::HostOmitted
-                | RepairCode::ServiceFromProfile => {}
-            }
-        }
-        assert_eq!(RepairCode::ALL, every.as_slice());
+    fn repair_code_labels_are_distinct() {
         let labels: std::collections::HashSet<_> =
             RepairCode::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(labels.len(), RepairCode::ALL.len(), "labels are distinct");
     }
 
     #[test]
-    fn reject_reason_all_lists_every_reason() {
-        // Exhaustive with no wildcard arm: a new reason fails to compile
-        // here until it is listed below and in `RejectReason::ALL`.
-        let every = [
-            RejectReason::MissingService,
-            RejectReason::ServiceNotString,
-            RejectReason::EmptyService,
-            RejectReason::ServiceTooLong,
-            RejectReason::InvalidChars,
-            RejectReason::InvalidEnv,
-            RejectReason::EnvNotAllowed,
-            RejectReason::HostMissingFromRelay,
-            RejectReason::NotObject,
-            RejectReason::InvalidJson,
-            RejectReason::WalFailure,
-            RejectReason::HotBufferFull,
-            RejectReason::IngestBatchTooLarge,
-        ];
-        for reason in every {
-            match reason {
-                RejectReason::MissingService
-                | RejectReason::ServiceNotString
-                | RejectReason::EmptyService
-                | RejectReason::ServiceTooLong
-                | RejectReason::InvalidChars
-                | RejectReason::InvalidEnv
-                | RejectReason::EnvNotAllowed
-                | RejectReason::HostMissingFromRelay
-                | RejectReason::NotObject
-                | RejectReason::InvalidJson
-                | RejectReason::WalFailure
-                | RejectReason::HotBufferFull
-                | RejectReason::IngestBatchTooLarge => {}
-            }
-        }
-        assert_eq!(RejectReason::ALL, every.as_slice());
+    fn reject_reason_labels_are_distinct() {
         let labels: std::collections::HashSet<_> =
             RejectReason::ALL.iter().map(|r| r.as_str()).collect();
         assert_eq!(labels.len(), RejectReason::ALL.len(), "labels are distinct");
