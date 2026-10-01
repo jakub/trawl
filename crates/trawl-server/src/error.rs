@@ -176,6 +176,23 @@ pub enum ServerError {
         ceiling: Charge,
     },
 
+    /// An ingest preview sample holds more positions than one preview
+    /// reads (413, code `preview_too_large`, ADR-0049). The sample is
+    /// refused whole, never truncated. The message gives the limit and
+    /// nothing from the sample.
+    #[error("the sample holds more than {limit} events; preview at most {limit} at a time")]
+    PreviewTooLarge {
+        /// `trawl_api::ingest_preview::MAX_PREVIEW_EVENTS`.
+        limit: usize,
+    },
+
+    /// The request body carries a `Content-Encoding` the route does not
+    /// decode (415, code `unsupported_encoding`). The ingest preview reads
+    /// uncompressed samples only (ADR-0049). The message never quotes the
+    /// header's value.
+    #[error("compressed bodies are not accepted here; send the sample uncompressed")]
+    UnsupportedEncoding,
+
     /// A corpus read refused because the corpus is not settled: WAL from
     /// before a restart is not yet proven covered, or a rollup is
     /// unresolved (503, no `Retry-After`, ADR-0041). The message is fixed
@@ -477,8 +494,9 @@ impl ServerError {
             Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
             // `IngestBodyTooLarge`, `HotBufferFull`, `IngestBatchTooLarge`,
-            // `CorpusRecovering` and `HotSnapshot` render fixed text and
-            // counts, with nothing to redact.
+            // `PreviewTooLarge`, `UnsupportedEncoding`, `CorpusRecovering`
+            // and `HotSnapshot` render fixed text and counts, with nothing
+            // to redact.
             other => other.to_string(),
         }
     }
@@ -528,6 +546,8 @@ impl ServerError {
             | Self::CorpusRecovering(_)
             | Self::HotSnapshot(_) => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
+            Self::PreviewTooLarge { .. } => "preview_too_large",
+            Self::UnsupportedEncoding => "unsupported_encoding",
             Self::Internal(_) => "internal",
             Self::Panicked(_) => "panic",
         }
@@ -569,6 +589,8 @@ impl ServerError {
             | Self::RateLimited
             | Self::TooManyStreams
             | Self::IngestBatchTooLarge { .. }
+            | Self::PreviewTooLarge { .. }
+            | Self::UnsupportedEncoding
             | Self::Panicked(_) => CauseKind::None,
         }
     }
@@ -938,6 +960,15 @@ impl IntoResponse for ServerError {
             Self::IngestBatchTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorEnvelope::simple(ErrorCode::IngestBatchTooLarge, self.to_string()),
+            ),
+            // Fixed text and the limit: nothing from the sample.
+            Self::PreviewTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorEnvelope::simple(ErrorCode::PreviewTooLarge, self.to_string()),
+            ),
+            Self::UnsupportedEncoding => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                ErrorEnvelope::simple(ErrorCode::UnsupportedEncoding, self.to_string()),
             ),
             // `self` renders as the fixed label only: a panic's payload
             // never made it into the variant.
@@ -1512,6 +1543,28 @@ mod tests {
         }
         .into_response();
         assert_eq!(unparsed.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The ingest preview's two refusals: fixed text, a class and no cause
+    /// beneath it.
+    #[tokio::test]
+    async fn preview_refusals_are_413_and_415_with_their_codes() {
+        let too_large = ServerError::PreviewTooLarge { limit: 500 };
+        assert_eq!(too_large.error_class(), "preview_too_large");
+        assert_eq!(too_large.cause_kind(), CauseKind::None);
+        let response = too_large.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "preview_too_large");
+        assert!(body["error"]["message"].as_str().unwrap().contains("500"));
+
+        let encoding = ServerError::UnsupportedEncoding;
+        assert_eq!(encoding.error_class(), "unsupported_encoding");
+        assert_eq!(encoding.cause_kind(), CauseKind::None);
+        let response = encoding.into_response();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "unsupported_encoding");
     }
 
     /// An engine refusal is the caller's mistake, not the server's: 400,

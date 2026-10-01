@@ -107,7 +107,23 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/saved/{id}/runs", get(handlers::list_report_runs))
         .route("/saved/{id}/runs/{run_id}", get(handlers::get_report_run))
         .route("/export", post(handlers::export))
-        .route("/stream", get(handlers::stream_query))
+        .route("/stream", get(handlers::stream_query));
+    // The ingest preview lives here, not beside `/ingest`: it spends the
+    // interactive bucket and body limit, and exists only where ingest does
+    // (ADR-0049). A report quotes the sample, so no response it produces
+    // may be cached.
+    let authenticated = if ingest_enabled {
+        authenticated.route(
+            "/ingest/preview",
+            post(ingest::preview::preview).layer(SetResponseHeaderLayer::overriding(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("no-store"),
+            )),
+        )
+    } else {
+        authenticated
+    };
+    let authenticated = authenticated
         // Innermost, so a failure recorded after it is the handler's.
         .route_layer(middleware::from_fn(failure::mark_handler))
         .layer(middleware::from_fn(rate_limit_middleware))

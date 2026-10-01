@@ -112,10 +112,6 @@ pub(crate) enum EventOutcome {
         message: String,
         /// The canonicalizer's `host_absent` for a rejected object; false
         /// for a position that never parsed as an object.
-        #[cfg_attr(
-            not(test),
-            expect(dead_code, reason = "only the ingest preview reads it")
-        )]
         host_absent: bool,
     },
 }
@@ -138,10 +134,6 @@ pub(crate) struct EventReport<'i> {
     pub index: usize,
     /// The parsed value at this position. `None` when it was not valid
     /// JSON: the line text is never echoed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "only the ingest preview reads it")
-    )]
     pub input: Option<&'i Value>,
     pub outcome: EventOutcome,
 }
