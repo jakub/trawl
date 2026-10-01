@@ -91,6 +91,7 @@ fn authenticated_routes() -> Vec<(reqwest::Method, &'static str)> {
         (Method::POST, "/api/v1/export"),
         (Method::GET, "/api/v1/stream?query=*"),
         (Method::POST, "/api/v1/ingest"),
+        (Method::POST, "/api/v1/ingest/preview"),
     ]
 }
 

@@ -1306,6 +1306,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         SchedulerConfig::default(),
         None,
         None,
+        &[],
     )
     .await
 }
@@ -1339,6 +1340,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         SchedulerConfig::default(),
         None,
         None,
+        &[],
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1359,6 +1361,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         SchedulerConfig::default(),
         None,
         None,
+        &[],
     )
     .await
 }
@@ -1378,6 +1381,30 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         scheduler,
         None,
         None,
+        &[],
+    )
+    .await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
+}
+
+/// A fixture whose `[ingest] trusted_relays` holds `cidrs`, for tests of
+/// what a host-less event from a relay becomes. The tempdir holding its WAL
+/// is leaked so it outlives the server.
+pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let server = setup_with_ingest_config(
+        tmp.path(),
+        seed_data_root(tmp.path()),
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        RowCaps::DEFAULT,
+        SchedulerConfig::default(),
+        None,
+        None,
+        cidrs,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1421,6 +1448,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         SchedulerConfig::default(),
         Some(knobs),
         None,
+        &[],
     )
     .await
 }
@@ -1446,6 +1474,7 @@ pub async fn setup_observing_boot(
         SchedulerConfig::default(),
         knobs,
         Some(before_boot),
+        &[],
     )
     .await
 }
@@ -1462,6 +1491,7 @@ async fn setup_with_ingest_config(
     scheduler: SchedulerConfig,
     hot_buffer: Option<HotBufferKnobs>,
     before_boot: Option<&mut dyn FnMut(&AppState)>,
+    trusted_relays: &[&str],
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1544,6 +1574,7 @@ async fn setup_with_ingest_config(
             let mut ingest = IngestConfig {
                 enabled: ingest_enabled,
                 wal_dir: Some(wal_dir),
+                trusted_relays: trusted_relays.iter().map(|c| (*c).to_owned()).collect(),
                 ..IngestConfig::default()
             };
             if let Some(knobs) = hot_buffer {
