@@ -610,7 +610,7 @@ pub fn count_event_outcome(canonical: &crate::ingest::envelope::Canonical) {
         )
         .increment(1);
     }
-    if canonical.severity_unmapped {
+    if canonical.severity_unmapped() {
         metrics::counter!(
             crate::metrics::SEVERITY_UNMAPPED_TOTAL,
             "service" => crate::metrics::repair_service_label(&canonical.service),

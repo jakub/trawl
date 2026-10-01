@@ -120,7 +120,7 @@ impl ParsedEvents {
                         .entry((code.as_str(), canonical.service.clone()))
                         .or_default() += 1;
                 }
-                if canonical.severity_unmapped {
+                if canonical.severity_unmapped() {
                     *self
                         .severity_unmapped
                         .entry(canonical.service.clone())
@@ -129,9 +129,12 @@ impl ParsedEvents {
                 let key = (canonical.env, canonical.service);
                 self.batches.entry(key).or_default().push(canonical.obj);
             }
-            Err((message, reason)) => {
-                self.errors.push(IngestEventError { index, message });
-                self.reject_counts.increment(reason);
+            Err(rejection) => {
+                self.errors.push(IngestEventError {
+                    index,
+                    message: rejection.message,
+                });
+                self.reject_counts.increment(rejection.reason);
             }
         }
     }
