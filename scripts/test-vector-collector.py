@@ -333,12 +333,22 @@ def capture_block():
     return "\n".join(body) + "\n"
 
 
-def fixture_collector(directory, live_data, receiver_url):
+# Equivalent TOML spellings of the `trawld` sink headers that the guide's awk
+# filter does not match. The capture must refuse to run with either.
+SINK_SPELLINGS = {
+    "indented": lambda line: "  " + line,
+    "quoted": lambda line: line.replace("[sinks.trawld", '[sinks."trawld"', 1),
+}
+
+
+def fixture_collector(directory, live_data, receiver_url, spelling=None):
     """Copy the Debian collector configuration as a host would install it.
 
     Each file keeps its text, sink tables included. Only the source tables are
     replaced, by filters that take the stdin fixture stream, so Vector ends at
     the end of input. `data_dir` names the fixture's service directory.
+    `spelling` rewrites every `[sinks.trawld...]` header in `base.toml` with
+    one of SINK_SPELLINGS, keeping the parsed configuration the same.
     """
     live = directory / "vector.d"
     live.mkdir()
@@ -362,6 +372,12 @@ def fixture_collector(directory, live_data, receiver_url):
             assert text.count(shipped) == 1, "base.toml no longer sets the shipped data_dir"
             text = text.replace(shipped, f"data_dir = {json.dumps(str(live_data))}\n")
             text += '\n[sources.fixture]\ntype = "stdin"\ndecoding.codec = "json"\n'
+            if spelling:
+                respelled = "\n".join(
+                    SINK_SPELLINGS[spelling](line) if line.startswith("[sinks.trawld") else line
+                    for line in text.splitlines()) + "\n"
+                assert respelled != text and tomllib.loads(respelled) == tomllib.loads(text), spelling
+                text = respelled
         for name in sorted(removed):
             text += (f"\n[transforms.{name}]\ntype = \"filter\"\ninputs = [\"fixture\"]\n"
                      f"condition = {json.dumps(f'.fixture_source == {json.dumps(name)}')}\n")
@@ -395,7 +411,9 @@ def run_capture(directory, live, env_file, inputs):
 
     The block's host paths point at the fixture copies, and `sudo` runs its
     command as this user. Nothing else in the block changes. Vector reads the
-    fixture stream on stdin, which it inherits through the block.
+    fixture stream on stdin, which it inherits through the block. Returns the
+    finished process, the block's private directory, and the operator's
+    working directory.
     """
     block = capture_block()
     for path in (LIVE_CONFIG_DIR, LIVE_ENV_FILE):
@@ -408,11 +426,22 @@ def run_capture(directory, live, env_file, inputs):
         result = subprocess.run(["bash", "-c", script], cwd=work, env=clean_env(directory),
                                 stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=90)
-    assert result.returncode == 0, result.stderr.decode(errors="replace")
     assert result.stdout == b"", "the capture leaked events to the terminal"
+    [capture] = directory.glob("tmp.*")
+    # The captured lines are root-readable logs: they stay in the operator's
+    # private directory, and nothing lands in the working directory.
+    assert capture.stat().st_mode & 0o777 == 0o700, oct(capture.stat().st_mode)
+    assert capture.stat().st_uid == os.getuid()
+    assert not any(work.iterdir()), list(work.iterdir())
+    return result, capture, work
+
+
+def capture_events(directory, live, env_file, inputs):
+    """Run the capture block, assert it ran as the guide says, return its file."""
+    result, capture, _work = run_capture(directory, live, env_file, inputs)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
     # The configuration the capture ran: the service's files less the sink
     # and the syslog drop-in, with a console sink and its own data_dir.
-    [capture] = directory.glob("tmp.*")
     files = {path.name: tomllib.loads(path.read_text())
              for path in (capture / "config").glob("*.toml")}
     assert set(files) == {path.name for path in live.glob("*.toml")} - {"unifi-syslog.toml"}, files
@@ -420,7 +449,11 @@ def run_capture(directory, live, env_file, inputs):
     sinks = {name: sink for f in files.values() for name, sink in f.get("sinks", {}).items()}
     assert sinks == {"capture": {"type": "console", "inputs": ["trawl_*"], "target": "stdout",
                                  "encoding": {"codec": "json"}}}, sinks
-    return (work / "capture.ndjson").read_bytes(), result.stderr.decode(errors="replace")
+    output = capture / "capture.ndjson"
+    assert output.parent == capture and output.is_file(), output
+    print(f"PASS capture privacy: capture.ndjson in a {oct(capture.stat().st_mode & 0o777)} "
+          "directory owned by the operator; nothing written to the working directory")
+    return output.read_bytes(), result.stderr.decode(errors="replace")
 
 
 def preview_input(raw):
@@ -470,7 +503,7 @@ def capture_recipe():
             inputs = directory / "fixtures.ndjson"
             inputs.write_text("".join(json.dumps(e) + "\n" for e in events))
 
-            raw, log = run_capture(directory, live, env_file, inputs)
+            raw, log = capture_events(directory, live, env_file, inputs)
             assert "ERROR" not in log, log
             assert not requests, "the capture posted to trawld"
             assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
@@ -512,7 +545,7 @@ def capture_recipe():
                          host="fixture-host", PRIORITY="6", SYSLOG_IDENTIFIER="bulk")
                     for i in range(MAX_PREVIEW_EVENTS + 100)]
             inputs.write_text("".join(json.dumps(e) + "\n" for e in many))
-            raw, _log = run_capture(directory, live, env_file, inputs)
+            raw, _log = capture_events(directory, live, env_file, inputs)
             assert not requests, "the capture posted to trawld"
             assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
             captured = preview_input(raw)
@@ -520,6 +553,35 @@ def capture_recipe():
             assert len(ids) == MAX_PREVIEW_EVENTS == len(set(ids)), len(ids)
             assert set(ids) <= {event["fixture_id"] for event in many}
             print(f"PASS capture recipe cut: {len(many)} inputs, {len(captured)} captured lines")
+
+        # A sink the awk filter misses: Vector's own reading of the copy
+        # refuses it before Vector starts, so nothing is posted or captured.
+        for spelling in SINK_SPELLINGS:
+            requests.clear()
+            with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+                directory = Path(name)
+                live_data = directory / "var-lib-vector"
+                live_data.mkdir()
+                live, env_file = fixture_collector(
+                    directory, live_data, f"http://127.0.0.1:{server.server_port}", spelling)
+                inputs = directory / "fixtures.ndjson"
+                inputs.write_text("".join(json.dumps(e) + "\n" for e in events))
+                result, capture, _work = run_capture(directory, live, env_file, inputs)
+                log = result.stderr.decode(errors="replace")
+                # Give a sink that did start the time to flush a batch.
+                time.sleep(1)
+                assert not requests, f"the capture posted to trawld ({spelling} header)"
+                assert result.returncode != 0, log
+                assert "Vector did not start" in log, log
+                # The copy still holds the sink, so the check, not the filter,
+                # refused it.
+                assert "trawld" in tomllib.loads(
+                    (capture / "config/base.toml").read_text())["sinks"], spelling
+                assert (capture / "capture.ndjson").read_bytes() == b""
+                assert not any((capture / "data").iterdir()), "Vector ran"
+                assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
+                print(f"PASS capture refuses {spelling} sink header: exit {result.returncode}, "
+                      f"{len(requests)} requests, empty capture")
     finally:
         server.shutdown()
         thread.join()

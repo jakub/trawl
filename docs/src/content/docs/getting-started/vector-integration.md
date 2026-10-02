@@ -190,8 +190,21 @@ nothing.
    target = "stdout"
    encoding.codec = "json"
    EOF
-   sudo sh -c 'set -a && . /etc/default/vector && exec timeout 60 vector --config-dir "$1"' sh "$CAPTURE/config" |
-     head -n 500 > capture.ndjson
+   cat > "$CAPTURE/check.vrl" <<'EOF'
+   sinks = object!(.sinks)
+   keys(sinks) == ["capture"] && sinks.capture.type == "console" &&
+     .data_dir == get_env_var!("CAPTURE") + "/data"
+   EOF
+   sudo sh -c '
+     set -a && . /etc/default/vector && set +a
+     checked="$(vector config --config-dir "$1/config" |
+       CAPTURE="$1" vector vrl --input /dev/stdin --program "$1/check.vrl")"
+     if [ "$checked" != true ]; then
+       echo "capture: the copy has a sink other than capture, or another data_dir; Vector did not start" >&2
+       exit 1
+     fi
+     timeout 60 vector --config-dir "$1/config" | head -n 500
+   ' sh "$CAPTURE" > "$CAPTURE/capture.ndjson"
    ```
 
    The capture runs a copy of this host's configuration with two changes:
@@ -203,12 +216,24 @@ nothing.
      checkpoints there, so it does not move the service's checkpoints in
      `/var/lib/vector` or touch the sink's disk buffer.
 
+   The `awk` filter removes only `[sinks.trawld]` tables whose headers start
+   at the beginning of a line, as the shipped `base.toml` writes them. Before
+   Vector starts, the block checks the copy as Vector reads it:
+   `vector config` resolves the configuration, and `check.vrl` accepts it
+   only if the one sink is the `console` sink `capture` and `data_dir` is the
+   new directory. If you have reformatted `base.toml`, or another file in
+   `/etc/vector/vector.d` adds a sink, the check prints an error and exits
+   `1`, and Vector does not start. Remove that sink from the copy in
+   `$CAPTURE/config`, then run the `sudo` command again.
+
    `unifi-syslog.toml` stays out of the copy: its events come from devices,
    and its listener would compete with a running Vector for port 1514.
    Vector runs as root with the variables from `/etc/default/vector`, so
    `TRAWL_ENV` and the noise policy apply as they do in the service. It stops
    after 500 events or 60 seconds, whichever comes first. Its log goes to the
-   terminal, and only events go to `capture.ndjson`.
+   terminal, and only events go to `$CAPTURE/capture.ndjson`. `mktemp -d`
+   creates `$CAPTURE` readable only by you, so the captured log lines stay
+   private to your account and root.
 
    The empty `data_dir` has no journal checkpoint, so the journald source
    starts at the beginning of the current boot, as on Vector's
@@ -220,11 +245,11 @@ nothing.
 2. Preview the capture:
 
    ```bash
-   trawl -p prod preview-ingest capture.ndjson
+   trawl -p prod preview-ingest "$CAPTURE/capture.ndjson"
    ```
 
    The `prod` profile's key needs `trawl:server_manage` for this step. If it
-   lacks that permission, copy `capture.ndjson` to a machine with a profile
+   lacks that permission, copy `$CAPTURE/capture.ndjson` to a machine with a profile
    whose key holds it.
 
    The command exits `0` when every event is accepted, and `1` when any event
@@ -239,13 +264,14 @@ nothing.
 
    The preview reads at most `[server] max_request_body_bytes`, 128K by
    default. If it answers `413` for a body that is too large, preview fewer
-   lines, such as `head -n 200 capture.ndjson`.
+   lines, such as
+   `head -n 200 "$CAPTURE/capture.ndjson" | trawl -p prod preview-ingest -`.
 
 3. Delete the capture. It holds real log lines, and Vector wrote its
    checkpoints as root:
 
    ```bash
-   sudo rm -rf "$CAPTURE" capture.ndjson
+   sudo rm -rf "$CAPTURE"
    ```
 
 A preview checks canonicalization, not delivery. Prove that the first event
