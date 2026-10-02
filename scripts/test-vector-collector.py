@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Run the Debian collector with Vector 0.57.0 and disposable loopback inputs.
 
-Requires Python 3.11+, OpenSSL, and VECTOR_BIN (or vector on PATH). No host journal,
-application files, Docker socket, credentials, or running collector are used.
+Also run the Vector guide's sample capture recipe, as written, and prove that it
+captures the events the `trawld` sink posts.
+
+Requires Python 3.11+, OpenSSL, bash, awk, coreutils, and VECTOR_BIN (or vector on
+PATH). No host journal, application files, Docker socket, credentials, or running
+collector are used.
 """
 
 import collections
@@ -12,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -36,6 +41,14 @@ ENV.pop("VAR", None)
 ENV.pop("TRAWL_SUPPRESS_HOMELAB_NOISE", None)
 # Marker shape used by the sender proof recipes in the Vector guide.
 MARKER = "trawl-check-00000000-0000-4000-8000-000000000198"
+GUIDE = ROOT / "docs/src/content/docs/getting-started/vector-integration.md"
+# The guide's capture recipe, and the host paths it reads, which the run below
+# points at fixture copies.
+CAPTURE_MARKER = "<!-- proof:capture-sample -->"
+LIVE_CONFIG_DIR = "/etc/vector/vector.d"
+LIVE_ENV_FILE = "/etc/default/vector"
+# The most events one ingest preview reads (trawl_api::ingest_preview).
+MAX_PREVIEW_EVENTS = 500
 
 
 def load(tcp):
@@ -301,6 +314,218 @@ def run(tcp, suppress, tls="http"):
             server.server_close()
 
 
+def capture_block():
+    """The capture recipe exactly as the guide prints it, list indent removed."""
+    lines = GUIDE.read_text().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == CAPTURE_MARKER]
+    assert len(starts) == 1, starts
+    marker = lines[starts[0]]
+    indent = marker[:len(marker) - len(marker.lstrip())]
+    assert lines[starts[0] + 1] == indent + "```bash", lines[starts[0] + 1]
+    body = []
+    for line in lines[starts[0] + 2:]:
+        if line == indent + "```":
+            break
+        assert not line or line.startswith(indent), line
+        body.append(line[len(indent):])
+    else:
+        raise AssertionError("the capture block has no closing fence")
+    return "\n".join(body) + "\n"
+
+
+def fixture_collector(directory, live_data, receiver_url):
+    """Copy the Debian collector configuration as a host would install it.
+
+    Each file keeps its text, sink tables included. Only the source tables are
+    replaced, by filters that take the stdin fixture stream, so Vector ends at
+    the end of input. `data_dir` names the fixture's service directory.
+    """
+    live = directory / "vector.d"
+    live.mkdir()
+    header = re.compile(r"^\[([^\]]+)\]\s*$")
+    for path in sorted(CONFIG.glob("*.toml")):
+        text = path.read_text()
+        sources = set(tomllib.loads(text).get("sources", {}))
+        kept, removed, skip = [], set(), False
+        for line in text.splitlines():
+            match = header.match(line)
+            if match:
+                skip = match[1].startswith("sources.")
+                if skip:
+                    removed.add(match[1].split(".")[1])
+            if not skip:
+                kept.append(line)
+        assert removed == sources, (path.name, removed, sources)
+        text = "\n".join(kept) + "\n"
+        if path.name == "base.toml":
+            shipped = 'data_dir = "/var/lib/vector"\n'
+            assert text.count(shipped) == 1, "base.toml no longer sets the shipped data_dir"
+            text = text.replace(shipped, f"data_dir = {json.dumps(str(live_data))}\n")
+            text += '\n[sources.fixture]\ntype = "stdin"\ndecoding.codec = "json"\n'
+        for name in sorted(removed):
+            text += (f"\n[transforms.{name}]\ntype = \"filter\"\ninputs = [\"fixture\"]\n"
+                     f"condition = {json.dumps(f'.fixture_source == {json.dumps(name)}')}\n")
+        (live / path.name).write_text(text)
+    env_file = directory / "default-vector"
+    env_file.write_text(
+        f"VECTOR_CONFIG_DIR={live}\n"
+        "VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true\n"
+        f"TRAWL_URL={receiver_url}\n"
+        # Not the shipped default, so a capture that misses the service's
+        # environment sends a different env.
+        "TRAWL_ENV=lab\n"
+        "TRAWL_INGEST_TOKEN=fixture-token\n")
+    return live, env_file
+
+
+def clean_env(directory):
+    """An environment without inherited Vector or Trawl settings."""
+    shims = directory / "bin"
+    shims.mkdir(exist_ok=True)
+    vector = shutil.which(VECTOR)
+    assert vector, VECTOR
+    (shims / "vector").unlink(missing_ok=True)
+    (shims / "vector").symlink_to(vector)
+    return {"PATH": f"{shims}:{os.environ['PATH']}", "HOME": str(directory),
+            "TMPDIR": str(directory), "LC_ALL": "C.UTF-8"}
+
+
+def run_capture(directory, live, env_file, inputs):
+    """Run the guide's capture block against the fixture collector.
+
+    The block's host paths point at the fixture copies, and `sudo` runs its
+    command as this user. Nothing else in the block changes. Vector reads the
+    fixture stream on stdin, which it inherits through the block.
+    """
+    block = capture_block()
+    for path in (LIVE_CONFIG_DIR, LIVE_ENV_FILE):
+        assert path in block, f"the capture block no longer reads {path}"
+    script = ("set -eu\nsudo() { \"$@\"; }\n"
+              + block.replace(LIVE_CONFIG_DIR, str(live)).replace(LIVE_ENV_FILE, str(env_file)))
+    work = directory / "operator"
+    work.mkdir()
+    with inputs.open("rb") as stdin:
+        result = subprocess.run(["bash", "-c", script], cwd=work, env=clean_env(directory),
+                                stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=90)
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert result.stdout == b"", "the capture leaked events to the terminal"
+    # The configuration the capture ran: the service's files less the sink
+    # and the syslog drop-in, with a console sink and its own data_dir.
+    [capture] = directory.glob("tmp.*")
+    files = {path.name: tomllib.loads(path.read_text())
+             for path in (capture / "config").glob("*.toml")}
+    assert set(files) == {path.name for path in live.glob("*.toml")} - {"unifi-syslog.toml"}, files
+    assert [f["data_dir"] for f in files.values() if "data_dir" in f] == [str(capture / "data")]
+    sinks = {name: sink for f in files.values() for name, sink in f.get("sinks", {}).items()}
+    assert sinks == {"capture": {"type": "console", "inputs": ["trawl_*"], "target": "stdout",
+                                 "encoding": {"codec": "json"}}}, sinks
+    return (work / "capture.ndjson").read_bytes(), result.stderr.decode(errors="replace")
+
+
+def preview_input(raw):
+    """Assert the capture is a body the preview reads, and return its events."""
+    assert raw[:2] != b"\x1f\x8b", "the capture is gzip"
+    text = raw.decode("utf-8")
+    assert text.endswith("\n"), "the capture does not end with a newline"
+    lines = text[:-1].split("\n")
+    assert 0 < len(lines) <= MAX_PREVIEW_EVENTS, len(lines)
+    events = [json.loads(line) for line in lines]
+    assert all(isinstance(event, dict) for event in events), "a capture line is not an object"
+    return events
+
+
+def canonical(event):
+    return json.dumps(event, sort_keys=True)
+
+
+def capture_recipe():
+    events, expected = fixtures(False)
+    # A journal entry carries its own time. Give every fixture one, so both
+    # runs post the same `timestamp` instead of the moment Vector read it.
+    for event in events:
+        event["timestamp"] = "2026-09-28T10:30:45.123456Z"
+    requests = []
+
+    class Receiver(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            requests.append((self.path, self.headers.get("Content-Encoding"), body))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+            directory = Path(name)
+            live_data = directory / "var-lib-vector"
+            live_data.mkdir()
+            live, env_file = fixture_collector(
+                directory, live_data, f"http://127.0.0.1:{server.server_port}")
+            inputs = directory / "fixtures.ndjson"
+            inputs.write_text("".join(json.dumps(e) + "\n" for e in events))
+
+            raw, log = run_capture(directory, live, env_file, inputs)
+            assert "ERROR" not in log, log
+            assert not requests, "the capture posted to trawld"
+            assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
+            captured = preview_input(raw)
+
+            # The same configuration and inputs, as the service runs them.
+            env = clean_env(directory)
+            for line in env_file.read_text().splitlines():
+                key, value = line.split("=", 1)
+                env[key] = value
+            with inputs.open("rb") as stdin:
+                service = subprocess.run([VECTOR, "--config-dir", str(live)], env=env, stdin=stdin,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            assert service.returncode == 0, service.stderr.decode(errors="replace")
+            posted = []
+            for path, encoding, body in requests:
+                assert (path, encoding) == ("/api/v1/ingest", "gzip"), (path, encoding)
+                batch = json.loads(gzip.decompress(body))
+                assert isinstance(batch, list), batch
+                posted.extend(batch)
+            assert len(posted) == len(expected), (len(posted), len(expected))
+            assert all(event["env"] == "lab" for event in posted), posted
+            assert (collections.Counter(map(canonical, captured))
+                    == collections.Counter(map(canonical, posted))), (captured, posted)
+            print(f"PASS capture recipe: {len(captured)} captured lines equal the "
+                  f"{len(posted)} events the trawld sink posted; nothing posted or "
+                  "checkpointed by the capture")
+
+        # A source that outruns the cut: the capture stops at the event limit.
+        requests.clear()
+        with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+            directory = Path(name)
+            live_data = directory / "var-lib-vector"
+            live_data.mkdir()
+            live, env_file = fixture_collector(
+                directory, live_data, f"http://127.0.0.1:{server.server_port}")
+            inputs = directory / "fixtures.ndjson"
+            many = [dict(message=f"line {i}", fixture_id=f"bulk-{i}", fixture_source="journald",
+                         host="fixture-host", PRIORITY="6", SYSLOG_IDENTIFIER="bulk")
+                    for i in range(MAX_PREVIEW_EVENTS + 100)]
+            inputs.write_text("".join(json.dumps(e) + "\n" for e in many))
+            raw, _log = run_capture(directory, live, env_file, inputs)
+            assert not requests, "the capture posted to trawld"
+            assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
+            captured = preview_input(raw)
+            ids = [event["fixture_id"] for event in captured]
+            assert len(ids) == MAX_PREVIEW_EVENTS == len(set(ids)), len(ids)
+            assert set(ids) <= {event["fixture_id"] for event in many}
+            print(f"PASS capture recipe cut: {len(many)} inputs, {len(captured)} captured lines")
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
 if __name__ == "__main__":
     version = subprocess.check_output([VECTOR, "--version"], text=True).strip()
     assert version.startswith("vector 0.57.0 "), version
@@ -313,3 +538,4 @@ if __name__ == "__main__":
             run(tcp, suppress)
     run(True, False, "trusted")
     run(False, False, "untrusted")
+    capture_recipe()
