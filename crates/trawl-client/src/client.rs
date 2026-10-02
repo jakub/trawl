@@ -25,6 +25,73 @@ use crate::types::{
     UpdateSavedRequestRef, ValidateRequest,
 };
 
+/// The deepest event, in nested containers, ingest accepts. Ingest parses
+/// each event with `serde_json`'s default recursion limit of 128, which
+/// refuses the 128th open container.
+const INGEST_EVENT_MAX_DEPTH: usize = 127;
+
+/// The containers an ingest preview report wraps each echoed `input` in:
+/// the report object, its `events` array and the event object.
+const PREVIEW_WRAPPER_DEPTH: usize = 3;
+
+/// Whether `json` nests containers deeper than `max`. Brackets inside
+/// strings are text. Bytes that are not JSON are scanned all the same: the
+/// parser that runs next refuses them, and up to its first error it has
+/// read the same strings and brackets this scan read, so it never nests
+/// deeper than this scan allowed.
+fn json_depth_exceeds(json: &[u8], max: usize) -> bool {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for &byte in json {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > max {
+                    return true;
+                }
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Decode an ingest preview report as deep as the sample ingest accepts.
+///
+/// The report echoes each parsed input three containers in, so an event
+/// at ingest's deepest would trip `serde_json`'s default recursion limit
+/// here. The limit is lifted only after a scan bounds the nesting at
+/// ingest's own limit plus the wrapper, so decoding recursion stays
+/// bounded, two levels past the default. Neither error quotes the body: it
+/// carries sample values.
+fn decode_preview(bytes: &[u8]) -> Result<PreviewResponse, ClientError> {
+    if json_depth_exceeds(bytes, INGEST_EVENT_MAX_DEPTH + PREVIEW_WRAPPER_DEPTH) {
+        return Err(ClientError::Parse(
+            "the ingest preview report nests deeper than any event ingest accepts".into(),
+        ));
+    }
+    let invalid = |_| ClientError::Parse("response is not valid JSON for an ingest preview".into());
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    deserializer.disable_recursion_limit();
+    let report: PreviewResponse =
+        serde::Deserialize::deserialize(&mut deserializer).map_err(invalid)?;
+    deserializer.end().map_err(invalid)?;
+    Ok(report)
+}
+
 /// Outcome of `POST /api/v1/schema/repin` — the HTTP status decoded.
 #[derive(Debug, Clone)]
 pub enum RepinStart {
@@ -872,9 +939,7 @@ impl HttpClient {
         if status != reqwest::StatusCode::OK {
             return Err(server_error(status.as_u16(), &bytes));
         }
-        serde_json::from_slice(&bytes).map_err(|_| {
-            ClientError::Parse("response is not valid JSON for an ingest preview".into())
-        })
+        decode_preview(&bytes)
     }
 
     /// Export query results in the specified format.
@@ -1439,6 +1504,7 @@ fn decode_repin_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::PreviewEvent;
 
     fn init() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1904,6 +1970,119 @@ mod tests {
         let err = result.expect_err("not a report");
         assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
         assert!(!err.to_string().contains("canary"), "{err}");
+    }
+
+    /// `depth` nested JSON arrays around a `1`.
+    fn nested_arrays(depth: usize) -> String {
+        format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
+    }
+
+    /// An NDJSON event `depth` containers deep: the object and the arrays
+    /// nested inside its `payload`.
+    fn event_of_depth(depth: usize) -> String {
+        format!(
+            r#"{{"service":"api","payload":{}}}"#,
+            nested_arrays(depth - 1)
+        )
+    }
+
+    /// A complete report echoing `input` in an accepted event and
+    /// `rejected_input` in a rejected one (an NDJSON line that parsed but
+    /// is not an object).
+    fn report_echoing(input: &str, rejected_input: &str) -> Vec<u8> {
+        format!(
+            r#"{{"producer":"http","peer":{{"ip":"192.0.2.1","given":false,"trusted_relay":false}},"arrival":"2026-10-01T00:00:00.000000Z","derivation":{{"time_from":["_time"],"severity_from":[]}},"accepted":1,"rejected":1,"events":[{{"outcome":"accepted","index":0,"input":{input},"event":{{"service":"api","payload":"[]"}},"repairs":[],"lineage":{{"time":{{"from":"arrival"}},"severity":{{"from":"missing"}},"fields":[{{"field":"payload","change":"stringified"}}]}},"host_depends_on_sender":true}},{{"outcome":"rejected","index":1,"input":{rejected_input},"reason":"not_object","message":"expected JSON object","host_depends_on_sender":false}}]}}"#
+        )
+        .into_bytes()
+    }
+
+    /// Ingest parses each event with `serde_json`'s default recursion
+    /// limit, so the deepest event it accepts is [`INGEST_EVENT_MAX_DEPTH`]
+    /// containers. The report echoes that event three containers further
+    /// in, and the client still decodes it: a preview never fails for an
+    /// event real ingest would take.
+    #[tokio::test]
+    async fn ingest_preview_decodes_the_deepest_event_ingest_accepts() {
+        let deepest = event_of_depth(INGEST_EVENT_MAX_DEPTH);
+        serde_json::from_str::<serde_json::Value>(&deepest)
+            .expect("ingest's parser takes the deepest event");
+        serde_json::from_str::<serde_json::Value>(&event_of_depth(INGEST_EVENT_MAX_DEPTH + 1))
+            .expect_err("ingest's parser refuses one container more");
+        let deepest_array = nested_arrays(INGEST_EVENT_MAX_DEPTH);
+        serde_json::from_str::<serde_json::Value>(&deepest_array)
+            .expect("a non-object line parses as deep before its rejection");
+
+        let (result, _) = preview_answered_with(
+            b"{}\n".to_vec(),
+            None,
+            http_response(
+                "200 OK",
+                "application/json",
+                &report_echoing(&deepest, &deepest_array),
+            ),
+        )
+        .await;
+        let report = result.expect("the deepest echoed input decodes");
+        let PreviewEvent::Accepted { input, .. } = &report.events[0] else {
+            panic!("outcome changed: {:?}", report.events[0]);
+        };
+        assert_eq!(
+            input,
+            &serde_json::from_str::<serde_json::Value>(&deepest).unwrap()
+        );
+    }
+
+    /// The bound is ingest's own plus the report's wrapper, not unbounded:
+    /// an echoed input one container deeper than ingest accepts is a quiet
+    /// parse error, never a stack overflow or a quoted body.
+    #[tokio::test]
+    async fn ingest_preview_refuses_an_input_deeper_than_ingest_accepts() {
+        let too_deep = format!(
+            r#"{{"canary":"secret","payload":{}}}"#,
+            nested_arrays(INGEST_EVENT_MAX_DEPTH)
+        );
+        for (input, rejected_input) in [
+            (too_deep.as_str(), "[]"),
+            ("{}", nested_arrays(INGEST_EVENT_MAX_DEPTH + 1).as_str()),
+        ] {
+            let (result, _) = preview_answered_with(
+                b"{}\n".to_vec(),
+                None,
+                http_response(
+                    "200 OK",
+                    "application/json",
+                    &report_echoing(input, rejected_input),
+                ),
+            )
+            .await;
+            let err = result.expect_err("deeper than ingest accepts");
+            assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+            assert!(!err.to_string().contains("canary"), "{err}");
+        }
+        // Far deeper is refused the same way, before any recursion.
+        let (result, _) = preview_answered_with(
+            b"{}\n".to_vec(),
+            None,
+            http_response(
+                "200 OK",
+                "application/json",
+                &report_echoing(&nested_arrays(100_000), "[]"),
+            ),
+        )
+        .await;
+        assert!(matches!(result, Err(ClientError::Parse(_))), "{result:?}");
+    }
+
+    /// Brackets inside strings, escaped quotes included, are text, not
+    /// nesting.
+    #[test]
+    fn brackets_inside_strings_do_not_count_as_depth() {
+        let text = format!(r#"{{"a":"{}\"{}","b":[["\\"]]}}"#, "[{".repeat(500), "]}");
+        assert!(!json_depth_exceeds(text.as_bytes(), 3));
+        assert!(json_depth_exceeds(text.as_bytes(), 2));
+        assert!(!json_depth_exceeds(b"[]", 1));
+        assert!(json_depth_exceeds(b"[[]]", 1));
+        assert!(!json_depth_exceeds(b"\"[[\"", 0));
     }
 
     /// Only a 503 carrying a health body is kept. A 502 is an error whatever

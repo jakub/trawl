@@ -497,6 +497,55 @@ async fn all_accepted_from_a_file_with_a_peer_exits_0() {
     server.stop().await;
 }
 
+/// An NDJSON event `depth` containers deep: the object and the arrays
+/// nested inside its `payload`.
+fn event_of_depth(depth: usize) -> String {
+    let arrays = depth - 1;
+    format!(
+        r#"{{"service":"api","payload":{}1{}}}"#,
+        "[".repeat(arrays),
+        "]".repeat(arrays)
+    )
+}
+
+/// The deepest event ingest accepts previews as accepted, and one
+/// container more as refused, in a complete report: the CLI decodes the
+/// report even though it echoes that event three containers further in.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_deepest_event_ingest_accepts_previews_whole() {
+    // `serde_json`'s default recursion limit, which ingest parses with,
+    // refuses the 128th open container.
+    const DEEPEST: usize = 127;
+    let server = Server::start(true).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = server.config(dir.path());
+    let sample = format!(
+        "{}\n{}\n",
+        event_of_depth(DEEPEST),
+        event_of_depth(DEEPEST + 1)
+    );
+
+    let output = trawl(
+        &config,
+        Some(&server.admin_token),
+        &["--peer-ip", "10.0.0.7"],
+        sample.as_bytes(),
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stderr), "");
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.ends_with("2 event(s): 1 accepted, 1 rejected\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("┆ invalid_json: invalid JSON: recursion limit exceeded"),
+        "{stdout}"
+    );
+    server.stop().await;
+}
+
 /// `--json` prints the server's report, whole, and keeps the exit status.
 #[tokio::test(flavor = "multi_thread")]
 async fn json_prints_the_report_and_keeps_the_exit_status() {
