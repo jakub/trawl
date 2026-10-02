@@ -35,8 +35,9 @@ HTTPS address. `trawl-web` answers 404 on `/api/v1/ingest`.
    ```
 
    Expect `{"accepted":1}`. A rejected event adds `rejected` and an `errors`
-   array with the event's index and the reason. Accepted events in the same
-   batch still land.
+   array. Each entry gives the event's `index`, its `reason` code from the
+   [rejection table](/reference/events/#rejection-reasons), and a `message`.
+   Accepted events in the same batch still land.
 
 3. Query it back:
 
@@ -83,6 +84,119 @@ decoding.
 
 A 503 that repeats for minutes means compaction is not draining. See
 [ingest admission refusing](/operate/operational-alerts/#ingest-admission-refusing).
+
+## Ingest preview
+
+The ingest preview shows what trawld would do to a sample of events, and
+stores none of them. Run it on a sample from a new sender before you switch
+the sender on. `trawl preview-ingest` sends the sample and prints one row per
+event:
+
+```bash
+trawl -p prod preview-ingest capture.ndjson
+```
+
+The key needs `trawl:server_manage`. A collector's `trawl:ingest` key cannot
+preview, because the report shows server configuration: the allowed envs, the
+trusted relays, and the derivation sources. The route is
+`POST /api/v1/ingest/preview`. See the [API reference](/reference/api/#preview-ingest)
+and the [CLI reference](/reference/cli/#preview-ingest-mode). To capture a
+sample from Vector, see
+[Preview a sample](/getting-started/vector-integration/#preview-a-sample).
+
+### What the preview shows
+
+The preview reads the same body as `/api/v1/ingest`, NDJSON or a JSON array,
+and passes it through the same parse and canonicalization step. It covers the
+HTTP producer only. Syslog frames have their own parser and are not
+previewed. For each event, in input order, the report gives one of two
+outcomes:
+
+- **Accepted.** The canonical event as trawld would store it, its repair
+  codes, and its lineage. The lineage names the field that gave `_time`, or
+  says that the arrival time filled it. It names the field that gave
+  `_severity`, the earlier sources that did not map, or says that no source
+  mapped. It lists each field that was renamed, dropped, truncated, or
+  stringified, with its repair code.
+- **Rejected.** The `reason` and `message` that real ingest gives for the
+  same event. A line that is not valid JSON, or an array element that is not
+  an object, is a rejected event too. No partial canonical event is shown.
+
+The report also gives the peer address, whether that address is a trusted
+relay, the one arrival time that every event in the sample shares, and the
+`time_from` and `severity_from` lists in the order trawld reads them. A sample
+in which every event is rejected still answers `200`.
+
+### Name the sender's address
+
+trawld fills a missing `host` from the sender's address, or rejects the event
+when that address is in `[ingest] trusted_relays`. The machine that runs the
+preview is rarely the sender. To get the real outcome for events without
+`host`, pass the address that trawld sees for the collector, after any NAT:
+
+```bash
+trawl -p prod preview-ingest capture.ndjson --peer-ip 192.0.2.10
+```
+
+Without `--peer-ip`, trawld uses `192.0.2.1`, an address reserved for
+documentation, and the report says that no peer was given. Each event
+without `host` is then marked as depending on the sender. trawld classifies
+the placeholder against its relay configuration like any other address. An
+event that carries `host` gets the same outcome with or without a peer. The
+shipped Vector configuration sets `host` on every event.
+
+### Bounds
+
+- The body limit is `[server] max_request_body_bytes`, 128K by default, not
+  the ingest limit. A larger body answers `413`.
+- A sample holds at most 500 events. A line that is not valid JSON counts.
+  A blank line does not. A larger sample answers `413 preview_too_large`.
+  trawld refuses the whole sample and never truncates it.
+- The body must be uncompressed. Any `Content-Encoding` other than
+  `identity`, `gzip` included, answers `415 unsupported_encoding`.
+- The preview spends the key's interactive rate bucket,
+  `[server.rate_limit] default_rpm`, not the ingest bucket.
+- On a node with `[ingest] enabled = false`, the route answers `404`. That
+  node does not receive events, so its configuration does not describe the
+  node that will.
+
+### What the preview leaves behind
+
+The preview stores nothing from the sample. It writes no WAL, takes no
+hot-buffer space, and publishes nothing to the hot buffer or to a live
+stream. It changes no ingest, repair, rejection, or unmapped-severity counter,
+no `/stats` total, and no service label on the repair metric. No log line
+carries a sample value.
+
+The request itself leaves the same traces as any other read:
+
+- the key's last-used time;
+- one request from the key's interactive rate budget;
+- an [`http_failure` event](/operate/health/#trace-a-server-failure) if trawld
+  answers with a 5xx.
+
+With debug logging on, trawld also logs the request line: method, path, and
+status. None of these traces holds a value from the sample. The response
+carries `Cache-Control: no-store`, because it quotes the sample.
+
+### What the preview does not promise
+
+A preview reports canonicalization and nothing more. An accepted event in a
+preview does not mean any of these:
+
+- That the batch will be admitted. Hot-buffer capacity changes from moment
+  to moment.
+- That the collector's key works. The preview runs with your key, not the
+  collector's.
+- That every value survives compaction. A value whose type conflicts with
+  the [field catalog](/operate/catalog/) is shelved at compaction time.
+- That the same sample gets the same repairs after the configuration
+  changes. A change to `envs`, `default_env`, `trusted_relays`, `time_from`,
+  or `severity_from` changes the result.
+- That the deployment is correct. The doctors check the deployment, see
+  [Check the server](/operate/health/#check-the-server). The
+  [sender proof recipes](/getting-started/vector-integration/#prove-the-first-event-arrived)
+  prove that a real sender's events arrive.
 
 ## Receive syslog
 

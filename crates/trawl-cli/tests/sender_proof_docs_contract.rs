@@ -9,6 +9,8 @@
 //! with the DSL parser after putting sample values in for its shell
 //! variables. A query that stops parsing, or loses the identity, arrival, or
 //! time-window predicate that makes it a proof, fails here.
+//! `scripts/test-vector-collector.py` runs the `capture-sample` block
+//! itself, as written, against the Debian collector configuration.
 
 use trawl_core::ast::{
     Expr, FieldFilter, FilterOp, FilterValue, PipeStage, Query, SearchToken, TimeUnit,
@@ -20,6 +22,7 @@ const INGESTION_GUIDE: &str = include_str!("../../../docs/src/content/docs/opera
 
 const VECTOR_MARKERS: &[&str] = &[
     "key-write",
+    "capture-sample",
     "vector-start",
     "vars",
     "journald-send",
