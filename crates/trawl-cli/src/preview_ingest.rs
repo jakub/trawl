@@ -132,7 +132,9 @@ pub fn exit_status(result: Result<u8, CliError>, err: &mut impl Write) -> u8 {
             writeln!(err, "trawl: {DOES_NOT_INGEST}")
         }
         CliError::Arg(clap_error) => write!(err, "{}", clap_error.render()),
-        other => writeln!(err, "trawl: {other}"),
+        // A server error carries the server's own message, so the line is
+        // sanitised before it reaches a terminal.
+        other => writeln!(err, "trawl: {}", sanitize_display_text(&other.to_string())),
     };
     NO_REPORT
 }
@@ -495,6 +497,33 @@ mod tests {
         assert_eq!(
             status_and_stderr(Err(CliError::Io(broken))),
             (NO_REPORT, String::new())
+        );
+    }
+
+    /// A server's error message is the server's text, so it reaches the
+    /// terminal only after sanitisation: no OSC 52 clipboard write, no
+    /// colour, no line forged under it.
+    #[test]
+    fn server_error_text_is_sanitised() {
+        let hostile = Err(CliError::Client(ClientError::Server {
+            status: 403,
+            error: ErrorEnvelope::simple(
+                ErrorCode::Forbidden,
+                "denied\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[31mred\u{9b}2J\r\ntrawl: forged\u{202e}",
+            ),
+        }));
+        let (status, stderr) = status_and_stderr(hostile);
+        assert_eq!(status, NO_REPORT);
+        let line = stderr.strip_suffix('\n').expect("one line");
+        assert!(
+            !line
+                .chars()
+                .any(trawl_core::sanitize::is_unsafe_display_char),
+            "{stderr:?}"
+        );
+        assert!(
+            line.starts_with("trawl: server error (HTTP 403): denied"),
+            "{stderr:?}"
         );
     }
 
