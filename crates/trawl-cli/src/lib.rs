@@ -494,7 +494,11 @@ fn exit_on_error(e: &CliError) -> ! {
     {
         process::exit(1);
     }
-    eprintln!("trawl: {e}");
+    // A server-supplied message may carry terminal control sequences.
+    eprintln!(
+        "trawl: {}",
+        trawl_core::sanitize::sanitize_display_text(&e.to_string())
+    );
     process::exit(1);
 }
 
