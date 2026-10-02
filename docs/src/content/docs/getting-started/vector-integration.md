@@ -228,15 +228,18 @@ nothing.
    whose key holds it.
 
    The command exits `0` when every event is accepted, and `1` when any event
-   is rejected. Look at each rejected row's reason, and at the repairs and
-   the `_time` and `_severity` sources of the accepted rows. For example,
-   `time.from_ingest` means that no `_time` source parsed, so trawld would use
-   the arrival time. Fix the configuration and capture again until the
+   is rejected. It exits `2` when it gets no report, for example when the key
+   lacks the permission. Look at each rejected row's reason, and at the repairs and
+   the `_time` and `_severity` sources of the accepted rows. For example, a
+   `_time` of `arrival (bad timestamp)`, with the `time.from_ingest` repair,
+   means that `timestamp` did not parse, so trawld would use the arrival time.
+   Fix the configuration and capture again until the
    preview shows what you expect. The shipped configuration sets `host` on
    every event, so the preview needs no `--peer-ip`.
 
-   The preview reads at most 128K. If it answers `413` for a body that is too
-   large, preview fewer lines, such as `head -n 200 capture.ndjson`.
+   The preview reads at most `[server] max_request_body_bytes`, 128K by
+   default. If it answers `413` for a body that is too large, preview fewer
+   lines, such as `head -n 200 capture.ndjson`.
 
 3. Delete the capture. It holds real log lines, and Vector wrote its
    checkpoints as root:

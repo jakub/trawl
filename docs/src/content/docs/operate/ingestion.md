@@ -117,7 +117,8 @@ outcomes:
   says that the arrival time filled it. It names the field that gave
   `_severity`, the earlier sources that did not map, or says that no source
   mapped. It lists each field that was renamed, dropped, truncated, or
-  stringified, with its repair code.
+  stringified. A change that is a repair carries its repair code. A
+  stringified field carries none.
 - **Rejected.** The `reason` and `message` that real ingest gives for the
   same event. A line that is not valid JSON, or an array element that is not
   an object, is a rejected event too. No partial canonical event is shown.
@@ -140,7 +141,11 @@ trawl -p prod preview-ingest capture.ndjson --peer-ip 192.0.2.10
 
 Without `--peer-ip`, trawld uses `192.0.2.1`, an address reserved for
 documentation, and the report says that no peer was given. Each event
-without `host` is then marked as depending on the sender. trawld classifies
+without `host` is then marked as depending on the sender, rejected events
+included. trawld reads `host` after it normalizes field names, so `Host` and
+`_host` count as `host`, and a `host` of `null` counts as no `host`. A line
+that is not valid JSON, or an element that is not an object, is never marked.
+trawld classifies
 the placeholder against its relay configuration like any other address. An
 event that carries `host` gets the same outcome with or without a peer. The
 shipped Vector configuration sets `host` on every event.
@@ -176,8 +181,9 @@ The request itself leaves the same traces as any other read:
   answers with a 5xx.
 
 With debug logging on, trawld also logs the request line: method, path, and
-status. None of these traces holds a value from the sample. The response
-carries `Cache-Control: no-store`, because it quotes the sample.
+status. None of these traces holds a value from the sample. Every response
+from the route carries `Cache-Control: no-store`, because a report quotes the
+sample. Refusals carry it too.
 
 ### What the preview does not promise
 
