@@ -436,15 +436,43 @@ async fn send_canary_previews(server: &TestServer) -> Vec<String> {
         assert!(repaired.iter().any(|r| r == code), "{code} in {repaired:?}");
     }
 
-    // Every refusal carries the canaries too.
-    let oversized = format!("{sample}\n{}", "x".repeat(128 * 1024));
+    // Every refusal carries the canaries too. The body limit's comes over
+    // a raw connection: the sample in one chunk of exactly one byte past
+    // the fixture's 128 KiB limit, never terminated, so trawld reads every
+    // canary before it refuses and nothing is left unwritten to race the
+    // 413 (see `common::raw_https_exchange`).
+    let mut oversized = format!("{sample}\n{}", "x".repeat(128 * 1024));
+    oversized.truncate(128 * 1024 + 1);
+    let host = server.url.strip_prefix("https://").unwrap();
+    let mut request = format!(
+        "POST /api/v1/ingest/preview HTTP/1.1\r\nhost: {host}\r\n\
+         authorization: Bearer {}\r\ncontent-type: application/x-ndjson\r\n\
+         transfer-encoding: chunked\r\n\r\n{:x}\r\n",
+        server.admin_token,
+        oversized.len(),
+    )
+    .into_bytes();
+    request.extend_from_slice(oversized.as_bytes());
+    let response = common::raw_https_exchange(&server.url, &request).await;
+    assert_eq!(response.status, 413, "body limit");
+    request_ids.push(
+        response
+            .header("x-request-id")
+            .expect("every response carries X-Request-Id")
+            .to_owned(),
+    );
+    let text = String::from_utf8(response.body).unwrap();
+    assert!(
+        !has_canary(&text),
+        "body limit: a refusal quotes no sample: {text}"
+    );
+
     let framing = format!("[{}", json!({"service": "cnry-svc-framing"}));
     for (what, query, headers, body, status) in [
-        ("body limit", "", &[][..], oversized.into_bytes(), 413),
         (
             "position limit",
             "",
-            &[],
+            &[][..],
             repeated(MAX_PREVIEW_EVENTS + 1).into_bytes(),
             413,
         ),

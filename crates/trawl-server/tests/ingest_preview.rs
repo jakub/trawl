@@ -54,6 +54,41 @@ async fn post_preview(
         .unwrap()
 }
 
+/// A preview request head as `token`, with `framing` as its body header.
+fn preview_head(server: &TestServer, token: &str, framing: &str) -> String {
+    let host = server.url.strip_prefix("https://").unwrap();
+    format!(
+        "POST /api/v1/ingest/preview HTTP/1.1\r\nhost: {host}\r\n\
+         authorization: Bearer {token}\r\ncontent-type: application/x-ndjson\r\n\
+         {framing}\r\n\r\n"
+    )
+}
+
+/// A preview that announces `length` body bytes and sends none: the body
+/// limit's `Content-Length` refusal answers on the head alone.
+fn announced_body(server: &TestServer, token: &str, length: usize) -> Vec<u8> {
+    preview_head(server, token, &format!("content-length: {length}")).into_bytes()
+}
+
+/// A preview whose chunked body is `body` in one chunk and never ends: the
+/// limit is met only by reading it, and the server reads all of it before
+/// it can refuse.
+fn unterminated_chunked_body(server: &TestServer, token: &str, body: &[u8]) -> Vec<u8> {
+    let mut request = preview_head(server, token, "transfer-encoding: chunked").into_bytes();
+    request.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+    request.extend_from_slice(body);
+    request
+}
+
+/// Assert a raw response may not be cached.
+fn assert_raw_no_store(resp: &common::RawResponse, what: &str) {
+    assert_eq!(
+        resp.header("cache-control"),
+        Some("no-store"),
+        "{what}: Cache-Control must be no-store"
+    );
+}
+
 /// Assert the response may not be cached.
 fn assert_no_store(resp: &reqwest::Response, what: &str) {
     assert_eq!(
@@ -552,8 +587,17 @@ async fn body_over_max_request_body_bytes_is_413() {
     let mut body = line.repeat(INTERACTIVE_BODY_LIMIT / line.len() + 1);
     body.truncate(INTERACTIVE_BODY_LIMIT + 1);
     assert_eq!(body.len(), INTERACTIVE_BODY_LIMIT + 1);
-    let resp = post_preview(&server, &server.admin_token, "", body).await;
-    assert_eq!(resp.status(), 413);
+    let admin = &server.admin_token;
+
+    // Refused on the announced length, before a body byte is read.
+    let request = announced_body(&server, admin, body.len());
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    assert_eq!(resp.status, 413, "Content-Length refusal");
+
+    // No length announced: refused once the byte past the limit is read.
+    let request = unterminated_chunked_body(&server, admin, body.as_bytes());
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    assert_eq!(resp.status, 413, "streamed refusal");
 }
 
 /// Lines of `{"service":"s"}`, `valid` of them, then `invalid` lines that
@@ -631,7 +675,8 @@ async fn ingest_disabled_answers_404() {
 }
 
 /// Every response to the preview is no-store, whichever layer answers it:
-/// the handler, the body limit's `Content-Length` refusal, the auth
+/// the handler, the body limit's refusals (on `Content-Length` and on a
+/// streamed body), the auth
 /// layer's 401 or the grant layer's 403. Another route on the same router
 /// is not given the header.
 #[tokio::test(flavor = "multi_thread")]
@@ -663,13 +708,18 @@ async fn every_preview_response_is_no_store() {
     assert_eq!(resp.status(), 415);
     assert_no_store(&resp, "415");
 
-    // A sized body (reqwest sends `Content-Length` for a `String`) is
-    // refused by the router's body limit on the header alone, before any
-    // extractor reads it.
+    // A sized body is refused by the router's body limit on the header
+    // alone, before any extractor reads it; an unsized one by the
+    // extractor, once it reads past the limit.
+    let request = announced_body(&server, admin, INTERACTIVE_BODY_LIMIT + 1);
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    assert_eq!(resp.status, 413, "body-limit 413");
+    assert_raw_no_store(&resp, "body-limit 413");
     let oversized = "x".repeat(INTERACTIVE_BODY_LIMIT + 1);
-    let resp = post_preview(&server, admin, "", oversized).await;
-    assert_eq!(resp.status(), 413, "body-limit 413");
-    assert_no_store(&resp, "body-limit 413");
+    let request = unterminated_chunked_body(&server, admin, oversized.as_bytes());
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    assert_eq!(resp.status, 413, "streamed body-limit 413");
+    assert_raw_no_store(&resp, "streamed body-limit 413");
 
     // A key with no trawl grant at all is refused by the grant layer.
     let resp = post_preview(&server, &server.coastwatch_only_token, "", "{}").await;
