@@ -207,6 +207,11 @@ nothing.
      fi
      { timeout 60 vector --config-dir "$1/config"; echo "$?" > "$1/vector.status"; } |
        head -n 500
+     written=$?
+     if [ "$written" -ne 0 ]; then
+       echo "capture: writing the capture stopped with status $written; the capture is incomplete, do not preview it" >&2
+       exit 1
+     fi
      status="$(cat "$1/vector.status")"
      case "$status" in
        0 | 124) ;;
@@ -256,10 +261,12 @@ nothing.
    A capture that ends at 500 events, at the end of its input, or at the 60
    second limit is complete. If Vector stops for another reason, such as a
    crash or a kill, the `sudo` command prints
-   `capture: Vector stopped with status N` and exits `1`.
-   `$CAPTURE/capture.ndjson` can then hold some events. Do not preview
-   them. Fix the cause shown in Vector's log, then run the `sudo` command
-   again.
+   `capture: Vector stopped with status N` and exits `1`. If writing
+   `$CAPTURE/capture.ndjson` fails, for example on a full disk, it prints
+   `capture: writing the capture stopped with status N` and exits `1`.
+   In both cases `$CAPTURE/capture.ndjson` can hold some events. Do not
+   preview them. Fix the cause shown in the error or in Vector's log, then
+   run the `sudo` command again.
 
    The empty `data_dir` has no journal checkpoint, so the journald source
    starts at the beginning of the current boot, as on Vector's

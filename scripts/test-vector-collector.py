@@ -398,12 +398,13 @@ def fixture_collector(directory, live_data, receiver_url, spelling=None):
     return live, env_file
 
 
-def clean_env(directory, crash=False):
+def clean_env(directory, crash=False, full=False):
     """An environment without inherited Vector or Trawl settings.
 
     With `crash`, a `vector` run (not `vector config` or `vector vrl`) is
     killed with SIGKILL after Vector has written every event, as the kernel's
-    OOM killer would end it.
+    OOM killer would end it. With `full`, `head` runs under a 1 KiB file size
+    limit, so writing the capture file fails partway, as on a full disk.
     """
     shims = directory / "bin"
     shims.mkdir(exist_ok=True)
@@ -418,11 +419,17 @@ def clean_env(directory, crash=False):
         (shims / "vector").chmod(0o755)
     else:
         (shims / "vector").symlink_to(vector)
+    (shims / "head").unlink(missing_ok=True)
+    if full:
+        head = shutil.which("head")
+        assert head
+        (shims / "head").write_text(f"#!/bin/sh\nulimit -c 0\nulimit -f 2\nexec {shlex.quote(head)} \"$@\"\n")
+        (shims / "head").chmod(0o755)
     return {"PATH": f"{shims}:{os.environ['PATH']}", "HOME": str(directory),
             "TMPDIR": str(directory), "LC_ALL": "C.UTF-8"}
 
 
-def run_capture(directory, live, env_file, inputs, crash=False):
+def run_capture(directory, live, env_file, inputs, crash=False, full=False):
     """Run the guide's capture block against the fixture collector.
 
     The block's host paths point at the fixture copies, and `sudo` runs its
@@ -440,7 +447,7 @@ def run_capture(directory, live, env_file, inputs, crash=False):
     work = directory / "operator"
     work.mkdir()
     with inputs.open("rb") as stdin:
-        result = subprocess.run(["bash", "-c", script], cwd=work, env=clean_env(directory, crash),
+        result = subprocess.run(["bash", "-c", script], cwd=work, env=clean_env(directory, crash, full),
                                 stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=90)
     assert result.stdout == b"", "the capture leaked events to the terminal"
@@ -622,6 +629,28 @@ def capture_recipe():
             assert not requests, "the capture posted to trawld"
             print(f"PASS capture fails when Vector dies: exit {result.returncode} after "
                   f"{lines} captured lines")
+
+        # Writing the capture file fails: Vector ends cleanly when the pipe
+        # closes, but the block fails instead of passing off a cut file.
+        requests.clear()
+        with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+            directory = Path(name)
+            live_data = directory / "var-lib-vector"
+            live_data.mkdir()
+            live, env_file = fixture_collector(
+                directory, live_data, f"http://127.0.0.1:{server.server_port}")
+            inputs = directory / "fixtures.ndjson"
+            inputs.write_text("".join(json.dumps(e) + "\n" for e in events))
+            result, capture, _work = run_capture(directory, live, env_file, inputs, full=True)
+            log = result.stderr.decode(errors="replace")
+            written = (capture / "capture.ndjson").read_bytes()
+            assert 0 < len(written) <= 1024, len(written)
+            assert written.count(b"\n") < len(expected), written
+            assert result.returncode != 0, log
+            assert "writing the capture stopped with status" in log, log
+            assert not requests, "the capture posted to trawld"
+            print(f"PASS capture fails when writing it fails: exit {result.returncode} after "
+                  f"{len(written)} bytes written")
 
         # A drop-in the operator cannot read: the copy would differ from the
         # service, so the block stops before Vector starts.
