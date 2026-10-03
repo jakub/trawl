@@ -50,6 +50,9 @@ LIVE_CONFIG_DIR = "/etc/vector/vector.d"
 LIVE_ENV_FILE = "/etc/default/vector"
 # The most events one ingest preview reads (trawl_api::ingest_preview).
 MAX_PREVIEW_EVENTS = 500
+# The largest body the preview reads under the default `[server]
+# max_request_body_bytes` (trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES).
+MAX_PREVIEW_BODY_BYTES = 128 * 1024
 
 
 def load(tcp):
@@ -477,6 +480,7 @@ def preview_input(raw):
     assert text.endswith("\n"), "the capture does not end with a newline"
     lines = text[:-1].split("\n")
     assert 0 < len(lines) <= MAX_PREVIEW_EVENTS, len(lines)
+    assert len(raw) <= MAX_PREVIEW_BODY_BYTES, len(raw)
     events = [json.loads(line) for line in lines]
     assert all(isinstance(event, dict) for event in events), "a capture line is not an object"
     return events
