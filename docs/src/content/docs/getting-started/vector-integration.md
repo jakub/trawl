@@ -168,21 +168,23 @@ nothing.
 
    <!-- proof:capture-sample -->
    ```bash
-   CAPTURE="$(mktemp -d)"
-   mkdir "$CAPTURE/config" "$CAPTURE/data"
-   for file in /etc/vector/vector.d/*.toml; do
-     case "$(basename "$file")" in
-       base.toml | unifi-syslog.toml) ;;
-       *) cp "$file" "$CAPTURE/config/" ;;
-     esac
-   done
+   CAPTURE="$(mktemp -d)" &&
+   mkdir "$CAPTURE/config" "$CAPTURE/data" &&
+   (
+     for file in /etc/vector/vector.d/*.toml; do
+       case "$(basename "$file")" in
+         base.toml | unifi-syslog.toml) ;;
+         *) cp "$file" "$CAPTURE/config/" || exit ;;
+       esac
+     done
+   ) &&
    awk -v data_dir="$CAPTURE/data" '
      BEGIN { print "data_dir = \"" data_dir "\"" }
      /^\[/ { skip = /^\[sinks\.trawld[].]/ }
      /^data_dir *=/ { next }
      !skip
-   ' /etc/vector/vector.d/base.toml > "$CAPTURE/config/base.toml"
-   cat >> "$CAPTURE/config/base.toml" <<'EOF'
+   ' /etc/vector/vector.d/base.toml > "$CAPTURE/config/base.toml" &&
+   cat >> "$CAPTURE/config/base.toml" <<'EOF' &&
 
    [sinks.capture]
    type = "console"
@@ -190,7 +192,7 @@ nothing.
    target = "stdout"
    encoding.codec = "json"
    EOF
-   cat > "$CAPTURE/check.vrl" <<'EOF'
+   cat > "$CAPTURE/check.vrl" <<'EOF' &&
    sinks = object!(.sinks)
    keys(sinks) == ["capture"] && sinks.capture.type == "console" &&
      .data_dir == get_env_var!("CAPTURE") + "/data"
@@ -203,7 +205,16 @@ nothing.
        echo "capture: the copy has a sink other than capture, or another data_dir; Vector did not start" >&2
        exit 1
      fi
-     timeout 60 vector --config-dir "$1/config" | head -n 500
+     { timeout 60 vector --config-dir "$1/config"; echo "$?" > "$1/vector.status"; } |
+       head -n 500
+     status="$(cat "$1/vector.status")"
+     case "$status" in
+       0 | 124) ;;
+       *)
+         echo "capture: Vector stopped with status $status; the capture is incomplete, do not preview it" >&2
+         exit 1
+         ;;
+     esac
    ' sh "$CAPTURE" > "$CAPTURE/capture.ndjson"
    ```
 
@@ -234,6 +245,21 @@ nothing.
    terminal, and only events go to `$CAPTURE/capture.ndjson`. `mktemp -d`
    creates `$CAPTURE` readable only by you, so the captured log lines stay
    private to your account and root.
+
+   Each step runs only if the step before it succeeded. If a file in
+   `/etc/vector/vector.d` cannot be copied, for example because you cannot
+   read it, the block stops with the `cp` error and Vector does not start.
+   A partial copy would capture with a configuration that the service does
+   not run. The block does not exit your shell, so you can fix the cause and
+   run it again.
+
+   A capture that ends at 500 events, at the end of its input, or at the 60
+   second limit is complete. If Vector stops for another reason, such as a
+   crash or a kill, the `sudo` command prints
+   `capture: Vector stopped with status N` and exits `1`.
+   `$CAPTURE/capture.ndjson` can then hold some events. Do not preview
+   them. Fix the cause shown in Vector's log, then run the `sudo` command
+   again.
 
    The empty `data_dir` has no journal checkpoint, so the journald source
    starts at the beginning of the current boot, as on Vector's

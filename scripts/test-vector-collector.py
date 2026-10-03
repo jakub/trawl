@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -394,23 +395,36 @@ def fixture_collector(directory, live_data, receiver_url, spelling=None):
     return live, env_file
 
 
-def clean_env(directory):
-    """An environment without inherited Vector or Trawl settings."""
+def clean_env(directory, crash=False):
+    """An environment without inherited Vector or Trawl settings.
+
+    With `crash`, a `vector` run (not `vector config` or `vector vrl`) is
+    killed with SIGKILL after Vector has written every event, as the kernel's
+    OOM killer would end it.
+    """
     shims = directory / "bin"
     shims.mkdir(exist_ok=True)
     vector = shutil.which(VECTOR)
     assert vector, VECTOR
     (shims / "vector").unlink(missing_ok=True)
-    (shims / "vector").symlink_to(vector)
+    if crash:
+        (shims / "vector").write_text(
+            "#!/bin/sh\n"
+            f"{shlex.quote(vector)} \"$@\"\n"
+            'if [ "$1" = --config-dir ]; then kill -KILL $$; fi\n')
+        (shims / "vector").chmod(0o755)
+    else:
+        (shims / "vector").symlink_to(vector)
     return {"PATH": f"{shims}:{os.environ['PATH']}", "HOME": str(directory),
             "TMPDIR": str(directory), "LC_ALL": "C.UTF-8"}
 
 
-def run_capture(directory, live, env_file, inputs):
+def run_capture(directory, live, env_file, inputs, crash=False):
     """Run the guide's capture block against the fixture collector.
 
     The block's host paths point at the fixture copies, and `sudo` runs its
-    command as this user. Nothing else in the block changes. Vector reads the
+    command as this user. Nothing else in the block changes, and no shell
+    option is set around it. Vector reads the
     fixture stream on stdin, which it inherits through the block. Returns the
     finished process, the block's private directory, and the operator's
     working directory.
@@ -418,12 +432,12 @@ def run_capture(directory, live, env_file, inputs):
     block = capture_block()
     for path in (LIVE_CONFIG_DIR, LIVE_ENV_FILE):
         assert path in block, f"the capture block no longer reads {path}"
-    script = ("set -eu\nsudo() { \"$@\"; }\n"
+    script = ("sudo() { \"$@\"; }\n"
               + block.replace(LIVE_CONFIG_DIR, str(live)).replace(LIVE_ENV_FILE, str(env_file)))
     work = directory / "operator"
     work.mkdir()
     with inputs.open("rb") as stdin:
-        result = subprocess.run(["bash", "-c", script], cwd=work, env=clean_env(directory),
+        result = subprocess.run(["bash", "-c", script], cwd=work, env=clean_env(directory, crash),
                                 stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=90)
     assert result.stdout == b"", "the capture leaked events to the terminal"
@@ -582,6 +596,56 @@ def capture_recipe():
                 assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
                 print(f"PASS capture refuses {spelling} sink header: exit {result.returncode}, "
                       f"{len(requests)} requests, empty capture")
+
+        # Vector dies after it has written events: the capture holds lines,
+        # but the block fails instead of passing them off as a sample.
+        requests.clear()
+        with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+            directory = Path(name)
+            live_data = directory / "var-lib-vector"
+            live_data.mkdir()
+            live, env_file = fixture_collector(
+                directory, live_data, f"http://127.0.0.1:{server.server_port}")
+            inputs = directory / "fixtures.ndjson"
+            inputs.write_text("".join(json.dumps(e) + "\n" for e in events))
+            result, capture, _work = run_capture(directory, live, env_file, inputs, crash=True)
+            log = result.stderr.decode(errors="replace")
+            written = (capture / "capture.ndjson").read_bytes()
+            lines = written.count(b"\n")
+            assert lines == len(expected), written
+            assert result.returncode != 0, log
+            assert "Vector stopped with status 137" in log, log
+            assert not requests, "the capture posted to trawld"
+            print(f"PASS capture fails when Vector dies: exit {result.returncode} after "
+                  f"{lines} captured lines")
+
+        # A drop-in the operator cannot read: the copy would differ from the
+        # service, so the block stops before Vector starts.
+        if os.geteuid() == 0:
+            print("SKIP capture refuses an unreadable drop-in: root reads a mode 000 file")
+        else:
+            requests.clear()
+            with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+                directory = Path(name)
+                live_data = directory / "var-lib-vector"
+                live_data.mkdir()
+                live, env_file = fixture_collector(
+                    directory, live_data, f"http://127.0.0.1:{server.server_port}")
+                (live / "nginx.toml").chmod(0)
+                inputs = directory / "fixtures.ndjson"
+                inputs.write_text("".join(json.dumps(e) + "\n" for e in events))
+                result, capture, _work = run_capture(directory, live, env_file, inputs)
+                log = result.stderr.decode(errors="replace")
+                time.sleep(1)
+                assert result.returncode != 0, log
+                assert "nginx.toml" in log, log
+                # The `sudo` command owns the capture file; it never ran.
+                assert not (capture / "capture.ndjson").exists(), "Vector started"
+                assert not any((capture / "data").iterdir()), "Vector ran"
+                assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
+                assert not requests, "the capture posted to trawld"
+                print(f"PASS capture refuses an unreadable drop-in: exit {result.returncode}, "
+                      f"{len(requests)} requests, no capture file")
     finally:
         server.shutdown()
         thread.join()
