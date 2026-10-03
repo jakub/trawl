@@ -214,3 +214,7 @@ does not substitute the browser's request latency or current clock.
 Existing malformed-link refusal and repair behavior, unreadable-filter
 notice and guarded chip removal remain in force. No query ID is added
 by this decision.
+
+## Amendment: display zone, 2026-10-02
+
+ADR-0051 adds a display zone to the web UI. `r=` still carries canonical UTC `Z` instants, and a link opens the same interval for every viewer. The Started fact keeps its date and seconds. Its suffix becomes the instant's offset in the display zone, which is `UTC` when that zone is UTC. The range dialog reads a time without an offset in the display zone and still writes `Z` bounds. This takes effect when #201 lands.

@@ -116,6 +116,14 @@ _Avoid_: resolved theme, automatic toggle
 The Light or Dark appearance selected by the theme preference and, for System, the current operating-system appearance. CSS, charts and Atmosphere render this value.
 _Avoid_: theme preference, system theme
 
+**Zone preference**:
+The user's choice of Browser, UTC, or a named zone from a short fixed list, used to print instants. Browser follows the browser's own zone; the stored choice remains Browser when that zone changes. It changes printed text only, never a query, a bucket or a link.
+_Avoid_: timezone (unqualified), local time, locale
+
+**Display zone**:
+The IANA zone the zone preference selects and, for Browser, the zone the browser reports. Every printed instant carries its offset in this zone.
+_Avoid_: zone preference, user timezone
+
 **Toast host**:
 The one mounted `Toasts` component that renders the queue. Its dismiss control is a named native button.
 _Avoid_: toaster, notification area

@@ -130,3 +130,7 @@ cap.
   picture off the screen, and it stays.
 - Pie and Area are not in this decision. Adding a type is an amendment
   here, not a new ADR.
+
+## Amendment: display zone, 2026-10-02
+
+ADR-0051 replaces the UTC label rule. The axis, tooltip and legend print in the display zone, with each instant's offset, through uPlot `tzDate` given the zone name. The x coordinates and the bucket ladder stay UTC. When the display zone is not UTC, the caption adds "Buckets align to UTC hours and days". The strict `_time` parser and the request's `timezone: None` are unchanged. This takes effect when #201 lands.

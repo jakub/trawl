@@ -205,3 +205,7 @@ behavior, and existing chart/backdrop state retention. First-paint evidence
 must inspect computed styles with Wasm delayed, then compare the runtime
 handoff under production asset serving and CSP. A final DOM attribute alone
 does not establish first-paint behavior.
+
+## Amendment: time zone preference group, 2026-10-02
+
+ADR-0051 adds a second radio group, "Time zone", to the account menu, after "Theme". It follows the theme group's contract: `menuitemradio` items, a visible selected indicator, `aria-checked` derived from the stored preference, and no shortcut. Opening the menu still focuses the checked theme choice. The menu has no submenus, so the group holds Browser, UTC and eight named zones. This takes effect when #201 lands.
