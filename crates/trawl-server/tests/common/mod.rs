@@ -936,7 +936,19 @@ impl RawResponse {
 /// than it sends, or a chunk with no terminator), and nothing is written
 /// after the response starts, so no write can fail and no unread byte is
 /// left to turn the server's close into a reset.
+///
+/// The whole exchange is bounded, so a server that never answers fails the
+/// test with a message instead of hanging it until the runner's timeout.
 pub async fn raw_https_exchange(url: &str, request: &[u8]) -> RawResponse {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        raw_https_exchange_unbounded(url, request),
+    )
+    .await
+    .expect("the fixture server answered within 30 s")
+}
+
+async fn raw_https_exchange_unbounded(url: &str, request: &[u8]) -> RawResponse {
     use rustls::pki_types::pem::PemObject as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
