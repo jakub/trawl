@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::Request;
+use axum::extract::{MatchedPath, Request};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware;
 use axum::response::Response;
@@ -58,8 +58,8 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let ingest_rate_state = RateLimitState::ingest(&http.rate_limit, &interactive_rate_state);
     let bearer_state = state.auth.bearer_state.clone();
 
-    // Query routes. Onion (first .layer() = innermost): body limit →
-    // envelope normalization → require_bearer_only (fleet-auth authn) →
+    // Query routes. Onion (first .layer() = innermost): preview no-store →
+    // body limit → envelope normalization → require_bearer_only (fleet-auth authn) →
     // require_trawl_grant (mandatory trawl policy) → rate limit → handler.
     let authenticated = Router::new()
         .route("/query", post(handlers::query))
@@ -107,7 +107,17 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/saved/{id}/runs", get(handlers::list_report_runs))
         .route("/saved/{id}/runs/{run_id}", get(handlers::get_report_run))
         .route("/export", post(handlers::export))
-        .route("/stream", get(handlers::stream_query))
+        .route("/stream", get(handlers::stream_query));
+    // The ingest preview lives here, not beside `/ingest`: it spends the
+    // interactive bucket and body limit, and exists only where ingest does
+    // (ADR-0049). Its no-store header is set by `no_store_on_preview`
+    // below, outside every refusal this router can answer with.
+    let authenticated = if ingest_enabled {
+        authenticated.route("/ingest/preview", post(ingest::preview::preview))
+    } else {
+        authenticated
+    };
+    let authenticated = authenticated
         // Innermost, so a failure recorded after it is the handler's.
         .route_layer(middleware::from_fn(failure::mark_handler))
         .layer(middleware::from_fn(rate_limit_middleware))
@@ -120,7 +130,10 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             fleet_auth::require_bearer_only,
         ))
         .layer(middleware::from_fn(normalize_auth_errors))
-        .layer(RequestBodyLimitLayer::new(max_body));
+        .layer(RequestBodyLimitLayer::new(max_body))
+        // Outermost, so the body limit's 413, the auth layers' 401 and the
+        // grant layer's 403 for the preview are covered too.
+        .layer(middleware::from_fn(no_store_on_preview));
 
     // Ingest route: same auth stack, separate (larger) body limit.
     let ingest_routes = if ingest_enabled {
@@ -158,6 +171,32 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .nest("/api/v1", ingest_routes);
 
     with_edge_layers(app, http).with_state(state)
+}
+
+/// The ingest preview's route as the router matched it, prefix included.
+const INGEST_PREVIEW_ROUTE: &str = "/api/v1/ingest/preview";
+
+/// Mark every response to the ingest preview `Cache-Control: no-store`.
+///
+/// A report quotes the sample, and a refusal is no less the route's
+/// answer, so the header goes on whatever comes back, from the handler or
+/// from any layer inside this one (ADR-0049). No other route is touched.
+///
+/// The route is recognised by its [`MatchedPath`], which the outer router
+/// sets before any per-route layer runs. The request's own URI cannot be
+/// used here: `nest` strips `/api/v1` from it before these layers see it.
+async fn no_store_on_preview(request: Request, next: middleware::Next) -> Response {
+    let preview = request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|matched| matched.as_str() == INGEST_PREVIEW_ROUTE);
+    let mut response = next.run(request).await;
+    if preview {
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 /// Wrap `app` in trawld's edge layers, the ones every route shares.

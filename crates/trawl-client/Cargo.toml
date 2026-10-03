@@ -16,7 +16,9 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `unbounded_depth` lets the ingest preview decode a report that echoes an
+# event three containers deep, under its own depth bound (client.rs).
+serde_json = { workspace = true, features = ["unbounded_depth"] }
 thiserror = { workspace = true }
 zeroize = { workspace = true }
 

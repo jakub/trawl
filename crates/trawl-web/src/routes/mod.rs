@@ -46,7 +46,9 @@ pub fn build(state: AppState) -> Router {
         // are never guarded and never reach upstream.
         .route("/api/v1/stream", get(stream::forward))
         .route("/api/v1/dashboard/stream", get(stream::forward_dashboard))
-        // Block /ingest before it can match the generic forwarder.
+        // Block /ingest before it can match the generic forwarder. The
+        // route is the exact path, so /api/v1/ingest/preview still reaches
+        // the forwarder with the session's bearer token (ADR-0049).
         .route("/api/v1/ingest", any(proxy::block_ingest))
         .route("/api/v1/{*path}", any(proxy::forward))
         // Keep unknown API namespaces out of the SPA fallback. The

@@ -294,6 +294,31 @@ impl Derivation {
     pub fn time_from(&self, kind: ProducerKind) -> &[Source] {
         &self.time[kind.index()]
     }
+
+    /// The field a lineage [`SeveritySource`](super::envelope::SeveritySource)
+    /// position names in this profile's `severity_from` list. Lineage
+    /// records positions so the ingest hot path copies no names; only a
+    /// reader that reports them (the ingest preview) resolves them here.
+    ///
+    /// # Panics
+    ///
+    /// When `index` did not come from a lineage this derivation recorded
+    /// for `kind`.
+    pub fn severity_field(&self, kind: ProducerKind, index: usize) -> &str {
+        &self.severity_from(kind)[index].field
+    }
+
+    /// The field a lineage [`TimeSource`](super::envelope::TimeSource)
+    /// position names in this profile's `time_from` list, under the same
+    /// contract as [`Self::severity_field`].
+    ///
+    /// # Panics
+    ///
+    /// When `index` did not come from a lineage this derivation recorded
+    /// for `kind`.
+    pub fn time_field(&self, kind: ProducerKind, index: usize) -> &str {
+        &self.time_from(kind)[index].field
+    }
 }
 
 impl Default for Derivation {
@@ -610,7 +635,7 @@ pub fn count_event_outcome(canonical: &crate::ingest::envelope::Canonical) {
         )
         .increment(1);
     }
-    if canonical.severity_unmapped {
+    if canonical.severity_unmapped() {
         metrics::counter!(
             crate::metrics::SEVERITY_UNMAPPED_TOTAL,
             "service" => crate::metrics::repair_service_label(&canonical.service),

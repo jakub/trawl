@@ -37,7 +37,7 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 | `export` | Export query results |
 | `stream` | Subscribe to live event streams |
 | `query_cancel` | Cancel the key's own running queries |
-| `server_manage` | Read server stats and the dashboard, cancel any query, and see the text of system-owned retained work |
+| `server_manage` | Read server stats and the dashboard, [preview ingest](#preview-ingest), cancel any query, and see the text of system-owned retained work |
 | `ingest` | Submit events to `/api/v1/ingest` |
 | `schema_write` | Repin a field, reclaim pins, and acknowledge degraded pins |
 
@@ -75,6 +75,8 @@ Every error that trawld itself produces has this body:
 | `bad_request` | 400 | Malformed input. Also the code on every 409, which has no code of its own. |
 | `ingest_error` | 400, 413 | An ingest body that cannot be read. 413 when a gzip body decodes past `[ingest] max_body_bytes` |
 | `ingest_batch_too_large` | 413 | An ingest request holds more events or bytes than external producers may place in the hot buffer, so it can never be admitted |
+| `preview_too_large` | 413 | An ingest preview sample holds more than 500 events |
+| `unsupported_encoding` | 415 | An ingest preview body carries a `Content-Encoding` other than `identity` |
 | `auth_error` | 401 | Authentication failed |
 | `forbidden` | 403 | The key lacks a permission |
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
@@ -417,21 +419,24 @@ Accepts a batch of events and writes them to the WAL. The body is either a JSON 
 
 ```bash
 curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
-  -d '[{"timestamp": "2026-09-11T08:00:00Z", "service": "myapp", "level": "info", "message": "started"}]' \
+  -d '[{"timestamp": "2026-09-11T08:00:00Z", "service": "myapp", "level": "info", "message": "started"}, {"message": "no service here"}]' \
   "$TRAWL_URL/api/v1/ingest"
 ```
 
 **Response**
 
 ```json
-{ "accepted": 1, "rejected": 1, "errors": [{ "index": 1, "message": "missing message" }] }
+{ "accepted": 1, "rejected": 1, "errors": [{ "index": 1, "reason": "missing_service", "message": "missing 'service' field" }] }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `accepted` | integer | Events written to the WAL |
 | `rejected` | integer | Number of error entries, one per validation rejection. Omitted when `0`. |
-| `errors` | array | Validation entries identify the rejected event: `index` is the zero-based array position or line number, counting blank lines. Omitted when empty. |
+| `errors` | array | One entry per rejected event. Omitted when empty. |
+| `errors[].index` | integer | The zero-based array position, or the zero-based line number counting blank lines |
+| `errors[].reason` | string | The reason code from the [rejection table](/reference/events/#rejection-reasons), such as `missing_service` or `invalid_json`. The same value labels `trawl_ingest_events_rejected_total` |
+| `errors[].message` | string | What was wrong with the event. It can quote the event's values, such as the env that is not allowed |
 
 A rejected event does not stop its siblings. Repairs do not change `accepted` or `rejected`. A body whose first non-blank byte is not `[` is read as newline-delimited JSON, so a single event object is accepted and a line that is not an event object counts as one rejected event with the response still 200. See [connect and verify a sender](/operate/ingestion/) for an end-to-end check.
 
@@ -479,6 +484,171 @@ events are counted.
 | 429 | `rate_limited` | The key's ingest bucket is empty |
 | 500 | `internal_error` | A group's WAL write failed. Other groups in the request may still have been accepted. |
 | 503 | `hot_buffer_full` | The hot buffer has no room for the request. `Retry-After` gives `[ingest] compaction_interval_secs` in seconds. Nothing was written |
+
+### Preview ingest
+
+`POST /api/v1/ingest/preview`
+
+Permission: `server_manage`
+
+Runs a sample through the same parse and canonicalization step as [`/api/v1/ingest`](#ingest-events) and reports what each event would become. Nothing from the sample is stored, counted, or logged. The route covers the HTTP producer only. It exists only when `[ingest] enabled` is `true`. On a node with ingest disabled the server answers 404 with an empty body. It spends the interactive rate bucket and has the interactive body limit, `[server] max_request_body_bytes`. Every response from the route carries `Cache-Control: no-store`, refusals included. Refusals come in this order. A `Content-Length` over the body limit gets 413 before the key is checked. Then come authentication (401, or 503 when the key store is unavailable), a key with no trawl permission (403) and the rate limit (429). Then trawld reads the body: a body sent without `Content-Length` that grows past the limit gets 413 here. Last, the route checks `server_manage` (403), `Content-Encoding` (415), the query string (400) and the sample itself. See [ingest preview](/operate/ingestion/#ingest-preview) for what the preview does not promise.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| body | body | array or ndjson | yes | The same body as `/api/v1/ingest`, at most 500 events. A non-blank line that is not valid JSON counts toward the 500. A blank line does not |
+| `peer_ip` | query | string | no | The address trawld would see for the sender, IPv4 or IPv6. An IPv4-mapped IPv6 address, such as `::ffff:10.0.0.7`, is read as its IPv4 address, as real ingest reads it. Default `192.0.2.1`, an RFC 5737 documentation address. trawld classifies either address against `[ingest] trusted_relays` |
+| `Content-Encoding` | header | string | no | Absent or `identity`, in any letter case. Any other value answers 415, a list such as `identity, gzip` included |
+
+**Request**
+
+```bash
+printf '%s\n' \
+  '{"Level":"warn","message":"disk 91% full","service":"myapp","timestamp":"2026-10-01T08:00:00Z"}' \
+  '{"message":"no service here"}' |
+  curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/x-ndjson" \
+    --data-binary @- "$TRAWL_URL/api/v1/ingest/preview"
+```
+
+**Response**
+
+```json
+{
+  "producer": "http",
+  "peer": {
+    "ip": "192.0.2.1",
+    "given": false,
+    "trusted_relay": false
+  },
+  "arrival": "2026-10-02T23:14:01.881449Z",
+  "derivation": {
+    "time_from": [
+      "_time",
+      "timestamp",
+      "@timestamp"
+    ],
+    "severity_from": [
+      {
+        "field": "severity",
+        "dialect": "otel"
+      },
+      {
+        "field": "severity_text",
+        "dialect": "otel"
+      },
+      {
+        "field": "level",
+        "dialect": "otel"
+      }
+    ]
+  },
+  "accepted": 1,
+  "rejected": 1,
+  "events": [
+    {
+      "outcome": "accepted",
+      "index": 0,
+      "input": {
+        "Level": "warn",
+        "message": "disk 91% full",
+        "service": "myapp",
+        "timestamp": "2026-10-01T08:00:00Z"
+      },
+      "event": {
+        "_ingested": "2026-10-02T23:14:01.881449Z",
+        "_producer": "http",
+        "_raw": "{\"Level\":\"warn\",\"message\":\"disk 91% full\",\"service\":\"myapp\",\"timestamp\":\"2026-10-01T08:00:00Z\"}",
+        "_repairs": "field.name_case_folded,env.defaulted,host.from_peer",
+        "_severity": 13,
+        "_time": "2026-10-01T08:00:00.000000Z",
+        "env": "prod",
+        "host": "192.0.2.1",
+        "level": "warn",
+        "message": "disk 91% full",
+        "service": "myapp",
+        "timestamp": "2026-10-01T08:00:00Z"
+      },
+      "repairs": [
+        "field.name_case_folded",
+        "env.defaulted",
+        "host.from_peer"
+      ],
+      "lineage": {
+        "time": {
+          "from": "field",
+          "field": "timestamp"
+        },
+        "severity": {
+          "from": "field",
+          "field": "level",
+          "skipped_unmappable": []
+        },
+        "fields": [
+          {
+            "field": "Level",
+            "change": "renamed",
+            "to": "level",
+            "code": "field.name_case_folded"
+          }
+        ]
+      },
+      "host_depends_on_sender": true
+    },
+    {
+      "outcome": "rejected",
+      "index": 1,
+      "input": {
+        "message": "no service here"
+      },
+      "reason": "missing_service",
+      "message": "missing 'service' field",
+      "host_depends_on_sender": true
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `producer` | string | Always `http` |
+| `peer.ip` | string | The peer address used: `peer_ip` as trawld reads it, or `192.0.2.1` |
+| `peer.given` | boolean | `true` when the request named `peer_ip` |
+| `peer.trusted_relay` | boolean | `true` when the address is in `[ingest] trusted_relays`. A missing `host` is then a rejection, not a fill |
+| `arrival` | string | The one arrival time for the whole sample, RFC 3339 UTC with microseconds. It is `_ingested`, and it fills a missing `_time` |
+| `derivation.time_from` | array | The fields read for `_time`, in order. The first present one decides |
+| `derivation.severity_from` | array | The fields read for `_severity`, in order, each with its `dialect`. The first mappable one decides |
+| `accepted` | integer | Accepted events |
+| `rejected` | integer | Rejected events, invalid JSON included |
+| `events` | array | One entry per non-blank input position, in input order. Empty for a body of only whitespace |
+
+Each entry in `events` has `outcome` set to `accepted` or `rejected`.
+
+| Field | Outcome | Type | Description |
+|-------|---------|------|-------------|
+| `index` | both | integer | The position, by the same rule as `errors[].index` on [ingest](#ingest-events) |
+| `input` | both | any | The parsed input. Absent when the position was not valid JSON. Present for a non-object element, `null` included |
+| `event` | `accepted` | object | The canonical event as trawld would store it, `_ingested` included |
+| `repairs` | `accepted` | array | Repair codes in the order trawld applied them, the same codes as `_repairs`. See [repair codes](/reference/events/#repair-codes) |
+| `lineage.time` | `accepted` | object | `{"from": "field", "field": F}` when field `F` gave `_time`. `{"from": "arrival"}` when the arrival time filled it, with `unparseable` naming the first present source when that source did not parse |
+| `lineage.severity` | `accepted` | object | `{"from": "field", "field": F, "skipped_unmappable": [...]}` when `F` gave `_severity`, listing earlier present sources that did not map. `{"from": "missing"}` when no source was present. `{"from": "unmapped", "sources": [...]}` when sources were present and none mapped |
+| `lineage.fields` | `accepted` | array | One entry per field change, in the order trawld made them: `field` as that step saw it, `change` (`renamed`, `dropped`, `truncated`, or `stringified`), `to` for a rename, and `code` for a change that is a repair. A stringified value carries no code |
+| `reason` | `rejected` | string | The reason code, as on [ingest](#ingest-events) |
+| `message` | `rejected` | string | The message real ingest gives for the same event |
+| `host_depends_on_sender` | both | boolean | `true` when the request named no peer and the event has no `host` once its field names are normalized. A `Host` or `_host` field counts as `host`. A `host` of `null` counts as no `host`. The stored `host`, or a rejection behind a trusted relay, then depends on the real sender's address. A rejected event can be `true` too, because trawld settles the host before it checks `service` and `env`. Always `false` for a position that is not valid JSON or not an object |
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | An unknown query parameter, or a `peer_ip` that is not an IP address. The message does not quote the value |
+| 400 | `ingest_error` | Empty body, invalid UTF-8, or an unparseable or empty JSON array. The same refusals as `/api/v1/ingest`. A body of only whitespace is not refused. It answers 200 with no events |
+| 403 | `forbidden` | The key lacks `server_manage` |
+| 404 | none | `[ingest] enabled` is `false` on this node. The body is empty |
+| 413 | none | The body exceeds `[server] max_request_body_bytes`. The body is plain text |
+| 413 | `preview_too_large` | The sample holds more than 500 events. Nothing is truncated. Send a smaller sample |
+| 415 | `unsupported_encoding` | The body carries a `Content-Encoding` other than `identity`, `gzip` included |
+| 429 | `rate_limited` | The key's interactive bucket is empty |
 
 ## Schema
 

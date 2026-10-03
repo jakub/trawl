@@ -309,8 +309,8 @@ impl SyslogDoor {
                     transport,
                 })
             }
-            Err((_, reason)) => {
-                producer::count_profile_reject(ProducerKind::Syslog, reason);
+            Err(rejection) => {
+                producer::count_profile_reject(ProducerKind::Syslog, rejection.reason);
                 None
             }
         }

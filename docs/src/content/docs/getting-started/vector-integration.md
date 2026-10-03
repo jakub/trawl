@@ -156,6 +156,160 @@ and `unifi-syslog.toml`.
    trust its issuer. Keep both verification settings enabled on deployed
    collectors.
 
+## Preview a sample
+
+Before you start Vector, check what trawld would do to the events this host
+sends. Vector parses and reshapes each line before it posts it, so a raw log
+file is not a sample. Capture what Vector would post, then run the
+[ingest preview](/operate/ingestion/#ingest-preview) on it. The preview stores
+nothing.
+
+1. Capture up to 500 events:
+
+   <!-- proof:capture-sample -->
+   ```bash
+   CAPTURE="$(mktemp -d)" &&
+   mkdir "$CAPTURE/config" "$CAPTURE/data" &&
+   (
+     for file in /etc/vector/vector.d/*.toml; do
+       case "$(basename "$file")" in
+         base.toml | unifi-syslog.toml) ;;
+         *) cp "$file" "$CAPTURE/config/" || exit ;;
+       esac
+     done
+   ) &&
+   awk -v data_dir="$CAPTURE/data" '
+     BEGIN { print "data_dir = \"" data_dir "\"" }
+     /^\[/ { skip = /^\[sinks\.trawld[].]/ }
+     /^data_dir *=/ { next }
+     !skip
+   ' /etc/vector/vector.d/base.toml > "$CAPTURE/config/base.toml" &&
+   cat >> "$CAPTURE/config/base.toml" <<'EOF' &&
+
+   [sinks.capture]
+   type = "console"
+   inputs = ["trawl_*"]
+   target = "stdout"
+   encoding.codec = "json"
+   EOF
+   cat > "$CAPTURE/check.vrl" <<'EOF' &&
+   sinks = object!(.sinks)
+   keys(sinks) == ["capture"] && sinks.capture.type == "console" &&
+     .data_dir == get_env_var!("CAPTURE") + "/data"
+   EOF
+   sudo sh -c '
+     set -a && . /etc/default/vector && set +a
+     checked="$(vector config --config-dir "$1/config" |
+       CAPTURE="$1" vector vrl --input /dev/stdin --program "$1/check.vrl")"
+     if [ "$checked" != true ]; then
+       echo "capture: the copy has a sink other than capture, or another data_dir; Vector did not start" >&2
+       exit 1
+     fi
+     { timeout 60 vector --config-dir "$1/config"; echo "$?" > "$1/vector.status"; } |
+       head -n 500
+     written=$?
+     if [ "$written" -ne 0 ]; then
+       echo "capture: writing the capture stopped with status $written; the capture is incomplete, do not preview it" >&2
+       exit 1
+     fi
+     status="$(cat "$1/vector.status")"
+     case "$status" in
+       0 | 124) ;;
+       *)
+         echo "capture: Vector stopped with status $status; the capture is incomplete, do not preview it" >&2
+         exit 1
+         ;;
+     esac
+   ' sh "$CAPTURE" > "$CAPTURE/capture.ndjson"
+   ```
+
+   The capture runs a copy of this host's configuration with two changes:
+
+   - The `trawld` sink is replaced by a `console` sink that writes each event
+     as one JSON line, the same JSON the `trawld` sink posts. Nothing is sent
+     to trawld.
+   - `data_dir` points at a new, empty directory. The capture keeps its
+     checkpoints there, so it does not move the service's checkpoints in
+     `/var/lib/vector` or touch the sink's disk buffer.
+
+   The `awk` filter removes only `[sinks.trawld]` tables whose headers start
+   at the beginning of a line, as the shipped `base.toml` writes them. Before
+   Vector starts, the block checks the copy as Vector reads it:
+   `vector config` resolves the configuration, and `check.vrl` accepts it
+   only if the one sink is the `console` sink `capture` and `data_dir` is the
+   new directory. If you have reformatted `base.toml`, or another file in
+   `/etc/vector/vector.d` adds a sink, the check prints an error and exits
+   `1`, and Vector does not start. Remove that sink from the copy in
+   `$CAPTURE/config`, then run the `sudo` command again.
+
+   `unifi-syslog.toml` stays out of the copy: its events come from devices,
+   and its listener would compete with a running Vector for port 1514.
+   Vector runs as root with the variables from `/etc/default/vector`, so
+   `TRAWL_ENV` and the noise policy apply as they do in the service. It stops
+   after 500 events or 60 seconds, whichever comes first. Its log goes to the
+   terminal, and only events go to `$CAPTURE/capture.ndjson`. `mktemp -d`
+   creates `$CAPTURE` readable only by you, so the captured log lines stay
+   private to your account and root.
+
+   Each step runs only if the step before it succeeded. If a file in
+   `/etc/vector/vector.d` cannot be copied, for example because you cannot
+   read it, the block stops with the `cp` error and Vector does not start.
+   A partial copy would capture with a configuration that the service does
+   not run. The block does not exit your shell, so you can fix the cause and
+   run it again.
+
+   A capture that ends at 500 events, at the end of its input, or at the 60
+   second limit is complete. If Vector stops for another reason, such as a
+   crash or a kill, the `sudo` command prints
+   `capture: Vector stopped with status N` and exits `1`. If writing
+   `$CAPTURE/capture.ndjson` fails, for example on a full disk, it prints
+   `capture: writing the capture stopped with status N` and exits `1`.
+   In both cases `$CAPTURE/capture.ndjson` can hold some events. Do not
+   preview them. Fix the cause shown in the error or in Vector's log, then
+   run the `sudo` command again.
+
+   The empty `data_dir` has no journal checkpoint, so the journald source
+   starts at the beginning of the current boot, as on Vector's
+   [first start](#what-arrives-from-before). The file sources read only lines
+   appended while the capture runs. To sample a file source, write to its log
+   during the capture, for example with the request from the
+   [nginx recipe](#nginx).
+
+2. Preview the capture:
+
+   ```bash
+   trawl -p prod preview-ingest "$CAPTURE/capture.ndjson"
+   ```
+
+   The `prod` profile's key needs `trawl:server_manage` for this step. If it
+   lacks that permission, copy `$CAPTURE/capture.ndjson` to a machine with a profile
+   whose key holds it.
+
+   The command exits `0` when every event is accepted, and `1` when any event
+   is rejected. It exits `2` when it gets no report, for example when the key
+   lacks the permission. Look at each rejected row's reason, and at the repairs and
+   the `_time` and `_severity` sources of the accepted rows. For example, a
+   `_time` of `arrival (bad timestamp)`, with the `time.from_ingest` repair,
+   means that `timestamp` did not parse, so trawld would use the arrival time.
+   Fix the configuration and capture again until the
+   preview shows what you expect. The shipped configuration sets `host` on
+   every event, so the preview needs no `--peer-ip`.
+
+   The preview reads at most `[server] max_request_body_bytes`, 128K by
+   default. If it answers `413` for a body that is too large, preview fewer
+   lines, such as
+   `head -n 200 "$CAPTURE/capture.ndjson" | trawl -p prod preview-ingest -`.
+
+3. Delete the capture. It holds real log lines, and Vector wrote its
+   checkpoints as root:
+
+   ```bash
+   sudo rm -rf "$CAPTURE"
+   ```
+
+A preview checks canonicalization, not delivery. Prove that the first event
+arrived after you start Vector.
+
 ## Start Vector
 
 Record the start time in UTC, then start and enable the service:
@@ -471,6 +625,8 @@ Some failures leave no error in that journal, because trawld answers `200` and
 counts the rejection on `/metrics` instead. The rejection counter is
 `trawl_ingest_events_rejected_total{reason}`. See
 [Confirm delivery over time](/operate/ingestion/#confirm-delivery-over-time).
+A [preview of a sample](#preview-a-sample) shows each rejected event with its
+reason and message, without waiting for the counter.
 
 | What you see | What to do |
 | --- | --- |
@@ -479,7 +635,7 @@ counts the rejection on `/metrics` instead. The rejection counter is
 | Vector logs `403` | The key lacks `trawl:ingest`. Give its role that permission, or create a key with the `trawl-ingest` role. Vector does not retry a `403`. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="invalid_env"` rises | `TRAWL_ENV` fails the env name rule: 1 to 32 characters from `a-z`, `0-9`, `_`, and `-`. `Prod` fails it. Fix `TRAWL_ENV` and restart Vector. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="env_not_allowed"` rises | `TRAWL_ENV` is not in trawld's `[ingest] envs`. Keys are not scoped to an env, so the list is the only check. Add the env to the list and restart trawld, or fix `TRAWL_ENV`. |
-| The check finds nothing, and the rejection counter rises with another `reason` | For a rule an event broke, trawld answered `200` with `rejected` in the body, and Vector counted the batch as a success. The `reason` label names the rule. See the [event contract](/reference/events/). Three reasons refuse the whole request instead, and Vector logs the status. |
+| The check finds nothing, and the rejection counter rises with another `reason` | For a rule an event broke, trawld answered `200` with `rejected` in the body, and Vector counted the batch as a success. The `reason` label names the rule. See the [event contract](/reference/events/). To see which events trawld rejects and why, [preview a sample](#preview-a-sample). Three reasons refuse the whole request instead, and Vector logs the status. |
 | Vector logs `503`, and `trawl_hot_buffer_admission_refusals_total{producer="http",kind="full"}` or the rejection counter with `reason="hot_buffer_full"` rises | trawld's hot buffer is full. A request refused before trawld parses it raises only the admission counter. Vector retries. If it persists, check compaction and disk headroom on the [Health page](/operate/health/). |
 | Vector logs `413` | One request is too large, and Vector drops that batch. Lower the sink's `batch.max_bytes`. If `trawl_hot_buffer_admission_refusals_total{producer="http",kind="oversized"}` or the rejection counter with `reason="ingest_batch_too_large"` rises, the request holds more than the hot buffer admits at once. If neither rises, the body exceeds trawld's `[ingest] max_body_bytes`, as sent or once gzip is decoded. A decoded body over the limit logs `ingest_body_too_large` on trawld. |
 | Vector logs `500`, and `reason="wal_failure"` rises | trawld could not write its WAL. Vector retries. Check trawld's journal and the data directory's disk. |
@@ -525,6 +681,7 @@ Vector's sources set `timestamp` and `host`, and trawld derives `_time` from
 `timestamp`. Set `severity_text`, `severity`, or `level` from the line when
 the source has one. trawld derives `_severity` from the first that maps.
 `service`, `env`, `host`, and `message` are the envelope, and names that start
-with `_` belong to Trawl. Test one host with the
-[proof pattern](#prove-the-first-event-arrived) before you roll a new mapping
-out to every sender.
+with `_` belong to Trawl. [Preview a sample](#preview-a-sample) of the new
+mapping, then test one host with the
+[proof pattern](#prove-the-first-event-arrived) before you roll it out to
+every sender.

@@ -7,8 +7,8 @@
 //! The binary target (`src/main.rs`) is a one-line shim over [`main`]; the
 //! command implementations live here so integration tests can drive them
 //! directly against a real server instead of shelling out. [`cli`],
-//! [`doctor`] and [`schema`] are public for exactly that reason — `config`
-//! and `tui` stay private.
+//! [`doctor`], [`preview_ingest`] and [`schema`] are public for exactly
+//! that reason — `config` and `tui` stay private.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 pub mod cli;
 mod config;
 pub mod doctor;
+pub mod preview_ingest;
 pub mod schema;
 mod trial;
 mod tui;
@@ -116,6 +117,14 @@ enum Command {
     /// Name the target with --url or --profile; the TRAWL_* environment is
     /// refused. Exits 0 pass, 1 fail, 3 incomplete, 2 on a usage error.
     Doctor(doctor::DoctorArgs),
+
+    /// Show what ingest would do to a sample of events, storing nothing.
+    ///
+    /// Sends FILE (or stdin) unchanged to the server's ingest preview, which
+    /// needs the `server_manage` permission. Exits 0 when every event would be
+    /// accepted, 1 when any would be rejected, 2 on a usage error or when no
+    /// complete report came back.
+    PreviewIngest(preview_ingest::PreviewIngestArgs),
 
     /// Run a disposable trial installation in Docker on this machine:
     /// loopback only, with sample data. `-p trial` connects to it.
@@ -420,7 +429,8 @@ pub async fn main() {
     let args = parse_cli();
 
     match run(args).await {
-        // Only `trawl doctor` returns a status other than 0.
+        // Only `trawl doctor` and `trawl preview-ingest` return a status
+        // other than 0.
         Ok(0) => {}
         Ok(status) => process::exit(i32::from(status)),
         Err(CliError::Arg(e)) => e.exit(),
@@ -484,12 +494,16 @@ fn exit_on_error(e: &CliError) -> ! {
     {
         process::exit(1);
     }
-    eprintln!("trawl: {e}");
+    // A server-supplied message may carry terminal control sequences.
+    eprintln!(
+        "trawl: {}",
+        trawl_core::sanitize::sanitize_display_text(&e.to_string())
+    );
     process::exit(1);
 }
 
 /// Run the command and return its exit status. Every command but `doctor`
-/// returns 0 on success and an error otherwise.
+/// and `preview-ingest` returns 0 on success and an error otherwise.
 async fn run(mut args: Cli) -> Result<u8, CliError> {
     // Trial verbs run before config.toml is read: a broken client config
     // must not block `trawl trial up` or `down`. `doctor` selects its own
@@ -499,6 +513,21 @@ async fn run(mut args: Cli) -> Result<u8, CliError> {
         Some(Command::Doctor(doctor_args)) => return doctor::run(args.into(), doctor_args).await,
         command => command,
     };
+    // The preview's own contract: any failure, the config included, is
+    // exit 2 (no complete report), never `CliError`'s generic 1.
+    if matches!(command, Some(Command::PreviewIngest(_))) {
+        let result = run_configured(args, command).await;
+        return Ok(preview_ingest::exit_status(
+            result,
+            &mut io::stderr().lock(),
+        ));
+    }
+    run_configured(args, command).await
+}
+
+/// Load the client config, resolve the connection, and run a command that
+/// reads it: everything but `trial` and `doctor`.
+async fn run_configured(args: Cli, command: Option<Command>) -> Result<u8, CliError> {
     // The driver sends to whatever TUI holds the socket and never uses the
     // resolved connection, so under -p trial it could drive a TUI that is
     // connected elsewhere. Refused before the socket is touched.
@@ -601,6 +630,13 @@ async fn run(mut args: Cli) -> Result<u8, CliError> {
 
         Some(Command::Driver { socket, cmd }) => {
             run_driver(&socket, cmd).await?;
+        }
+
+        Some(Command::PreviewIngest(preview)) => {
+            let body = preview_ingest::read_sample(preview.file.as_deref())?;
+            let conn = connection(&cfg, args.token.as_deref())?;
+            let stdout = io::stdout();
+            return preview_ingest::run(&mut stdout.lock(), &conn, body, &preview).await;
         }
 
         Some(Command::Trial { .. } | Command::Doctor(_)) => {

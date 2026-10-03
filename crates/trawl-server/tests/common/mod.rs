@@ -904,6 +904,127 @@ pub fn harness_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().add_root_certificate(certificate)
 }
 
+/// A response read off a [`raw_https_exchange`].
+pub struct RawResponse {
+    pub status: u16,
+    /// Header names lowercased, in the order the server sent them.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RawResponse {
+    /// The first value of header `name` (any case).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        let name = name.to_ascii_lowercase();
+        self.headers
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Write `request` verbatim to the fixture server at `url`
+/// (`https://host:port`) over one TLS connection that trusts the
+/// [`ensure_test_cert`] certificate, then read one HTTP/1.1 response,
+/// whose head must carry `Content-Length`.
+///
+/// For requests reqwest cannot send without a race: a body the server
+/// refuses before reading all of it. reqwest writes the whole body before
+/// it reads, so a server that answers early and closes leaves it with a
+/// broken pipe instead of the answer. Here the caller sends only what the
+/// server will consume before it answers (a head that announces more body
+/// than it sends, or a chunk with no terminator), and nothing is written
+/// after the response starts, so no write can fail and no unread byte is
+/// left to turn the server's close into a reset.
+///
+/// The whole exchange is bounded, so a server that never answers fails the
+/// test with a message instead of hanging it until the runner's timeout.
+pub async fn raw_https_exchange(url: &str, request: &[u8]) -> RawResponse {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        raw_https_exchange_unbounded(url, request),
+    )
+    .await
+    .expect("the fixture server answered within 30 s")
+}
+
+async fn raw_https_exchange_unbounded(url: &str, request: &[u8]) -> RawResponse {
+    use rustls::pki_types::pem::PemObject as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let authority = url
+        .strip_prefix("https://")
+        .expect("a fixture URL is https://host:port");
+    let host = authority
+        .rsplit_once(':')
+        .expect("a fixture URL carries a port")
+        .0;
+    let (cert_path, _) = ensure_test_cert();
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from_pem_file(&cert_path).unwrap())
+        .unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let mut tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+        .connect(
+            rustls::pki_types::ServerName::try_from(host.to_owned()).unwrap(),
+            tcp,
+        )
+        .await
+        .unwrap();
+    tls.write_all(request).await.unwrap();
+    tls.flush().await.unwrap();
+
+    let mut buf = Vec::new();
+    let head_end = loop {
+        if let Some(at) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break at;
+        }
+        let mut chunk = [0u8; 4096];
+        let n = tls.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "the server closed before a full response head");
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    let head = std::str::from_utf8(&buf[..head_end]).expect("an ASCII response head");
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse().ok())
+        .expect("an HTTP/1.1 status line");
+    let headers: Vec<(String, String)> = lines
+        .map(|line| {
+            let (name, value) = line.split_once(':').expect("a header line");
+            (name.trim().to_ascii_lowercase(), value.trim().to_owned())
+        })
+        .collect();
+    let length: usize = headers
+        .iter()
+        .find(|(n, _)| n == "content-length")
+        .map(|(_, v)| v.parse().unwrap())
+        .expect("the response carries Content-Length");
+    let mut body = buf.split_off(head_end + 4);
+    while body.len() < length {
+        let mut chunk = [0u8; 4096];
+        let n = tls.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "the server closed mid-body");
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(length);
+    RawResponse {
+        status,
+        headers,
+        body,
+    }
+}
+
 /// What a failing test needs to know about its own fixture (ADR-0021
 /// ruling 8): which two databases it minted, which port it bound, and the
 /// connection ceilings it was sized against.
@@ -1306,6 +1427,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         SchedulerConfig::default(),
         None,
         None,
+        &[],
     )
     .await
 }
@@ -1339,6 +1461,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         SchedulerConfig::default(),
         None,
         None,
+        &[],
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1359,6 +1482,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         SchedulerConfig::default(),
         None,
         None,
+        &[],
     )
     .await
 }
@@ -1378,6 +1502,30 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         scheduler,
         None,
         None,
+        &[],
+    )
+    .await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
+}
+
+/// A fixture whose `[ingest] trusted_relays` holds `cidrs`, for tests of
+/// what a host-less event from a relay becomes. The tempdir holding its WAL
+/// is leaked so it outlives the server.
+pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let server = setup_with_ingest_config(
+        tmp.path(),
+        seed_data_root(tmp.path()),
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        RowCaps::DEFAULT,
+        SchedulerConfig::default(),
+        None,
+        None,
+        cidrs,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1421,6 +1569,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         SchedulerConfig::default(),
         Some(knobs),
         None,
+        &[],
     )
     .await
 }
@@ -1446,6 +1595,7 @@ pub async fn setup_observing_boot(
         SchedulerConfig::default(),
         knobs,
         Some(before_boot),
+        &[],
     )
     .await
 }
@@ -1462,6 +1612,7 @@ async fn setup_with_ingest_config(
     scheduler: SchedulerConfig,
     hot_buffer: Option<HotBufferKnobs>,
     before_boot: Option<&mut dyn FnMut(&AppState)>,
+    trusted_relays: &[&str],
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1544,6 +1695,7 @@ async fn setup_with_ingest_config(
             let mut ingest = IngestConfig {
                 enabled: ingest_enabled,
                 wal_dir: Some(wal_dir),
+                trusted_relays: trusted_relays.iter().map(|c| (*c).to_owned()).collect(),
                 ..IngestConfig::default()
             };
             if let Some(knobs) = hot_buffer {

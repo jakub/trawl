@@ -10,6 +10,9 @@
 //!
 //! Exceptions:
 //! - `/api/v1/ingest` is blocked outright (never exposed to browsers).
+//!   The block matches that exact path only: `/api/v1/ingest/preview`
+//!   forwards like any other call, with the session's bearer token
+//!   (ADR-0049).
 //! - `/api/v1/stream` is handled by the SSE-specific handler in
 //!   `routes::stream`, which streams bytes rather than buffering.
 //! - Hop-by-hop headers are stripped (connection, upgrade, te, etc.).
@@ -224,7 +227,7 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
     use trawl_config::WebConfig;
-    use wiremock::matchers::{bearer_token, method, path};
+    use wiremock::matchers::{bearer_token, body_bytes, method, path, query_param};
     use wiremock::{Mock, ResponseTemplate};
 
     use crate::config::ResolvedConfig;
@@ -377,6 +380,73 @@ mod tests {
                 "/ingest must never be exposed to browsers (method={method_name})"
             );
         }
+
+        // The 404 is local: no request for the ingest path ever reaches
+        // upstream. Filter by path, since the login above hits /whoami.
+        let relayed: Vec<String> = upstream
+            .mock()
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.url.path().to_owned())
+            .filter(|p| p == "/api/v1/ingest")
+            .collect();
+        assert!(
+            relayed.is_empty(),
+            "/ingest must not relay to the upstream: {relayed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_preview_forwards_with_session_bearer() {
+        // The exact-path ingest block must not swallow its preview child
+        // (ADR-0049): the generic forwarder relays it with the session's
+        // bearer token, the body bytes and the query string intact, and
+        // mirrors the upstream's no-store header and body.
+        let upstream = TlsUpstream::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = build_app(state);
+
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        let request_body: &[u8] = br#"{"message":"hello","host":"web-01"}"#;
+        let response_body: &[u8] =
+            br#"{"events":[{"_time":"2026-01-01T00:00:00Z","message":"hello"}],"rejected":[]}"#;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/ingest/preview"))
+            .and(bearer_token("flt_token"))
+            .and(query_param("peer_ip", "192.0.2.7"))
+            .and(body_bytes(request_body))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("cache-control", "no-store")
+                    .set_body_raw(response_body, "application/json"),
+            )
+            .expect(1)
+            .mount(upstream.mock())
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/ingest/preview?peer_ip=192.0.2.7")
+            .header("cookie", &cookie)
+            .header("origin", TEST_ORIGIN)
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from(request_body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let relayed = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&relayed[..], response_body);
     }
 
     #[tokio::test]

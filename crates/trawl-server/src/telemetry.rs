@@ -1768,10 +1768,10 @@ where
             // a closed label set, while the message quotes values and
             // would have nowhere to go but a log line emitted from
             // inside the logger.
-            Err((_, reason)) => {
+            Err(rejection) => {
                 crate::ingest::producer::count_profile_reject(
                     crate::ingest::producer::ProducerKind::Trawld,
-                    reason,
+                    rejection.reason,
                 );
                 return;
             }
@@ -3111,7 +3111,7 @@ mod tests {
                         "round {round}: an unstorable name became a column"
                     );
                 }
-                Err((_, reason)) => count_profile_reject(ProducerKind::Trawld, reason),
+                Err(rejection) => count_profile_reject(ProducerKind::Trawld, rejection.reason),
             }
         }
     }

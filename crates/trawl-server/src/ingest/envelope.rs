@@ -28,86 +28,96 @@ use serde_json::{Map, Value, json};
 use crate::ingest::pipeline;
 use crate::ingest::producer::{self, Asserted, Derivation, Producer};
 
-/// What the server changed about an accepted event — a closed enum, same
-/// principle as ADR-0006's "roles are data, permissions are code": codes
-/// are code, so `_repairs` cannot become a junk drawer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepairCode {
-    /// `host` was missing; filled from the sender IP.
-    HostFromPeer,
-    /// `env` was missing; filled from `default_env`.
-    EnvDefaulted,
-    /// `_time` was missing or unparseable; used arrival time.
-    TimeFromIngest,
-    /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
-    TimeOutOfRange,
-    /// a value exceeded the length cap (`_raw`).
-    FieldTruncated,
-    /// a field name arrived in trawl's `_` namespace and is not a slot the
-    /// sender may propose (ADR-0013 §5). The leading underscore run was
-    /// stripped and the value stored under the bare remainder
-    /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`); a name with no
-    /// remainder at all (`_`, `___`) was dropped. Nothing is lost either
-    /// way — `_raw` carries the original name and value.
-    ReservedPrefix,
-    /// stripping a reserved prefix produced a name the same event already
-    /// carries bare, so the prefixed loser was dropped (the case-collision
-    /// precedent). Its value stays findable in `_raw`.
-    ReservedPrefixCollision,
-    /// a field's name exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
-    /// the field was dropped (its value stays findable in `_raw`).
-    FieldNameTooLong,
-    /// a field's name carried ASCII uppercase and was folded to lowercase —
-    /// `DuckDB` identifiers are ASCII case-insensitive, so the lowercase
-    /// form is the one spelling every downstream layer (catalog, parquet,
-    /// hot snapshot) agrees on. The original spelling stays in `_raw`.
-    FieldNameCaseFolded,
-    /// two field names in one event differed only in ASCII case — one
-    /// column as far as `DuckDB` is concerned — so the losing key was
-    /// dropped (its value stays findable in `_raw`). The exact-lowercase
-    /// spelling wins when present; otherwise the ASCII-lexicographically
-    /// first variant does.
-    FieldNameCaseCollision,
-    /// a payload key named a slot the producer asserts (`env`, `service`,
-    /// `host`, `message`) and carried a different value, so the assertion
-    /// won (ADR-0013). Identity is protected by precedence, not by a
-    /// namespace: telemetry's own fields are ordinary sender vocabulary,
-    /// and the displaced value stays findable in `_raw`. An identical
-    /// value is not a collision and earns no code, and neither is a JSON
-    /// `null`, which is absence rather than a competing claim.
-    ProducerAsserted,
-    /// the producer had no honest `host` to assert, so the event was kept
-    /// with `host` absent (ADR-0013). Reached by a hostname-less syslog
-    /// frame behind a trusted relay and by a failed hostname lookup for
-    /// trawld: absent but honest beats both the peer-fill lie and dropping
-    /// the event. The HTTP door never gets here, since an HTTP sender can
-    /// be rejected and resend.
-    HostOmitted,
-    /// the producer could not derive a usable `service` from the frame
-    /// and fell back to its profile's configured default (a syslog
-    /// APP-NAME that fails the service charset). The original stays
-    /// findable in `_raw`.
-    ServiceFromProfile,
+// Declares a wire-coded enum together with its `ALL` list and `as_str`
+// from one `Variant => "wire.code"` list, so `ALL` is complete by
+// construction: a variant cannot exist without being listed and labelled.
+macro_rules! wire_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident => $wire:literal, )+
+        }
+    ) => {
+        $(#[$meta])*
+        pub enum $name {
+            $( $(#[$vmeta])* $variant, )+
+        }
+
+        impl $name {
+            /// The wire/metric label spelling.
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $wire, )+
+                }
+            }
+
+            /// Every variant, in declaration order, for exhaustive iteration.
+            pub const ALL: &'static [Self] = &[ $( Self::$variant, )+ ];
+        }
+    };
 }
 
-impl RepairCode {
-    /// The wire/metric label spelling of the code.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::HostFromPeer => "host.from_peer",
-            Self::EnvDefaulted => "env.defaulted",
-            Self::TimeFromIngest => "time.from_ingest",
-            Self::TimeOutOfRange => "time.out_of_range",
-            Self::FieldTruncated => "field.truncated",
-            Self::ReservedPrefix => "field.reserved_prefix",
-            Self::ReservedPrefixCollision => "field.reserved_prefix_collision",
-            Self::FieldNameTooLong => "field.name_too_long",
-            Self::FieldNameCaseFolded => "field.name_case_folded",
-            Self::FieldNameCaseCollision => "field.name_case_collision",
-            Self::ProducerAsserted => "field.producer_asserted",
-            Self::HostOmitted => "host.omitted",
-            Self::ServiceFromProfile => "service.from_profile",
-        }
+wire_enum! {
+    /// What the server changed about an accepted event — a closed enum, same
+    /// principle as ADR-0006's "roles are data, permissions are code": codes
+    /// are code, so `_repairs` cannot become a junk drawer.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RepairCode {
+        /// `host` was missing; filled from the sender IP.
+        HostFromPeer => "host.from_peer",
+        /// `env` was missing; filled from `default_env`.
+        EnvDefaulted => "env.defaulted",
+        /// `_time` was missing or unparseable; used arrival time.
+        TimeFromIngest => "time.from_ingest",
+        /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
+        TimeOutOfRange => "time.out_of_range",
+        /// a value exceeded the length cap (`_raw`).
+        FieldTruncated => "field.truncated",
+        /// a field name arrived in trawl's `_` namespace and is not a slot the
+        /// sender may propose (ADR-0013 §5). The leading underscore run was
+        /// stripped and the value stored under the bare remainder
+        /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`); a name with no
+        /// remainder at all (`_`, `___`) was dropped. Nothing is lost either
+        /// way — `_raw` carries the original name and value.
+        ReservedPrefix => "field.reserved_prefix",
+        /// stripping a reserved prefix produced a name the same event already
+        /// carries bare, so the prefixed loser was dropped (the case-collision
+        /// precedent). Its value stays findable in `_raw`.
+        ReservedPrefixCollision => "field.reserved_prefix_collision",
+        /// a field's name exceeded [`trawl_core::schema::MAX_FIELD_NAME_BYTES`];
+        /// the field was dropped (its value stays findable in `_raw`).
+        FieldNameTooLong => "field.name_too_long",
+        /// a field's name carried ASCII uppercase and was folded to lowercase —
+        /// `DuckDB` identifiers are ASCII case-insensitive, so the lowercase
+        /// form is the one spelling every downstream layer (catalog, parquet,
+        /// hot snapshot) agrees on. The original spelling stays in `_raw`.
+        FieldNameCaseFolded => "field.name_case_folded",
+        /// two field names in one event differed only in ASCII case — one
+        /// column as far as `DuckDB` is concerned — so the losing key was
+        /// dropped (its value stays findable in `_raw`). The exact-lowercase
+        /// spelling wins when present; otherwise the ASCII-lexicographically
+        /// first variant does.
+        FieldNameCaseCollision => "field.name_case_collision",
+        /// a payload key named a slot the producer asserts (`env`, `service`,
+        /// `host`, `message`) and carried a different value, so the assertion
+        /// won (ADR-0013). Identity is protected by precedence, not by a
+        /// namespace: telemetry's own fields are ordinary sender vocabulary,
+        /// and the displaced value stays findable in `_raw`. An identical
+        /// value is not a collision and earns no code, and neither is a JSON
+        /// `null`, which is absence rather than a competing claim.
+        ProducerAsserted => "field.producer_asserted",
+        /// the producer had no honest `host` to assert, so the event was kept
+        /// with `host` absent (ADR-0013). Reached by a hostname-less syslog
+        /// frame behind a trusted relay and by a failed hostname lookup for
+        /// trawld: absent but honest beats both the peer-fill lie and dropping
+        /// the event. The HTTP door never gets here, since an HTTP sender can
+        /// be rejected and resend.
+        HostOmitted => "host.omitted",
+        /// the producer could not derive a usable `service` from the frame
+        /// and fell back to its profile's configured default (a syslog
+        /// APP-NAME that fails the service charset). The original stays
+        /// findable in `_raw`.
+        ServiceFromProfile => "service.from_profile",
     }
 }
 
@@ -117,78 +127,133 @@ impl fmt::Display for RepairCode {
     }
 }
 
-/// Why an event was rejected — used as a prometheus label value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RejectReason {
-    MissingService,
-    /// `service` present but not a JSON string — type-specific, never
-    /// conflated with [`Self::MissingService`].
-    ServiceNotString,
-    EmptyService,
-    ServiceTooLong,
-    InvalidChars,
-    /// `env` present but not a string, or failing the env charset.
-    InvalidEnv,
-    /// `env` valid in shape but not in the configured allowlist —
-    /// repairing it into `default_env` would misfile data in the wrong
-    /// path root permanently.
-    EnvNotAllowed,
-    /// `host` missing and the peer is a configured trusted relay: filling
-    /// from the peer would stamp the relay's address as the origin.
-    HostMissingFromRelay,
-    NotObject,
-    InvalidJson,
-    WalFailure,
-    /// A valid event in an HTTP request the hot buffer refused for lack of
-    /// free space (503 `hot_buffer_full`, ADR-0043). Nothing was written.
-    HotBufferFull,
-    /// A valid event in an HTTP request larger than the hot buffer admits
-    /// for one request (413 `ingest_batch_too_large`, ADR-0043).
-    IngestBatchTooLarge,
-}
-
-impl RejectReason {
-    /// The prometheus label spelling of the reason.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::MissingService => "missing_service",
-            Self::ServiceNotString => "service_not_string",
-            Self::EmptyService => "empty_service",
-            Self::ServiceTooLong => "service_too_long",
-            Self::InvalidChars => "invalid_chars",
-            Self::InvalidEnv => "invalid_env",
-            Self::EnvNotAllowed => "env_not_allowed",
-            Self::HostMissingFromRelay => "host_missing_from_relay",
-            Self::NotObject => "not_object",
-            Self::InvalidJson => "invalid_json",
-            Self::WalFailure => "wal_failure",
-            Self::HotBufferFull => "hot_buffer_full",
-            Self::IngestBatchTooLarge => "ingest_batch_too_large",
-        }
+wire_enum! {
+    /// Why an event was rejected — used as a prometheus label value.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum RejectReason {
+        MissingService => "missing_service",
+        /// `service` present but not a JSON string — type-specific, never
+        /// conflated with [`Self::MissingService`].
+        ServiceNotString => "service_not_string",
+        EmptyService => "empty_service",
+        ServiceTooLong => "service_too_long",
+        InvalidChars => "invalid_chars",
+        /// `env` present but not a string, or failing the env charset.
+        InvalidEnv => "invalid_env",
+        /// `env` valid in shape but not in the configured allowlist —
+        /// repairing it into `default_env` would misfile data in the wrong
+        /// path root permanently.
+        EnvNotAllowed => "env_not_allowed",
+        /// `host` missing and the peer is a configured trusted relay: filling
+        /// from the peer would stamp the relay's address as the origin.
+        HostMissingFromRelay => "host_missing_from_relay",
+        NotObject => "not_object",
+        InvalidJson => "invalid_json",
+        WalFailure => "wal_failure",
+        /// A valid event in an HTTP request the hot buffer refused for lack of
+        /// free space (503 `hot_buffer_full`, ADR-0043). Nothing was written.
+        HotBufferFull => "hot_buffer_full",
+        /// A valid event in an HTTP request larger than the hot buffer admits
+        /// for one request (413 `ingest_batch_too_large`, ADR-0043).
+        IngestBatchTooLarge => "ingest_batch_too_large",
     }
-
-    /// Every reason, for exhaustive metric/summary iteration.
-    pub const ALL: &'static [Self] = &[
-        Self::MissingService,
-        Self::ServiceNotString,
-        Self::EmptyService,
-        Self::ServiceTooLong,
-        Self::InvalidChars,
-        Self::InvalidEnv,
-        Self::EnvNotAllowed,
-        Self::HostMissingFromRelay,
-        Self::NotObject,
-        Self::InvalidJson,
-        Self::WalFailure,
-        Self::HotBufferFull,
-        Self::IngestBatchTooLarge,
-    ];
 }
 
 impl fmt::Display for RejectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Why [`canonicalize`] refused an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejection {
+    /// The typed reason, a closed label set.
+    pub reason: RejectReason,
+    /// The human-readable explanation. It may quote a bounded client value,
+    /// so it belongs in a response to that client and never in a log line.
+    pub message: String,
+    /// The event had no `host` (absent or JSON `null`) once its names were
+    /// normalized, under the same rule [`Canonical::host_absent`] uses.
+    /// Settled before any validator can refuse, so a rejection says whether
+    /// the event's host would have depended on its sender.
+    pub host_absent: bool,
+}
+
+/// How an accepted event's `_time` was decided, recorded as
+/// [`derive_time`] decided it.
+///
+/// Sources are positions in the profile's `time_from` list
+/// ([`Derivation::time_from`]), not names, so recording a decision on the
+/// ingest hot path copies nothing. [`Derivation::time_field`] names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeSource {
+    /// The first present source parsed; `_time` is its canonical spelling.
+    Field(usize),
+    /// Arrival time filled `_time` (`time.from_ingest`). `unparseable` is
+    /// the first present source when one claimed the derivation and failed
+    /// to parse (a JSON `null` included); `None` means no source was present.
+    Arrival { unparseable: Option<usize> },
+}
+
+/// How an accepted event's `_severity` was decided, recorded as
+/// [`derive_severity`] decided it.
+///
+/// Sources are positions in the profile's `severity_from` list
+/// ([`Derivation::severity_from`]), not names, so recording a decision
+/// allocates nothing unless a present source failed to map.
+/// [`Derivation::severity_field`] names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeveritySource {
+    /// The source at `index` mapped and fed `_severity`.
+    /// `skipped_unmappable` lists the earlier sources that were present but
+    /// mapped to nothing, in the order the derivation consulted them.
+    Field {
+        index: usize,
+        skipped_unmappable: Vec<usize>,
+    },
+    /// No source in the profile's `severity_from` list was present.
+    Missing,
+    /// Sources were present and none mapped, so `_severity` was omitted
+    /// (the `trawl_severity_unmapped_total` signal). `sources` lists them
+    /// in consultation order.
+    Unmapped { sources: Vec<usize> },
+}
+
+/// What one canonicalization step did to one field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldChangeKind {
+    /// The value now lives under `to`.
+    Renamed { to: String },
+    /// The field is gone from the event (its value stays in `_raw`).
+    Dropped,
+    /// The value was cut to a length cap.
+    Truncated,
+    /// An object or array value became its JSON text.
+    Stringified,
+}
+
+/// One field-level decision, naming the field as the deciding step saw it.
+/// A chained decision is one entry per step: `_HOSTNAME` folds to
+/// `_hostname`, which strips to `hostname`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldChange {
+    pub field: String,
+    pub kind: FieldChangeKind,
+    /// The repair the decision earned. `None` for stringification, which
+    /// is canonicalization rather than a repair.
+    pub code: Option<RepairCode>,
+}
+
+/// Where an accepted event's derived values came from and what happened to
+/// its fields, recorded by each decision as the canonicalizer makes it.
+/// Real ingest ignores it; the ingest preview reports it (ADR-0049).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineage {
+    pub time: TimeSource,
+    pub severity: SeveritySource,
+    /// Field changes in decision order.
+    pub fields: Vec<FieldChange>,
 }
 
 /// Per-event context the canonicalizer needs: arrival instant, which door
@@ -232,13 +297,24 @@ pub struct Canonical {
     /// Repair codes applied, in application order (also joined into the
     /// object's `_repairs`).
     pub repairs: Vec<RepairCode>,
+    /// Where `_time` and `_severity` came from and every field change.
+    pub lineage: Lineage,
+    /// The event had no `host` (absent or JSON `null`) once its names were
+    /// normalized: the HTTP door filled it from the peer, a profile door
+    /// left it omitted.
+    pub host_absent: bool,
+}
+
+impl Canonical {
     /// The event carried a severity source that mapped to nothing on the
     /// `OTel` ladder, so `_severity` was omitted (ADR-0013 §2).
     ///
     /// Not a repair: derivation into the `_` namespace is an annotation,
     /// and nothing sender-visible was touched — the source column is
     /// stored verbatim. The ops signal is a metrics counter instead.
-    pub severity_unmapped: bool,
+    pub const fn severity_unmapped(&self) -> bool {
+        matches!(self.lineage.severity, SeveritySource::Unmapped { .. })
+    }
 }
 
 /// Maximum preserved length of `_raw` (chars). Generous — `_raw` is the
@@ -460,9 +536,11 @@ fn resolve_env(
 /// (ADR-0013 §2): the configured `[ingest] severity_from` chain with the
 /// profile's fixed sources prepended. Every source stays exactly where it
 /// is, so `{"service":"game","level":"gold"}` keeps a queryable
-/// `level="gold"` column and simply gets no `_severity`. Returns whether a
-/// source existed and none mapped, which is the ops counter's input. That
-/// is not a repair, because nothing sender-visible was touched.
+/// `level="gold"` column and simply gets no `_severity`. Returns which
+/// source fed `_severity` and which present sources it skipped as
+/// unmappable, or that none was present, or that some were and none
+/// mapped (the ops counter's input). An unmapped severity is not a
+/// repair, because nothing sender-visible was touched.
 ///
 /// Each source carries its own dialect and every value goes through
 /// `trawl_core::severity`. A word maps through the token table (`error` →
@@ -476,23 +554,35 @@ fn resolve_env(
 /// Ingest and the `sev()` query function read through that same code, so
 /// the number a query computes from a raw `level` is the number derivation
 /// would have stored for it.
-fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -> bool {
-    let mut saw_source = false;
-    for source in sources {
+fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -> SeveritySource {
+    // Positions, not names: an event whose first present source maps
+    // allocates nothing for its lineage (an empty `Vec` is free).
+    let mut skipped: Vec<usize> = Vec::new();
+    for (index, source) in sources.iter().enumerate() {
         let Some(value) = out.get(&source.field) else {
             continue;
         };
-        saw_source = true;
         if let Some(number) = trawl_core::severity::reading(value, source.dialect) {
             out.insert(trawl_core::schema::SEVERITY.into(), json!(number));
-            return false;
+            return SeveritySource::Field {
+                index,
+                skipped_unmappable: skipped,
+            };
         }
+        skipped.push(index);
     }
-    saw_source
+    if skipped.is_empty() {
+        SeveritySource::Missing
+    } else {
+        SeveritySource::Unmapped { sources: skipped }
+    }
 }
 
 /// Stamp what the producer asserts over the payload, returning whether any
-/// payload value was displaced (ADR-0013).
+/// payload value was displaced (ADR-0013). Each displaced payload value is
+/// recorded in `changes` as a drop earning `field.producer_asserted`: the
+/// payload's value is gone from its slot (it stays in `_raw`), whether the
+/// assertion replaced it or emptied the slot.
 ///
 /// Runs after the reserved-prefix strip and before the validators, so a
 /// stripped `_service` has already landed on its bare slot and the
@@ -513,12 +603,27 @@ fn derive_severity(out: &mut Map<String, Value>, sources: &[producer::Source]) -
 ///   `host: null` displaces nothing, being absence itself;
 /// - `message: None` asserts nothing at all (the payload is the message,
 ///   as for telemetry), so whatever the payload carries stands.
-fn apply_assertions(out: &mut Map<String, Value>, asserted: &Asserted<'_>) -> bool {
-    let mut displaced = claim_slot(out, trawl_core::schema::ENV, Some(asserted.env));
-    displaced |= claim_slot(out, trawl_core::schema::SERVICE, Some(asserted.service));
-    displaced |= claim_slot(out, trawl_core::schema::HOST, asserted.host);
+fn apply_assertions(
+    out: &mut Map<String, Value>,
+    asserted: &Asserted<'_>,
+    changes: &mut Vec<FieldChange>,
+) -> bool {
+    let mut claim = |key: &str, value: Option<&str>| {
+        let displaced = claim_slot(out, key, value);
+        if displaced {
+            changes.push(FieldChange {
+                field: key.to_owned(),
+                kind: FieldChangeKind::Dropped,
+                code: Some(RepairCode::ProducerAsserted),
+            });
+        }
+        displaced
+    };
+    let mut displaced = claim(trawl_core::schema::ENV, Some(asserted.env));
+    displaced |= claim(trawl_core::schema::SERVICE, Some(asserted.service));
+    displaced |= claim(trawl_core::schema::HOST, asserted.host);
     if let Some(message) = asserted.message {
-        displaced |= claim_slot(out, trawl_core::schema::MESSAGE, Some(message));
+        displaced |= claim(trawl_core::schema::MESSAGE, Some(message));
     }
     displaced
 }
@@ -560,11 +665,17 @@ fn claim_slot(out: &mut Map<String, Value>, key: &str, value: Option<&str>) -> b
 /// is a canonicalization like RFC 3339 time reformatting, not a repair: a
 /// code firing on every k8s event would fill `_repairs` on most of the
 /// corpus, and its value is that it is almost always null. Reach nested
-/// values with `json_extract_string(k8s, '$.pod')`.
-fn stringify_nested_values(out: &mut Map<String, Value>) {
-    for value in out.values_mut() {
+/// values with `json_extract_string(k8s, '$.pod')`. Each stringified field
+/// is recorded in `changes`, with no repair code.
+fn stringify_nested_values(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange>) {
+    for (key, value) in out.iter_mut() {
         if value.is_object() || value.is_array() {
             *value = Value::String(value.to_string());
+            changes.push(FieldChange {
+                field: key.clone(),
+                kind: FieldChangeKind::Stringified,
+                code: None,
+            });
         }
     }
 }
@@ -637,7 +748,15 @@ fn is_proposable(key: &str, value: &Value, raw_proposable: bool) -> bool {
 /// - two prefixed claimants for one bare name: the first in map order
 ///   wins (`serde_json::Map` iterates sorted, so that is the
 ///   ASCII-lexicographically first spelling), the rest collide out.
-fn strip_reserved_prefixes(out: &mut Map<String, Value>, raw_proposable: bool) -> PrefixStrip {
+///
+/// Each key is recorded in `changes`: renamed to its bare remainder, or
+/// dropped as `field.reserved_prefix` (no remainder) or
+/// `field.reserved_prefix_collision` (the bare name was taken).
+fn strip_reserved_prefixes(
+    out: &mut Map<String, Value>,
+    raw_proposable: bool,
+    changes: &mut Vec<FieldChange>,
+) -> PrefixStrip {
     let reserved: Vec<String> = out
         .keys()
         .filter(|k| trawl_core::schema::is_reserved_name(k))
@@ -652,12 +771,26 @@ fn strip_reserved_prefixes(out: &mut Map<String, Value>, raw_proposable: bool) -
         if bare.is_empty() || out.contains_key(bare) {
             // No name to store under, or the bare name is already taken:
             // drop the prefixed value. `_raw` still carries it.
-            if !bare.is_empty() {
+            let code = if bare.is_empty() {
+                RepairCode::ReservedPrefix
+            } else {
                 strip.collided = true;
-            }
+                RepairCode::ReservedPrefixCollision
+            };
+            changes.push(FieldChange {
+                field: key,
+                kind: FieldChangeKind::Dropped,
+                code: Some(code),
+            });
             continue;
         }
-        out.insert(bare.to_owned(), value);
+        let bare = bare.to_owned();
+        out.insert(bare.clone(), value);
+        changes.push(FieldChange {
+            field: key,
+            kind: FieldChangeKind::Renamed { to: bare },
+            code: Some(RepairCode::ReservedPrefix),
+        });
     }
     strip
 }
@@ -697,7 +830,11 @@ struct FoldedNames {
 /// that). Nothing honest can be done with two values for what `DuckDB`
 /// reads as one column; the dropped key and its value stay findable in
 /// `_raw`, which is captured from the pre-fold object.
-fn fold_field_names(obj: &Map<String, Value>) -> FoldedNames {
+///
+/// Each folded key is recorded in `changes` as renamed to its lowercase
+/// spelling (`field.name_case_folded`), each collision loser as dropped
+/// (`field.name_case_collision`).
+fn fold_field_names(obj: &Map<String, Value>, changes: &mut Vec<FieldChange>) -> FoldedNames {
     let mut out = Map::new();
     // Pass 1: exact (already-folded) spellings — the collision winners.
     for (key, value) in obj {
@@ -715,9 +852,19 @@ fn fold_field_names(obj: &Map<String, Value>) -> FoldedNames {
         let lower = key.to_ascii_lowercase();
         if out.contains_key(&lower) {
             collided = true;
+            changes.push(FieldChange {
+                field: key.clone(),
+                kind: FieldChangeKind::Dropped,
+                code: Some(RepairCode::FieldNameCaseCollision),
+            });
         } else {
-            out.insert(lower, value.clone());
+            out.insert(lower.clone(), value.clone());
             folded = true;
+            changes.push(FieldChange {
+                field: key.clone(),
+                kind: FieldChangeKind::Renamed { to: lower },
+                code: Some(RepairCode::FieldNameCaseFolded),
+            });
         }
     }
     FoldedNames {
@@ -748,23 +895,30 @@ pub(crate) fn is_folded_name(name: &str) -> bool {
 /// Dropping the field is a repair with an honest answer rather than a
 /// guess: `_raw` is captured before this runs, so the name and its value
 /// both stay recoverable, and no other field in the event is punished for
-/// one bad key (rejecting the event would throw away good data).
-fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
+/// one bad key (rejecting the event would throw away good data). Each
+/// dropped key is recorded in `changes`.
+fn drop_unstorable_names(out: &mut Map<String, Value>, changes: &mut Vec<FieldChange>) -> bool {
     let unstorable: Vec<String> = out
         .keys()
         .filter(|k| !trawl_core::schema::is_storable_field_name(k))
         .cloned()
         .collect();
-    for k in &unstorable {
-        out.remove(k);
+    let dropped = !unstorable.is_empty();
+    for k in unstorable {
+        out.remove(&k);
+        changes.push(FieldChange {
+            field: k,
+            kind: FieldChangeKind::Dropped,
+            code: Some(RepairCode::FieldNameTooLong),
+        });
     }
-    !unstorable.is_empty()
+    dropped
 }
 
 /// Decide what to do about `host`, per door (ADR-0013).
 ///
-/// Returns whether the event arrived without one and, if so, the peer
-/// address to fill it from.
+/// `host_missing` is [`host_absent`] of the normalized event. Returns the
+/// peer address to fill a missing host from, if any.
 ///
 /// Only the HTTP door has a peer to fill from or to refuse behind: an
 /// HTTP sender can be rejected and resend, so trawl holds out for an
@@ -773,10 +927,9 @@ fn drop_unstorable_names(out: &mut Map<String, Value>) -> bool {
 /// absent and the caller confesses `host.omitted`: absent but honest beats
 /// both the peer-fill lie and dropping the event.
 fn decide_host<'a>(
-    out: &Map<String, Value>,
+    host_missing: bool,
     producer: &Producer<'a>,
-) -> Result<(bool, Option<&'a str>), (String, RejectReason)> {
-    let host_missing = matches!(out.get(trawl_core::schema::HOST), None | Some(Value::Null));
+) -> Result<Option<&'a str>, (String, RejectReason)> {
     let peer_fill = match producer {
         Producer::Http {
             peer_host,
@@ -795,7 +948,14 @@ fn decide_host<'a>(
         }
         _ => None,
     };
-    Ok((host_missing, peer_fill))
+    Ok(peer_fill)
+}
+
+/// Whether the event has no `host`: the key is absent or JSON `null`,
+/// which is absence rather than a value. The one rule behind the peer
+/// fill, the relay refusal, `host.omitted` and the reported `host_absent`.
+fn host_absent(out: &Map<String, Value>) -> bool {
+    matches!(out.get(trawl_core::schema::HOST), None | Some(Value::Null))
 }
 
 /// Derive `_time` from the first present source in this profile's
@@ -810,34 +970,76 @@ fn decide_host<'a>(
 /// First present, not first parseable: an unparseable value claims the
 /// derivation and falls to arrival time rather than reaching past itself
 /// to a lower-precedence source, so what `_time` holds is always
-/// explicable from one input.
+/// explicable from one input. The returned [`TimeSource`] names that
+/// input, including when it claimed the derivation and failed to parse.
 fn derive_time(
     out: &mut Map<String, Value>,
     ctx: &EnvelopeContext<'_>,
-) -> (String, Option<RepairCode>) {
+) -> (String, Option<RepairCode>, TimeSource) {
     let time_input = ctx
         .derivation
         .time_from(ctx.producer.kind())
         .iter()
-        .find_map(|source| out.get(&source.field).cloned());
+        .enumerate()
+        .find_map(|(index, source)| out.get(&source.field).cloned().map(|v| (index, v)));
     out.remove(trawl_core::schema::TIME);
-    match &time_input {
-        None => (ctx.arrival.to_owned(), Some(RepairCode::TimeFromIngest)),
-        Some(v) => match parse_event_time(v) {
-            Some(dt) => {
-                let past = ctx.arrival_instant - chrono::Duration::days(OUT_OF_RANGE_PAST_DAYS);
-                let future = ctx.arrival_instant + chrono::Duration::days(OUT_OF_RANGE_FUTURE_DAYS);
-                // Implausible, but parseable: kept — flagged, never
-                // substituted (the client said what it said).
-                let repair = (dt < past || dt > future).then_some(RepairCode::TimeOutOfRange);
-                (
-                    dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
-                    repair,
-                )
-            }
-            None => (ctx.arrival.to_owned(), Some(RepairCode::TimeFromIngest)),
-        },
+    let Some((index, v)) = time_input else {
+        return (
+            ctx.arrival.to_owned(),
+            Some(RepairCode::TimeFromIngest),
+            TimeSource::Arrival { unparseable: None },
+        );
+    };
+    match parse_event_time(&v) {
+        Some(dt) => {
+            let past = ctx.arrival_instant - chrono::Duration::days(OUT_OF_RANGE_PAST_DAYS);
+            let future = ctx.arrival_instant + chrono::Duration::days(OUT_OF_RANGE_FUTURE_DAYS);
+            // Implausible, but parseable: kept — flagged, never
+            // substituted (the client said what it said).
+            let repair = (dt < past || dt > future).then_some(RepairCode::TimeOutOfRange);
+            (
+                dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+                repair,
+                TimeSource::Field(index),
+            )
+        }
+        None => (
+            ctx.arrival.to_owned(),
+            Some(RepairCode::TimeFromIngest),
+            TimeSource::Arrival {
+                unparseable: Some(index),
+            },
+        ),
     }
+}
+
+/// Capture `_raw`, cut to [`MAX_RAW_CHARS`], returning it and whether it
+/// was cut (recorded in `changes` as `field.truncated`).
+///
+/// On a door that admits the proposal a client-supplied string `_raw` is
+/// kept verbatim; otherwise the pre-repair serialization of the pre-fold
+/// `obj` is the most original form available, since wire-exact bytes do
+/// not exist (events arrive inside JSON arrays and the WAL re-serializes
+/// anyway).
+fn capture_raw(
+    obj: &Map<String, Value>,
+    folded: &Map<String, Value>,
+    raw_proposable: bool,
+    changes: &mut Vec<FieldChange>,
+) -> (String, bool) {
+    let raw_string = match folded.get(trawl_core::schema::RAW) {
+        Some(Value::String(s)) if raw_proposable => s.clone(),
+        _ => serde_json::to_string(obj).unwrap_or_default(),
+    };
+    let (raw_string, truncated) = truncate_chars(raw_string, MAX_RAW_CHARS);
+    if truncated {
+        changes.push(FieldChange {
+            field: trawl_core::schema::RAW.to_owned(),
+            kind: FieldChangeKind::Truncated,
+            code: Some(RepairCode::FieldTruncated),
+        });
+    }
+    (raw_string, truncated)
 }
 
 /// Canonicalize one parsed event object into the declared envelope.
@@ -880,31 +1082,27 @@ fn derive_time(
 ///    7.5. `_producer` stamp, after the strip, so an incoming `_producer`
 ///    has already become a bare `producer` and the column is unforgeable.
 /// 8. `_repairs` assembly (omitted when clean).
+///
+/// Each step records its own decision in the [`Lineage`] as it makes it,
+/// so the lineage is never reconstructed from the rules afterwards.
 pub fn canonicalize(
     obj: &Map<String, Value>,
     ctx: &EnvelopeContext<'_>,
-) -> Result<Canonical, (String, RejectReason)> {
+) -> Result<Canonical, Rejection> {
+    let mut changes: Vec<FieldChange> = Vec::new();
+
     // 0. One spelling per DuckDB identifier, before anything reads a name.
-    let fold = fold_field_names(obj);
+    let fold = fold_field_names(obj, &mut changes);
     let folded_obj = fold.obj;
 
-    // 1. Capture `_raw` before anything is stripped or repaired. On a door
-    // that admits the proposal a client-supplied string `_raw` is kept
-    // verbatim; otherwise the pre-repair serialization of the pre-fold
-    // object is the most original form available, since wire-exact bytes
-    // do not exist (events arrive inside JSON arrays and the WAL
-    // re-serializes anyway).
+    // 1. Capture `_raw` before anything is stripped or repaired.
     let raw_proposable = raw_is_proposable(ctx.producer.kind());
-    let raw_string = match folded_obj.get(trawl_core::schema::RAW) {
-        Some(Value::String(s)) if raw_proposable => s.clone(),
-        _ => serde_json::to_string(obj).unwrap_or_default(),
-    };
-    let (raw_string, truncated) = truncate_chars(raw_string, MAX_RAW_CHARS);
+    let (raw_string, truncated) = capture_raw(obj, &folded_obj, raw_proposable, &mut changes);
 
     let mut out = folded_obj;
 
     // 2. The `_` namespace is trawl's: strip the prefix, keep the data.
-    let strip = strip_reserved_prefixes(&mut out, raw_proposable);
+    let strip = strip_reserved_prefixes(&mut out, raw_proposable, &mut changes);
 
     let mut repairs: Vec<RepairCode> = Vec::new();
     let push_repair = |repairs: &mut Vec<RepairCode>, code: RepairCode| {
@@ -920,7 +1118,7 @@ pub fn canonicalize(
         for code in asserted.repairs {
             push_repair(&mut repairs, *code);
         }
-        if apply_assertions(&mut out, asserted) {
+        if apply_assertions(&mut out, asserted, &mut changes) {
             push_repair(&mut repairs, RepairCode::ProducerAsserted);
         }
     }
@@ -930,11 +1128,18 @@ pub fn canonicalize(
     // is ordinary sender-asserted data and the fills below cannot
     // overwrite it (nor claim in `_repairs` that the sender asserted
     // nothing). A profile's assertion sits in those same slots, so it
-    // faces exactly these validators.
-    let service = validate_service(&out)?;
-    let (env, env_defaulted) = resolve_env(&out, ctx)?;
+    // faces exactly these validators. Whether `host` is absent is settled
+    // first, so a rejection reports it too.
+    let host_missing = host_absent(&out);
+    let reject = |(message, reason): (String, RejectReason)| Rejection {
+        reason,
+        message,
+        host_absent: host_missing,
+    };
+    let service = validate_service(&out).map_err(reject)?;
+    let (env, env_defaulted) = resolve_env(&out, ctx).map_err(reject)?;
 
-    let (host_missing, peer_fill) = decide_host(&out, &ctx.producer)?;
+    let peer_fill = decide_host(host_missing, &ctx.producer).map_err(reject)?;
 
     if fold.folded {
         push_repair(&mut repairs, RepairCode::FieldNameCaseFolded);
@@ -950,15 +1155,15 @@ pub fn canonicalize(
     }
 
     // 3.2. Names too long to be a catalog key never become columns.
-    if drop_unstorable_names(&mut out) {
+    if drop_unstorable_names(&mut out, &mut changes) {
         push_repair(&mut repairs, RepairCode::FieldNameTooLong);
     }
 
     // 3.5. Nested values become JSON text (see [`stringify_nested_values`]).
-    stringify_nested_values(&mut out);
+    stringify_nested_values(&mut out, &mut changes);
 
     // 4. `_time` from this profile's own source list.
-    let (canonical_time, time_repair) = derive_time(&mut out, ctx);
+    let (canonical_time, time_repair, time_source) = derive_time(&mut out, ctx);
     if let Some(code) = time_repair {
         push_repair(&mut repairs, code);
     }
@@ -983,7 +1188,7 @@ pub fn canonicalize(
 
     // 7. `_severity` derivation is read-only: every source stays where
     // it is, and an event with no mappable one simply has no `_severity`.
-    let severity_unmapped =
+    let severity_source =
         derive_severity(&mut out, ctx.derivation.severity_from(ctx.producer.kind()));
 
     // 7.5. Provenance becomes data (ADR-0013). Stamped from the profile,
@@ -1015,7 +1220,12 @@ pub fn canonicalize(
         service,
         obj: out,
         repairs,
-        severity_unmapped,
+        lineage: Lineage {
+            time: time_source,
+            severity: severity_source,
+            fields: changes,
+        },
+        host_absent: host_missing,
     })
 }
 
@@ -1075,7 +1285,8 @@ mod tests {
 
     fn reject(json: &str) -> (String, RejectReason) {
         let e = envs(&["prod", "lab"]);
-        canonicalize(&event(json), &ctx_with(&e, false)).expect_err("event must reject")
+        let r = canonicalize(&event(json), &ctx_with(&e, false)).expect_err("event must reject");
+        (r.message, r.reason)
     }
 
     fn codes(c: &Canonical) -> Vec<&'static str> {
@@ -1290,7 +1501,11 @@ mod tests {
     fn missing_host_behind_trusted_relay_rejects() {
         let e = envs(&["prod"]);
         let ctx = ctx_with(&e, true);
-        let (msg, reason) = canonicalize(
+        let Rejection {
+            message: msg,
+            reason,
+            ..
+        } = canonicalize(
             &event(r#"{"service":"s","env":"prod","_time":"2025-12-31T23:00:00Z"}"#),
             &ctx,
         )
@@ -1347,7 +1562,8 @@ mod tests {
 
     fn reject_obj(obj: &Map<String, Value>) -> (String, RejectReason) {
         let e = envs(&["prod", "lab"]);
-        canonicalize(obj, &ctx_with(&e, false)).expect_err("event must reject")
+        let r = canonicalize(obj, &ctx_with(&e, false)).expect_err("event must reject");
+        (r.message, r.reason)
     }
 
     #[test]
@@ -1414,7 +1630,7 @@ mod tests {
             "no mappable source → no `_severity` key at all"
         );
         assert!(
-            c.severity_unmapped,
+            c.severity_unmapped(),
             "a source existed and mapped to nothing — the ops counter's input"
         );
         // `env`/`host`/`_time` are filled, which is confessed; nothing
@@ -1438,7 +1654,7 @@ mod tests {
             3,
             "OTel 1-24, never the syslog inversion that would say 17"
         );
-        assert!(!c.severity_unmapped);
+        assert!(!c.severity_unmapped());
     }
 
     /// The numeric dialect matrix (ADR-0013 §4): words map through the
@@ -1467,7 +1683,7 @@ mod tests {
                 .and_then(Value::as_i64);
             assert_eq!(got, expected, "severity {input}");
             assert_eq!(
-                c.severity_unmapped,
+                c.severity_unmapped(),
                 expected.is_none(),
                 "the counter fires exactly when a source mapped to nothing: {input}"
             );
@@ -1533,7 +1749,7 @@ mod tests {
     fn absent_severity_sources_are_silent() {
         let c = canon(r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z"}"#);
         assert!(!c.obj.contains_key(trawl_core::schema::SEVERITY));
-        assert!(!c.severity_unmapped);
+        assert!(!c.severity_unmapped());
         assert!(c.repairs.is_empty());
     }
 
@@ -2439,7 +2655,7 @@ mod tests {
         let e = envs(&["prod"]);
         let d = default_derivation();
         let a = asserted("prod", "../escaped", Some("gw"), None, &[]);
-        let (_, reason) = canonicalize(
+        let Rejection { reason, .. } = canonicalize(
             &event(r#"{"msg":"x"}"#),
             &profile_ctx(&e, Producer::Syslog(a), d),
         )
@@ -2562,7 +2778,7 @@ mod tests {
         assert!(!c.obj.contains_key("_severity"));
         assert_eq!(c.obj["level"], "error", "the source column is untouched");
         assert!(
-            !c.severity_unmapped,
+            !c.severity_unmapped(),
             "no source was CONSULTED, so nothing was unmapped"
         );
 
@@ -2572,5 +2788,451 @@ mod tests {
         let ctx = profile_ctx(&e, Producer::Syslog(a), &derivation);
         let c = canonicalize(&event(r#"{"syslog_severity":4}"#), &ctx).unwrap();
         assert_eq!(c.obj["_severity"], 13, "syslog 4 is warning, OTel 13");
+    }
+
+    // --- lineage (ADR-0049): each decision records itself ---
+
+    fn change(field: &str, kind: FieldChangeKind, code: Option<RepairCode>) -> FieldChange {
+        FieldChange {
+            field: field.to_owned(),
+            kind,
+            code,
+        }
+    }
+
+    fn renamed(to: &str) -> FieldChangeKind {
+        FieldChangeKind::Renamed { to: to.to_owned() }
+    }
+
+    /// The position of `field` in the HTTP door's default `time_from` list.
+    fn time_at(field: &str) -> usize {
+        let sources = default_derivation().time_from(producer::ProducerKind::Http);
+        sources.iter().position(|s| s.field == field).unwrap()
+    }
+
+    /// The position of `field` in the HTTP door's default `severity_from`
+    /// list.
+    fn severity_at(field: &str) -> usize {
+        let sources = default_derivation().severity_from(producer::ProducerKind::Http);
+        sources.iter().position(|s| s.field == field).unwrap()
+    }
+
+    #[test]
+    fn time_lineage_names_the_parsed_source() {
+        let c = canon(r#"{"service":"s","timestamp":"2025-12-31T23:00:00Z"}"#);
+        assert_eq!(c.lineage.time, TimeSource::Field(time_at("timestamp")));
+        assert_eq!(c.obj["_time"], "2025-12-31T23:00:00.000000Z");
+        let TimeSource::Field(index) = c.lineage.time else {
+            unreachable!()
+        };
+        assert_eq!(
+            default_derivation().time_field(producer::ProducerKind::Http, index),
+            "timestamp",
+            "the preview names the position through the same derivation"
+        );
+    }
+
+    #[test]
+    fn time_lineage_names_a_first_present_but_invalid_source() {
+        // `_time` claims the derivation and fails; the valid `timestamp`
+        // below it is never reached, and the lineage says which input lost.
+        let c = canon(r#"{"service":"s","_time":"garbage","timestamp":"2025-12-31T23:00:00Z"}"#);
+        assert_eq!(
+            c.lineage.time,
+            TimeSource::Arrival {
+                unparseable: Some(time_at("_time"))
+            }
+        );
+        assert_eq!(c.obj["_time"], ARRIVAL);
+        assert!(codes(&c).contains(&"time.from_ingest"));
+
+        // A present JSON null claims precedence the same way.
+        let c = canon(r#"{"service":"s","_time":null,"timestamp":"2025-12-31T23:00:00Z"}"#);
+        assert_eq!(
+            c.lineage.time,
+            TimeSource::Arrival {
+                unparseable: Some(time_at("_time"))
+            }
+        );
+    }
+
+    #[test]
+    fn time_lineage_with_no_source_is_bare_arrival() {
+        let c = canon(r#"{"service":"s"}"#);
+        assert_eq!(c.lineage.time, TimeSource::Arrival { unparseable: None });
+        assert_eq!(c.obj["_time"], ARRIVAL);
+    }
+
+    #[test]
+    fn severity_lineage_records_the_fall_through_to_a_mappable_source() {
+        let c = canon(r#"{"service":"s","severity":"gold","severity_text":"gold","level":"warn"}"#);
+        assert_eq!(
+            c.lineage.severity,
+            SeveritySource::Field {
+                index: severity_at("level"),
+                skipped_unmappable: vec![severity_at("severity"), severity_at("severity_text")],
+            }
+        );
+        assert_eq!(c.obj["_severity"], 13);
+        assert!(!c.severity_unmapped());
+
+        // The preview names the positions through the same derivation.
+        let SeveritySource::Field {
+            index,
+            skipped_unmappable,
+        } = &c.lineage.severity
+        else {
+            unreachable!()
+        };
+        let name =
+            |i: &usize| default_derivation().severity_field(producer::ProducerKind::Http, *i);
+        assert_eq!(name(index), "level");
+        assert_eq!(
+            skipped_unmappable.iter().map(name).collect::<Vec<_>>(),
+            ["severity", "severity_text"]
+        );
+
+        // The first source mapping skips nothing.
+        let c = canon(r#"{"service":"s","severity":17,"level":"debug"}"#);
+        assert_eq!(
+            c.lineage.severity,
+            SeveritySource::Field {
+                index: severity_at("severity"),
+                skipped_unmappable: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn severity_lineage_tells_missing_from_unmappable() {
+        let missing = canon(r#"{"service":"s","msg":"x"}"#);
+        assert_eq!(missing.lineage.severity, SeveritySource::Missing);
+        assert!(!missing.severity_unmapped());
+
+        let unmapped = canon(r#"{"service":"s","severity":"gold","level":"silver"}"#);
+        assert_eq!(
+            unmapped.lineage.severity,
+            SeveritySource::Unmapped {
+                sources: vec![severity_at("severity"), severity_at("level")],
+            }
+        );
+        assert!(unmapped.severity_unmapped());
+        assert!(!unmapped.obj.contains_key("_severity"));
+    }
+
+    #[test]
+    fn case_fold_collision_drops_the_loser_and_keeps_the_exact_spelling() {
+        // The exact spelling wins untouched, so it earns no entry; the
+        // variant is the dropped loser.
+        let c = canon(r#"{"service":"s","FOO":1,"foo":2}"#);
+        assert_eq!(
+            c.lineage.fields,
+            vec![change(
+                "FOO",
+                FieldChangeKind::Dropped,
+                Some(RepairCode::FieldNameCaseCollision)
+            )]
+        );
+        assert_eq!(c.obj["foo"], 2);
+
+        // Variants only: the lexicographically first is folded (the
+        // winner's rename), the other dropped.
+        let c = canon(r#"{"service":"s","Foo":1,"FOO":2}"#);
+        assert_eq!(
+            c.lineage.fields,
+            vec![
+                change("FOO", renamed("foo"), Some(RepairCode::FieldNameCaseFolded)),
+                change(
+                    "Foo",
+                    FieldChangeKind::Dropped,
+                    Some(RepairCode::FieldNameCaseCollision)
+                ),
+            ]
+        );
+        assert_eq!(c.obj["foo"], 2);
+    }
+
+    #[test]
+    fn reserved_prefix_lineage_records_each_step_of_a_chain() {
+        let c = canon(r#"{"service":"s","host":"h","_HOSTNAME":"box","_":1,"_foo":2,"foo":3}"#);
+        assert_eq!(
+            c.lineage.fields,
+            vec![
+                // Step 0: the fold sees the arriving spelling.
+                change(
+                    "_HOSTNAME",
+                    renamed("_hostname"),
+                    Some(RepairCode::FieldNameCaseFolded)
+                ),
+                // Step 2: the strip sees folded names, in map order.
+                change(
+                    "_",
+                    FieldChangeKind::Dropped,
+                    Some(RepairCode::ReservedPrefix)
+                ),
+                change(
+                    "_foo",
+                    FieldChangeKind::Dropped,
+                    Some(RepairCode::ReservedPrefixCollision)
+                ),
+                change(
+                    "_hostname",
+                    renamed("hostname"),
+                    Some(RepairCode::ReservedPrefix)
+                ),
+            ]
+        );
+        assert_eq!(c.obj["hostname"], "box");
+        assert_eq!(c.obj["foo"], 3);
+    }
+
+    #[test]
+    fn truncated_raw_is_a_field_change() {
+        let long = "x".repeat(MAX_RAW_CHARS + 10);
+        let c = canon(&format!(r#"{{"service":"s","_raw":"{long}"}}"#));
+        assert_eq!(
+            c.lineage.fields,
+            vec![change(
+                "_raw",
+                FieldChangeKind::Truncated,
+                Some(RepairCode::FieldTruncated)
+            )]
+        );
+    }
+
+    #[test]
+    fn an_overlong_name_is_a_dropped_field_change() {
+        let name = "a".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
+        let c = canon(&format!(r#"{{"service":"s","{name}":1}}"#));
+        assert_eq!(
+            c.lineage.fields,
+            vec![change(
+                &name,
+                FieldChangeKind::Dropped,
+                Some(RepairCode::FieldNameTooLong)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_stringified_nested_value_is_a_field_change_without_a_code() {
+        let c = canon(r#"{"service":"s","k8s":{"pod":"p"},"tags":[1,2],"n":1}"#);
+        assert_eq!(
+            c.lineage.fields,
+            vec![
+                change("k8s", FieldChangeKind::Stringified, None),
+                change("tags", FieldChangeKind::Stringified, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn producer_assertions_record_each_displaced_payload_value() {
+        // Overwritten and emptied slots are both drops: the payload's
+        // value is gone from the event (it stays in `_raw`).
+        let a = asserted("prod", "trawld", None, Some("asserted"), &[]);
+        let c = canon_profile(
+            r#"{"service":"nginx","host":"web01","env":"lab","message":"boom"}"#,
+            Producer::Trawld(a),
+        );
+        let dropped = |field: &str| {
+            change(
+                field,
+                FieldChangeKind::Dropped,
+                Some(RepairCode::ProducerAsserted),
+            )
+        };
+        assert_eq!(
+            c.lineage.fields,
+            vec![
+                dropped("env"),
+                dropped("service"),
+                dropped("host"),
+                dropped("message")
+            ]
+        );
+        assert_eq!(c.obj["service"], "trawld");
+        assert_eq!(c.obj["env"], "prod");
+        assert!(!c.obj.contains_key("host"));
+
+        // An identical value or a null displaces nothing.
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        let c = canon_profile(
+            r#"{"service":"unifi","host":null,"env":"lab","msg":"x"}"#,
+            Producer::Syslog(a),
+        );
+        assert_eq!(c.lineage.fields, vec![dropped("env")]);
+    }
+
+    #[test]
+    fn host_absent_is_reported_on_accepted_events() {
+        assert!(!canon(r#"{"service":"s","host":"h"}"#).host_absent);
+        // A stripped `_host` lands on the bare slot before the check.
+        assert!(!canon(r#"{"service":"s","_host":"h"}"#).host_absent);
+
+        let filled = canon(r#"{"service":"s"}"#);
+        assert!(filled.host_absent);
+        assert_eq!(filled.obj["host"], "10.0.4.55");
+        assert!(canon(r#"{"service":"s","host":null}"#).host_absent);
+
+        // A profile door's omitted host is absent too.
+        let a = asserted("prod", "unifi", None, None, &[]);
+        assert!(canon_profile(r#"{"msg":"x"}"#, Producer::Syslog(a)).host_absent);
+        let a = asserted("prod", "unifi", Some("gw"), None, &[]);
+        assert!(!canon_profile(r#"{"msg":"x"}"#, Producer::Syslog(a)).host_absent);
+    }
+
+    #[test]
+    fn host_absent_is_reported_on_rejected_events() {
+        let e = envs(&["prod", "lab"]);
+        let ctx = ctx_with(&e, false);
+
+        // Service validation refuses before the host is decided, and the
+        // rejection still says whether the host was there.
+        let r = canonicalize(&event(r#"{"msg":"x"}"#), &ctx).unwrap_err();
+        assert_eq!(r.reason, RejectReason::MissingService);
+        assert!(r.host_absent);
+
+        let r = canonicalize(&event(r#"{"msg":"x","host":"h"}"#), &ctx).unwrap_err();
+        assert_eq!(r.reason, RejectReason::MissingService);
+        assert!(!r.host_absent);
+
+        let r = canonicalize(&event(r#"{"service":"s","env":"nope"}"#), &ctx).unwrap_err();
+        assert_eq!(r.reason, RejectReason::EnvNotAllowed);
+        assert!(r.host_absent);
+
+        let relay = ctx_with(&e, true);
+        let r = canonicalize(&event(r#"{"service":"s","host":null}"#), &relay).unwrap_err();
+        assert_eq!(r.reason, RejectReason::HostMissingFromRelay);
+        assert!(r.host_absent);
+    }
+
+    /// Whether a repair code describes a field change. Exhaustive with no
+    /// wildcard arm, so a new code must state which side it is on.
+    const fn is_field_level(code: RepairCode) -> bool {
+        match code {
+            RepairCode::FieldTruncated
+            | RepairCode::ReservedPrefix
+            | RepairCode::ReservedPrefixCollision
+            | RepairCode::FieldNameTooLong
+            | RepairCode::FieldNameCaseFolded
+            | RepairCode::FieldNameCaseCollision
+            | RepairCode::ProducerAsserted => true,
+            RepairCode::HostFromPeer
+            | RepairCode::EnvDefaulted
+            | RepairCode::TimeFromIngest
+            | RepairCode::TimeOutOfRange
+            | RepairCode::HostOmitted
+            | RepairCode::ServiceFromProfile => false,
+        }
+    }
+
+    #[test]
+    fn lineage_and_repairs_agree() {
+        let long_name = "a".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
+        let long_raw = "x".repeat(MAX_RAW_CHARS + 1);
+        let fixtures = [
+            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z"}"#.to_owned(),
+            r#"{"service":"s"}"#.to_owned(),
+            r#"{"service":"s","FOO":1,"foo":2}"#.to_owned(),
+            r#"{"service":"s","Foo":1,"FOO":2,"Bar":3}"#.to_owned(),
+            r#"{"service":"s","_HOSTNAME":"box"}"#.to_owned(),
+            r#"{"service":"s","_foo":1,"foo":2}"#.to_owned(),
+            r#"{"service":"s","___":1}"#.to_owned(),
+            r#"{"service":"s","_Foo":1,"_foo":2,"foo":3}"#.to_owned(),
+            r#"{"service":"s","_raw":{"nested":true}}"#.to_owned(),
+            r#"{"service":"s","k8s":{"pod":"p"},"tags":[1]}"#.to_owned(),
+            r#"{"service":"s","_time":"garbage"}"#.to_owned(),
+            r#"{"service":"s","_time":"1990-01-01T00:00:00Z"}"#.to_owned(),
+            r#"{"service":"s","severity":"gold","level":"warn"}"#.to_owned(),
+            format!(r#"{{"service":"s","{long_name}":1}}"#),
+            format!(r#"{{"service":"s","_raw":"{long_raw}"}}"#),
+            format!(r#"{{"Service":"s","_X":{{"a":1}},"{long_name}":1,"_raw":"{long_raw}"}}"#),
+        ];
+        // Profile doors: displaced and emptied asserted slots, plus an
+        // identical value and a null that displace nothing.
+        let trawld = asserted("prod", "trawld", Some("box"), None, &[]);
+        let syslog = asserted("prod", "unifi", Some("gw"), Some("link down"), &[]);
+        let hostless = asserted("prod", "unifi", None, None, &[]);
+        let profile_fixtures = [
+            (
+                r#"{"service":"nginx","host":"web01","env":"lab","message":"boom"}"#,
+                Producer::Trawld(trawld),
+            ),
+            (
+                r#"{"service":"unifi","host":"gw","message":"other","_service":"x"}"#,
+                Producer::Syslog(syslog),
+            ),
+            (
+                r#"{"service":"unifi","host":"gw","env":"prod","message":"link down"}"#,
+                Producer::Syslog(syslog),
+            ),
+            (
+                r#"{"host":"whatever","msg":"x"}"#,
+                Producer::Syslog(hostless),
+            ),
+            (r#"{"host":null,"msg":"x"}"#, Producer::Syslog(hostless)),
+        ];
+        let http = fixtures
+            .iter()
+            .map(|json| (json.as_str(), canon(json), true));
+        let profile = profile_fixtures
+            .into_iter()
+            .map(|(json, producer)| (json, canon_profile(json, producer), false));
+        for (json, c, is_http) in http.chain(profile) {
+            let label = &json[..json.len().min(80)];
+            for change in &c.lineage.fields {
+                if let Some(code) = change.code {
+                    assert!(
+                        c.repairs.contains(&code),
+                        "{label}: change {change:?} has a code missing from {:?}",
+                        c.repairs
+                    );
+                }
+            }
+            for code in c.repairs.iter().copied().filter(|c| is_field_level(*c)) {
+                // A collision is a strip that lost, so a collision drop
+                // also accounts for `field.reserved_prefix`.
+                let covers = |change: &FieldChange| {
+                    change.code == Some(code)
+                        || (code == RepairCode::ReservedPrefix
+                            && change.code == Some(RepairCode::ReservedPrefixCollision))
+                };
+                assert!(
+                    c.lineage.fields.iter().any(covers),
+                    "{label}: repair {code} has no field change in {:?}",
+                    c.lineage.fields
+                );
+            }
+            assert_eq!(
+                c.repairs.contains(&RepairCode::TimeFromIngest),
+                matches!(c.lineage.time, TimeSource::Arrival { .. }),
+                "{label}: time lineage disagrees with repairs"
+            );
+            if c.repairs.contains(&RepairCode::TimeOutOfRange) {
+                assert!(matches!(c.lineage.time, TimeSource::Field(_)), "{label}");
+            }
+            if is_http {
+                assert_eq!(
+                    c.repairs.contains(&RepairCode::HostFromPeer),
+                    c.host_absent,
+                    "{label}: the HTTP door fills exactly the absent hosts"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repair_code_labels_are_distinct() {
+        let labels: std::collections::HashSet<_> =
+            RepairCode::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(labels.len(), RepairCode::ALL.len(), "labels are distinct");
+    }
+
+    #[test]
+    fn reject_reason_labels_are_distinct() {
+        let labels: std::collections::HashSet<_> =
+            RejectReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(labels.len(), RejectReason::ALL.len(), "labels are distinct");
     }
 }

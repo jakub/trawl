@@ -4,8 +4,8 @@ description: Command syntax, options, defaults, and output formats for the trawl
 ---
 
 The `trawl` binary runs the terminal UI, executes queries, validates syntax,
-inspects the field catalog, checks a connection, and drives a running TUI over
-a Unix socket.
+previews ingest, inspects the field catalog, checks a connection, and drives a
+running TUI over a Unix socket.
 For catalog procedures, see [catalog administration](/operate/catalog/).
 
 ## Global options
@@ -64,8 +64,8 @@ error. See [client configuration](/reference/configuration/#client-configuration
 | Code | Meaning |
 |------|---------|
 | `0` | The command succeeded |
-| `1` | The command failed. `trawl` prints the reason to stderr, except for a broken pipe, which exits quietly. For `trawl doctor`, the verdict is `fail` |
-| `2` | Usage error. The command line is not valid, or `trawl doctor` refused it. `trawl` prints the reason to stderr |
+| `1` | The command failed. `trawl` prints the reason to stderr, except for a broken pipe, which exits quietly. For `trawl doctor`, the verdict is `fail`. For `trawl preview-ingest`, the report is complete and at least one event is rejected |
+| `2` | Usage error. The command line is not valid, or `trawl doctor` refused it. `trawl` prints the reason to stderr. For `trawl preview-ingest`, also any failure that leaves no complete report |
 | `3` | `trawl doctor` only. The verdict is `incomplete` |
 
 ## TUI mode
@@ -150,6 +150,74 @@ parses locally.
 ```bash
 trawl validate "_severity>=error | stats count() by host"
 ```
+
+## Preview ingest mode
+
+```text
+trawl preview-ingest [FILE|-] [--peer-ip IP] [--json]
+```
+
+Sends a sample of events to `POST /api/v1/ingest/preview` and prints what
+trawld would do to each one. Nothing from the sample is stored. The sample is
+NDJSON or a JSON array, the same body as `/api/v1/ingest`, with at most 500
+events and at most `[server] max_request_body_bytes`, 128K by default. The key
+needs `server_manage`. See [ingest preview](/operate/ingestion/#ingest-preview)
+for what a preview shows and what it does not promise.
+
+| Argument or flag | Value | Default | Description |
+|------------------|-------|---------|-------------|
+| `FILE` | `<PATH>` or `-` | *(standard input)* | The sample file. `-`, or no `FILE`, reads standard input |
+| `--peer-ip` | `<IP>` | *(none)* | The address trawld would see for the sender. Without it, trawld uses `192.0.2.1` and marks each event without `host` as depending on the sender |
+| `--json` | *(flag)* | `false` | Print the server's report as JSON instead of the table |
+
+The output has a header line, a table with one row per event in input order,
+and a footer line. In every value from the sample, control, bidi, and
+zero-width characters print as `�`.
+
+The header line names the peer address, says whether `--peer-ip` gave it,
+says whether it is a trusted relay, and gives the arrival time that every
+event in the sample shares:
+
+```text
+peer 192.0.2.1 (placeholder, no --peer-ip given; an event without a host depends on the sender), not a trusted relay; arrival 2026-10-01T12:00:00.000000Z
+peer 10.0.0.7 (given), not a trusted relay; arrival 2026-10-01T12:00:00.000000Z
+```
+
+The table has these columns. A cell with no value shows `-`. A rejected row
+shows `-` in every column except `index`, `outcome`, `host`, and
+`reason or changes`.
+
+| Column | Shows |
+|--------|-------|
+| `index` | The position in the sample. In NDJSON, blank lines count, so an index can be skipped |
+| `outcome` | `accepted` or `rejected` |
+| `env` | The canonical `env` |
+| `service` | The canonical `service` |
+| `host` | The canonical `host`. `(sender)` follows it when the value comes from the sender's address. On a rejected row, `(sender)` alone means the event had no `host` and no peer was given |
+| `_time` | The canonical value and, in parentheses, the field it came from, such as `2026-01-01T10:00:00.000000Z (_time)`. `arrival` when no source field was present and the arrival time filled it. `arrival (bad timestamp)` when the first present source, here `timestamp`, did not parse |
+| `_severity` | The OTel severity level and, in parentheses, the field it came from, such as `warn (level)`. A field that was present but did not map is listed after it, such as `warn (level, skipped severity)`. A level with no OTel name shows its number. `missing` when no source field was present. `unmapped (severity)` when source fields were present and none mapped |
+| `repairs` | The repair codes, one per line, in the order trawld applied them |
+| `reason or changes` | For a rejected event, the reason code and the message, such as `missing_service: missing 'service' field`. For an accepted event, one line per field change: `Level → level`, `ctx dropped`, `ctx truncated`, or `ctx stringified` |
+
+The footer line counts the events and the outcomes. When any event depends on
+the sender's address, it counts those events too:
+
+```text
+5 event(s): 3 accepted, 2 rejected; 2 depend on the sender's address (pass --peer-ip)
+```
+
+```bash
+trawl -p prod preview-ingest capture.ndjson
+head -n 50 capture.ndjson | trawl -p prod preview-ingest - --json | jq '.events[] | select(.outcome == "rejected")'
+```
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Every event is accepted. Repairs and sender dependence do not change the code |
+| `1` | The report is complete and at least one event is rejected, invalid JSON included |
+| `2` | No complete report: a usage error, a sample that cannot be read, a connection or HTTP error, or a report whose counts disagree with its events. A `404` prints `trawl: this server does not ingest: ingest is disabled on it, or it predates the ingest preview` |
 
 ## Schema mode
 

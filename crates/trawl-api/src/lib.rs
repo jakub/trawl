@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub mod csv;
 pub mod display;
 pub mod doctor;
+pub mod ingest_preview;
 pub mod value;
 
 use crate::value::{QueryResult, SchemaColumn};
@@ -139,6 +140,12 @@ pub enum ErrorCode {
     /// written before a restart, or an interrupted storage rollup is
     /// unresolved (ADR-0041). The failure record's cause kind says which.
     CorpusRecovering,
+    /// An ingest preview sample holds more events than one preview reads
+    /// (413). The sample is refused whole, never truncated (ADR-0049).
+    PreviewTooLarge,
+    /// The request body carries a `Content-Encoding` this route does not
+    /// decode (415).
+    UnsupportedEncoding,
 }
 
 /// Source location within a query string.
@@ -1894,11 +1901,17 @@ impl std::str::FromStr for RunsSortDir {
 /// A per-event error from the ingest endpoint.
 ///
 /// Reported when individual events in a batch fail validation while
-/// other events in the same batch succeed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// other events in the same batch succeed. The ingest preview reports a
+/// rejected event with the same `index`, `reason` and `message`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestEventError {
     /// Zero-based event index (array position or ndjson line number including blanks).
     pub index: usize,
+    /// The typed rejection reason as its wire code (`missing_service`,
+    /// `invalid_json`, ...): the closed set documented in the events
+    /// reference's rejection table, and the `reason` label of
+    /// `trawl_ingest_events_rejected_total`.
+    pub reason: String,
     /// Human-readable error description.
     pub message: String,
 }
@@ -2529,6 +2542,14 @@ mod tests {
             serde_json::to_string(&ErrorCode::CorpusRecovering).unwrap(),
             "\"corpus_recovering\""
         );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::PreviewTooLarge).unwrap(),
+            "\"preview_too_large\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::UnsupportedEncoding).unwrap(),
+            "\"unsupported_encoding\""
+        );
     }
 
     #[test]
@@ -2601,10 +2622,12 @@ mod tests {
             errors: vec![
                 IngestEventError {
                     index: 3,
+                    reason: "not_object".into(),
                     message: "expected JSON object".into(),
                 },
                 IngestEventError {
                     index: 7,
+                    reason: "missing_service".into(),
                     message: "missing 'service' field".into(),
                 },
             ],
@@ -2616,8 +2639,15 @@ mod tests {
         assert_eq!(rt.accepted, 8);
         assert_eq!(rt.rejected, 2);
         assert_eq!(rt.errors.len(), 2);
-        assert_eq!(rt.errors[0].index, 3);
-        assert_eq!(rt.errors[1].message, "missing 'service' field");
+        assert_eq!(rt.errors, resp.errors);
+        assert_eq!(
+            serde_json::to_value(&resp.errors[1]).unwrap(),
+            serde_json::json!({
+                "index": 7,
+                "reason": "missing_service",
+                "message": "missing 'service' field",
+            })
+        );
     }
 
     #[test]

@@ -331,7 +331,8 @@ fn the_http_profile_survives_a_hostile_corpus() {
                 collect_repairs(&canonical.obj, &mut seen);
                 accepted += 1;
             }
-            Err((_, reason)) => {
+            Err(rejection) => {
+                let reason = rejection.reason;
                 assert!(hostile_identity, "{origin}: rejected as {reason}");
                 assert!(
                     RejectReason::ALL.contains(&reason),
@@ -443,7 +444,7 @@ fn the_syslog_profile_survives_hostile_frames_and_payloads() {
             derivation: &derivation,
         };
         let canonical = canonicalize(&payload, &ctx)
-            .unwrap_or_else(|(_, reason)| panic!("{origin}: refused as {reason}"));
+            .unwrap_or_else(|rejection| panic!("{origin}: refused as {}", rejection.reason));
         assert_universal_gates(&canonical.obj, ProducerKind::Syslog, &origin);
         assert_profile_assertions(&canonical, &asserted, &origin);
         collect_repairs(&canonical.obj, &mut seen);
@@ -538,7 +539,8 @@ fn the_trawld_profile_never_rejects_a_hostile_payload() {
             derivation: &derivation,
         };
 
-        let canonical = canonicalize(&payload, &ctx).unwrap_or_else(|(_, reason)| {
+        let canonical = canonicalize(&payload, &ctx).unwrap_or_else(|rejection| {
+            let reason = rejection.reason;
             panic!("{origin}: the trawld profile rejected as {reason} — it has nobody to reject to")
         });
         assert_universal_gates(&canonical.obj, ProducerKind::Trawld, &origin);
