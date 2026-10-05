@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Check health and stalled work | trawl</title><link rel="canonical" href="https://trawl.sh/operate/health/"/><link rel="sitemap" href="/sitemap-index.xml"/><link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.2.8"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="Check health and stalled work"/><meta property="og:type" content="article"/><meta property="og:url" content="https://trawl.sh/operate/health/"/><meta property="og:locale" content="en"/><meta property="og:description" content="Confirm that a trawld server is serving, read what is degraded, and free capacity that a stalled query still holds."/><meta property="og:site_name" content="trawl"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="Confirm that a trawld server is serving, read what is degraded, and free capacity that a stalled query still holds."/><script>
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Check health and stalled work | trawl</title><link rel="canonical" href="https://trawl.sh/operate/health/"/><link rel="sitemap" href="/sitemap-index.xml"/><link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.2.8"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="Check health and stalled work"/><meta property="og:type" content="article"/><meta property="og:url" content="https://trawl.sh/operate/health/"/><meta property="og:locale" content="en"/><meta property="og:description" content="Confirm that a trawld server is serving, read what is degraded, read disk headroom and retention reach, and free capacity that a stalled query still holds."/><meta property="og:site_name" content="trawl"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="Confirm that a trawld server is serving, read what is degraded, read disk headroom and retention reach, and free capacity that a stalled query still holds."/><script>
 	window.StarlightThemeProvider = (() => {
 		const storedTheme =
 			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
@@ -70,11 +70,21 @@
 		})();
 	</script></sl-sidebar-state-persist><div class="md:sl-hidden"><div class="mobile-preferences sl-flex astro-b5gddk54"><div class="social-icons astro-b5gddk54"><a href="https://github.com/jakub/trawl" rel="me" class="sl-flex astro-cg55etiy"><span class="sr-only astro-cg55etiy">GitHub</span><svg aria-hidden="true" class="astro-cg55etiy astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><starlight-theme-select><label style="--sl-select-width: 6.25em" class="astro-r2p65idu"><span class="sr-only astro-r2p65idu">Select theme</span><svg aria-hidden="true" class="icon label-icon astro-r2p65idu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg><select autocomplete="off" class="astro-r2p65idu"><option value="dark" class="astro-r2p65idu">Dark</option><option value="light" class="astro-r2p65idu">Light</option><option value="auto" selected class="astro-r2p65idu">Auto</option></select><svg aria-hidden="true" class="icon caret astro-r2p65idu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1.002 1.002 0 0 0 1.42 0L17 10.59a1.002 1.002 0 0 0 0-1.42Z"/></svg></label></starlight-theme-select><script>
 	StarlightThemeProvider.updatePickers();
-</script></div></div></div></div></nav><div class="main-frame astro-gqpr5s5a"><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><div class="lg:sl-flex astro-abfeecmu"><aside class="right-sidebar-container print:hidden astro-abfeecmu"><div class="right-sidebar astro-abfeecmu"><div class="lg:sl-hidden astro-q5mffni3"><mobile-starlight-toc data-min-h="2" data-max-h="3" class="astro-5ulgm6bh"><nav aria-labelledby="starlight__on-this-page--mobile" class="astro-5ulgm6bh"><details id="starlight__mobile-toc" class="astro-5ulgm6bh"><summary id="starlight__on-this-page--mobile" class="sl-flex astro-5ulgm6bh"><span class="toggle sl-flex astro-5ulgm6bh">On this page<svg aria-hidden="true" class="caret astro-5ulgm6bh astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></span><span class="display-current astro-5ulgm6bh"></span></summary><div class="dropdown astro-5ulgm6bh"><ul class="isMobile astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#check-the-server" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Check the server</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-the-checks" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read the checks</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-capacity" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect capacity</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#diagnose-a-503-or-504-from-a-query" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Diagnose a 503 or 504 from a query</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#restore-missing-log-lines" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Restore missing log lines</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#find-authentication-failures" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Find authentication failures</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#enable-the-query-debug-log" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Enable the query debug log</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#remove-the-query-debug-log" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Remove the query debug log</span></a></li></ul></div></details></nav></mobile-starlight-toc><script type="module" src="/_astro/MobileTableOfContents.astro_astro_type_script_index_0_lang.BcSo_yiZ.js"></script></div><div class="right-sidebar-panel sl-hidden lg:sl-block astro-q5mffni3"><div class="sl-container astro-q5mffni3"><starlight-toc data-min-h="2" data-max-h="3"><nav aria-labelledby="starlight__on-this-page"><h2 id="starlight__on-this-page">On this page</h2><ul class="astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#check-the-server" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Check the server</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-the-checks" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read the checks</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-capacity" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect capacity</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#diagnose-a-503-or-504-from-a-query" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Diagnose a 503 or 504 from a query</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#restore-missing-log-lines" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Restore missing log lines</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#find-authentication-failures" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Find authentication failures</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#enable-the-query-debug-log" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Enable the query debug log</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#remove-the-query-debug-log" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Remove the query debug log</span></a></li></ul></nav></starlight-toc><script type="module" src="/_astro/TableOfContents.astro_astro_type_script_index_0_lang.Csloo1VZ.js"></script></div></div></div></aside><div class="main-pane astro-abfeecmu"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><aside class="preview-banner astro-yp67euhd">Manual for <a href="https://github.com/jakub/trawl/releases/tag/v0.9.0" class="astro-yp67euhd">Trawl v0.9.0</a>. <a href="/release.json" class="astro-yp67euhd">Build identity</a>.</aside><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><h1 id="_top" class="astro-2sm4b3ln">Check health and stalled work</h1></div></div><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><div class="sl-markdown-content"><p>These commands address one server. <code dir="auto">TRAWL_URL</code> names its HTTPS API,
+</script></div></div></div></div></nav><div class="main-frame astro-gqpr5s5a"><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><div class="lg:sl-flex astro-abfeecmu"><aside class="right-sidebar-container print:hidden astro-abfeecmu"><div class="right-sidebar astro-abfeecmu"><div class="lg:sl-hidden astro-q5mffni3"><mobile-starlight-toc data-min-h="2" data-max-h="3" class="astro-5ulgm6bh"><nav aria-labelledby="starlight__on-this-page--mobile" class="astro-5ulgm6bh"><details id="starlight__mobile-toc" class="astro-5ulgm6bh"><summary id="starlight__on-this-page--mobile" class="sl-flex astro-5ulgm6bh"><span class="toggle sl-flex astro-5ulgm6bh">On this page<svg aria-hidden="true" class="caret astro-5ulgm6bh astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></span><span class="display-current astro-5ulgm6bh"></span></summary><div class="dropdown astro-5ulgm6bh"><ul class="isMobile astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#check-the-server" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Check the server</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-the-checks" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read the checks</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-capacity" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect capacity</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-ingestion-and-storage" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect ingestion and storage</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-disk-and-retention" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read disk and retention</span></a><ul class="isMobile astro-cxyftcne" style="--depth: 1;"><li style="--depth: 1;" class="astro-cxyftcne"><a href="#read-retention-reach" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Read retention reach</span></a></li><li style="--depth: 1;" class="astro-cxyftcne"><a href="#read-an-environment-that-is-excluded-from-growth" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Read an environment that is excluded from growth</span></a></li><li style="--depth: 1;" class="astro-cxyftcne"><a href="#act-on-a-withheld-reach" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Act on a withheld reach</span></a></li><li style="--depth: 1;" class="astro-cxyftcne"><a href="#why-there-is-no-countdown" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Why there is no countdown</span></a></li><li style="--depth: 1;" class="astro-cxyftcne"><a href="#read-the-terminal-summary-line" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Read the terminal summary line</span></a></li></ul></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#diagnose-a-503-or-504-from-a-query" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Diagnose a 503 or 504 from a query</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#find-the-slow-phase-of-a-query" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Find the slow phase of a query</span></a><ul class="isMobile astro-cxyftcne" style="--depth: 1;"><li style="--depth: 1;" class="astro-cxyftcne"><a href="#join-a-timed-out-query-to-its-final-totals" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Join a timed-out query to its final totals</span></a></li></ul></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#trace-a-server-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Trace a server failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#restore-missing-log-lines" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Restore missing log lines</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#find-authentication-failures" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Find authentication failures</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#enable-the-query-debug-log" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Enable the query debug log</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#remove-the-query-debug-log" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Remove the query debug log</span></a></li></ul></div></details></nav></mobile-starlight-toc><script type="module" src="/_astro/MobileTableOfContents.astro_astro_type_script_index_0_lang.BcSo_yiZ.js"></script></div><div class="right-sidebar-panel sl-hidden lg:sl-block astro-q5mffni3"><div class="sl-container astro-q5mffni3"><starlight-toc data-min-h="2" data-max-h="3"><nav aria-labelledby="starlight__on-this-page"><h2 id="starlight__on-this-page">On this page</h2><ul class="astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#check-the-server" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Check the server</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-the-checks" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read the checks</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-capacity" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect capacity</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-ingestion-and-storage" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect ingestion and storage</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-disk-and-retention" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read disk and retention</span></a><ul class="astro-cxyftcne" style="--depth: 1;"><li style="--depth: 1;" class="astro-cxyftcne"><a href="#read-retention-reach" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Read retention reach</span></a></li><li style="--depth: 1;" class="astro-cxyftcne"><a href="#read-an-environment-that-is-excluded-from-growth" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Read an environment that is excluded from growth</span></a></li><li style="--depth: 1;" class="astro-cxyftcne"><a href="#act-on-a-withheld-reach" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Act on a withheld reach</span></a></li><li style="--depth: 1;" class="astro-cxyftcne"><a href="#why-there-is-no-countdown" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Why there is no countdown</span></a></li><li style="--depth: 1;" class="astro-cxyftcne"><a href="#read-the-terminal-summary-line" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Read the terminal summary line</span></a></li></ul></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#diagnose-a-503-or-504-from-a-query" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Diagnose a 503 or 504 from a query</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#find-the-slow-phase-of-a-query" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Find the slow phase of a query</span></a><ul class="astro-cxyftcne" style="--depth: 1;"><li style="--depth: 1;" class="astro-cxyftcne"><a href="#join-a-timed-out-query-to-its-final-totals" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Join a timed-out query to its final totals</span></a></li></ul></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#trace-a-server-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Trace a server failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#restore-missing-log-lines" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Restore missing log lines</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#find-authentication-failures" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Find authentication failures</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#enable-the-query-debug-log" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Enable the query debug log</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#remove-the-query-debug-log" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Remove the query debug log</span></a></li></ul></nav></starlight-toc><script type="module" src="/_astro/TableOfContents.astro_astro_type_script_index_0_lang.Csloo1VZ.js"></script></div></div></div></aside><div class="main-pane astro-abfeecmu"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><aside class="preview-banner astro-yp67euhd">Manual for <a href="https://github.com/jakub/trawl/releases/tag/v0.9.1" class="astro-yp67euhd">Trawl v0.9.1</a>. <a href="/release.json" class="astro-yp67euhd">Build identity</a>.</aside><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><h1 id="_top" class="astro-2sm4b3ln">Check health and stalled work</h1></div></div><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><div class="sl-markdown-content"><p>These commands address one server. <code dir="auto">TRAWL_URL</code> names its HTTPS API,
 <code dir="auto">TRAWL_PROFILE</code> names the matching CLI profile, and <code dir="auto">TRAWL_CURL_CONFIG</code> names
 an owner-only curl config file that holds the bearer header. Keep the token in
 that file, not on the command line, and do not print the file.</p>
+<p>The recipes on this page that search trawld’s own telemetry filter on
+<code dir="auto">service=trawld _producer=trawld</code>, not on <code dir="auto">service=trawld</code> alone. Any HTTP
+sender can set <code dir="auto">service=trawld</code> on the events it sends. Only trawld stamps
+<code dir="auto">_producer=trawld</code>, so that filter keeps a forged event out of the answer. See
+the <a href="/reference/events/#declared-fields">event reference</a>.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="check-the-server">Check the server</h2><a class="sl-anchor-link" href="#check-the-server"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Check the server”</span></a></div>
+<p>To check an installation from the server host, before or after the first start, run
+<a href="/reference/configuration/#check-the-installation-with-trawld---doctor"><code dir="auto">trawld --doctor</code></a>
+as the service user. It checks the databases, the data root, the certificate,
+and the listener without changing anything. To check a running server from a
+client, run <code dir="auto">trawl doctor</code> (see the <a href="/reference/cli/#doctor-mode">CLI reference</a>).</p>
 <p>For warnings about reported discards, persistence failures, compaction
 failures, and quarantined files, use <a href="/operate/operational-alerts/">Respond to operational alerts</a>.
 Those rules complement serving checks; they do not detect silent stalls or
@@ -83,8 +93,8 @@ establish recovery when an alert resolves.</p>
 <li>
 <p>Ask for health. <code dir="auto">/api/v1/health</code> needs no key.</p>
 <div class="expressive-code"><link rel="stylesheet" href="/_astro/ec.v4551.css"><script type="module" src="/_astro/ec.0vx5m.js"></script><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">curl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">--fail-with-body</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">--config</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_CURL_CONFIG</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_URL</span><span style="--0:#ECC48D;--1:#984E4D">/api/v1/health</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="curl --fail-with-body --config &quot;$TRAWL_CURL_CONFIG&quot; &quot;$TRAWL_URL/api/v1/health&quot;"><div></div></button></div></figure></div>
-<p>A serving server answers 200 with <code dir="auto">"status":"ok"</code> and four checks that read <code dir="auto">ok</code>:</p>
-<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#D6DEEB;--1:#403F53">{</span><span style="--0:#7FDBCA;--1:#096E72">"status"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"checks"</span><span style="--0:#D6DEEB;--1:#403F53">:{</span><span style="--0:#7FDBCA;--1:#096E72">"duckdb"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"auth_db"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"storage_db"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"data_path"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">},</span><span style="--0:#7FDBCA;--1:#096E72">"version"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">...</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{&quot;status&quot;:&quot;ok&quot;,&quot;checks&quot;:{&quot;duckdb&quot;:&quot;ok&quot;,&quot;auth_db&quot;:&quot;ok&quot;,&quot;storage_db&quot;:&quot;ok&quot;,&quot;data_path&quot;:&quot;ok&quot;},&quot;version&quot;:&quot;...&quot;}"><div></div></button></div></figure></div>
+<p>A serving server answers 200 with <code dir="auto">"status":"ok"</code> and six checks that read <code dir="auto">ok</code>:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="json"><code><div class="ec-line"><div class="code"><span style="--0:#D6DEEB;--1:#403F53">{</span><span style="--0:#7FDBCA;--1:#096E72">"status"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"checks"</span><span style="--0:#D6DEEB;--1:#403F53">:{</span><span style="--0:#7FDBCA;--1:#096E72">"duckdb"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"auth_db"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"storage_db"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"data_path"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"ingest_capacity"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">,</span><span style="--0:#7FDBCA;--1:#096E72">"corpus"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">ok</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">},</span><span style="--0:#7FDBCA;--1:#096E72">"version"</span><span style="--0:#D6DEEB;--1:#403F53">:</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C789D6;--1:#7C5686">...</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53">}</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="{&quot;status&quot;:&quot;ok&quot;,&quot;checks&quot;:{&quot;duckdb&quot;:&quot;ok&quot;,&quot;auth_db&quot;:&quot;ok&quot;,&quot;storage_db&quot;:&quot;ok&quot;,&quot;data_path&quot;:&quot;ok&quot;,&quot;ingest_capacity&quot;:&quot;ok&quot;,&quot;corpus&quot;:&quot;ok&quot;},&quot;version&quot;:&quot;...&quot;}"><div></div></button></div></figure></div>
 </li>
 <li>
 <p>Confirm that your key is accepted.</p>
@@ -112,7 +122,7 @@ alone. The response shape is in <a href="/reference/api/#health">the API referen
 <thead>
 <tr>
 <th>Check</th>
-<th>Meaning when it reads <code dir="auto">error</code></th>
+<th>Meaning when it fails</th>
 <th>What to do</th>
 </tr>
 </thead>
@@ -136,6 +146,16 @@ alone. The response shape is in <a href="/reference/api/#health">the API referen
 <td><code dir="auto">data_path</code></td>
 <td><code dir="auto">[data] path</code> is missing or is not a readable directory. Cold data is unreadable.</td>
 <td>Check the mount and the directory permissions for the <code dir="auto">trawl</code> user.</td>
+</tr>
+<tr>
+<td><code dir="auto">ingest_capacity</code></td>
+<td>Reads <code dir="auto">refusing</code>, not <code dir="auto">error</code>. The hot buffer is full, so ingest is refused until compaction drains it. Reads stay complete.</td>
+<td>Follow <a href="/operate/operational-alerts/#ingest-admission-refusing">ingest admission refusing</a>.</td>
+</tr>
+<tr>
+<td><code dir="auto">corpus</code></td>
+<td>Reads <code dir="auto">restart_backlog</code> or <code dir="auto">rollup_pending</code>, not <code dir="auto">error</code>. The server cannot yet count every stored event once, so searches, exports, manual runs, and repins answer 503 <code dir="auto">corpus_recovering</code>. Live tail still works. <code dir="auto">restart_backlog</code> means WAL from before a restart is not yet proven covered. <code dir="auto">rollup_pending</code> means a daily rollup marker is unfinished.</td>
+<td>Wait for compaction to clear it. If it stays, follow <a href="/operate/operational-alerts/#corpus-unsettled">corpus unsettled</a>.</td>
 </tr>
 </tbody>
 </table>
@@ -169,10 +189,204 @@ gauge.</p>
 retained interval in the trawld log. They carry metadata, never DSL. Field
 details are in the API reference under <a href="/reference/api/#running-queries">Running queries</a>
 and <a href="/reference/api/#server-info">Server info</a>.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="inspect-ingestion-and-storage">Inspect ingestion and storage</h2><a class="sl-anchor-link" href="#inspect-ingestion-and-storage"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Inspect ingestion and storage”</span></a></div>
+<ol>
+<li>
+<p>Open <strong>Health</strong> with a key that has <code dir="auto">server_manage</code>, or read the
+shared dashboard snapshot:</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">curl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">--fail-with-body</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">--config</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_CURL_CONFIG</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_URL</span><span style="--0:#ECC48D;--1:#984E4D">/api/v1/dashboard</span><span style="--0:#D9F5DD;--1:#111111">"</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="curl --fail-with-body --config &quot;$TRAWL_CURL_CONFIG&quot; &quot;$TRAWL_URL/api/v1/dashboard&quot;"><div></div></button></div></figure></div>
+</li>
+<li>
+<p>Check the stream label before using the browser readings. If it reports
+<strong>Stale; reconnecting</strong> or <strong>Live updates failed</strong>, treat the displayed values
+as a retained snapshot. Wait for a new stream snapshot to clear that label.
+A live connection does not prove that a storage measurement succeeded.</p>
+</li>
+<li>
+<p>Read <strong>Syslog configuration</strong> before interpreting its counters. If syslog is
+disabled, use the <a href="/operate/ingestion/#receive-syslog">syslog setup guidance</a>
+to check the intended configuration. If received counts increase, confirm
+persistence with a bounded query as described in
+<a href="/operate/ingestion/#confirm-delivery-over-time">Confirm delivery over time</a>.
+HTTP readings exclude syslog, and receive counts alone do not prove persistence.</p>
+</li>
+<li>
+<p>Read each storage measurement’s status and age before using its totals.
+Treat <strong>Awaiting measurement</strong> and <strong>Measurement unavailable</strong> as unknown
+storage usage. If collection failed after a successful scan, use the retained
+totals only with their displayed age. Check the configured root and its mount
+using <a href="#read-the-checks">the data-path guidance</a>. An absent query-only archive
+is not a measured empty directory.</p>
+</li>
+<li>
+<p>Compare compaction readings across new snapshots. Use
+<a href="/architecture/recovery/">storage recovery</a> and
+<a href="/operate/retention/">retention guidance</a> when investigating storage behavior.
+Do not infer a current incident from an error tally accumulated since startup.
+Successful cycles can contain no eligible work, and error tallies can accompany
+successful cycles. A missing last-success age means no successful cycle
+reported since startup; an age of zero is a reported success.</p>
+</li>
+</ol>
+<p>The <a href="/reference/api/#dashboard-snapshot">dashboard reference</a> defines the four
+measurement states and the scope of each count. In the terminal’s <strong>DATA
+PIPELINE</strong> panel, <code dir="auto">failed age 120s 7f/91 B</code> means seven files and 91 bytes from
+the last complete sample, aged 120 seconds at the displayed snapshot.
+<code dir="auto">not configured</code>, <code dir="auto">awaiting measurement</code>, and <code dir="auto">failed; unavailable</code> do not
+represent measured zero. The browser and terminal keep the supplied sample age
+unchanged until they receive another dashboard snapshot.</p>
+<p>If you use Prometheus, read the dashboard metadata when you need storage sample
+status or age. The four <a href="/reference/api/#prometheus-metrics">storage gauges</a>
+retain last complete totals after collection failure and have no status or age
+signal. Flat values alone cannot confirm collector health.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="read-disk-and-retention">Read disk and retention</h2><a class="sl-anchor-link" href="#read-disk-and-retention"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Read disk and retention”</span></a></div>
+<p>The <strong>Disk and retention</strong> section of <strong>Health</strong> answers one question: will
+the data disk hold the retention you configured if the recent days repeat? It
+needs a key with <code dir="auto">server_manage</code>, like the storage readings. The same data is
+the <code dir="auto">capacity</code> object of the <a href="/reference/api/#capacity">dashboard snapshot</a>.</p>
+<p>The section has three parts:</p>
+<ul>
+<li><strong>Headroom</strong>: the free space on each filesystem that trawld writes to, and
+the deletion floor on the data filesystem.</li>
+<li><strong>Pressure-deletion evidence</strong>: removal counters, pressure attempts, the last
+sweep, and each environment’s oldest date.</li>
+<li><strong>Retention reach</strong>: for each environment, how many days of its
+<code dir="auto">max_age_days</code> the disk is projected to hold.</li>
+</ul>
+<p><a href="/operate/retention/#read-headroom">Manage retention</a> explains how to read
+headroom and the evidence. This section explains reach.</p>
+<p>The section colours no value as good or bad and shows no “safe” state. Reach
+is a projection from seven days of data, and a green badge would read as a
+guarantee. Compare the projected days with the policy you need.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="read-retention-reach">Read retention reach</h3><a class="sl-anchor-link" href="#read-retention-reach"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Read retention reach”</span></a></div>
+<p>A reach of “about 38–52 of 90 days” means: if the observed days repeat,
+pressure deletion is projected to leave this environment between 38 and 52
+days of its 90-day policy. It is a conditional projection, not a guarantee.</p>
+<p>trawld computes reach from the Parquet already on disk:</p>
+<ul>
+<li><strong>Observed days</strong> are the UTC dates from 8 days ago through 2 days ago.
+Today and yesterday are left out while rollup and late events settle them.
+The section shows the dates it used.</li>
+<li>A date in that window with no Parquet counts as a quiet day of 0 bytes, if
+it is newer than the environment’s oldest date. A date older than the oldest
+date is not an observed day.</li>
+<li>The oldest date is the oldest date directory that holds Parquet. An empty
+date directory does not count.</li>
+<li>The <strong>budget</strong> is the Parquet bytes in every environment’s date directories,
+plus the available bytes on the data filesystem, minus the floor.</li>
+<li>Pressure deletion removes the dates closest to their expiry first. Under
+sustained pressure, every environment with a finite <code dir="auto">max_age_days</code> keeps
+the same fraction of its policy. trawld solves for that fraction.</li>
+<li>The low end uses the environment’s largest observed day. The high end uses
+its mean observed day.</li>
+</ul>
+<p>Each end of the range reads in one of three ways:</p>
+<table>
+<thead>
+<tr>
+<th>Reading</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A number of days</td>
+<td>The disk is projected to hold this many whole days of the policy.</td>
+</tr>
+<tr>
+<td>The full policy</td>
+<td>The projected fraction is 1 or more. The environment keeps every day of its policy.</td>
+</tr>
+<tr>
+<td>The disk fills before retention is reached</td>
+<td><code dir="auto">min_free_disk_bytes</code> is 0, so pressure deletion is off. The full policy does not fit in the stored bytes plus the available bytes. No date is given.</td>
+</tr>
+</tbody>
+</table>
+<p>The two ends can read differently. For example, the full policy fits at the
+mean observed day but not at the largest.</p>
+<p>An environment with <code dir="auto">max_age_days = 0</code> keeps its data forever. It shows its
+stored bytes and its mean observed daily growth, and makes no time claim.
+Pressure deletion removes its dates last, so the projection keeps all of its
+stored bytes. Its growth takes space from the other environments, so their
+reach shrinks over time even when their own volume stays the same.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="read-an-environment-that-is-excluded-from-growth">Read an environment that is excluded from growth</h3><a class="sl-anchor-link" href="#read-an-environment-that-is-excluded-from-growth"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Read an environment that is excluded from growth”</span></a></div>
+<p>An environment with a finite <code dir="auto">max_age_days</code> and fewer than 3 observed days has
+no daily rate. This happens to:</p>
+<ul>
+<li>a new environment, until about four days after its first stored date;</li>
+<li>an environment with <code dir="auto">max_age_days</code> of 3 or less, which never has 3 observed
+days;</li>
+<li>an environment that pressure deletion has cut down to fewer than 3 observed
+days.</li>
+</ul>
+<p>Its reach is withheld with the reason <code dir="auto">insufficient_history</code>. The projection
+reserves its stored bytes, as it does for a keep-forever environment, and the
+section names it as excluded from growth. The other environments still get a
+projection. Their projection does not include the excluded environment’s
+growth, so for a few days after a new environment appears, the others read
+higher than they will be.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="act-on-a-withheld-reach">Act on a withheld reach</h3><a class="sl-anchor-link" href="#act-on-a-withheld-reach"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Act on a withheld reach”</span></a></div>
+<p>A withheld reach shows a reason and no number.</p>
+<table>
+<thead>
+<tr>
+<th>Reason</th>
+<th>Meaning</th>
+<th>What to do</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">insufficient_history</code></td>
+<td>The environment has fewer than 3 observed days. A keep-forever environment gets this reason too.</td>
+<td>Wait for a new environment to collect observed days. For a short policy, read headroom instead. If pressure deletion cut the environment down, add space.</td>
+</tr>
+<tr>
+<td><code dir="auto">retention_suppressed</code></td>
+<td>A repin job ran during the Parquet scan or the headroom sample, or repin staging is still on the data root. A repin holds two generations of files, so the sample can overstate stored bytes or understate free space. This holds for a job that was cancelled, or refused after it built its shadow, too. A dry run or a refusal at the scan gate writes no second generation and does not suppress. Every environment gets this reason.</td>
+<td>Wait for the repin to finish and for the next samples. If the reason stays, follow <a href="/operate/retention/#clear-suppressed-retention">Clear suppressed retention</a>.</td>
+</tr>
+<tr>
+<td><code dir="auto">measurement_unavailable</code></td>
+<td>The Parquet measurement or the headroom measurement is not <code dir="auto">complete</code>. Every environment gets this reason. A retained, failed sample never feeds a projection. The raw readings stay visible with their age.</td>
+<td>After a start, wait for the first measurements. If a measurement failed, check the data path as described in <a href="#read-the-checks">Read the checks</a>.</td>
+</tr>
+</tbody>
+</table>
+<p>When more than one reason applies, <code dir="auto">measurement_unavailable</code> wins, then
+<code dir="auto">retention_suppressed</code>, then <code dir="auto">insufficient_history</code>.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="why-there-is-no-countdown">Why there is no countdown</h3><a class="sl-anchor-link" href="#why-there-is-no-countdown"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Why there is no countdown”</span></a></div>
+<p>With a floor set, the data disk does not fill. When free space falls below the
+floor, pressure deletion removes the dates closest to their expiry. The loss
+lands on retention: an environment set to 90 days keeps 40. A “days until
+full” countdown would count down to an event that does not happen.</p>
+<p>Free space also misleads under pressure. While pressure deletion removes data,
+free space stays flat near the floor, so a trend on it reads as stable while
+history is lost. Reach states the cost in the unit you configured: days kept.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="read-the-terminal-summary-line">Read the terminal summary line</h3><a class="sl-anchor-link" href="#read-the-terminal-summary-line"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Read the terminal summary line”</span></a></div>
+<p>In the terminal’s <strong>DATA PIPELINE</strong> panel, the third line summarizes the data
+filesystem and retention:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="text"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">free: age 2s 120.0 GB/500.0 GB  floor 1.0 GB  sweep: completed 12m 34s ago  pressure deletions: 3</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="free: age 2s 120.0 GB/500.0 GB  floor 1.0 GB  sweep: completed 12m 34s ago  pressure deletions: 3"><div></div></button></div></figure></div>
+<ul>
+<li><code dir="auto">free:</code> shows the headroom status and age, then the data filesystem’s
+available and total bytes. <code dir="auto">failed age 45s</code> marks a retained sample.
+<code dir="auto">awaiting measurement</code>, <code dir="auto">not configured</code>, and <code dir="auto">failed; unavailable</code> carry no
+bytes.</li>
+<li><code dir="auto">floor 1.0 GB</code> reads <code dir="auto">pressure deletion off</code> when <code dir="auto">min_free_disk_bytes</code> is 0.</li>
+<li><code dir="auto">sweep:</code> shows the last sweep’s outcome and age, or <code dir="auto">none yet</code>.</li>
+<li><code dir="auto">pressure deletions:</code> counts <code dir="auto">disk_pressure</code> removals since process start.</li>
+</ul>
+<p>At 80 columns only the <code dir="auto">free:</code> part and the floor fit. The sweep and the count
+appear from about 140 columns. The line never shows an environment’s reach,
+because one environment’s reach is not the answer for the installation. The
+<strong>Dashboard</strong> tab of the <code dir="auto">trawl</code> terminal UI shows the same line to a key with
+<code dir="auto">server_manage</code>.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="diagnose-a-503-or-504-from-a-query">Diagnose a 503 or 504 from a query</h2><a class="sl-anchor-link" href="#diagnose-a-503-or-504-from-a-query"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Diagnose a 503 or 504 from a query”</span></a></div>
 <p><code dir="auto">timeout_secs</code>, 30 seconds by default, starts one deadline right after
 authentication, and that deadline covers admission, queueing, and execution.
-Where it expires decides the status code.</p>
+Where it expires decides the status code. Two other 503s refuse a query
+whose answer could not be complete.</p>
 <table>
 <thead>
 <tr>
@@ -197,6 +411,16 @@ Where it expires decides the status code.</p>
 <td>Finished requests still occupy the pool.</td>
 <td>Cancel each retained id.</td>
 </tr>
+<tr>
+<td>503 <code dir="auto">corpus_recovering</code></td>
+<td>The corpus is unsettled after a restart or an interrupted rollup. Nothing ran.</td>
+<td>Read <code dir="auto">checks.corpus</code> in <code dir="auto">/api/v1/health</code>. If it stays unsettled, follow <a href="/operate/operational-alerts/#corpus-unsettled">corpus unsettled</a>.</td>
+</tr>
+<tr>
+<td>503 with <code dir="auto">recent events could not be read for this query</code></td>
+<td>The hot buffer’s snapshot could not be built, so the server refused the query rather than answer without the newest events.</td>
+<td>Read the <code dir="auto">http_failure</code> event’s <code dir="auto">cause_kind</code>, then the trawld journal for the I/O error. See <a href="#trace-a-server-failure">Trace a server failure</a>.</td>
+</tr>
 </tbody>
 </table>
 <p>To cancel, send <code dir="auto">DELETE /api/v1/queries/{id}</code> with <code dir="auto">server_manage</code>, or with
@@ -206,6 +430,249 @@ the work stopped, and a repeated cancel changes nothing. trawld records a cancel
 that arrives during the bind and checks it again before execution. A bind
 already inside DuckDB cannot be interrupted, so its permit returns only when the
 bind returns.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="find-the-slow-phase-of-a-query">Find the slow phase of a query</h2><a class="sl-anchor-link" href="#find-the-slow-phase-of-a-query"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Find the slow phase of a query”</span></a></div>
+<p>Symptom: a query is slow or timed out, and you need to know where its time went.</p>
+<p>trawld writes one <code dir="auto">query_timing</code> event for each DSL query that reaches its DSL
+check. That covers interactive queries, <code dir="auto">from saved</code> queries, exports, and
+scheduled and manual report runs, including the ones refused at the DSL check
+or for capacity. Live tail, the pool ping, and field sampling write none. The
+event splits the query’s time into phases. Each phase is an integer number of
+microseconds in a field named <code dir="auto">query_&lt;phase&gt;_us</code>, such as <code dir="auto">query_bind_us</code>.
+<a href="/architecture/reports-telemetry/#query-timing">Query timing</a> lists the phases
+and the other fields.</p>
+<ol>
+<li>
+<p>Read the <code dir="auto">X-Request-Id</code> header of the slow response, and find its timing
+event.</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">trawl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_PROFILE</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">query</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">service=trawld _producer=trawld event_type=query_timing request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, query_id, kind, outcome, timing_complete, query_observed_us, query_pool_wait_us, query_source_us, query_bind_us, query_execute_us, query_other_us</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl -p &quot;$TRAWL_PROFILE&quot; query &#x27;service=trawld _producer=trawld event_type=query_timing request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, query_id, kind, outcome, timing_complete, query_observed_us, query_pool_wait_us, query_source_us, query_bind_us, query_execute_us, query_other_us&#x27;"><div></div></button></div></figure></div>
+<p>If you know the query ID instead, from <code dir="auto">/api/v1/queries</code> or an
+<code dir="auto">http_failure</code> event, filter on it. Keep the time bound, because query IDs
+restart at 0 each time trawld starts.</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">trawl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_PROFILE</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">query</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">service=trawld _producer=trawld event_type=query_timing query_id=4182 last=1h | table query_bind_us, query_execute_us, query_pool_wait_us</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl -p &quot;$TRAWL_PROFILE&quot; query &#x27;service=trawld _producer=trawld event_type=query_timing query_id=4182 last=1h | table query_bind_us, query_execute_us, query_pool_wait_us&#x27;"><div></div></button></div></figure></div>
+<p>A scheduled or manual run has no request. Its events carry <code dir="auto">run_id</code>, the
+<code dir="auto">id</code> of its <a href="/reference/api/#report-runs">report run</a>, instead of
+<code dir="auto">request_id</code>.</p>
+</li>
+<li>
+<p>Compare the phases. The largest one is where the query spent its time.</p>
+<ul>
+<li>An absent field means the query never entered that phase. A query without
+<code dir="auto">from saved</code> has no <code dir="auto">query_saved_lookup_us</code>, and only a <code dir="auto">timechart</code> query
+has <code dir="auto">query_probe_us</code>.</li>
+<li>A present <code dir="auto">0</code> is a measurement: the phase ran for less than one
+microsecond.</li>
+<li><code dir="auto">query_observed_us</code> is the whole window. It starts at the same instant as
+the response’s <code dir="auto">execution.duration_ms</code>. An export has no
+<code dir="auto">execution.duration_ms</code>: its window starts before <code dir="auto">dsl_check</code>, earlier
+than <code dir="auto">export_complete.duration_ms</code> starts, and runs through <code dir="auto">render</code>.</li>
+<li><code dir="auto">query_other_us</code> is the observed time that no phase measured. On a
+complete event, the present phases plus <code dir="auto">query_other_us</code> add up exactly to
+<code dir="auto">query_observed_us</code>. A large <code dir="auto">query_other_us</code> is a gap in trawld’s
+measurement, so report it.</li>
+<li><code dir="auto">duckdb_attempts</code> counts how many times DuckDB bound the main statement.
+When it is more than 1, <code dir="auto">fallback</code> says why: <code dir="auto">raw_retry</code>, <code dir="auto">hot_only</code>, or
+<code dir="auto">both</code>. <code dir="auto">query_bind_us</code> and <code dir="auto">query_execute_us</code> add up every attempt.</li>
+</ul>
+</li>
+<li>
+<p>To see which phase is slow across many queries, aggregate the phases.</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">trawl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_PROFILE</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">query</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">service=trawld _producer=trawld event_type=query_timing outcome=success last=24h | stats count(), p95(query_observed_us), p95(query_pool_wait_us), p95(query_source_us), p95(query_hot_snapshot_us), p95(query_bind_us), p95(query_execute_us), p95(query_other_us) by kind</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl -p &quot;$TRAWL_PROFILE&quot; query &#x27;service=trawld _producer=trawld event_type=query_timing outcome=success last=24h | stats count(), p95(query_observed_us), p95(query_pool_wait_us), p95(query_source_us), p95(query_hot_snapshot_us), p95(query_bind_us), p95(query_execute_us), p95(query_other_us) by kind&#x27;"><div></div></button></div></figure></div>
+<p>A high <code dir="auto">query_pool_wait_us</code> means queries waited for an executor permit.
+See <a href="#inspect-capacity">Inspect capacity</a>. A high <code dir="auto">query_bind_us</code> or
+<code dir="auto">query_execute_us</code> means DuckDB itself was slow for that query shape.</p>
+</li>
+</ol>
+<p><code dir="auto">outcome</code> is <code dir="auto">success</code>, <code dir="auto">error</code>, <code dir="auto">capacity_refused</code>, <code dir="auto">timeout</code>, or <code dir="auto">abandoned</code>.
+An <code dir="auto">error</code> event carries <code dir="auto">error_class</code>, never the error text. A
+<code dir="auto">capacity_refused</code> event has <code dir="auto">work_started=false</code> and no worker phase. It
+carries the wait that ran out: <code dir="auto">query_pool_wait_us</code> or
+<code dir="auto">query_publication_wait_us</code>, or <code dir="auto">query_saved_lookup_us</code> when the deadline cut a
+<code dir="auto">from saved</code> lookup before the pool was reached. It is the 503 in
+<a href="#diagnose-a-503-or-504-from-a-query">Diagnose a 503 or 504 from a query</a>.
+<code dir="auto">abandoned</code> with <code dir="auto">work_started=false</code> means the client went away before any
+work started, and nothing is left to report.</p>
+<div class="sl-heading-wrapper level-h3"><h3 id="join-a-timed-out-query-to-its-final-totals">Join a timed-out query to its final totals</h3><a class="sl-anchor-link" href="#join-a-timed-out-query-to-its-final-totals"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Join a timed-out query to its final totals”</span></a></div>
+<p>When a query times out, or its client goes away while its work runs, trawld
+writes <code dir="auto">query_timing</code> at once. It does not wait for the worker. That event
+carries <code dir="auto">timing_complete=false</code>, and it is partial:</p>
+<ul>
+<li>It carries the phases that finished. The time of the unfinished iteration is
+not booked. A phase with no earlier completed iteration has no
+<code dir="auto">query_&lt;phase&gt;_us</code> field. A phase that also ran to completion earlier keeps
+those earlier iterations in its field. For example, on the second bind of a
+<code dir="auto">raw_retry</code>, <code dir="auto">query_bind_us</code> holds the first bind only.</li>
+<li><code dir="auto">active_query_phase</code> names the phase still running, and <code dir="auto">active_elapsed_us</code>
+says how long its current iteration had run.</li>
+<li><code dir="auto">query_observed_us</code> equals the finished phases, plus <code dir="auto">active_elapsed_us</code>,
+plus <code dir="auto">query_other_us</code>.</li>
+</ul>
+<p>When the worker finishes and returns its permit, trawld writes
+<code dir="auto">query_permit_reclaimed</code> with the same <code dir="auto">query_id</code>, and the same <code dir="auto">request_id</code> or
+<code dir="auto">run_id</code>. That event carries the worker’s final phase totals,
+<code dir="auto">duckdb_attempts</code>, <code dir="auto">fallback</code>, and <code dir="auto">physical_outcome</code>: <code dir="auto">completed</code>, <code dir="auto">failed</code>,
+<code dir="auto">cancelled</code>, <code dir="auto">panicked</code>, or <code dir="auto">not_started</code>. A <code dir="auto">not_started</code> reclaim follows a
+capacity refusal where trawld had handed the work to a worker, but the deadline
+expired before the work started. It carries no phases, because no work ran. A worker that never finishes writes no reclaim event.</p>
+<p>If the worker had already finished and released its permit when the deadline
+expired, no work is left running. trawld then writes one complete event with <code dir="auto">outcome=timeout</code> and
+<code dir="auto">timing_complete=true</code>, and no reclaim follows.</p>
+<p>Join the two events on <code dir="auto">request_id</code>, or on <code dir="auto">run_id</code> for a report run. A
+<code dir="auto">query_id</code> alone can match a query from before a restart.</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">trawl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_PROFILE</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">query</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">service=trawld _producer=trawld event_type=query_timing,query_permit_reclaimed request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, event_type, query_id, outcome, timing_complete, active_query_phase, active_elapsed_us, physical_outcome, retained_ms, query_bind_us, query_execute_us</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl -p &quot;$TRAWL_PROFILE&quot; query &#x27;service=trawld _producer=trawld event_type=query_timing,query_permit_reclaimed request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, event_type, query_id, outcome, timing_complete, active_query_phase, active_elapsed_us, physical_outcome, retained_ms, query_bind_us, query_execute_us&#x27;"><div></div></button></div></figure></div>
+<p>To see which phase timeouts stop in, count the partial events.</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">trawl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_PROFILE</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">query</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">service=trawld _producer=trawld event_type=query_timing timing_complete=false last=24h | stats count() by outcome, active_query_phase</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl -p &quot;$TRAWL_PROFILE&quot; query &#x27;service=trawld _producer=trawld event_type=query_timing timing_complete=false last=24h | stats count() by outcome, active_query_phase&#x27;"><div></div></button></div></figure></div>
+<p>Timing events are best-effort telemetry. When the telemetry buffer is full,
+trawld drops them and counts the loss in
+<code dir="auto">trawl_telemetry_events_dropped_total</code>. A missing <code dir="auto">query_timing</code> event does not
+prove that the query did not run.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="trace-a-server-failure">Trace a server failure</h2><a class="sl-anchor-link" href="#trace-a-server-failure"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Trace a server failure”</span></a></div>
+<p>Symptom: a client received a 5xx, and you need to know which request failed,
+where, and why.</p>
+<p>Every 5xx that trawld returns, <code dir="auto">/api/v1/health</code> included, emits one event with
+<code dir="auto">event_type=http_failure</code>. The event names its request with explicit fields. It
+does not inherit them from the request span, so it never carries the raw path or
+the user agent. It never carries error text either, because that text can hold
+generated SQL, event values, and the caller’s DSL.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">request_id</code></td>
+<td>The ULID that the response returned in its <code dir="auto">X-Request-Id</code> header.</td>
+</tr>
+<tr>
+<td><code dir="auto">method</code></td>
+<td>A standard HTTP method name, or <code dir="auto">OTHER</code>.</td>
+</tr>
+<tr>
+<td><code dir="auto">route</code></td>
+<td>The matched route template, such as <code dir="auto">/api/v1/query</code>. <code dir="auto">&lt;unmatched&gt;</code> when no route matched. Never the raw path.</td>
+</tr>
+<tr>
+<td><code dir="auto">status</code></td>
+<td>The status code sent.</td>
+</tr>
+<tr>
+<td><code dir="auto">latency_ms</code></td>
+<td>Time from the start of the request to the response.</td>
+</tr>
+<tr>
+<td><code dir="auto">stage</code></td>
+<td>How far the request got. See the next table.</td>
+</tr>
+<tr>
+<td><code dir="auto">reached</code></td>
+<td>On <code dir="auto">stage=unrecorded</code> only: <code dir="auto">pre_admission</code>, <code dir="auto">admitted</code>, or <code dir="auto">handler</code>, the last point the request passed.</td>
+</tr>
+<tr>
+<td><code dir="auto">error_class</code></td>
+<td>The server’s closed error class. <code dir="auto">panic</code> for a caught panic, <code dir="auto">unknown</code> when nothing was recorded.</td>
+</tr>
+<tr>
+<td><code dir="auto">cause_kind</code></td>
+<td>A closed kind taken from the typed error beneath the class: an I/O error kind such as <code dir="auto">io_storage_full</code>, a DuckDB kind such as <code dir="auto">duckdb_failure</code>, a Postgres kind such as <code dir="auto">pg_pool_timed_out</code>, <code dir="auto">auth_worker</code>, <code dir="auto">hot_buffer_full</code> for an ingest request that the hot buffer had no room for, or <code dir="auto">restart_backlog</code> or <code dir="auto">rollup_pending</code> for a read refused as <code dir="auto">corpus_recovering</code>. <code dir="auto">unknown</code> when a server fault kept no typed source: an <code dir="auto">internal</code> error or a <code dir="auto">service_unavailable</code> other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. <code dir="auto">none</code> when the class is the whole cause, as for <code dir="auto">timeout</code>, <code dir="auto">panic</code>, or a capacity refusal, and when nothing was recorded.</td>
+</tr>
+<tr>
+<td><code dir="auto">query_id</code></td>
+<td>Present when the request allocated a query ID.</td>
+</tr>
+<tr>
+<td><code dir="auto">key_id</code></td>
+<td>Present when a rate limiter metered the request. Names the key it metered.</td>
+</tr>
+<tr>
+<td><code dir="auto">peer_addr</code></td>
+<td>Present when no rate limiter metered the request. The client address, the only lead when no key is known.</td>
+</tr>
+</tbody>
+</table>
+<table>
+<thead>
+<tr>
+<th><code dir="auto">stage</code></th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code dir="auto">pre_admission</code></td>
+<td>The request failed before any rate limiter admitted it, for example with the auth backend down.</td>
+</tr>
+<tr>
+<td><code dir="auto">admitted</code></td>
+<td>The request failed after the rate limiter admitted it, before the handler.</td>
+</tr>
+<tr>
+<td><code dir="auto">handler_error</code></td>
+<td>The handler returned a typed error.</td>
+</tr>
+<tr>
+<td><code dir="auto">panicked</code></td>
+<td>trawld caught a panic while it served the request.</td>
+</tr>
+<tr>
+<td><code dir="auto">unrecorded</code></td>
+<td>The response is a 5xx, but its producer recorded no failure. <code dir="auto">reached</code> points at that producer.</td>
+</tr>
+</tbody>
+</table>
+<p>A 503 or 504 logs at WARN, because both are expected pressure outcomes. See
+<a href="#diagnose-a-503-or-504-from-a-query">Diagnose a 503 or 504 from a query</a>.
+Every other 5xx logs at ERROR.</p>
+<p>To trace one failure:</p>
+<ol>
+<li>
+<p>Read the <code dir="auto">X-Request-Id</code> header of the failed response, or ask the client
+for it.</p>
+</li>
+<li>
+<p>Find the failure event and the events logged inside the same request.</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">trawl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_PROFILE</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">query</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">service=trawld _producer=trawld request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, event_type, _severity, route, stage, reached, error_class, cause_kind, query_id</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl -p &quot;$TRAWL_PROFILE&quot; query &#x27;service=trawld _producer=trawld request_id=01K5EXAMPLE0000000000000000 last=24h | table _time, event_type, _severity, route, stage, reached, error_class, cause_kind, query_id&#x27;"><div></div></button></div></figure></div>
+</li>
+<li>
+<p>If the failure event carries a <code dir="auto">query_id</code>, find the query lifecycle events
+for that ID. <code dir="auto">query_failed</code> names the query ID and its own <code dir="auto">error_class</code>.</p>
+<div class="expressive-code"><figure class="frame is-terminal not-content"><figcaption class="header"><span class="title"></span><span class="sr-only">Terminal window</span></figcaption><pre data-language="bash"><code><div class="ec-line"><div class="code"><span style="--0:#82AAFF;--1:#3B61B0">trawl</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#82AAFF;--1:#3B61B0">-p</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#C5E478;--1:#3B61B0">$TRAWL_PROFILE</span><span style="--0:#D9F5DD;--1:#111111">"</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#ECC48D;--1:#3B61B0">query</span><span style="--0:#D6DEEB;--1:#403F53"> </span><span style="--0:#D9F5DD;--1:#111111">'</span><span style="--0:#ECC48D;--1:#984E4D">service=trawld _producer=trawld query_id=4182 last=24h | table _time, event_type, _severity, error_class, duration_ms</span><span style="--0:#D9F5DD;--1:#111111">'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawl -p &quot;$TRAWL_PROFILE&quot; query &#x27;service=trawld _producer=trawld query_id=4182 last=24h | table _time, event_type, _severity, error_class, duration_ms&#x27;"><div></div></button></div></figure></div>
+</li>
+<li>
+<p>For a failure with <code dir="auto">stage=unrecorded</code>, read <code dir="auto">reached</code>. The producer that
+sent the 5xx without recording why sits after that point, and that
+producer is the bug to report.</p>
+</li>
+</ol>
+<p>Not every failure event persists:</p>
+<ul>
+<li>A metered failure event has no rate cap of its own. The per-key rate limiter
+already bounds how many of them one client can cause. Like every
+self-telemetry event, it persists only if the log filter keeps it and the
+telemetry buffer budget has room for it.</li>
+<li>An unmetered 5xx persists under one process-wide cap of 60 events per
+minute. The cap is fixed in code and has no setting. Past the cap, the event
+goes to stdout only, and <code dir="auto">trawl_telemetry_events_dropped_total</code> counts it under
+<code dir="auto">reason="unmetered_cap"</code>. The <code dir="auto">telemetry_dropped</code> event in stored telemetry
+reports the same count as <code dir="auto">dropped_events_unmetered_cap</code>. When that is its
+only loss, at most one such event is stored per minute, and it reports every
+drop since the previous one.</li>
+<li>An unmetered 401, 403, or TLS rejection never persists. See
+<a href="#find-authentication-failures">Find authentication failures</a>.</li>
+</ul>
+<p>A panic also produces one ERROR event with <code dir="auto">event_type=panic</code> on the target
+<code dir="auto">trawl_server::panic</code>. It carries the source <code dir="auto">file</code>, <code dir="auto">line</code>, <code dir="auto">column</code>, and the
+<code dir="auto">thread</code> name, never the panic message. It goes to stdout, and to <code dir="auto">log_file</code>
+when file logging is active. It never persists. The failure event of the caught request is the stored
+record, with <code dir="auto">stage=panicked</code>.</p>
+<p>trawld runs its terminal monitor when stdout is a terminal and you start it
+without <code dir="auto">--no-monitor</code>. The monitor owns stdout, so stdout carries no log
+lines. If trawld also writes no <code dir="auto">log_file</code>, nothing records the panic event.
+Nothing records it either when <code dir="auto">RUST_LOG</code> filters out the
+<code dir="auto">trawl_server::panic</code> target, for example <code dir="auto">RUST_LOG=trawld=debug</code>. In either
+case trawld also writes one line to stderr, with the location and no message:</p>
+<div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="text"><code><div class="ec-line"><div class="code"><span style="--0:#d6deeb;--1:#403f53">trawld: panicked at FILE:LINE:COLUMN on thread 'NAME'</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="trawld: panicked at FILE:LINE:COLUMN on thread &#x27;NAME&#x27;"><div></div></button></div></figure></div>
 <div class="sl-heading-wrapper level-h2"><h2 id="restore-missing-log-lines">Restore missing log lines</h2><a class="sl-anchor-link" href="#restore-missing-log-lines"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Restore missing log lines”</span></a></div>
 <p>Symptom: expected <code dir="auto">trawl_server</code> or <code dir="auto">fleet_auth</code> lines are absent from the
 journal or from stored telemetry.</p>
@@ -268,11 +735,15 @@ silences the proxy’s session, origin, and upstream diagnostics.</p>
 <p>A configuration-file failure happens before tracing starts. It appears on
 stderr with the resolved config path and never in stored telemetry.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="find-authentication-failures">Find authentication failures</h2><a class="sl-anchor-link" href="#find-authentication-failures"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Find authentication failures”</span></a></div>
-<p>Symptom: a client reports 401 or 403, and a query for <code dir="auto">service=trawld</code> shows no
-rejection event.</p>
-<p>Check: rejections from the targets <code dir="auto">fleet_auth</code>, <code dir="auto">auth.backend</code>,
-<code dir="auto">preauth.transport</code>, and <code dir="auto">trawl_server::policy::unmetered</code> never enter stored
-telemetry, whatever <code dir="auto">RUST_LOG</code> says. They print to stdout, and to <code dir="auto">log_file</code>
+<p>Symptom: a client reports 401 or 403, and a query for <code dir="auto">service=trawld _producer=trawld</code>
+shows no rejection event.</p>
+<p>Check: events from the targets <code dir="auto">fleet_auth</code>, <code dir="auto">auth.backend</code>,
+<code dir="auto">preauth.transport</code>, <code dir="auto">trawl_server::policy::unmetered</code>, and
+<code dir="auto">trawl_server::panic</code> never enter stored telemetry, whatever <code dir="auto">RUST_LOG</code> says.
+Targets beneath <code dir="auto">trawl_server::transport::failure::unmetered</code> never enter
+stored telemetry either. That exact target is the one exception. It persists
+under a cap, as <a href="#trace-a-server-failure">Trace a server failure</a> describes.
+The excluded events print to stdout, and to <code dir="auto">log_file</code>
 when file logging is configured and either <code dir="auto">[ingest] enabled</code> or
 <code dir="auto">internal_telemetry</code> is false. With both enabled, <code dir="auto">log_file</code> is not opened.
 Read these events in the daemon output, or read

@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Respond to operational alerts | trawl</title><link rel="canonical" href="https://trawl.sh/operate/operational-alerts/"/><link rel="sitemap" href="/sitemap-index.xml"/><link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.2.8"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="Respond to operational alerts"/><meta property="og:type" content="article"/><meta property="og:url" content="https://trawl.sh/operate/operational-alerts/"/><meta property="og:locale" content="en"/><meta property="og:description" content="Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, and quarantined files."/><meta property="og:site_name" content="trawl"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, and quarantined files."/><script>
+<!DOCTYPE html><html lang="en" dir="ltr" data-theme="dark" data-has-toc data-has-sidebar class="astro-vdxcvpsm"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Respond to operational alerts | trawl</title><link rel="canonical" href="https://trawl.sh/operate/operational-alerts/"/><link rel="sitemap" href="/sitemap-index.xml"/><link rel="shortcut icon" href="/favicon.svg" type="image/svg+xml"/><meta name="generator" content="Astro v7.2.8"/><meta name="generator" content="Starlight v0.41.3"/><meta property="og:title" content="Respond to operational alerts"/><meta property="og:type" content="article"/><meta property="og:url" content="https://trawl.sh/operate/operational-alerts/"/><meta property="og:locale" content="en"/><meta property="og:description" content="Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, quarantined files, ingest refusals, and refused searches."/><meta property="og:site_name" content="trawl"/><meta name="twitter:card" content="summary_large_image"/><meta name="description" content="Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, quarantined files, ingest refusals, and refused searches."/><script>
 	window.StarlightThemeProvider = (() => {
 		const storedTheme =
 			typeof localStorage !== 'undefined' && localStorage.getItem('starlight-theme');
@@ -70,17 +70,26 @@
 		})();
 	</script></sl-sidebar-state-persist><div class="md:sl-hidden"><div class="mobile-preferences sl-flex astro-b5gddk54"><div class="social-icons astro-b5gddk54"><a href="https://github.com/jakub/trawl" rel="me" class="sl-flex astro-cg55etiy"><span class="sr-only astro-cg55etiy">GitHub</span><svg aria-hidden="true" class="astro-cg55etiy astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57L9 21.07c-3.34.72-4.04-1.61-4.04-1.61-.55-1.39-1.34-1.76-1.34-1.76-1.08-.74.09-.73.09-.73 1.2.09 1.83 1.24 1.83 1.24 1.08 1.83 2.81 1.3 3.5 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22l-.01 3.29c0 .31.2.69.82.57A12 12 0 0 0 12 .3Z"/></svg></a></div><starlight-theme-select><label style="--sl-select-width: 6.25em" class="astro-r2p65idu"><span class="sr-only astro-r2p65idu">Select theme</span><svg aria-hidden="true" class="icon label-icon astro-r2p65idu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M21 14h-1V7a3 3 0 0 0-3-3H7a3 3 0 0 0-3 3v7H3a1 1 0 0 0-1 1v2a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-2a1 1 0 0 0-1-1ZM6 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v7H6V7Zm14 10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-1h16v1Z"/></svg><select autocomplete="off" class="astro-r2p65idu"><option value="dark" class="astro-r2p65idu">Dark</option><option value="light" class="astro-r2p65idu">Light</option><option value="auto" selected class="astro-r2p65idu">Auto</option></select><svg aria-hidden="true" class="icon caret astro-r2p65idu astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1em;"><path d="M17 9.17a1 1 0 0 0-1.41 0L12 12.71 8.46 9.17a1 1 0 1 0-1.41 1.42l4.24 4.24a1.002 1.002 0 0 0 1.42 0L17 10.59a1.002 1.002 0 0 0 0-1.42Z"/></svg></label></starlight-theme-select><script>
 	StarlightThemeProvider.updatePickers();
-</script></div></div></div></div></nav><div class="main-frame astro-gqpr5s5a"><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><div class="lg:sl-flex astro-abfeecmu"><aside class="right-sidebar-container print:hidden astro-abfeecmu"><div class="right-sidebar astro-abfeecmu"><div class="lg:sl-hidden astro-q5mffni3"><mobile-starlight-toc data-min-h="2" data-max-h="3" class="astro-5ulgm6bh"><nav aria-labelledby="starlight__on-this-page--mobile" class="astro-5ulgm6bh"><details id="starlight__mobile-toc" class="astro-5ulgm6bh"><summary id="starlight__on-this-page--mobile" class="sl-flex astro-5ulgm6bh"><span class="toggle sl-flex astro-5ulgm6bh">On this page<svg aria-hidden="true" class="caret astro-5ulgm6bh astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></span><span class="display-current astro-5ulgm6bh"></span></summary><div class="dropdown astro-5ulgm6bh"><ul class="isMobile astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-the-observation-window" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read the observation window</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#load-rules-into-plain-prometheus" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Load rules into plain Prometheus</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#enable-rules-in-helm" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Enable rules in Helm</span></a><ul class="isMobile astro-cxyftcne" style="--depth: 1;"><li style="--depth: 1;" class="astro-cxyftcne"><a href="#keep-namespace-enforcement-compatible" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Keep namespace enforcement compatible</span></a></li></ul></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-the-affected-target" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect the affected target</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-queue-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog queue discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-wal-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog WAL discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-capacity-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry capacity discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-write-outcome-uncertain" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog write outcome uncertain</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-write-outcome-uncertain" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry write outcome uncertain</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#http-persistence-rejection" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">HTTP persistence rejection</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-wal-write-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry WAL write failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#wal-durability-degraded" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">WAL durability degraded</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#compaction-operation-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Compaction operation failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#file-quarantine" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">File quarantine</span></a></li></ul></div></details></nav></mobile-starlight-toc><script type="module" src="/_astro/MobileTableOfContents.astro_astro_type_script_index_0_lang.BcSo_yiZ.js"></script></div><div class="right-sidebar-panel sl-hidden lg:sl-block astro-q5mffni3"><div class="sl-container astro-q5mffni3"><starlight-toc data-min-h="2" data-max-h="3"><nav aria-labelledby="starlight__on-this-page"><h2 id="starlight__on-this-page">On this page</h2><ul class="astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-the-observation-window" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read the observation window</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#load-rules-into-plain-prometheus" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Load rules into plain Prometheus</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#enable-rules-in-helm" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Enable rules in Helm</span></a><ul class="astro-cxyftcne" style="--depth: 1;"><li style="--depth: 1;" class="astro-cxyftcne"><a href="#keep-namespace-enforcement-compatible" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Keep namespace enforcement compatible</span></a></li></ul></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-the-affected-target" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect the affected target</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-queue-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog queue discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-wal-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog WAL discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-capacity-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry capacity discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-write-outcome-uncertain" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog write outcome uncertain</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-write-outcome-uncertain" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry write outcome uncertain</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#http-persistence-rejection" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">HTTP persistence rejection</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-wal-write-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry WAL write failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#wal-durability-degraded" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">WAL durability degraded</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#compaction-operation-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Compaction operation failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#file-quarantine" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">File quarantine</span></a></li></ul></nav></starlight-toc><script type="module" src="/_astro/TableOfContents.astro_astro_type_script_index_0_lang.Csloo1VZ.js"></script></div></div></div></aside><div class="main-pane astro-abfeecmu"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><aside class="preview-banner astro-yp67euhd">Manual for <a href="https://github.com/jakub/trawl/releases/tag/v0.9.0" class="astro-yp67euhd">Trawl v0.9.0</a>. <a href="/release.json" class="astro-yp67euhd">Build identity</a>.</aside><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><h1 id="_top" class="astro-2sm4b3ln">Respond to operational alerts</h1></div></div><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><div class="sl-markdown-content"><p>Use this pack to receive warnings when Trawl reports a discard, persistence
-failure, compaction failure, or successful quarantine. It adds no monitoring
+</script></div></div></div></div></nav><div class="main-frame astro-gqpr5s5a"><script type="module">var e=document.getElementById(`starlight__sidebar`),t=e?.querySelector(`sl-sidebar-state-persist`),n=`sl-sidebar-state`,r=()=>{let r=[],i=t?.dataset.hash||``;try{let e=sessionStorage.getItem(n),t=JSON.parse(e||`{}`);Array.isArray(t.open)&&t.hash===i&&(r=t.open)}catch{}return{hash:i,open:r,scroll:e?.scrollTop||0}},i=e=>{try{sessionStorage.setItem(n,JSON.stringify(e))}catch{}},a=()=>i(r()),o=(e,t)=>{let n=r();n.open[t]=e,i(n)};t?.addEventListener(`click`,e=>{if(!(e.target instanceof Element))return;let t=e.target.closest(`summary`)?.closest(`details`);if(!t)return;let n=t.querySelector(`sl-sidebar-restore`),r=parseInt(n?.dataset.index||``);isNaN(r)||o(!t.open,r)}),addEventListener(`visibilitychange`,()=>{document.visibilityState===`hidden`&&a()}),addEventListener(`pageHide`,a);</script><div class="lg:sl-flex astro-abfeecmu"><aside class="right-sidebar-container print:hidden astro-abfeecmu"><div class="right-sidebar astro-abfeecmu"><div class="lg:sl-hidden astro-q5mffni3"><mobile-starlight-toc data-min-h="2" data-max-h="3" class="astro-5ulgm6bh"><nav aria-labelledby="starlight__on-this-page--mobile" class="astro-5ulgm6bh"><details id="starlight__mobile-toc" class="astro-5ulgm6bh"><summary id="starlight__on-this-page--mobile" class="sl-flex astro-5ulgm6bh"><span class="toggle sl-flex astro-5ulgm6bh">On this page<svg aria-hidden="true" class="caret astro-5ulgm6bh astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1rem;"><path d="m14.83 11.29-4.24-4.24a1 1 0 1 0-1.42 1.41L12.71 12l-3.54 3.54a1 1 0 0 0 0 1.41 1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.24-4.24a1.002 1.002 0 0 0 0-1.42Z"/></svg></span><span class="display-current astro-5ulgm6bh"></span></summary><div class="dropdown astro-5ulgm6bh"><ul class="isMobile astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-the-observation-window" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read the observation window</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#load-rules-into-plain-prometheus" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Load rules into plain Prometheus</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#enable-rules-in-helm" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Enable rules in Helm</span></a><ul class="isMobile astro-cxyftcne" style="--depth: 1;"><li style="--depth: 1;" class="astro-cxyftcne"><a href="#keep-namespace-enforcement-compatible" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Keep namespace enforcement compatible</span></a></li></ul></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-the-affected-target" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect the affected target</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-queue-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog queue discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-wal-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog WAL discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-capacity-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry capacity discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-write-outcome-uncertain" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog write outcome uncertain</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-write-outcome-uncertain" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry write outcome uncertain</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#http-persistence-rejection" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">HTTP persistence rejection</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-wal-write-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry WAL write failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#wal-durability-degraded" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">WAL durability degraded</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#compaction-operation-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Compaction operation failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#file-quarantine" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">File quarantine</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#publication-recovery-blocked" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Publication recovery blocked</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#ingest-admission-refusing" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Ingest admission refusing</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#hot-buffer-drain-stalled" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Hot buffer drain stalled</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#corpus-unsettled" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Corpus unsettled</span></a></li></ul></div></details></nav></mobile-starlight-toc><script type="module" src="/_astro/MobileTableOfContents.astro_astro_type_script_index_0_lang.BcSo_yiZ.js"></script></div><div class="right-sidebar-panel sl-hidden lg:sl-block astro-q5mffni3"><div class="sl-container astro-q5mffni3"><starlight-toc data-min-h="2" data-max-h="3"><nav aria-labelledby="starlight__on-this-page"><h2 id="starlight__on-this-page">On this page</h2><ul class="astro-cxyftcne" style="--depth: 0;"><li style="--depth: 0;" class="astro-cxyftcne"><a href="#_top" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Overview</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#read-the-observation-window" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Read the observation window</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#load-rules-into-plain-prometheus" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Load rules into plain Prometheus</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#enable-rules-in-helm" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Enable rules in Helm</span></a><ul class="astro-cxyftcne" style="--depth: 1;"><li style="--depth: 1;" class="astro-cxyftcne"><a href="#keep-namespace-enforcement-compatible" style="--depth: 1;" class="astro-cxyftcne"><span style="--depth: 1;" class="astro-cxyftcne">Keep namespace enforcement compatible</span></a></li></ul></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#inspect-the-affected-target" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Inspect the affected target</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-queue-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog queue discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-wal-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog WAL discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-capacity-discard" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry capacity discard</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#syslog-write-outcome-uncertain" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Syslog write outcome uncertain</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-write-outcome-uncertain" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry write outcome uncertain</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#http-persistence-rejection" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">HTTP persistence rejection</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#telemetry-wal-write-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Telemetry WAL write failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#wal-durability-degraded" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">WAL durability degraded</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#compaction-operation-failure" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Compaction operation failure</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#file-quarantine" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">File quarantine</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#publication-recovery-blocked" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Publication recovery blocked</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#ingest-admission-refusing" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Ingest admission refusing</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#hot-buffer-drain-stalled" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Hot buffer drain stalled</span></a></li><li style="--depth: 0;" class="astro-cxyftcne"><a href="#corpus-unsettled" style="--depth: 0;" class="astro-cxyftcne"><span style="--depth: 0;" class="astro-cxyftcne">Corpus unsettled</span></a></li></ul></nav></starlight-toc><script type="module" src="/_astro/TableOfContents.astro_astro_type_script_index_0_lang.Csloo1VZ.js"></script></div></div></div></aside><div class="main-pane astro-abfeecmu"><main data-pagefind-body class="astro-vdxcvpsm" lang="en" dir="ltr"><aside class="preview-banner astro-yp67euhd">Manual for <a href="https://github.com/jakub/trawl/releases/tag/v0.9.1" class="astro-yp67euhd">Trawl v0.9.1</a>. <a href="/release.json" class="astro-yp67euhd">Build identity</a>.</aside><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><h1 id="_top" class="astro-2sm4b3ln">Respond to operational alerts</h1></div></div><div class="content-panel astro-oil7k7jf"><div class="sl-container astro-oil7k7jf"><div class="sl-markdown-content"><p>Use this pack to receive alerts when Trawl reports a discard, persistence
+failure, compaction failure, or successful quarantine, when ingest is refused
+for lack of hot-buffer space, when the hot buffer stops draining, or when
+search stays refused because the corpus is unsettled. It adds no monitoring
 server, receiver, notification route, or automatic repair. Use your existing
 monitoring system to detect failed scrapes and stopped targets.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="read-the-observation-window">Read the observation window</h2><a class="sl-anchor-link" href="#read-the-observation-window"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Read the observation window”</span></a></div>
-<p>Every rule evaluates <code dir="auto">increase(counter[10m]) &gt; 0</code> separately for each source
-series. There is no <code dir="auto">for</code> delay. One observed increment fires at the next
+<p>Eleven rules evaluate <code dir="auto">increase(counter[10m]) &gt; 0</code> separately for each source
+series. They have no <code dir="auto">for</code> delay. One observed increment fires at the next
 evaluation once enough samples exist. Repeated increments can keep it firing.
 Use <strong>30-second scrape and evaluation intervals</strong>, no greater than <strong>two
 minutes</strong>, for this pack.</p>
-<p>All rules default to <code dir="auto">severity: warning</code>. Alert labels retain <code dir="auto">job</code>,
+<p>Three rules work differently.
+<a href="#ingest-admission-refusing">Ingest admission refusing</a> sums a counter over
+producers in a five-minute window and waits ten minutes with <code dir="auto">for</code>.
+<a href="#hot-buffer-drain-stalled">Hot buffer drain stalled</a> compares two gauges and
+waits two minutes. <a href="#corpus-unsettled">Corpus unsettled</a> reads one gauge and
+waits ten minutes. Their sections describe their windows.</p>
+<p><code dir="auto">TrawlHotBufferDrainStalled</code> defaults to <code dir="auto">severity: critical</code>. Every other rule
+defaults to <code dir="auto">severity: warning</code>. Alert labels retain <code dir="auto">job</code>,
 <code dir="auto">instance</code>, and any target <code dir="auto">namespace</code>, <code dir="auto">service</code>, <code dir="auto">pod</code>, or <code dir="auto">cluster</code> labels.
 Metric labels such as <code dir="auto">reason</code>, <code dir="auto">operation</code>, and <code dir="auto">kind</code> identify the evidence.
 The target <code dir="auto">service</code> label names the scraped Kubernetes Service, not an
@@ -102,10 +111,10 @@ increments are not recorded at all. A later zero baseline does not establish
 that startup had no drops. Missing or stale series and stopped scrapes also
 do not establish health. A range can retain a recent observed increment after
 the current series becomes stale.</p>
-<p>The rules have no current-value or ingest-enable gate. Stopping a producer
-does not erase observations still in the window. This pack introduces no
-current-enabled measurement and makes no claim to detect silent stalls,
-backlog eligibility, every network loss, or every disk failure.</p>
+<p>The counter rules have no current-value or ingest-enable gate. Stopping a producer
+does not erase observations still in the window. Apart from the hot-buffer
+drain and the corpus state, this pack makes no claim to detect silent stalls, backlog eligibility,
+every network loss, or every disk failure.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="load-rules-into-plain-prometheus">Load rules into plain Prometheus</h2><a class="sl-anchor-link" href="#load-rules-into-plain-prometheus"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Load rules into plain Prometheus”</span></a></div>
 <ol>
 <li>
@@ -130,7 +139,7 @@ The certificate must cover the target name. See <a href="/operate/access/#config
 </li>
 <li>
 <p>Check that its Targets page shows the <code dir="auto">trawl</code> job as up and its Rules page
-lists all ten Trawl alerts without evaluation errors.</p>
+lists all fourteen Trawl alerts without evaluation errors.</p>
 </li>
 </ol>
 <p>The plain expressions select <code dir="auto">job="trawl"</code>. If you choose another job name,
@@ -144,7 +153,8 @@ only when the pack is enabled. The chart defaults to
 ServiceMonitor creation is independent.</p>
 <p>Merge this example into your existing Trawl values:</p>
 <div class="expressive-code"><figure class="frame not-content"><figcaption class="header"></figcaption><pre data-language="yaml"><code><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">serviceMonitor</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">enabled</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">true</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">interval</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">30s</span></div></div><div class="ec-line"><div class="code"><span style="--0:#7FDBCA;--1:#111111">prometheusRule</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">enabled</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">true</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">namespace</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#D9F5DD;--1:#111111">""</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">additionalLabels</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">monitoring</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">homelab</span></div></div><div class="ec-line"><div class="code"><span class="indent">  </span><span style="--0:#7FDBCA;--1:#111111">alerts</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">TrawlSyslogQueueDiscard</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">severity</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#ECC48D;--1:#3B61B0">page</span></div></div><div class="ec-line"><div class="code"><span class="indent">    </span><span style="--0:#7FDBCA;--1:#111111">TrawlTelemetryCapacityDiscard</span><span style="--0:#D6DEEB;--1:#403F53">:</span></div></div><div class="ec-line"><div class="code"><span class="indent">      </span><span style="--0:#7FDBCA;--1:#111111">enabled</span><span style="--0:#D6DEEB;--1:#403F53">: </span><span style="--0:#FF6A83;--1:#A24848">false</span></div></div></code></pre><div class="copy"><div aria-live="polite"></div><button title="Copy to clipboard" data-copied="Copied!" data-code="serviceMonitor:  enabled: true  interval: 30sprometheusRule:  enabled: true  namespace: &quot;&quot;  additionalLabels:    monitoring: homelab  alerts:    TrawlSyslogQueueDiscard:      severity: page    TrawlTelemetryCapacityDiscard:      enabled: false"><div></div></button></div></figure></div>
-<p>All ten alerts are enabled with severity <code dir="auto">warning</code> when the pack is enabled.
+<p>All fourteen alerts are enabled when the pack is enabled.
+<code dir="auto">TrawlHotBufferDrainStalled</code> has severity <code dir="auto">critical</code>, and the others have <code dir="auto">warning</code>.
 Use the exact alert names in the <a href="/reference/api/#operational-alert-counters">metric mapping</a>
 as keys under <code dir="auto">prometheusRule.alerts</code>. Each entry accepts only <code dir="auto">enabled</code> and
 <code dir="auto">severity</code>. Severity is a nonblank static string, with no severity enum;
@@ -222,13 +232,29 @@ errors from daemon output even if stored internal telemetry is incomplete.
 The telemetry flush path reports its own write errors on stderr to avoid
 recursion. <a href="/operate/health/">Check health</a> covers the serving checks.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="syslog-queue-discard">Syslog queue discard</h2><a class="sl-anchor-link" href="#syslog-queue-discard"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Syslog queue discard”</span></a></div>
-<p><code dir="auto">TrawlSyslogQueueDiscard</code> observes <code dir="auto">trawl_syslog_events_dropped_total</code>, in
-events, when the shared TCP/UDP receive queue is full or closed. It does not
-distinguish transport and cannot observe packets lost before receipt.</p>
+<p><code dir="auto">TrawlSyslogQueueDiscard</code> observes <code dir="auto">trawl_syslog_events_dropped_total{reason}</code>,
+in events, when the syslog receive path abandons events. It cannot observe
+packets lost before receipt. The reason follows the syslog batcher’s own
+blocked state, not <code dir="auto">trawl_hot_buffer_admission_state</code>. The alert fires
+separately for each reason:</p>
+<ul>
+<li><code dir="auto">queue_full</code>: the listener queue was full while the batcher was not
+blocked, or the batcher was gone. A UDP datagram found the queue full
+because the batcher was slow, or found it closed because the daemon was
+stopping. TCP waits on a full queue instead of dropping. It counts here
+when the batcher was gone, or when shutdown abandoned a waiting frame while
+the batcher was not blocked.</li>
+<li><code dir="auto">backpressure</code>: the batcher was holding a group that hot-buffer admission
+refused. A UDP datagram found the queue full, or shutdown abandoned a
+waiting TCP frame, while the batcher was blocked. Events the batcher still
+held at shutdown count here too.
+See <a href="/operate/ingestion/#syslog-delivery-under-load">syslog delivery under load</a>.</li>
+</ul>
 <ol>
 <li>Inspect this counter alongside <code dir="auto">trawl_syslog_events_total{transport}</code> and
 the daemon’s queue and shutdown messages.</li>
-<li>Check sender bursts and whether the daemon was stopping.</li>
+<li>For <code dir="auto">backpressure</code>, follow <a href="#ingest-admission-refusing">ingest admission refusing</a>
+first. For <code dir="auto">queue_full</code>, check sender bursts and whether the daemon was stopping.</li>
 <li>Reduce sender pressure or correct the receiver’s capacity problem before
 increasing traffic. Keep any sender copies for reconciliation.</li>
 </ol>
@@ -254,7 +280,9 @@ establish that earlier events were recovered.</p>
 events. <code dir="auto">preinit_cap</code> is the capacity boundary before the telemetry sink is
 ready; <code dir="auto">buffer_cap</code> is the shared active-buffer, retry-queue, and in-flight
 memory budget’s capacity boundary.
-The rule excludes <code dir="auto">write_crashed</code>.</p>
+The rule excludes <code dir="auto">write_crashed</code> and <code dir="auto">unmetered_cap</code>. An <code dir="auto">unmetered_cap</code>
+drop is an unmetered server-failure event past the fixed cap of 60 persisted
+per minute; it still reached stdout.</p>
 <p>Metric increments emitted <strong>before recorder installation are lost</strong>. A
 zero-valued <code dir="auto">preinit_cap</code> series after startup does not prove that no earlier
 telemetry was dropped. Scraping more often cannot recover those increments.</p>
@@ -302,9 +330,10 @@ sender may retry; this is not confirmed permanent loss. Malformed input,
 producer policy rejections, and field-conformance outcomes are excluded.</p>
 <ol>
 <li>Read daemon WAL errors and the sender’s response, retry, and buffer state.</li>
-<li>Check <code dir="auto">accepted</code> and <code dir="auto">errors</code> even when the response is HTTP 200. A failed
-three-event group increments this metric by three but contributes one
-group error to the response’s <code dir="auto">rejected</code> count.</li>
+<li>A request with any failed group answers a redacted HTTP 500. Groups that
+did write in the same request are still accepted and published, so a
+retry of the whole request duplicates them. A failed three-event group
+increments this metric by three.</li>
 <li>Correct the storage problem and reconcile accepted siblings before a
 controlled retry. Preserve sender copies and any temporary WAL bytes.</li>
 </ol>
@@ -328,17 +357,40 @@ failure alerts; never subtract attempt counts from event counts.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="wal-durability-degraded">WAL durability degraded</h2><a class="sl-anchor-link" href="#wal-durability-degraded"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “WAL durability degraded”</span></a></div>
 <p><code dir="auto">TrawlWalDurabilityDegraded</code> observes
 <code dir="auto">trawl_wal_durability_failures_total{operation="parent_directory_sync"}</code>, in
-failed operations. <code dir="auto">WalWriter::write</code> has published the file, then failed to
-sync its parent directory. The directory entry may not survive a crash.
-The write remains accepted; this is neither rejection nor event discard.</p>
+failed operations. <code dir="auto">WalWriter::write</code> failed to sync a WAL directory: the
+environment directory after the writer linked a new file into it, or the WAL
+root before the first write into an environment. A write is acknowledged only
+after that sync, so the write is rejected. Before it returns the error, the
+writer removes the new file and syncs the directory again. A file that it
+cannot remove durably stays in the WAL, as steps 2 and 3 describe.
+Each lane then follows its own failure path:</p>
+<ul>
+<li>HTTP ingest answers a redacted 500 and counts the failed group under
+<code dir="auto">TrawlHttpPersistenceRejection</code>. The sender retries.</li>
+<li>Syslog discards the group and counts it under <code dir="auto">TrawlSyslogWalDiscard</code>.</li>
+<li>Telemetry counts the attempt under <code dir="auto">TrawlTelemetryWalWriteFailure</code>. It
+retains the batch for retry, unless the removal failed or was not durable.</li>
+</ul>
 <ol>
-<li>Find <code dir="auto">wal_dir_fsync_failed</code> and the filesystem error it carries.</li>
-<li>Inspect filesystem and storage health while preserving the published WAL.</li>
-<li>Address the reported sync failure. Avoid an unnecessary restart or blind
-resend as a repair for this warning; a resend can duplicate visible data.</li>
+<li>Find <code dir="auto">wal_dir_fsync_failed</code> and the filesystem error it carries. The
+<code dir="auto">withdrawn</code> field says whether the new file was removed.</li>
+<li>If <code dir="auto">withdrawn</code> is <code dir="auto">false</code>, <code dir="auto">withdraw_error</code> carries the removal error. The
+file stays in the WAL, and compaction merges it, although the write was
+rejected. A sender that retries that batch duplicates it. Telemetry does
+not retry such a batch.</li>
+<li>If <code dir="auto">withdrawn</code> is <code dir="auto">true</code>, read <code dir="auto">withdrawal_durable</code>. The writer syncs the
+directory again after it removes the file. <code dir="auto">true</code> means that the removal
+is durable. <code dir="auto">false</code> means that the second sync failed too, and
+<code dir="auto">withdrawal_sync_error</code> carries its error. The file is gone now, but a
+power loss before the next successful sync of that directory can restore
+it. The next boot then hydrates it, and compaction merges a batch whose
+write was rejected. Telemetry does not retry such a batch either. That
+second failure increments the counter again.</li>
+<li>Inspect filesystem and storage health, and address the reported sync
+failure.</li>
 </ol>
-<p>Resolution means no new parent-directory sync failure was observed. It does
-not retroactively prove crash durability for the earlier directory entry.</p>
+<p>Resolution means no new directory sync failure was observed. It does not
+prove that rejected writes were retried.</p>
 <div class="sl-heading-wrapper level-h2"><h2 id="compaction-operation-failure">Compaction operation failure</h2><a class="sl-anchor-link" href="#compaction-operation-failure"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Compaction operation failure”</span></a></div>
 <p><code dir="auto">TrawlCompactionOperationFailure</code> observes
 <code dir="auto">trawl_compaction_operation_failures_total{operation}</code>, in failed attempts.
@@ -390,4 +442,227 @@ followed by a different failure can legitimately emit both facts.</p>
 <p>Resolution means no new file isolation was observed. It does not mean that
 quarantined files disappeared, that their contents were restored, or that a
 number of events was permanently lost.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="publication-recovery-blocked">Publication recovery blocked</h2><a class="sl-anchor-link" href="#publication-recovery-blocked"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Publication recovery blocked”</span></a></div>
+<p><code dir="auto">TrawlPublicationRecoveryBlocked</code> observes
+<code dir="auto">trawl_publication_recovery_total{outcome=~"contradictory|failed"}</code>, in
+publication markers. Compaction writes a marker before it publishes a
+parquet file and removes it after the consumed WAL files are retired.
+Recovery runs at boot and at the start of every compaction tick, and it
+finishes or rolls back each marker it finds. While a marker stays, its
+environment and service are out of compaction, stale temporary-file cleanup,
+daily rollup of that day, and retention of that date. A repin cutover is
+refused. <a href="/architecture/recovery/">Crash recovery</a> describes the protocol.</p>
+<p>A marker that recovery cannot resolve at boot also refuses search. Boot
+hydration skips the scope that the marker blocks, so queries, exports, and
+manual runs answer 503 <code dir="auto">corpus_recovering</code> with cause kind <code dir="auto">restart_backlog</code>,
+and <a href="#corpus-unsettled">corpus unsettled</a> fires after ten minutes. Search stays
+refused until the marker is resolved and compaction drains that scope.
+While search is refused as <code dir="auto">restart_backlog</code>, any pending publication marker
+keeps it refused, because compaction’s coverage proof fails while a marker is
+pending.</p>
+<p>A marker that is invalid, or that cannot be read, also refuses ingest for its
+environment and service. The WAL writer cannot tell which file names such a
+marker claims, so it refuses every write for that service until the marker is
+resolved. HTTP ingest answers 500 and counts the events as <code dir="auto">wal_failure</code>,
+which fires <a href="#http-persistence-rejection">HTTP persistence rejection</a>. Syslog
+discards the group and counts it, and self-telemetry keeps the batch for
+retry. A contradictory marker that is valid does not refuse ingest.</p>
+<ul>
+<li><code dir="auto">failed</code>: a filesystem error stopped recovery of one marker, for example a
+WAL directory where the consumed files cannot be removed. Check whether
+the marker still exists: while it does, the service stays blocked and the
+next tick retries it, and each retry that fails counts again. Recovery
+removes a marker only after its outcome is settled, so if the marker is
+gone nothing is retried: the rows are already published, or still in the
+WAL for the next compaction.</li>
+<li><code dir="auto">contradictory</code>: the evidence contradicts itself. For example, the
+canonical parquet file does not carry the identity the marker recorded,
+and the temporary output is gone. Recovery touches nothing and counts the
+marker on every tick until an operator resolves it.</li>
+</ul>
+<ol>
+<li>Find <code dir="auto">publication_recovery_failed</code> in the daemon log. An event about one
+marker names the environment, the service, and the marker path. A
+contradiction carries a <code dir="auto">reason</code>: <code dir="auto">invalid_marker</code>, <code dir="auto">not_regular_file</code>,
+<code dir="auto">output_missing</code>, or <code dir="auto">output_mismatch</code>. A failure carries the filesystem
+error. Recovery can also fail before it reaches a marker. If recovery
+cannot list an environment’s WAL directory, the event carries only the
+environment and the error, and every service in that environment stays
+blocked. This case does not count toward this alert; compaction counts
+it under <code dir="auto">wal_environment_scan</code>. A compaction tick lists the WAL root
+before recovery runs. If that first listing fails, compaction counts it
+under <code dir="auto">wal_root_scan</code> and the tick stops before recovery. If the first
+listing succeeds and recovery’s own listing of the root then fails, the
+event carries only the error and counts as <code dir="auto">failed</code>.</li>
+<li>For a failure, correct the reported permission or storage problem. When
+the event has no service or marker path, investigate the directory that
+its error names. The next tick completes the marker, and the service
+compacts again.</li>
+<li>For a contradiction, stop trawld and preserve the marker, the WAL files it
+lists, and the parquet and temporary files at its partition. Find out what
+changed the canonical file or removed the temporary output, such as a
+manual edit, a restore from backup, or an interrupted disk. Keep the
+marker until you know whether the listed WAL rows are in the canonical
+file. Removing it makes compaction merge those WAL files again, which
+duplicates their rows if they were published.</li>
+<li>After the marker is resolved, the next compaction pass drains the scope.
+If search was refused as <code dir="auto">restart_backlog</code>, the coverage proof after that
+pass settles the corpus and logs <code dir="auto">corpus_settled</code>.</li>
+</ol>
+<p>While a marker keeps blocking, every compaction pass counts it as a failure.
+After a failed pass, compaction starts no early pass under hot-buffer
+pressure and waits for its next regular pass, at most one
+<code dir="auto">[ingest] compaction_interval_secs</code> away. This applies to every service, not
+only the blocked one, so all ingest drains at the regular cadence until the
+marker is resolved. A WAL file that fails on every pass and a WAL root entry
+that compaction cannot inspect have the same effect. Resolving the fault
+restores early draining.</p>
+<p>Resolution means that no recovery outcome of either kind was observed in the
+window. A contradictory marker repeats on every tick, so the alert keeps
+firing while that marker stays.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="ingest-admission-refusing">Ingest admission refusing</h2><a class="sl-anchor-link" href="#ingest-admission-refusing"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Ingest admission refusing”</span></a></div>
+<p><code dir="auto">TrawlIngestAdmissionRefusing</code> observes
+<code dir="auto">trawl_hot_buffer_admission_refusals_total{kind="full"}</code>, in refused
+reservations, summed over <code dir="auto">producer</code>. The hot buffer refuses a write that
+does not fit its free space instead of removing events that it already holds.
+The rule fires when a refusal was observed in every five-minute window for ten
+minutes. A short burst that compaction clears does not fire it.
+<code dir="auto">oversized</code> refusals never fire it: they come from one request or event that
+is larger than its producer’s share, and they do not mean the buffer is full.</p>
+<p>While ingest is refused:</p>
+<ul>
+<li>HTTP senders receive 503 <code dir="auto">hot_buffer_full</code> and retry.</li>
+<li>Syslog TCP senders stall, and UDP datagrams are dropped with
+<code dir="auto">reason="backpressure"</code>.</li>
+<li>Internal telemetry keeps its batch queued.</li>
+<li>Every admitted event stays searchable, and <code dir="auto">/api/v1/health</code> reports
+<code dir="auto">ingest_capacity: refusing</code> at HTTP 200.</li>
+</ul>
+<ol>
+<li>Read <code dir="auto">trawl_hot_buffer_admission_state</code> and
+<code dir="auto">trawl_hot_buffer_oldest_batch_age_seconds</code>. If the age keeps growing,
+compaction is not draining; follow <a href="#hot-buffer-drain-stalled">hot buffer drain stalled</a>.</li>
+<li>If the age stays near the compaction interval, compaction drains but
+senders write faster than it. Compare <code dir="auto">trawl_hot_buffer_events</code> and
+<code dir="auto">trawl_hot_buffer_bytes</code> with <code dir="auto">trawl_hot_buffer_max_events</code> and
+<code dir="auto">trawl_hot_buffer_max_bytes</code> to see which cap is full. Check
+<code dir="auto">TrawlCompactionOperationFailure</code> and <code dir="auto">TrawlPublicationRecoveryBlocked</code>
+too. While a failure repeats on every pass, compaction runs no early
+passes under pressure, for any service, and drains only on its interval.
+See <a href="#publication-recovery-blocked">publication recovery blocked</a>.</li>
+<li>Read the <code dir="auto">producer</code> label on the raw counter to find the sender that is
+refused, and the <code dir="auto">http_failure</code> WARN events with <code dir="auto">cause_kind=hot_buffer_full</code>
+for the HTTP requests.</li>
+<li>Reduce the sender’s rate, or raise <code dir="auto">[ingest] hot_buffer_max_events</code> or
+<code dir="auto">hot_buffer_max_bytes</code> if the host has the memory. See
+<a href="/reference/configuration/#ingest">the <code dir="auto">[ingest]</code> reference</a>.</li>
+</ol>
+<p>Resolution means no refusal was observed in the last five minutes. It does
+not establish that refused HTTP requests were retried or that dropped UDP
+datagrams were recovered.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="hot-buffer-drain-stalled">Hot buffer drain stalled</h2><a class="sl-anchor-link" href="#hot-buffer-drain-stalled"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Hot buffer drain stalled”</span></a></div>
+<p><code dir="auto">TrawlHotBufferDrainStalled</code> compares two gauges:
+<code dir="auto">trawl_hot_buffer_oldest_batch_age_seconds</code>, the seconds since the oldest
+resident batch was inserted, and <code dir="auto">trawl_compaction_interval_seconds</code>. A batch
+that boot hydration loaded counts from the time in its WAL file name, so a
+restart does not reset the age. It fires
+when the age stays above ten compaction intervals, with a floor of 60 seconds,
+for two minutes. With the default interval of 10 seconds, that is an age over
+100 seconds. A long interval raises the threshold with it, so a slow schedule
+alone does not fire the alert.</p>
+<p>Compaction is the only thing that removes a batch from the hot buffer. A batch
+that stays this long means compaction is not draining, and ingest is refused
+once the buffer fills. Admitted events stay searchable. Common causes are an
+unreachable catalog database, a repin cutover, and a
+<a href="#publication-recovery-blocked">publication marker</a> that blocks a service.</p>
+<ol>
+<li>Read <code dir="auto">compaction_error</code> and <code dir="auto">publication_recovery_failed</code> events and the
+daemon journal for the affected target. Compare
+<code dir="auto">TrawlCompactionOperationFailure</code> and <code dir="auto">TrawlPublicationRecoveryBlocked</code>.</li>
+<li>Check <code dir="auto">storage_db</code> in <code dir="auto">/api/v1/health</code> and the app-state database, which
+holds the catalog.</li>
+<li>Check whether a repin job is running. See <a href="/operate/catalog/#repin-a-field">repin a field</a>.</li>
+<li>Correct the cause. Compaction then drains the buffer, and the age falls on
+the next scrape.</li>
+</ol>
+<p>Resolution means the oldest batch is younger than the threshold. It does not
+establish that ingest refusals stopped; check
+<a href="#ingest-admission-refusing">ingest admission refusing</a>.</p>
+<div class="sl-heading-wrapper level-h2"><h2 id="corpus-unsettled">Corpus unsettled</h2><a class="sl-anchor-link" href="#corpus-unsettled"><span aria-hidden="true" class="sl-anchor-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="m12.11 15.39-3.88 3.88a2.52 2.52 0 0 1-3.5 0 2.47 2.47 0 0 1 0-3.5l3.88-3.88a1 1 0 1 0-1.42-1.42l-3.88 3.89a4.48 4.48 0 0 0 6.33 6.33l3.89-3.88a1 1 0 0 0-1.42-1.42m8.58-12.08a4.49 4.49 0 0 0-6.33 0l-3.89 3.88a1 1 0 1 0 1.42 1.42l3.88-3.88a2.52 2.52 0 0 1 3.5 0 2.47 2.47 0 0 1 0 3.5l-3.88 3.88a1 1 0 0 0 0 1.42 1 1 0 0 0 1.42 0l3.88-3.89a4.49 4.49 0 0 0 0-6.33M8.83 15.17a1 1 0 0 0 .71.29 1 1 0 0 0 .71-.29l4.92-4.92a1 1 0 1 0-1.42-1.42l-4.92 4.92a1 1 0 0 0 0 1.42"></path></svg></span><span class="sr-only" data-pagefind-ignore>Section titled “Corpus unsettled”</span></a></div>
+<p><code dir="auto">TrawlCorpusUnsettled</code> observes the gauge <code dir="auto">trawl_corpus_unsettled{reason}</code>.
+It fires when the corpus has been unsettled for ten minutes. The rule takes
+the maximum over <code dir="auto">reason</code>, so a change from one reason to the other does not
+restart the delay. <a href="/architecture/data-flow/#reads-while-the-corpus-is-unsettled">Reads while the corpus is unsettled</a>
+explains the state.</p>
+<p>While the corpus is unsettled:</p>
+<ul>
+<li>Searches, exports, uncached field values, and manual runs answer 503
+<code dir="auto">corpus_recovering</code>.</li>
+<li>Scheduled runs wait. The scheduler claims no window until the corpus
+settles, and one claim then covers the gap.</li>
+<li>A repin is refused and ends <code dir="auto">blocked</code>.</li>
+<li>Live tail, health, and metrics work as usual.</li>
+<li><code dir="auto">checks.corpus</code> in <code dir="auto">/api/v1/health</code> names the current reason.</li>
+</ul>
+<p>The <code dir="auto">reason</code> label is one of two values:</p>
+<ul>
+<li><code dir="auto">restart_backlog</code>: WAL from before the last restart is not yet proven
+covered. Boot hydration left some of it out of the hot buffer, and
+compaction has not proven that it drained it.</li>
+<li><code dir="auto">rollup_pending</code>: a daily rollup marker is unfinished, or the scan for
+rollup markers failed. When both reasons hold, health and the refusals
+name <code dir="auto">rollup_pending</code>.</li>
+</ul>
+<ol>
+<li>Read <code dir="auto">checks.corpus</code> in <code dir="auto">/api/v1/health</code>, and both
+<code dir="auto">trawl_corpus_unsettled</code> series, to see which reasons hold.</li>
+<li>For <code dir="auto">restart_backlog</code>, find <code dir="auto">boot_hydration</code> in the log of the last boot.
+Its counts say why WAL was left out:
+<ul>
+<li><code dir="auto">capacity</code>, or <code dir="auto">examine_bound_hit=true</code>: the backlog did not fit the
+caps. Lowering <code dir="auto">[ingest] hot_buffer_max_events</code> or <code dir="auto">hot_buffer_max_bytes</code>
+across a restart can cause this once. Compaction drains the rest.</li>
+<li><code dir="auto">oversized</code>: a file is larger than a full cap. Compaction merges it.</li>
+<li><code dir="auto">undecodable</code>: a file is not exactly what the WAL writer produces.
+Compaction’s decoder merges it or quarantines it.</li>
+<li><code dir="auto">unreadable</code>: an entry is not a regular file, or could not be read.
+Check its type and permissions.</li>
+<li><code dir="auto">claimed</code>: a pending publication marker blocks a service. Follow
+<a href="#publication-recovery-blocked">publication recovery blocked</a>.</li>
+<li><code dir="auto">unlisted</code>: a WAL directory could not be listed. Check its permissions
+and the storage.</li>
+</ul>
+</li>
+<li>Read the <code dir="auto">coverage_proof</code> events that compaction logs after each pass.
+Their <code dir="auto">outcome</code> names what still holds the state:
+<ul>
+<li><code dir="auto">settled</code>: the proof cleared the state, and <code dir="auto">corpus_settled</code> follows.</li>
+<li><code dir="auto">incomplete</code>: a WAL directory could not be listed. Check
+<code dir="auto">TrawlCompactionOperationFailure</code> for <code dir="auto">wal_root_scan</code> or
+<code dir="auto">wal_environment_scan</code>.</li>
+<li><code dir="auto">marker_pending</code>: a publication marker is pending. Follow
+<a href="#publication-recovery-blocked">publication recovery blocked</a>.</li>
+<li><code dir="auto">too_many_candidates</code>: more than 1024 WAL files are not resident.</li>
+<li><code dir="auto">not_resident</code>: a WAL file is on disk and not resident.</li>
+</ul>
+</li>
+<li>If the outcome stays <code dir="auto">too_many_candidates</code> or <code dir="auto">not_resident</code> while
+<code dir="auto">trawl_wal_files</code> does not fall, compaction is not draining the WAL. Read <code dir="auto">compaction_error</code> events, and check
+<code dir="auto">storage_db</code> in <code dir="auto">/api/v1/health</code>: a catalog outage stops every merge.
+Follow <a href="#hot-buffer-drain-stalled">hot buffer drain stalled</a> for the
+causes.</li>
+<li>For <code dir="auto">rollup_pending</code>, find <code dir="auto">rollup_boot_recovery</code> at ERROR and
+<code dir="auto">rollup_error</code>, and check <code dir="auto">TrawlCompactionOperationFailure</code> for
+<code dir="auto">pending_rollup_scan</code> and <code dir="auto">pending_rollup_recovery</code>. Correct the reported
+filesystem problem. The next compaction pass retries, and
+<code dir="auto">publication_scan_recovered</code> logs a failed scan that it clears. A
+query-only node clears a failed scan only when you restart it.
+<a href="/architecture/recovery/#daily-rollup">Daily rollup</a> describes the
+recovery.</li>
+</ol>
+<p>Do not remove WAL files or markers to clear the state. A removed WAL file
+loses its events, and a removed marker can duplicate rows.</p>
+<p>Resolution means the gauge read 0 for both reasons. Searches answer again
+from the moment the state clears, and the next scheduler poll claims the
+windows that waited.</p>
 </div><footer class="sl-flex astro-xhxjzfa7"><div class="meta sl-flex astro-xhxjzfa7"><a href="https://github.com/jakub/trawl/edit/main/docs/src/content/docs/operate/operational-alerts.md" class="sl-flex print:hidden astro-xk5gmzsg"><svg aria-hidden="true" class="astro-xk5gmzsg astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.2em;"><path d="M22 7.24a1 1 0 0 0-.29-.71l-4.24-4.24a1 1 0 0 0-1.1-.22 1 1 0 0 0-.32.22l-2.83 2.83L2.29 16.05a1 1 0 0 0-.29.71V21a1 1 0 0 0 1 1h4.24a1 1 0 0 0 .76-.29l10.87-10.93L21.71 8c.1-.1.17-.2.22-.33a1 1 0 0 0 0-.24v-.14l.07-.05ZM6.83 20H4v-2.83l9.93-9.93 2.83 2.83L6.83 20ZM18.17 8.66l-2.83-2.83 1.42-1.41 2.82 2.82-1.41 1.42Z"/></svg>Edit page</a></div><div class="pagination-links print:hidden astro-jgq3vlii" dir="ltr"><a href="/operate/health/" rel="prev" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17 11H9.41l3.3-3.29a1.004 1.004 0 1 0-1.42-1.42l-5 5a1 1 0 0 0-.21.33 1 1 0 0 0 0 .76 1 1 0 0 0 .21.33l5 5a1.002 1.002 0 0 0 1.639-.325 1 1 0 0 0-.219-1.095L9.41 13H17a1 1 0 0 0 0-2Z"/></svg><span class="astro-jgq3vlii">Previous<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Check health and stalled work</span></span></a><a href="/operate/catalog/" rel="next" class="astro-jgq3vlii"><svg aria-hidden="true" class="astro-jgq3vlii astro-n5k4ipy7" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" style="--sl-icon-size: 1.5rem;"><path d="M17.92 11.62a1.001 1.001 0 0 0-.21-.33l-5-5a1.003 1.003 0 1 0-1.42 1.42l3.3 3.29H7a1 1 0 0 0 0 2h7.59l-3.3 3.29a1.002 1.002 0 0 0 .325 1.639 1 1 0 0 0 1.095-.219l5-5a1 1 0 0 0 .21-.33 1 1 0 0 0 0-.76Z"/></svg><span class="astro-jgq3vlii">Next<br class="astro-jgq3vlii"><span class="link-title astro-jgq3vlii">Repair catalog conflicts</span></span></a></div></footer></div></div></main></div></div></div></div></body></html>
