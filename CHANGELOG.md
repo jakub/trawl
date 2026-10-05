@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.1
+
+See the [0.9.1 release notes](docs/releases/v0.9.1.md) for shipped capabilities,
+fixes, and the trawl-web certificate change for Helm installations.
+
 ## 0.9.0
 
 See the [0.9.0 release notes](docs/releases/v0.9.0.md) for shipped capabilities,
