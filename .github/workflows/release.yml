@@ -206,6 +206,10 @@ jobs:
       group: gh-pages-deploy
       cancel-in-progress: false
     steps:
+      # Self-hosted runner image is minimal; the Pages deploy action shells
+      # out to rsync, which it does not ship.
+      - name: Install deploy tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends rsync
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           ref: ${{ github.sha }}
