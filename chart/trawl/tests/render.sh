@@ -332,6 +332,43 @@ for case in default custom no-init-auth; do
   fi
 done
 
+# -- httpRoute.backend mirrors ingress.backend ------------------------------
+
+# A backendRef port is a number, not a Service port name, so the route must
+# carry the same number service.yaml publishes for the chosen backend.
+assert_route_port() {
+  local expected=$1
+  shift
+  local route="$work_dir/route.yaml"
+  render_only httproute.yaml --set httpRoute.enabled=true "$@" >"$route"
+  local ports
+  ports=$(grep -E '^ +port: ' "$route" | sed -E 's/^ +port: //')
+  if [[ $ports != "$expected" ]]; then
+    echo "expected the HTTPRoute backendRef port ${expected}, found '${ports}'" >&2
+    cat "$route" >&2
+    exit 1
+  fi
+}
+assert_route_port 8090 "${web_enabled[@]}"
+assert_route_port 9090 "${web_enabled[@]}" --set service.webPort=9090
+assert_route_port 8090 "${web_enabled[@]}" --set httpRoute.backend=web
+assert_route_port 5514 --set httpRoute.backend=trawld
+assert_route_port 9443 "${web_enabled[@]}" --set httpRoute.backend=trawld --set service.port=9443
+
+assert_render_fails "httpRoute.backend=web without the web sidecar" \
+  'httpRoute.backend=web requires web.enabled=true' \
+  render_only httproute.yaml --set httpRoute.enabled=true
+# An unknown backend fails in the schema, and in the template itself when
+# schema validation is skipped.
+assert_render_fails "an unknown httpRoute.backend" \
+  'must be one of' \
+  render_only httproute.yaml "${web_enabled[@]}" --set httpRoute.enabled=true \
+  --set httpRoute.backend=api
+assert_render_fails "an unknown httpRoute.backend without schema validation" \
+  'httpRoute.backend=api is not supported; set it to "web" or "trawld"' \
+  render_only httproute.yaml "${web_enabled[@]}" --set httpRoute.enabled=true \
+  --set httpRoute.backend=api --skip-schema-validation
+
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"

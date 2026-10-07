@@ -140,13 +140,28 @@ class InstallNotes(unittest.TestCase):
             "ingress.hosts[0].paths[0].path": "/",
             "ingress.hosts[0].paths[0].pathType": "Prefix",
             "httpRoute.enabled": "true",
+            "httpRoute.backend": "trawld",
             "httpRoute.hostnames[0]": "api.example.com",
         })
         self.assertIn("Browser ingress hosts:\n  logs.example.com", notes)
         self.assertIn("API HTTPRoute hosts (for bearer-token clients):\n  api.example.com", notes)
+        self.assertNotIn("Browser HTTPRoute", notes)
         self.assertIn("kind: Ingress", manifest)
         self.assertIn("kind: HTTPRoute", manifest)
         self.assertNotIn("Open http://localhost", notes)
+
+    def test_browser_route_is_identified_as_browser(self):
+        for settings in ({}, {"httpRoute.backend": "web"}):
+            with self.subTest(settings=settings):
+                notes, _ = render(**{
+                    "web.enabled": "true",
+                    "web.publicOrigins[0]": "https://logs.example.com",
+                    "httpRoute.enabled": "true",
+                    "httpRoute.hostnames[0]": "logs.example.com",
+                    **settings,
+                })
+                self.assertIn("Browser HTTPRoute hosts:\n  logs.example.com", notes)
+                self.assertNotIn("API HTTPRoute", notes)
 
     def test_daemon_ingress_is_identified_as_an_api(self):
         notes, _ = render(**{

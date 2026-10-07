@@ -56,10 +56,15 @@ ingress:
   #      - trawl.local
 
 # -- Gateway API HTTPRoute (alternative to Ingress)
-# trawld speaks HTTPS natively — configure BackendTLSPolicy if your
-# gateway controller needs to trust the backend certificate.
+# When httpRoute.backend is "web" (default) the route targets the trawl-web
+# sidecar on plain HTTP, which serves the browser UI. Switch to "trawld" to
+# route the HTTPS API directly (for bearer-token API clients). Only then does
+# the gateway need a BackendTLSPolicy that trusts the backend certificate.
 httpRoute:
   enabled: false
+  # "web"    — browser UI via trawl-web sidecar (default)
+  # "trawld" — HTTPS API (the gateway must trust trawld's certificate)
+  backend: web
   parentRef:
     name: ""
     namespace: ""

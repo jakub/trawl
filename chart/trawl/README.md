@@ -211,7 +211,8 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `ingress.annotations` | object | `{}` | Ingress annotations |
 | `ingress.hosts` | list | one host `trawl.local` with path `/` | Ingress host rules |
 | `ingress.tls` | list | `[]` | Ingress TLS entries |
-| `httpRoute.enabled` | bool | `false` | Create a Gateway API HTTPRoute to the trawld HTTPS port. The gateway needs a `BackendTLSPolicy` that trusts the backend certificate |
+| `httpRoute.enabled` | bool | `false` | Create a Gateway API HTTPRoute |
+| `httpRoute.backend` | string | `web` | `web` targets trawl-web over HTTP. `trawld` targets the HTTPS API, and the gateway needs a `BackendTLSPolicy` that trusts the backend certificate |
 | `httpRoute.parentRef.name` | string | `""` | Gateway name |
 | `httpRoute.parentRef.namespace` | string | `""` | Gateway namespace |
 | `httpRoute.parentRef.sectionName` | string | `websecure` | Gateway listener name |

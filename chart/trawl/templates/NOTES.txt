@@ -66,8 +66,13 @@ API ingress hosts (for bearer-token clients):
 {{- end }}
 {{- end }}
 {{- if .Values.httpRoute.enabled }}
+{{- if eq (.Values.httpRoute.backend | default "web") "web" }}
+
+Browser HTTPRoute hosts:
+{{- else }}
 
 API HTTPRoute hosts (for bearer-token clients):
+{{- end }}
 {{- range .Values.httpRoute.hostnames }}
   {{ . }}
 {{- end }}

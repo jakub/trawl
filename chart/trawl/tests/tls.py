@@ -679,12 +679,19 @@ class TLS(unittest.TestCase):
     def test_host_coverage_uses_one_label_wildcards(self):
         for host, accepted in [("api.example.com", True), ("deep.api.example.com", False), ("example.com", False)]:
             settings = managed(certManager={"issuerRef": {"name": "ca"}, "dnsNames": ["*.example.com"]})
-            settings["httpRoute"] = {"enabled": True, "hostnames": [host]}
+            settings["httpRoute"] = {"enabled": True, "backend": "trawld", "hostnames": [host]}
             with self.subTest(host=host):
                 if accepted:
                     self.objects(settings)
                 else:
                     self.fails(settings, "httpRoute.hostnames")
+        # A browser route reaches trawl-web over HTTP, so trawld's
+        # certificate need not cover its hosts, as with a browser ingress.
+        settings = managed()
+        settings["web"] = web()
+        settings["tls"]["upstreamCa"] = "system"
+        settings["httpRoute"] = {"enabled": True, "hostnames": ["browser.example.com"]}
+        self.objects(settings)
         settings = managed()
         settings["ingress"] = {"enabled": True, "backend": "trawld", "hosts": [{"host": "other.example.com", "paths": []}]}
         self.fails(settings, "ingress.hosts")
