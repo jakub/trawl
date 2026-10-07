@@ -268,6 +268,8 @@ enum Unclosable {
     Symlink,
     /// The configured path does not end in a directory name.
     BadPath,
+    /// Something other than a directory is there.
+    NotDirectory,
     /// Another user owns it.
     ForeignOwner,
     /// It needs closing and sits on a read-only mount.
@@ -295,7 +297,7 @@ impl Unclosable {
     /// not root, and a root run's opens prove nothing about the service
     /// user's.
     const fn structural(self) -> bool {
-        matches!(self, Self::Symlink | Self::BadPath)
+        matches!(self, Self::Symlink | Self::BadPath | Self::NotDirectory)
     }
 }
 
@@ -314,7 +316,11 @@ fn predict_closing(data_root: &Path, wal_dir: &Path, ingest: bool, ask_access: b
                 tighten.push(root.kind);
                 continue;
             }
-            Ok(Prediction::Absent | Prediction::NotDirectory | Prediction::OwnerOnly) => continue,
+            Ok(Prediction::NotDirectory) if root.kind.epoch_gate_judges_non_directory() => {
+                continue;
+            }
+            Ok(Prediction::NotDirectory) => Unclosable::NotDirectory,
+            Ok(Prediction::Absent | Prediction::OwnerOnly) => continue,
             Ok(Prediction::Refused(refusal)) => Unclosable::from(refusal),
             Err(_) => Unclosable::Uninspectable,
         };
@@ -393,6 +399,18 @@ fn closing_row(closing: Closing) -> Option<Row> {
                     _ => "set [data] path to the directory itself",
                 }),
             )
+        }
+        Closing::Refused(kind, Unclosable::NotDirectory) => {
+            Row::failed(check, about!(kind, "is not a directory")).next(Text::new(match kind {
+                RootKind::DataRoot => "point [data] path at a directory",
+                RootKind::WalDir => {
+                    "point [ingest] wal_dir at a directory, or move what is there aside so \
+                     trawld can create it"
+                }
+                RootKind::RepinShadow | RootKind::RepinAside => {
+                    "move it aside; trawld creates the repin roots when a repin runs"
+                }
+            }))
         }
         Closing::Refused(kind, Unclosable::ForeignOwner) => Row::failed(
             check,
@@ -2562,6 +2580,33 @@ mod tests {
         }
     }
 
+    /// A repin sibling that is not a directory refuses at boot whoever runs
+    /// trawld, so the row fails in a root run too, and the file is left as
+    /// it was. A data root that is not a directory stays the structural
+    /// check's to report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_repin_sibling_that_is_not_a_directory_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(&data.join("EPOCH"), b"3\n");
+        owner_only_mode(&data);
+        let shadow = marker::shadow_root(&data);
+        std::fs::write(&shadow, b"not a directory").unwrap();
+        for ask_access in [false, true] {
+            let row = check_root(data.clone(), data.join("wal"), true, ask_access).await;
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (
+                    Outcome::Failed,
+                    Some("the repin shadow root is not a directory")
+                ),
+                "ask_access {ask_access}"
+            );
+        }
+        assert_eq!(std::fs::read(&shadow).unwrap(), b"not a directory");
+    }
+
     /// A storage root whose final component is a symlink refuses at boot,
     /// so the row fails, in a root run too: boot refuses it whoever runs
     /// trawld. The link and its target are left as they were. A symlink
@@ -2663,6 +2708,7 @@ mod tests {
         let causes = [
             Unclosable::Symlink,
             Unclosable::BadPath,
+            Unclosable::NotDirectory,
             Unclosable::ForeignOwner,
             Unclosable::ReadOnlyFilesystem,
             Unclosable::Uninspectable,

@@ -28,7 +28,9 @@
 //! of a configured path is held this way. Its ancestors are configuration
 //! the operator trusts, as ADR-0041 treats the storage roots themselves.
 //!
-//! A symlink as the final component refuses. So does a root that another
+//! A symlink as the final component refuses, and so does a WAL directory or
+//! repin sibling that is not a directory; a data root that is not one is
+//! the epoch gate's to refuse. So does a root that another
 //! user owns, even when trawld runs as root and could change it: trawld does
 //! not take over a directory it was not given, the rule `tls.rs` applies to
 //! its generated directories. A root the filesystem will not change refuses,
@@ -78,6 +80,14 @@ pub enum RootKind {
 }
 
 impl RootKind {
+    /// Whether something other than a directory at this root is left for
+    /// the epoch gate, which refuses it with its own message. Only the data
+    /// root's is; any other root that is not a directory is refused here.
+    #[must_use]
+    pub const fn epoch_gate_judges_non_directory(self) -> bool {
+        matches!(self, Self::DataRoot)
+    }
+
     /// The setting that names this root, or that the root is derived from.
     const fn setting(self) -> &'static str {
         match self {
@@ -257,8 +267,9 @@ impl Placement {
 pub enum Observation {
     /// Nothing is there. Boot creates a missing root later, under its umask.
     Absent,
-    /// Something other than a directory or a symlink is there. The epoch
-    /// gate refuses it with its own message, so it is not judged here.
+    /// Something other than a directory or a symlink is there. At the data
+    /// root the epoch gate refuses it with its own message; any other root
+    /// is refused here (see [`RootKind::epoch_gate_judges_non_directory`]).
     NotDirectory,
     /// The final component is a symbolic link.
     Symlink,
@@ -394,7 +405,9 @@ pub enum Refusal {
 pub enum Prediction {
     /// Nothing is there yet.
     Absent,
-    /// Not a directory; the epoch gate's verdict, not this module's.
+    /// Not a directory. At the data root that is the epoch gate's verdict;
+    /// boot refuses any other root that is not a directory (see
+    /// [`RootKind::epoch_gate_judges_non_directory`]).
     NotDirectory,
     /// Already owner-only.
     OwnerOnly,
@@ -435,7 +448,7 @@ pub fn predict(path: &Path, euid: u32) -> io::Result<Prediction> {
 pub enum Closed {
     /// Nothing was there; boot creates it later, under its umask.
     Absent,
-    /// Not a directory; left for the epoch gate to refuse.
+    /// The data root is not a directory; left for the epoch gate to refuse.
     NotDirectory,
     /// Already owner-only; unchanged.
     OwnerOnly,
@@ -490,7 +503,10 @@ where
         let state = match observe(&root.path) {
             Err(e) => return Err(refuse(None, Cause::Inspect(e))),
             Ok(Observation::Absent) => Pending::Done(Closed::Absent),
-            Ok(Observation::NotDirectory) => Pending::Done(Closed::NotDirectory),
+            Ok(Observation::NotDirectory) if root.kind.epoch_gate_judges_non_directory() => {
+                Pending::Done(Closed::NotDirectory)
+            }
+            Ok(Observation::NotDirectory) => return Err(refuse(None, Cause::NotDirectory)),
             Ok(Observation::Symlink) => return Err(refuse(None, Cause::Symlink)),
             Ok(Observation::BadPath) => return Err(refuse(None, Cause::BadPath)),
             Ok(Observation::Directory(dir)) => match judge(dir.owner, dir.mode, euid) {
@@ -539,12 +555,7 @@ pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> 
             euid,
             Cause::Inspect(Errno::NOENT.into()),
         )),
-        [Closed::NotDirectory] => Err(OwnerOnlyError::new(
-            &root,
-            None,
-            euid,
-            Cause::Inspect(Errno::NOTDIR.into()),
-        )),
+        [Closed::NotDirectory] => Err(OwnerOnlyError::new(&root, None, euid, Cause::NotDirectory)),
         [closed] => {
             log_closed(&root, *closed);
             Ok(())
@@ -619,6 +630,8 @@ pub enum Cause {
     Symlink,
     /// The path does not end in a directory name.
     BadPath,
+    /// Something other than a directory is there.
+    NotDirectory,
     /// Another user owns it.
     ForeignOwner,
     /// It could not be opened or stat'ed.
@@ -683,6 +696,16 @@ impl OwnerOnlyError {
                 }
             },
             Cause::BadPath => format!("set {} to the directory itself", self.kind.setting()),
+            Cause::NotDirectory => match self.kind {
+                RootKind::DataRoot => format!("point {} at a directory", self.kind.setting()),
+                RootKind::WalDir => format!(
+                    "point [ingest] wal_dir at a directory, or move {path} aside so trawld can \
+                     create it"
+                ),
+                RootKind::RepinShadow | RootKind::RepinAside => {
+                    format!("move {path} aside; trawld creates it when a repin runs")
+                }
+            },
             Cause::ForeignOwner => format!(
                 "chown {path} to uid {euid}, the user that runs trawld, or run trawld as \
                  its owner"
@@ -727,6 +750,7 @@ impl fmt::Display for OwnerOnlyError {
                 "it is a symbolic link, and trawld does not follow one at a storage root",
             ),
             Cause::BadPath => f.write_str("the configured path does not end in a directory name"),
+            Cause::NotDirectory => f.write_str("it is not a directory"),
             Cause::ForeignOwner => f.write_str(
                 "another user owns it, and trawld does not take over a directory it does not own",
             ),
@@ -766,9 +790,11 @@ impl std::error::Error for OwnerOnlyError {
             | Cause::TightenDenied(e)
             | Cause::ReadOnlyFilesystem(e)
             | Cause::TightenFailed(e) => Some(e),
-            Cause::Symlink | Cause::BadPath | Cause::ForeignOwner | Cause::Ineffective { .. } => {
-                None
-            }
+            Cause::Symlink
+            | Cause::BadPath
+            | Cause::NotDirectory
+            | Cause::ForeignOwner
+            | Cause::Ineffective { .. } => None,
         }
     }
 }
@@ -950,6 +976,38 @@ mod tests {
             vec![Closed::NotDirectory]
         );
         assert_eq!(mode_of(&root), 0o644);
+    }
+
+    /// A WAL directory or repin sibling that is not a directory refuses,
+    /// without a chmod, and is left as it was: only the data root's
+    /// non-directory is the epoch gate's to refuse.
+    #[test]
+    fn a_non_directory_wal_or_repin_sibling_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        set_mode(&file, 0o644);
+        for kind in [
+            RootKind::WalDir,
+            RootKind::RepinShadow,
+            RootKind::RepinAside,
+        ] {
+            let roots = [ProtectedRoot {
+                kind,
+                path: file.clone(),
+            }];
+            let error = close(&roots, euid(), no_chmod).unwrap_err();
+            assert!(matches!(error.cause, Cause::NotDirectory), "{error}");
+            let text = error.to_string();
+            assert!(text.contains("it is not a directory"), "{text}");
+            assert!(
+                text.contains(&format!("move {} aside", file.display())),
+                "{text}"
+            );
+        }
+        assert_eq!(mode_of(&file), 0o644);
+        assert!(!RootKind::WalDir.epoch_gate_judges_non_directory());
+        assert!(RootKind::DataRoot.epoch_gate_judges_non_directory());
     }
 
     #[test]

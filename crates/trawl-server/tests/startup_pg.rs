@@ -2406,3 +2406,31 @@ async fn the_roots_close_before_postgres_admission() {
         .refused_within("backend unreachable at startup", Duration::from_secs(90))
         .await;
 }
+
+/// #282: a repin sibling of the data root that is not a directory refuses
+/// the start before anything reads the corpus, and is left as it was: boot
+/// keeps every storage root owner-only, and a file there is none.
+#[tokio::test]
+async fn a_repin_sibling_that_is_not_a_directory_refuses_the_start() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let data = fixture.data();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("EPOCH"), b"3\n").unwrap();
+    let shadow = trawl_server::repin::marker::shadow_root(&data);
+    std::fs::write(&shadow, b"not a directory").unwrap();
+    set_mode(&shadow, 0o644);
+
+    let mut daemon = fixture.spawn();
+    daemon.refused("it is not a directory").await;
+    let log = daemon.log();
+    for needle in [
+        format!("repin shadow root {}", shadow.display()),
+        format!("Fix: move {} aside", shadow.display()),
+    ] {
+        assert!(log.contains(&needle), "{needle:?} missing from {log}");
+    }
+    assert_eq!(std::fs::read(&shadow).unwrap(), b"not a directory");
+    assert_mode(&shadow, 0o644);
+    fixture.assert_lock_free().await;
+}
