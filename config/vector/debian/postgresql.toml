@@ -30,9 +30,23 @@ source = '''
 #   2024-01-15 10:30:45.123 UTC [12345] LOG:  autovacuum launcher started
 parsed, err = parse_regex(
   .message,
-  r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \w+) \[(?P<pid>\d+)\] (?:(?P<user>\w+)@(?P<db>\w+) )?(?P<level>\w+):\s+(?P<msg>.*)'
+  r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) (?P<tz>\w+) \[(?P<pid>\d+)\] (?:(?P<user>\w+)@(?P<db>\w+) )?(?P<level>\w+):\s+(?P<msg>.*)'
 )
 if err == null {
+  # The line's own time, not the time Vector read it. UTC and GMT are exact.
+  # Other zone names are abbreviations such as CEST, which name no fixed
+  # offset, so read the time in Vector's local zone: initdb copies the host's
+  # zone into log_timezone. Keep the read time if the timestamp does not parse.
+  time = null
+  if parsed.tz == "UTC" || parsed.tz == "GMT" {
+    time = parse_timestamp(parsed.ts, "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC") ?? null
+  } else {
+    time = parse_timestamp(parsed.ts, "%Y-%m-%d %H:%M:%S%.f") ?? null
+  }
+  if time != null {
+    ._time = time
+  }
+
   .message = parsed.msg
 
   if parsed.user != null {
