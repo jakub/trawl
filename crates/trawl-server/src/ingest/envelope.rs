@@ -1323,6 +1323,24 @@ mod tests {
         assert_eq!(c.obj["_repairs"], "time.from_ingest");
     }
 
+    /// An offset-less date-time from an HTTP sender reads as UTC
+    /// (ADR-0009). The syslog zone settings (ADR-0050) never reach it.
+    #[test]
+    fn http_offsetless_remains_utc() {
+        for sent in [
+            "2025-12-31 06:30:00",
+            "2025-12-31T06:30:00",
+            "2025-12-31T06:30",
+            "2025/12/31 06:30:00",
+        ] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"{sent}"}}"#
+            ));
+            assert_eq!(c.obj["_time"], "2025-12-31T06:30:00.000000Z", "{sent}");
+            assert!(c.repairs.is_empty(), "{sent}: {:?}", c.repairs);
+        }
+    }
+
     #[test]
     fn missing_env_repairs_from_default() {
         let c = canon(r#"{"service":"s","host":"h","_time":"2025-12-31T23:00:00Z"}"#);

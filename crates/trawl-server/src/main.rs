@@ -445,12 +445,14 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // Everything the listeners need to reach the one canonicalizer.
         // The env allowlist, the relay CIDRs and the derivation policy all
-        // live on `IngestState`, resolved boot-fatally there.
+        // live on `IngestState`, resolved boot-fatally there; the per-peer
+        // zones come from the syslog peer settings resolved at boot.
         let door = Arc::new(trawl_server::syslog::convert::SyslogDoor {
             envs: Arc::clone(&state.ingest.envs),
             default_env: Arc::clone(&state.ingest.default_env),
             trusted_relays: Arc::clone(&state.ingest.trusted_relays),
             derivation: Arc::clone(&state.ingest.derivation),
+            zones: Arc::new(syslog_peers.zones.clone()),
         });
         let handles = trawl_server::syslog::spawn_syslog(
             &config.syslog,

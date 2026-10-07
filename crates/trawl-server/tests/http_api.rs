@@ -1717,6 +1717,7 @@ async fn producer_is_stamped_stored_and_queryable_per_door() {
         default_env: Arc::clone(&server.state.ingest.default_env),
         trusted_relays: Arc::clone(&server.state.ingest.trusted_relays),
         derivation: Arc::clone(&server.state.ingest.derivation),
+        zones: Arc::default(),
     };
     let frame = format!(
         "<165>1 {} appliance-01 prov-syslog 1234 ID47 - reboot",
