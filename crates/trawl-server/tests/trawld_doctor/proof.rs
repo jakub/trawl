@@ -19,8 +19,9 @@ use sqlx::Connection as _;
 use trawl_api::doctor::{Outcome, Report};
 
 use crate::common;
+use crate::common::userns::Userns;
 use crate::support::{
-    DoctorConfig, LOCKLESS, PLANTED_APP_URL, PLANTED_FLEET_URL, SECRET, Userns, admin,
+    DoctorConfig, LOCKLESS, PLANTED_APP_URL, PLANTED_FLEET_URL, SECRET, admin,
     assert_fresh_install_rows, assert_no_values, database_rows_complete, ensure_role,
     forbid_advisory_locks, forbidden_shape, lockless, migrated_app, migrated_fleet, planted,
     planted_env, report, row, run_doctor, run_doctor_in_userns, url_values, verdict,

@@ -30,6 +30,8 @@
 
 #![allow(dead_code)] // each test binary uses a subset of these items
 
+pub mod userns;
+
 use std::net::TcpListener;
 use std::path::PathBuf;
 
