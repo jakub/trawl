@@ -95,7 +95,7 @@ export function releasePinsPlugin(pins) {
 
   return {
     name: 'trawl-release-pins',
-    options: { position: true },
+    options: { position: true, tag: pins.tag, version: pins.version },
     ...Object.fromEntries(NODE_TYPES.map((type) => [type, visit])),
   };
 }

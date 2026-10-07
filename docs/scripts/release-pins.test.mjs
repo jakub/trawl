@@ -106,3 +106,10 @@ test('development flag wins over a populated tag', async () => {
   assert.match(html, /Download main and run:/);
   assert.doesNotMatch(html, /--version|v0\.9\.1/);
 });
+
+test('plugin options expose the selected pins to Astro config digest', () => {
+  assert.deepEqual(releasePinsPlugin(releasePins({})).options,
+    { position: true, tag: 'main', version: null });
+  assert.deepEqual(releasePinsPlugin(releasePins({ TRAWL_DOCS_RELEASE_TAG: 'v0.9.1' })).options,
+    { position: true, tag: 'v0.9.1', version: '0.9.1' });
+});
