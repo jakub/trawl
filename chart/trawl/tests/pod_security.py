@@ -200,7 +200,11 @@ def violations(metadata, spec):
 
     common("pod", pod_sc)
     pod_seccomp = (pod_sc.get("seccompProfile") or {}).get("type") in SECCOMP_TYPES
-    pod_non_root = pod_sc.get("runAsNonRoot") is True
+    # Restricted: Running as Non-root. The pod may leave it unset or set it
+    # true, never false, even when every container sets it true.
+    pod_non_root = pod_sc.get("runAsNonRoot")
+    if pod_non_root is False:
+        bad("pod", "running as non-root", pod_non_root)
     for field, container in containers(spec):
         where = f"{field}[{container['name']}]"
         sc = container.get("securityContext") or {}
@@ -235,7 +239,7 @@ def violations(metadata, spec):
         # Restricted: Running as Non-root. A container may leave it unset
         # only when the pod sets it true, and may never set it false.
         non_root = sc.get("runAsNonRoot")
-        if non_root is False or (non_root is None and not pod_non_root):
+        if non_root is False or (non_root is None and pod_non_root is not True):
             bad(where, "running as non-root", non_root)
         # Restricted: Seccomp. Set at the pod, or on every container.
         if not pod_seccomp and (sc.get("seccompProfile") or {}).get("type") not in SECCOMP_TYPES:
@@ -279,15 +283,29 @@ class PodSecurity(unittest.TestCase):
         ])
         self.assertEqual(violations(*self.crash[f"Pod/{FULLNAME}-test-connection"][:2]), [])
         self.assertEqual(claims, ["data", "cores"])
-        # Apart from that one capability, every securityContext is the one
-        # the default render has, pod-level RuntimeDefault seccomp included.
-        default = self.default[label][1]
-        self.assertEqual(spec["securityContext"], default["securityContext"])
+        # Apart from that one capability, every pod's securityContext and every
+        # container's is the one the default render has, pod-level
+        # RuntimeDefault seccomp included. Outside that capability no
+        # container adds any, in either render. Restricted would allow
+        # NET_BIND_SERVICE, so its check alone cannot hold the chart to this.
         self.assertEqual(spec["securityContext"]["seccompProfile"], {"type": "RuntimeDefault"})
-        contexts = copy.deepcopy({c["name"]: c["securityContext"] for _, c in containers(spec)})
-        trawld = contexts["trawld"]
-        self.assertEqual(trawld["capabilities"].pop("add"), ["SYS_PTRACE"])
-        self.assertEqual(contexts, {c["name"]: c["securityContext"] for _, c in containers(default)})
+        for pod, (_, default, _) in self.default.items():
+            with self.subTest(pod=pod):
+                crash = self.crash[pod][1]
+                self.assertEqual(crash["securityContext"], default["securityContext"])
+                contexts = {
+                    mode: copy.deepcopy({c["name"]: c.get("securityContext") or {} for _, c in containers(s)})
+                    for mode, s in (("default", default), ("crash", crash))
+                }
+                if pod == label:
+                    added = contexts["crash"]["trawld"]["capabilities"].pop("add")
+                    self.assertEqual(added, ["SYS_PTRACE"])
+                for mode, by_name in contexts.items():
+                    for name, sc in by_name.items():
+                        self.assertEqual(
+                            (sc.get("capabilities") or {}).get("add") or [], [], f"{mode} {name}"
+                        )
+                self.assertEqual(contexts["crash"], contexts["default"])
 
     def test_helm_test_pod_command_is_unchanged(self):
         _, spec, _ = self.default[f"Pod/{FULLNAME}-test-connection"]
@@ -309,23 +327,25 @@ class PodSecurity(unittest.TestCase):
         def sc(spec):
             return trawld(spec)["securityContext"]
 
-        cases = {
-            "host namespaces": lambda m, s: s.update(hostPID=True),
-            "hostPath volumes": lambda m, s: s["volumes"].append({"name": "h", "hostPath": {"path": "/"}}),
-            "volume types": lambda m, s: s["volumes"].append({"name": "n", "nfs": {"server": "x", "path": "/"}}),
-            "sysctls": lambda m, s: s["securityContext"].update(sysctls=[{"name": "kernel.msgmax", "value": "1"}]),
-            "apparmor": lambda m, s: sc(s).update(appArmorProfile={"type": "Unconfined"}),
-            "selinux": lambda m, s: s["securityContext"].update(seLinuxOptions={"type": "spc_t"}),
-            "hostprocess": lambda m, s: sc(s).update(windowsOptions={"hostProcess": True}),
-            "privileged": lambda m, s: sc(s).update(privileged=True),
-            "proc mount": lambda m, s: sc(s).update(procMount="Unmasked"),
-            "host ports": lambda m, s: trawld(s)["ports"][0].update(hostPort=5514),
-            "host probes": lambda m, s: trawld(s)["livenessProbe"]["httpGet"].update(host="10.0.0.1"),
-            "privilege escalation": lambda m, s: sc(s).pop("allowPrivilegeEscalation"),
-            "running as non-root": lambda m, s: sc(s).update(runAsNonRoot=False),
-            "running as non-root user": lambda m, s: sc(s).update(runAsUser=0),
-        }
-        for control, mutate in cases.items():
+        cases = [
+            ("host namespaces", lambda m, s: s.update(hostPID=True)),
+            ("hostPath volumes", lambda m, s: s["volumes"].append({"name": "h", "hostPath": {"path": "/"}})),
+            ("volume types", lambda m, s: s["volumes"].append({"name": "n", "nfs": {"server": "x", "path": "/"}})),
+            ("sysctls", lambda m, s: s["securityContext"].update(sysctls=[{"name": "kernel.msgmax", "value": "1"}])),
+            ("apparmor", lambda m, s: sc(s).update(appArmorProfile={"type": "Unconfined"})),
+            ("selinux", lambda m, s: s["securityContext"].update(seLinuxOptions={"type": "spc_t"})),
+            ("hostprocess", lambda m, s: sc(s).update(windowsOptions={"hostProcess": True})),
+            ("privileged", lambda m, s: sc(s).update(privileged=True)),
+            ("proc mount", lambda m, s: sc(s).update(procMount="Unmasked")),
+            ("host ports", lambda m, s: trawld(s)["ports"][0].update(hostPort=5514)),
+            ("host probes", lambda m, s: trawld(s)["livenessProbe"]["httpGet"].update(host="10.0.0.1")),
+            ("privilege escalation", lambda m, s: sc(s).pop("allowPrivilegeEscalation")),
+            ("running as non-root", lambda m, s: sc(s).update(runAsNonRoot=False)),
+            # Every container sets it true, which does not excuse the pod.
+            ("running as non-root", lambda m, s: s["securityContext"].update(runAsNonRoot=False)),
+            ("running as non-root user", lambda m, s: sc(s).update(runAsUser=0)),
+        ]
+        for control, mutate in cases:
             with self.subTest(control=control):
                 metadata, spec = copy.deepcopy(base_metadata), copy.deepcopy(base_spec)
                 mutate(metadata, spec)
@@ -333,6 +353,10 @@ class PodSecurity(unittest.TestCase):
                 expected = {control} | ({"volume types"} if control == "hostPath volumes" else set())
                 self.assertEqual({v[1] for v in violations(metadata, spec)}, expected)
 
+        # An explicit pod-level false is the pod's own violation.
+        spec = copy.deepcopy(base_spec)
+        spec["securityContext"]["runAsNonRoot"] = False
+        self.assertEqual(violations(base_metadata, spec), [("pod", "running as non-root", False)])
         # Seccomp: Unconfined anywhere, or no profile at either level.
         spec = copy.deepcopy(base_spec)
         sc(spec)["seccompProfile"] = {"type": "Unconfined"}
