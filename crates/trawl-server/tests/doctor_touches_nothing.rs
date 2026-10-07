@@ -9,8 +9,9 @@
 //! was asked to describe. The doctor's code lives in `src/doctor/`, and this
 //! test reads every file there for the calls that would do that: the boot's
 //! admission and recovery steps, the pool and keystore owners, the
-//! advisory-lock and migration calls, TLS generation, and the filesystem
-//! calls that create, write, rename, remove, or change modes.
+//! advisory-lock and migration calls, TLS generation, boot's closing of the
+//! storage roots, and the filesystem calls that create, write, rename,
+//! remove, or change modes.
 //!
 //! This is a tripwire, not the proof. The proof that nothing changes is
 //! `doctor_writes_nothing` in `tests/trawld_doctor/proof.rs`, which runs
@@ -67,6 +68,11 @@ const FORBIDDEN: &[&str] = &[
     "fs::symlink(",
     "fsync",
     "sync_all",
+    // Closing the storage roots (ADR-0052): the doctor predicts through
+    // `owner_only::predict`, and only boot closes. `close` takes the chmod
+    // it applies, so a doctor that closed would also name `fchmod`.
+    "owner_only::close",
+    "fchmod",
 ];
 
 fn doctor_root() -> PathBuf {
@@ -204,6 +210,8 @@ fn check() {
     std::fs::create_dir_all(&root)?;
     let lock = sqlx::query(\"SELECT pg_try_advisory_lock($1)\");
     let path = root.join(\"recovery\"); // recovery is a word, not a call
+    owner_only::close(&roots, euid, owner_only::fchmod)?;
+    owner_only::predict(&root, euid)?;
 }
 
 #[cfg(test)]
@@ -219,7 +227,9 @@ mod tests {
         [
             (3, "create_dir"),
             (4, "advisory_lock("),
-            (4, "try_advisory")
+            (4, "try_advisory"),
+            (6, "owner_only::close"),
+            (6, "fchmod")
         ]
     );
 

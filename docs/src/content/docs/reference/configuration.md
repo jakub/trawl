@@ -72,7 +72,7 @@ A check runs only when its prerequisite completed. Otherwise the check is
 | `server.app.connect` | A connection to the app-state database authenticates. | `server.config` |
 | `server.app.schema` | trawld's boot admits the app-state migration ledger. | `server.app.connect` |
 | `server.app.writer` | Reports whether a session holds trawld's writer lock. A held lock does not prove that trawld runs on this host. | `server.app.connect` |
-| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node, the same holds for the WAL directory, even when `[ingest] wal_dir` names a path inside the data root: the running user can read and write it, or create it in the nearest directory above it that exists. The access check covers the directories trawld writes and the directory where it creates them. It does not cover every parent directory that boot opens to sync. | `server.config` |
+| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node, the same holds for the WAL directory, even when `[ingest] wal_dir` names a path inside the data root: the running user can read and write it, or create it in the nearest directory above it that exists. The access check covers the directories trawld writes and the directory where it creates them. It does not cover every parent directory that boot opens to sync. The check also predicts how boot closes the storage roots to their owner: the data root, a WAL directory outside it, and the repin siblings when they exist. A root with group or other permissions is `complete` with the reason `will_tighten`. A root that is a symlink, that another user owns, or that needs closing on a read-only filesystem fails. | `server.config` |
 | `server.data.epoch` | The data root's `EPOCH` is current, or boot initializes it. | `server.data.root` |
 | `server.data.identity` | The data root belongs to the catalog in the app-state database. | `server.data.epoch`, `server.app.schema` |
 | `server.data.conformance` | Conformance is recorded for this catalog and data root, or boot runs the pass. A query-only node reports `not_configured`. | `server.data.identity` |
@@ -119,6 +119,21 @@ boot will accept it. When it will, the check is `complete` with the reason
 Fleet schema (run `fleet-admin migrate`), an unsupported epoch, an owned root
 without an epoch, and a dirty, ahead, or foreign migration ledger.
 
+trawld closes its storage roots to their owner at every start. When a root has
+group or other permissions, `server.data.root` is `complete` with the reason
+`will_tighten`. trawld removes those permissions at its next start and changes
+nothing beneath the root. This is a prediction, and the doctor changes no mode.
+The start can still refuse a root, for example when an immutable attribute
+blocks the change. The check fails for each root that the start refuses:
+
+- The root itself is a symlink. A symlink in a directory above the root is
+  followed.
+- Another user owns the root, even when trawld runs as root.
+- The root needs closing and is on a read-only filesystem.
+
+The failed row names the root by kind, never by path or owner. trawld's
+refusal at start names the path, owner, and mode.
+
 A fresh installation that has not started yet reports `will_initialize` rows,
 and its listener is `not_sampled` with the reason `not_listening`. It exits
 with code 3. It exits with code 1 only when something must change before the
@@ -161,7 +176,9 @@ service user has access. An access check, `server.data.root`, is `not_sampled`
 with the reason `ran_as_root`. It still fails when the data root, or a WAL
 directory outside it, is not a directory, or is absent and cannot be created
 there. It does not ask what the running user may do with either directory, and
-so does not report a read-only filesystem. In a root run, `server.tls.material`
+so does not report a read-only filesystem. It does not judge the owner or mode
+of a storage root, because trawld compares the owner with the service user, but
+a root that is a symlink still fails. In a root run, `server.tls.material`
 does not ask whether the running user can create or write `tls/` and
 `tls-key/`. It reports `ran_as_root` when a generated directory or the key
 belongs to another uid, because a root run cannot know which user trawld runs
