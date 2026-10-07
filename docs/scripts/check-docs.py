@@ -18,14 +18,33 @@ class Page(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.ids = set()
         self.links = []
+        self.markdown_depth = 0
+        self.markdown_has_body = False
+        self.empty_markdown = False
         self.feed(source)
 
     def handle_starttag(self, tag, attributes):
         attrs = dict(attributes)
+        if self.markdown_depth:
+            self.markdown_has_body = True
+            self.markdown_depth += 1
+        elif 'sl-markdown-content' in attrs.get('class', '').split():
+            self.markdown_depth = 1
+            self.markdown_has_body = False
         if attrs.get('id'):
             self.ids.add(attrs['id'])
         if tag == 'a' and attrs.get('href'):
             self.links.append(attrs['href'])
+
+    def handle_data(self, data):
+        if self.markdown_depth and data.strip():
+            self.markdown_has_body = True
+
+    def handle_endtag(self, tag):
+        if self.markdown_depth:
+            self.markdown_depth -= 1
+            if not self.markdown_depth and not self.markdown_has_body:
+                self.empty_markdown = True
 
 
 pages = {}
@@ -33,7 +52,10 @@ for path in DIST.rglob('*.html'):
     source = path.read_text()
     if re.search(r'\{\{release\.|%7b%7brelease\.', source, re.I):
         errors.append(f'{path.relative_to(DIST)}: unrendered release placeholder')
-    pages[path] = Page(source)
+    page = Page(source)
+    if page.empty_markdown:
+        errors.append(f'{path.relative_to(DIST)}: empty markdown content; check the build log for a rendering error')
+    pages[path] = page
 if not pages:
     sys.exit('No built HTML found. Run npm run build first.')
 links = 0

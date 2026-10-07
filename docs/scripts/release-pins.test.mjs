@@ -48,6 +48,17 @@ test('unknown names fail with file and position', async () => {
   await assert.rejects(render('bad {{release.nope}}'), /example\.md:1:5: invalid release placeholder/);
 });
 
+test('diagnostic locates a bad token after frontmatter and a valid token', async () => {
+  const markdown = '---\ntitle: Example\n---\n\n`tool --version {{release.version}}` then {{release.version}}';
+  await assert.rejects(render(markdown),
+    /example\.md:5:43: invalid release placeholder in text\.value/);
+});
+
+test('diagnostic counts a non-ASCII prefix on the bad token line', async () => {
+  await assert.rejects(render('é then {{release.nope}}'),
+    /example\.md:1:8: invalid release placeholder in text\.value/);
+});
+
 test('bare version fails in both modes', async () => {
   for (const env of [{}, { TRAWL_DOCS_RELEASE_TAG: 'v0.9.1' }]) {
     await assert.rejects(render('{{release.version}}', env), /invalid release placeholder/);
@@ -63,6 +74,24 @@ test('version pair in prose fails with file and position in both modes', async (
 
 test('leftover placeholders in HTML fail', async () => {
   await assert.rejects(render('<span data-tag="{{release.tag}}">hello</span>'), /invalid release placeholder in html\.value/);
+});
+
+test('code fence metadata rewrites tags and rejects every other release pin', async () => {
+  const html = await render('```sh title="{{release.tag}}"\necho ok\n```',
+    { TRAWL_DOCS_RELEASE_TAG: 'v0.9.1' });
+  assert.doesNotMatch(html, /\{\{release\./);
+  const source = '```sh title="{{release.tag}}"\necho ok\n```';
+  const node = { type: 'code', value: 'echo ok', meta: 'title="{{release.tag}}"',
+    position: { start: { offset: 0 }, end: { offset: source.length } } };
+  releasePinsPlugin({ tag: 'v0.9.1', version: '0.9.1' }).code(node, {
+    source,
+    setProperty(target, field, value) { target[field] = value; },
+  });
+  assert.equal(node.meta, 'title="v0.9.1"');
+  for (const token of ['{{release.version}}', '{{release.nope}}']) {
+    await assert.rejects(render(`\`\`\`sh title="${token}"\necho ok\n\`\`\``),
+      /example\.md:1:14: invalid release placeholder in code\.meta/);
+  }
 });
 
 test('invalid release tag fails', () => {

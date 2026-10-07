@@ -92,24 +92,29 @@ jobs:
       - name: Test release pin rendering
         working-directory: docs
         run: npm test
+      - name: Prove invalid source pins fail the full check
+        env:
+          TRAWL_DOCS_DEVELOPMENT: ${{ inputs.release-tag == '' && '1' || '0' }}
+          TRAWL_DOCS_RELEASE_TAG: ${{ inputs.release-tag }}
+        working-directory: docs
+        run: |
+          page=src/content/docs/reference/crash-dumps.md
+          backup="$RUNNER_TEMP/release-pins-source-backup.md"
+          log="$RUNNER_TEMP/release-pins-negative.log"
+          cp "$page" "$backup"
+          trap 'cp "$backup" "$page"' EXIT
+          printf '\n{{release.version}}\n' >> "$page"
+          if npm run check > "$log" 2>&1; then
+            echo 'npm run check accepted an invalid source placeholder' >&2
+            exit 1
+          fi
+          grep -F 'empty markdown content' "$log"
       - name: Build and check documentation
         env:
           TRAWL_DOCS_DEVELOPMENT: ${{ inputs.release-tag == '' && '1' || '0' }}
           TRAWL_DOCS_RELEASE_TAG: ${{ inputs.release-tag }}
         working-directory: docs
         run: npm run check
-      - name: Prove unrendered release pins fail the check
-        working-directory: docs
-        run: |
-          mkdir -p ../.flow-scratch
-          cp dist/index.html ../.flow-scratch/index.html.release-pins-backup
-          trap 'cp ../.flow-scratch/index.html.release-pins-backup dist/index.html; rm -f ../.flow-scratch/index.html.release-pins-backup ../.flow-scratch/release-pins-negative.stderr' EXIT
-          printf '<p>{{release.tag}}</p>\n' >> dist/index.html
-          if python3 scripts/check-docs.py 2> ../.flow-scratch/release-pins-negative.stderr; then
-            echo 'check-docs.py accepted an unrendered release placeholder' >&2
-            exit 1
-          fi
-          grep -F 'unrendered release placeholder' ../.flow-scratch/release-pins-negative.stderr
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: documentation-site
