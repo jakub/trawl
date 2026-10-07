@@ -7,6 +7,14 @@ metadata:
   annotations:
     "helm.sh/hook": test
 spec:
+  # Pod Security Restricted, so `helm test` runs in the same namespace as the
+  # release. busybox's nobody uid, because the image has no non-root default.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
   containers:
     - name: wget
       image: busybox:stable
@@ -15,4 +23,11 @@ spec:
         - --no-check-certificate
         - -qO-
         - https://{{ include "trawl.fullname" . }}:{{ .Values.service.port }}/api/v1/health
+      # -qO- writes the response to stdout, so the root filesystem stays
+      # read-only with no writable volume.
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: [ALL]
   restartPolicy: Never

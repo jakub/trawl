@@ -131,6 +131,23 @@ assert_security_context_lines() {
   fi
 }
 
+# The pod-level securityContext of a rendered StatefulSet: its six-space
+# key, up to the next six-space key.
+assert_pod_seccomp_runtime_default() {
+  local manifest=$1
+  local block
+  block=$(awk '
+    $0 == "      securityContext:" { inside = 1; next }
+    inside && /^      [^ ]/ { exit }
+    inside { print }
+  ' "$manifest")
+  if [[ $block != *$'\n        seccompProfile:\n          type: RuntimeDefault'* ]]; then
+    echo "expected the pod securityContext in ${manifest} to set seccompProfile.type RuntimeDefault:" >&2
+    echo "$block" >&2
+    exit 1
+  fi
+}
+
 enabled="$work_dir/enabled.yaml"
 render \
   --set persistence.enabled=true \
@@ -181,6 +198,9 @@ assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
 assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
   "$security_enabled" trawld
 assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_enabled" trawld
+# The capability does not cost the pod its RuntimeDefault seccomp filter;
+# capture is verified under it (ADR-0023, amended).
+assert_pod_seccomp_runtime_default "$security_enabled"
 for sidecar in init-auth init-tls-dir trawl-web; do
   assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
     "$security_enabled" "$sidecar"
@@ -200,6 +220,7 @@ assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
 assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
   "$security_disabled" trawld
 assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_disabled" trawld
+assert_pod_seccomp_runtime_default "$security_disabled"
 
 # The helper appends to whatever the operator put in securityContext, so a
 # capability they added survives and SYS_PTRACE is not added twice.
@@ -253,6 +274,7 @@ assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"
+python3 "$chart/tests/pod_security.py"
 python3 "$chart/tests/operational-alerts.py"
 
 echo "helm render assertions passed"

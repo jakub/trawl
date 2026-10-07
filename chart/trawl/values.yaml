@@ -516,6 +516,10 @@ podSecurityContext:
   runAsGroup: 1000
   fsGroup: 1000
   fsGroupChangePolicy: OnRootMismatch
+  # The container runtime's default filter, for every container in the pod.
+  # Pod Security Restricted requires it, and crash-dump capture works under it.
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   readOnlyRootFilesystem: true
