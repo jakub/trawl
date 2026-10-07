@@ -14,15 +14,18 @@
 //! the writers and follow links planted under a directory trawld can write.
 //!
 //! The roots are those [`protected_roots`] lists: the data root on every
-//! node, the WAL directory on an ingest node when it lies outside the data
-//! root, and the repin shadow and aside siblings when they exist. Boot and
-//! `trawld --doctor` walk the same list.
+//! node, the WAL directory on an ingest node unless the data root provably
+//! covers it, and the repin shadow and aside siblings when they exist. Boot
+//! and `trawld --doctor` walk the same list. A WAL directory is covered only
+//! when [`data_root_covers_wal`] reaches it from the data root by
+//! descriptor, through real directories in the data root's mount; a name
+//! under the data root is not enough, since a symlink or a mount there leads
+//! out of it.
 //!
 //! A root is opened no-follow as a directory, and its owner and mode are read
 //! from that handle. The chmod goes through the same handle, so the stat and
 //! the change cannot land on two different inodes. Only the final component
-//! of a configured path is held this way. Its ancestors, and a symlink inside
-//! the data root that a nested `wal_dir` passes through, are configuration
+//! of a configured path is held this way. Its ancestors are configuration
 //! the operator trusts, as ADR-0041 treats the storage roots themselves.
 //!
 //! A symlink as the final component refuses. So does a root that another
@@ -102,9 +105,9 @@ pub struct ProtectedRoot {
 /// The roots trawld keeps owner-only, in the order boot closes them.
 ///
 /// The data root is always listed. On an ingest node the WAL directory is
-/// listed too, unless [`wal_outside_data_root`] says the data root covers it.
-/// The repin siblings are listed only when something exists at their path:
-/// their absence is the normal state, and nothing here creates them.
+/// listed too, unless [`data_root_covers_wal`] proves the data root covers
+/// it. The repin siblings are listed only when something exists at their
+/// path: their absence is the normal state, and nothing here creates them.
 #[must_use]
 pub fn protected_roots(
     data_root: &Path,
@@ -115,7 +118,7 @@ pub fn protected_roots(
         kind: RootKind::DataRoot,
         path: data_root.to_owned(),
     }];
-    if ingest_enabled && wal_outside_data_root(data_root, wal_dir) {
+    if ingest_enabled && !data_root_covers_wal(data_root, wal_dir) {
         roots.push(ProtectedRoot {
             kind: RootKind::WalDir,
             path: wal_dir.to_owned(),
@@ -135,18 +138,88 @@ pub fn protected_roots(
     roots
 }
 
-/// Whether `wal_dir` needs closing on its own, rather than through the data
-/// root above it.
+/// Whether closing `data_root` closes `wal_dir` too, so the WAL directory
+/// needs no closing of its own.
 ///
-/// It is covered only when it is a plain lexical descendant of `data_root`,
-/// compared component by component, and neither path has a `..` component.
-/// A `..` can climb back out of the data root, so a path with one is treated
-/// as outside: closing a directory twice costs nothing, and leaving one open
-/// would expose it.
+/// A name under the data root proves nothing: `data/wal` may be a symlink
+/// out of it, or a mount whose directory other users reach by another path.
+/// So the WAL path must be a plain descendant of the data root, compared
+/// component by component with no `..` in either path, and then be reached
+/// by descriptor. The walk opens the data root no-follow and each component
+/// below it with `openat(O_DIRECTORY | O_NOFOLLOW)` from the directory
+/// before, and every directory on the way must sit on the data root's
+/// filesystem and, on Linux, in its mount. A symlink, a non-directory, a
+/// mount boundary or any failure ends the walk unproven, and the WAL
+/// directory is then a root of its own: held no-follow at its final
+/// component and closed or refused like any other. Closing a directory the
+/// root already covered costs nothing; leaving one open would expose it.
+///
+/// A component that does not exist yet, below directories the walk reached,
+/// is covered: boot creates it there, inside the closed root, and checks
+/// the roots again once it exists. A data root that cannot be walked, such
+/// as one still absent, proves nothing.
 #[must_use]
-pub fn wal_outside_data_root(data_root: &Path, wal_dir: &Path) -> bool {
+pub fn data_root_covers_wal(data_root: &Path, wal_dir: &Path) -> bool {
     let climbs = |path: &Path| path.components().any(|c| c == Component::ParentDir);
-    climbs(data_root) || climbs(wal_dir) || !wal_dir.starts_with(data_root)
+    if climbs(data_root) || climbs(wal_dir) {
+        return false;
+    }
+    let Ok(below) = wal_dir.strip_prefix(data_root) else {
+        return false;
+    };
+    let Ok(Observation::Directory(root)) = observe(data_root) else {
+        return false;
+    };
+    let Ok(home) = Placement::of(root.handle.as_fd()) else {
+        return false;
+    };
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = root.handle;
+    for component in below.components() {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        dir = match rustix::fs::openat(&dir, name, flags, Mode::empty()) {
+            Ok(next) if Placement::of(next.as_fd()).is_ok_and(|at| at == home) => File::from(next),
+            Err(Errno::NOENT) => return true,
+            Ok(_) | Err(_) => return false,
+        };
+    }
+    true
+}
+
+/// Where a directory lives: its filesystem and, where the kernel says, its
+/// mount. Two directories on one filesystem can sit in different mounts, as
+/// a bind mount does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Placement {
+    device: u64,
+    mount: Option<u64>,
+}
+
+impl Placement {
+    /// The placement of the directory `fd` holds. The mount is read with
+    /// `statx(STATX_MNT_ID)`, which a kernel before 5.8 does not answer;
+    /// the device alone then stands for it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
+        use rustix::fs::{AtFlags, StatxFlags};
+        let stat = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+        Ok(Self {
+            device: rustix::fs::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+            mount: (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id),
+        })
+    }
+
+    /// The placement of the directory `fd` holds: its device alone, since
+    /// this platform names no mount.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
+        Ok(Self {
+            device: rustix::fs::fstat(fd)?.st_dev as u64,
+            mount: None,
+        })
+    }
 }
 
 /// What is at a root's path, read without following a final symlink and
@@ -979,34 +1052,135 @@ mod tests {
     }
 
     #[test]
-    fn a_wal_is_outside_unless_it_is_a_plain_descendant() {
-        let data = Path::new("/srv/trawl/data");
-        for (wal, outside) in [
-            ("/srv/trawl/data/wal", false),
-            ("/srv/trawl/data/nested/wal", false),
-            ("/srv/trawl/data/", false),
-            ("/srv/trawl/wal", true),
-            ("/srv/trawl/data2/wal", true),
-            ("/srv/trawl/data-wal", true),
-            ("/srv/trawl/data/../wal", true),
-            ("/srv/trawl/data/wal/../../wal", true),
+    fn a_wal_is_covered_only_as_a_plain_descendant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(tmp.path().join("x")).unwrap();
+        let at = |rest: &str| PathBuf::from(format!("{}/{rest}", tmp.path().display()));
+        for (wal, covered) in [
+            ("data/wal", true),
+            ("data/nested/wal", true),
+            ("data/", true),
+            ("wal", false),
+            ("data2/wal", false),
+            ("data-wal", false),
+            ("data/../wal", false),
+            ("data/wal/../../wal", false),
         ] {
-            assert_eq!(
-                wal_outside_data_root(data, Path::new(wal)),
-                outside,
-                "{wal}"
-            );
+            assert_eq!(data_root_covers_wal(&data, &at(wal)), covered, "{wal}");
         }
-        assert!(wal_outside_data_root(
-            Path::new("/srv/x/../data"),
-            Path::new("/srv/x/../data/wal")
+        assert!(!data_root_covers_wal(
+            &at("x/../data"),
+            &at("x/../data/wal")
         ));
+    }
+
+    /// The kinds and paths `protected_roots` lists for an ingest node.
+    fn listed(data: &Path, wal: &Path) -> Vec<(RootKind, PathBuf)> {
+        protected_roots(data, wal, true)
+            .into_iter()
+            .map(|r| (r.kind, r.path))
+            .collect()
+    }
+
+    #[test]
+    fn a_wal_under_the_root_by_name_is_covered_only_when_reached_by_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("wal")).unwrap();
+        set_mode(&elsewhere.join("wal"), 0o755);
+        let only_root = vec![(RootKind::DataRoot, data.clone())];
+
+        // A real directory nested in the root is the root's, and is never
+        // chmodded (AC3), however deep, and while it is still absent.
+        std::fs::create_dir_all(data.join("spool/wal")).unwrap();
+        set_mode(&data.join("spool/wal"), 0o755);
+        for wal in [
+            data.join("spool/wal"),
+            data.join("spool/absent"),
+            data.join("absent/wal"),
+        ] {
+            assert_eq!(listed(&data, &wal), only_root, "{}", wal.display());
+        }
+        let closed = close(
+            &protected_roots(&data, &data.join("spool/wal"), true),
+            euid(),
+            fchmod,
+        );
+        assert!(closed.is_ok());
+        assert_eq!(mode_of(&data.join("spool/wal")), 0o755);
+
+        // The WAL directory itself is a symlink out of the root: it is its
+        // own root, and the close refuses it without following it.
+        let link = data.join("wal");
+        std::os::unix::fs::symlink(elsewhere.join("wal"), &link).unwrap();
+        let wal_root = |path: &Path| {
+            vec![
+                (RootKind::DataRoot, data.clone()),
+                (RootKind::WalDir, path.to_owned()),
+            ]
+        };
+        assert_eq!(listed(&data, &link), wal_root(&link));
+        let error = close(&protected_roots(&data, &link, true), euid(), no_chmod).unwrap_err();
+        assert_eq!(error.kind, RootKind::WalDir);
+        assert!(matches!(error.cause, Cause::Symlink), "{error}");
+
+        // A directory on the way is a symlink out of the root: the WAL
+        // directory past it is its own root, and the close tightens it.
+        let hop = data.join("hop");
+        std::os::unix::fs::symlink(&elsewhere, &hop).unwrap();
+        let through = hop.join("wal");
+        assert_eq!(listed(&data, &through), wal_root(&through));
+        assert_eq!(
+            listed(&data, &hop.join("absent")),
+            wal_root(&hop.join("absent"))
+        );
+        close(&protected_roots(&data, &through, true), euid(), fchmod).unwrap();
+        assert_eq!(
+            mode_of(&elsewhere.join("wal")),
+            0o700,
+            "the escape is closed"
+        );
+        assert!(std::fs::symlink_metadata(&hop).unwrap().is_symlink());
+
+        // A non-directory on the way, a `..`, or a data root that cannot be
+        // walked (absent, or a symlink) proves nothing: the WAL directory
+        // is listed on its own.
+        std::fs::write(data.join("file"), b"").unwrap();
+        for wal in [
+            data.join("file/wal"),
+            data.join("../elsewhere/wal"),
+            data.join("spool/../wal"),
+        ] {
+            assert_eq!(listed(&data, &wal), wal_root(&wal), "{}", wal.display());
+        }
+        let absent = tmp.path().join("absent-data");
+        assert_eq!(
+            listed(&absent, &absent.join("wal")),
+            vec![
+                (RootKind::DataRoot, absent.clone()),
+                (RootKind::WalDir, absent.join("wal"))
+            ]
+        );
+        let linked = tmp.path().join("linked-data");
+        std::os::unix::fs::symlink(&data, &linked).unwrap();
+        assert_eq!(
+            listed(&linked, &linked.join("spool/wal")),
+            vec![
+                (RootKind::DataRoot, linked.clone()),
+                (RootKind::WalDir, linked.join("spool/wal"))
+            ]
+        );
     }
 
     #[test]
     fn protected_roots_lists_what_boot_closes() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
         let nested = data.join("wal");
         let outside = tmp.path().join("wal");
         let kinds = |roots: Vec<ProtectedRoot>| -> Vec<(RootKind, PathBuf)> {

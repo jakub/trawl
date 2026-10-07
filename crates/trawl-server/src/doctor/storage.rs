@@ -2284,9 +2284,11 @@ mod tests {
 
     /// A WAL path that starts with the data root is judged on its own: `..`
     /// or a symlink takes it out of the root, and a child that exists has
-    /// its own modes. When the root fails too, the row reports the root's
-    /// failure once. A privileged user may do everything the modes forbid;
-    /// the test asserts whichever the running user is.
+    /// its own modes. A symlink there is also a storage root of its own,
+    /// which boot refuses whoever runs it, so a root run fails it too. When
+    /// the root fails too, the row reports the root's failure once. A
+    /// privileged user may do everything the modes forbid; the test asserts
+    /// whichever the running user is.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_wal_directory_under_the_root_path_is_judged_on_its_own() {
@@ -2305,21 +2307,39 @@ mod tests {
         let link = data.join("link");
         std::os::unix::fs::symlink(&unwritable, &link).unwrap();
         let write = "the running user cannot write the WAL directory";
+        // The case, its WAL path, the access failure, and the refusal boot
+        // gives whoever runs it.
         let cases = [
-            ("escapes through ..", data.join("../unwritable"), write),
+            (
+                "escapes through ..",
+                data.join("../unwritable"),
+                write,
+                None,
+            ),
             (
                 "absent, escapes through ..",
                 data.join("../sealed/wal"),
                 "the running user cannot create the WAL directory in the directory above it",
+                None,
             ),
-            ("a symlink under the root", link.clone(), write),
-            ("an unwritable child of the root", child.clone(), write),
+            (
+                "a symlink under the root",
+                link.clone(),
+                write,
+                Some(WAL_LINK),
+            ),
+            (
+                "an unwritable child of the root",
+                child.clone(),
+                write,
+                None,
+            ),
         ];
         for dir in [&unwritable, &sealed, &child] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
         let mut seen = Vec::new();
-        for (name, wal, _) in &cases {
+        for (name, wal, _, _) in &cases {
             let asked = check_root(data.clone(), wal.clone(), true, true).await;
             let root_run = check_root(data.clone(), wal.clone(), true, false).await;
             seen.push((*name, asked, root_run));
@@ -2330,18 +2350,18 @@ mod tests {
         for dir in [&data, &unwritable, &sealed, &child] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        for ((name, asked, root_run), (_, _, why)) in seen.into_iter().zip(cases) {
-            let expected = if privileged {
-                (Outcome::Complete, None)
-            } else {
-                (Outcome::Failed, Some(why))
+        for ((name, asked, root_run), (_, _, why, refused)) in seen.into_iter().zip(cases) {
+            let expected = match (privileged, refused) {
+                (false, _) => (Outcome::Failed, Some(why)),
+                (true, Some(refused)) => (Outcome::Failed, Some(refused)),
+                (true, None) => (Outcome::Complete, None),
             };
             assert_eq!((asked.outcome(), asked.reason()), expected, "{name}");
-            assert_eq!(
-                (root_run.outcome(), root_run.reason()),
+            let expected = refused.map_or(
                 (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
-                "{name}"
+                |refused| (Outcome::Failed, Some(refused)),
             );
+            assert_eq!((root_run.outcome(), root_run.reason()), expected, "{name}");
         }
         let expected = if privileged {
             (Outcome::Complete, None)
@@ -2464,8 +2484,10 @@ mod tests {
         assert!(!detail.contains(tmp.path().to_str().unwrap()), "{detail}");
     }
 
-    /// A WAL directory outside the data root is closed on its own, and one
-    /// nested in it is covered by the root and never judged. The repin
+    /// A WAL directory outside the data root is closed on its own, and a
+    /// real directory nested in it is covered by the root and never judged.
+    /// One reached through a symlink under the root is outside it, and is
+    /// closed on its own too. The repin
     /// siblings are closed when they exist. Every root boot would close is
     /// named, and a refusal anywhere beats them. No mode changes.
     #[cfg(unix)]
@@ -2496,6 +2518,14 @@ mod tests {
             (Outcome::Complete, None),
             "a query-only node has no WAL directory"
         );
+        let hop = data.join("hop");
+        std::os::unix::fs::symlink(tmp.path(), &hop).unwrap();
+        assert_eq!(
+            unchanged(&tmp, &data, &hop.join("spool"), true, true).await,
+            (Outcome::Complete, Some(reason::WILL_TIGHTEN)),
+            "a WAL directory reached through a symlink is its own root"
+        );
+        std::fs::remove_file(&hop).unwrap();
 
         let shadow = marker::shadow_root(&data);
         std::fs::create_dir(&shadow).unwrap();

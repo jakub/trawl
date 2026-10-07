@@ -43,6 +43,8 @@ struct Fixture {
     tls: Tls,
     /// `[server] query_log`.
     query_log: Option<PathBuf>,
+    /// `[ingest] wal_dir`, when not `wal` beside the data root.
+    wal_dir: Option<PathBuf>,
 }
 
 /// The certificate a spawned daemon serves.
@@ -83,6 +85,7 @@ impl Fixture {
             child_umask: None,
             tls: Tls::Shared,
             query_log: None,
+            wal_dir: None,
         }
     }
 
@@ -95,7 +98,9 @@ impl Fixture {
     }
 
     fn wal(&self) -> PathBuf {
-        self.storage_root().join("wal")
+        self.wal_dir
+            .clone()
+            .unwrap_or_else(|| self.storage_root().join("wal"))
     }
 
     async fn current_fleet(&self) {
@@ -2249,6 +2254,45 @@ async fn ac4_root_that_cannot_be_closed_refuses_the_start() {
         before,
         "the refused start changed the data root"
     );
+    fixture.assert_lock_free().await;
+}
+
+/// #282: a WAL directory under the data root by name, which is a mount of
+/// its own, is not covered by closing the root: other users may reach it by
+/// the path it was mounted from. In an unprivileged user and mount
+/// namespace, `data/wal` is bind-mounted onto itself read-only, so it sits
+/// on the data root's filesystem, in a mount of its own. trawld closes it as
+/// a root of its own, and the real `fchmod` fails with EROFS: the start
+/// refuses, naming the WAL directory, and never listens. The 0700 data root
+/// passes, and the WAL directory keeps its 0755.
+#[tokio::test]
+async fn a_wal_mount_under_the_data_root_is_closed_on_its_own() {
+    let Some(userns) = Userns::for_test("a_wal_mount_under_the_data_root_is_closed_on_its_own")
+    else {
+        return;
+    };
+    let mut fixture = Fixture::new().await;
+    fixture.wal_dir = Some(fixture.data().join("wal"));
+    fixture.current_fleet().await;
+    let data = fixture.data();
+    let wal = fixture.wal();
+    std::fs::create_dir_all(&wal).unwrap();
+    std::fs::write(data.join("EPOCH"), b"3\n").unwrap();
+    set_mode(&data, 0o700);
+    set_mode(&wal, 0o755);
+
+    let mut daemon = fixture.spawn_in_userns(&userns, &wal);
+    daemon.refused("on a read-only filesystem").await;
+    let log = daemon.log();
+    for needle in [
+        format!("WAL directory {}", wal.display()),
+        "mode 0755".to_owned(),
+        "Refusing to start".to_owned(),
+    ] {
+        assert!(log.contains(&needle), "{needle:?} missing from {log}");
+    }
+    assert_mode(&data, 0o700);
+    assert_mode(&wal, 0o755);
     fixture.assert_lock_free().await;
 }
 
