@@ -70,6 +70,9 @@ pub enum NetworkKind {
     BodyRead,
     /// The server answered with a redirect the client refused to follow.
     Redirect,
+    /// The server reset or closed the connection while a request that
+    /// carries a body was in flight, and no response was read.
+    UploadCutOff,
     /// Any other transport failure.
     Other,
 }
