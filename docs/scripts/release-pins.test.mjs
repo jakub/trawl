@@ -5,7 +5,7 @@ import { releasePins, releasePinsPlugin } from './release-pins.mjs';
 
 async function render(markdown, env = {}) {
   const processor = satteri({
-    features: { smartPunctuation: false },
+    features: { smartPunctuation: true },
     mdastPlugins: [releasePinsPlugin(releasePins(env))],
   });
   const renderer = await processor.createRenderer({ syntaxHighlight: false });
@@ -15,7 +15,7 @@ async function render(markdown, env = {}) {
   return result.code;
 }
 
-const sample = `Download {{release.tag}} and run --version {{release.version}}.
+const sample = `Download {{release.tag}} and run:
 
 \`trawl --version {{release.version}}\`
 
@@ -26,19 +26,20 @@ trawl --version {{release.version}}
 [chart](https://github.com/jakub/trawl/tree/{{release.tag}}/chart/trawl)
 `;
 
-test('release values render in text, inline code, fenced code, and links', async () => {
+test('release values render in text, inline code, fenced code, and links with smart punctuation', async () => {
   const html = await render(sample, { TRAWL_DOCS_RELEASE_TAG: 'v0.9.1' });
-  assert.match(html, /Download v0\.9\.1 and run --version 0\.9\.1/);
+  assert.match(html, /Download v0\.9\.1 and run:/);
   assert.match(html, /<code>trawl --version 0\.9\.1<\/code>/);
-  assert.match(html, /trawl --version 0\.9\.1/);
+  assert.match(html, /<pre><code[^>]*>trawl --version 0\.9\.1\n<\/code><\/pre>/);
   assert.match(html, /href="https:\/\/github\.com\/jakub\/trawl\/tree\/v0\.9\.1\/chart\/trawl"/);
   assert.doesNotMatch(html, /\{\{release\./);
 });
 
 test('development removes the version pair and its leading spaces', async () => {
-  const html = await render(sample.replace('run --version', 'run  \t--version'));
-  assert.match(html, /Download main and run\./);
+  const html = await render(sample.replaceAll(' --version', '  \t--version'));
+  assert.match(html, /Download main and run:/);
   assert.match(html, /<code>trawl<\/code>/);
+  assert.match(html, /<pre><code[^>]*>trawl\n<\/code><\/pre>/);
   assert.match(html, /href="https:\/\/github\.com\/jakub\/trawl\/tree\/main\/chart\/trawl"/);
   assert.doesNotMatch(html, /--version|\{\{release\./);
 });
@@ -50,6 +51,13 @@ test('unknown names fail with file and position', async () => {
 test('bare version fails in both modes', async () => {
   for (const env of [{}, { TRAWL_DOCS_RELEASE_TAG: 'v0.9.1' }]) {
     await assert.rejects(render('{{release.version}}', env), /invalid release placeholder/);
+  }
+});
+
+test('version pair in prose fails with file and position in both modes', async () => {
+  for (const env of [{}, { TRAWL_DOCS_RELEASE_TAG: 'v0.9.1' }]) {
+    await assert.rejects(render('run --version {{release.version}}', env),
+      /example\.md:1:15: invalid release placeholder in text\.value/);
   }
 });
 
@@ -66,6 +74,6 @@ test('development flag wins over a populated tag', async () => {
     TRAWL_DOCS_DEVELOPMENT: '1',
     TRAWL_DOCS_RELEASE_TAG: 'v0.9.1',
   });
-  assert.match(html, /Download main and run\./);
+  assert.match(html, /Download main and run:/);
   assert.doesNotMatch(html, /--version|v0\.9\.1/);
 });

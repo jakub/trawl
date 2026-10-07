@@ -12,9 +12,7 @@ export default defineConfig({
   site: 'https://trawl.sh',
   server: { allowedHosts },
   devToolbar: { enabled: false },
-  // Keep the version pair intact in text nodes before the plugin validates it.
   markdown: { processor: satteri({
-    features: { smartPunctuation: false },
     mdastPlugins: [releasePinsPlugin(pins)],
   }) },
   integrations: [

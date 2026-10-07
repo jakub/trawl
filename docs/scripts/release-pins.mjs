@@ -34,15 +34,17 @@ const REWRITTEN_FIELDS = {
   image: ['url', 'title'],
   definition: ['url', 'title'],
 };
+const VERSION_NODES = new Set(['code', 'inlineCode']);
 
 export function releasePinsPlugin(pins) {
   function visit(node, ctx) {
     const fields = REWRITTEN_FIELDS[node.type] || [];
     for (const [field, value] of Object.entries(node)) {
       const rendered = fields.includes(field) && typeof value === 'string'
-        ? value.replace(VERSION_PAIR, (pair, leading) =>
-            pins.version === null ? '' : `${leading}--version ${pins.version}`)
-            .replace(TAG, pins.tag)
+        ? (VERSION_NODES.has(node.type)
+            ? value.replace(VERSION_PAIR, (pair, leading) =>
+                pins.version === null ? '' : `${leading}--version ${pins.version}`)
+            : value).replace(TAG, pins.tag)
         : value;
       if (rendered !== value) ctx.setProperty(node, field, rendered);
       if (typeof rendered !== 'string' || !rendered.includes('{{release.')) continue;
