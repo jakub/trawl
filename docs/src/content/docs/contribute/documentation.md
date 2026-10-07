@@ -74,7 +74,9 @@ release version placeholder. For GitHub links to files readers copy, use the
 release tag placeholder in place of a branch name. The build renders these from
 the release tag; development builds link to `main` and omit the version option.
 `docs/scripts/release-pins.mjs` defines the accepted forms and rejects unknown
-placeholders.
+placeholders. A rejected placeholder leaves its page empty; `npm run check`
+rejects that output. Astro keeps separate content caches for development and
+each release tag, so you can switch build modes in the same checkout.
 
 Keep unpublished launch notes and pending support decisions under `docs/launch/`,
 outside the site's content collection. The repository's `CHANGELOG.md` links to

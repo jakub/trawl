@@ -10,6 +10,7 @@ const allowedHosts = (process.env.TRAWL_DOCS_ALLOWED_HOSTS || '')
 
 export default defineConfig({
   site: 'https://trawl.sh',
+  cacheDir: `./node_modules/.astro/pins-${pins.tag}`,
   server: { allowedHosts },
   devToolbar: { enabled: false },
   markdown: { processor: satteri({
