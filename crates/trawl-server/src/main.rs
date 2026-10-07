@@ -344,6 +344,18 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         }
     });
 
+    // Close the storage roots before anything waits on PostgreSQL, so a
+    // database that is down or slow never leaves the corpus open to other
+    // users while trawld waits or restarts (ADR-0052). The close only ever
+    // removes group and other bits, so it needs no sole-writer lock: a
+    // second trawld that runs it and then loses the lock has done no harm.
+    #[cfg(unix)]
+    close_storage_roots(
+        &config.data.base_dir(),
+        &config.wal_dir(),
+        config.ingest.enabled,
+    )?;
+
     // Admit both databases before the epoch gate can initialize a fresh
     // root or repin recovery can rename/sweep an existing corpus. This exact
     // storage owner holds the sole-writer lock through recovery and serving.
@@ -641,8 +653,6 @@ fn prepare_data_root(
     ),
     String,
 > {
-    #[cfg(unix)]
-    close_storage_roots(data_root, wal_dir, ingest_enabled)?;
     let epoch = trawl_server::epoch::ensure_current_epoch(data_root, wal_dir, ingest_enabled)?;
     // The gate creates a data root that was absent, and the umask decides
     // its mode only where the filesystem lets it: a fixed-mode mount or a
@@ -661,14 +671,17 @@ fn prepare_data_root(
 
 /// Close every storage root to its owner, or refuse the start (ADR-0052).
 ///
-/// This is the first step of `prepare_data_root`, so it runs under the
-/// sole-writer lock: a second trawld that lost the lock never reaches it. It
-/// runs on ingest and query-only nodes alike, before the epoch gate, recovery
-/// or any reader touches the corpus, and before any listener binds. A root
-/// absent then is left for boot to create, and closed again once it exists:
-/// after the epoch gate creates the data root, and in [`create_wal_dir`].
-/// A root that is already owner-only is only looked at, so a second pass
-/// changes nothing it did not have to.
+/// Boot runs this once the configuration is loaded and before it waits on
+/// PostgreSQL, so a database that is down never keeps the corpus open. That
+/// is before the sole-writer lock, and safe there: the close only removes
+/// group and other bits, so a second trawld that runs it and then loses the
+/// lock has changed nothing the winner would not. It runs on ingest and
+/// query-only nodes alike, before the epoch gate, recovery or any reader
+/// touches the corpus, and before any listener binds. A root absent then is
+/// left for boot to create, and closed again once it exists: after the epoch
+/// gate creates the data root, and in [`create_wal_dir`]. A root that is
+/// already owner-only is only looked at, so a second pass changes nothing it
+/// did not have to.
 #[cfg(unix)]
 fn close_storage_roots(
     data_root: &std::path::Path,
@@ -1196,7 +1209,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prepare_data_root_closes_storage_roots_before_the_epoch_gate() {
+    fn close_storage_roots_closes_the_roots_and_refuses_a_symlink() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let mode =
             |path: &std::path::Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
@@ -1213,17 +1226,16 @@ mod tests {
         set(&data, 0o755);
         set(&wal, 0o755);
 
-        let (epoch, _) = prepare_data_root(&data, &wal, true).unwrap();
-        assert_eq!(epoch, trawl_server::epoch::Outcome::Current);
+        close_storage_roots(&data, &wal, true).unwrap();
         assert_eq!(mode(&data), 0o700);
         assert_eq!(mode(&wal), 0o700);
         assert_eq!(mode(&data.join("EPOCH")), 0o644, "nothing beneath a root");
 
-        // A symlinked data root refuses before the gate follows it.
+        // A symlinked data root refuses, so the gate never follows it.
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&data, &link).unwrap();
         set(&data, 0o755);
-        let error = prepare_data_root(&link, &wal, true).unwrap_err();
+        let error = close_storage_roots(&link, &wal, true).unwrap_err();
         assert!(error.contains("symbolic link"), "{error}");
         assert_eq!(mode(&data), 0o755);
     }

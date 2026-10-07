@@ -380,7 +380,13 @@ impl Daemon {
     }
 
     async fn refused(&mut self, diagnostic: &str) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        self.refused_within(diagnostic, Duration::from_secs(20))
+            .await;
+    }
+
+    /// [`Self::refused`], for a refusal that takes up to `within`.
+    async fn refused_within(&mut self, diagnostic: &str, within: Duration) {
+        let deadline = Instant::now() + within;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 let log = self.log();
@@ -2356,4 +2362,47 @@ async fn a_server_log_file_left_open_is_tightened_at_start() {
     let log = std::fs::read_to_string(&log_file).unwrap();
     assert!(log.starts_with("{\"older\":\"trawld\"}\n"), "{log}");
     assert!(log.contains("HTTPS server listening"), "{log}");
+}
+
+/// #282: the start closes the storage roots before it waits on PostgreSQL,
+/// so a database that is down never leaves the corpus open while trawld
+/// waits, fails and restarts. Both database URLs name a port nothing
+/// listens on. While trawld still waits on the connection, the 0755 data
+/// root and out-of-root WAL directory are already 0700; then it exits on the
+/// connection error, never having listened.
+#[tokio::test]
+async fn the_roots_close_before_postgres_admission() {
+    let mut fixture = Fixture::new().await;
+    // Binding port 1 takes privilege, so nothing a test runs listens there.
+    for url in [&mut fixture.fleet_url, &mut fixture.app_url] {
+        *url = "postgres://fleet:fleet@127.0.0.1:1/fleet_test".to_owned();
+    }
+    let data = fixture.data();
+    let wal = fixture.wal();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&wal).unwrap();
+    std::fs::write(data.join("EPOCH"), b"3\n").unwrap();
+    set_mode(&data, 0o755);
+    set_mode(&wal, 0o755);
+
+    let mut daemon = fixture.spawn();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while mode_of(&data) & GROUP_OTHER != 0 || mode_of(&wal) & GROUP_OTHER != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the roots stayed open: {}",
+            daemon.log()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "closed only after PostgreSQL refused: {}",
+        daemon.log()
+    );
+    assert_mode(&data, 0o700);
+    assert_mode(&wal, 0o700);
+    daemon
+        .refused_within("backend unreachable at startup", Duration::from_secs(90))
+        .await;
 }
