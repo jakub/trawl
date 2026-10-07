@@ -30,18 +30,34 @@ source = '''
 #   2024-01-15 10:30:45.123 UTC [12345] LOG:  autovacuum launcher started
 parsed, err = parse_regex(
   .message,
-  r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) (?P<tz>\w+) \[(?P<pid>\d+)\] (?:(?P<user>\w+)@(?P<db>\w+) )?(?P<level>\w+):\s+(?P<msg>.*)'
+  r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) (?P<tz>[A-Za-z]+|[+-]\d{2}(?:\d{2})?) \[(?P<pid>\d+)\] (?:(?P<user>\w+)@(?P<db>\w+) )?(?P<level>\w+):\s+(?P<msg>.*)'
 )
 if err == null {
-  # The line's own time, not the time Vector read it. UTC and GMT are exact.
-  # Other zone names are abbreviations such as CEST, which name no fixed
-  # offset, so read the time in Vector's local zone: initdb copies the host's
-  # zone into log_timezone. Keep the read time if the timestamp does not parse.
+  # The line's own time, not the time Vector read it. PostgreSQL stamps the
+  # log_timezone abbreviation. UTC and GMT are exact, and so are the numeric
+  # names, such as -03 or +0545, of zones without one. Other names, such as
+  # EDT or CEST, name no fixed offset: read the time in the collector's zone
+  # (TZ, else the host's zone, which initdb copies into log_timezone) and keep
+  # it only if that zone has the line's abbreviation at that instant. An
+  # abbreviation that two zones share, such as CST, cannot be told apart.
+  # Otherwise, or if the timestamp does not parse, such as in the hour a
+  # change from summer time repeats, keep the read time. Set
+  # log_timezone = 'UTC' for exact times.
   time = null
-  if parsed.tz == "UTC" || parsed.tz == "GMT" {
+  tz = string!(parsed.tz)
+  if tz == "UTC" || tz == "GMT" {
     time = parse_timestamp(parsed.ts, "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC") ?? null
+  } else if starts_with(tz, "+") || starts_with(tz, "-") {
+    time = parse_timestamp(string!(parsed.ts) + " " + tz, "%Y-%m-%d %H:%M:%S%.f %#z") ?? null
   } else {
-    time = parse_timestamp(parsed.ts, "%Y-%m-%d %H:%M:%S%.f") ?? null
+    zone = get_env_var("TZ") ?? get_timezone_name() ?? ""
+    if starts_with(zone, ":") {
+      zone = slice!(zone, 1)
+    }
+    local, local_err = parse_timestamp(parsed.ts, "%Y-%m-%d %H:%M:%S%.f", timezone: zone)
+    if local_err == null && (format_timestamp(local, "%Z", timezone: zone) ?? null) == tz {
+      time = local
+    }
   }
   if time != null {
     ._time = time

@@ -11,6 +11,7 @@ collector are used.
 """
 
 import collections
+import datetime
 import gzip
 import http.server
 import json
@@ -120,7 +121,8 @@ def fixtures(suppress):
     for service in ("fail2ban", "mysql", "postgresql", "redis"):
         add(service, service, service)
     # run() sets TZ to a zone that is never UTC: a UTC line keeps its own
-    # instant, and a line in another zone is read in Vector's local zone.
+    # instant, and a line in that zone's abbreviation is read in that zone.
+    # postgresql_zones() covers the other zone cases.
     add("postgresql", "postgresql-utc", "postgresql",
         message="2026-09-28 10:30:45.123 UTC [4242] LOG:  checkpoint starting: time")
     add("postgresql", "postgresql-local", "postgresql", "error",
@@ -338,6 +340,59 @@ def run(tcp, suppress, tls="http"):
             server.shutdown()
             thread.join()
             server.server_close()
+
+
+def postgresql_zones():
+    """Run the postgresql transform under two collector zones.
+
+    A line keeps its own time only when its zone name proves the offset; any
+    other line keeps the time Vector read it, like a line that does not parse.
+    """
+    transform = load(False)["transforms"]["trawl_postgresql"]
+    line = "2026-09-28 10:30:45.123 {} [4242] alice@app LOG:  checkpoint starting"
+    read = "read time"
+    cases = {
+        "America/New_York": {"UTC": "2026-09-28T10:30:45.123Z", "GMT": "2026-09-28T10:30:45.123Z",
+                             # EDT is UTC-4 in America/New_York on that date.
+                             "EDT": "2026-09-28T14:30:45.123Z", "EST": read, "CEST": read,
+                             "-03": "2026-09-28T13:30:45.123Z", "+0545": "2026-09-28T04:45:45.123Z"},
+        "UTC": {"UTC": "2026-09-28T10:30:45.123Z", "EDT": read, "CEST": read,
+                "+0545": "2026-09-28T04:45:45.123Z"},
+    }
+    wrong = []
+    with tempfile.TemporaryDirectory(prefix="trawl-postgresql-", dir=FIXTURES) as name:
+        for zone, expected in cases.items():
+            config = {"data_dir": name,
+                      "sources": {"fixture": {"type": "stdin", "decoding": {"codec": "json"}}},
+                      "transforms": {"pg": dict(transform, inputs=["fixture"])},
+                      "sinks": {"out": {"type": "console", "inputs": ["pg"], "target": "stdout",
+                                        "encoding": {"codec": "json"}}}}
+            path = Path(name) / "postgresql.json"
+            path.write_text(json.dumps(config))
+            started = time.time()
+            stdin = "".join(json.dumps({"message": line.format(tz), "tz": tz}) + "\n"
+                            for tz in expected)
+            result = subprocess.run([VECTOR, "--config", str(path)], env=dict(ENV, TZ=zone),
+                                    input=stdin, capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+            events = {e["tz"]: e for e in map(json.loads, result.stdout.splitlines())}
+            assert events.keys() == expected.keys(), (events, result.stderr)
+            for tz, want in expected.items():
+                event = events[tz]
+                if (event["message"], event.get("user_name")) != ("checkpoint starting", "alice"):
+                    wrong.append(f"collector TZ={zone}, line zone {tz}: not parsed: {event}")
+                    continue
+                got = event.get("_time", read)
+                if got == read:
+                    # The read time the stdin source stamped, as for any line
+                    # without a time of its own.
+                    stamped = datetime.datetime.fromisoformat(event["timestamp"]).timestamp()
+                    assert started - 1 <= stamped <= time.time() + 1, event
+                if got != want:
+                    wrong.append(f"collector TZ={zone}, line zone {tz}: _time {got}, want {want}")
+    assert not wrong, "\n".join(wrong)
+    print("PASS postgresql line zones: UTC, GMT, and numeric offsets exact; a named zone only "
+          "when the collector's zone names it; otherwise the read time")
 
 
 def development_page(raw):
@@ -948,5 +1003,6 @@ if __name__ == "__main__":
             run(tcp, suppress)
     run(True, False, "trusted")
     run(False, False, "untrusted")
+    postgresql_zones()
     varlog_glob()
     capture_recipe()
