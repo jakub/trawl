@@ -92,7 +92,8 @@ trawld measures the filesystem under each of three roles:
   filesystem.
 - `wal`: the live WAL directory, `ingest.wal_dir`. The role exists only when
   ingest is enabled.
-- `spill`: the query engine's temporary directory, `TMPDIR` or `/tmp`.
+- `spill`: the query engine's temporary files, in a private directory
+  trawld makes in `TMPDIR` or `/tmp`.
 
 Roles on the same device share one row, and the row lists each role it holds.
 A `wal_dir` or temporary directory on a different device gets its own row.

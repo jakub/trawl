@@ -520,7 +520,8 @@ nothing else. You supply what the package supplies:
 - The data directory, and an `[ingest] wal_dir` outside it, owned by the
   user that runs trawld. trawld creates a missing data directory at 0700.
   At every start it closes an existing data directory, and an out-of-root
-  WAL directory, to owner-only. If it cannot, it refuses to start, and the
+  WAL directory, to owner-only. A `wal_dir` under the data directory that is
+  a symlink, or a mount, or is reached through one, counts as outside. If it cannot, it refuses to start, and the
   error names the path, its owner, its mode, and the fix.
   `[data] path` must name the directory itself. trawld follows symlinks in
   the parent directories, but refuses a path whose last component is a
