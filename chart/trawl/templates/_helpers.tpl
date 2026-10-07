@@ -81,10 +81,12 @@ stamps on /usr/bin/trawld is what keeps the bit across that exec, and
 no_new_privs does not object because nothing is gained: commoncap
 downgrades only when the new permitted set is not a subset of the old
 one. So allowPrivilegeEscalation stays false, which a kind run at
-ptrace_scope=2 confirmed (34-thread dump, NoNewPrivs=1). Adding any
+ptrace_scope=2 confirmed (34-thread dump, NoNewPrivs=1). Capture also
+works under the pod's RuntimeDefault seccomp filter. Adding any
 capability other than NET_BIND_SERVICE is what the Restricted Pod
-Security profile refuses, so an enabled install is still incompatible
-with Restricted. The chart documents that rather than enforcing it,
+Security profile refuses, and Baseline refuses SYS_PTRACE too, so an
+enabled install needs a namespace that allows it, in practice
+privileged. The chart documents that rather than enforcing it,
 because admission policy is cluster state the chart cannot read
 (ADR-0023 ruling 7, as amended). Only trawld is touched; init-auth,
 init-tls-dir and trawl-web keep the unmodified securityContext.

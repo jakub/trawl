@@ -103,7 +103,8 @@ persistence:
 # therefore changes nothing, since Baseline rejects this pod too. Enabling
 # crash dumps needs a namespace with no Pod Security enforcement, an exemption
 # for this workload, or an admission policy that permits SYS_PTRACE for it. The
-# kubernetes Pod Security Standards page carries both allowlists.
+# kubernetes Pod Security Standards page carries both allowlists. Capture works
+# under the default RuntimeDefault seccomp profile (podSecurityContext).
 #
 # The dump PVC is separate from the data PVC, so dumps stay out of data backups
 # and survive container restarts, pod reschedules, and node reboots. Off by

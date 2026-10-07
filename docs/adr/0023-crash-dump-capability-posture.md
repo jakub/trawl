@@ -178,3 +178,28 @@ Ruling 8's standing CI check moved from `k8s-big` to a GitHub-hosted
 docker daemon, which is all the check needs. `ci/crashdump-image.sh`
 already reads the host's `ptrace_scope` and never writes it, so the
 shared-runner reasoning holds unchanged.
+
+## Amendment (2026-10-07)
+
+Capture works under the container runtime's default seccomp filter. The
+2026-09-06 kind run had no seccomp profile (`Seccomp: 0`), so it did not
+show this. A probe on Talos 1.13.7, containerd 2.2.6 and Kubernetes 1.35
+did. It installed chart 0.9.1 with `crashDump.enabled=true` and
+`podSecurityContext.seccompProfile.type=RuntimeDefault`. Both trawld and
+its monitor ran with `Seccomp: 2`. The monitor held `CapEff=0x80000`, the
+verdict was `ready`, and `kill -SEGV 1` wrote a dump carrying 39 threads.
+The transcript is in the
+[#284 prep journal](https://github.com/jakub/trawl/issues/284#issuecomment-6029543429).
+Ruling 5 still holds: the readiness probe does not read seccomp.
+
+The chart now sets `seccompProfile: {type: RuntimeDefault}` in the default
+pod security context, for every container. With crash dumps off, the pod
+passes Restricted.
+
+Ruling 7's admission note is sharpened. Baseline refuses the pod as well as
+Restricted: Baseline's capability allowlist is the runtime's default set,
+which does not include `SYS_PTRACE`. The probe's first install failed on
+that cluster's default `baseline` enforcement with `non-default
+capabilities`. Crash-dump mode therefore needs a namespace whose Pod
+Security level allows `SYS_PTRACE`. In practice that is `privileged`, or
+an exemption or admission policy that permits it for this workload.
