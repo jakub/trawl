@@ -38,7 +38,7 @@ struct Capture(Arc<Mutex<Vec<u8>>>);
 
 impl Capture {
     fn text(&self) -> String {
-        strip_ansi(&String::from_utf8(self.0.lock().unwrap().clone()).unwrap())
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
     }
 }
 
@@ -59,25 +59,6 @@ impl<'a> MakeWriter<'a> for Capture {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
-}
-
-/// Drop ANSI SGR sequences, so a line reads the same with or without
-/// colour.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
 }
 
 fn read_wal(dir: &std::path::Path) -> Vec<serde_json::Value> {
@@ -127,6 +108,7 @@ fn install_and_panic(
     let (subscriber, _) = telemetry::build_subscriber(
         directives,
         LogSinks {
+            stdout_ansi: false,
             stdout,
             wal: Some(wal.clone()),
             file_log: false,

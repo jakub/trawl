@@ -125,6 +125,7 @@ fn doctor_usage_error(error: &clap::Error) -> u8 {
 /// The proxy: load the configuration, build the state, bind, and serve.
 async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
+        .with_ansi(trawl_config::color::stdout_ansi())
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| EnvFilter::new(trawl_web::DEFAULT_LOG_FILTER)),

@@ -90,6 +90,7 @@ fn sinks() -> &'static Sinks {
         let (subscriber, _) = telemetry::build_subscriber(
             telemetry::DEFAULT_LOG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: Some(stdout.clone()),
                 wal: Some(wal.clone()),
                 file_log: false,
@@ -104,32 +105,13 @@ fn sinks() -> &'static Sinks {
     })
 }
 
-/// Drop ANSI SGR sequences, so a line reads the same with or without
-/// colour.
-fn strip_ansi(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Every stdout line so far, colour removed.
+/// Every stdout line so far.
 fn stdout_lines() -> Vec<String> {
     let bytes = sinks().stdout.0.lock().unwrap().clone();
     String::from_utf8(bytes)
         .unwrap()
         .lines()
-        .map(strip_ansi)
+        .map(str::to_owned)
         .collect()
 }
 

@@ -12362,6 +12362,7 @@ mod tests {
         let (dispatch, _) = build_subscriber(
             DEFAULT_LOG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: None::<fn() -> std::io::Sink>,
                 wal: Some(telemetry.clone()),
                 file_log: false,

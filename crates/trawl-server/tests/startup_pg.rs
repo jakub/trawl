@@ -242,7 +242,6 @@ impl Fixture {
             .arg(path)
             .env("HOME", self.root.path())
             .env("RUST_LOG", "info")
-            .env("NO_COLOR", "1")
             .current_dir(self.root.path())
             .stdin(Stdio::null())
             .stdout(output.try_clone().unwrap())
@@ -287,8 +286,17 @@ impl Drop for Daemon {
 }
 
 impl Daemon {
+    /// The daemon's combined stdout and stderr so far. Its stdout is a
+    /// file, not a terminal, so no line may carry an ANSI escape: a
+    /// redirected stdout is a log stream (journald, `kubectl logs`), and
+    /// escapes there end up in stored events.
     fn log(&self) -> String {
-        std::fs::read_to_string(&self.log).unwrap()
+        let log = std::fs::read_to_string(&self.log).unwrap();
+        assert!(
+            !log.contains('\u{1b}'),
+            "trawld coloured a stdout that is not a terminal: {log}"
+        );
+        log
     }
 
     async fn refused(&mut self, diagnostic: &str) {

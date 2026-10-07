@@ -80,6 +80,7 @@ fn sinks() -> &'static Sinks {
         let (subscriber, _) = telemetry::build_subscriber(
             telemetry::DEFAULT_LOG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: Some(stdout.clone()),
                 wal: Some(wal.clone()),
                 file_log: false,

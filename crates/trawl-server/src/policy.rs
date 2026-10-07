@@ -599,6 +599,7 @@ mod tests {
         let (subscriber, _) = build_subscriber(
             crate::telemetry::DEFAULT_LOG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: Some({
                     let stdout = stdout.clone();
                     move || stdout.clone()

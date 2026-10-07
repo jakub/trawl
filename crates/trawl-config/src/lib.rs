@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+pub mod color;
 pub mod fs;
 
 /// Top-level daemon configuration, loaded from TOML.

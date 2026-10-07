@@ -898,6 +898,7 @@ fn init_tracing(
         filter_directives,
         telemetry::LogSinks {
             stdout,
+            stdout_ansi: trawl_config::color::stdout_ansi(),
             // Same Arc<WalLayerInner> as the flush task's clone.
             wal: telemetry.as_ref().map(|(_, layer)| layer.clone()),
             file_log: file_log_path.is_some(),

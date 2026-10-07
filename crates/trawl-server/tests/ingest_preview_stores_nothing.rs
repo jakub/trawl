@@ -99,6 +99,7 @@ fn telemetry() -> &'static Telemetry {
         let (subscriber, _) = telemetry::build_subscriber(
             DEBUG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: Some(stdout.clone()),
                 wal: Some(layer.clone()),
                 file_log: false,

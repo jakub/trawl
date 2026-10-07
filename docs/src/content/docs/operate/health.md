@@ -597,6 +597,15 @@ Read these events in the daemon output, or read
 The metric carries no key name and no request path. Ship the stdout stream
 through your log pipeline when you need those details.
 
+trawld and `trawl-web` colour their stdout lines only on a terminal, and never
+when `NO_COLOR` is set, so the journal and `kubectl logs` hold plain text. When
+a collector ships the trawld journal back into the same Trawl, as the
+[Debian Vector configuration](/getting-started/vector-integration/) does, each
+line that stored telemetry also keeps arrives twice: once with
+`_producer=trawld` and once with `_producer=http`. Query
+`service=trawld _producer=trawld` for stored telemetry, and
+`service=trawld _producer=http` for the stdout-only events above.
+
 ## Enable the query debug log
 
 Use this log when you need the raw DSL, the generated SQL with its parameter

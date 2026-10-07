@@ -497,6 +497,11 @@ pub struct LogSinks<W> {
     /// Human-readable lines. `None` while the monitor TUI owns the terminal:
     /// interleaved log output would corrupt it.
     pub stdout: Option<W>,
+    /// Whether the stdout lines carry ANSI colour. Production passes
+    /// [`trawl_config::color::stdout_ansi`]: colour only on a terminal and
+    /// never under `NO_COLOR`, because a redirected stdout is a log stream
+    /// whose escapes would land in stored events.
+    pub stdout_ansi: bool,
     /// Self-telemetry into the ingest WAL. Production registers it in place
     /// of the JSON file logger.
     pub wal: Option<WalLayer>,
@@ -511,6 +516,7 @@ impl<W> std::fmt::Debug for LogSinks<W> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LogSinks")
             .field("stdout", &self.stdout.is_some())
+            .field("stdout_ansi", &self.stdout_ansi)
             .field("wal", &self.wal)
             .field("file_log", &self.file_log)
             .finish()
@@ -558,9 +564,14 @@ where
     // span or event on that worker thread inherits them: a request span
     // vanished from stdout and the WAL alike, and an event was dropped.
     let filter = tracing_subscriber::EnvFilter::new(directives);
+    let stdout_ansi = sinks.stdout_ansi;
     let subscriber = tracing_subscriber::registry()
         .with(file_layer)
-        .with(sinks.stdout.map(|writer| fmt::layer().with_writer(writer)))
+        .with(
+            sinks
+                .stdout
+                .map(|writer| fmt::layer().with_ansi(stdout_ansi).with_writer(writer)),
+        )
         .with(sinks.wal)
         .with(filter);
     (subscriber.into(), file_handle)
@@ -2029,6 +2040,7 @@ mod tests {
         let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
             DEFAULT_LOG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: None,
                 wal: Some(layer.clone()),
                 file_log: false,
@@ -2172,6 +2184,7 @@ mod tests {
             let (subscriber, _) = build_subscriber(
                 DEFAULT_LOG_FILTER,
                 LogSinks {
+                    stdout_ansi: false,
                     stdout: Some(stdout.clone()),
                     wal: Some(layer.clone()),
                     file_log: false,
@@ -2262,6 +2275,7 @@ mod tests {
         let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
             DEFAULT_LOG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: None,
                 wal: Some(layer.clone()),
                 file_log: false,
@@ -2339,6 +2353,7 @@ mod tests {
         let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
             DEFAULT_LOG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: None,
                 wal: Some(layer.clone()),
                 file_log: false,
@@ -2477,6 +2492,7 @@ mod tests {
         let (subscriber, _) = build_subscriber::<fn() -> std::io::Sink>(
             DEFAULT_LOG_FILTER,
             LogSinks {
+                stdout_ansi: false,
                 stdout: None,
                 wal: Some(layer.clone()),
                 file_log: false,

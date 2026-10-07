@@ -54,6 +54,7 @@ fn install_telemetry() -> (WalHandle, WalLayer) {
     let (dispatch, _) = telemetry::build_subscriber(
         telemetry::DEFAULT_LOG_FILTER,
         telemetry::LogSinks {
+            stdout_ansi: false,
             stdout: None::<fn() -> std::io::Sink>,
             wal: Some(layer.clone()),
             file_log: false,
