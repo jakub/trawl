@@ -113,10 +113,36 @@ A `T` or a space separates the date from the time, and seconds and a fraction
 are optional. A number is not an event-time encoding, and neither is a nested
 value.
 
-For an RFC 3164 frame with no year, the syslog listener considers the previous,
-current, and next year in its local timezone, then takes the valid date nearest
-arrival, breaking an exact tie toward the past. With no valid candidate,
-ordinary derivation handles the missing time.
+An RFC 3164 timestamp with no offset, such as `Oct  2 14:00:05` or
+`Oct  2 2026 14:00:05`, is wall-clock time. The syslog listener reads it in the
+peer's zone: the peer's entry in `[syslog] sender_timezones`, or else
+`[syslog] default_timezone`, or else UTC. It never reads the zone of the host
+trawld runs on. See [`[syslog]`](/reference/configuration/#syslog).
+
+For a timestamp with no year, the listener considers the previous, current,
+and next year. It takes the date whose wall-clock time is nearest arrival, with
+arrival read in the peer's zone. Only a date the calendar rejects, such as
+Feb 29 in a non-leap year, drops out. An exact tie goes to the past. With no
+valid candidate, ordinary derivation handles the missing time.
+
+The zone's daylight-saving rules then fix the instant:
+
+- A wall time that occurs once becomes that instant.
+- A wall time that occurs twice, in a fall-back overlap, becomes the instant
+  nearer arrival. An exact tie becomes the earlier instant.
+- A wall time that never occurs, in a spring-forward gap, writes no
+  `syslog_timestamp`. The configured time sources apply as for any missing
+  time, and with none present the event takes its arrival time with
+  `time.from_ingest`. The frame's PRI, host, and app are kept.
+
+An offset on the wire always wins. An RFC 5424 timestamp, or an RFC 3339
+timestamp inside a 3164 frame, keeps its own offset, and the configured zone
+does not apply. The listener never reads a zone word in the frame, such as
+`UTC` or `CET`. An RFC 5424 timestamp with no offset still fails to parse, and
+the frame loses its whole header.
+
+`syslog_timestamp_zone` records the zone a zone-less timestamp was read in.
+See [syslog listener fields](#syslog-listener-fields).
 
 ## Severity derivation
 
@@ -212,12 +238,18 @@ profile's fixed derivation sources read the first two.
 | Column | Value | Present when |
 |--------|-------|--------------|
 | `syslog_severity` | The raw PRI severity numeral, 0 to 7 | The frame carried a PRI |
-| `syslog_timestamp` | The frame time, as RFC 3339 UTC at microsecond precision | The frame carried a timestamp |
+| `syslog_timestamp` | The frame time, as RFC 3339 UTC at microsecond precision | The frame carried a timestamp that names an instant. A wall time in a daylight-saving gap names none |
+| `syslog_timestamp_zone` | The zone a zone-less RFC 3164 timestamp was read in: `UTC`, a fixed offset such as `+05:30`, or the IANA name as configured | The frame carried a zone-less timestamp, including one in a daylight-saving gap |
 | `syslog_facility` | The facility name, such as `local0` | The facility is known |
 | `syslog_pid` | The frame's PROCID | The frame carried one |
 | `syslog_msgid` | The frame's MSGID | The frame carried one |
 | `syslog_source_ip` | The peer address | Always |
 | `sd_<id>_<param>` | One RFC 5424 structured-data parameter | The frame carried structured data |
+
+`syslog_timestamp_zone` is an annotation, not a repair. trawld changed no
+value the sender wrote, so the event gets no `_repairs` code for it. A zone
+change in the configuration applies to new events only, and this column tells
+which zone an older event was read in.
 
 Structured data is bounded at 32 elements and 128 parameters in total. Keys
 arrive as the frame spelled them, then take the ordinary name rules. `_raw` is
