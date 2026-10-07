@@ -49,7 +49,14 @@ in practice `privileged`.
    fleet-admin roles create --name trawl-ingest --perm trawl:ingest
    fleet-admin roles create --name trawl-schema-admin \
      --perm trawl:schema_read --perm trawl:schema_write
+   fleet-admin roles create --name trawl-operator --perm trawl:server_manage
    ```
+
+   `trawl-operator` is for the people who run the server. Keep it out of the
+   reader role: `trawl:server_manage` also cancels any key's query and reads
+   server stats and the dashboard. The
+   [ingest preview](/operate/ingestion/#ingest-preview) and the
+   [health checks](/operate/health/) need it.
 
    `fleet-admin` warns about a permission it does not recognize but stores it
    anyway. Check the spelling in the warning.
@@ -60,6 +67,7 @@ in practice `privileged`.
    ```bash
    (umask 077
     fleet-admin keys create --name alice --kind human --role trawl-reader > alice.token
+    fleet-admin keys create --name alice-ops --kind human --role trawl-operator > alice-ops.token
     fleet-admin keys create --name vector --kind service --role trawl-ingest \
       --expires 90d > vector.token)
    ```
@@ -70,14 +78,69 @@ in practice `privileged`.
    prefix, and expiry go to standard error. `--role` repeats. `--expires`
    accepts `24h`, `90d`, or `52w`, and a key without it never expires.
 
-4. Check what a key can do:
+   Save `alice-ops` in a CLI profile named `ops`, as
+   [Keep more than one server in profiles](/start/connect/#keep-more-than-one-server-in-profiles)
+   shows. The ingest preview runs as `trawl -p ops`.
+
+### Keep a key in a curl config file
+
+curl reads a header from a config file, so the token stays off the command
+line and out of your shell history. The [health checks](/operate/health/) and
+the [API reference](/reference/api/) name this file `TRAWL_CURL_CONFIG`.
+
+1. Get the CA certificate that curl needs to trust trawld. Skip this step
+   when a publicly trusted CA issued trawld's certificate.
+
+   trawld's generated certificate names only `localhost`, `127.0.0.1`, and
+   `::1`. With that certificate, run curl on the trawld host, or through a
+   port-forward, and use `https://localhost:5514`.
+
+   On Debian, copy the certificate on the trawld host. `sudo` is needed
+   because only `trawl` and its group can open `/var/lib/trawl`:
 
    ```bash
-   curl --fail-with-body -H "Authorization: Bearer $(cat alice.token)" \
-     https://trawl.example.com:5514/api/v1/whoami
+   sudo cat /var/lib/trawl/tls/cert.pem > trawl-ca.pem
    ```
 
-   The response lists the key's `roles` and its resolved `permissions`.
+   On Helm, copy it out of the `trawld` container, then keep a port-forward
+   running in another terminal:
+
+   ```bash
+   kubectl -n trawl exec trawl-0 -c trawld -- cat /var/lib/trawl/tls/cert.pem > trawl-ca.pem
+   kubectl -n trawl port-forward svc/trawl 5514:5514
+   ```
+
+   If you set `tls_cert_path`, copy the certificate of the CA that issued
+   it instead. When trawld generates a new certificate, copy it again.
+
+2. Write the config file. `printf` is a shell builtin, so the token never
+   appears in a process list:
+
+   ```bash
+   (umask 077 && printf 'header = "Authorization: Bearer %s"\ncacert = "%s"\n' \
+     "$(cat alice.token)" "$PWD/trawl-ca.pem" > alice.curl)
+   export TRAWL_CURL_CONFIG="$PWD/alice.curl"
+   ```
+
+   The `cacert` line is curl's `--cacert` option. Delete it when a publicly
+   trusted CA issued trawld's certificate. curl does not expand `~` in a
+   config file, so keep both paths absolute. Do not print the file.
+
+3. Check what the key can do:
+
+   ```bash
+   curl --fail-with-body --config "$TRAWL_CURL_CONFIG" https://localhost:5514/api/v1/whoami
+   ```
+
+   The response lists the key's `roles` and its resolved `permissions`. For a
+   certificate that names your server, use its name in the URL, such as
+   `https://trawl.example.com:5514`.
+
+Write one file per key. Write `alice-ops.curl` from `alice-ops.token` for the
+health checks, and `vector.curl` from `vector.token` to
+[send a test batch](/operate/ingestion/#send-events-over-http).
+
+### Change roles and keys later
 
 To change roles and keys later, use these commands. `PREFIX` is the prefix that
 `fleet-admin keys list` prints.
@@ -230,8 +293,8 @@ allow_insecure_cookies = false
   `http://127.0.0.1:8090` address the proxy forwards to, and keep
   `allow_insecure_cookies = false`. Set it to `true` only when the browser
   itself uses HTTP.
-- `bind_addr` defaults to loopback. External browsers need a reverse proxy in
-  front of it.
+- `bind_addr` defaults to loopback. For browsers on other machines,
+  [put trawl-web behind a reverse proxy](/operate/deployment/#put-trawl-web-behind-a-reverse-proxy).
 
 Restart the proxy after a change with `sudo systemctl restart trawl-web`. The
 [`[web]` reference](/reference/configuration/#web) lists every key, including
