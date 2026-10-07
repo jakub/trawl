@@ -4,6 +4,7 @@
 
 //! HTTP handler for the `POST /api/v1/ingest` endpoint.
 
+use std::borrow::Cow;
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
@@ -322,10 +323,12 @@ async fn parse_request(
         let _span = span.enter();
         let ctx = request.envelope();
         let t0 = std::time::Instant::now();
-        let raw = if compressed {
-            decompress_gzip(&body, max_body_bytes)?
+        // An uncompressed body is parsed in place: copying it would double
+        // the request's footprint at up to `[ingest] max_body_bytes`.
+        let raw: Cow<'_, [u8]> = if compressed {
+            Cow::Owned(decompress_gzip(&body, max_body_bytes)?)
         } else {
-            body.to_vec()
+            Cow::Borrowed(&body)
         };
         let decompress_ms = t0.elapsed().as_millis();
 
