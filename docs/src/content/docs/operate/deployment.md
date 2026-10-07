@@ -145,10 +145,12 @@ APT repository from [Installation](/getting-started/).
 
 The package, systemd, and trawld create these files and directories. Stored
 data is owner-only. trawld sets its process umask to 077 at every start, so
-everything it creates under `data/` is readable by user `trawl` alone, and it
-closes the data root to 0700 before it serves. `trawl-web` reads two files on
-disk, `web.cookie` and `tls/cert.pem`. It reaches stored events only through
-trawld's API.
+everything it creates under `data/` is readable by user `trawl` alone. A data
+root that trawld creates is 0700. At every start, before it connects to its
+databases, trawld removes the group and other permissions from an existing
+data root. It keeps the owner's permissions as they are, so a read-only
+archive at 0500 stays 0500. `trawl-web` reads two files on disk, `web.cookie`
+and `tls/cert.pem`. It reaches stored events only through trawld's API.
 
 | Path | Owner and mode | Purpose |
 | --- | --- | --- |
@@ -158,7 +160,7 @@ trawld's API.
 | `/etc/default/trawld` | root:trawl 0640 | Environment for `trawld.service`: `FLEET_DATABASE_URL`, `TRAWL_DATABASE_URL`, `RUST_LOG`. |
 | `/etc/default/trawl-web` | root:root 0644 | Environment for `trawl-web.service`: `RUST_LOG`. World-readable, so no secrets. |
 | `/var/lib/trawl` | trawl:trawl 0750 | State directory. The package creates it, and systemd reapplies the mode at every start of `trawld.service`. `trawld` writes only here and to `/var/log/trawl`. The `trawl` group lets `trawl-web` pass through to `web.cookie` and `tls/`. |
-| `/var/lib/trawl/data` | trawl:trawl 0700 | Parquet files, `wal/`, `scheduled/`, and the `EPOCH` and `CATALOG` markers. Everything trawld creates beneath it is 0700 or 0600. trawld creates it on first start and closes it to 0700 at every start. |
+| `/var/lib/trawl/data` | trawl:trawl 0700 | Parquet files, `wal/`, `scheduled/`, and the `EPOCH` and `CATALOG` markers. Everything trawld creates beneath it is 0700 or 0600. trawld creates it at 0700 on first start, and removes any group or other permission from it at every start. |
 | `/var/lib/trawl/tls` | trawl:trawl 0755 | `cert.pem`, mode 0644, generated when `[server]` names no certificate. trawld creates both on first start. The packaged `[web] upstream_ca_path` pins the certificate. |
 | `/var/lib/trawl/tls-key` | trawl:trawl 0700 | `key.pem`, mode 0600, the private key of the generated certificate. trawld creates both on first start. |
 | `/var/lib/trawl/web.cookie` | trawl:trawl 0640 | 32-byte session cookie key, generated once on first install. The `trawl` group lets `trawl-web` read it. |
@@ -519,10 +521,15 @@ nothing else. You supply what the package supplies:
   cannot reach `web.cookie` or `tls/cert.pem`.
 - The data directory, and an `[ingest] wal_dir` outside it, owned by the
   user that runs trawld. trawld creates a missing data directory at 0700.
-  At every start it closes an existing data directory, and an out-of-root
-  WAL directory, to owner-only. A `wal_dir` under the data directory that is
-  a symlink, or a mount, or is reached through one, counts as outside. If it cannot, it refuses to start, and the
-  error names the path, its owner, its mode, and the fix.
+  At every start, before it connects to its databases, trawld removes the
+  group and other permissions from an existing data directory and from a
+  WAL directory outside it. If trawld cannot remove them, it refuses to
+  start, and the error names the path, its owner, its mode, and the fix.
+  A `wal_dir` under the data directory counts as outside when it is a
+  symlink or a mount, or is reached through one. It also counts as outside
+  when the kernel does not report mount IDs, as Linux before 5.8 does not.
+  A WAL directory, `<data>.repin-next` or `<data>.repin-aside` that is not
+  a directory refuses the start.
   `[data] path` must name the directory itself. trawld follows symlinks in
   the parent directories, but refuses a path whose last component is a
   symlink. A default ACL on a parent directory is outside this guarantee.
@@ -540,6 +547,12 @@ nothing else. You supply what the package supplies:
   [`crates/trawl-server/debian/`](https://github.com/jakub/trawl/tree/main/crates/trawl-server/debian).
   The supervisor needs no umask setting. trawld sets its own umask to 077
   before it creates a file.
+- A `TMPDIR` that keeps Unix modes, or none, which means `/tmp`. The query
+  engine spills into a private directory that trawld makes there, and
+  trawld refuses a spill directory that is not 0700 and owned by `trawl`.
+  Other users must not be able to rename entries in `TMPDIR`. The system
+  `/tmp` is safe, because its sticky bit stops that. A directory that only
+  `trawl` can write is safe too.
 
 ## Use a current storage root
 

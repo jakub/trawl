@@ -29,7 +29,9 @@ keep it private.
 Run a file-level backup or restore of `/var/lib/trawl` as the `trawl` user or
 as root. The data root and everything beneath it are owner-only, so a member
 of group `trawl`, such as `trawl-web`, cannot read them. A backup agent that
-runs as another user copies nothing. On Kubernetes, the mover must run as
+runs as another user cannot make a complete backup. As a member of group
+`trawl` it can read `web.cookie` and `tls/cert.pem`, but none of the stored
+data. On Kubernetes, the mover must run as
 trawld's uid, `podSecurityContext.runAsUser` in the chart, 1000 by default.
 
 ## Create a backup
@@ -131,8 +133,10 @@ database, restore the `trawl` dump only and reconcile keys by hand.
    The restored data root must be owned by the user that runs trawld, `trawl`
    on a Debian host. `tar` as root restores the archived owner by name, so
    the packaged user gets it right. If trawld runs as another user on this
-   host, run `chown -R` on `/var/lib/trawl/data`, `/var/lib/trawl/tls` and
-   `/var/lib/trawl/tls-key` to that user before you start trawld. trawld
+   host, run `chown -R` on `/var/lib/trawl/data` to that user before you
+   start trawld. Do the same for `/var/lib/trawl/tls` and
+   `/var/lib/trawl/tls-key` if they exist. They exist only when trawld
+   generated its own certificate. trawld
    refuses to start on a data root or TLS directory owned by another user,
    and its error names the path, the owner, and the fix.
 

@@ -45,3 +45,17 @@ The implementation of #282 settled the rules the body left open.
 **Files outside the roots.** The query engine spills into a directory it makes for each database in the system temp directory, with a random name and mode 0700, and removes it when the database closes. `DuckDB` opens its spill files by predictable names without `O_EXCL`, so the shared temp directory would reuse a file another user planted or an older process left readable. Compaction and the conform pass already spill under the data root. `[server] log_file` opens like the query debug log: 0600 at creation, and an existing looser file is tightened, since it can sit outside every directory trawld or systemd closes.
 
 **The doctor predicts, boot decides.** `will_tighten` is a read-only prediction from the root's owner and mode, plus a read-only-filesystem check. Boot does not pre-judge the filesystem. Its `fchmod` is the authority, and its result is what refuses or serves.
+
+## Amendment (2026-10-07)
+
+Review of #282 moved the start-time close and widened what it covers.
+
+**trawld closes the roots before it waits on PostgreSQL.** The first close runs once the configuration is loaded, before the database admission that takes the sole-writer lock. The earlier placement, after the lock, kept a corpus open for as long as a database was down, across every restart. The lock is not needed: the close only removes group and other bits, so a second trawld that runs it and then loses the lock has changed nothing the winner would not. The checks after the epoch gate creates the data root and after boot creates the WAL directory stay where they are.
+
+**A repin closes its staging roots when it creates them.** A repin makes `data.repin-next` and `data.repin-aside` while trawld serves, after the start-time close. Each is closed through the same no-follow handle as soon as it exists, before anything is linked, written or renamed into it. A refused shadow root fails the job with the corpus untouched. A refused aside root comes after the cutover marker, so it ends the process like any other swap failure, and the boot replay refuses the start until the operator fixes the root.
+
+**An unknown mount does not prove containment.** On Linux a WAL directory is held by the data root only when `statx` names the mount of every directory on the way. A kernel before 5.8 does not, and the device alone cannot tell a bind mount from a plain directory, so the WAL directory is then a root of its own.
+
+**A WAL directory or repin sibling that is not a directory refuses the start**, at boot and in the doctor. A data root that is not a directory stays the epoch gate's to refuse.
+
+**trawld checks the spill directory and the diagnostic logs on their descriptors.** The spill directory is opened no-follow after it is made, and refused unless trawld's euid owns it and it has no group or other bit. `[server] log_file` and the query debug log are judged on the opened descriptor after the chmod, whatever the chmod returned: a file another user owns, or one with a group or other bit left, refuses the open. A file another user owns is refused even when it is already tight, since its owner can loosen it at any time. The deployment guide asks for a `TMPDIR` in which other users cannot rename entries, such as the sticky `/tmp`.
