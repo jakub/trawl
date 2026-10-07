@@ -437,13 +437,29 @@ async fn catalog_id(url: &str) -> String {
 /// own boot steps made: the epoch gate initializes the absent data root, as
 /// `main` does before anything else, the seed parquet then stands for what
 /// ingest wrote, and the fixture's boot (`boot::prepare_corpus`) runs
-/// conformance and publishes the `CATALOG` marker.
+/// conformance and publishes the `CATALOG` marker. The fixture boot does
+/// not close the storage roots, and this test process's umask is not
+/// trawld's, so `main`'s close step runs last, as a restart would run it.
 async fn running_server(dir: &Path) -> common::TestServer {
-    trawl_server::epoch::ensure_current_epoch(&dir.join("data"), &dir.join("wal"), true)
+    use trawl_server::owner_only;
+    let (data, wal) = (dir.join("data"), dir.join("wal"));
+    trawl_server::epoch::ensure_current_epoch(&data, &wal, true)
         .expect("the epoch gate initializes the data root");
-    let data = common::seed_data_root(dir);
-    common::setup_in_dir_with_data(dir, data, trawl_server::config::RateLimitConfig::default())
-        .await
+    let seeded = common::seed_data_root(dir);
+    let server = common::setup_in_dir_with_data(
+        dir,
+        seeded,
+        trawl_server::config::RateLimitConfig::default(),
+    )
+    .await;
+    let euid = rustix::process::geteuid().as_raw();
+    owner_only::close(
+        &owner_only::protected_roots(&data, &wal, true),
+        euid,
+        owner_only::fchmod,
+    )
+    .expect("boot's close step closes the fixture's roots");
+    server
 }
 
 /// A doctor configuration for a running fixture server in `dir`, which
