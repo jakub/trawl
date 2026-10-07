@@ -131,9 +131,10 @@ database, restore the `trawl` dump only and reconcile keys by hand.
    The restored data root must be owned by the user that runs trawld, `trawl`
    on a Debian host. `tar` as root restores the archived owner by name, so
    the packaged user gets it right. If trawld runs as another user on this
-   host, run `chown -R` on `/var/lib/trawl/data` to that user before you
-   start trawld. trawld refuses to start on a data root owned by another
-   user, and its error names the path, the owner, and the fix.
+   host, run `chown -R` on `/var/lib/trawl/data`, `/var/lib/trawl/tls` and
+   `/var/lib/trawl/tls-key` to that user before you start trawld. trawld
+   refuses to start on a data root or TLS directory owned by another user,
+   and its error names the path, the owner, and the fix.
 
 4. Edit the restored configuration for this host: the DSNs in
    `/etc/default/trawld`, `http_addr`, the TLS paths, and `public_origins`.
