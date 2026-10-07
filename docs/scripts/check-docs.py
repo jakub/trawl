@@ -28,7 +28,12 @@ class Page(HTMLParser):
             self.links.append(attrs['href'])
 
 
-pages = {path: Page(path.read_text()) for path in DIST.rglob('*.html')}
+pages = {}
+for path in DIST.rglob('*.html'):
+    source = path.read_text()
+    if re.search(r'\{\{release\.|%7b%7brelease\.', source, re.I):
+        errors.append(f'{path.relative_to(DIST)}: unrendered release placeholder')
+    pages[path] = Page(source)
 if not pages:
     sys.exit('No built HTML found. Run npm run build first.')
 links = 0
@@ -118,6 +123,8 @@ for path in (DOCS / 'src/content/docs').rglob('*'):
     if path.suffix not in ('.md', '.mdx'):
         continue
     source = path.read_text()
+    if path.suffix == '.mdx' and '{{release.' in source:
+        errors.append(f'{path.relative_to(ROOT)}: unrendered release placeholder in MDX source')
     frontmatter = re.match(r'^---\n(.*?)\n---', source, re.S)
     if not frontmatter or any(not re.search(rf'^{key}:\s*\S', frontmatter[1], re.M)
                               for key in ('title', 'description')):
