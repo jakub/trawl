@@ -36,6 +36,7 @@ use serde_json::{Map, Value, json};
 use syslog_loose::Message;
 
 use super::batch::SyslogEvent;
+use super::zone::SyslogZone;
 use super::{CidrEntry, parse};
 use crate::ingest::envelope::{self, EnvelopeContext, RepairCode};
 use crate::ingest::pipeline;
@@ -265,7 +266,7 @@ impl SyslogDoor {
         transport: &'static str,
     ) -> Option<SyslogEvent> {
         let arrival_instant = Utc::now();
-        let parsed = parse::parse_syslog(raw, arrival_instant);
+        let parsed = parse::parse_syslog(raw, arrival_instant, SyslogZone::UTC).msg;
         // Membership, not `is_allowed`: an empty relay list means "no
         // relays configured", the exact opposite of the empty CIDR
         // allowlist's "everything is allowed". Same predicate the HTTP
@@ -517,7 +518,7 @@ mod tests {
         // becomes a future event for part of the year and earns a repair.
         let raw = format!(
             "<134>{} web01 nginx: GET /",
-            chrono::Local::now().format("%b %e %H:%M:%S")
+            Utc::now().format("%b %e %H:%M:%S")
         );
         let lab = SyslogDoor {
             default_env: "lab".into(),
