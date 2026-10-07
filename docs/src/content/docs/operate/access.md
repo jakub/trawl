@@ -26,7 +26,10 @@ kubectl -n NAMESPACE exec -i trawl-0 -c trawld -- fleet-admin roles list
 
 The redirect runs on your machine, so the token file is written there. Do not
 add `-t` to `keys create`, because a terminal mixes standard error into the
-token file. A command that asks `[y/N]` needs `-it`, or `--yes`.
+token file. A command that asks `[y/N]` needs `-it`, or `--yes`. With
+[crash dumps](/reference/crash-dumps/) enabled, the trawld container holds
+`SYS_PTRACE`, so the pod needs a namespace whose Pod Security level allows it,
+in practice `privileged`.
 
 1. List the existing roles. A new Fleet database has none:
 
