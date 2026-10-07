@@ -65,18 +65,21 @@ in practice `privileged`.
    `service` key is for software:
 
    ```bash
-   (umask 077
-    fleet-admin keys create --name alice --kind human --role trawl-reader > alice.token
-    fleet-admin keys create --name alice-ops --kind human --role trawl-operator > alice-ops.token
-    fleet-admin keys create --name vector --kind service --role trawl-ingest \
-      --expires 90d > vector.token)
+   install -m 0600 /dev/null alice.token &&
+     fleet-admin keys create --name alice --kind human --role trawl-reader > alice.token
+   install -m 0600 /dev/null alice-ops.token &&
+     fleet-admin keys create --name alice-ops --kind human --role trawl-operator > alice-ops.token
+   install -m 0600 /dev/null vector.token &&
+     fleet-admin keys create --name vector --kind service --role trawl-ingest \
+       --expires 90d > vector.token
    ```
 
-   `umask 077` makes each new token file readable by you alone. A redirect
-   into a file that already exists keeps that file's mode, so delete a stale
-   token file before you reuse its name. The token goes to standard output once. The name, kind, roles, 8-character
-   prefix, and expiry go to standard error. `--role` repeats. `--expires`
-   accepts `24h`, `90d`, or `52w`, and a key without it never expires.
+   `install` replaces each token file with an empty file that only you can
+   read, before the token is written. This also holds when a file with that
+   name already exists. The token goes to standard output once. The name,
+   kind, roles, 8-character prefix, and expiry go to standard error. `--role`
+   repeats. `--expires` accepts `24h`, `90d`, or `52w`, and a key without it
+   never expires.
 
    Save `alice-ops` in a CLI profile named `ops`, as
    [Keep more than one server in profiles](/start/connect/#keep-more-than-one-server-in-profiles)
@@ -117,12 +120,14 @@ the [API reference](/reference/api/) name this file `TRAWL_CURL_CONFIG`.
    appears in a process list:
 
    ```bash
-   (umask 077 && printf 'header = "Authorization: Bearer %s"\ncacert = "%s"\n' \
-     "$(cat alice.token)" "$PWD/trawl-ca.pem" > alice.curl)
+   install -m 0600 /dev/null alice.curl &&
+     printf 'header = "Authorization: Bearer %s"\ncacert = "%s"\n' \
+       "$(cat alice.token)" "$PWD/trawl-ca.pem" > alice.curl
    export TRAWL_CURL_CONFIG="$PWD/alice.curl"
    ```
 
-   The `cacert` line is curl's `--cacert` option. Delete it when a publicly
+   `install` replaces the file with an empty file that only you can read, so
+   the token never lands in a file that others can read. The `cacert` line is curl's `--cacert` option. Delete it when a publicly
    trusted CA issued trawld's certificate. curl does not expand `~` in a
    config file, so keep both paths absolute. Do not print the file.
 
@@ -310,8 +315,8 @@ every application needs the same 32-byte session key and the same
 1. Generate the key once and keep the file private:
 
    ```bash
-   umask 077
-   fleet-admin generate-session-key > fleet-session.b64
+   install -m 0600 /dev/null fleet-session.b64 &&
+     fleet-admin generate-session-key > fleet-session.b64
    ```
 
    The output is one line of 43 base64url characters. Store it in your secret
@@ -321,7 +326,8 @@ every application needs the same 32-byte session key and the same
    reads, then install it over the package-generated key:
 
    ```bash
-   { tr -d '\n' < fleet-session.b64; printf '='; } | basenc --base64url -d > web.cookie.new
+   install -m 0600 /dev/null web.cookie.new &&
+     { tr -d '\n' < fleet-session.b64; printf '='; } | basenc --base64url -d > web.cookie.new
    test "$(stat -c %s web.cookie.new)" -eq 32
    sudo install -o trawl -g trawl -m 0640 web.cookie.new /var/lib/trawl/web.cookie
    ```

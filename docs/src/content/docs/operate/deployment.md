@@ -790,8 +790,15 @@ ServiceMonitor creation; neither option installs a monitoring system.
 
 3. Create a human key with [Create roles and keys](/operate/access/#create-roles-and-keys).
 
-4. Save the server in a [CLI profile](/start/connect/) with that key. When
-   the API certificate is from a CA the system trusts:
+4. Save the server in a [CLI profile](/start/connect/) with that key. First
+   make the config file readable by you alone, before the key goes into it:
+
+   ```bash
+   install -d -m 0700 ~/.config/trawl
+   touch ~/.config/trawl/config.toml && chmod 0600 ~/.config/trawl/config.toml
+   ```
+
+   When the API certificate is from a CA the system trusts:
 
    ```toml
    [profiles.prod]
@@ -804,7 +811,6 @@ ServiceMonitor creation; neither option installs a monitoring system.
    copy the certificate and pin it with `ca_cert`:
 
    ```bash
-   install -d -m 0700 ~/.config/trawl
    sudo cat /var/lib/trawl/tls/cert.pem > ~/.config/trawl/prod-ca.pem
    ```
 
@@ -814,8 +820,6 @@ ServiceMonitor creation; neither option installs a monitoring system.
    ca_cert = "~/.config/trawl/prod-ca.pem"
    token = "PASTE_THE_HUMAN_KEY_HERE"
    ```
-
-   Then run `chmod 0600 ~/.config/trawl/config.toml`.
 
 5. Run the client doctor against the profile. If the browser UI is enabled, add its
    origin with `--web-url`:
