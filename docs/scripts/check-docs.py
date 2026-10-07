@@ -125,6 +125,10 @@ for path in (DOCS / 'src/content/docs').rglob('*'):
     source = path.read_text()
     if path.suffix == '.mdx' and '{{release.' in source:
         errors.append(f'{path.relative_to(ROOT)}: unrendered release placeholder in MDX source')
+    for match in re.finditer(r'Bearer\s+\$\(', source):
+        line = source[:match.start()].count('\n') + 1
+        errors.append(f'{path.relative_to(ROOT)}:{line}: bearer token expanded onto a command line; '
+                      'use the curl config file from operate/access.md')
     frontmatter = re.match(r'^---\n(.*?)\n---', source, re.S)
     if not frontmatter or any(not re.search(rf'^{key}:\s*\S', frontmatter[1], re.M)
                               for key in ('title', 'description')):
