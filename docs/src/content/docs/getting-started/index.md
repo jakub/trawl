@@ -33,7 +33,7 @@ the shared DuckDB library. APT installs it automatically.
    Debian cloud image has no `gpg`, so install it first:
 
    ```bash
-   sudo apt-get install -y curl gpg
+   sudo apt-get update && sudo apt-get install -y curl gpg
    curl -fsSL https://trawl.sh/gpg.key -o trawl.asc
    gpg --show-keys --with-fingerprint trawl.asc
    ```
