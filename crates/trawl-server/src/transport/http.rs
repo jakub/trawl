@@ -16,10 +16,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::{MatchedPath, Request};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware;
-use axum::response::Response;
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::{delete, get, post, put};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -41,6 +41,7 @@ pub struct RequestId(pub(crate) String);
 
 use super::failure;
 use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};
+use crate::error::ServerError;
 use crate::handlers;
 use crate::ingest;
 use crate::policy::{normalize_auth_errors, require_trawl_grant};
@@ -59,7 +60,8 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
     let bearer_state = state.auth.bearer_state.clone();
 
     // Query routes. Onion (first .layer() = innermost): preview no-store →
-    // body limit → envelope normalization → require_bearer_only (fleet-auth authn) →
+    // body-limit envelope → body limit → axum's default limit off →
+    // envelope normalization → require_bearer_only (fleet-auth authn) →
     // require_trawl_grant (mandatory trawl policy) → rate limit → handler.
     let authenticated = Router::new()
         .route("/query", post(handlers::query))
@@ -130,12 +132,22 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
             fleet_auth::require_bearer_only,
         ))
         .layer(middleware::from_fn(normalize_auth_errors))
+        // The configured limit is the only one: see `envelope_body_limit`.
+        .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(max_body))
+        .layer(middleware::from_fn_with_state(
+            BodyLimit {
+                setting: "[server] max_request_body_bytes",
+                bytes: max_body,
+            },
+            envelope_body_limit,
+        ))
         // Outermost, so the body limit's 413, the auth layers' 401 and the
         // grant layer's 403 for the preview are covered too.
         .layer(middleware::from_fn(no_store_on_preview));
 
-    // Ingest route: same auth stack, separate (larger) body limit.
+    // Ingest route: same auth stack and body-limit layers, separate
+    // (larger) body limit.
     let ingest_routes = if ingest_enabled {
         let ingest_body_limit = http
             .ingest_max_body_bytes
@@ -156,7 +168,15 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
                 fleet_auth::require_bearer_only,
             ))
             .layer(middleware::from_fn(normalize_auth_errors))
+            .layer(DefaultBodyLimit::disable())
             .layer(RequestBodyLimitLayer::new(ingest_body_limit))
+            .layer(middleware::from_fn_with_state(
+                BodyLimit {
+                    setting: "[ingest] max_body_bytes",
+                    bytes: ingest_body_limit,
+                },
+                envelope_body_limit,
+            ))
     } else {
         Router::new()
     };
@@ -171,6 +191,67 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .nest("/api/v1", ingest_routes);
 
     with_edge_layers(app, http).with_state(state)
+}
+
+/// The body limit a router enforces, as [`envelope_body_limit`] names it.
+#[derive(Clone, Copy)]
+struct BodyLimit {
+    /// The setting's name as an operator writes it in the config.
+    setting: &'static str,
+    /// The exact value the router's `RequestBodyLimitLayer` enforces.
+    bytes: usize,
+}
+
+/// Answer a body-limit refusal with the error envelope, code
+/// `request_too_large`, naming the setting and its value.
+///
+/// Mounted directly outside a `RequestBodyLimitLayer`. That layer refuses
+/// in two places, and both answer `text/plain`. An announced
+/// `Content-Length` past the limit is refused before the inner service
+/// runs (tower-http 0.6.11 `limit/service.rs:55`, `create_error_response`
+/// in `limit/body.rs:83`). A chunked body is refused by the handler's body
+/// extractor once its `Limited` wrapper reads past the limit, as axum's
+/// `LengthLimitError` rejection (axum-core 0.5.6 `extract/rejection.rs:40`).
+/// That 413 comes back out through the auth layers, so this sits outside
+/// them too.
+///
+/// A 413 that is already `application/json` is a handler's own refusal
+/// (`preview_too_large`, a gzip `ingest_error`, `ingest_batch_too_large`)
+/// and passes untouched. `DefaultBodyLimit::disable()` sits directly
+/// inside the limit layer: otherwise axum's extractors wrap the body in
+/// their own hidden 2 MiB limit (axum-core 0.5.6
+/// `ext_traits/request.rs:319`), whose plain-text 413 this would mislabel
+/// as the configured setting, and which refuses ingest bodies far under
+/// `[ingest] max_body_bytes`.
+///
+/// The request body is never touched: trawld still hangs up on an
+/// oversized upload without reading the rest of it.
+async fn envelope_body_limit(
+    State(limit): State<BodyLimit>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE || is_json(&response) {
+        return response;
+    }
+    // A fresh response, so the body, `Content-Type` and `Content-Length`
+    // are replaced together and no stale length survives.
+    ServerError::RequestTooLarge {
+        setting: limit.setting,
+        limit: limit.bytes,
+    }
+    .into_response()
+}
+
+/// Whether `response` declares an `application/json` body.
+fn is_json(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("application/json"))
 }
 
 /// The ingest preview's route as the router matched it, prefix included.

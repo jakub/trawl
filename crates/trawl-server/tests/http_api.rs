@@ -1965,6 +1965,103 @@ async fn ingest_partial_success() {
     assert_eq!(body.errors[0].reason, "invalid_json");
 }
 
+/// An ingest request head as `token`, with `framing` as its body header.
+fn ingest_head(server: &common::TestServer, token: &str, framing: &str) -> String {
+    let host = server.url.strip_prefix("https://").unwrap();
+    format!(
+        "POST /api/v1/ingest HTTP/1.1\r\nhost: {host}\r\n\
+         authorization: Bearer {token}\r\ncontent-type: application/x-ndjson\r\n\
+         {framing}\r\n\r\n"
+    )
+}
+
+/// An ingest request whose chunked body is `body` in one chunk, with no
+/// terminator: the server reads every byte of it before it can refuse.
+fn unterminated_chunked_ingest(server: &common::TestServer, token: &str, body: &[u8]) -> Vec<u8> {
+    let mut request = ingest_head(server, token, "transfer-encoding: chunked").into_bytes();
+    request.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
+    request.extend_from_slice(body);
+    request
+}
+
+/// The ingest router's body limit answers with the envelope at its shipped
+/// default, whether it learned the size from `Content-Length` or by
+/// reading a chunked body past the limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_body_over_max_body_bytes_is_413_with_the_envelope() {
+    let server = setup().await;
+    let token = &server.ingest_token;
+    let limit = trawl_server::config::DEFAULT_INGEST_MAX_BODY_BYTES;
+    let message = "request body exceeds [ingest] max_body_bytes (16777216 bytes)";
+
+    // Refused on the announced length, before a body byte is read.
+    let request = ingest_head(&server, token, &format!("content-length: {}", limit + 1));
+    let resp = common::raw_https_exchange(&server.url, request.as_bytes()).await;
+    common::assert_request_too_large(&resp, message, "Content-Length");
+
+    // No length announced: refused once the byte past the limit is read.
+    let body = vec![b'x'; limit + 1];
+    let request = unterminated_chunked_ingest(&server, token, &body);
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    common::assert_request_too_large(&resp, message, "chunked");
+}
+
+/// A whole body past a small `[ingest] max_body_bytes`, sent complete in
+/// either framing, gets the envelope naming that setting.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_complete_body_over_the_limit_is_413_with_the_envelope() {
+    let server = common::setup_with_body_limits(common::BodyLimits {
+        max_request_body_bytes: 1024,
+        ingest_max_body_bytes: 1024,
+    })
+    .await;
+    let token = &server.ingest_token;
+    let body = "x".repeat(4 * 1024);
+    let message = "request body exceeds [ingest] max_body_bytes (1024 bytes)";
+
+    // The whole request, head and body, goes out in one write of under
+    // 8 KiB: trawld's first read takes all of it, so when it refuses and
+    // hangs up, nothing it left unread is in its socket. Its close is then
+    // a FIN, never a reset that could destroy the 413 before it is read.
+    let mut request =
+        ingest_head(&server, token, &format!("content-length: {}", body.len())).into_bytes();
+    request.extend_from_slice(body.as_bytes());
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    common::assert_request_too_large(&resp, message, "complete Content-Length body");
+
+    let mut request = unterminated_chunked_ingest(&server, token, body.as_bytes());
+    request.extend_from_slice(b"\r\n0\r\n\r\n");
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    common::assert_request_too_large(&resp, message, "complete chunked body");
+}
+
+/// The configured `[ingest] max_body_bytes` is the only bound on an ingest
+/// body: axum's own 2 MiB extractor limit, which would otherwise refuse a
+/// body well under the 16 MiB default, is off.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_body_past_axum_default_limit_is_accepted() {
+    let server = setup().await;
+    let line = format!(
+        "{{\"service\":\"big-body\",\"message\":\"{}\"}}\n",
+        "x".repeat(1000)
+    );
+    let events = 3 * 1024 * 1024 / line.len() + 1;
+    let body = line.repeat(events);
+    assert!(body.len() > 3 * 1024 * 1024);
+
+    let resp = raw_client()
+        .post(format!("{}/api/v1/ingest", server.url))
+        .header("authorization", format!("Bearer {}", server.ingest_token))
+        .header("content-type", "application/x-ndjson")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: trawl_api::IngestResponse = resp.json().await.unwrap();
+    assert_eq!((body.accepted, body.rejected), (events, 0));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_all_rejected_per_event() {
     let server = setup().await;

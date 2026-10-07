@@ -16,8 +16,8 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 
 use common::{
-    TestServer, roles, setup, setup_in_dir_with_ingest, setup_with_rate_limit,
-    setup_with_trusted_relays,
+    BodyLimits, TestServer, roles, setup, setup_in_dir_with_ingest, setup_with_body_limits,
+    setup_with_rate_limit, setup_with_trusted_relays,
 };
 use fleet_auth::{KeyStore, PrincipalKind};
 use serde_json::{Value, json};
@@ -69,6 +69,10 @@ fn preview_head(server: &TestServer, token: &str, framing: &str) -> String {
 fn announced_body(server: &TestServer, token: &str, length: usize) -> Vec<u8> {
     preview_head(server, token, &format!("content-length: {length}")).into_bytes()
 }
+
+/// The body limit's refusal message at the fixture's interactive limit.
+const INTERACTIVE_BODY_LIMIT_MESSAGE: &str =
+    "request body exceeds [server] max_request_body_bytes (131072 bytes)";
 
 /// A preview whose chunked body is `body` in one chunk and never ends: the
 /// limit is met only by reading it, and the server reads all of it before
@@ -592,12 +596,45 @@ async fn body_over_max_request_body_bytes_is_413() {
     // Refused on the announced length, before a body byte is read.
     let request = announced_body(&server, admin, body.len());
     let resp = common::raw_https_exchange(&server.url, &request).await;
-    assert_eq!(resp.status, 413, "Content-Length refusal");
+    common::assert_request_too_large(&resp, INTERACTIVE_BODY_LIMIT_MESSAGE, "Content-Length");
+    assert_raw_no_store(&resp, "Content-Length refusal");
 
     // No length announced: refused once the byte past the limit is read.
     let request = unterminated_chunked_body(&server, admin, body.as_bytes());
     let resp = common::raw_https_exchange(&server.url, &request).await;
-    assert_eq!(resp.status, 413, "streamed refusal");
+    common::assert_request_too_large(&resp, INTERACTIVE_BODY_LIMIT_MESSAGE, "chunked");
+    assert_raw_no_store(&resp, "streamed refusal");
+}
+
+/// A whole body past the limit, sent complete in either framing, gets the
+/// same envelope as the head-only and unterminated legs above.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_complete_body_over_the_limit_is_413_with_the_envelope() {
+    let server = setup_with_body_limits(BodyLimits {
+        max_request_body_bytes: 1024,
+        ingest_max_body_bytes: 1024,
+    })
+    .await;
+    let admin = &server.admin_token;
+    let body = "x".repeat(4 * 1024);
+    let message = "request body exceeds [server] max_request_body_bytes (1024 bytes)";
+
+    // The whole request, head and body, goes out in one write of under
+    // 8 KiB: trawld's first read takes all of it, so when it refuses and
+    // hangs up, nothing it left unread is in its socket. Its close is then
+    // a FIN, never a reset that could destroy the 413 before it is read.
+    let mut request =
+        preview_head(&server, admin, &format!("content-length: {}", body.len())).into_bytes();
+    request.extend_from_slice(body.as_bytes());
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    common::assert_request_too_large(&resp, message, "complete Content-Length body");
+    assert_raw_no_store(&resp, "complete Content-Length body");
+
+    let mut request = unterminated_chunked_body(&server, admin, body.as_bytes());
+    request.extend_from_slice(b"\r\n0\r\n\r\n");
+    let resp = common::raw_https_exchange(&server.url, &request).await;
+    common::assert_request_too_large(&resp, message, "complete chunked body");
+    assert_raw_no_store(&resp, "complete chunked body");
 }
 
 /// Lines of `{"service":"s"}`, `valid` of them, then `invalid` lines that
