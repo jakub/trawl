@@ -111,12 +111,14 @@ assert_mode() { # assert_mode <path> <octal>
   local actual
   actual="$(sudo stat -c %a "$1")"
   [[ "$actual" == "$2" ]] || fail "$1 mode is $actual, expected $2"
+  echo "mode $1 $2 ok"
 }
 
 assert_owner() { # assert_owner <path> <user>
   local actual
   actual="$(sudo stat -c %U "$1")"
   [[ "$actual" == "$2" ]] || fail "$1 owner is $actual, expected $2"
+  echo "owner $1 $2 ok"
 }
 
 assert_kind() { # assert_kind <path> <d|f>
@@ -148,13 +150,44 @@ has_parquet() {
 }
 
 signin_query_ready() {
-  python3 "$probe" signin-query "$scratch/human.token" 2> "$scratch/signin-query.stderr"
+  local output
+  if ! output="$(python3 "$probe" signin-query "$scratch/human.token" 2> "$scratch/signin-query.stderr")"; then
+    return 1
+  fi
+  [[ "$output" == 'ok signin-query' ]] || fail "sign-in probe did not print its ok token"
+  echo "browser sign-in and stored-event query ok"
 }
 
-probe_as() { # probe_as <user> <action> <args...>
+probe_ok() { # probe_ok <token> <log line> <command> [args...]
+  local expected="$1" label="$2" output
+  shift 2
+  if ! output="$("$@")"; then
+    fail "$label: probe failed"
+  fi
+  [[ "$output" == "$expected" ]] || fail "$label: probe did not print its ok token"
+  echo "$label"
+}
+
+run_probe_as() {
   local user="$1"
   shift
   (cd / && sudo -u "$user" python3 -I - "$@" < "$probe")
+}
+
+probe_as() { # probe_as <user> <action> <args...>
+  local user="$1" action="$2" path="$3" expected label
+  case "$action" in
+    deny-file|deny-list)
+      expected="ok $action EACCES"
+      label="deny $user $path: EACCES"
+      ;;
+    can-read)
+      expected='ok can-read'
+      label="read $user $path ok"
+      ;;
+    *) fail "unknown probe action" ;;
+  esac
+  probe_ok "$expected" "$label" run_probe_as "$@"
 }
 
 postgres_as() {
@@ -318,7 +351,8 @@ sudo -u trawl-web test -r /var/lib/trawl/tls/cert.pem || fail "trawl-web cannot 
 probe_as trawl-web can-read /var/lib/trawl/web.cookie
 probe_as trawl-web can-read /var/lib/trawl/tls/cert.pem
 
-python3 "$probe" ingest "$scratch/ingest.token" "$scratch/cert.pem"
+probe_ok 'ok ingest accepted=1' 'ingest accepted=1 ok' \
+  python3 "$probe" ingest "$scratch/ingest.token" "$scratch/cert.pem"
 wait_until "durable WAL file" 30 has_wal
 assert_kind "$wal" f
 assert_owner "$wal" trawl

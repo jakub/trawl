@@ -101,10 +101,13 @@ def main():
     action = sys.argv[1]
     if action == "ingest":
         ingest(sys.argv[2], sys.argv[3])
+        print("ok ingest accepted=1")
     elif action == "signin-query":
         signin_query(sys.argv[2])
+        print("ok signin-query")
     elif action in ("deny-file", "deny-list", "can-read"):
         access(action, sys.argv[2])
+        print("ok " + action + (" EACCES" if action.startswith("deny-") else ""))
     else:
         fail("unknown probe action")
 
