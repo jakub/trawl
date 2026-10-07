@@ -14,6 +14,7 @@ pub mod convert;
 pub mod parse;
 pub mod tcp;
 pub mod udp;
+pub mod zone;
 
 use std::net::IpAddr;
 use std::sync::Arc;

@@ -24,6 +24,7 @@ async-stream = { workspace = true }
 axum = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 clap = { workspace = true }
 # `trawld --doctor` computes the `SQLx` migrator's lock key as `SQLx` does,
 # with the same crate and version (sqlx-postgres 0.9.0 depends on it).
