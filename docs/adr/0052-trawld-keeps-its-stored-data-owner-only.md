@@ -29,3 +29,15 @@ A walk of the published v0.9.1 manual on a fresh Debian 13 host found every stor
 ## Consequences
 
 A backup agent must run as the trawl user or as root. Homelab volsync already runs its mover as uid 1000, the chart's trawld uid. The deployment guide's file table gives every row a mode and says which entries trawld creates at first start. The tarball section no longer asks the supervisor for a umask.
+
+## Amendment (2026-10-07)
+
+The implementation of #282 settled the rules the body left open.
+
+**Which roots trawld closes.** The data root on every node, ingest or query-only. On an ingest node, the WAL directory when it lies outside the data root. Outside means the WAL path is not a plain lexical descendant of the data root, and a path with a `..` component counts as outside. A WAL directory nested under the data root is covered by the root and is never chmodded. The repin siblings, `data.repin-next` and `data.repin-aside`, are closed when they exist. A query-only node whose root does not exist leaves it absent.
+
+**Only the final path component is held no-follow.** trawld opens the last component of each root with `O_NOFOLLOW` and judges and tightens through that handle. The directories above it are operator-trusted storage, as ADR-0041 rules, so a symlink among them is followed. A root whose final component is a symlink refuses, at boot and in the doctor. Boot followed it before. This is a deliberate change.
+
+**How trawld tightens.** It clears the group and other bits, `mode & !0o077`, through the handle, and keeps the owner bits and the setgid and sticky bits, which Kubernetes `fsGroup` sets. After the change it reads the mode again and refuses if any group or other bit survives, as on a filesystem that ignores `fchmod`. A root owned by another user refuses before any change, even when trawld runs as root.
+
+**The doctor predicts, boot decides.** `will_tighten` is a read-only prediction from the root's owner and mode, plus a read-only-filesystem check. Boot does not pre-judge the filesystem. Its `fchmod` is the authority, and its result is what refuses or serves.
