@@ -154,7 +154,8 @@ pub fn protected_roots(
 /// below it with `openat(O_DIRECTORY | O_NOFOLLOW)` from the directory
 /// before, and every directory on the way must sit on the data root's
 /// filesystem and, on Linux, in its mount. A symlink, a non-directory, a
-/// mount boundary or any failure ends the walk unproven, and the WAL
+/// mount boundary, a Linux kernel that does not name the mount, or any
+/// failure ends the walk unproven, and the WAL
 /// directory is then a root of its own: held no-follow at its final
 /// component and closed or refused like any other. Closing a directory the
 /// root already covered costs nothing; leaving one open would expose it.
@@ -165,6 +166,17 @@ pub fn protected_roots(
 /// as one still absent, proves nothing.
 #[must_use]
 pub fn data_root_covers_wal(data_root: &Path, wal_dir: &Path) -> bool {
+    covers_wal_with(data_root, wal_dir, Placement::of)
+}
+
+/// [`data_root_covers_wal`], reading each directory's placement with
+/// `placement`: [`Placement::of`] in production, and a stand-in in tests
+/// for a kernel that answers differently.
+fn covers_wal_with(
+    data_root: &Path,
+    wal_dir: &Path,
+    placement: impl Fn(BorrowedFd<'_>) -> io::Result<Placement>,
+) -> bool {
     let climbs = |path: &Path| path.components().any(|c| c == Component::ParentDir);
     if climbs(data_root) || climbs(wal_dir) {
         return false;
@@ -175,9 +187,12 @@ pub fn data_root_covers_wal(data_root: &Path, wal_dir: &Path) -> bool {
     let Ok(Observation::Directory(root)) = observe(data_root) else {
         return false;
     };
-    let Ok(home) = Placement::of(root.handle.as_fd()) else {
+    let Ok(home) = placement(root.handle.as_fd()) else {
         return false;
     };
+    if !home.names_its_mount() {
+        return false;
+    }
     let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let mut dir = root.handle;
     for component in below.components() {
@@ -185,7 +200,7 @@ pub fn data_root_covers_wal(data_root: &Path, wal_dir: &Path) -> bool {
             return false;
         };
         dir = match rustix::fs::openat(&dir, name, flags, Mode::empty()) {
-            Ok(next) if Placement::of(next.as_fd()).is_ok_and(|at| at == home) => File::from(next),
+            Ok(next) if placement(next.as_fd()).is_ok_and(|at| at == home) => File::from(next),
             Err(Errno::NOENT) => return true,
             Ok(_) | Err(_) => return false,
         };
@@ -203,9 +218,18 @@ struct Placement {
 }
 
 impl Placement {
+    /// Whether this placement can prove two directories share a mount. On
+    /// Linux it must name its mount: a bind mount keeps the device, so the
+    /// device alone cannot tell a directory in the data root's mount from a
+    /// mount of another directory on the same filesystem. Elsewhere the
+    /// platform names no mount, and the device is all there is.
+    const fn names_its_mount(self) -> bool {
+        !cfg!(any(target_os = "linux", target_os = "android")) || self.mount.is_some()
+    }
+
     /// The placement of the directory `fd` holds. The mount is read with
     /// `statx(STATX_MNT_ID)`, which a kernel before 5.8 does not answer;
-    /// the device alone then stands for it.
+    /// the mount is then unknown, and containment unproven.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
         use rustix::fs::{AtFlags, StatxFlags};
@@ -1161,6 +1185,29 @@ mod tests {
         assert!(!data_root_covers_wal(
             &at("x/../data"),
             &at("x/../data/wal")
+        ));
+    }
+
+    /// A kernel that does not answer `STATX_MNT_ID` (before 5.8) leaves a
+    /// bind mount indistinguishable from a plain directory by device, so a
+    /// WAL directory really nested in the data root is unproven there and
+    /// gets closed on its own.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn an_unknown_mount_id_leaves_wal_containment_unproven() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(data.join("spool/wal")).unwrap();
+        let wal = data.join("spool/wal");
+        assert!(covers_wal_with(&data, &wal, Placement::of), "a real kernel");
+
+        let without_mount_id =
+            |fd: BorrowedFd<'_>| Placement::of(fd).map(|at| Placement { mount: None, ..at });
+        assert!(!covers_wal_with(&data, &wal, without_mount_id));
+        assert!(!covers_wal_with(
+            &data,
+            &data.join("absent"),
+            without_mount_id
         ));
     }
 
