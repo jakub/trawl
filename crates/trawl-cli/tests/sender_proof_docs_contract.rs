@@ -18,11 +18,19 @@ use trawl_core::ast::{
     Expr, FieldFilter, FilterOp, FilterValue, PipeStage, Query, SearchToken, TimeUnit,
 };
 
-/// docs/scripts/release-pins.mjs owns the release placeholder grammar.
+/// Match the plugin's whitespace around version pairs. This source helper
+/// cannot distinguish code from prose; the docs build rejects prose pairs.
 fn development_page(raw: &str) -> String {
-    let page = raw
-        .replace(" --version {{release.version}}", "")
-        .replace("{{release.tag}}", "main");
+    const PAIR: &str = "--version {{release.version}}";
+    let mut rendered = String::with_capacity(raw.len());
+    let mut remaining = raw;
+    while let Some(offset) = remaining.find(PAIR) {
+        let (before, after) = remaining.split_at(offset);
+        rendered.push_str(before.trim_end_matches([' ', '\t']));
+        remaining = &after[PAIR.len()..];
+    }
+    rendered.push_str(remaining);
+    let page = rendered.replace("{{release.tag}}", "main");
     assert!(
         !page.contains("{{release."),
         "a release placeholder the docs plugin rejects"

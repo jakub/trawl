@@ -343,9 +343,11 @@ def run(tcp, suppress, tls="http"):
 def development_page(raw):
     """The page as a development docs build renders its release pins.
 
-    docs/scripts/release-pins.mjs owns the placeholder grammar.
+    Match the plugin's whitespace around version pairs. This source helper
+    cannot distinguish code from prose; the docs build rejects prose pairs.
     """
-    page = raw.replace(" --version {{release.version}}", "").replace("{{release.tag}}", "main")
+    page = re.sub(r"[ \t]*--version \{\{release\.version\}\}", "", raw)
+    page = page.replace("{{release.tag}}", "main")
     assert "{{release." not in page, "a release placeholder the docs plugin rejects"
     return page
 
