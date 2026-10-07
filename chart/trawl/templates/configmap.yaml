@@ -129,11 +129,21 @@ data:
     {{- if .Values.config.syslog.allowCidrs }}
     allow_cidrs = [{{ range $i, $cidr := .Values.config.syslog.allowCidrs }}{{ if $i }}, {{ end }}{{ $cidr | quote }}{{ end }}]
     {{- end }}
+    {{- if .Values.config.syslog.defaultTimezone }}
+    default_timezone = {{ .Values.config.syslog.defaultTimezone | quote }}
+    {{- end }}
     {{- if .Values.config.syslog.sourceServiceMap }}
 
     [syslog.source_service_map]
     {{- range $ip, $service := .Values.config.syslog.sourceServiceMap }}
     {{ $ip | quote }} = {{ $service | quote }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.config.syslog.senderTimezones }}
+
+    [syslog.sender_timezones]
+    {{- range $ip, $zone := .Values.config.syslog.senderTimezones }}
+    {{ $ip | quote }} = {{ $zone | quote }}
     {{- end }}
     {{- end }}
     {{- end }}

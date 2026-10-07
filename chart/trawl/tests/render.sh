@@ -369,6 +369,60 @@ assert_render_fails "an unknown httpRoute.backend without schema validation" \
   render_only httproute.yaml "${web_enabled[@]}" --set httpRoute.enabled=true \
   --set httpRoute.backend=api --skip-schema-validation
 
+# Syslog zones (ADR-0050). A values file, because --set splits dotted
+# and colon keys. default_timezone must land in [syslog] itself, before
+# any [syslog.*] subtable, so parse the rendered TOML as well as grep it.
+syslog_zones_values="$work_dir/syslog-zones-values.yaml"
+cat >"$syslog_zones_values" <<'EOF'
+config:
+  syslog:
+    enabled: true
+    defaultTimezone: America/Chicago
+    sourceServiceMap:
+      "10.0.0.1": unifi-gateway
+    senderTimezones:
+      "10.0.0.1": "+05:30"
+      "2001:db8::1": Europe/Warsaw
+EOF
+syslog_zones_config="$work_dir/syslog-zones-config.yaml"
+render_only configmap.yaml -f "$syslog_zones_values" >"$syslog_zones_config"
+for line in 'default_timezone = "America/Chicago"' '[syslog.sender_timezones]' \
+  '"2001:db8::1" = "Europe/Warsaw"' '"10.0.0.1" = "+05:30"'; do
+  if ! grep -Fq -- "$line" "$syslog_zones_config"; then
+    echo "expected the rendered [syslog] block to carry '${line}'" >&2
+    exit 1
+  fi
+done
+python3 - "$syslog_zones_config" <<'EOF'
+import sys
+import tomllib
+
+lines = open(sys.argv[1]).read().splitlines()
+start = lines.index("  trawld.toml: |") + 1
+body = []
+for line in lines[start:]:
+    if line and not line.startswith("    "):
+        break
+    body.append(line[4:])
+syslog = tomllib.loads("\n".join(body))["syslog"]
+expected = {
+    "default_timezone": "America/Chicago",
+    "sender_timezones": {"10.0.0.1": "+05:30", "2001:db8::1": "Europe/Warsaw"},
+    "source_service_map": {"10.0.0.1": "unifi-gateway"},
+}
+for key, value in expected.items():
+    if syslog.get(key) != value:
+        sys.exit(f"expected syslog.{key} = {value!r}, parsed {syslog.get(key)!r}")
+EOF
+
+# Unset zones render nothing, so trawld applies its UTC default.
+syslog_default_config="$work_dir/syslog-default-config.yaml"
+render_only configmap.yaml --set config.syslog.enabled=true >"$syslog_default_config"
+if grep -Eq 'default_timezone|sender_timezones' "$syslog_default_config"; then
+  echo "expected unset syslog zones to render no zone keys" >&2
+  exit 1
+fi
+
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"
