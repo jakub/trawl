@@ -22,7 +22,9 @@
 //! That refuses the open only when the file is *actually* reachable by
 //! group or other — an already-owner-only foreign file is as tight as
 //! this code would have made it, so it warns and continues rather than
-//! turning an opt-in debug feature into a boot failure.
+//! turning an opt-in debug feature into a boot failure. trawld's
+//! `server.log_file` opens through [`open_append_owner_only`] under the
+//! same rules (ADR-0052).
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -65,10 +67,26 @@ struct Inner {
     detached: bool,
 }
 
+/// The `event_type` of the warning a tolerated failed `chmod` on the
+/// query log logs.
+const QUERY_LOG_CHMOD_FAILED: &str = "query_log_chmod_failed";
+
 /// Open `path` for appending, owner-only on Unix (`0600` at creation,
 /// and a pre-existing looser file is tightened).
 fn open_owner_only(path: &Path) -> io::Result<File> {
-    open_owner_only_with(path, |opts| {
+    open_append_owner_only(path, QUERY_LOG_CHMOD_FAILED)
+}
+
+/// Open the log at `path` for appending, owner-only on Unix: `0600` at
+/// creation, a pre-existing looser file tightened, and a symlink at the
+/// final component refused. A `chmod` that fails refuses the open unless
+/// the file is already owner-only; then it warns, as `event_type`, and the
+/// open goes on (see the module docs).
+///
+/// # Errors
+/// The failed open, or a looser file that could not be tightened.
+pub fn open_append_owner_only(path: &Path, event_type: &'static str) -> io::Result<File> {
+    open_owner_only_with(path, event_type, |opts| {
         opts.create(true).append(true);
     })
 }
@@ -77,20 +95,26 @@ fn open_owner_only(path: &Path) -> io::Result<File> {
 /// makes the absent active path part of the atomic open: a regular file planted
 /// after the rename is refused just like any other reoccupation of the path.
 fn create_owner_only(path: &Path) -> io::Result<File> {
-    open_owner_only_with(path, |opts| {
+    open_owner_only_with(path, QUERY_LOG_CHMOD_FAILED, |opts| {
         opts.create_new(true).append(true);
     })
 }
 
-fn open_owner_only_with(path: &Path, configure: impl FnOnce(&mut OpenOptions)) -> io::Result<File> {
+fn open_owner_only_with(
+    path: &Path,
+    event_type: &'static str,
+    configure: impl FnOnce(&mut OpenOptions),
+) -> io::Result<File> {
     // The helper sets `0600` at creation and re-applies it to a
     // pre-existing looser file, handing back a failed `chmod` instead of
     // raising it — the tolerance below is this log's own policy.
     let (file, chmod_error) = trawl_config::fs::open_with_mode(path, 0o600, configure)?;
     #[cfg(unix)]
     if let Some(err) = chmod_error {
-        tolerate_chmod_failure(&file, path, &err)?;
+        tolerate_chmod_failure(&file, path, &err, event_type)?;
     }
+    #[cfg(not(unix))]
+    let _ = event_type;
     #[cfg(not(unix))]
     let _ = chmod_error;
     Ok(file)
@@ -108,7 +132,12 @@ fn chmod_failure_is_fatal(mode: Option<u32>) -> bool {
 /// tolerating the one failure that carries no exposure: a foreign-owned
 /// file that is already owner-only (see the module docs).
 #[cfg(unix)]
-fn tolerate_chmod_failure(file: &File, path: &Path, chmod_err: &io::Error) -> io::Result<()> {
+fn tolerate_chmod_failure(
+    file: &File,
+    path: &Path,
+    chmod_err: &io::Error,
+    event_type: &'static str,
+) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     let mode = file
         .metadata()
@@ -124,10 +153,10 @@ fn tolerate_chmod_failure(file: &File, path: &Path, chmod_err: &io::Error) -> io
         ));
     }
     tracing::warn!(
-        event_type = "query_log_chmod_failed",
+        event_type,
         path = %path.display(),
         error = %chmod_err,
-        "could not chmod query log to 0600 (not its owner?); the existing \
+        "could not chmod the log to 0600 (not its owner?); the existing \
          mode is already owner-only, continuing"
     );
     Ok(())

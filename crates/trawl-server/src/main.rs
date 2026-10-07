@@ -907,10 +907,10 @@ impl FileLog {
         if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        // Owner-only, like the query log: `0600` at creation, and a file an
+        // older trawld left looser is tightened (ADR-0052). It may sit
+        // outside every directory trawld or systemd closes.
+        let file = trawl_server::query_log::open_append_owner_only(&path, "log_file_chmod_failed")?;
         // Check the opened file too, before installing a writer that can
         // append bytes. This also detects existing hard-link aliases.
         #[cfg(unix)]

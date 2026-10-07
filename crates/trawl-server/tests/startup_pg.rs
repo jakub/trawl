@@ -2330,3 +2330,30 @@ async fn ac5_symlinked_data_root_refuses_the_start() {
     );
     fixture.assert_lock_free().await;
 }
+
+/// #282: a `server.log_file` an older trawld left at 0644, outside the
+/// state directory systemd closes, is tightened to 0600 when trawld opens
+/// it, and a restart keeps it there. The file is appended to, not
+/// replaced: its inode and earlier lines survive.
+#[tokio::test]
+async fn a_server_log_file_left_open_is_tightened_at_start() {
+    let mut fixture = Fixture::new().await;
+    let log_file = fixture.root.path().join("server.json");
+    fixture.log_file = Some(log_file.clone());
+    fixture.current_fleet().await;
+    std::fs::write(&log_file, b"{\"older\":\"trawld\"}\n").unwrap();
+    set_mode(&log_file, 0o644);
+    let inode = std::fs::metadata(&log_file).unwrap().ino();
+
+    for _ in 0..2 {
+        let mut daemon = fixture.spawn();
+        daemon.ready().await;
+        assert_mode(&log_file, 0o600);
+        daemon.stop().await;
+        fixture.assert_lock_free().await;
+    }
+    assert_eq!(std::fs::metadata(&log_file).unwrap().ino(), inode);
+    let log = std::fs::read_to_string(&log_file).unwrap();
+    assert!(log.starts_with("{\"older\":\"trawld\"}\n"), "{log}");
+    assert!(log.contains("HTTPS server listening"), "{log}");
+}
