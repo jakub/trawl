@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+use common::userns::Userns;
 use sqlx::{Connection as _, Executor as _, PgConnection, PgPool};
 use trawl_server::repin::marker::{RepinMarker, RepinPhase, write_marker};
 
@@ -33,6 +36,23 @@ struct Fixture {
     producers: bool,
     /// `[ingest] enabled`; false boots a query-only node.
     ingest: bool,
+    /// The umask the daemon inherits, set in its parent shell alone; the
+    /// test process keeps its own.
+    child_umask: Option<u32>,
+    /// Where the daemon's certificate comes from.
+    tls: Tls,
+    /// `[server] query_log`.
+    query_log: Option<PathBuf>,
+}
+
+/// The certificate a spawned daemon serves.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tls {
+    /// The shared test pair, named in `tls_cert_path` and `tls_key_path`.
+    Shared,
+    /// Neither path is set, so trawld generates its own pair under the
+    /// state directory.
+    Generated,
 }
 
 /// The file whose existence releases a boot pass held by
@@ -60,6 +80,9 @@ impl Fixture {
             crash_at: None,
             producers: false,
             ingest: true,
+            child_umask: None,
+            tls: Tls::Shared,
+            query_log: None,
         }
     }
 
@@ -69,6 +92,10 @@ impl Fixture {
 
     fn data(&self) -> PathBuf {
         self.storage_root().join("data")
+    }
+
+    fn wal(&self) -> PathBuf {
+        self.storage_root().join("wal")
     }
 
     async fn current_fleet(&self) {
@@ -180,23 +207,59 @@ impl Fixture {
     }
 
     fn spawn_with(&self, hold_boot_pass: bool) -> Daemon {
+        let trawld = env!("CARGO_BIN_EXE_trawld");
+        let command = match self.child_umask {
+            // `CommandExt::pre_exec` is unsafe, which the workspace forbids;
+            // a shell that sets the umask and execs trawld gives the daemon
+            // the same inherited mask.
+            Some(mask) => {
+                let mut command = Command::new("/bin/sh");
+                command
+                    .args(["-c", r#"umask "$1" && shift && exec "$@""#, "sh"])
+                    .arg(format!("{mask:03o}"))
+                    .arg(trawld);
+                command
+            }
+            None => Command::new(trawld),
+        };
+        self.launch(command, hold_boot_pass)
+    }
+
+    /// Spawn trawld as root inside an unprivileged user and mount namespace,
+    /// with `read_only` bind-mounted read-only (see [`Userns`]).
+    fn spawn_in_userns(&self, userns: &Userns, read_only: &Path) -> Daemon {
+        let mut command = userns.command(Some(read_only));
+        command.arg(env!("CARGO_BIN_EXE_trawld"));
+        self.launch(command, false)
+    }
+
+    /// Write the config and run `command`, which ends in the trawld binary,
+    /// with trawld's arguments appended.
+    fn launch(&self, mut command: Command, hold_boot_pass: bool) -> Daemon {
         let quote = |s: &str| toml::Value::String(s.to_owned()).to_string();
-        let (cert, key) = common::ensure_test_cert();
+        let tls = if self.tls == Tls::Generated {
+            String::new()
+        } else {
+            let (cert, key) = common::ensure_test_cert();
+            format!(
+                "tls_cert_path = {}\ntls_key_path = {}\n",
+                quote(&cert.to_string_lossy()),
+                quote(&key.to_string_lossy()),
+            )
+        };
         let config = format!(
             "[server]\nhttp_addr = '127.0.0.1:0'\nshutdown_drain_secs = 1\n\
-             tls_cert_path = {}\ntls_key_path = {}\n{log_file}\n\
+             {tls}{log_file}\n{query_log}\n\
              [data]\npath = {}\n[auth]\ndatabase_url = {}\naudit_interval_secs = 0\n\
              [storage]\ndatabase_url = {}\n\
              [ingest]\nenabled = {ingest}\ninternal_telemetry = {telemetry}\nwal_dir = {}\n\
              envs = ['prod']\ndefault_env = 'prod'\n{compaction}\
              [retention]\nmax_age_days = 0\nmin_free_disk_bytes = 0\n\
              [scheduler]\nenabled = {producers}\n{syslog}",
-            quote(&cert.to_string_lossy()),
-            quote(&key.to_string_lossy()),
             quote(&self.data().to_string_lossy()),
             quote(&self.fleet_url),
             quote(&self.app_url),
-            quote(&self.storage_root().join("wal").to_string_lossy()),
+            quote(&self.wal().to_string_lossy()),
             telemetry = self.internal_telemetry,
             ingest = self.ingest,
             producers = self.producers,
@@ -213,12 +276,14 @@ impl Fixture {
             log_file = self.log_file.as_ref().map_or_else(String::new, |path| {
                 format!("log_file = {}", quote(&path.to_string_lossy()))
             }),
+            query_log = self.query_log.as_ref().map_or_else(String::new, |path| {
+                format!("query_log = {}", quote(&path.to_string_lossy()))
+            }),
         );
         let path = self.root.path().join("trawld.toml");
         std::fs::write(&path, config).unwrap();
         let log = self.root.path().join("daemon.log");
         let output = std::fs::File::create(&log).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_trawld"));
         command.env_clear();
         for name in ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
             if let Some(value) = std::env::var_os(name) {
@@ -248,7 +313,14 @@ impl Fixture {
             .stderr(output)
             .spawn()
             .unwrap();
-        Daemon { child, log }
+        Daemon {
+            child,
+            log,
+            trusted_cert: self
+                .tls
+                .eq(&Tls::Generated)
+                .then(|| self.storage_root().join("tls/cert.pem")),
+        }
     }
 
     async fn assert_lock_free(&self) {
@@ -276,6 +348,9 @@ impl Fixture {
 struct Daemon {
     child: Child,
     log: PathBuf,
+    /// The certificate readiness trusts, when trawld generated its own;
+    /// otherwise the shared test pair's.
+    trusted_cert: Option<PathBuf>,
 }
 
 impl Drop for Daemon {
@@ -330,10 +405,9 @@ impl Daemon {
     async fn serving(&mut self, status: &str) -> String {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let client = common::harness_client_builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .unwrap();
+        // A generated certificate is published before the listener binds,
+        // so the client is built once the listening line is logged.
+        let mut client = None;
         loop {
             assert!(
                 self.child.try_wait().unwrap().is_none(),
@@ -353,6 +427,7 @@ impl Daemon {
                     .next()
                     .unwrap();
                 let url = format!("https://{addr}");
+                let client = client.get_or_insert_with(|| self.health_client());
                 if let Ok(response) = client.get(format!("{url}/api/v1/health")).send().await {
                     let body: serde_json::Value = response.json().await.unwrap();
                     if body["status"] == status {
@@ -363,6 +438,21 @@ impl Daemon {
             assert!(Instant::now() < deadline, "readiness timed out: {log}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// A client that trusts the certificate this daemon serves, with
+    /// certificate and hostname verification left on.
+    fn health_client(&self) -> reqwest::Client {
+        let builder = match &self.trusted_cert {
+            Some(path) => {
+                let pem =
+                    std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                reqwest::Client::builder()
+                    .add_root_certificate(reqwest::Certificate::from_pem(&pem).unwrap())
+            }
+            None => common::harness_client_builder(),
+        };
+        builder.timeout(Duration::from_secs(1)).build().unwrap()
     }
 
     /// Wait until the first compaction pass logs that it is held (see
@@ -1924,5 +2014,275 @@ async fn blocked_marker_at_boot_refuses_reads_until_resolved() {
         assert_eq!(parquet_count(&data, tag), events, "{tag} published once");
     }
     daemon.stop().await;
+    fixture.assert_lock_free().await;
+}
+
+// Stored data is owner-only (#282, ADR-0052). The daemon inherits a umask of
+// 000 where a test sets one, so every mode below is trawld's own doing.
+
+/// The group and other permission bits.
+const GROUP_OTHER: u32 = 0o077;
+
+/// The permission bits at `path`, not following a final symlink.
+fn mode_of(path: &Path) -> u32 {
+    std::fs::symlink_metadata(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .mode()
+        & 0o7777
+}
+
+fn assert_mode(path: &Path, want: u32) {
+    let got = mode_of(path);
+    assert_eq!(
+        got,
+        want,
+        "{}: mode {got:04o}, want {want:04o}",
+        path.display()
+    );
+}
+
+fn assert_owner_only(path: &Path) {
+    let got = mode_of(path);
+    assert_eq!(
+        got & GROUP_OTHER,
+        0,
+        "{}: mode {got:04o} carries group or other bits",
+        path.display()
+    );
+}
+
+fn set_mode(path: &Path, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// Every entry under `root`, `root` included, depth first.
+fn tree(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_owned()];
+    if std::fs::symlink_metadata(root).unwrap().is_dir() {
+        for entry in std::fs::read_dir(root).unwrap() {
+            paths.extend(tree(&entry.unwrap().path()));
+        }
+    }
+    paths
+}
+
+/// AC1 and AC2 (#282): started on a fresh, absent data root under an
+/// inherited umask of 000, trawld creates its storage owner-only. The data
+/// root, the WAL directory and its env directory are 0700; a durable WAL
+/// stage file, held by the boot pass before any compaction, and `EPOCH` are
+/// 0600; once the pass is released, the published Parquet is 0600 and its
+/// partition directories are owner-only. The explicitly moded paths keep
+/// their modes under trawld's umask: the generated `tls/` 0755 and
+/// `cert.pem` 0644, `tls-key/` 0700 and `key.pem` 0600, and the query debug
+/// log 0600. Nothing else under the state directory carries a group or
+/// other bit.
+#[tokio::test]
+async fn ac1_ac2_fresh_start_under_permissive_umask_stores_owner_only() {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.compaction_interval_secs = Some(3600);
+    fixture.child_umask = Some(0o000);
+    fixture.tls = Tls::Generated;
+    let query_log = fixture.root.path().join("query.ndjson");
+    fixture.query_log = Some(query_log.clone());
+    let token = writer_token(&fixture).await;
+    assert!(
+        !fixture.storage_root().exists(),
+        "the state dir starts absent"
+    );
+
+    let mut daemon = fixture.spawn_holding_boot_pass();
+    let client = client(&daemon.ready().await, &token);
+    daemon.held_at_boot_pass().await;
+    ingest(&client, &recent_time(), "owner-only", 1).await;
+    let [stage] = <[PathBuf; 1]>::try_from(wal_files(&fixture))
+        .unwrap_or_else(|files| panic!("one request, one WAL file: {files:?}"));
+
+    let storage = fixture.storage_root();
+    let data = fixture.data();
+    let wal = fixture.wal();
+    assert_mode(&storage, 0o700);
+    assert_mode(&data, 0o700);
+    assert_mode(&data.join("EPOCH"), 0o600);
+    assert_mode(&wal, 0o700);
+    assert_mode(&wal.join("prod"), 0o700);
+    assert_mode(&stage, 0o600);
+    // AC2: the explicitly moded paths.
+    assert_mode(&storage.join("tls"), 0o755);
+    assert_mode(&storage.join("tls/cert.pem"), 0o644);
+    assert_mode(&storage.join("tls-key"), 0o700);
+    assert_mode(&storage.join("tls-key/key.pem"), 0o600);
+    assert_mode(&query_log, 0o600);
+
+    fixture.release_boot_pass();
+    wait_for_drain(&fixture, "the released boot pass never published the WAL").await;
+    assert_eq!(parquet_count(&data, "owner-only"), 1);
+    let parquet: Vec<PathBuf> = tree(&data.join("prod"))
+        .into_iter()
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet"))
+        .collect();
+    assert!(!parquet.is_empty(), "nothing was published");
+    for file in &parquet {
+        assert_mode(file, 0o600);
+        for dir in file.ancestors().skip(1).take_while(|dir| *dir != data) {
+            assert_owner_only(dir);
+        }
+    }
+    let explicit = [storage.join("tls"), storage.join("tls/cert.pem")];
+    for path in tree(&storage) {
+        if !explicit.contains(&path) {
+            assert_owner_only(&path);
+        }
+    }
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
+}
+
+/// AC3 (#282): a data root and an out-of-root WAL directory left at 0755
+/// are closed to 0700 at start, through the handle, and nothing beneath
+/// them is chmodded: a valid `EPOCH` and a sentinel, both 0644, keep their
+/// mode, inode and bytes.
+#[tokio::test]
+async fn ac3_start_closes_open_roots_and_nothing_beneath_them() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let data = fixture.data();
+    let wal = fixture.wal();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::create_dir_all(&wal).unwrap();
+    let epoch = data.join("EPOCH");
+    let sentinel = data.join("sentinel");
+    std::fs::write(&epoch, b"3\n").unwrap();
+    std::fs::write(&sentinel, b"older trawld file\n").unwrap();
+    for (path, mode) in [
+        (&epoch, 0o644),
+        (&sentinel, 0o644),
+        (&data, 0o755),
+        (&wal, 0o755),
+    ] {
+        set_mode(path, mode);
+    }
+    let before = |path: &Path| {
+        (
+            std::fs::metadata(path).unwrap().ino(),
+            std::fs::read(path).unwrap(),
+        )
+    };
+    let (epoch_before, sentinel_before) = (before(&epoch), before(&sentinel));
+    let (data_ino, wal_ino) = (
+        std::fs::metadata(&data).unwrap().ino(),
+        std::fs::metadata(&wal).unwrap().ino(),
+    );
+
+    let mut daemon = fixture.spawn();
+    daemon.ready().await;
+    assert_mode(&data, 0o700);
+    assert_mode(&wal, 0o700);
+    assert_eq!(std::fs::metadata(&data).unwrap().ino(), data_ino);
+    assert_eq!(std::fs::metadata(&wal).unwrap().ino(), wal_ino);
+    assert_mode(&epoch, 0o644);
+    assert_mode(&sentinel, 0o644);
+    assert_eq!(
+        before(&epoch),
+        epoch_before,
+        "EPOCH kept its inode and bytes"
+    );
+    assert_eq!(
+        before(&sentinel),
+        sentinel_before,
+        "the sentinel kept its inode and bytes"
+    );
+    let log = daemon.log();
+    let closed: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("event_type=\"storage_root_closed\""))
+        .collect();
+    assert_eq!(closed.len(), 2, "both roots logged as closed: {log}");
+    for line in closed {
+        assert!(
+            line.contains("from=0755") && line.contains("to=0700"),
+            "{line}"
+        );
+    }
+    daemon.stop().await;
+    fixture.assert_lock_free().await;
+}
+
+/// AC4 (#282): a root trawld cannot close stops the start, with no
+/// privilege and no injected fault. In an unprivileged user and mount
+/// namespace, trawld runs as root and owns the 0755 data root, which is
+/// bind-mounted read-only, so the real `fchmod` fails with EROFS. trawld
+/// exits nonzero with the named error, giving the path, the owner, the
+/// octal mode and the fix, and never listens; the mode is unchanged and the
+/// sole-writer lock is free.
+#[tokio::test]
+async fn ac4_root_that_cannot_be_closed_refuses_the_start() {
+    let Some(userns) = Userns::for_test("ac4_root_that_cannot_be_closed_refuses_the_start") else {
+        return;
+    };
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let data = fixture.data();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("EPOCH"), b"3\n").unwrap();
+    set_mode(&data, 0o755);
+    let before = bytes(&data);
+
+    let mut daemon = fixture.spawn_in_userns(&userns, &data);
+    daemon.refused("on a read-only filesystem").await;
+    let log = daemon.log();
+    for needle in [
+        format!("data root {}", data.display()),
+        "owner uid 0".to_owned(),
+        "mode 0755".to_owned(),
+        "Refusing to start".to_owned(),
+        format!(
+            "Fix: mount it read-write, or run `chmod 0700 {}` before mounting it read-only",
+            data.display()
+        ),
+    ] {
+        assert!(log.contains(&needle), "{needle:?} missing from {log}");
+    }
+    assert_mode(&data, 0o755);
+    assert_eq!(
+        bytes(&data),
+        before,
+        "the refused start changed the data root"
+    );
+    fixture.assert_lock_free().await;
+}
+
+/// AC5 (#282): a data root that is a symlink is not followed. The start
+/// refuses with the symlink error and never listens; the 0755 target and
+/// its `EPOCH` are unchanged, the link is still a link, and the sole-writer
+/// lock is free.
+#[tokio::test]
+async fn ac5_symlinked_data_root_refuses_the_start() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let target = fixture.storage_root().join("real-data");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("EPOCH"), b"3\n").unwrap();
+    set_mode(&target, 0o755);
+    std::os::unix::fs::symlink(&target, fixture.data()).unwrap();
+    let before = bytes(&target);
+
+    let mut daemon = fixture.spawn();
+    daemon.refused("it is a symbolic link").await;
+    let log = daemon.log();
+    for needle in [
+        format!("data root {}", fixture.data().display()),
+        "Fix: point [data] path at the directory itself, not a symlink".to_owned(),
+    ] {
+        assert!(log.contains(&needle), "{needle:?} missing from {log}");
+    }
+    assert_mode(&target, 0o755);
+    assert_eq!(bytes(&target), before, "the link target changed");
+    assert!(
+        std::fs::symlink_metadata(fixture.data())
+            .unwrap()
+            .is_symlink(),
+        "the data root is still a link"
+    );
     fixture.assert_lock_free().await;
 }
