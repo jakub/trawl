@@ -807,11 +807,19 @@ ServiceMonitor creation; neither option installs a monitoring system.
    ```
 
    The generated self-signed certificate names only `localhost`, and
-   `trawl doctor --url` trusts only the system roots. On the host itself,
-   copy the certificate and pin it with `ca_cert`:
+   `trawl doctor --url` trusts only the system roots. Copy the certificate
+   and pin it with `ca_cert`. On Debian, copy it on the trawld host:
 
    ```bash
    sudo cat /var/lib/trawl/tls/cert.pem > ~/.config/trawl/prod-ca.pem
+   ```
+
+   On Helm, copy it out of the `trawld` container, then keep a port-forward
+   running in another terminal:
+
+   ```bash
+   kubectl -n trawl exec trawl-0 -c trawld -- cat /var/lib/trawl/tls/cert.pem > ~/.config/trawl/prod-ca.pem
+   kubectl -n trawl port-forward svc/trawl 5514:5514
    ```
 
    ```toml
@@ -830,8 +838,24 @@ ServiceMonitor creation; neither option installs a monitoring system.
 
    `--web-url` trusts the system roots only, because a browser opens that
    origin. See [Trust](/reference/cli/#trust) in the CLI reference. If your
-   proxy's certificate comes from a private CA, run the doctor on the trawld
-   host with `--web-url http://127.0.0.1:8090`, which `public_origins` lists.
+   proxy's certificate comes from a private CA, check `trawl-web` on a
+   loopback origin instead.
+
+   On Debian, run the doctor on the trawld host with
+   `--web-url http://127.0.0.1:8090`, which `public_origins` lists.
+
+   On Helm, add `http://localhost:8090` to `web.publicOrigins` and apply the
+   values with the `helm upgrade --install` command above. Then keep this
+   port-forward running in another terminal. It also forwards port 5514, so
+   stop any other port-forward of 5514 first:
+
+   ```bash
+   kubectl port-forward --namespace trawl svc/trawl 5514:5514 8090:8090
+   ```
+
+   Run the doctor on the same machine with `--web-url http://localhost:8090`.
+   Use `localhost` as written: `http://127.0.0.1:8090` is a different origin,
+   and the chart's `web.publicOrigins` does not list it.
 
    Expect `verdict: pass (exit 0)`.
    `api.health.duckdb`, `api.health.auth_db`, `api.health.storage_db`,
