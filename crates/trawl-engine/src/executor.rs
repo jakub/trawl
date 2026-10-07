@@ -288,6 +288,21 @@ pub fn spill_dir() -> std::path::PathBuf {
 /// Make a directory in [`spill_dir`] that only this process's user can
 /// enter, with a fresh random name.
 fn private_spill_dir() -> std::io::Result<tempfile::TempDir> {
+    private_dir_in(&spill_dir(), |_| Ok(()))
+}
+
+/// Make a private directory in `parent`, run `after_create` on it (tests
+/// stand in a filesystem that ignores the requested mode), then check it.
+///
+/// The directory is asked for at 0700, and a filesystem can still answer
+/// otherwise: a fixed-mode mount ignores the mode. So it is opened
+/// no-follow and its owner and mode are read from that handle: it must
+/// belong to this process's euid and carry no group or other bit, or it is
+/// refused and removed.
+fn private_dir_in(
+    parent: &Path,
+    after_create: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix("trawl-spill-");
     #[cfg(unix)]
@@ -295,7 +310,40 @@ fn private_spill_dir() -> std::io::Result<tempfile::TempDir> {
         use std::os::unix::fs::PermissionsExt as _;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    builder.tempdir_in(spill_dir())
+    let dir = builder.tempdir_in(parent)?;
+    after_create(dir.path())?;
+    #[cfg(unix)]
+    check_private(dir.path(), rustix::process::geteuid().as_raw())?;
+    Ok(dir)
+}
+
+/// Refuse the directory at `path` unless `euid` owns it and it has no group
+/// or other bit, read through a handle opened without following a symlink.
+#[cfg(unix)]
+fn check_private(path: &Path, euid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use rustix::fs::{Mode, OFlags};
+    /// The group and other permission bits.
+    const GROUP_OTHER: u32 = 0o077;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let handle = std::fs::File::from(rustix::fs::open(path, flags, Mode::empty())?);
+    let meta = handle.metadata()?;
+    let (owner, mode) = (meta.uid(), meta.mode() & 0o7777);
+    if owner == euid && mode & GROUP_OTHER == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "the query spill directory {} is not private to uid {euid}, the user \
+             trawld runs as (owner uid {}, mode {mode:04o}), so other users could \
+             read spilled query state; point TMPDIR at a directory on a \
+             filesystem that keeps Unix modes",
+            path.display(),
+            owner,
+        ),
+    ))
 }
 
 /// Query executor backed by an in-memory `DuckDB` connection.
@@ -318,7 +366,8 @@ impl Executor {
     /// filesystems), and pins the session time zone ([`Self::configure`]).
     ///
     /// The directory is made with a random name and mode 0700, never
-    /// reused. `DuckDB` opens its spill files by predictable names and
+    /// reused, and refused unless its handle shows it owner-only and owned
+    /// by this process's euid. `DuckDB` opens its spill files by predictable names and
     /// without `O_EXCL`, and the umask does not tighten a file that exists,
     /// so spilling into the shared temp dir would reuse a file another user
     /// planted, or one an older process left readable (ADR-0052). It is
@@ -2419,6 +2468,42 @@ fn an_executor_spills_into_a_private_directory_of_its_own() {
     assert!(dir.is_dir(), "the clone still holds it");
     drop(clone);
     assert!(!dir.exists(), "the last clone removed it");
+}
+
+/// A spill directory the filesystem leaves open, as a fixed-mode mount
+/// does whatever mode was asked for, is refused and removed rather than
+/// handed to `DuckDB` (ADR-0052).
+#[cfg(unix)]
+#[test]
+fn a_spill_directory_left_open_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let parent = tempfile::tempdir().expect("parent");
+    let mut made = None;
+    let error = private_dir_in(parent.path(), |dir| {
+        made = Some(dir.to_owned());
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+    })
+    .expect_err("a 0755 spill directory");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    let text = error.to_string();
+    assert!(text.contains("mode 0755"), "{text}");
+    assert!(text.contains("TMPDIR"), "{text}");
+    assert!(
+        !made.expect("created").exists(),
+        "the refused directory is removed"
+    );
+}
+
+/// A spill directory another user owns is refused whatever its mode.
+#[cfg(unix)]
+#[test]
+fn a_spill_directory_another_user_owns_is_refused() {
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = private_dir_in(parent.path(), |_| Ok(())).expect("private");
+    let euid = rustix::process::geteuid().as_raw();
+    check_private(dir.path(), euid).expect("its own");
+    let error = check_private(dir.path(), euid.wrapping_add(1)).expect_err("another uid");
+    assert!(error.to_string().contains("mode 0700"), "{error}");
 }
 
 /// The message of the bucket-type refusal `dsl` earns, or a panic
