@@ -16,6 +16,8 @@ indexmap = { workspace = true }
 parquet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Each database's private spill directory (`Executor::new`).
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -25,7 +27,6 @@ tracing = { workspace = true }
 # independent of the test-support hook.
 trawl-engine = { path = ".", default-features = false, features = ["test-support"] }
 insta = { workspace = true }
-tempfile = { workspace = true }
 
 [features]
 # Exposes `executor::prepare_probe`, the count of statements handed to

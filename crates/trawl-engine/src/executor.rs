@@ -274,38 +274,70 @@ impl Cancellable<'_> {
     }
 }
 
-/// The directory `DuckDB` spills query state into.
+/// The directory `DuckDB` spills query state under: the system temp dir.
 ///
-/// The one source of that path: [`Executor::new`] points every connection
-/// at it, and the server's headroom measurement stats the filesystem under
-/// it (ADR-0042), so the two can never name different directories.
+/// The one source of that path: [`Executor::new`] makes each database's
+/// private spill directory in it, and the server's headroom measurement
+/// stats the filesystem under it (ADR-0042). A directory made in it is on
+/// its filesystem, so the two can never measure different devices.
 #[must_use]
 pub fn spill_dir() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
+/// Make a directory in [`spill_dir`] that only this process's user can
+/// enter, with a fresh random name.
+fn private_spill_dir() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("trawl-spill-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir_in(spill_dir())
+}
+
 /// Query executor backed by an in-memory `DuckDB` connection.
 #[derive(Debug)]
 pub struct Executor {
+    // Declared first, so it drops first: `DuckDB` closes and removes its
+    // spill files before the directory holding them goes.
     conn: Connection,
+    /// The database's private spill directory, shared with every clone
+    /// and removed when the last of them drops.
+    spill: Arc<tempfile::TempDir>,
 }
 
 impl Executor {
     /// Create a new executor with an in-memory `DuckDB` connection.
     ///
-    /// Sets `temp_directory` to [`spill_dir`], the system temp dir, so
-    /// `DuckDB` can spill to disk even when the process working directory
-    /// is read-only (e.g. container overlay filesystems), and pins the
-    /// session time zone ([`Self::configure`]).
+    /// Points `temp_directory` at a private directory made for this
+    /// database in [`spill_dir`], so `DuckDB` can spill to disk even when
+    /// the process working directory is read-only (e.g. container overlay
+    /// filesystems), and pins the session time zone ([`Self::configure`]).
+    ///
+    /// The directory is made with a random name and mode 0700, never
+    /// reused. `DuckDB` opens its spill files by predictable names and
+    /// without `O_EXCL`, and the umask does not tighten a file that exists,
+    /// so spilling into the shared temp dir would reuse a file another user
+    /// planted, or one an older process left readable (ADR-0052). It is
+    /// removed when the last executor sharing this database drops. A process
+    /// that exits without dropping it, as on a wedged shutdown, leaves the
+    /// empty directory behind; `DuckDB` deletes its own files when the
+    /// database closes.
     pub fn new() -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
-        let tmp = spill_dir();
+        let spill = private_spill_dir()?;
         conn.execute_batch(&format!(
             "SET temp_directory='{}'",
-            tmp.to_string_lossy().replace('\'', "''")
+            spill.path().to_string_lossy().replace('\'', "''")
         ))?;
         Self::configure(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            spill: Arc::new(spill),
+        })
     }
 
     /// Create a new executor sharing the same underlying database.
@@ -320,7 +352,10 @@ impl Executor {
     pub fn try_clone(&self) -> Result<Self, EngineError> {
         let conn = self.conn.try_clone()?;
         Self::configure(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            spill: Arc::clone(&self.spill),
+        })
     }
 
     /// Pin the settings a query's answer depends on: currently the session
@@ -2338,6 +2373,52 @@ fn timechart_fixture(dir: &tempfile::TempDir) -> String {
         ))
         .expect("fixture writes");
     path
+}
+
+/// The directory `DuckDB` spills `exec`'s database into, as it reads it.
+#[cfg(test)]
+fn temp_directory(exec: &Executor) -> std::path::PathBuf {
+    exec.conn
+        .query_row("SELECT current_setting('temp_directory')", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("temp_directory")
+        .into()
+}
+
+/// A query spills into a directory only this process's user can enter,
+/// made for its database: `DuckDB` opens its spill files by predictable
+/// names without `O_EXCL`, so a shared temp directory would let another
+/// user plant or read one (ADR-0052). The directory sits in [`spill_dir`],
+/// on the filesystem the headroom measurement stats (ADR-0042). A clone
+/// shares its database and so its directory, which goes when the last of
+/// them does.
+#[cfg(unix)]
+#[test]
+fn an_executor_spills_into_a_private_directory_of_its_own() {
+    use std::os::unix::fs::MetadataExt as _;
+    let me = tempfile::tempfile()
+        .expect("probe file")
+        .metadata()
+        .unwrap()
+        .uid();
+    let exec = Executor::new().expect("executor");
+    let dir = temp_directory(&exec);
+    let meta = std::fs::symlink_metadata(&dir).expect("the spill directory exists");
+    assert!(meta.is_dir(), "{}", dir.display());
+    assert_eq!(meta.mode() & 0o7777, 0o700, "{}", dir.display());
+    assert_eq!(meta.uid(), me, "{}", dir.display());
+    assert_ne!(dir, spill_dir(), "not the shared temp directory itself");
+    assert_eq!(dir.parent(), Some(spill_dir().as_path()));
+
+    let clone = exec.try_clone().expect("clone");
+    assert_eq!(temp_directory(&clone), dir, "a clone shares the directory");
+    let other = Executor::new().expect("a second executor");
+    assert_ne!(temp_directory(&other), dir, "another database has its own");
+    drop(exec);
+    assert!(dir.is_dir(), "the clone still holds it");
+    drop(clone);
+    assert!(!dir.exists(), "the last clone removed it");
 }
 
 /// The message of the bucket-type refusal `dsl` earns, or a panic
