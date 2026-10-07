@@ -72,6 +72,16 @@ struct Cli {
 const RUNTIME_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Stored data is owner-only (ADR-0052). Setting the umask here, first,
+    // puts it ahead of every file and thread trawld's own code creates: the
+    // crash-dump monitor re-execs into this line, the runtime's workers are
+    // built below, and DuckDB's `COPY ... TO` Parquet takes `0666 & !umask`
+    // with no other creation-time control. It is never restored. It cannot
+    // reach work a linked library does in a constructor before `main`. Paths
+    // whose modes must differ (`tls/`, `cert.pem`, the query log, `cores/`)
+    // set them explicitly, and the check modes create nothing.
+    #[cfg(unix)]
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     // Inspect only arguments before choosing the seal. The monitor re-exec
     // carries no arguments, so it always reaches normal crash-dump init.
     // Both paths seal before config reads or threads. Check mode must not

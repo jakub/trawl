@@ -76,9 +76,11 @@ metrics-process = { workspace = true }
 # `ingest::no_follow` opens WAL files and markers with `O_NOFOLLOW |
 # O_NONBLOCK` on every Unix host. The Linux-only paths (the `statx` mount
 # root) take the same `fs` feature. `process` for `geteuid`: trawld's
-# generated TLS directories must be its own. `trawld --doctor` reads its
-# files and checks access (`accessat`) through the same `fs` feature, and
-# names the user it ran as through nix's `user` feature (`getpwuid_r`).
+# generated TLS directories must be its own; with `fs` it also gives
+# `umask`, which trawld sets to 077 first thing (ADR-0052). `trawld
+# --doctor` reads its files and checks access (`accessat`) through the same
+# `fs` feature, and names the user it ran as through nix's `user` feature
+# (`getpwuid_r`).
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["process"] }
 nix = { workspace = true }
