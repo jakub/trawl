@@ -30,7 +30,7 @@ A walk of the published v0.9.1 manual on a fresh Debian 13 host found every stor
 
 A backup agent must run as the trawl user or as root. Homelab volsync already runs its mover as uid 1000, the chart's trawld uid. The deployment guide's file table gives every row a mode and says which entries trawld creates at first start. The tarball section no longer asks the supervisor for a umask.
 
-## Amendment (2026-10-07)
+## Amendment (2026-10-06)
 
 The implementation of #282 settled the rules the body left open.
 
