@@ -13,13 +13,33 @@
 //! group, environment file and `--config`, the Helm sidecar's container name
 //! and `--config`, and the trial's web configuration path.
 
+use std::sync::LazyLock;
 use trawl_api::doctor::{Outcome, Verdict, reason};
 use trawl_web::doctor::WebCheck;
 use trawl_web::doctor::output::HealthKey;
 
-const CONFIGURATION: &str =
-    include_str!("../../../docs/src/content/docs/reference/configuration.md");
-const DEPLOYMENT: &str = include_str!("../../../docs/src/content/docs/operate/deployment.md");
+/// docs/scripts/release-pins.mjs owns the release placeholder grammar.
+fn development_page(raw: &str) -> String {
+    let page = raw
+        .replace(" --version {{release.version}}", "")
+        .replace("{{release.tag}}", "main");
+    assert!(
+        !page.contains("{{release."),
+        "a release placeholder the docs plugin rejects"
+    );
+    page
+}
+
+static CONFIGURATION: LazyLock<String> = LazyLock::new(|| {
+    development_page(include_str!(
+        "../../../docs/src/content/docs/reference/configuration.md"
+    ))
+});
+static DEPLOYMENT: LazyLock<String> = LazyLock::new(|| {
+    development_page(include_str!(
+        "../../../docs/src/content/docs/operate/deployment.md"
+    ))
+});
 
 const DEBIAN_UNIT: &str = include_str!("../../trawl-server/debian/trawl-web.service");
 const HELM_STATEFULSET: &str = include_str!("../../../chart/trawl/templates/statefulset.yaml");
@@ -53,7 +73,7 @@ fn section(page: &'static str, heading: &str) -> &'static str {
 /// The section headed "Check the web proxy with `trawl-web --doctor`".
 fn doctor_section() -> &'static str {
     section(
-        CONFIGURATION,
+        &CONFIGURATION,
         "### Check the web proxy with `trawl-web --doctor`",
     )
 }
@@ -144,7 +164,7 @@ fn exit_codes_zero_to_three_are_documented() {
 
 #[test]
 fn the_deployment_guide_gives_each_channel_its_command() {
-    let verify = section(DEPLOYMENT, "## Verify the installation");
+    let verify = section(&DEPLOYMENT, "## Verify the installation");
     for command in [DEBIAN_COMMAND, HELM_COMMAND, TRIAL_COMMAND] {
         assert!(
             verify.lines().any(|line| line.trim() == command),

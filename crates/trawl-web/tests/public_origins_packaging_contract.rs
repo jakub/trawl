@@ -42,9 +42,27 @@ fn repo_root() -> PathBuf {
         .expect("the workspace root must exist relative to the crate")
 }
 
+/// docs/scripts/release-pins.mjs owns the release placeholder grammar.
+fn development_page(raw: &str) -> String {
+    let page = raw
+        .replace(" --version {{release.version}}", "")
+        .replace("{{release.tag}}", "main");
+    assert!(
+        !page.contains("{{release."),
+        "a release placeholder the docs plugin rejects"
+    );
+    page
+}
+
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    if relative.starts_with("docs/src/content/docs/") {
+        development_page(&raw)
+    } else {
+        raw
+    }
 }
 
 /// The double-quoted strings of a TOML array literal, in order.
