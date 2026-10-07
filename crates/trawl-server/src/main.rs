@@ -694,17 +694,7 @@ fn close_storage_roots(
     let euid = rustix::process::geteuid().as_raw();
     let closed = owner_only::close(&roots, euid, owner_only::fchmod).map_err(|e| e.to_string())?;
     for (root, closed) in roots.iter().zip(closed) {
-        if let owner_only::Closed::Tightened { from, to } = closed {
-            tracing::warn!(
-                event_type = "storage_root_closed",
-                root = %root.kind,
-                path = %root.path.display(),
-                from = format_args!("{from:04o}"),
-                to = format_args!("{to:04o}"),
-                "storage root was readable by other users; closed it to its owner \
-                 (files beneath it keep their modes and are unreachable to others)"
-            );
-        }
+        owner_only::log_closed(root, closed);
     }
     Ok(())
 }

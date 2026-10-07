@@ -35,8 +35,13 @@
 //! and so does one whose change the filesystem accepts and then ignores,
 //! as a CIFS or FUSE mount with fixed modes does.
 //!
-//! [`close`] is boot's, and the only function here that changes anything.
-//! The doctor calls [`predict`], which also reads whether a root that needs
+//! A repin creates its shadow and aside roots while trawld serves, after
+//! boot's close. [`close_created`] closes each as soon as it exists, before
+//! anything is linked, written or renamed into it, and a refusal stops the
+//! repin.
+//!
+//! [`close`] and [`close_created`] are the only functions here that change
+//! anything, and the doctor calls neither. The doctor calls [`predict`], which also reads whether a root that needs
 //! closing sits on a read-only mount. That is a prediction: boot's chmod is
 //! authoritative, and an immutable attribute or a security module can still
 //! refuse a root the doctor expected to close.
@@ -484,6 +489,61 @@ where
         .collect()
 }
 
+/// Close a root trawld has just created, for a trawld running as its own
+/// euid, and log it if it had to be tightened.
+///
+/// A repin calls this right after it creates its shadow or aside root,
+/// before anything enters it. The umask makes a new directory owner-only
+/// unless a fixed-mode mount or a default ACL on the parent overrides it,
+/// so the new root goes through the same close as one boot found. A root
+/// that is gone again, or is no longer a directory, refuses too: something
+/// replaced it after its creation.
+///
+/// # Errors
+/// The root cannot be kept owner-only, as an [`OwnerOnlyError`].
+pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> {
+    let root = ProtectedRoot {
+        kind,
+        path: path.to_owned(),
+    };
+    let euid = rustix::process::geteuid().as_raw();
+    let closed = close(std::slice::from_ref(&root), euid, fchmod)?;
+    match closed.as_slice() {
+        [Closed::Absent] => Err(OwnerOnlyError::new(
+            &root,
+            None,
+            euid,
+            Cause::Inspect(Errno::NOENT.into()),
+        )),
+        [Closed::NotDirectory] => Err(OwnerOnlyError::new(
+            &root,
+            None,
+            euid,
+            Cause::Inspect(Errno::NOTDIR.into()),
+        )),
+        [closed] => {
+            log_closed(&root, *closed);
+            Ok(())
+        }
+        _ => unreachable!("one root closed, one result"),
+    }
+}
+
+/// Log a root [`close`] had to tighten, so the operator learns it was open.
+pub fn log_closed(root: &ProtectedRoot, closed: Closed) {
+    if let Closed::Tightened { from, to } = closed {
+        tracing::warn!(
+            event_type = "storage_root_closed",
+            root = %root.kind,
+            path = %root.path.display(),
+            from = format_args!("{from:04o}"),
+            to = format_args!("{to:04o}"),
+            "storage root was readable by other users; closed it to its owner \
+             (files beneath it keep their modes and are unreachable to others)"
+        );
+    }
+}
+
 /// Remove `dir`'s group and other bits through its handle, then read the
 /// mode back and refuse if any survived.
 fn tighten<F>(
@@ -687,6 +747,34 @@ impl std::error::Error for OwnerOnlyError {
             }
         }
     }
+}
+
+/// Give `dir` a default ACL of `u::rwx,g::r-x,o::r-x`, so a directory
+/// created in it is 0755 whatever the umask: the real-filesystem stand-in
+/// for a mount whose modes trawld's umask does not decide.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn inherit_0755(dir: &Path) {
+    const USER_OBJ: u16 = 0x01;
+    const GROUP_OBJ: u16 = 0x04;
+    const OTHER: u16 = 0x20;
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    for (tag, perm) in [(USER_OBJ, 7_u16), (GROUP_OBJ, 5), (OTHER, 5)] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(perm.to_le_bytes());
+        acl.extend(u32::MAX.to_le_bytes());
+    }
+    rustix::fs::setxattr(
+        dir,
+        "system.posix_acl_default",
+        &acl,
+        rustix::fs::XattrFlags::empty(),
+    )
+    .expect("the test filesystem must support default ACLs");
+    let probe = dir.join("probe");
+    std::fs::create_dir(&probe).unwrap();
+    let mode = std::fs::symlink_metadata(&probe).unwrap().mode() & PERMISSION_BITS;
+    assert_eq!(mode, 0o755, "the default ACL decides the mode");
+    std::fs::remove_dir(&probe).unwrap();
 }
 
 #[cfg(test)]
