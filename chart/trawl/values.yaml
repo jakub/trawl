@@ -279,7 +279,9 @@ tls:
 # -- Fleet-auth PostgreSQL keystore
 # API keys and roles live in an external database shared across Fleet apps.
 # An existing Secret supplies DATABASE_URL to fleet-admin in the init-auth
-# container and FLEET_DATABASE_URL to trawld. The chart never renders the
+# container and FLEET_DATABASE_URL to trawld. The trawld container also gets
+# DATABASE_URL, for an operator's in-pod fleet-admin; trawld itself never
+# reads it. The chart never renders the
 # connection string into the ConfigMap. Provision the database
 # using https://trawl.sh/operate/deployment/#provision-the-databases and create keys
 # using https://trawl.sh/operate/access/#create-roles-and-keys.

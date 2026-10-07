@@ -131,6 +131,42 @@ assert_security_context_lines() {
   fi
 }
 
+# The Secret name and key one container's env var reads, as name/key, or
+# nothing when the container does not set it. Scoped like
+# container_security_context: the container's entry, then its env block, then
+# the variable's entry up to the next one.
+env_secret_ref() {
+  local manifest=$1
+  local container=$2
+  local var=$3
+  awk -v want="        - name: ${container}" -v var="            - name: ${var}" '
+    $0 == want { inside = 1; next }
+    inside && (/^        - name: / || /^      [^ ]/) { inside = 0 }
+    !inside { in_env = 0 }
+    inside && $0 == "          env:" { in_env = 1; next }
+    in_env && /^          [^ ]/ { in_env = 0 }
+    !in_env { in_var = 0 }
+    in_env && $0 == var { in_var = 1; next }
+    in_var && /^            - / { in_var = 0 }
+    in_var && /^                  name: / { name = $2 }
+    in_var && /^                  key: / { key = $2 }
+    END { if (name != "" || key != "") print name "/" key }
+  ' "$manifest"
+}
+
+assert_env_secret_ref() {
+  local expected=$1
+  local manifest=$2
+  local container=$3
+  local var=$4
+  local actual
+  actual=$(env_secret_ref "$manifest" "$container" "$var")
+  if [[ $actual != "$expected" ]]; then
+    echo "expected ${container} ${var} to read '${expected:-nothing}', found '${actual:-nothing}'" >&2
+    exit 1
+  fi
+}
+
 # The pod-level securityContext of a rendered StatefulSet: its six-space
 # key, up to the next six-space key.
 assert_pod_seccomp_runtime_default() {
@@ -270,6 +306,31 @@ render "${web_enabled[@]}" \
   --set-string 'web.publicOrigins[1]=http://localhost:8090' >"$origins_sts"
 assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
   "value: \"${web_origin},http://localhost:8090\"" "$origins_sts"
+
+# -- ADR-0004: trawld reads FLEET_DATABASE_URL; fleet-admin reads DATABASE_URL --
+
+# Both names in the trawld container read the one Secret key, so the access
+# guide's fleet-admin commands run in that container. trawl-web gets no DSN.
+# Any key name works, and the variables do not depend on the init container.
+for case in default custom no-init-auth; do
+  dsn="$work_dir/dsn-${case}.yaml"
+  key=DATABASE_URL
+  extra=()
+  case $case in
+    custom) key=fleet-dsn; extra=(--set-string auth.database.existingSecretKey=fleet-dsn) ;;
+    no-init-auth) extra=(--set initAuth.enabled=false) ;;
+  esac
+  render "${web_enabled[@]}" "${extra[@]}" >"$dsn"
+  assert_env_secret_ref "fleet-db/${key}" "$dsn" trawld FLEET_DATABASE_URL
+  assert_env_secret_ref "fleet-db/${key}" "$dsn" trawld DATABASE_URL
+  assert_env_secret_ref "" "$dsn" trawl-web FLEET_DATABASE_URL
+  assert_env_secret_ref "" "$dsn" trawl-web DATABASE_URL
+  if [[ $case == no-init-auth ]]; then
+    assert_name_count 0 init-auth "$dsn"
+  else
+    assert_env_secret_ref "fleet-db/${key}" "$dsn" init-auth DATABASE_URL
+  fi
+done
 
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"

@@ -70,6 +70,20 @@ class InstallNotes(unittest.TestCase):
         self.assertNotIn("Open http", notes)
         self.assertNotIn("Configured browser origins", notes)
 
+    def test_fleet_admin_runs_in_the_rendered_trawld_pod(self):
+        for settings in ({"fullnameOverride": "logs"}, {"initAuth.enabled": "false"}):
+            with self.subTest(settings=settings):
+                notes, manifest = render(**settings)
+                statefulset = next(
+                    doc for doc in manifest.split("\n---") if "\nkind: StatefulSet\n" in doc
+                )
+                name = re.search(r"\nmetadata:\n  name: (\S+)", statefulset)[1]
+                self.assertIn("\n        - name: trawld\n", statefulset)
+                self.assertIn(
+                    f"kubectl exec --namespace example -i {name}-0 -c trawld -- "
+                    "fleet-admin roles list", notes,
+                )
+
     def test_tls_instructions_match_selected_mode(self):
         notes, _ = render()
         self.assertIn("generates a self-signed certificate", notes)
