@@ -29,21 +29,44 @@ before pasting the commands.
 Both packages depend on the exact matching `trawl-runtime` package, which owns
 the shared DuckDB library. APT installs it automatically.
 
-```bash
-curl -fsSL https://trawl.sh/gpg.key \
-  | sudo gpg --dearmor -o /usr/share/keyrings/trawl.gpg
-echo "deb [signed-by=/usr/share/keyrings/trawl.gpg] https://trawl.sh/apt stable main" \
-  | sudo tee /etc/apt/sources.list.d/trawl.list
-sudo apt update
-sudo apt install trawl-cli trawl-server
-trawl --version
-```
+1. Download the repository's signing key and print its fingerprint. A stock
+   Debian cloud image has no `gpg`, so install it first:
+
+   ```bash
+   sudo apt-get install -y curl gpg
+   curl -fsSL https://trawl.sh/gpg.key -o trawl.asc
+   gpg --show-keys --with-fingerprint trawl.asc
+   ```
+
+   Compare the fingerprint with this one. If it differs, stop and do not
+   install the key:
+
+   ```text
+   B0A5 9AF7 3CB2 A188 0E99  74FA 8D80 8761 AF51 151E
+   ```
+
+2. Install the key, add the repository, and install the packages:
+
+   ```bash
+   sudo install -m 0644 trawl.asc /usr/share/keyrings/trawl.asc
+   echo "deb [signed-by=/usr/share/keyrings/trawl.asc] https://trawl.sh/apt stable main" \
+     | sudo tee /etc/apt/sources.list.d/trawl.list
+   sudo apt update
+   sudo apt install trawl-cli trawl-server
+   trawl --version
+   ```
+
+   APT reads the armored `.asc` key as it is, so the key needs no
+   conversion.
 
 Expect `trawl`, the version, and the build details. A client-only machine
 needs `trawl-cli` alone. The package writes `/etc/trawl/trawld.toml` and
-installs the `trawld` and `trawl-web` units disabled and stopped. Set the
-`[auth]` and `[storage]` database URLs as the
-[deployment guide](/operate/deployment/) shows, then start both services:
+installs the `trawld` and `trawl-web` units disabled and stopped.
+[Provision the databases](/operate/deployment/#provision-the-databases), then
+put their DSNs in `/etc/default/trawld` as `FLEET_DATABASE_URL` and
+`TRAWL_DATABASE_URL`, as
+[Install the Debian package](/operate/deployment/#install-the-debian-package)
+shows. Then start both services:
 
 ```bash
 sudo systemctl enable --now trawld trawl-web
@@ -57,8 +80,9 @@ loads the file when `trawld` writes it, with no restart. To use your own
 certificate, see
 [Configure TLS](/operate/access/#configure-tls).
 
-`trawl-web` listens on `127.0.0.1:8090` by default, so browser access from
-other machines needs a TLS-terminating reverse proxy and a public origin.
+`trawl-web` listens on `127.0.0.1:8090` by default. For browsers on other
+machines, [put trawl-web behind a reverse proxy](/operate/deployment/#put-trawl-web-behind-a-reverse-proxy)
+and add its origin to `public_origins`.
 
 ## Install from a GitHub release tarball
 

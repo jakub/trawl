@@ -12,9 +12,18 @@ per app-state database and data directory, and plan
 ## Provision the databases
 
 Every install path needs both databases. They can share one PostgreSQL server,
-but they are separate databases with separate owners.
+but they are separate databases with separate owners. Trawl is tested with
+PostgreSQL 17, the version Debian 13 installs, and with PostgreSQL 18.
 
-1. As a PostgreSQL superuser, create the owners and databases in `psql`:
+1. Open `psql` as a PostgreSQL superuser. On a Debian host with no PostgreSQL
+   server yet, install one first:
+
+   ```bash
+   sudo apt install postgresql
+   sudo -u postgres psql
+   ```
+
+2. In `psql`, create the owners and databases:
 
    ```sql
    CREATE ROLE fleet LOGIN;
@@ -23,12 +32,20 @@ but they are separate databases with separate owners.
    CREATE DATABASE trawl OWNER trawl;
    ```
 
-2. Set a password for each owner with `\password fleet` and `\password trawl`.
+3. Set a password for each owner with `\password fleet` and `\password trawl`.
    If another Fleet application already has a `fleet` database, reuse it and
    skip its two statements.
 
-3. Apply the Fleet schema. `fleet-admin` reads the Fleet DSN from
-   `DATABASE_URL`, and `read` keeps the password out of your shell history:
+   Each password goes into a DSN, which is a URL. Use letters and digits
+   only, such as the output of `openssl rand -hex 24`. In a DSN, write each
+   `@`, `:`, `/`, `?`, `#`, or `%` in a password percent-encoded: `@` is
+   `%40`, `:` is `%3A`, `/` is `%2F`, `?` is `%3F`, `#` is `%23`, and `%` is
+   `%25`.
+
+4. Apply the Fleet schema. On Helm, skip this step: the `init-auth` init
+   container runs `fleet-admin migrate` on every pod start. `fleet-admin`
+   reads the Fleet DSN from `DATABASE_URL`, and `read` keeps the password out
+   of your shell history:
 
    ```bash
    read -r -s -p 'Fleet DSN: ' DATABASE_URL && export DATABASE_URL
@@ -109,14 +126,17 @@ APT repository from [Installation](/getting-started/).
    path = "/var/lib/trawl/data"
 
    [web]
-   public_origins = ["https://trawl.example.com"]
+   public_origins = ["https://trawl.example.com", "http://127.0.0.1:8090"]
    cookie_secret_path = "/var/lib/trawl/web.cookie"
    ```
 
    `public_origins` lists the origin a browser shows, scheme and port
-   included. The packaged default allows `http://127.0.0.1:8090` and
-   `http://localhost:8090` for a browser on the same host. See
-   [Set the browser origin](/operate/access/#set-the-browser-origin).
+   included. `https://trawl.example.com` is the origin of the
+   [reverse proxy](#put-trawl-web-behind-a-reverse-proxy) in front of
+   `trawl-web`. Keep `http://127.0.0.1:8090`, so that `trawl doctor` can check
+   `trawl-web` from the host. The packaged default allows
+   `http://127.0.0.1:8090` and `http://localhost:8090` for a browser on the
+   same host. See [Set the browser origin](/operate/access/#set-the-browser-origin).
 
    Mount storage at `/var/lib/trawl`, not at `/var/lib/trawl/data`. A repin
    writes a sibling directory next to `data/` on the same filesystem.
@@ -169,9 +189,94 @@ and `tls/cert.pem`. It reaches stored events only through trawld's API.
 | `/usr/lib/sysusers.d/trawl.conf`, `/usr/lib/tmpfiles.d/trawl.conf` | root:root 0644 | Create user `trawl` and user `trawl-web`, a member of group `trawl`, and reapply the modes of `cores` and `web.cookie` at every boot. |
 | `/usr/share/doc/trawl-server/examples/crashdump.conf` | root:root 0644 | Optional systemd drop-in that enables crash dumps. |
 
+## Put trawl-web behind a reverse proxy
+
+`trawl-web` listens on `127.0.0.1:8090` over HTTP. Browsers on other machines
+reach it through a reverse proxy that terminates TLS. This recipe uses nginx
+on the Debian host. Any proxy that keeps the `Origin` header and does not
+buffer responses also works, such as Caddy. On Helm, the chart's ingress
+takes this place.
+
+1. Install nginx:
+
+   ```bash
+   sudo apt install nginx
+   ```
+
+2. Put a certificate for the browser's host name, with its full chain, at
+   `/etc/ssl/trawl/fullchain.pem`, and its key at
+   `/etc/ssl/trawl/privkey.pem`. Make the key readable by root only.
+
+3. Write `/etc/nginx/conf.d/trawl.conf`:
+
+   ```nginx
+   server {
+       listen 443 ssl;
+       listen [::]:443 ssl;
+       server_name trawl.example.com;
+
+       ssl_certificate /etc/ssl/trawl/fullchain.pem;
+       ssl_certificate_key /etc/ssl/trawl/privkey.pem;
+
+       location / {
+           proxy_pass http://127.0.0.1:8090;
+           proxy_http_version 1.1;
+           proxy_set_header Connection "";
+           proxy_set_header Host $host;
+           proxy_buffering off;
+           proxy_read_timeout 60s;
+       }
+   }
+
+   server {
+       listen 80;
+       listen [::]:80;
+       server_name trawl.example.com;
+       return 301 https://$host$request_uri;
+   }
+   ```
+
+   The file works with nginx 1.22, the version in Debian 12, and later. It
+   does not turn on HTTP/2, because the `http2` directive needs nginx 1.25.1.
+
+4. Check the configuration and load it:
+
+   ```bash
+   sudo nginx -t
+   sudo systemctl reload nginx
+   ```
+
+5. Add the proxy's origin to `[web] public_origins` in
+   `/etc/trawl/trawld.toml`, then restart `trawl-web`:
+
+   ```toml
+   [web]
+   public_origins = ["https://trawl.example.com", "http://127.0.0.1:8090"]
+   ```
+
+   ```bash
+   sudo systemctl restart trawl-web
+   ```
+
+   The origin is the URL the browser shows, with no path.
+
+The recipe depends on three settings:
+
+- **`Origin` passes through unchanged.** nginx forwards the browser's
+  `Origin` header by default. Never set it with `proxy_set_header`.
+  `trawl-web` compares the whole header with `public_origins`, and ignores
+  `Host` and `X-Forwarded-*`. A request whose `Origin` is not in the list
+  gets 403.
+- **Buffering is off.** Live tail and the dashboard use server-sent events.
+  With `proxy_buffering off`, nginx sends each event when it arrives.
+  `trawl-web` also sends `X-Accel-Buffering: no` on those responses.
+- **The read timeout is longer than the keepalive.** trawld sends a keepalive
+  on an idle event stream every 15 seconds. A `proxy_read_timeout` of 60
+  seconds keeps a quiet stream open.
+
 ## Install with Helm
 
-You need Kubernetes 1.26 or later, Helm 3, a StorageClass that provides
+You need Kubernetes 1.26 or later, Helm 3 or later, a StorageClass that provides
 `ReadWriteOnce` volumes, and the two databases above, reachable from the
 cluster.
 
@@ -220,7 +325,7 @@ cluster.
    The ingress targets the `trawl-web` sidecar on port 8090. Bearer-token
    clients and Vector need trawld's port 5514 instead: in-cluster at
    `https://trawl.trawl.svc.cluster.local:5514`, or outside through a second
-   ingress with `ingress.backend: trawld`. The [chart README](https://github.com/jakub/trawl/blob/main/chart/trawl/README.md)
+   ingress with `ingress.backend: trawld`. The [chart README](https://github.com/jakub/trawl/blob/{{release.tag}}/chart/trawl/README.md)
    lists every value.
 
    Before installation, supply the browser ingress Secret named
@@ -260,8 +365,12 @@ cluster.
 
    ```bash
    helm upgrade --install trawl oci://ghcr.io/jakub/charts/trawl \
-     --namespace trawl -f trawl-values.yaml
+     --namespace trawl -f trawl-values.yaml --version {{release.version}}
    ```
+
+   The manual for a release pins the chart to that release with `--version`.
+   The development manual leaves `--version` out, so Helm installs the newest
+   published chart.
 
    The `init-auth` init container runs `fleet-admin migrate` on every pod
    start. `trawld` migrates the app-state database when it starts.
@@ -544,7 +653,7 @@ nothing else. You supply what the package supplies:
 - A supervisor that runs `trawld --config /etc/trawl/trawld.toml --no-monitor`
   as `trawl` and `trawl-web --config /etc/trawl/trawld.toml` as `trawl-web`.
   Start from the packaged units in
-  [`crates/trawl-server/debian/`](https://github.com/jakub/trawl/tree/main/crates/trawl-server/debian).
+  [`crates/trawl-server/debian/`](https://github.com/jakub/trawl/tree/{{release.tag}}/crates/trawl-server/debian).
   The supervisor needs no umask setting. trawld sets its own umask to 077
   before it creates a file.
 - A `TMPDIR` that keeps Unix modes, or none, which means `/tmp`. The query
@@ -715,8 +824,12 @@ ServiceMonitor creation; neither option installs a monitoring system.
    trawl doctor -p prod --web-url https://trawl.example.com
    ```
 
-   On the host with the packaged `public_origins`, use
-   `--web-url http://127.0.0.1:8090`. Expect `verdict: pass (exit 0)`.
+   `--web-url` trusts the system roots only, because a browser opens that
+   origin. See [Trust](/reference/cli/#trust) in the CLI reference. If your
+   proxy's certificate comes from a private CA, run the doctor on the trawld
+   host with `--web-url http://127.0.0.1:8090`, which `public_origins` lists.
+
+   Expect `verdict: pass (exit 0)`.
    `api.health.duckdb`, `api.health.auth_db`, `api.health.storage_db`,
    `api.health.data_path`, and `api.health.ingest_capacity` are `complete`.
    `api.identity` is `complete` and shows the key's name, kind, and
@@ -746,8 +859,50 @@ ServiceMonitor creation; neither option installs a monitoring system.
 
    Expect rows with `service` = `trawld`. Internal telemetry is on by default,
    so the daemon's own events appear before any sender connects.
+   [Query your own installation](#query-your-own-installation) has more
+   queries over those events.
 
 7. If the browser UI is enabled, open the origin and log in with the human
    key. The search page loads.
 
 If a step fails, continue with [Check health and stalled work](/operate/health/).
+
+## Query your own installation
+
+trawld records its own events, so a new server has data to query before any
+sender connects. These queries use the `prod` profile from
+[Verify the installation](#verify-the-installation). They filter on
+`service=trawld _producer=trawld`, because only trawld stamps
+`_producer=trawld`. See [Check health and stalled work](/operate/health/).
+Each query covers the last day. If trawld last started more than a day ago,
+widen `last=1d`.
+
+1. List the steps of trawld's startup:
+
+   ```bash
+   trawl -p prod query 'service=trawld _producer=trawld event_type=lifecycle last=1d | table _time, message'
+   ```
+
+   Expect one row per step, such as `starting trawld`,
+   `internal telemetry enabled`, and `HTTPS server listening`. Each restart
+   adds another set.
+
+2. Count trawld's events by severity:
+
+   ```bash
+   trawl -p prod query 'service=trawld _producer=trawld last=1d | stats count() by _severity'
+   ```
+
+   `_severity` is the OpenTelemetry severity number: 9 is info, 13 is warn,
+   and 17 is error. A server that uses its generated certificate logs warn
+   events that say so.
+
+3. Read trawld's messages with their severity:
+
+   ```bash
+   trawl -p prod query 'service=trawld _producer=trawld last=1d | head 20 | table _time, _severity, message'
+   ```
+
+   You see up to 20 events. To run the same query in the browser, type it in
+   the search box. [Build a query](/use/query-tutorial/) adds filters,
+   columns, and summaries.
