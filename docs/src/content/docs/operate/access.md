@@ -13,6 +13,21 @@ from `DATABASE_URL`, which is separate from the daemon's `FLEET_DATABASE_URL`.
 
 ## Create roles and keys
 
+On a Helm install, run each `fleet-admin` command inside the trawld container,
+which holds `DATABASE_URL`. Put `kubectl exec` in front of it. For a release
+named `trawl`:
+
+```bash
+kubectl -n NAMESPACE exec -i trawl-0 -c trawld -- fleet-admin roles list
+(umask 077
+ kubectl -n NAMESPACE exec -i trawl-0 -c trawld -- \
+   fleet-admin keys create --name alice --kind human --role trawl-reader > alice.token)
+```
+
+The redirect runs on your machine, so the token file is written there. Do not
+add `-t` to `keys create`, because a terminal mixes standard error into the
+token file. A command that asks `[y/N]` needs `-it`, or `--yes`.
+
 1. List the existing roles. A new Fleet database has none:
 
    ```bash
