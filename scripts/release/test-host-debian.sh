@@ -64,7 +64,7 @@ expect_state enabled inactive "upgrade over enabled units"
 #    stored files. CI checks out only scripts/release, so use packaged binaries.
 umask 077
 scratch="$(mktemp -d)"
-probe="$(dirname "${BASH_SOURCE[0]}")/host-debian-probe.py"
+probe="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host-debian-probe.py"
 
 on_exit() {
   local status=$? path
@@ -89,14 +89,21 @@ on_exit() {
 }
 trap on_exit EXIT
 
-wait_until() { # wait_until <label> <seconds> <predicate> [args...]
-  local label="$1" seconds="$2" deadline
+wait_until() { # wait_until <label> <seconds> [--error-file <path>] <predicate> [args...]
+  local label="$1" seconds="$2" deadline error_file=""
   shift 2
+  if [[ "${1:-}" == --error-file ]]; then
+    error_file="$2"
+    shift 2
+  fi
   deadline=$((SECONDS + seconds))
   while (( SECONDS < deadline )); do
     if "$@"; then return 0; fi
     sleep 1
   done
+  if [[ -n "$error_file" && -s "$error_file" ]]; then
+    fail "$label timed out after ${seconds}s: $(tail -n 1 "$error_file")"
+  fi
   fail "$label timed out after ${seconds}s"
 }
 
@@ -141,7 +148,7 @@ has_parquet() {
 }
 
 signin_query_ready() {
-  python3 "$probe" signin-query "$scratch/human.token" 2>/dev/null
+  python3 "$probe" signin-query "$scratch/human.token" 2> "$scratch/signin-query.stderr"
 }
 
 probe_as() { # probe_as <user> <action> <args...>
@@ -337,7 +344,7 @@ for user in nobody trawl-web; do
 done
 assert_file_blocks_web "$parquet"
 probe_as trawl can-read "$parquet"
-wait_until "browser sign-in and stored-event query" 60 signin_query_ready
+wait_until "browser sign-in and stored-event query" 60 --error-file "$scratch/signin-query.stderr" signin_query_ready
 
 # 4. Simulate an old installation, then exercise the package's running-unit
 #    upgrade path. A world-readable sentinel proves no recursive chmod ran.
@@ -399,7 +406,7 @@ done
 probe_as trawl can-read "$sentinel"
 sudo systemctl start trawl-web
 wait_until "trawl-web health after upgrade" 60 web_healthy
-wait_until "browser sign-in and query after upgrade" 60 signin_query_ready
+wait_until "browser sign-in and query after upgrade" 60 --error-file "$scratch/signin-query.stderr" signin_query_ready
 echo "host owner-only storage assertions passed"
 
 # 5. Purge removes the units and every enable or mask link.
