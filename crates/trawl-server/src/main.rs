@@ -266,6 +266,12 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             e
         })?,
     );
+    // The syslog peer settings resolve on the same boundary and under the
+    // contract `--check-config` and the doctor run (ADR-0050), whether or
+    // not the listener is enabled, so a fault there never waits for the
+    // day someone turns syslog on.
+    let syslog_peers = trawl_server::syslog::SyslogPeers::resolve(&config.syslog)
+        .inspect_err(|e| eprintln!("[trawld] {e} — refusing to start"))?;
 
     let Tracing {
         telemetry,
@@ -448,16 +454,13 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         });
         let handles = trawl_server::syslog::spawn_syslog(
             &config.syslog,
+            &syslog_peers,
             door,
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
             std::time::Duration::from_secs(config.ingest.compaction_interval_secs),
             state.ingest.syslog_stats.clone(),
             shutdown_rx,
-        )
-        .map_err(|e| {
-            tracing::error!(event_type = "config_error", error = %e, "syslog config rejected — refusing to start");
-            e
-        })?;
+        );
         tracing::info!(
             event_type = "lifecycle",
             udp = config.syslog.udp_enabled,

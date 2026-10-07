@@ -278,9 +278,9 @@ pub struct IngestState {
 
 /// Parse `[ingest] trusted_relays` CIDRs, boot-fatally.
 ///
-/// Deliberately not the syslog `parse_cidrs` warn-skip: a skipped relay
-/// CIDR would fail open, peer-repairing host-less events from that relay
-/// where the operator configured a reject.
+/// Like the syslog `allow_cidrs`, a malformed entry refuses the list: a
+/// skipped relay CIDR would fail open, peer-repairing host-less events from
+/// that relay where the operator configured a reject.
 fn parse_trusted_relays(
     cidrs: &[String],
 ) -> Result<Arc<[crate::syslog::CidrEntry]>, crate::error::ServerError> {

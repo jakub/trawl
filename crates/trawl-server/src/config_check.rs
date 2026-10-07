@@ -10,6 +10,11 @@
 //! opens the log, and `trawld --doctor` runs [`check_loaded`] on a file it
 //! read through its own bounded reader, so the three agree on what a valid
 //! configuration is.
+//!
+//! After the file parses, [`check_loaded`] checks `server.log_file`, the
+//! Fleet and app-state database URLs, the ingest derivation settings and
+//! the syslog peer settings (zones, peer-keyed maps and `allow_cidrs`), the
+//! last two through the same resolvers boot runs.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +48,9 @@ pub enum LoadedFault {
     AppUrl(ConfigError),
     /// The ingest derivation settings do not resolve.
     Ingest,
+    /// The syslog peer settings do not resolve, whether or not the
+    /// listener is enabled.
+    Syslog(crate::syslog::SyslogPeerFault),
 }
 
 impl std::fmt::Display for LoadedFault {
@@ -53,6 +61,7 @@ impl std::fmt::Display for LoadedFault {
             Self::Ingest => {
                 f.write_str("invalid setting at ingest: check severity_from and time_from")
             }
+            Self::Syslog(fault) => fault.fmt(f),
         }
     }
 }
@@ -75,6 +84,7 @@ pub fn check_loaded(config: &Config) -> Result<(), LoadedFault> {
         .map_err(LoadedFault::AppUrl)?;
     crate::ingest::producer::Derivation::resolve(&config.ingest)
         .map_err(|_| LoadedFault::Ingest)?;
+    crate::syslog::SyslogPeers::resolve(&config.syslog).map_err(LoadedFault::Syslog)?;
     Ok(())
 }
 

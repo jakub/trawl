@@ -9,7 +9,9 @@
 //! instant. Nothing here reads the host's zone: the IANA rules are
 //! compiled in through chrono-tz, so every host gives the same answer.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
 
 use chrono::{DateTime, FixedOffset, LocalResult, NaiveDateTime, TimeZone, Utc};
@@ -82,6 +84,42 @@ impl SyslogZone {
             Self::Fixed(offset) => resolve_in(&offset, wall, arrival),
             Self::Iana(tz) => resolve_in(&tz, wall, arrival),
         }
+    }
+}
+
+/// The zone each syslog peer's zone-less timestamps are read in: the
+/// peer's `sender_timezones` entry, else `default_timezone`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyslogZones {
+    default: SyslogZone,
+    /// Keyed by the canonical peer address's spelling, folded like
+    /// `source_service_map`.
+    by_peer: HashMap<String, SyslogZone>,
+}
+
+impl SyslogZones {
+    /// `by_peer` must already be folded to canonical peer spellings.
+    #[must_use]
+    pub fn new(default: SyslogZone, by_peer: HashMap<String, SyslogZone>) -> Self {
+        Self { default, by_peer }
+    }
+
+    /// The zone for a transport peer, canonicalized by the listener. The
+    /// frame's hostname never takes part, and neither does
+    /// `trusted_relays`: a relay's entry covers everything it forwards.
+    #[must_use]
+    pub fn for_peer(&self, peer: IpAddr) -> SyslogZone {
+        self.by_peer
+            .get(&peer.to_string())
+            .copied()
+            .unwrap_or(self.default)
+    }
+}
+
+impl Default for SyslogZones {
+    /// Every peer in UTC: the unset configuration.
+    fn default() -> Self {
+        Self::new(SyslogZone::UTC, HashMap::new())
     }
 }
 

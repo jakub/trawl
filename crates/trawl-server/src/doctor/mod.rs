@@ -750,7 +750,24 @@ fn loaded_fault(fault: &LoadedFault, explain: &Text) -> Row {
         LoadedFault::Ingest => {
             Row::failed(check, "the ingest settings do not resolve").next(explain.clone())
         }
+        LoadedFault::Syslog(fault) => Row::failed(check, "the syslog settings do not resolve")
+            .detail(syslog_fault_text(*fault))
+            .next(explain.clone()),
     }
+}
+
+/// A syslog peer fault as the doctor shows it: the setting path, the
+/// `allow_cidrs` index when there is one, and the reason. All three are
+/// static or numeric, so no configured value can reach the report.
+fn syslog_fault_text(fault: crate::syslog::SyslogPeerFault) -> Text {
+    let mut text = Text::new(fault.setting());
+    if let Some(index) = fault.index() {
+        text = text
+            .lit("[")
+            .int(u64::try_from(index).unwrap_or(u64::MAX))
+            .lit("]");
+    }
+    text.lit(": ").lit(fault.reason())
 }
 
 /// `server.identity`: the effective uid and, when the password database
@@ -1290,6 +1307,49 @@ mod tests {
         assert_ne!(thread, here, "the parse ran on the doctor's thread");
         assert_eq!(given, "[data]\npath = \"~/data\"\n");
         drop(release);
+    }
+
+    /// A syslog peer fault fails `server.config` with the setting path and
+    /// the reason, never the value, even with the listener disabled
+    /// (ADR-0050, ADR-0047).
+    #[tokio::test]
+    async fn server_config_fails_on_syslog_peer_faults_without_the_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = "[server]\n[data]\npath = \"/data\"\n\
+                    [auth]\ndatabase_url = \"postgres://u@127.0.0.1:1/fleet\"\n\
+                    [storage]\ndatabase_url = \"postgres://u@127.0.0.1:1/trawl\"\n\
+                    [syslog]\nenabled = false\n";
+        for (syslog, detail) in [
+            (
+                "default_timezone = \"Sentinel/Q7x\"\n",
+                "syslog.default_timezone: not UTC, an IANA zone name, or a ±HH:MM offset",
+            ),
+            (
+                "allow_cidrs = [\"10.0.0.0/8\", \"10.0.0.0/8\", \"sentinel-q7x\"]\n",
+                "syslog.allow_cidrs[2]: not an IP address or CIDR",
+            ),
+            (
+                "[syslog.source_service_map]\n\"198.51.100.7\" = \"svc-q7x-a\"\n\
+                 \"::ffff:198.51.100.7\" = \"svc-q7x-b\"\n",
+                "syslog.source_service_map: two keys name one peer with different services",
+            ),
+        ] {
+            let path = dir.path().join("trawld.toml");
+            std::fs::write(&path, format!("{base}{syslog}")).unwrap();
+            let path = path.to_str().expect("a UTF-8 temporary path").to_owned();
+            let (row, _) = config_row(&path, tilde_path, Config::from_toml).await;
+            assert_eq!(
+                row,
+                (
+                    Outcome::Failed,
+                    Some("the syslog settings do not resolve".to_owned()),
+                    Some(detail.to_owned())
+                )
+            );
+            let shown = format!("{row:?}");
+            assert!(!shown.contains("q7x") && !shown.contains("Q7x"), "{shown}");
+            assert!(!shown.contains("198.51"), "{shown}");
+        }
     }
 
     /// A `server.log_file` refusal is `failed` only when it proves the
