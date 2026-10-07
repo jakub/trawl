@@ -5,6 +5,7 @@
 //! HTTP handler for the `POST /api/v1/ingest` endpoint.
 
 use std::borrow::Cow;
+use std::future::{self, Future};
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
@@ -14,8 +15,9 @@ use std::sync::Arc;
 use axum::Extension;
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{FromRequestParts, State};
 use axum::http::HeaderMap;
+use axum::http::request::Parts;
 use fleet_auth::VerifiedKey;
 use indexmap::IndexMap;
 
@@ -159,6 +161,56 @@ impl ParsedEvents {
     }
 }
 
+/// The caller's key, holding `Permission::Ingest`.
+///
+/// A parts extractor because axum runs those before the body extractor:
+/// a key without the grant is refused on its request head, before trawld
+/// collects up to `[ingest] max_body_bytes` it would discard. Extractors
+/// run inside the router's layers, so the rate limiter still sees the
+/// request first. The refusal is a [`ServerError`] like any the handler
+/// returns, so it keeps the envelope, and `failure::mark_handler`, which
+/// runs before every extractor, still classifies it as the handler's.
+pub struct IngestKey(VerifiedKey);
+
+// `VerifiedKey` has no `Debug`, so neither does the key here.
+impl std::fmt::Debug for IngestKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IngestKey").finish_non_exhaustive()
+    }
+}
+
+impl<S: Sync> FromRequestParts<S> for IngestKey {
+    type Rejection = ServerError;
+
+    // Not `async fn`: nothing here awaits.
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        future::ready(ingest_key(parts))
+    }
+}
+
+impl IngestKey {
+    /// Admit `verified` to ingest, or refuse it with a 403.
+    pub fn new(verified: VerifiedKey) -> Result<Self, ServerError> {
+        if !verified.has_permission(Permission::Ingest) {
+            return Err(ServerError::Forbidden("insufficient permissions".into()));
+        }
+        Ok(Self(verified))
+    }
+}
+
+fn ingest_key(parts: &Parts) -> Result<IngestKey, ServerError> {
+    // The bearer layer inserts the key on every request it lets through.
+    let verified = parts
+        .extensions
+        .get::<VerifiedKey>()
+        .cloned()
+        .ok_or_else(|| ServerError::Internal("ingest route without a verified key".into()))?;
+    IngestKey::new(verified)
+}
+
 /// `POST /api/v1/ingest` — accept ndjson events into the WAL.
 ///
 /// Expects `Content-Type: application/x-ndjson` (or `application/json`).
@@ -186,15 +238,11 @@ impl ParsedEvents {
 /// reservation is released.
 pub async fn ingest(
     State(state): State<AppState>,
-    Extension(verified): Extension<VerifiedKey>,
+    IngestKey(verified): IngestKey,
     Extension(peer_addr): Extension<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<IngestResponse>, ServerError> {
-    if !verified.has_permission(Permission::Ingest) {
-        return Err(ServerError::Forbidden("insufficient permissions".into()));
-    }
-
     let pipeline = state
         .ingest
         .pipeline

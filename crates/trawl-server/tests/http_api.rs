@@ -1984,6 +1984,32 @@ fn unterminated_chunked_ingest(server: &common::TestServer, token: &str, body: &
     request
 }
 
+/// A trawl-granted key without `ingest` is refused on its request head:
+/// trawld answers the 403 without waiting for a body it would discard.
+/// Only the head goes out, announcing 1 MiB, so a server that read the
+/// body first would wait forever and fail the bound here.
+///
+/// No control for a key that holds `ingest`: that server must wait for the
+/// body, and a test can only show waiting by timing out on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_without_the_grant_is_403_before_the_body_arrives() {
+    let server = setup().await;
+    let request = ingest_head(&server, &server.analyst_token, "content-length: 1048576");
+
+    let resp = tokio::time::timeout(
+        Duration::from_secs(10),
+        common::raw_https_exchange(&server.url, request.as_bytes()),
+    )
+    .await
+    .expect("the 403 arrives without the body");
+
+    assert_eq!(resp.status, 403);
+    assert_eq!(resp.header("content-type"), Some("application/json"));
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+    assert_eq!(body["error"]["code"], "forbidden", "{body}");
+    assert_eq!(body["error"]["message"], "insufficient permissions");
+}
+
 /// The ingest router's body limit answers with the envelope at its shipped
 /// default, whether it learned the size from `Content-Length` or by
 /// reading a chunked body past the limit.
