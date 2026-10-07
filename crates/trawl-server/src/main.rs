@@ -641,12 +641,47 @@ fn prepare_data_root(
     ),
     String,
 > {
+    #[cfg(unix)]
+    close_storage_roots(data_root, wal_dir, ingest_enabled)?;
     let epoch = trawl_server::epoch::ensure_current_epoch(data_root, wal_dir, ingest_enabled)?;
     let recovered = trawl_server::repin::recover::recover_filesystem(data_root, ingest_enabled)?;
     if ingest_enabled {
         recover_publications_at_boot(wal_dir, data_root)?;
     }
     Ok((epoch, recovered))
+}
+
+/// Close every storage root to its owner, or refuse the start (ADR-0052).
+///
+/// This is the first step of `prepare_data_root`, so it runs under the
+/// sole-writer lock: a second trawld that lost the lock never reaches it. It
+/// runs on ingest and query-only nodes alike, before the epoch gate, recovery
+/// or any reader touches the corpus, and before any listener binds.
+#[cfg(unix)]
+fn close_storage_roots(
+    data_root: &std::path::Path,
+    wal_dir: &std::path::Path,
+    ingest_enabled: bool,
+) -> Result<(), String> {
+    use trawl_server::owner_only;
+
+    let roots = owner_only::protected_roots(data_root, wal_dir, ingest_enabled);
+    let euid = rustix::process::geteuid().as_raw();
+    let closed = owner_only::close(&roots, euid, owner_only::fchmod).map_err(|e| e.to_string())?;
+    for (root, closed) in roots.iter().zip(closed) {
+        if let owner_only::Closed::Tightened { from, to } = closed {
+            tracing::warn!(
+                event_type = "storage_root_closed",
+                root = %root.kind,
+                path = %root.path.display(),
+                from = format_args!("{from:04o}"),
+                to = format_args!("{to:04o}"),
+                "storage root was readable by other users; closed it to its owner \
+                 (files beneath it keep their modes and are unreachable to others)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Finish or roll back every compaction publish a crash interrupted, before
@@ -1123,6 +1158,40 @@ mod tests {
         assert!(recovered.is_some());
         assert_eq!(std::fs::read(data.join("prod/a.parquet")).unwrap(), b"new");
         assert_eq!(std::fs::read(data.join("EPOCH")).unwrap(), b"3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_data_root_closes_storage_roots_before_the_epoch_gate() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mode =
+            |path: &std::path::Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        let set = |path: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&wal).unwrap();
+        std::fs::write(data.join("EPOCH"), "3").unwrap();
+        set(&data.join("EPOCH"), 0o644);
+        set(&data, 0o755);
+        set(&wal, 0o755);
+
+        let (epoch, _) = prepare_data_root(&data, &wal, true).unwrap();
+        assert_eq!(epoch, trawl_server::epoch::Outcome::Current);
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&wal), 0o700);
+        assert_eq!(mode(&data.join("EPOCH")), 0o644, "nothing beneath a root");
+
+        // A symlinked data root refuses before the gate follows it.
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        set(&data, 0o755);
+        let error = prepare_data_root(&link, &wal, true).unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(mode(&data), 0o755);
     }
 
     fn config_with(retention: &str, ingest: &str) -> Config {

@@ -28,6 +28,8 @@ pub mod hot_buffer;
 pub mod ingest;
 pub mod metrics;
 pub mod monitor;
+#[cfg(unix)]
+pub mod owner_only;
 pub(crate) mod ping;
 pub mod policy;
 pub mod pool;
