@@ -144,6 +144,38 @@ signin_query_ready() {
   python3 "$probe" signin-query "$scratch/human.token" 2>/dev/null
 }
 
+probe_as() { # probe_as <user> <action> <args...>
+  local user="$1"
+  shift
+  (cd / && sudo -u "$user" python3 -I - "$@" < "$probe")
+}
+
+postgres_as() {
+  (cd / && sudo -u postgres "$@")
+}
+
+# Nobody is stopped by the 0750 state root. trawl-web can traverse that root,
+# but the 0700 data root stops it. Grant group traversal to the file, so this
+# separate trawl-web denial reaches the file's own 0600 mode.
+assert_file_blocks_web() {
+  local file="$1" dir
+  local -a ancestors=()
+  dir="${file%/*}"
+  while [[ "$dir" != /var/lib/trawl ]]; do
+    assert_mode "$dir" 700
+    ancestors+=("$dir")
+    dir="${dir%/*}"
+  done
+  (
+    trap 'for dir in "${ancestors[@]}"; do sudo chmod g-x "$dir"; done' EXIT
+    for dir in "${ancestors[@]}"; do sudo chmod g+x "$dir"; done
+    for dir in "${ancestors[@]}"; do
+      (cd / && sudo -u trawl-web test -x "$dir") || fail "trawl-web cannot traverse $dir"
+    done
+    probe_as trawl-web deny-file "$file"
+  )
+}
+
 if ! command -v pg_lsclusters >/dev/null 2>&1; then
   sudo apt-get update -qq >/dev/null
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql >/dev/null
@@ -166,13 +198,13 @@ wait_until "PostgreSQL readiness" 60 pg_isready -q -h 127.0.0.1 -p "$pg_port"
 # SQL syntax or URL delimiters. Neither SQL nor token output enters CI logs.
 fleet_password="$(openssl rand -hex 24)"
 trawl_password="$(openssl rand -hex 24)"
-if ! sudo -u postgres psql -p "$pg_port" -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
+if ! postgres_as psql -p "$pg_port" -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL
 CREATE ROLE fleet LOGIN PASSWORD '$fleet_password';
 CREATE ROLE trawl LOGIN PASSWORD '$trawl_password';
 SQL
 then fail "could not create PostgreSQL roles"; fi
-sudo -u postgres createdb -p "$pg_port" -O fleet fleet >/dev/null 2>&1 || fail "could not create fleet database"
-sudo -u postgres createdb -p "$pg_port" -O trawl trawl >/dev/null 2>&1 || fail "could not create trawl database"
+postgres_as createdb -p "$pg_port" -O fleet fleet >/dev/null 2>&1 || fail "could not create fleet database"
+postgres_as createdb -p "$pg_port" -O trawl trawl >/dev/null 2>&1 || fail "could not create trawl database"
 fleet_dsn="postgres://fleet:${fleet_password}@127.0.0.1:${pg_port}/fleet"
 trawl_dsn="postgres://trawl:${trawl_password}@127.0.0.1:${pg_port}/trawl"
 DATABASE_URL="$fleet_dsn" /usr/bin/fleet-admin migrate >/dev/null 2>&1 || fail "fleet schema migration failed"
@@ -276,8 +308,8 @@ assert_owner /var/lib/trawl/tls-key/key.pem trawl
 assert_mode /var/lib/trawl/tls-key/key.pem 600
 sudo -u trawl-web test -r /var/lib/trawl/web.cookie || fail "trawl-web cannot read the session key"
 sudo -u trawl-web test -r /var/lib/trawl/tls/cert.pem || fail "trawl-web cannot read the pinned certificate"
-sudo -u trawl-web python3 "$probe" can-read /var/lib/trawl/web.cookie
-sudo -u trawl-web python3 "$probe" can-read /var/lib/trawl/tls/cert.pem
+probe_as trawl-web can-read /var/lib/trawl/web.cookie
+probe_as trawl-web can-read /var/lib/trawl/tls/cert.pem
 
 python3 "$probe" ingest "$scratch/ingest.token" "$scratch/cert.pem"
 wait_until "durable WAL file" 30 has_wal
@@ -285,10 +317,11 @@ assert_kind "$wal" f
 assert_owner "$wal" trawl
 assert_mode "$wal" 600
 for user in nobody trawl-web; do
-  sudo -u "$user" python3 "$probe" deny-list /var/lib/trawl/data
-  sudo -u "$user" python3 "$probe" deny-file "$wal"
+  probe_as "$user" deny-list /var/lib/trawl/data
+  probe_as "$user" deny-file "$wal"
 done
-sudo -u trawl python3 "$probe" can-read "$wal"
+assert_file_blocks_web "$wal"
+probe_as trawl can-read "$wal"
 
 # Keep the first WAL stable, then use a short tick to publish its event.
 sudo sed -i 's/compaction_interval_secs = 600/compaction_interval_secs = 1/' /etc/trawl/trawld.toml
@@ -299,10 +332,11 @@ assert_kind "$parquet" f
 assert_owner "$parquet" trawl
 assert_mode "$parquet" 600
 for user in nobody trawl-web; do
-  sudo -u "$user" python3 "$probe" deny-list /var/lib/trawl/data
-  sudo -u "$user" python3 "$probe" deny-file "$parquet"
+  probe_as "$user" deny-list /var/lib/trawl/data
+  probe_as "$user" deny-file "$parquet"
 done
-sudo -u trawl python3 "$probe" can-read "$parquet"
+assert_file_blocks_web "$parquet"
+probe_as trawl can-read "$parquet"
 wait_until "browser sign-in and stored-event query" 60 signin_query_ready
 
 # 4. Simulate an old installation, then exercise the package's running-unit
@@ -313,14 +347,41 @@ sudo -u trawl install -m 0644 /dev/null "$sentinel"
 printf 'legacy file stays unchanged\n' | sudo -u trawl tee "$sentinel" >/dev/null
 sentinel_inode="$(sudo stat -c %i "$sentinel")"
 sentinel_sha="$(sudo sha256sum "$sentinel" | cut -d ' ' -f 1)"
+# The shipped unit is a non-conffile, so dpkg replaces this edited copy. Its
+# missing mode directives reproduce the old unit's 0755 defaults at start.
+unit=/usr/lib/systemd/system/trawld.service
+[[ -f "$unit" ]] || fail "installed trawld unit is missing"
+[[ "$(readlink -f "$(systemctl show trawld -p FragmentPath --value)")" == "$(readlink -f "$unit")" ]] || \
+  fail "systemd is not loading the installed trawld unit"
+sudo sed -i '/^[[:space:]]*StateDirectoryMode[[:space:]]*=/d; /^[[:space:]]*LogsDirectoryMode[[:space:]]*=/d' "$unit"
+sudo systemctl daemon-reload
+unit_text="$(systemctl cat trawld)" || fail "could not read the old-unit simulation"
+if grep -E '^[[:space:]]*(StateDirectoryMode|LogsDirectoryMode)[[:space:]]*=' <<< "$unit_text" >/dev/null; then
+  fail "old-unit simulation left an active directory mode directive"
+fi
 sudo chmod 0755 /var/lib/trawl /var/lib/trawl/data /var/log/trawl
 sudo systemctl start trawld
 wait_until "trawld health after old-mode start" 60 server_healthy
+assert_mode /var/lib/trawl 755
+assert_mode /var/log/trawl 755
 before_upgrade="$(systemctl show trawld -p InvocationID --value)"
 [[ -n "$before_upgrade" ]] || fail "trawld has no InvocationID before upgrade"
+# This package already has the new binary: it closes data at start even under
+# the old unit. Reopen data while that same invocation runs.
+sudo chmod 0755 /var/lib/trawl/data
+assert_mode /var/lib/trawl/data 755
+assert_mode "$sentinel" 644
+[[ "$(systemctl show trawld -p InvocationID --value)" == "$before_upgrade" ]] || \
+  fail "trawld restarted before the package upgrade"
 sudo DEBIAN_FRONTEND=noninteractive dpkg -i "${server_deb[0]}" 2>&1 | tee "$log"
+grep -Eq '^[[:space:]]*StateDirectoryMode[[:space:]]*=[[:space:]]*0750[[:space:]]*$' "$unit" || \
+  fail "upgrade did not restore StateDirectoryMode=0750"
+grep -Eq '^[[:space:]]*LogsDirectoryMode[[:space:]]*=[[:space:]]*0700[[:space:]]*$' "$unit" || \
+  fail "upgrade did not restore LogsDirectoryMode=0700"
 invocation_changed() {
-  [[ "$(systemctl show trawld -p InvocationID --value)" != "$before_upgrade" ]] && \
+  local after_upgrade
+  after_upgrade="$(systemctl show trawld -p InvocationID --value)"
+  [[ -n "$after_upgrade" && "$after_upgrade" != "$before_upgrade" ]] && \
     systemctl is-active --quiet trawld
 }
 wait_until "trawld restart on package upgrade" 60 invocation_changed
@@ -333,9 +394,9 @@ assert_mode "$sentinel" 644
 [[ "$(sudo stat -c %i "$sentinel")" == "$sentinel_inode" ]] || fail "upgrade replaced the legacy sentinel"
 [[ "$(sudo sha256sum "$sentinel" | cut -d ' ' -f 1)" == "$sentinel_sha" ]] || fail "upgrade changed the legacy sentinel"
 for user in nobody trawl-web; do
-  sudo -u "$user" python3 "$probe" deny-file "$sentinel"
+  probe_as "$user" deny-file "$sentinel"
 done
-sudo -u trawl python3 "$probe" can-read "$sentinel"
+probe_as trawl can-read "$sentinel"
 sudo systemctl start trawl-web
 wait_until "trawl-web health after upgrade" 60 web_healthy
 wait_until "browser sign-in and query after upgrade" 60 signin_query_ready

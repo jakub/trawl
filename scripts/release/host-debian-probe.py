@@ -16,8 +16,12 @@ WEB = "http://127.0.0.1:8090"
 ORIGIN = WEB
 
 
+class ProbeFailure(RuntimeError):
+    """Fixed probe assertion message safe to print without credentials."""
+
+
 def fail(message):
-    raise RuntimeError(message)
+    raise ProbeFailure(message)
 
 
 def request(opener, url, payload=None, headers=None):
@@ -50,7 +54,7 @@ def ingest(token_file, certificate):
         if response.status != 200:
             fail("ingest status was not 200")
         result = json.load(response)
-    if result.get("accepted") != 1 or result.get("rejected") != 0:
+    if result.get("accepted") != 1 or result.get("rejected", 0) != 0:
         fail("ingest did not accept exactly one event")
 
 
@@ -109,7 +113,11 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        # A response body or URL from urllib may contain credentials. Report
-        # only the probe and the exception class; the shell trap gives journals.
-        print("host probe failed: " + sys.argv[1] + " (" + type(exc).__name__ + ")", file=sys.stderr)
+        # Only fail() supplies fixed, secret-free messages. urllib and HTTP
+        # exceptions may include a credential-bearing URL or response body.
+        detail = ": " + str(exc) if isinstance(exc, ProbeFailure) else ""
+        print(
+            "host probe failed: " + sys.argv[1] + " (" + type(exc).__name__ + ")" + detail,
+            file=sys.stderr,
+        )
         sys.exit(1)
