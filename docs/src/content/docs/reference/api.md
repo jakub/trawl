@@ -75,6 +75,7 @@ Every error that trawld itself produces has this body:
 | `bad_request` | 400 | Malformed input. Also the code on every 409, which has no code of its own. |
 | `ingest_error` | 400, 413 | An ingest body that cannot be read. 413 when a gzip body decodes past `[ingest] max_body_bytes` |
 | `ingest_batch_too_large` | 413 | An ingest request holds more events or bytes than external producers may place in the hot buffer, so it can never be admitted |
+| `request_too_large` | 413 | A request body exceeds the router's body limit, `[server] max_request_body_bytes` or `[ingest] max_body_bytes`. The message names the setting and its value. See [body size limits](#body-size-limits) |
 | `preview_too_large` | 413 | An ingest preview sample holds more than 500 events |
 | `unsupported_encoding` | 415 | An ingest preview body carries a `Content-Encoding` other than `identity` |
 | `auth_error` | 401 | Authentication failed |
@@ -100,7 +101,7 @@ A read answers 503 `corpus_recovering` while the corpus is unsettled: after a re
 
 When both reasons hold, the response names `rollup_pending`. The reason is the `cause_kind` of the [`http_failure` event](/operate/health/#trace-a-server-failure), and `checks.corpus` in [server health](#server-health) names it too. The envelope carries no reason field. Live tail, `| from saved` queries, `/api/v1/schema`, `/api/v1/schema/services`, health, metrics, and a cached field-values hit answer as usual. See [reads while the corpus is unsettled](/architecture/data-flow/#reads-while-the-corpus-is-unsettled).
 
-Four refusals come from the HTTP framework before a handler runs, with an empty or plain-text body instead of the envelope: 413 when the body exceeds the size limit, 415 when a JSON route receives no `Content-Type: application/json`, 400 when the body is not valid JSON, and 422 when the JSON does not match the request shape.
+A body over the size limit is refused before a handler runs, with 413 and the envelope, code `request_too_large`. Three other refusals come from the HTTP framework before a handler runs, with an empty or plain-text body instead of the envelope: 415 when a JSON route receives no `Content-Type: application/json`, 400 when the body is not valid JSON, and 422 when the JSON does not match the request shape.
 
 Every response carries an `X-Request-Id` header holding a ULID. Quote it when reporting a problem.
 
@@ -130,7 +131,7 @@ Every instant is RFC 3339 in UTC. Catalog, repin, pin reclamation, and schedule 
 | `[server] max_request_body_bytes` | `"128K"` | Every route except `/api/v1/ingest` |
 | `[ingest] max_body_bytes` | `"16M"` | `/api/v1/ingest` |
 
-Both accept sizes such as `"128K"` and `"1M"`. A body over the limit is refused with 413. A gzip ingest body is held to `[ingest] max_body_bytes` twice: once as sent, and once decoded. trawld stops decoding one byte past the limit and answers 413 `ingest_error`.
+Both accept sizes such as `"128K"` and `"1M"`. These two keys are the only body bounds. A body over the limit is refused with 413 `request_too_large`, whether `Content-Length` announced the size or trawld found it while reading a chunked body. The message names the setting and its value, for example `request body exceeds [server] max_request_body_bytes (131072 bytes)`. trawld hangs up on an oversized body and does not read the rest of it. A client that is still uploading can lose the 413 to a connection reset. The trawl CLI and client then report `network error: the server closed the connection before the upload finished; the request may exceed the server's request size limit`. A gzip ingest body is held to `[ingest] max_body_bytes` twice: once as sent, and once decoded. trawld stops decoding one byte past the limit and answers 413 `ingest_error`.
 
 ### Query timeout
 
@@ -478,7 +479,7 @@ events are counted.
 | Status | Code | When |
 |--------|------|------|
 | 400 | `ingest_error` | Empty body, invalid UTF-8, an unparseable or empty JSON array, or a gzip body that fails to decode |
-| 413 | none | The body exceeds `[ingest] max_body_bytes` |
+| 413 | `request_too_large` | The body exceeds `[ingest] max_body_bytes`. The message names the setting and its value |
 | 413 | `ingest_error` | A gzip body decodes to more than `[ingest] max_body_bytes`. No `Retry-After`. Send smaller batches |
 | 413 | `ingest_batch_too_large` | The request holds more than 15/16 of `hot_buffer_max_events` or `hot_buffer_max_bytes`, or a cap of 0 or 1 admits no request. No `Retry-After`. Split the batch |
 | 429 | `rate_limited` | The key's ingest bucket is empty |
@@ -645,7 +646,7 @@ Each entry in `events` has `outcome` set to `accepted` or `rejected`.
 | 400 | `ingest_error` | Empty body, invalid UTF-8, or an unparseable or empty JSON array. The same refusals as `/api/v1/ingest`. A body of only whitespace is not refused. It answers 200 with no events |
 | 403 | `forbidden` | The key lacks `server_manage` |
 | 404 | none | `[ingest] enabled` is `false` on this node. The body is empty |
-| 413 | none | The body exceeds `[server] max_request_body_bytes`. The body is plain text |
+| 413 | `request_too_large` | The body exceeds `[server] max_request_body_bytes`. The message names the setting and its value. Carries `Cache-Control: no-store` |
 | 413 | `preview_too_large` | The sample holds more than 500 events. Nothing is truncated. Send a smaller sample |
 | 415 | `unsupported_encoding` | The body carries a `Content-Encoding` other than `identity`, `gzip` included |
 | 429 | `rate_limited` | The key's interactive bucket is empty |

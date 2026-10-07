@@ -1,6 +1,6 @@
 # An ingest preview canonicalizes a sample as the HTTP door would and stores nothing of it
 
-status: accepted (2026-09-30), prep record for #200; amended (2026-10-01): the peer address is optional and the sample's source is documented, see the Amendment
+status: accepted (2026-09-30), prep record for #200; amended (2026-10-01): the peer address is optional and the sample's source is documented; amended (2026-10-07): a body-limit refusal carries an envelope and a cut-off upload has its own message, see the Amendments
 
 An operator who connects a new source learns what trawld did to its events only after they land. The `/api/v1/ingest` response reports a rejected event's index and message. It drops the typed reason and never reports repairs. A repair surfaces later, as a `_repairs` code on stored rows or as a `/metrics` counter. By then the events are permanent, because ingest has no idempotency key (ADR-0045). The doctors do not help: a doctor never ingests (ADR-0047). This record adds an **ingest preview**. It is a route that runs a bounded sample through the HTTP producer's canonicalization and returns what each event would become, without keeping any of it.
 
@@ -62,3 +62,12 @@ The peer address matters only for an event that has no `host`. Such an event tak
 
 - **`peer_ip` is optional.** When it is left out, trawld uses `192.0.2.1`, an address reserved for documentation (RFC 5737). trawld classifies that address against its relay configuration, like any other peer. The response says that no peer was given. For each event without `host`, the response names the outcome as depending on the sender: the sender's address fills `host`, or the event is rejected if the sender is a trusted relay. `peer_ip`, when given, works as the Decision describes. The rejection of a caller-address default stands. That address looks real and is wrong, and the placeholder cannot be mistaken for a real host.
 - **The sample is what Vector would send.** Vector parses and reshapes source lines before it posts them, so a raw log file is not a sample. The Vector guide documents how to capture one: run the sender's own configuration with a temporary `console` sink that writes JSON lines, and keep the first lines of its output. The collector test proves that the captured lines are the events the `http` sink posts.
+
+## Amendment: a body-limit refusal names its limit, and a cut-off upload says so, 2026-10-07
+
+The preview's body limit, `[server] max_request_body_bytes`, refused an oversized body with a bare `text/plain` 413 from the framework. A client that read it could only report `unknown error`. A client that was still uploading often lost the 413 to a connection reset and reported `request failed`. The docs walk of 2026-10-06 hit both. The human ruled:
+
+- **A body-limit refusal carries the error envelope.** The code is `request_too_large`, and the message names the setting and its value, for example `request body exceeds [server] max_request_body_bytes (131072 bytes)`. The ingest route does the same for `[ingest] max_body_bytes`. This holds whether `Content-Length` announced the size or trawld found it in a chunked body. The preview's 413 still carries `Cache-Control: no-store`. The other framework refusals, 415, 400 and 422, keep their plain bodies.
+- **axum's implicit extractor cap is disabled.** It sat under the configured limit on ingest, so the 413 named a setting that was not the one that refused. With it gone, the configured limit is the one named.
+- **trawld still does not drain.** It hangs up on an oversized body at once. Draining would spend bandwidth on bodies it has refused, and the limit runs before authentication, so any caller could trigger it.
+- **A client that loses the 413 reports a cut-off upload.** When the server resets or closes the connection while the request body is being written, the CLI and client report `network error: the server closed the connection before the upload finished; the request may exceed the server's request size limit`. They never claim a 413 they did not read. `trawl preview-ingest` exits 2 in both cases.
