@@ -15,7 +15,8 @@ from `DATABASE_URL`, which is separate from the daemon's `FLEET_DATABASE_URL`.
 
 On a Helm install, run each `fleet-admin` command inside the trawld container,
 which holds `DATABASE_URL`. Put `kubectl exec` in front of it. For a release
-named `trawl`:
+named `trawl`, steps 1 and 3 below become these commands. Run the
+`keys create` command after step 2, because it needs the `trawl-reader` role:
 
 ```bash
 kubectl -n NAMESPACE exec -i trawl-0 -c trawld -- fleet-admin roles list
