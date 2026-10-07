@@ -16,15 +16,15 @@
 //! to a single retained `<path>.1` (also owner-only; `0` disables
 //! rollover).
 //!
-//! Tightening is best-effort in exactly one direction: POSIX `chmod`
-//! requires the caller to own the file, so a pre-existing log owned by
-//! another uid cannot be re-moded even when it opens fine for append.
-//! That refuses the open only when the file is *actually* reachable by
-//! group or other — an already-owner-only foreign file is as tight as
-//! this code would have made it, so it warns and continues rather than
-//! turning an opt-in debug feature into a boot failure. trawld's
-//! `server.log_file` opens through [`open_append_owner_only`] under the
-//! same rules (ADR-0052).
+//! The open is then judged on the descriptor it returned, whatever the
+//! `chmod` said: the file must belong to the uid trawld runs as and carry
+//! no group or other bit, or the open is refused. A file another user owns
+//! is refused even when it is already tight, since its owner can loosen it
+//! or read it at any time. A `chmod` can also report success and change
+//! nothing, as on a filesystem with fixed modes, and a `chmod` on trawld's
+//! own file can fail, as on an append-only file; neither decides alone.
+//! trawld's `server.log_file` opens through [`open_append_owner_only`]
+//! under the same rules (ADR-0052).
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -79,12 +79,14 @@ fn open_owner_only(path: &Path) -> io::Result<File> {
 
 /// Open the log at `path` for appending, owner-only on Unix: `0600` at
 /// creation, a pre-existing looser file tightened, and a symlink at the
-/// final component refused. A `chmod` that fails refuses the open unless
-/// the file is already owner-only; then it warns, as `event_type`, and the
-/// open goes on (see the module docs).
+/// final component refused. The opened descriptor must then show a file
+/// trawld's euid owns with no group or other bit; a `chmod` that failed on
+/// such a file warns, as `event_type`, and the open goes on (see the module
+/// docs).
 ///
 /// # Errors
-/// The failed open, or a looser file that could not be tightened.
+/// The failed open, a file another user owns, or one that is not
+/// owner-only after the `chmod`.
 pub fn open_append_owner_only(path: &Path, event_type: &'static str) -> io::Result<File> {
     open_owner_only_with(path, event_type, |opts| {
         opts.create(true).append(true);
@@ -107,12 +109,16 @@ fn open_owner_only_with(
 ) -> io::Result<File> {
     // The helper sets `0600` at creation and re-applies it to a
     // pre-existing looser file, handing back a failed `chmod` instead of
-    // raising it — the tolerance below is this log's own policy.
+    // raising it — what the descriptor shows afterwards is the verdict.
     let (file, chmod_error) = trawl_config::fs::open_with_mode(path, 0o600, configure)?;
     #[cfg(unix)]
-    if let Some(err) = chmod_error {
-        tolerate_chmod_failure(&file, path, &err, event_type)?;
-    }
+    check_owner_only(
+        &file,
+        path,
+        chmod_error,
+        rustix::process::geteuid().as_raw(),
+        event_type,
+    )?;
     #[cfg(not(unix))]
     let _ = event_type;
     #[cfg(not(unix))]
@@ -120,45 +126,54 @@ fn open_owner_only_with(
     Ok(file)
 }
 
-/// Whether a failed `chmod` on the log must refuse the open: it must,
-/// unless the file's observed mode is already free of every group and
-/// other bit. `None` (mode unreadable) is treated as unsafe.
+/// Judge an opened log on its descriptor, after the `chmod` attempt: it
+/// must belong to `euid` and carry no group or other bit, whatever the
+/// `chmod` returned. A `chmod` that failed on a file that passes warns, as
+/// `event_type`, and the open goes on.
 #[cfg(unix)]
-fn chmod_failure_is_fatal(mode: Option<u32>) -> bool {
-    mode.is_none_or(|m| m & 0o077 != 0)
-}
-
-/// Decide what a failed `chmod 0600` on an already-open log file means,
-/// tolerating the one failure that carries no exposure: a foreign-owned
-/// file that is already owner-only (see the module docs).
-#[cfg(unix)]
-fn tolerate_chmod_failure(
+fn check_owner_only(
     file: &File,
     path: &Path,
-    chmod_err: &io::Error,
+    chmod_err: Option<io::Error>,
+    euid: u32,
     event_type: &'static str,
 ) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = file
-        .metadata()
-        .ok()
-        .map(|meta| meta.permissions().mode() & 0o777);
-    if chmod_failure_is_fatal(mode) {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = file.metadata()?;
+    let (owner, mode) = (meta.uid(), meta.mode() & 0o7777);
+    let chmod = chmod_err
+        .as_ref()
+        .map_or_else(String::new, |err| format!(" (chmod: {err})"));
+    if owner != euid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{} is group/other-accessible and cannot be tightened to 0600: {chmod_err}",
+                "{} is owned by uid {owner}, not uid {euid} that trawld runs as, so \
+                 trawld cannot keep it owner-only{chmod}; remove it or chown it to \
+                 uid {euid}",
                 path.display()
             ),
         ));
     }
-    tracing::warn!(
-        event_type,
-        path = %path.display(),
-        error = %chmod_err,
-        "could not chmod the log to 0600 (not its owner?); the existing \
-         mode is already owner-only, continuing"
-    );
+    if mode & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is still mode {mode:04o} after trawld set it to 0600{chmod}; its \
+                 filesystem does not keep Unix modes, so move the log to one that does",
+                path.display()
+            ),
+        ));
+    }
+    if let Some(err) = chmod_err {
+        tracing::warn!(
+            event_type,
+            path = %path.display(),
+            error = %err,
+            "could not chmod the log to 0600; it is trawld's own file and \
+             already owner-only, continuing"
+        );
+    }
     Ok(())
 }
 
@@ -477,29 +492,73 @@ mod tests {
         );
     }
 
-    /// A `chmod` we are not permitted to make (foreign-owned file) is
-    /// only worth refusing the open over when the file is actually
-    /// exposed — otherwise trawld would refuse to boot over an opt-in
-    /// debug log that leaks nothing.
+    fn euid() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
+    /// An owner-only file of trawld's own passes, and so does one whose
+    /// `chmod` failed (an append-only file refuses it) while its descriptor
+    /// shows it owner-only.
     #[cfg(unix)]
     #[test]
-    fn chmod_failure_is_fatal_only_when_group_or_other_can_reach_the_file() {
-        for mode in [0o600, 0o400, 0o200, 0o000] {
+    fn the_descriptor_decides_an_owner_only_file_passes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let file = std::fs::File::create(&path).unwrap();
+        for mode in [0o600, 0o400, 0o200] {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .unwrap();
+            check_owner_only(&file, &path, None, euid(), "test").unwrap();
+            check_owner_only(
+                &file,
+                &path,
+                Some(io::Error::from(rustix::io::Errno::PERM)),
+                euid(),
+                "test",
+            )
+            .unwrap();
+        }
+    }
+
+    /// A `chmod` that reported success and left a group or other bit, as a
+    /// filesystem with fixed modes does, refuses the open: the descriptor's
+    /// mode decides, not the `chmod`'s answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_chmod_that_left_the_file_open_refuses() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let error = check_owner_only(&file, &path, None, euid(), "test").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("still mode 0644"), "{error}");
+    }
+
+    /// A file another user owns is refused even when it is owner-only:
+    /// its owner can loosen or read it whenever they like.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_another_user_owns_refuses() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("query.log");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        let other = euid().wrapping_add(1);
+        for chmod_err in [None, Some(io::Error::from(rustix::io::Errno::PERM))] {
+            let error = check_owner_only(&file, &path, chmod_err, other, "test").unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            let text = error.to_string();
             assert!(
-                !chmod_failure_is_fatal(Some(mode)),
-                "{mode:04o} is already owner-only; failing chmod must not refuse the open"
+                text.contains(&format!("owned by uid {}, not uid {other}", euid())),
+                "{text}"
             );
         }
-        for mode in [0o644, 0o640, 0o660, 0o606, 0o601, 0o666] {
-            assert!(
-                chmod_failure_is_fatal(Some(mode)),
-                "{mode:04o} is group/other-accessible and untightenable; must refuse"
-            );
-        }
-        assert!(
-            chmod_failure_is_fatal(None),
-            "an unreadable mode must be assumed unsafe"
-        );
     }
 
     #[test]
