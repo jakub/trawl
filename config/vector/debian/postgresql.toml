@@ -34,12 +34,15 @@ parsed, err = parse_regex(
 )
 if err == null {
   # The line's own time, not the time Vector read it. PostgreSQL stamps the
-  # log_timezone abbreviation. UTC and GMT are exact, and so are the numeric
-  # names, such as -03 or +0545, of zones without one. Other names, such as
-  # EDT or CEST, name no fixed offset: read the time in the collector's zone
-  # (TZ, else the host's zone, which initdb copies into log_timezone) and keep
-  # it only if that zone has the line's abbreviation at that instant. An
-  # abbreviation that two zones share, such as CST, cannot be told apart.
+  # log_timezone abbreviation. Supported log_timezone values are IANA zone
+  # names (initdb copies the host's), UTC, and the numeric Etc/GMT+-N forms.
+  # UTC is exact, and so are the numeric names, such as -03 or +0545, of zones
+  # without an abbreviation. Other names, such as EDT or CEST, name no fixed
+  # offset: read the time in the collector's zone (TZ, else the host's zone)
+  # and keep it only if that zone has the line's abbreviation at that
+  # instant. An abbreviation that two zones share, such as CST, cannot be told
+  # apart. POSIX offset strings, such as GMT+3 or UTC+3, are not supported:
+  # they stamp GMT or UTC at a non-zero offset, with the sign inverted.
   # Otherwise, or if the timestamp does not parse, such as in the hour a
   # change from summer time repeats, keep the read time. Set
   # log_timezone = 'UTC' for exact times.
