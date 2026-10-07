@@ -143,7 +143,12 @@ APT repository from [Installation](/getting-started/).
    trawld writes it, with no restart. Then
    [verify the installation](#verify-the-installation).
 
-The package creates these files and directories:
+The package, systemd, and trawld create these files and directories. Stored
+data is owner-only. trawld sets its process umask to 077 at every start, so
+everything it creates under `data/` is readable by user `trawl` alone, and it
+closes the data root to 0700 before it serves. `trawl-web` reads two files on
+disk, `web.cookie` and `tls/cert.pem`. It reaches stored events only through
+trawld's API.
 
 | Path | Owner and mode | Purpose |
 | --- | --- | --- |
@@ -152,13 +157,13 @@ The package creates these files and directories:
 | `/etc/trawl/trawld.toml` | root:trawl 0640 | Configuration for both daemons. |
 | `/etc/default/trawld` | root:trawl 0640 | Environment for `trawld.service`: `FLEET_DATABASE_URL`, `TRAWL_DATABASE_URL`, `RUST_LOG`. |
 | `/etc/default/trawl-web` | root:root 0644 | Environment for `trawl-web.service`: `RUST_LOG`. World-readable, so no secrets. |
-| `/var/lib/trawl` | trawl:trawl 0750 | State directory. `trawld` writes only here and to `/var/log/trawl`. |
-| `/var/lib/trawl/data` | trawl:trawl | Parquet files, `wal/`, `scheduled/`, and the `EPOCH` and `CATALOG` markers. Created on first start. |
-| `/var/lib/trawl/tls` | trawl:trawl | `cert.pem`, mode 0644, generated when `[server]` names no certificate. The packaged `[web] upstream_ca_path` pins it. |
-| `/var/lib/trawl/tls-key` | trawl:trawl 0700 | `key.pem`, mode 0600, the private key of the generated certificate. |
+| `/var/lib/trawl` | trawl:trawl 0750 | State directory. The package creates it, and systemd reapplies the mode at every start of `trawld.service`. `trawld` writes only here and to `/var/log/trawl`. The `trawl` group lets `trawl-web` pass through to `web.cookie` and `tls/`. |
+| `/var/lib/trawl/data` | trawl:trawl 0700 | Parquet files, `wal/`, `scheduled/`, and the `EPOCH` and `CATALOG` markers. Everything trawld creates beneath it is 0700 or 0600. trawld creates it on first start and closes it to 0700 at every start. |
+| `/var/lib/trawl/tls` | trawl:trawl 0755 | `cert.pem`, mode 0644, generated when `[server]` names no certificate. trawld creates both on first start. The packaged `[web] upstream_ca_path` pins the certificate. |
+| `/var/lib/trawl/tls-key` | trawl:trawl 0700 | `key.pem`, mode 0600, the private key of the generated certificate. trawld creates both on first start. |
 | `/var/lib/trawl/web.cookie` | trawl:trawl 0640 | 32-byte session cookie key, generated once on first install. The `trawl` group lets `trawl-web` read it. |
 | `/var/lib/trawl/cores` | trawl:trawl 0700 | Crash dumps. Empty unless the [crash-dump drop-in](/reference/crash-dumps/) is enabled. |
-| `/var/log/trawl` | trawl:trawl | Log directory for `[server] log_file`. |
+| `/var/log/trawl` | trawl:trawl 0700 | Log directory for `[server] log_file`. systemd creates it on the first start of `trawld.service` and reapplies the mode at every start. |
 | `/usr/lib/sysusers.d/trawl.conf`, `/usr/lib/tmpfiles.d/trawl.conf` | root:root 0644 | Create user `trawl` and user `trawl-web`, a member of group `trawl`, and reapply the modes of `cores` and `web.cookie` at every boot. |
 | `/usr/share/doc/trawl-server/examples/crashdump.conf` | root:root 0644 | Optional systemd drop-in that enables crash dumps. |
 
@@ -509,7 +514,17 @@ nothing else. You supply what the package supplies:
 
 - A user `trawl` and a user `trawl-web`, with `trawl-web` in group `trawl`.
 - `/var/lib/trawl`, owned by `trawl:trawl`, mode 0750, with the data
-  directory inside it.
+  directory inside it. Create the state directory before the first start. A
+  parent directory that trawld creates itself is 0700, and `trawl-web` then
+  cannot reach `web.cookie` or `tls/cert.pem`.
+- The data directory, and an `[ingest] wal_dir` outside it, owned by the
+  user that runs trawld. trawld creates a missing data directory at 0700.
+  At every start it closes an existing data directory, and an out-of-root
+  WAL directory, to owner-only. If it cannot, it refuses to start, and the
+  error names the path, its owner, its mode, and the fix.
+  `[data] path` must name the directory itself. trawld follows symlinks in
+  the parent directories, but refuses a path whose last component is a
+  symlink. A default ACL on a parent directory is outside this guarantee.
 - `/etc/trawl/trawld.toml`, owned by `root:trawl`, mode 0640, with the
   `[auth]` and `[storage]` DSNs or the two environment variables set for the
   daemon.
@@ -522,6 +537,8 @@ nothing else. You supply what the package supplies:
   as `trawl` and `trawl-web --config /etc/trawl/trawld.toml` as `trawl-web`.
   Start from the packaged units in
   [`crates/trawl-server/debian/`](https://github.com/jakub/trawl/tree/main/crates/trawl-server/debian).
+  The supervisor needs no umask setting. trawld sets its own umask to 077
+  before it creates a file.
 
 ## Use a current storage root
 
@@ -531,6 +548,11 @@ If the marker names another format, restore a complete epoch-3 backup or
 configure new empty data and WAL directories. Do not change the marker to
 relabel existing files. Startup does not convert, rename, or import an older
 root or its scheduled report results.
+
+Whether the daemon ingests or only queries, an existing root must be owned by
+the user that runs trawld. trawld closes the root to owner-only at every start
+and refuses to start when it cannot. A root on a read-only mount must already
+be owner-only, because trawld cannot change its mode there.
 
 Current WAL batches live under environment directories. A batch directly
 under the configured WAL directory causes startup to refuse before storage
@@ -586,8 +608,10 @@ ServiceMonitor creation; neither option installs a monitoring system.
 
    Expect exit code 0. A server that has never started reports rows with the
    reason `will_initialize` and exits with code 3, because its listener does
-   not answer yet. A row with `failed` names its next action. Do not run the
-   doctor as root: a root run cannot exit 0.
+   not answer yet. A data root that trawld would close at its next start
+   passes with the reason `will_tighten`, and the doctor leaves its mode as
+   it is. A row with `failed` names its next action. Do not run the doctor
+   as root: a root run cannot exit 0.
 
 2. If the browser UI is enabled, run the web proxy doctor where `trawl-web`
    runs, as its service user and with its environment. It checks the proxy's
