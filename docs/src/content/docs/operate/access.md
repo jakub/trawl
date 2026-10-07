@@ -56,7 +56,9 @@ in practice `privileged`.
    reader role: `trawl:server_manage` also cancels any key's query and reads
    server stats and the dashboard. The
    [ingest preview](/operate/ingestion/#ingest-preview) and the
-   [health checks](/operate/health/) need it.
+   [health checks](/operate/health/) need it. The health checks also run a
+   query and list running queries, which need `trawl:query`. Give an
+   operator's key both roles, as `alice-ops` gets below.
 
    `fleet-admin` warns about a permission it does not recognize but stores it
    anyway. Check the spelling in the warning.
@@ -68,7 +70,8 @@ in practice `privileged`.
    install -m 0600 /dev/null alice.token &&
      fleet-admin keys create --name alice --kind human --role trawl-reader > alice.token
    install -m 0600 /dev/null alice-ops.token &&
-     fleet-admin keys create --name alice-ops --kind human --role trawl-operator > alice-ops.token
+     fleet-admin keys create --name alice-ops --kind human \
+       --role trawl-reader --role trawl-operator > alice-ops.token
    install -m 0600 /dev/null vector.token &&
      fleet-admin keys create --name vector --kind service --role trawl-ingest \
        --expires 90d > vector.token

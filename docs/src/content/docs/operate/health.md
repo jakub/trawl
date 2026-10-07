@@ -9,8 +9,10 @@ an owner-only curl config file that holds the bearer header.
 [Keep a key in a curl config file](/operate/access/#keep-a-key-in-a-curl-config-file)
 shows how to write it. Keep the token in that file, not on the command line,
 and do not print the file. Server stats and the dashboard need
-`trawl:server_manage`, so use a key with the
-[`trawl-operator` role](/operate/access/#create-roles-and-keys).
+`trawl:server_manage`. The `trawl query` commands and the list of running
+queries need `trawl:query`. Use a key with both the `trawl-reader` and
+`trawl-operator` roles, such as `alice-ops` from
+[Create roles and keys](/operate/access/#create-roles-and-keys).
 
 The recipes on this page that search trawld's own telemetry filter on
 `service=trawld _producer=trawld`, not on `service=trawld` alone. Any HTTP
