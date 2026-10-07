@@ -86,10 +86,19 @@ struct Server {
     _dir: tempfile::TempDir,
 }
 
+/// The fixture's `[server] max_request_body_bytes`.
+const DEFAULT_BODY_LIMIT: usize = 128 * 1024;
+
 impl Server {
     /// Boot a trawld with ingest on or off.
-    #[allow(clippy::too_many_lines)] // linear assembly: two databases, one config, one boot
     async fn start(ingest_enabled: bool) -> Self {
+        Self::start_with_body_limit(ingest_enabled, DEFAULT_BODY_LIMIT).await
+    }
+
+    /// Boot a trawld with ingest on or off and `max_request_body_bytes`
+    /// set to `body_limit`.
+    #[allow(clippy::too_many_lines)] // linear assembly: two databases, one config, one boot
+    async fn start_with_body_limit(ingest_enabled: bool, body_limit: usize) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -128,7 +137,7 @@ impl Server {
                 max_concurrent_queries: 2,
                 max_result_rows: 10_000,
                 max_export_rows: 10_000,
-                max_request_body_bytes: 128 * 1024,
+                max_request_body_bytes: body_limit,
                 max_concurrent_requests: 256,
                 shutdown_drain_secs: 5,
                 log_file: None,
@@ -685,4 +694,106 @@ async fn an_unreadable_sample_exits_2() {
         stderr.starts_with(&format!("trawl: cannot read {}: ", missing.display())),
         "{stderr}"
     );
+}
+
+/// `lines` valid NDJSON events of `line_len` bytes each, newline
+/// included, so a refusal can only be about the body's size.
+fn padded_events(lines: usize, line_len: usize) -> Vec<u8> {
+    let shell = r#"{"service":"api","msg":""}"#.len() + 1;
+    let line = format!(
+        "{{\"service\":\"api\",\"msg\":\"{}\"}}\n",
+        "x".repeat(line_len - shell)
+    );
+    assert_eq!(line.len(), line_len);
+    line.repeat(lines).into_bytes()
+}
+
+/// A body moderately over `max_request_body_bytes` gets the server's
+/// `request_too_large` message, never `unknown error`, and exits 2.
+///
+/// The 1 KiB limit and a 4 KiB body keep this deterministic: the whole
+/// request is a few TLS records that land in trawld's first read, so when
+/// it refuses and hangs up nothing it was sent is left unread. The close
+/// is a FIN, not a reset, and the client always reads the 413.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_moderately_over_the_limit_prints_the_servers_413() {
+    let server = Server::start_with_body_limit(true, 1024).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = server.config(dir.path());
+    let body = padded_events(32, 128);
+    assert_eq!(body.len(), 4096);
+
+    let output = trawl(&config, Some(&server.admin_token), &["-"], &body).await;
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "");
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("unknown error"), "{stderr}");
+    assert_eq!(
+        stderr,
+        "trawl: server error (HTTP 413): request body exceeds [server] \
+         max_request_body_bytes (1024 bytes)\n"
+    );
+    server.stop().await;
+}
+
+/// More events than one preview reads, in a body under the byte limit,
+/// gets the server's `preview_too_large` message and exits 2.
+#[tokio::test(flavor = "multi_thread")]
+async fn more_events_than_a_preview_reads_prints_the_servers_413() {
+    let server = Server::start(true).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = server.config(dir.path());
+    let limit = trawl_api::ingest_preview::MAX_PREVIEW_EVENTS;
+    let body = r#"{"service":"api"}"#.to_owned() + "\n";
+    let body = body.repeat(limit + 1);
+    assert!(body.len() < DEFAULT_BODY_LIMIT);
+
+    let output = trawl(&config, Some(&server.admin_token), &["-"], body.as_bytes()).await;
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "");
+    assert_eq!(
+        text(&output.stderr),
+        format!(
+            "trawl: server error (HTTP 413): the sample holds more than {limit} events; \
+             preview at most {limit} at a time\n"
+        )
+    );
+    server.stop().await;
+}
+
+/// A body several times over `max_request_body_bytes` exits 2 with one of
+/// two exact lines, and never `request failed`.
+///
+/// Both outcomes are legitimate. trawld refuses on `Content-Length` and
+/// hangs up without draining the body (a ruling: draining would spend
+/// bandwidth on refused bodies, before authentication). The client is
+/// still uploading, so whether it reads the 413 first or hits the reset
+/// of the unread upload depends on socket buffers and timing. A reset is
+/// reported as a cut-off upload. The test never retries.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_far_over_the_limit_prints_the_413_or_a_cut_off_upload() {
+    let server = Server::start(true).await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = server.config(dir.path());
+    // 256 events, under the preview's event cap, so the byte limit is the
+    // only refusal on offer.
+    let body = padded_events(256, 8 * 1024);
+    assert_eq!(body.len(), 2 * 1024 * 1024);
+    const { assert!(256 <= trawl_api::ingest_preview::MAX_PREVIEW_EVENTS) };
+
+    let output = trawl(&config, Some(&server.admin_token), &["-"], &body).await;
+    assert_eq!(output.status.code(), Some(2), "{}", text(&output.stderr));
+    assert_eq!(text(&output.stdout), "");
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("request failed"), "{stderr}");
+    assert!(!stderr.contains("unknown error"), "{stderr}");
+    let refused = format!(
+        "trawl: server error (HTTP 413): request body exceeds [server] \
+         max_request_body_bytes ({DEFAULT_BODY_LIMIT} bytes)\n"
+    );
+    let cut_off = "trawl: network error: the server closed the connection before the \
+                   upload finished; the request may exceed the server's request size limit\n";
+    assert!(stderr == refused || stderr == cut_off, "{stderr}");
+    eprintln!("far-over-limit outcome: {}", stderr.trim_end());
+    server.stop().await;
 }
