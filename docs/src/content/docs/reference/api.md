@@ -439,7 +439,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | `errors[].reason` | string | The reason code from the [rejection table](/reference/events/#rejection-reasons), such as `missing_service` or `invalid_json`. The same value labels `trawl_ingest_events_rejected_total` |
 | `errors[].message` | string | What was wrong with the event. It can quote the event's values, such as the env that is not allowed |
 
-A rejected event does not stop its siblings. Repairs do not change `accepted` or `rejected`. A body whose first non-blank byte is not `[` is read as newline-delimited JSON, so a single event object is accepted and a line that is not an event object counts as one rejected event with the response still 200. See [connect and verify a sender](/operate/ingestion/) for an end-to-end check.
+A rejected event does not stop its siblings. Repairs do not change `accepted` or `rejected`. A body whose first non-blank byte is not `[` is read as newline-delimited JSON, so a single event object is accepted and a line that is not an event object counts as one rejected event with the response still 200. A sender that reads only the status code, such as Vector, does not see these rejections. [Ingest events rejected](/operate/operational-alerts/#ingest-events-rejected) alerts on them. See [connect and verify a sender](/operate/ingestion/) for an end-to-end check.
 
 trawld writes one WAL file per environment and service group. If any group's
 WAL write fails, including its directory fsync, the whole request answers
@@ -2274,6 +2274,7 @@ Prometheus scrape-target labels are separate and remain on every alert.
 | `TrawlSyslogWriteOutcomeUncertain` | `trawl_syslog_write_tasks_failed_total` | Failed syslog flush tasks, counted at the handled `JoinError`; no metric labels |
 | `TrawlTelemetryWriteOutcomeUncertain` | `trawl_telemetry_events_dropped_total{reason="write_crashed"}` | Events consumed from the in-memory telemetry batch when its write task fails; WAL bytes may already exist |
 | `TrawlHttpPersistenceRejection` | `trawl_ingest_events_rejected_total{reason="wal_failure"}` | Events in failed HTTP WAL groups, counted during final ingest accounting |
+| `TrawlIngestEventsRejected` | `trawl_ingest_events_rejected_total{reason!~"wal_failure\|hot_buffer_full\|ingest_batch_too_large"}` | Events that each broke an event-contract rule and were refused alone, under that rule's `reason`; counted during final ingest accounting |
 | `TrawlTelemetryWalWriteFailure` | `trawl_telemetry_wal_write_failures_total` | Failed telemetry write attempts, including retained retries and crashed tasks; no metric labels |
 | `TrawlWalDurabilityDegraded` | `trawl_wal_durability_failures_total{operation="parent_directory_sync"}` | Failed WAL directory sync operations, each of which rejected its write; counted by the WAL writer |
 | `TrawlCompactionOperationFailure` | `trawl_compaction_operation_failures_total{operation}` | Explicit failed attempts, using the eight closed operations below |
@@ -2291,11 +2292,16 @@ cap of 60 persisted per minute, and each of those events still reaches
 stdout. A crashed telemetry write also increments the
 inclusive failed-attempt counter; both telemetry failure alerts can fire.
 The WAL durability counter has only `operation="parent_directory_sync"`.
-HTTP rejection reasons other than `wal_failure` remain diagnostic, including
-`hot_buffer_full` and `ingest_batch_too_large`.
+`TrawlIngestEventsRejected` selects every rejection reason except
+`wal_failure`, `hot_buffer_full`, and `ingest_batch_too_large`, so a new
+reason alerts without a rule change. The two rejection rules select disjoint
+reasons. `hot_buffer_full` and `ingest_batch_too_large` stay diagnostic:
+they refuse the whole request with a 503 or 413 that the sender sees.
 
-All 26 selected counter series are initialized at zero after recorder
+All 36 selected counter series are initialized at zero after recorder
 installation and before the first scrape, independently of feature enablement.
+Every `reason` of `trawl_ingest_events_rejected_total` starts at zero too, so
+the first refusal for a reason is an observed increase.
 Initialization preserves accumulated values. The exporter has no idle expiry
 for these baselines. Counters reset when the process restarts. The two gauges
 that `TrawlHotBufferDrainStalled` selects are set at startup and on every
@@ -2303,7 +2309,7 @@ scrape. The age gauge exists only on a node with a hot buffer.
 `trawl_corpus_unsettled` starts at zero for both reasons and is read from
 the publication gate on every scrape.
 
-The eleven counter rules use a fixed ten-minute `increase` window with no `for` delay,
+The twelve counter rules use a fixed ten-minute `increase` window with no `for` delay,
 aggregation, current-value guard, or ingest-enable gate. The window describes
 scraped observations, not an exact event-loss count. A first nonzero sample
 cannot recover a prior baseline; an unseen process lifetime is unobservable.
