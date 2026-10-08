@@ -2,6 +2,10 @@ Trawl has been installed.
 
 Create roles and API keys against the Fleet database:
   https://trawl.sh/operate/access/#create-roles-and-keys
+Run the guide's fleet-admin commands inside the trawld container, for example:
+
+  kubectl exec --namespace {{ .Release.Namespace }} -i {{ include "trawl.fullname" . }}-0 -c trawld -- fleet-admin roles list
+
 Use a personal API key to sign in to the browser and a service key for each collector.
 {{- if .Values.initAuth.enabled }}
 The init-auth container initializes the database schema; it does not create API keys.
@@ -62,8 +66,13 @@ API ingress hosts (for bearer-token clients):
 {{- end }}
 {{- end }}
 {{- if .Values.httpRoute.enabled }}
+{{- if eq (.Values.httpRoute.backend | default "web") "web" }}
+
+Browser HTTPRoute hosts:
+{{- else }}
 
 API HTTPRoute hosts (for bearer-token clients):
+{{- end }}
 {{- range .Values.httpRoute.hostnames }}
   {{ . }}
 {{- end }}

@@ -59,7 +59,7 @@
       {{- $hosts = append $hosts (dict "name" .host "field" "ingress.hosts") -}}
     {{- end -}}
   {{- end -}}
-  {{- if .Values.httpRoute.enabled -}}
+  {{- if and .Values.httpRoute.enabled (eq .Values.httpRoute.backend "trawld") -}}
     {{- range .Values.httpRoute.hostnames -}}
       {{- $hosts = append $hosts (dict "name" . "field" "httpRoute.hostnames") -}}
     {{- end -}}

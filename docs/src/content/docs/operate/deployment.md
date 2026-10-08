@@ -229,6 +229,26 @@ cluster.
    Choose the daemon API certificate separately using the section below.
    The default API certificate is self-signed.
 
+   On a cluster that routes through Gateway API, replace the `ingress` block
+   with an HTTPRoute. `backend: web` is the default and targets the same
+   `trawl-web` port:
+
+   ```yaml
+   httpRoute:
+     enabled: true
+     backend: web
+     parentRef:
+       name: public-gateway
+       namespace: gateway
+       sectionName: websecure
+     hostnames:
+       - trawl.example.com
+   ```
+
+   The gateway terminates browser TLS for that hostname. `backend: trawld`
+   routes to the HTTPS API instead, and the gateway then needs a
+   `BackendTLSPolicy` that trusts trawld's certificate.
+
 3. Install:
 
    ```bash
@@ -250,6 +270,11 @@ cluster.
    [verify the installation](#verify-the-installation), through
    `kubectl -n trawl port-forward svc/trawl 5514:5514` if port 5514 is not
    published.
+
+[Crash dumps](/reference/crash-dumps/) add `SYS_PTRACE` to the trawld
+container, which Pod Security `baseline` and `restricted` both refuse, so
+`crashDump.enabled` needs a namespace that allows it, in practice
+`privileged`.
 
 ### Configure the daemon API certificate
 

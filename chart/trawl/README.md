@@ -211,7 +211,8 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `ingress.annotations` | object | `{}` | Ingress annotations |
 | `ingress.hosts` | list | one host `trawl.local` with path `/` | Ingress host rules |
 | `ingress.tls` | list | `[]` | Ingress TLS entries |
-| `httpRoute.enabled` | bool | `false` | Create a Gateway API HTTPRoute to the trawld HTTPS port. The gateway needs a `BackendTLSPolicy` that trusts the backend certificate |
+| `httpRoute.enabled` | bool | `false` | Create a Gateway API HTTPRoute |
+| `httpRoute.backend` | string | `web` | `web` targets trawl-web over HTTP. `trawld` targets the HTTPS API, and the gateway needs a `BackendTLSPolicy` that trusts the backend certificate |
 | `httpRoute.parentRef.name` | string | `""` | Gateway name |
 | `httpRoute.parentRef.namespace` | string | `""` | Gateway namespace |
 | `httpRoute.parentRef.sectionName` | string | `websecure` | Gateway listener name |
@@ -288,7 +289,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `tls.upstreamServerName` | string | `""` | DNS name that trawl-web verifies in trawld's certificate while it connects over loopback. Required for `secret` with `web.enabled`. `certManager` defaults to the first `dnsNames` entry that is not a wildcard, and an explicit name must be covered by `dnsNames`. Wildcards and IP addresses are refused. Refused with `auto` |
 | `tls.upstreamCa` | string | `""` | CA that trawl-web trusts for trawld. Required for `secret` and `certManager` with `web.enabled`, with no default. `secret` pins `ca.crt` from the TLS Secret, `system` uses the platform roots, and an absolute path pins a CA file you mount. Refused with `auto` |
 | `auth.database.existingSecret` | string | `""` | Secret holding the Fleet DSN. Required |
-| `auth.database.existingSecretKey` | string | `DATABASE_URL` | Key in that Secret. Injected into `init-auth` as `DATABASE_URL` and into trawld as `FLEET_DATABASE_URL` |
+| `auth.database.existingSecretKey` | string | `DATABASE_URL` | Key in that Secret. Injected into `init-auth` as `DATABASE_URL`, and into trawld as `FLEET_DATABASE_URL` and as `DATABASE_URL` for in-pod `fleet-admin` |
 | `storage.database.existingSecret` | string | `""` | Secret holding the Trawl app-state DSN. Required |
 | `storage.database.existingSecretKey` | string | `TRAWL_DATABASE_URL` | Key in that Secret. Injected into trawld as `TRAWL_DATABASE_URL` |
 | `initAuth.enabled` | bool | `true` | Run `fleet-admin migrate` in an init container on every pod start |

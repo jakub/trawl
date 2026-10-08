@@ -84,6 +84,18 @@
         }
       }
     },
+    "httpRoute": {
+      "type": "object",
+      "properties": {
+        "backend": {
+          "type": "string",
+          "enum": [
+            "web",
+            "trawld"
+          ]
+        }
+      }
+    },
     "web": {
       "type": "object",
       "required": [

@@ -56,10 +56,15 @@ ingress:
   #      - trawl.local
 
 # -- Gateway API HTTPRoute (alternative to Ingress)
-# trawld speaks HTTPS natively — configure BackendTLSPolicy if your
-# gateway controller needs to trust the backend certificate.
+# When httpRoute.backend is "web" (default) the route targets the trawl-web
+# sidecar on plain HTTP, which serves the browser UI. Switch to "trawld" to
+# route the HTTPS API directly (for bearer-token API clients). Only then does
+# the gateway need a BackendTLSPolicy that trusts the backend certificate.
 httpRoute:
   enabled: false
+  # "web"    — browser UI via trawl-web sidecar (default)
+  # "trawld" — HTTPS API (the gateway must trust trawld's certificate)
+  backend: web
   parentRef:
     name: ""
     namespace: ""
@@ -98,7 +103,8 @@ persistence:
 # therefore changes nothing, since Baseline rejects this pod too. Enabling
 # crash dumps needs a namespace with no Pod Security enforcement, an exemption
 # for this workload, or an admission policy that permits SYS_PTRACE for it. The
-# kubernetes Pod Security Standards page carries both allowlists.
+# kubernetes Pod Security Standards page carries both allowlists. Capture works
+# under the default RuntimeDefault seccomp profile (podSecurityContext).
 #
 # The dump PVC is separate from the data PVC, so dumps stay out of data backups
 # and survive container restarts, pod reschedules, and node reboots. Off by
@@ -279,7 +285,9 @@ tls:
 # -- Fleet-auth PostgreSQL keystore
 # API keys and roles live in an external database shared across Fleet apps.
 # An existing Secret supplies DATABASE_URL to fleet-admin in the init-auth
-# container and FLEET_DATABASE_URL to trawld. The chart never renders the
+# container and FLEET_DATABASE_URL to trawld. The trawld container also gets
+# DATABASE_URL, for an operator's in-pod fleet-admin; trawld itself never
+# reads it. The chart never renders the
 # connection string into the ConfigMap. Provision the database
 # using https://trawl.sh/operate/deployment/#provision-the-databases and create keys
 # using https://trawl.sh/operate/access/#create-roles-and-keys.
@@ -516,6 +524,10 @@ podSecurityContext:
   runAsGroup: 1000
   fsGroup: 1000
   fsGroupChangePolicy: OnRootMismatch
+  # The container runtime's default filter, for every container in the pod.
+  # Pod Security Restricted requires it, and crash-dump capture works under it.
+  seccompProfile:
+    type: RuntimeDefault
 
 securityContext:
   readOnlyRootFilesystem: true

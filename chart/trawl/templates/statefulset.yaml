@@ -182,10 +182,17 @@ spec:
             - name: HOME
               value: /var/lib/trawl
             # Fleet keystore DSN — from the Secret, never the ConfigMap.
-            # trawld reads FLEET_DATABASE_URL. fleet-admin in the init
-            # container reads DATABASE_URL. See
+            # trawld reads FLEET_DATABASE_URL and never bare DATABASE_URL
+            # (ADR-0004). DATABASE_URL carries the same Secret key for
+            # fleet-admin, which reads only that name, so an operator can run
+            # it in this container. See
             # https://trawl.sh/operate/deployment/#provision-the-databases.
             - name: FLEET_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ required "auth.database.existingSecret is required (Secret holding the fleet keystore DSN)" .Values.auth.database.existingSecret }}
+                  key: {{ .Values.auth.database.existingSecretKey }}
+            - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ required "auth.database.existingSecret is required (Secret holding the fleet keystore DSN)" .Values.auth.database.existingSecret }}

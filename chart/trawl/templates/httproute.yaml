@@ -1,4 +1,20 @@
 {{- if .Values.httpRoute.enabled }}
+{{- $backend := .Values.httpRoute.backend | default "web" -}}
+{{- /*
+  HTTPRoute target port. A backendRef port is a number, so this renders the
+  same expressions service.yaml uses for the Service ports:
+   - "web"    → trawl-web sidecar on plain HTTP (service.webPort).
+   - "trawld" → HTTPS API (service.port). The gateway needs a
+                BackendTLSPolicy that trusts trawld's certificate.
+  values.schema.json limits the value too; the check here does not rely on
+  schema validation having run.
+*/ -}}
+{{- if not (has $backend (list "web" "trawld")) -}}
+{{-   fail (printf "httpRoute.backend=%v is not supported; set it to \"web\" or \"trawld\"" $backend) -}}
+{{- end -}}
+{{- if and (eq $backend "web") (not .Values.web.enabled) -}}
+{{-   fail "httpRoute.backend=web requires web.enabled=true; set httpRoute.backend to \"trawld\" or enable the web sidecar" -}}
+{{- end }}
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -17,5 +33,5 @@ spec:
   rules:
     - backendRefs:
         - name: {{ include "trawl.fullname" . }}
-          port: {{ .Values.service.port }}
+          port: {{ if eq $backend "web" }}{{ .Values.service.webPort | default 8090 }}{{ else }}{{ .Values.service.port }}{{ end }}
 {{- end }}

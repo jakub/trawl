@@ -131,6 +131,59 @@ assert_security_context_lines() {
   fi
 }
 
+# The Secret name and key one container's env var reads, as name/key, or
+# nothing when the container does not set it. Scoped like
+# container_security_context: the container's entry, then its env block, then
+# the variable's entry up to the next one.
+env_secret_ref() {
+  local manifest=$1
+  local container=$2
+  local var=$3
+  awk -v want="        - name: ${container}" -v var="            - name: ${var}" '
+    $0 == want { inside = 1; next }
+    inside && (/^        - name: / || /^      [^ ]/) { inside = 0 }
+    !inside { in_env = 0 }
+    inside && $0 == "          env:" { in_env = 1; next }
+    in_env && /^          [^ ]/ { in_env = 0 }
+    !in_env { in_var = 0 }
+    in_env && $0 == var { in_var = 1; next }
+    in_var && /^            - / { in_var = 0 }
+    in_var && /^                  name: / { name = $2 }
+    in_var && /^                  key: / { key = $2 }
+    END { if (name != "" || key != "") print name "/" key }
+  ' "$manifest"
+}
+
+assert_env_secret_ref() {
+  local expected=$1
+  local manifest=$2
+  local container=$3
+  local var=$4
+  local actual
+  actual=$(env_secret_ref "$manifest" "$container" "$var")
+  if [[ $actual != "$expected" ]]; then
+    echo "expected ${container} ${var} to read '${expected:-nothing}', found '${actual:-nothing}'" >&2
+    exit 1
+  fi
+}
+
+# The pod-level securityContext of a rendered StatefulSet: its six-space
+# key, up to the next six-space key.
+assert_pod_seccomp_runtime_default() {
+  local manifest=$1
+  local block
+  block=$(awk '
+    $0 == "      securityContext:" { inside = 1; next }
+    inside && /^      [^ ]/ { exit }
+    inside { print }
+  ' "$manifest")
+  if [[ $block != *$'\n        seccompProfile:\n          type: RuntimeDefault'* ]]; then
+    echo "expected the pod securityContext in ${manifest} to set seccompProfile.type RuntimeDefault:" >&2
+    echo "$block" >&2
+    exit 1
+  fi
+}
+
 enabled="$work_dir/enabled.yaml"
 render \
   --set persistence.enabled=true \
@@ -181,6 +234,9 @@ assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
 assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
   "$security_enabled" trawld
 assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_enabled" trawld
+# The capability does not cost the pod its RuntimeDefault seccomp filter;
+# capture is verified under it (ADR-0023, amended).
+assert_pod_seccomp_runtime_default "$security_enabled"
 for sidecar in init-auth init-tls-dir trawl-web; do
   assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
     "$security_enabled" "$sidecar"
@@ -200,6 +256,7 @@ assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
 assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
   "$security_disabled" trawld
 assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_disabled" trawld
+assert_pod_seccomp_runtime_default "$security_disabled"
 
 # The helper appends to whatever the operator put in securityContext, so a
 # capability they added survives and SYS_PTRACE is not added twice.
@@ -250,9 +307,72 @@ render "${web_enabled[@]}" \
 assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
   "value: \"${web_origin},http://localhost:8090\"" "$origins_sts"
 
+# -- ADR-0004: trawld reads FLEET_DATABASE_URL; fleet-admin reads DATABASE_URL --
+
+# Both names in the trawld container read the one Secret key, so the access
+# guide's fleet-admin commands run in that container. trawl-web gets no DSN.
+# Any key name works, and the variables do not depend on the init container.
+for case in default custom no-init-auth; do
+  dsn="$work_dir/dsn-${case}.yaml"
+  key=DATABASE_URL
+  extra=()
+  case $case in
+    custom) key=fleet-dsn; extra=(--set-string auth.database.existingSecretKey=fleet-dsn) ;;
+    no-init-auth) extra=(--set initAuth.enabled=false) ;;
+  esac
+  render "${web_enabled[@]}" "${extra[@]}" >"$dsn"
+  assert_env_secret_ref "fleet-db/${key}" "$dsn" trawld FLEET_DATABASE_URL
+  assert_env_secret_ref "fleet-db/${key}" "$dsn" trawld DATABASE_URL
+  assert_env_secret_ref "" "$dsn" trawl-web FLEET_DATABASE_URL
+  assert_env_secret_ref "" "$dsn" trawl-web DATABASE_URL
+  if [[ $case == no-init-auth ]]; then
+    assert_name_count 0 init-auth "$dsn"
+  else
+    assert_env_secret_ref "fleet-db/${key}" "$dsn" init-auth DATABASE_URL
+  fi
+done
+
+# -- httpRoute.backend mirrors ingress.backend ------------------------------
+
+# A backendRef port is a number, not a Service port name, so the route must
+# carry the same number service.yaml publishes for the chosen backend.
+assert_route_port() {
+  local expected=$1
+  shift
+  local route="$work_dir/route.yaml"
+  render_only httproute.yaml --set httpRoute.enabled=true "$@" >"$route"
+  local ports
+  ports=$(grep -E '^ +port: ' "$route" | sed -E 's/^ +port: //')
+  if [[ $ports != "$expected" ]]; then
+    echo "expected the HTTPRoute backendRef port ${expected}, found '${ports}'" >&2
+    cat "$route" >&2
+    exit 1
+  fi
+}
+assert_route_port 8090 "${web_enabled[@]}"
+assert_route_port 9090 "${web_enabled[@]}" --set service.webPort=9090
+assert_route_port 8090 "${web_enabled[@]}" --set httpRoute.backend=web
+assert_route_port 5514 --set httpRoute.backend=trawld
+assert_route_port 9443 "${web_enabled[@]}" --set httpRoute.backend=trawld --set service.port=9443
+
+assert_render_fails "httpRoute.backend=web without the web sidecar" \
+  'httpRoute.backend=web requires web.enabled=true' \
+  render_only httproute.yaml --set httpRoute.enabled=true
+# An unknown backend fails in the schema, and in the template itself when
+# schema validation is skipped.
+assert_render_fails "an unknown httpRoute.backend" \
+  'must be one of' \
+  render_only httproute.yaml "${web_enabled[@]}" --set httpRoute.enabled=true \
+  --set httpRoute.backend=api
+assert_render_fails "an unknown httpRoute.backend without schema validation" \
+  'httpRoute.backend=api is not supported; set it to "web" or "trawld"' \
+  render_only httproute.yaml "${web_enabled[@]}" --set httpRoute.enabled=true \
+  --set httpRoute.backend=api --skip-schema-validation
+
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"
+python3 "$chart/tests/pod_security.py"
 python3 "$chart/tests/operational-alerts.py"
 
 echo "helm render assertions passed"

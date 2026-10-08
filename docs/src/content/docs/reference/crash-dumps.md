@@ -77,9 +77,11 @@ replaces anything at that path that is not a directory on the next boot.
    `readiness` reads `ready`.
 
 Keep `trawld` as the container's first process. A wrapper in front of it drops
-the capability at its own exec, and the verdict reads `denied`. Neither
-built-in Pod Security profile admits `SYS_PTRACE`, so the namespace needs no
-enforcement, an exemption, or a policy of your own that allows the capability.
+the capability at its own exec, and the verdict reads `denied`. Pod Security
+`restricted` and `baseline` both refuse `SYS_PTRACE`, so in practice the
+namespace enforces `privileged`. An exemption, or a policy of your own that
+allows the capability, also works. Capture works under the chart's default
+`RuntimeDefault` seccomp profile.
 
 ### Find the dumps
 
