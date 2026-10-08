@@ -282,6 +282,9 @@ class PodSecurity(unittest.TestCase):
                 self.assertEqual(violations(metadata, spec), [])
                 self.assertEqual(spec["securityContext"]["seccompProfile"], {"type": "RuntimeDefault"})
         self.assertEqual(self.default[f"StatefulSet/{FULLNAME}"][2], ["data"])
+        # The sidecar's own /tmp (ADR-0052) is among the volumes checked above.
+        volumes = {v["name"]: v for v in self.default[f"StatefulSet/{FULLNAME}"][1]["volumes"]}
+        self.assertIn("emptyDir", volumes["web-tmp"])
 
     def test_crash_dumps_break_restricted_only_by_trawld_ptrace(self):
         label = f"StatefulSet/{FULLNAME}"
