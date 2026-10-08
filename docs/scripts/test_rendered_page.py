@@ -23,6 +23,14 @@ class EmptyMarkdown(unittest.TestCase):
         self.assertTrue(empty('<br>'))
         self.assertTrue(empty('<p><br><wbr></p>'))
 
+    def test_text_in_non_visible_elements_is_empty(self):
+        self.assertTrue(empty('<script>init()</script>'))
+        self.assertTrue(empty('<style>p { color: red }</style>'))
+        self.assertTrue(empty('<template><p>later</p><img src="a.png"></template>'))
+
+    def test_text_beside_a_script_is_content(self):
+        self.assertFalse(empty('<script>init()</script><p>Install the package.</p>'))
+
     def test_text_is_content(self):
         self.assertFalse(empty('<p>Install the package.</p>'))
 
