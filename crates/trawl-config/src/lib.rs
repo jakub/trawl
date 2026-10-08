@@ -859,9 +859,21 @@ pub struct SyslogConfig {
 
     /// Map source IPs to service names. Takes priority over APP-NAME/tag
     /// from the syslog message. Useful for appliances that don't set a
-    /// meaningful APP-NAME (e.g. `UniFi` consoles).
+    /// meaningful APP-NAME (e.g. `UniFi` consoles). Keys must be IP
+    /// addresses; trawl-server folds and checks them (ADR-0050).
     #[serde(default)]
     pub source_service_map: std::collections::HashMap<String, String>,
+
+    /// The zone a zone-less RFC 3164 timestamp is read in: `UTC`, an IANA
+    /// name, or a `±HH:MM` offset. Unset means UTC, never the host's zone
+    /// (ADR-0050). Held raw here; trawl-server parses it.
+    #[serde(default)]
+    pub default_timezone: Option<String>,
+
+    /// Per-peer overrides of `default_timezone`, keyed by the exact peer
+    /// IP address, folded and checked like `source_service_map`.
+    #[serde(default)]
+    pub sender_timezones: std::collections::HashMap<String, String>,
 
     /// Channel capacity for the event queue between listeners and batcher.
     /// Increase for high-volume syslog deployments. Default: 10,000.
@@ -929,6 +941,8 @@ impl Default for SyslogConfig {
             default_service: "syslog".to_owned(),
             allow_cidrs: Vec::new(),
             source_service_map: std::collections::HashMap::new(),
+            default_timezone: None,
+            sender_timezones: std::collections::HashMap::new(),
             channel_capacity: DEFAULT_SYSLOG_CHANNEL_CAPACITY,
         }
     }
@@ -1605,6 +1619,22 @@ fn validate_max_catchup_intervals(intervals: u32) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Settings keyed by a peer address. An error inside one names the map and
+/// never the key, because the key is configuration too (ADR-0047).
+const PEER_KEYED_SETTINGS: [&str; 2] = ["syslog.sender_timezones", "syslog.source_service_map"];
+
+/// Cut a setting path inside a [`PEER_KEYED_SETTINGS`] map back to the map.
+fn without_peer_key(setting: String) -> String {
+    PEER_KEYED_SETTINGS
+        .into_iter()
+        .find(|map| {
+            setting
+                .strip_prefix(map)
+                .is_some_and(|rest| rest.starts_with('.'))
+        })
+        .map_or(setting, str::to_owned)
+}
+
 impl Config {
     /// Parse the current TOML schema with value-free error diagnostics.
     ///
@@ -1628,7 +1658,7 @@ impl Config {
             {
                 format!("{}.{field}", e.path())
             } else {
-                e.path().to_string()
+                without_peer_key(e.path().to_string())
             },
             reason: if e.inner().message().starts_with("unknown field") {
                 "unknown setting"
@@ -1927,10 +1957,15 @@ impl Config {
         if !is_valid_service_name(&self.syslog.default_service) {
             return Err(invalid("syslog.default_service".to_owned()));
         }
-        for (ip, service) in &self.syslog.source_service_map {
-            if !is_valid_service_name(service) {
-                return Err(invalid(format!("syslog.source_service_map[{ip:?}]")));
-            }
+        // The map is named without its key: a peer address is
+        // configuration too, and error text carries no values (ADR-0047).
+        if !self
+            .syslog
+            .source_service_map
+            .values()
+            .all(|service| is_valid_service_name(service))
+        {
+            return Err(invalid("syslog.source_service_map".to_owned()));
         }
 
         Ok(())
@@ -3591,12 +3626,18 @@ enabled = true
         let err = with_syslog(
             r#"
 [syslog.source_service_map]
-"192.168.1.1" = "Living Room AP"
+"192.0.2.250" = "Living Room AP"
 "#,
         )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("syslog.source_service_map"), "got: {err}");
+        .unwrap_err();
+        let shown = err.to_string();
+        assert!(shown.contains("syslog.source_service_map"), "got: {shown}");
+        for text in [shown, format!("{err:?}")] {
+            assert!(
+                !text.contains("192.0.2.250") && !text.contains("Living Room"),
+                "the key and the value stay out of the error: {text}"
+            );
+        }
 
         with_syslog(
             r#"
@@ -3607,6 +3648,77 @@ default_service = "syslog"
 "#,
         )
         .expect("valid syslog service names must load");
+    }
+
+    /// The zone keys are raw strings here; trawl-server parses and folds
+    /// them (ADR-0050). Unset means UTC, which this crate spells `None`.
+    #[test]
+    fn syslog_timezone_keys_parse_and_default_to_unset() {
+        let config = Config::from_toml("[server]\n[data]\npath = \"/data\"\n").unwrap();
+        assert_eq!(config.syslog.default_timezone, None);
+        assert!(config.syslog.sender_timezones.is_empty());
+
+        let config = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[syslog]
+default_timezone = "America/Chicago"
+
+[syslog.sender_timezones]
+"192.0.2.10" = "Europe/Warsaw"
+"2001:db8::1" = "+05:30"
+"::ffff:192.0.2.11" = "UTC"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.syslog.default_timezone.as_deref(),
+            Some("America/Chicago")
+        );
+        let zones = &config.syslog.sender_timezones;
+        assert_eq!(zones.len(), 3);
+        assert_eq!(zones["192.0.2.10"], "Europe/Warsaw");
+        assert_eq!(zones["2001:db8::1"], "+05:30");
+        assert_eq!(zones["::ffff:192.0.2.11"], "UTC");
+
+        let err = Config::from_toml(
+            "[server]\n[data]\npath = \"/data\"\n[syslog]\ndefault_timezon = \"UTC\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("syslog.default_timezon"), "got: {err}");
+        assert!(err.contains("unknown setting"), "got: {err}");
+    }
+
+    /// A wrong-typed value inside a peer-keyed map names the map, never
+    /// the key: a peer address is configuration too (ADR-0047).
+    #[test]
+    fn syslog_peer_keyed_errors_name_the_map_not_the_key() {
+        for map in ["sender_timezones", "source_service_map"] {
+            let err = Config::from_toml(&format!(
+                "[server]\n[data]\npath = \"/data\"\n[syslog.{map}]\n\"198.51.100.77\" = 5\n"
+            ))
+            .unwrap_err();
+            let shown = err.to_string();
+            assert!(
+                shown.contains(&format!("at syslog.{map} in")),
+                "{map}: {shown}"
+            );
+            for text in [shown, format!("{err:?}")] {
+                assert!(!text.contains("198.51.100.77"), "{map}: {text}");
+            }
+        }
+        // A setting that merely shares the prefix is not cut.
+        assert_eq!(
+            without_peer_key("syslog.sender_timezones_x".to_owned()),
+            "syslog.sender_timezones_x"
+        );
+        assert_eq!(
+            without_peer_key("syslog.sender_timezones.10.0.0.1".to_owned()),
+            "syslog.sender_timezones"
+        );
     }
 
     /// A TCP sender under backpressure waits for hot-buffer space instead

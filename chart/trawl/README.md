@@ -273,6 +273,8 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.syslog.maxEventsPerConnection` | int | `100000` | `[syslog] max_events_per_connection` |
 | `config.syslog.allowCidrs` | list | `[]` | `[syslog] allow_cidrs` |
 | `config.syslog.sourceServiceMap` | map | `{}` | `[syslog] source_service_map`, source IP to service name |
+| `config.syslog.defaultTimezone` | string | `""` | `[syslog] default_timezone`. Empty means UTC |
+| `config.syslog.senderTimezones` | map | `{}` | `[syslog] sender_timezones`, peer IP to zone |
 | `config.syslog.channelCapacity` | int | `10000` | `[syslog] channel_capacity` |
 | `config.scheduler.enabled` | bool | `true` | `[scheduler] enabled` |
 | `config.scheduler.pollIntervalSecs` | int | `10` | `[scheduler] poll_interval_secs` |

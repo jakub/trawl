@@ -38,6 +38,9 @@ blake3 = "1.8"
 brotli = "8"
 chacha20poly1305 = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Syslog reads zone-less time in an IANA zone (ADR-0050). The default
+# features compile the zone database in, so no host needs tzdata.
+chrono-tz = "0.10.4"
 cookie = "0.18"
 chumsky = "0.13"
 clap = { version = "4", features = ["derive", "env"] }

@@ -377,6 +377,7 @@ fn the_syslog_profile_survives_hostile_frames_and_payloads() {
         default_env: ENV.into(),
         trusted_relays: Vec::new().into(),
         derivation: Arc::clone(&derivation),
+        zones: Arc::default(),
     };
     let source_service_map: HashMap<String, String> = HashMap::new();
     let mut rng = Rng::new(SEED);

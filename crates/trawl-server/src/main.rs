@@ -266,6 +266,12 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             e
         })?,
     );
+    // The syslog peer settings resolve on the same boundary and under the
+    // contract `--check-config` and the doctor run (ADR-0050), whether or
+    // not the listener is enabled, so a fault there never waits for the
+    // day someone turns syslog on.
+    let syslog_peers = trawl_server::syslog::SyslogPeers::resolve(&config.syslog)
+        .inspect_err(|e| eprintln!("[trawld] {e} — refusing to start"))?;
 
     let Tracing {
         telemetry,
@@ -439,25 +445,24 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         // Everything the listeners need to reach the one canonicalizer.
         // The env allowlist, the relay CIDRs and the derivation policy all
-        // live on `IngestState`, resolved boot-fatally there.
+        // live on `IngestState`, resolved boot-fatally there; the per-peer
+        // zones come from the syslog peer settings resolved at boot.
         let door = Arc::new(trawl_server::syslog::convert::SyslogDoor {
             envs: Arc::clone(&state.ingest.envs),
             default_env: Arc::clone(&state.ingest.default_env),
             trusted_relays: Arc::clone(&state.ingest.trusted_relays),
             derivation: Arc::clone(&state.ingest.derivation),
+            zones: Arc::new(syslog_peers.zones.clone()),
         });
         let handles = trawl_server::syslog::spawn_syslog(
             &config.syslog,
+            &syslog_peers,
             door,
             Arc::clone(state.ingest.pipeline.as_ref().expect("ingest enabled")),
             std::time::Duration::from_secs(config.ingest.compaction_interval_secs),
             state.ingest.syslog_stats.clone(),
             shutdown_rx,
-        )
-        .map_err(|e| {
-            tracing::error!(event_type = "config_error", error = %e, "syslog config rejected — refusing to start");
-            e
-        })?;
+        );
         tracing::info!(
             event_type = "lifecycle",
             udp = config.syslog.udp_enabled,

@@ -419,6 +419,7 @@ mod tests {
             default_env: "prod".into(),
             trusted_relays: Vec::new().into(),
             derivation: Arc::new(crate::ingest::producer::Derivation::defaults()),
+            zones: Arc::default(),
         }
     }
 

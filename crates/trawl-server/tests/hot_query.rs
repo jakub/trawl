@@ -407,6 +407,7 @@ async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgP
         default_env: "prod".into(),
         trusted_relays: Vec::new().into(),
         derivation: Arc::new(Derivation::defaults()),
+        zones: Arc::default(),
     };
     let raw = r#"<165>1 2026-02-15T12:00:00Z web01 app 1234 ID47 [exampleSDID@32473 eventID="1011"] boom"#;
     let event = door

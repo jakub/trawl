@@ -19,7 +19,8 @@ trawld --check-config --config /etc/trawl/trawld.toml
 
 Check mode requires an explicit `--config` path or `TRAWL_CONFIG`. It checks
 TOML syntax, supported setting names and types, config constraints, ingest
-derivation settings, and the presence of both database URLs. It exits with
+derivation settings, the syslog peer settings, and the presence of both
+database URLs. It exits with
 code 0 for valid configuration or a nonzero code for an error.
 
 Check mode does not connect to databases, bind listeners, generate keys or
@@ -28,9 +29,9 @@ verify database credentials, network reachability, certificate contents, or
 filesystem permissions. Environment overrides apply as they do at startup.
 
 All typed sections reject unknown settings, including nested sections.
-Dynamic tables such as `retention.env.<name>` and `syslog.source_service_map`
-accept operator-defined names; each retention entry still requires supported
-fields. Error messages identify the setting path without printing its value
+Dynamic tables such as `retention.env.<name>`, `syslog.source_service_map`, and
+`syslog.sender_timezones` accept operator-defined names; each retention entry
+still requires supported fields, and each syslog key must be an IP address. Error messages identify the setting path without printing its value
 or the surrounding configuration text.
 
 ### Check the installation with `trawld --doctor`
@@ -692,8 +693,10 @@ mapping is in [the event contract](/reference/events/#syslog-listener-fields).
 | `default_service` | string | `"syslog"` | Service name used when no APP-NAME and no source-IP mapping applies |
 | `tcp_idle_timeout_secs` | integer | `60` | Close a TCP connection that sends no data for this long |
 | `max_events_per_connection` | integer | `100000` | Events accepted from one TCP connection before it is closed |
-| `allow_cidrs` | string array | `[]` | Source IP allowlist in CIDR notation. An empty list accepts every source IP |
+| `allow_cidrs` | string array | `[]` | Source IP allowlist in CIDR notation. An empty list accepts every source IP. A malformed entry refuses to start |
 | `source_service_map` | map | `{}` | Source IP to service name. Takes priority over the frame's APP-NAME |
+| `default_timezone` | string | *(none)* | Zone for an RFC 3164 timestamp that carries no offset. Unset means `UTC` |
+| `sender_timezones` | map | `{}` | Source IP to zone. Overrides `default_timezone` for that peer |
 | `channel_capacity` | integer | `10000` | Event queue capacity between the listeners and the batcher |
 
 ```toml
@@ -703,17 +706,28 @@ udp_addr = "0.0.0.0:1514"
 tcp_addr = "0.0.0.0:1514"
 allow_cidrs = ["192.0.2.0/24", "198.51.100.0/24"]
 default_service = "syslog"
+default_timezone = "UTC"
 
 [syslog.source_service_map]
 "192.0.2.1" = "firewall"
 "192.0.2.10" = "unifi"
+
+[syslog.sender_timezones]
+"192.0.2.1" = "America/Chicago"
+"2001:db8::10" = "+05:30"
 ```
 
 Notes:
 
 - A UDP source IP can be spoofed on the local network, so `allow_cidrs` is not authentication for UDP traffic.
 - A bare IP in `allow_cidrs` counts as `/32` for IPv4 and `/128` for IPv6. Peer addresses canonicalize before matching, so write v4 intent in v4 form. A v6 entry wide enough to cover the mapped range, such as `::/0` or `::ffff:0:0/95`, admits every v4 peer.
-- IP-shaped keys in `source_service_map` canonicalize at load, so a mapped spelling and its v4 form are one key, and two spellings naming different services refuse to start.
+- Keys in `source_service_map` and `sender_timezones` must be IP addresses. A key is one exact peer address, never a CIDR range. Boot, `trawld --check-config`, and the doctor's `server.config` check all fold each key to its canonical peer address, so a mapped spelling such as `::ffff:192.0.2.1` and its v4 form are one key. Two spellings with the same value collapse to one entry. A key that is not an IP address, or two spellings with different values, refuses to start.
+- A zone is exactly `UTC`, a fixed offset `±HH:MM` such as `+05:30` or `-03:00`, or an IANA name such as `Europe/Warsaw`. A zero offset is stored as `UTC`. An IANA name must contain a `/` and is case-sensitive, so `utc` and `europe/warsaw` are refused. `local`, single-word names such as `EST`, `CET`, and `Zulu`, and POSIX TZ strings such as `EST5EDT` are refused.
+- `Etc/GMT±N` names are accepted, but IANA inverts their sign: `Etc/GMT-5` is UTC+5. Write `+05:00` instead.
+- A link name such as `US/Central` is recorded as written. The zone rules are compiled into trawld, so a rule change arrives with a trawld upgrade.
+- The zone applies only to RFC 3164 timestamps that carry no offset. An offset on the wire always wins. [The event contract](/reference/events/#time-derivation) gives the year and daylight-saving rules.
+- The `sender_timezones` key is the transport peer. A relay's entry applies to every frame the relay forwards, whatever the frame's hostname says, and `trusted_relays` does not change that. A relay that forwards senders from several zones must send RFC 5424 with offsets.
+- trawld checks these settings even when `enabled = false`. Error messages name the setting and the reason, never the key or the value.
 - The listener needs `[ingest] enabled = true`. With ingest off, trawld logs a warning and disables syslog.
 
 ### `[web]`

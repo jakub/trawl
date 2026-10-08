@@ -7,8 +7,9 @@
 //! This module builds no envelope. It owns exactly what the transport
 //! proves: the service the frame belongs to, the host it came from, the
 //! message body, and the parse artifacts (`syslog_severity`,
-//! `syslog_timestamp`, `syslog_facility`, `syslog_pid`, `syslog_msgid`,
-//! `syslog_source_ip`, the `sd_*` structured-data pairs). It hands them
+//! `syslog_timestamp`, `syslog_timestamp_zone`, `syslog_facility`,
+//! `syslog_pid`, `syslog_msgid`, `syslog_source_ip`, the `sd_*`
+//! structured-data pairs). It hands them
 //! to [`crate::ingest::envelope::canonicalize`] as an ordinary payload
 //! under the `syslog` profile (ADR-0013).
 //!
@@ -31,11 +32,12 @@ use std::hash::BuildHasher;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
-use syslog_loose::Message;
 
 use super::batch::SyslogEvent;
+use super::parse::ParsedFrame;
+use super::zone::SyslogZones;
 use super::{CidrEntry, parse};
 use crate::ingest::envelope::{self, EnvelopeContext, RepairCode};
 use crate::ingest::pipeline;
@@ -43,6 +45,10 @@ use crate::ingest::producer::{
     self, Asserted, Derivation, Producer, ProducerKind, SYSLOG_SEVERITY_FIELD,
     SYSLOG_TIMESTAMP_FIELD,
 };
+
+/// The artifact naming the zone a zone-less timestamp was read in
+/// (ADR-0050). An annotation, not a repair: no sender-visible value changed.
+pub const SYSLOG_TIMESTAMP_ZONE_FIELD: &str = "syslog_timestamp_zone";
 
 /// Maximum number of RFC 5424 structured data elements to extract.
 const MAX_SD_ELEMENTS: usize = 32;
@@ -126,7 +132,7 @@ const fn severity_numeral(sev: syslog_loose::SyslogSeverity) -> u8 {
     }
 }
 
-/// Convert a parsed syslog message into a door-facing payload.
+/// Convert a parsed syslog frame into a door-facing payload.
 ///
 /// `raw` is the pre-parse wire line — the most original form available —
 /// and is proposed as `_raw`. `peer_is_trusted_relay` decides the
@@ -134,12 +140,13 @@ const fn severity_numeral(sev: syslog_loose::SyslogSeverity) -> u8 {
 /// wrong, so the event is kept with no `host` at all.
 pub fn syslog_to_payload<S: BuildHasher>(
     raw: &str,
-    msg: &Message<&str>,
+    frame: &ParsedFrame<'_>,
     source_ip: IpAddr,
     peer_is_trusted_relay: bool,
     source_service_map: &HashMap<String, String, S>,
     default_service: &str,
 ) -> SyslogPayload {
+    let msg = &frame.msg;
     let mut map = Map::new();
     let mut repairs = Vec::new();
 
@@ -178,7 +185,8 @@ pub fn syslog_to_payload<S: BuildHasher>(
     // the profile's fixed `_time` source can read it. Omitted when the
     // frame carried none: substituting `Utc::now()` here would make an
     // absent frame timestamp indistinguishable from a present one and hide
-    // `time.from_ingest` from `_repairs`.
+    // `time.from_ingest` from `_repairs`. A zone-less wall time in a
+    // spring-forward gap names no instant, so it is omitted too.
     if let Some(ts) = msg.timestamp {
         map.insert(
             SYSLOG_TIMESTAMP_FIELD.into(),
@@ -187,6 +195,12 @@ pub fn syslog_to_payload<S: BuildHasher>(
                     .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
             ),
         );
+    }
+    // The zone a zone-less timestamp was read in, gap included, so a query
+    // can tell which zone an event was read in after the configuration
+    // moves on (ADR-0013 ruling 6). A wire offset writes none.
+    if let Some(zone) = frame.read_in {
+        map.insert(SYSLOG_TIMESTAMP_ZONE_FIELD.into(), json!(zone.to_string()));
     }
 
     if let Some(facility) = parse::facility_to_str(msg.facility) {
@@ -233,8 +247,9 @@ pub fn syslog_to_payload<S: BuildHasher>(
 /// no handle on server state: the env allowlist and `default_env` come
 /// from `[ingest]` (the listener asserts a boot-validated env, so
 /// `env.defaulted` can never fire for it), `trusted_relays` is the same
-/// boot-parsed CIDR list the HTTP door consults, and `derivation` is the
-/// one resolved source policy every profile shares.
+/// boot-parsed CIDR list the HTTP door consults, `derivation` is the
+/// one resolved source policy every profile shares, and `zones` is the
+/// boot-resolved per-peer syslog zone.
 #[derive(Debug)]
 pub struct SyslogDoor {
     /// The effective env allowlist (never empty).
@@ -245,6 +260,8 @@ pub struct SyslogDoor {
     pub trusted_relays: Arc<[CidrEntry]>,
     /// The boot-resolved per-profile derivation policy.
     pub derivation: Arc<Derivation>,
+    /// The zone each peer's zone-less timestamps are read in.
+    pub zones: Arc<SyslogZones>,
 }
 
 impl SyslogDoor {
@@ -264,8 +281,32 @@ impl SyslogDoor {
         default_service: &str,
         transport: &'static str,
     ) -> Option<SyslogEvent> {
-        let arrival_instant = Utc::now();
-        let parsed = parse::parse_syslog(raw, arrival_instant);
+        self.admit_at(
+            raw,
+            source_ip,
+            Utc::now(),
+            source_service_map,
+            default_service,
+            transport,
+        )
+    }
+
+    /// [`Self::admit`] at a given arrival instant. The arrival picks a
+    /// year-less timestamp's year and a fall-back overlap's instant, and is
+    /// the event's time when the frame's own does not resolve.
+    fn admit_at<S: BuildHasher>(
+        &self,
+        raw: &str,
+        source_ip: IpAddr,
+        arrival_instant: DateTime<Utc>,
+        source_service_map: &HashMap<String, String, S>,
+        default_service: &str,
+        transport: &'static str,
+    ) -> Option<SyslogEvent> {
+        // The transport peer alone picks the zone: never the frame's
+        // hostname, and a relay's entry covers everything it forwards.
+        let zone = self.zones.for_peer(source_ip);
+        let parsed = parse::parse_syslog(raw, arrival_instant, zone);
         // Membership, not `is_allowed`: an empty relay list means "no
         // relays configured", the exact opposite of the empty CIDR
         // allowlist's "everything is allowed". Same predicate the HTTP
@@ -327,6 +368,7 @@ mod tests {
             default_env: "prod".into(),
             trusted_relays: Vec::new().into(),
             derivation: Arc::new(Derivation::defaults()),
+            zones: Arc::default(),
         }
     }
 
@@ -517,7 +559,7 @@ mod tests {
         // becomes a future event for part of the year and earns a repair.
         let raw = format!(
             "<134>{} web01 nginx: GET /",
-            chrono::Local::now().format("%b %e %H:%M:%S")
+            Utc::now().format("%b %e %H:%M:%S")
         );
         let lab = SyslogDoor {
             default_env: "lab".into(),
@@ -582,6 +624,232 @@ mod tests {
         let event = admit("<13>no timestamp here", "10.0.0.1");
         assert!(!event.map.contains_key(SYSLOG_TIMESTAMP_FIELD));
         assert!(repairs(&event).contains(&"time.from_ingest"));
+    }
+
+    fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
+        chrono::NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_opt(h, mi, 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    fn stamp(instant: DateTime<Utc>) -> String {
+        instant.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    }
+
+    /// The door with the peers a `[syslog]` table resolves to, through the
+    /// boot contract, and `relays` as `ingest.trusted_relays`.
+    fn zoned_door(syslog: &str, relays: &[&str]) -> SyslogDoor {
+        let config: crate::config::SyslogConfig = toml::from_str(syslog).unwrap();
+        let peers = super::super::SyslogPeers::resolve(&config).unwrap();
+        SyslogDoor {
+            trusted_relays: relays
+                .iter()
+                .map(|cidr| super::super::parse_cidr(cidr).unwrap())
+                .collect::<Vec<_>>()
+                .into(),
+            zones: Arc::new(peers.zones),
+            ..door()
+        }
+    }
+
+    fn admit_from(door: &SyslogDoor, raw: &str, peer: &str, arrival: DateTime<Utc>) -> SyslogEvent {
+        let peer = super::super::canonical_peer(peer.parse().unwrap());
+        door.admit_at(raw, peer, arrival, &HashMap::new(), "syslog", "udp")
+            .expect("the syslog profile must not reject")
+    }
+
+    const CHICAGO_PEER: &str = r#"
+[sender_timezones]
+"192.0.2.10" = "America/Chicago"
+"#;
+
+    #[test]
+    fn zone_less_3164_reads_in_configured_zone() {
+        let door = zoned_door(CHICAGO_PEER, &[]);
+        // (frame, arrival, the instant Chicago's wall clock denotes).
+        let cases = [
+            // Winter: CST, -06:00.
+            (
+                "<13>Jan 15 12:00:00 host app: x",
+                at(2026, 1, 15, 20, 0),
+                at(2026, 1, 15, 18, 0),
+            ),
+            (
+                "<13>Jan 15 2026 12:00:00 host app: x",
+                at(2026, 1, 15, 20, 0),
+                at(2026, 1, 15, 18, 0),
+            ),
+            // Summer: CDT, -05:00.
+            (
+                "<13>Jul 15 12:00:00 host app: x",
+                at(2026, 7, 15, 20, 0),
+                at(2026, 7, 15, 17, 0),
+            ),
+            (
+                "<13>Jul 15 2026 12:00:00 host app: x",
+                at(2026, 7, 15, 20, 0),
+                at(2026, 7, 15, 17, 0),
+            ),
+        ];
+        for (raw, arrival, expected) in cases {
+            let event = admit_from(&door, raw, "192.0.2.10", arrival);
+            assert_eq!(event.map[SYSLOG_TIMESTAMP_FIELD], stamp(expected), "{raw}");
+            assert_eq!(event.map["_time"], stamp(expected), "{raw}");
+            assert_eq!(
+                event.map[SYSLOG_TIMESTAMP_ZONE_FIELD], "America/Chicago",
+                "{raw}"
+            );
+        }
+    }
+
+    /// The zone is chosen by the canonical transport peer and nothing
+    /// else: not the frame's hostname, and not the relay check.
+    #[test]
+    fn sender_timezone_matches_canonical_peer_only() {
+        let door = zoned_door(
+            r#"
+default_timezone = "-03:00"
+
+[sender_timezones]
+"192.0.2.10" = "America/Chicago"
+"::ffff:192.0.2.11" = "Asia/Kolkata"
+"2001:db8::1" = "Europe/Warsaw"
+"192.0.2.12" = "+05:30"
+"#,
+            &["192.0.2.12/32"],
+        );
+        let arrival = at(2026, 1, 15, 20, 0);
+        // (peer, frame hostname, the zone it is read in, the instant).
+        let cases = [
+            // An IPv4 key.
+            (
+                "192.0.2.10",
+                "host",
+                "America/Chicago",
+                at(2026, 1, 15, 18, 0),
+            ),
+            // A `::ffff:` key, reached by the v4 peer and by the mapped
+            // spelling a dual-stack listener canonicalizes.
+            ("192.0.2.11", "host", "Asia/Kolkata", at(2026, 1, 15, 6, 30)),
+            (
+                "::ffff:192.0.2.11",
+                "host",
+                "Asia/Kolkata",
+                at(2026, 1, 15, 6, 30),
+            ),
+            // An IPv6 key: Warsaw is +01:00 in winter.
+            (
+                "2001:db8::1",
+                "host",
+                "Europe/Warsaw",
+                at(2026, 1, 15, 11, 0),
+            ),
+            // A hostname naming another mapped peer changes nothing.
+            (
+                "198.51.100.5",
+                "192.0.2.10",
+                "-03:00",
+                at(2026, 1, 15, 15, 0),
+            ),
+            // A trusted relay uses its own entry, whatever it forwards.
+            ("192.0.2.12", "192.0.2.10", "+05:30", at(2026, 1, 15, 6, 30)),
+            // An unlisted peer gets the default.
+            ("198.51.100.5", "host", "-03:00", at(2026, 1, 15, 15, 0)),
+        ];
+        for (peer, hostname, zone, expected) in cases {
+            let raw = format!("<13>Jan 15 12:00:00 {hostname} app: x");
+            let event = admit_from(&door, &raw, peer, arrival);
+            assert_eq!(
+                event.map[SYSLOG_TIMESTAMP_ZONE_FIELD], zone,
+                "{peer} {hostname}"
+            );
+            assert_eq!(
+                event.map[SYSLOG_TIMESTAMP_FIELD],
+                stamp(expected),
+                "{peer} {hostname}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_offset_wins_over_sender_zone() {
+        let door = zoned_door(CHICAGO_PEER, &[]);
+        let arrival = at(2026, 2, 15, 20, 0);
+        for (raw, expected) in [
+            (
+                "<165>1 2026-02-15T12:00:00+05:30 web01 app 1234 ID47 - boom",
+                at(2026, 2, 15, 6, 30),
+            ),
+            (
+                "<13>2026-02-15T12:00:00Z web01 app: boom",
+                at(2026, 2, 15, 12, 0),
+            ),
+        ] {
+            let event = admit_from(&door, raw, "192.0.2.10", arrival);
+            assert_eq!(event.map[SYSLOG_TIMESTAMP_FIELD], stamp(expected), "{raw}");
+            assert!(
+                !event.map.contains_key(SYSLOG_TIMESTAMP_ZONE_FIELD),
+                "{raw}: a wire offset is not read in a zone"
+            );
+        }
+    }
+
+    /// A spring-forward gap wall time names no instant. The frame keeps
+    /// every other field, and with the default `time_from` chain the event
+    /// takes its arrival with `time.from_ingest`.
+    #[test]
+    fn dst_gap_keeps_frame_fields_and_falls_to_arrival() {
+        let door = zoned_door(CHICAGO_PEER, &[]);
+        let arrival = at(2026, 3, 8, 18, 0);
+        let event = admit_from(
+            &door,
+            "<13>Mar  8 02:30:00 gw01 sshd[42]: x",
+            "192.0.2.10",
+            arrival,
+        );
+        assert!(!event.map.contains_key(SYSLOG_TIMESTAMP_FIELD));
+        assert_eq!(event.map["_time"], stamp(arrival));
+        assert!(repairs(&event).contains(&"time.from_ingest"));
+        assert_eq!(event.map[SYSLOG_TIMESTAMP_ZONE_FIELD], "America/Chicago");
+        assert_eq!(event.map[SYSLOG_SEVERITY_FIELD], 5);
+        assert_eq!(event.map["syslog_facility"], "user");
+        assert_eq!(event.map["host"], "gw01");
+        assert_eq!(event.service, "sshd");
+        assert_eq!(event.map["syslog_pid"], "42");
+        assert_eq!(event.map["message"], "x");
+    }
+
+    /// Reading a zone-less time in the configured zone changes no
+    /// sender-visible value, so it earns no repair (ADR-0013 §8), and the
+    /// artifact holds the normalized zone.
+    #[test]
+    fn syslog_timestamp_zone_is_an_annotation_not_a_repair() {
+        let door = zoned_door(
+            r#"
+[sender_timezones]
+"192.0.2.10" = "America/Chicago"
+"192.0.2.20" = "+00:00"
+"192.0.2.21" = "-04:30"
+"#,
+            &[],
+        );
+        let arrival = at(2026, 1, 15, 20, 0);
+        for (peer, zone) in [
+            ("192.0.2.10", "America/Chicago"),
+            ("192.0.2.20", "UTC"),
+            ("192.0.2.21", "-04:30"),
+            ("198.51.100.5", "UTC"),
+        ] {
+            let event = admit_from(&door, "<13>Jan 15 12:00:00 host app: x", peer, arrival);
+            assert_eq!(event.map[SYSLOG_TIMESTAMP_ZONE_FIELD], zone, "{peer}");
+            assert!(
+                !event.map.contains_key("_repairs"),
+                "{peer}: {:?}",
+                event.map.get("_repairs")
+            );
+        }
     }
 
     /// The `_raw` cap is the door's, and it reaches syslog.

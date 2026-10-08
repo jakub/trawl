@@ -230,6 +230,16 @@ config:
     # sourceServiceMap:
     #   "10.0.0.1": "unifi-gateway"
     #   "10.0.0.2": "unifi-ap"
+    # Zone for RFC 3164 timestamps that carry no offset. Empty means UTC.
+    # A value is UTC, an IANA name such as "Europe/Warsaw", or "+05:30".
+    # An offset on the wire always wins.
+    defaultTimezone: ""
+    # Per-peer zones: exact peer IP -> zone. Overrides defaultTimezone.
+    # A relay's entry applies to everything it forwards.
+    senderTimezones: {}
+    # senderTimezones:
+    #   "10.0.0.1": "America/Chicago"
+    #   "2001:db8::1": "Europe/Warsaw"
     channelCapacity: 10000
 
   scheduler:

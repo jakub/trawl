@@ -215,8 +215,9 @@ reads the syslog frame. It does not parse fields inside the vendor's message
 text, such as a rule name, and those stay in `message`.
 
 1. Enable the listener in `/etc/trawl/trawld.toml`. Set `allow_cidrs` to the
-   appliance's address, and map that address to a service name in
-   `source_service_map`:
+   appliance's address, map that address to a service name in
+   `source_service_map`, and set `default_timezone` to the zone of the
+   appliance's clock:
 
    <!-- proof:syslog-config -->
    ```toml
@@ -226,10 +227,18 @@ text, such as a rule name, and those stay in `message`.
    tcp_addr = "0.0.0.0:1514"
    allow_cidrs = ["192.0.2.1/32"]
    default_service = "syslog"
+   default_timezone = "UTC"
 
    [syslog.source_service_map]
    "192.0.2.1" = "firewall"
    ```
+
+   Many appliances send RFC 3164 timestamps in local time with no offset.
+   trawld reads such a timestamp in `default_timezone`, or in UTC when it is
+   unset, never in the zone of the trawld host. If the appliance's clock is
+   not on UTC, set its zone, such as `"Europe/Warsaw"`. To give one peer its
+   own zone, add a `[syslog.sender_timezones]` table. An offset on the wire
+   always wins.
 
    An empty `allow_cidrs` accepts every peer. `allow_cidrs` is not
    authentication. A UDP sender can forge its source address, and the

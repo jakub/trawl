@@ -169,6 +169,46 @@ fn config_check_rejects_errors_without_echoing_config_values() {
     }
 }
 
+/// The syslog peer settings are checked with the listener disabled, and a
+/// refusal names the setting without the value (ADR-0050, ADR-0047).
+#[test]
+fn check_config_refuses_syslog_peer_faults() {
+    for (syslog, setting) in [
+        (
+            "default_timezone = 'PRIVATE/SECRET'\n",
+            "invalid setting at syslog.default_timezone:",
+        ),
+        (
+            "[syslog.sender_timezones]\n'192.0.2.200' = 'PRIVATE-SECRET'\n",
+            "invalid setting at syslog.sender_timezones:",
+        ),
+        (
+            "[syslog.source_service_map]\n'192.0.2.200' = 'private-secret-a'\n\
+             '::ffff:192.0.2.200' = 'private-secret-b'\n",
+            "invalid setting at syslog.source_service_map: two keys name one peer",
+        ),
+        (
+            "[syslog.source_service_map]\n'private-secret.local' = 'printer'\n",
+            "invalid setting at syslog.source_service_map: a key is not an IP address",
+        ),
+        (
+            "allow_cidrs = ['192.0.2.0/24', 'PRIVATE-SECRET/8']\n",
+            "invalid setting at syslog.allow_cidrs[1]:",
+        ),
+    ] {
+        let output = check(&format!(
+            "[server]\n[data]\npath='~/data'\n[syslog]\nenabled = false\n{syslog}"
+        ));
+        assert_eq!(output.status.code(), Some(1), "{syslog}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(setting), "{syslog}: {stderr}");
+        for value in ["PRIVATE", "SECRET", "private", "secret", "192.0.2.200"] {
+            assert!(!stderr.contains(value), "{syslog}: {stderr}");
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Configuration is valid"));
+    }
+}
+
 #[test]
 fn config_check_rejects_daemon_globs_without_side_effects() {
     for path in [
