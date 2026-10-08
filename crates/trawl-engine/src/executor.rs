@@ -291,6 +291,25 @@ fn private_spill_dir() -> std::io::Result<tempfile::TempDir> {
     private_dir_in(&spill_dir(), |_| Ok(()))
 }
 
+/// The `SET temp_directory` statement for `dir`.
+///
+/// The path goes into SQL as text, so one that is not UTF-8 is refused
+/// rather than converted: a lossy conversion would point `DuckDB` at a
+/// different path than the private directory that was checked (ADR-0052).
+fn temp_directory_statement(dir: &Path) -> std::io::Result<String> {
+    let text = dir.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the query spill directory {} is not valid UTF-8, so it cannot be \
+                 handed to the query engine; point TMPDIR at a path that is",
+                dir.display()
+            ),
+        )
+    })?;
+    Ok(format!("SET temp_directory='{}'", text.replace('\'', "''")))
+}
+
 /// Make a private directory in `parent`, run `after_create` on it (tests
 /// stand in a filesystem that ignores the requested mode), then check it.
 ///
@@ -378,10 +397,7 @@ impl Executor {
     pub fn new() -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
         let spill = private_spill_dir()?;
-        conn.execute_batch(&format!(
-            "SET temp_directory='{}'",
-            spill.path().to_string_lossy().replace('\'', "''")
-        ))?;
+        conn.execute_batch(&temp_directory_statement(spill.path())?)?;
         Self::configure(&conn)?;
         Ok(Self {
             conn,
@@ -2468,6 +2484,22 @@ fn an_executor_spills_into_a_private_directory_of_its_own() {
     assert!(dir.is_dir(), "the clone still holds it");
     drop(clone);
     assert!(!dir.exists(), "the last clone removed it");
+}
+
+/// A spill path that is not UTF-8 is refused, not converted, so `DuckDB`
+/// never spills somewhere other than the checked directory (ADR-0052).
+#[cfg(unix)]
+#[test]
+fn a_spill_path_that_is_not_utf8_is_refused() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/trawl-spill-\xff"));
+    let error = temp_directory_statement(dir).expect_err("a non-UTF-8 spill path");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("TMPDIR"), "{error}");
+    assert_eq!(
+        temp_directory_statement(Path::new("/tmp/it's")).expect("a UTF-8 path"),
+        "SET temp_directory='/tmp/it''s'"
+    );
 }
 
 /// A spill directory the filesystem leaves open, as a fixed-mode mount
