@@ -15,7 +15,9 @@ class TokenOnArgv(unittest.TestCase):
                      '-H "Authorization: Bearer `cat alice.token`"',
                      '--oauth2-bearer "$TOKEN"',
                      '--oauth2-bearer=$TOKEN',
-                     '--oauth2-bearer="$(cat alice.token)"'):
+                     '--oauth2-bearer="$(cat alice.token)"',
+                     '-H "Authorization: Bearer flt_${TOKEN}"',
+                     '-H "Authorization: Bearer prefix$TOKEN"'):
             self.assertRegex(line, TOKEN_ON_ARGV)
 
     def test_literal_and_config_forms_pass(self):
