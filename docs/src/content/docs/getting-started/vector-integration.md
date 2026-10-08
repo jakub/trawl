@@ -351,10 +351,15 @@ nothing.
 
    A capture that ends at 500 events, at the byte limit, at the end of its
    input, or at the 60 second limit is complete. When the event or byte limit
-   ends it, Vector logs two `ERROR` lines, `Error writing to output. Stopping
-   sink.` with `Broken pipe (os error 32)`, and `An error occurred that
-   Vector couldn't handle: the task completed with an error.` They are
-   expected: the capture closed Vector's output on purpose. If no event fits,
+   ends it, Vector logs `ERROR` lines as its components stop. Which lines
+   appear, and how many, depends on the sources in the copy and on timing.
+   They include `Error writing to output. Stopping sink.` with
+   `Broken pipe (os error 32)`, `An error occurred that Vector couldn't
+   handle:` followed by `the task completed with an error.` or
+   `receiver disconnected.`, and `FinalizerSet task ended prematurely.`
+   They are expected: the capture closed Vector's output on purpose. The
+   block reports a capture that you must not preview in its own messages,
+   which start with `capture:`. If no event fits,
    because none arrived or the first event alone is larger than 131072 bytes,
    the block prints `capture: the capture is empty` and returns `1`.
 
