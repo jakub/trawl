@@ -251,3 +251,4 @@ scratch server on your own machine.
 - [Build a query](/use/query-tutorial/) adds filters, columns, and summaries on the sample data.
 - [Search in the browser](/reference/web-ui/) explains the other search controls.
 - [Vector integration](/getting-started/vector-integration/) sends logs continuously to an installation.
+- [Query your own installation](/operate/deployment/#query-your-own-installation) runs the first queries on a server you installed.

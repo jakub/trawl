@@ -6,8 +6,8 @@ description: Install Vector on a Debian host, load the Trawl configuration, set 
 Vector reads journald and `/var/log` files, maps them to the
 [event contract](/reference/events/), buffers to disk, and posts gzip batches
 to `POST /api/v1/ingest`. This page sets it up on one Debian host with the
-configuration shipped in the Trawl repository, then proves that the first
-event from each sender arrived.
+configuration that the `trawl-server` package ships, then proves that the
+first event from each sender arrived.
 
 You need:
 
@@ -20,6 +20,8 @@ You need:
 - The `trawl` CLI on the host, with a profile named `prod` whose key has
   `trawl:query`. The proof queries run in the same shell as the commands that
   send the test events.
+- For the [sample preview](#preview-a-sample), a CLI profile named `ops`
+  whose key has `trawl:server_manage`. It can be on another machine.
 - A `pass` verdict from `trawl doctor -p prod` on the host. The doctor checks the
   profile's configuration, the API's transport, TLS, and health, and the
   identity of the profile's key. It never sends an event, so it does not prove
@@ -28,12 +30,20 @@ You need:
 
 ## Install Vector
 
-1. Add the Vector repository and install the package:
+1. Add the Vector repository, then install Vector 0.57.0 and hold it at that
+   version:
 
    ```bash
    bash -c "$(curl -L https://setup.vector.dev)"
-   sudo apt-get install vector
+   sudo apt-get install vector=0.57.0-1 && sudo apt-mark hold vector
    ```
+
+   Trawl's CI runs the shipped configuration and the
+   [sample capture](#preview-a-sample) on Vector 0.57.0. Vector 0.58 removed
+   the `vector config` command that the capture uses to check its copy.
+   `apt-mark hold` keeps `apt upgrade` from moving Vector past the tested
+   version. Moving to 0.58 or later is a deliberate change of CI and this
+   guide together.
 
 2. Let the `vector` user read the journal and `/var/log`:
 
@@ -46,20 +56,41 @@ You need:
 
 ## Load the Trawl configuration
 
-The repository directory [`config/vector/debian/`](https://github.com/jakub/trawl/tree/main/config/vector/debian)
-holds `base.toml` and one drop-in per service: `apache.toml`, `docker.toml`,
-`fail2ban.toml`, `mysql.toml`, `nginx.toml`, `postgresql.toml`, `redis.toml`,
-and `unifi-syslog.toml`.
+The `trawl-server` package installs the configuration in
+`/usr/share/doc/trawl-server/examples/vector/`: `base.toml` and one drop-in
+per service: `apache.toml`, `docker.toml`, `fail2ban.toml`, `mysql.toml`,
+`nginx.toml`, `postgresql.toml`, `redis.toml`, and `unifi-syslog.toml`.
 
-1. Copy `base.toml` and only the drop-ins for services on this host:
+1. Copy `base.toml` and only the drop-ins for services on this host. On the
+   trawld host:
 
    ```bash
    sudo mkdir -p /etc/vector/vector.d
-   sudo cp base.toml nginx.toml /etc/vector/vector.d/
+   sudo install -m 0644 -t /etc/vector/vector.d \
+     /usr/share/doc/trawl-server/examples/vector/base.toml \
+     /usr/share/doc/trawl-server/examples/vector/nginx.toml
    ```
 
-   `base.toml` reads journald and `/var/log/**/*.log`, maps `_SYSTEMD_UNIT` to
-   `service` and `PRIORITY` to `severity_text`, and defines the `trawld` sink.
+   A collector host without `trawl-server` installed has no copy. Copy the
+   files from the trawld host, so they match the server's release:
+
+   ```bash
+   scp trawl.example.com:/usr/share/doc/trawl-server/examples/vector/base.toml \
+     trawl.example.com:/usr/share/doc/trawl-server/examples/vector/nginx.toml .
+   sudo mkdir -p /etc/vector/vector.d
+   sudo install -m 0644 -t /etc/vector/vector.d base.toml nginx.toml
+   ```
+
+   Some images install no files under `/usr/share/doc`, such as Debian's slim
+   container images, so even the trawld host has no copy. Download the files
+   for this release from
+   [`config/vector/debian/`](https://github.com/jakub/trawl/tree/{{release.tag}}/config/vector/debian)
+   instead.
+
+   `base.toml` reads journald and every `*.log` file under `/var/log`, except
+   in `/var/log/private`, which systemd keeps root-only. It maps
+   `_SYSTEMD_UNIT` to `service` and `PRIORITY` to `severity_text`, and defines
+   the `trawld` sink.
    The sink takes input from every final transform named `trawl_*`, so a
    drop-in needs no change to `base.toml`. Use another prefix for intermediate
    transforms, such as `journal_enriched`, to prevent duplicate delivery and
@@ -74,20 +105,20 @@ and `unifi-syslog.toml`.
 
    Journal collection covers the current boot. By default, every normalized
    journal event passes through. To enable the optional homelab noise policy,
-   set `TRAWL_SUPPRESS_HOMELAB_NOISE=true` in `/etc/default/vector` and restart
-   Vector. This drops `serial-getty@ttyS0` events, `init` messages containing
+   set `TRAWL_SUPPRESS_HOMELAB_NOISE=true` in `/etc/vector/trawl.env` and
+   restart Vector. This drops `serial-getty@ttyS0` events, `init` messages containing
    `serial-getty`, and container-network churn from `networkd-dispatcher`,
    `NetworkManager`, and `systemd-networkd`. Review the conditions in
    `transforms.trawl_journal` before enabling them. Leave the variable unset
    to keep these events.
 
-2. Put the ingest key in `/etc/default/vector`. Run these commands in the
+2. Put the ingest key in `/etc/vector/trawl.env`. Run these commands in the
    directory that holds `vector.token`:
 
    <!-- proof:key-write -->
    ```bash
-   sudo install -m 0600 -o root -g root /dev/null /etc/default/vector &&
-     printf 'TRAWL_INGEST_TOKEN=%s\n' "$(cat vector.token)" | sudo tee -a /etc/default/vector > /dev/null &&
+   sudo install -m 0600 -o root -g root /dev/null /etc/vector/trawl.env &&
+     printf 'TRAWL_INGEST_TOKEN=%s\n' "$(cat vector.token)" | sudo tee -a /etc/vector/trawl.env > /dev/null &&
      rm vector.token
    ```
 
@@ -98,7 +129,7 @@ and `unifi-syslog.toml`.
    the restricted file, and the copy in `vector.token` is deleted only after
    the write succeeds.
 
-3. Add the settings to the same file with `sudoedit /etc/default/vector`:
+3. Add the settings to the same file with `sudoedit /etc/vector/trawl.env`:
 
    ```ini
    VECTOR_CONFIG_DIR=/etc/vector/vector.d
@@ -107,7 +138,6 @@ and `unifi-syslog.toml`.
    TRAWL_ENV=prod
    ```
 
-   The unit reads this file for both `vector validate` and `vector`.
    `VECTOR_CONFIG_DIR` replaces the default `/etc/vector/vector.yaml`. The
    interpolation variable is required: Vector 0.57 and later do not expand
    `${TRAWL_URL}` in a configuration file without it. `TRAWL_ENV` must be in
@@ -127,7 +157,25 @@ and `unifi-syslog.toml`.
    and [revoke it](/operate/access/#rotate-or-revoke-an-api-key) when a host
    leaves.
 
-4. Configure certificate trust before starting Vector. The shipped sink
+4. Make the Vector service read the file, with a systemd drop-in:
+
+   <!-- proof:vector-dropin -->
+   ```bash
+   sudo install -d -m 0755 /etc/systemd/system/vector.service.d &&
+     printf '[Service]\nEnvironmentFile=/etc/vector/trawl.env\n' | sudo tee /etc/systemd/system/vector.service.d/trawl.conf > /dev/null &&
+     sudo systemctl daemon-reload
+   ```
+
+   The drop-in adds `/etc/vector/trawl.env` to the environment of the
+   packaged unit, for both the `vector validate` it runs before it starts and
+   `vector` itself. Do not put the settings in `/etc/default/vector`, which
+   the unit also reads. The Vector package ships that file as a dpkg
+   conffile: after you edit it, the next upgrade of Vector stops at a prompt
+   that asks which version to keep, and an unattended upgrade cannot answer
+   it. The drop-in and `trawl.env` belong to no package, so upgrades leave
+   them alone.
+
+5. Configure certificate trust before starting Vector. The shipped sink
    verifies the server certificate and the hostname in `TRAWL_URL` against
    the host's system CA store. For a publicly trusted certificate, keep the
    shipped TLS settings.
@@ -156,6 +204,23 @@ and `unifi-syslog.toml`.
    trust its issuer. Keep both verification settings enabled on deployed
    collectors.
 
+   On the trawld host itself, Vector can use trawld's generated certificate,
+   which is valid for `localhost`. Set `TRAWL_URL=https://localhost:5514` in
+   `/etc/vector/trawl.env`, and copy the certificate where the `vector` user
+   can read it:
+
+   ```bash
+   sudo install -m 0644 /var/lib/trawl/tls/cert.pem /etc/vector/trawl-ca.pem
+   ```
+
+   Then add the same `ca_file` line to `[sinks.trawld.tls]`. Vector needs a
+   copy because only the `trawl` user and group can open `/var/lib/trawl`.
+   trawld generates a new pair when its key file is missing or exposed, and
+   when it upgrades an older layout, as
+   [Install the Debian package](/operate/deployment/#install-the-debian-package)
+   describes. After that, Vector refuses the new certificate: copy it again
+   with the same command and run `sudo systemctl restart vector`.
+
 ## Preview a sample
 
 Before you start Vector, check what trawld would do to the events this host
@@ -164,7 +229,7 @@ file is not a sample. Capture what Vector would post, then run the
 [ingest preview](/operate/ingestion/#ingest-preview) on it. The preview stores
 nothing.
 
-1. Capture up to 500 events:
+1. Capture up to 500 events and 128 KiB:
 
    <!-- proof:capture-sample -->
    ```bash
@@ -178,11 +243,12 @@ nothing.
        esac
      done
    ) &&
-   awk -v data_dir="$CAPTURE/data" '
+   awk -v data_dir="$CAPTURE/data" -v since="${CAPTURE_SINCE-}" '
      BEGIN { print "data_dir = \"" data_dir "\"" }
      /^\[/ { skip = /^\[sinks\.trawld[].]/ }
      /^data_dir *=/ { next }
      !skip
+     /^\[sources\.journald\]/ && since != "" { print "extra_args = [\"--since=" since "\"]" }
    ' /etc/vector/vector.d/base.toml > "$CAPTURE/config/base.toml" &&
    cat >> "$CAPTURE/config/base.toml" <<'EOF' &&
 
@@ -198,7 +264,11 @@ nothing.
      .data_dir == get_env_var!("CAPTURE") + "/data"
    EOF
    sudo sh -c '
-     set -a && . /etc/default/vector && set +a
+     if ! vector config --help > /dev/null 2>&1 || ! vector vrl --help > /dev/null 2>&1; then
+       echo "capture: this Vector has no vector config or vector vrl command (Vector 0.58 removed vector config); install vector=0.57.0-1 as in Install Vector. Vector did not start" >&2
+       exit 1
+     fi
+     set -a && . /etc/vector/trawl.env && set +a
      checked="$(vector config --config-dir "$1/config" |
        CAPTURE="$1" vector vrl --input /dev/stdin --program "$1/check.vrl")"
      if [ "$checked" != true ]; then
@@ -206,6 +276,7 @@ nothing.
        exit 1
      fi
      { timeout 60 vector --config-dir "$1/config"; echo "$?" > "$1/vector.status"; } |
+       LC_ALL=C awk -v max=131072 "{ size += length + 1; if (size > max) exit; print }" |
        head -n 500
      written=$?
      if [ "$written" -ne 0 ]; then
@@ -220,7 +291,11 @@ nothing.
          exit 1
          ;;
      esac
-   ' sh "$CAPTURE" > "$CAPTURE/capture.ndjson"
+   ' sh "$CAPTURE" > "$CAPTURE/capture.ndjson" &&
+   if [ ! -s "$CAPTURE/capture.ndjson" ]; then
+     echo "capture: the capture is empty: no event arrived, or the first event alone is larger than 131072 bytes" >&2
+     false
+   fi
    ```
 
    The capture runs a copy of this host's configuration with two changes:
@@ -232,9 +307,14 @@ nothing.
      checkpoints there, so it does not move the service's checkpoints in
      `/var/lib/vector` or touch the sink's disk buffer.
 
-   The `awk` filter removes only `[sinks.trawld]` tables whose headers start
-   at the beginning of a line, as the shipped `base.toml` writes them. Before
-   Vector starts, the block checks the copy as Vector reads it:
+   The first `awk` filter removes only `[sinks.trawld]` tables whose headers
+   start at the beginning of a line, as the shipped `base.toml` writes them.
+   Before Vector starts, the block checks that this Vector has the
+   `vector config` and `vector vrl` commands. Vector 0.58 removed
+   `vector config`, so on a newer Vector the block prints
+   `capture: this Vector has no vector config or vector vrl command` with the
+   version to install, exits `1`, and Vector does not start. Then it checks
+   the copy as Vector reads it:
    `vector config` resolves the configuration, and `check.vrl` accepts it
    only if the one sink is the `console` sink `capture` and `data_dir` is the
    new directory. If you have reformatted `base.toml`, or another file in
@@ -244,10 +324,13 @@ nothing.
 
    `unifi-syslog.toml` stays out of the copy: its events come from devices,
    and its listener would compete with a running Vector for port 1514.
-   Vector runs as root with the variables from `/etc/default/vector`, so
-   `TRAWL_ENV` and the noise policy apply as they do in the service. It stops
-   after 500 events or 60 seconds, whichever comes first. Its log goes to the
-   terminal, and only events go to `$CAPTURE/capture.ndjson`. `mktemp -d`
+   Vector runs as root with the variables from `/etc/vector/trawl.env`, so
+   `TRAWL_ENV` and the noise policy apply as they do in the service. The
+   capture stops at 500 events, before the event that would take it past
+   131072 bytes, or after 60 seconds, whichever comes first. 131072 bytes is
+   128 KiB, the default `[server] max_request_body_bytes` that the preview
+   reads, and the cut always falls between two events. Vector's log goes to
+   the terminal, and only events go to `$CAPTURE/capture.ndjson`. `mktemp -d`
    creates `$CAPTURE` readable only by you, so the captured log lines stay
    private to your account and root.
 
@@ -258,8 +341,16 @@ nothing.
    not run. The block does not exit your shell, so you can fix the cause and
    run it again.
 
-   A capture that ends at 500 events, at the end of its input, or at the 60
-   second limit is complete. If Vector stops for another reason, such as a
+   A capture that ends at 500 events, at the byte limit, at the end of its
+   input, or at the 60 second limit is complete. When the event or byte limit
+   ends it, Vector logs two `ERROR` lines, `Error writing to output. Stopping
+   sink.` with `Broken pipe (os error 32)`, and `An error occurred that
+   Vector couldn't handle: the task completed with an error.` They are
+   expected: the capture closed Vector's output on purpose. If no event fits,
+   because none arrived or the first event alone is larger than 131072 bytes,
+   the block prints `capture: the capture is empty` and returns `1`.
+
+   If Vector stops for another reason, such as a
    crash or a kill, the `sudo` command prints
    `capture: Vector stopped with status N` and exits `1`. If writing
    `$CAPTURE/capture.ndjson` fails, for example on a full disk, it prints
@@ -270,20 +361,37 @@ nothing.
 
    The empty `data_dir` has no journal checkpoint, so the journald source
    starts at the beginning of the current boot, as on Vector's
-   [first start](#what-arrives-from-before). The file sources read only lines
-   appended while the capture runs. To sample a file source, write to its log
-   during the capture, for example with the request from the
-   [nginx recipe](#nginx).
+   [first start](#what-arrives-from-before). On a host that has run for days,
+   the sample then holds only the boot's first lines. To sample recent
+   journal lines instead, set `CAPTURE_SINCE` in the same shell before you run
+   the capture block. If you already ran it, delete that capture first, as in
+   step 3:
+
+   <!-- proof:capture-recent -->
+   ```bash
+   CAPTURE_SINCE=-15min
+   ```
+
+   The block then adds `extra_args = ["--since=-15min"]` to
+   `[sources.journald]` in the copy, so journalctl starts 15 minutes back in
+   the current boot. Any value that `journalctl --since` accepts works. The
+   same checks and limits apply. Run `unset CAPTURE_SINCE` to sample the
+   whole boot again.
+
+   The file sources read only lines appended while the capture runs. To
+   sample a file source, write to its log during the capture, for example
+   with the request from the [nginx recipe](#nginx).
 
 2. Preview the capture:
 
    ```bash
-   trawl -p prod preview-ingest "$CAPTURE/capture.ndjson"
+   trawl -p ops preview-ingest "$CAPTURE/capture.ndjson"
    ```
 
-   The `prod` profile's key needs `trawl:server_manage` for this step. If it
-   lacks that permission, copy `$CAPTURE/capture.ndjson` to a machine with a profile
-   whose key holds it.
+   The preview needs a key with `trawl:server_manage`, such as
+   [an operator key](/operate/access/#create-roles-and-keys) saved in the CLI
+   profile `ops`. The `prod` profile's query key gets `403`. If the `ops`
+   profile is on another machine, copy `$CAPTURE/capture.ndjson` there.
 
    The command exits `0` when every event is accepted, and `1` when any event
    is rejected. It exits `2` when it gets no report, for example when the key
@@ -295,13 +403,13 @@ nothing.
    preview shows what you expect. The shipped configuration sets `host` on
    every event, so the preview needs no `--peer-ip`.
 
-   The preview reads at most `[server] max_request_body_bytes`, 128K by
-   default. If it answers `413 request_too_large` for a body that is too large,
-   preview fewer lines. A large body can also show up as `network error: the
-   server closed the connection before the upload finished`: trawld hangs up
-   on an oversized upload, and the reset can arrive before the `413`. The
-   remedy is the same. Preview fewer lines, such as
-   `head -n 200 "$CAPTURE/capture.ndjson" | trawl -p prod preview-ingest -`.
+   The preview reads at most `[server] max_request_body_bytes`, 128 KiB by
+   default, and the capture stops below that. If trawld runs with a lower
+   limit, the preview answers `413 request_too_large`. A large body can also
+   show up as `network error: the server closed the connection before the
+   upload finished`: trawld hangs up on an oversized upload, and the reset can
+   arrive before the `413`. The remedy is the same. Set `max=` in the capture
+   block's second `awk` to trawld's limit in bytes, and capture again.
 
 3. Delete the capture. It holds real log lines, and Vector wrote its
    checkpoints as root:
@@ -383,7 +491,7 @@ CLI query finds.
 ### Set the variables
 
 Run this block before each recipe, in the shell on the collector. Set
-`SENDER_ENV` to the value of `TRAWL_ENV` in `/etc/default/vector`:
+`SENDER_ENV` to the value of `TRAWL_ENV` in `/etc/vector/trawl.env`:
 
 <!-- proof:vars -->
 ```bash
@@ -634,7 +742,7 @@ reason and message, without waiting for the counter.
 | What you see | What to do |
 | --- | --- |
 | Vector logs `404` from the `trawld` sink | Check whether `TRAWL_URL` is the `trawl-web` origin. `trawl-web` answers `404` on `/api/v1/ingest`. Set `TRAWL_URL` to trawld's HTTPS address. Vector drops a batch that gets a `404`. |
-| Vector logs `401` | The key in `TRAWL_INGEST_TOKEN` is wrong, missing, revoked, or expired. Replace it with `sudoedit /etc/default/vector` and restart Vector. Vector does not retry a `401`. |
+| Vector logs `401` | The key in `TRAWL_INGEST_TOKEN` is wrong, missing, revoked, or expired. Replace it with `sudoedit /etc/vector/trawl.env` and restart Vector. Vector does not retry a `401`. |
 | Vector logs `403` | The key lacks `trawl:ingest`. Give its role that permission, or create a key with the `trawl-ingest` role. Vector does not retry a `403`. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="invalid_env"` rises | `TRAWL_ENV` fails the env name rule: 1 to 32 characters from `a-z`, `0-9`, `_`, and `-`. `Prod` fails it. Fix `TRAWL_ENV` and restart Vector. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="env_not_allowed"` rises | `TRAWL_ENV` is not in trawld's `[ingest] envs`. Keys are not scoped to an env, so the list is the only check. Add the env to the list and restart trawld, or fix `TRAWL_ENV`. |

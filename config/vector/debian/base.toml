@@ -1,9 +1,18 @@
 # trawl log forwarder — debian 13 (trixie) base config
 #
-# deployment:
-#   1. install vector: https://vector.dev/docs/setup/installation/package-managers/apt/
-#   2. deploy configs to /etc/vector/vector.d/ (base.toml + service drop-ins)
-#   3. set env vars in /etc/default/vector or vector.service override:
+# deployment (getting-started/vector-integration in the Trawl docs):
+#   1. install the tested vector and hold it:
+#      apt-get install vector=0.57.0-1 && apt-mark hold vector
+#      (Vector 0.58 removed `vector config`, which the guide's sample capture uses)
+#   2. deploy configs to /etc/vector/vector.d/ (base.toml + service drop-ins).
+#      The trawl-server package installs them under
+#      /usr/share/doc/trawl-server/examples/vector/
+#   3. set env vars in /etc/vector/trawl.env (root:root 0600), loaded by the
+#      drop-in /etc/systemd/system/vector.service.d/trawl.conf:
+#        [Service]
+#        EnvironmentFile=/etc/vector/trawl.env
+#      Do not edit /etc/default/vector: it is a dpkg conffile, and an edit
+#      there stops unattended upgrades at a conffile prompt.
 #      VECTOR_CONFIG_DIR=/etc/vector/vector.d
 #      TRAWL_URL=https://trawl.internal:5514
 #      TRAWL_INGEST_TOKEN=<token>
@@ -54,12 +63,39 @@ current_boot_only = true
 # specific config (dpkg, apt, unattended-upgrades, misc application logs).
 # Excluded application files require their service drop-in; base alone skips them.
 # read_from=end collects newly appended lines, not existing file history.
+#
+# The include is every *.log under /var/log except under /var/log/private,
+# which systemd keeps root-only (0700) for DynamicUser services. Vector reads
+# every directory a `**` pattern reaches before it applies `exclude`, so
+# "/var/log/**/*.log" logs "Failed to glob path" for /var/log/private on every
+# scan. Each pattern below names the subdirectories it may enter: [!p]* is
+# every name not starting with "p", and the rest spell out the "p" names one
+# letter at a time, so no pattern ever matches "private" itself.
 
 [sources.varlog]
 type = "file"
-include = ["/var/log/**/*.log"]
+include = [
+  "/var/log/*.log",
+  "/var/log/[!p]*/**/*.log",
+  "/var/log/p/**/*.log",
+  "/var/log/p[!r]*/**/*.log",
+  "/var/log/pr/**/*.log",
+  "/var/log/pr[!i]*/**/*.log",
+  "/var/log/pri/**/*.log",
+  "/var/log/pri[!v]*/**/*.log",
+  "/var/log/priv/**/*.log",
+  "/var/log/priv[!a]*/**/*.log",
+  "/var/log/priva/**/*.log",
+  "/var/log/priva[!t]*/**/*.log",
+  "/var/log/privat/**/*.log",
+  "/var/log/privat[!e]*/**/*.log",
+  "/var/log/private?*/**/*.log",
+]
 read_from = "end"
 exclude = [
+  # root-only logs of systemd DynamicUser services (see the include above)
+  "/var/log/private/**",
+
   # rsyslog-managed files (already captured via journald)
   "/var/log/syslog*",
   "/var/log/auth.log*",
@@ -199,7 +235,7 @@ del(.source_type)
 # -- optional homelab noise policy ------------------------------------------
 # Default: forward every normalized journal event. To suppress serial-console
 # and container-network messages, explicitly set TRAWL_SUPPRESS_HOMELAB_NOISE=true
-# in /etc/default/vector. Review these rules before opting in.
+# in /etc/vector/trawl.env. Review these rules before opting in.
 
 [transforms.trawl_journal]
 type = "filter"

@@ -69,6 +69,15 @@ changes absent from the stable release. They are not deployed to the stable
 site. Local previews use `TRAWL_DOCS_PREVIEW=1` for an unpublished-preview banner.
 Release builds use `TRAWL_DOCS_RELEASE_TAG` and leave the development flag unset.
 
+For commands that install a chart, write the version option followed by the
+release version placeholder. For GitHub links to files readers copy, use the
+release tag placeholder in place of a branch name. The build renders these from
+the release tag; development builds link to `main` and omit the version option.
+`docs/scripts/release-pins.mjs` defines the accepted forms and rejects unknown
+placeholders. A rejected placeholder leaves its page empty; `npm run check`
+rejects that output. Astro clears its content store when the selected pins
+change, so you can switch build and dev-server modes in the same checkout.
+
 Keep unpublished launch notes and pending support decisions under `docs/launch/`,
 outside the site's content collection. The repository's `CHANGELOG.md` links to
 the draft initial-release notes and the preserved pre-1.0 journal. The historical

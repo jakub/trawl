@@ -12,7 +12,10 @@ rules. This page connects one sender and confirms the result.
 
 You need a service key whose role has `trawl:ingest`, from
 [Create roles and keys](/operate/access/#create-roles-and-keys), and the trawld
-HTTPS address. `trawl-web` answers 404 on `/api/v1/ingest`.
+HTTPS address. `trawl-web` answers 404 on `/api/v1/ingest`. Put the key in its
+own curl config file, `vector.curl`, as
+[Keep a key in a curl config file](/operate/access/#keep-a-key-in-a-curl-config-file)
+shows. That file also pins the CA of trawld's certificate.
 
 1. Write a test batch. The body is a JSON array or newline-delimited JSON
    objects. `service` is required. `env` must be in `[ingest] envs`, which
@@ -29,10 +32,14 @@ HTTPS address. `trawl-web` answers 404 on `/api/v1/ingest`.
 2. Send it:
 
    ```bash
-   curl --fail-with-body -H "Authorization: Bearer $(cat vector.token)" \
+   curl --fail-with-body --config "$PWD/vector.curl" \
      -H 'Content-Type: application/json' --data-binary @events.json \
-     https://trawl.example.com:5514/api/v1/ingest
+     https://localhost:5514/api/v1/ingest
    ```
+
+   This URL is for trawld's generated certificate, from the trawld host or a
+   port-forward. For a certificate that names your server, use its name, such
+   as `https://trawl.example.com:5514`.
 
    Expect `{"accepted":1}`. A rejected event adds `rejected` and an `errors`
    array. Each entry gives the event's `index`, its `reason` code from the
@@ -93,10 +100,12 @@ the sender on. `trawl preview-ingest` sends the sample and prints one row per
 event:
 
 ```bash
-trawl -p prod preview-ingest capture.ndjson
+trawl -p ops preview-ingest capture.ndjson
 ```
 
-The key needs `trawl:server_manage`. A collector's `trawl:ingest` key cannot
+The key needs `trawl:server_manage`, which the
+[`trawl-operator` role](/operate/access/#create-roles-and-keys) holds, and
+the `ops` profile names that key. A collector's `trawl:ingest` key cannot
 preview, because the report shows server configuration: the allowed envs, the
 trusted relays, and the derivation sources. The route is
 `POST /api/v1/ingest/preview`. See the [API reference](/reference/api/#preview-ingest)
@@ -136,7 +145,7 @@ preview is rarely the sender. To get the real outcome for events without
 `host`, pass the address that trawld sees for the collector, after any NAT:
 
 ```bash
-trawl -p prod preview-ingest capture.ndjson --peer-ip 192.0.2.10
+trawl -p ops preview-ingest capture.ndjson --peer-ip 192.0.2.10
 ```
 
 Without `--peer-ip`, trawld uses `192.0.2.1`, an address reserved for

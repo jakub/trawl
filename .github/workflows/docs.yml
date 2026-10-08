@@ -89,6 +89,26 @@ jobs:
               "channel": "release" if tag else "development",
           }, indent=2) + "\n")
           PYTHON
+      - name: Test release pin rendering
+        working-directory: docs
+        run: npm test
+      - name: Prove invalid source pins fail the full check
+        env:
+          TRAWL_DOCS_DEVELOPMENT: ${{ inputs.release-tag == '' && '1' || '0' }}
+          TRAWL_DOCS_RELEASE_TAG: ${{ inputs.release-tag }}
+        working-directory: docs
+        run: |
+          page=src/content/docs/reference/crash-dumps.md
+          backup="$RUNNER_TEMP/release-pins-source-backup.md"
+          log="$RUNNER_TEMP/release-pins-negative.log"
+          cp "$page" "$backup"
+          trap 'cp "$backup" "$page"' EXIT
+          printf '\n{{release.version}}\n' >> "$page"
+          if npm run check > "$log" 2>&1; then
+            echo 'npm run check accepted an invalid source placeholder' >&2
+            exit 1
+          fi
+          grep -F 'empty markdown content' "$log"
       - name: Build and check documentation
         env:
           TRAWL_DOCS_DEVELOPMENT: ${{ inputs.release-tag == '' && '1' || '0' }}
@@ -101,3 +121,16 @@ jobs:
           path: docs/dist
           # Development previews expire quickly; release evidence keeps the repository default.
           retention-days: ${{ inputs.release-tag == '' && 7 || 0 }}
+
+  # Syntax-checks the deployment guide's nginx recipe in a pinned nginx image.
+  # Skipped for a release so that a Docker Hub outage cannot block its docs.
+  nginx-recipe:
+    if: ${{ !inputs.release-tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source-sha || github.sha }}
+      - name: Check the reverse-proxy recipe with nginx -t
+        run: docs/scripts/check-nginx-recipe.sh

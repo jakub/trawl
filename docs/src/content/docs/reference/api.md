@@ -5,7 +5,7 @@ description: Look up every trawld route with its permission, request and respons
 
 trawld serves a JSON API over HTTPS under the base path `/api/v1`. Request bodies are JSON and carry `Content-Type: application/json`. Responses are JSON unless a route says otherwise. The Prometheus scrape route, `/metrics`, sits outside the base path.
 
-The examples on this page follow the same convention as [health checks](/operate/health/): `TRAWL_URL` names the HTTPS API and `TRAWL_CURL_CONFIG` names an owner-only curl config file that holds the `Authorization` header.
+The examples on this page follow the same convention as [health checks](/operate/health/): `TRAWL_URL` names the HTTPS API and `TRAWL_CURL_CONFIG` names an owner-only curl config file that holds the `Authorization` header. [Keep a key in a curl config file](/operate/access/#keep-a-key-in-a-curl-config-file) shows how to write it.
 
 ## Authentication
 

@@ -9,20 +9,47 @@
 //! with the DSL parser after putting sample values in for its shell
 //! variables. A query that stops parsing, or loses the identity, arrival, or
 //! time-window predicate that makes it a proof, fails here.
-//! `scripts/test-vector-collector.py` runs the `capture-sample` block
-//! itself, as written, against the Debian collector configuration.
+//! `scripts/test-vector-collector.py` runs the `capture-sample` and
+//! `capture-recent` blocks itself, as written, against the Debian collector
+//! configuration.
 
+use std::sync::LazyLock;
 use trawl_core::ast::{
     Expr, FieldFilter, FilterOp, FilterValue, PipeStage, Query, SearchToken, TimeUnit,
 };
 
-const VECTOR_GUIDE: &str =
-    include_str!("../../../docs/src/content/docs/getting-started/vector-integration.md");
+/// Match the plugin's whitespace around version pairs. This source helper
+/// cannot distinguish code from prose; the docs build rejects prose pairs.
+fn development_page(raw: &str) -> String {
+    const PAIR: &str = "--version {{release.version}}";
+    let mut rendered = String::with_capacity(raw.len());
+    let mut remaining = raw;
+    while let Some(offset) = remaining.find(PAIR) {
+        let (before, after) = remaining.split_at(offset);
+        rendered.push_str(before.trim_end_matches([' ', '\t']));
+        remaining = &after[PAIR.len()..];
+    }
+    rendered.push_str(remaining);
+    let page = rendered.replace("{{release.tag}}", "main");
+    assert!(
+        !page.contains("{{release."),
+        "a release placeholder the docs plugin rejects"
+    );
+    page
+}
+
+static VECTOR_GUIDE: LazyLock<String> = LazyLock::new(|| {
+    development_page(include_str!(
+        "../../../docs/src/content/docs/getting-started/vector-integration.md"
+    ))
+});
 const INGESTION_GUIDE: &str = include_str!("../../../docs/src/content/docs/operate/ingestion.md");
 
 const VECTOR_MARKERS: &[&str] = &[
     "key-write",
+    "vector-dropin",
     "capture-sample",
+    "capture-recent",
     "vector-start",
     "vars",
     "journald-send",
@@ -234,14 +261,14 @@ fn columns(extra: &[&'static str]) -> Vec<&'static str> {
 
 #[test]
 fn every_proof_block_is_marked_once() {
-    assert_inventory(VECTOR_GUIDE, "vector-integration.md", VECTOR_MARKERS);
+    assert_inventory(&VECTOR_GUIDE, "vector-integration.md", VECTOR_MARKERS);
     assert_inventory(INGESTION_GUIDE, "ingestion.md", INGESTION_MARKERS);
 }
 
 #[test]
 fn neither_page_checks_arrival_with_a_bare_short_window() {
     for (page_name, page) in [
-        ("vector-integration.md", VECTOR_GUIDE),
+        ("vector-integration.md", VECTOR_GUIDE.as_str()),
         ("ingestion.md", INGESTION_GUIDE),
     ] {
         assert!(!page.contains("last=15m"), "{page_name} uses last=15m");
@@ -251,17 +278,17 @@ fn neither_page_checks_arrival_with_a_bare_short_window() {
 #[test]
 fn the_variables_capture_a_uuid_marker_and_a_utc_start() {
     let utc_now = "T0=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"";
-    let vars = block(VECTOR_GUIDE, "vars");
+    let vars = block(&VECTOR_GUIDE, "vars");
     assert!(vars.contains(&"MARKER=\"trawl-check-$(cat /proc/sys/kernel/random/uuid)\""));
     assert!(vars.contains(&utc_now));
     assert!(vars.contains(&"HOST=\"$(hostname)\""));
     assert!(vars.iter().any(|line| line.starts_with("SENDER_ENV=")));
     assert!(
-        block(VECTOR_GUIDE, "vector-start")
+        block(&VECTOR_GUIDE, "vector-start")
             .contains(&"VECTOR_START=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"")
     );
     assert!(block(INGESTION_GUIDE, "syslog-vars").contains(&utc_now));
-    let ufw = block(VECTOR_GUIDE, "ufw-vars");
+    let ufw = block(&VECTOR_GUIDE, "ufw-vars");
     for variable in ["PEER=", "COLLECTOR=", "PORT="] {
         assert!(
             ufw.iter().any(|line| line.starts_with(variable)),
@@ -272,7 +299,7 @@ fn the_variables_capture_a_uuid_marker_and_a_utc_start() {
 
 #[test]
 fn the_key_file_is_restricted_before_the_key_is_written() {
-    let lines = block(VECTOR_GUIDE, "key-write");
+    let lines = block(&VECTOR_GUIDE, "key-write");
     let restrict = lines
         .iter()
         .position(|line| {
@@ -280,9 +307,9 @@ fn the_key_file_is_restricted_before_the_key_is_written() {
                 && line
                     .trim_end_matches("&&")
                     .trim_end()
-                    .ends_with("/etc/default/vector")
+                    .ends_with("/etc/vector/trawl.env")
         })
-        .expect("key-write creates /etc/default/vector with mode 0600");
+        .expect("key-write creates /etc/vector/trawl.env with mode 0600");
     let write = lines
         .iter()
         .position(|line| line.contains("TRAWL_INGEST_TOKEN="))
@@ -301,7 +328,7 @@ fn the_key_file_is_restricted_before_the_key_is_written() {
         "the key file copy is deleted only after the restricted write succeeds"
     );
     assert!(
-        lines[write].contains("| sudo tee -a /etc/default/vector"),
+        lines[write].contains("| sudo tee -a /etc/vector/trawl.env"),
         "the key reaches the file through sudo tee's standard input"
     );
     for line in &lines[restrict..=remove] {
@@ -313,8 +340,54 @@ fn the_key_file_is_restricted_before_the_key_is_written() {
 }
 
 #[test]
+fn the_service_reads_the_key_file_through_a_dropin() {
+    let lines = block(&VECTOR_GUIDE, "vector-dropin");
+    let directory = lines
+        .iter()
+        .position(|line| line.contains("install -d -m 0755 /etc/systemd/system/vector.service.d"))
+        .expect("vector-dropin creates the unit's drop-in directory");
+    let write = lines
+        .iter()
+        .position(|line| {
+            line.contains("'[Service]\\nEnvironmentFile=/etc/vector/trawl.env\\n'")
+                && line.contains("| sudo tee /etc/systemd/system/vector.service.d/trawl.conf")
+        })
+        .expect("vector-dropin writes EnvironmentFile=/etc/vector/trawl.env into trawl.conf");
+    let reload = lines
+        .iter()
+        .position(|line| line.trim() == "sudo systemctl daemon-reload")
+        .expect("vector-dropin reloads systemd");
+    assert!(
+        directory < write && write < reload && reload == lines.len() - 1,
+        "the drop-in directory, then the drop-in, then the reload"
+    );
+    for line in &lines[..reload] {
+        assert!(
+            line.ends_with("&&") && !line.contains("||") && !line.contains(';'),
+            "each step of vector-dropin runs only if the step before it succeeded: {line}"
+        );
+    }
+}
+
+#[test]
+fn no_command_edits_the_vector_conffile() {
+    let mut fenced = false;
+    for line in VECTOR_GUIDE.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        } else if fenced {
+            assert!(
+                !line.contains("/etc/default/vector"),
+                "a command reads or writes the dpkg conffile /etc/default/vector: {line}"
+            );
+        }
+    }
+    assert!(!fenced, "an unclosed fence");
+}
+
+#[test]
 fn journald_check_matches_the_unit_and_marker() {
-    let query = parse(VECTOR_GUIDE, "journald-check");
+    let query = parse(&VECTOR_GUIDE, "journald-check");
     assert_proof(
         &query,
         "journald-check",
@@ -332,7 +405,7 @@ fn journald_check_matches_the_unit_and_marker() {
 
 #[test]
 fn nginx_check_matches_the_service_and_marker() {
-    let query = parse(VECTOR_GUIDE, "nginx-check");
+    let query = parse(&VECTOR_GUIDE, "nginx-check");
     assert_proof(
         &query,
         "nginx-check",
@@ -354,7 +427,7 @@ fn nginx_check_matches_the_service_and_marker() {
 
 #[test]
 fn docker_check_matches_the_container_identity_and_marker() {
-    let query = parse(VECTOR_GUIDE, "docker-check");
+    let query = parse(&VECTOR_GUIDE, "docker-check");
     assert_proof(
         &query,
         "docker-check",
@@ -376,7 +449,7 @@ fn docker_check_matches_the_container_identity_and_marker() {
 
 #[test]
 fn ufw_check_matches_the_packet_source_and_port() {
-    let query = parse(VECTOR_GUIDE, "ufw-check");
+    let query = parse(&VECTOR_GUIDE, "ufw-check");
     assert_proof(
         &query,
         "ufw-check",
@@ -426,7 +499,7 @@ fn syslog_check_matches_the_device_address() {
 
 #[test]
 fn history_finder_bounds_time_and_groups_by_service() {
-    let query = parse(VECTOR_GUIDE, "history-finder");
+    let query = parse(&VECTOR_GUIDE, "history-finder");
     assert_proof(
         &query,
         "history-finder",

@@ -42,9 +42,35 @@ fn repo_root() -> PathBuf {
         .expect("the workspace root must exist relative to the crate")
 }
 
+/// Match the plugin's whitespace around version pairs. This source helper
+/// cannot distinguish code from prose; the docs build rejects prose pairs.
+fn development_page(raw: &str) -> String {
+    const PAIR: &str = "--version {{release.version}}";
+    let mut rendered = String::with_capacity(raw.len());
+    let mut remaining = raw;
+    while let Some(offset) = remaining.find(PAIR) {
+        let (before, after) = remaining.split_at(offset);
+        rendered.push_str(before.trim_end_matches([' ', '\t']));
+        remaining = &after[PAIR.len()..];
+    }
+    rendered.push_str(remaining);
+    let page = rendered.replace("{{release.tag}}", "main");
+    assert!(
+        !page.contains("{{release."),
+        "a release placeholder the docs plugin rejects"
+    );
+    page
+}
+
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    if relative.starts_with("docs/src/content/docs/") {
+        development_page(&raw)
+    } else {
+        raw
+    }
 }
 
 /// The double-quoted strings of a TOML array literal, in order.

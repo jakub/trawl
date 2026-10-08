@@ -2,7 +2,8 @@
 """Run the Debian collector with Vector 0.57.0 and disposable loopback inputs.
 
 Also run the Vector guide's sample capture recipe, as written, and prove that it
-captures the events the `trawld` sink posts.
+captures the events the `trawld` sink posts, and prove that `base.toml`'s
+`/var/log` catch-all never reads `/var/log/private`.
 
 Requires Python 3.11+, OpenSSL, bash, awk, coreutils, and VECTOR_BIN (or vector on
 PATH). No host journal, application files, Docker socket, credentials, or running
@@ -10,6 +11,7 @@ collector are used.
 """
 
 import collections
+import datetime
 import gzip
 import http.server
 import json
@@ -46,13 +48,19 @@ GUIDE = ROOT / "docs/src/content/docs/getting-started/vector-integration.md"
 # The guide's capture recipe, and the host paths it reads, which the run below
 # points at fixture copies.
 CAPTURE_MARKER = "<!-- proof:capture-sample -->"
+# The guide's opt-in variant: a shell variable set before the capture block.
+CAPTURE_RECENT_MARKER = "<!-- proof:capture-recent -->"
 LIVE_CONFIG_DIR = "/etc/vector/vector.d"
-LIVE_ENV_FILE = "/etc/default/vector"
+LIVE_ENV_FILE = "/etc/vector/trawl.env"
+# The Vector release the guide pins, which the capture's version check names.
+PINNED_PACKAGE = "vector=0.57.0-1"
 # The most events one ingest preview reads (trawl_api::ingest_preview).
 MAX_PREVIEW_EVENTS = 500
 # The largest body the preview reads under the default `[server]
 # max_request_body_bytes` (trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES).
 MAX_PREVIEW_BODY_BYTES = 128 * 1024
+# A zone that is never UTC, for the postgresql drop-in's line times.
+POSTGRES_ZONE = "America/New_York"
 
 
 def load(tcp):
@@ -112,6 +120,13 @@ def fixtures(suppress):
             message='192.0.2.1 - alice [15/Jan/2024:10:30:45 +0000] "GET /test HTTP/1.1" 404 42 "-" "fixture"')
     for service in ("fail2ban", "mysql", "postgresql", "redis"):
         add(service, service, service)
+    # run() sets TZ to a zone that is never UTC: a UTC line keeps its own
+    # instant, and a line in that zone's abbreviation is read in that zone.
+    # postgresql_zones() covers the other zone cases.
+    add("postgresql", "postgresql-utc", "postgresql",
+        message="2026-09-28 10:30:45.123 UTC [4242] LOG:  checkpoint starting: time")
+    add("postgresql", "postgresql-local", "postgresql", "error",
+        message="2026-09-28 10:30:45.123 EDT [4242] alice@app ERROR:  relation does not exist")
     # Sender proof recipes: each marker event must arrive under the identity
     # the guide tells the operator to query.
     add("journald", "proof-journald", MARKER, message=MARKER, _SYSTEMD_UNIT=f"{MARKER}.service")
@@ -153,7 +168,7 @@ def run(tcp, suppress, tls="http"):
     for name, transform in config["transforms"].items():
         assert not any(i.startswith("trawl_") for i in transform["inputs"]), name
     events, expected = fixtures(suppress)
-    env = dict(ENV)
+    env = dict(ENV, TZ=POSTGRES_ZONE)
     if suppress:
         env["TRAWL_SUPPRESS_HOMELAB_NOISE"] = "true"
     assert config["sinks"]["trawld"]["tls"]["verify_certificate"] is True
@@ -304,6 +319,15 @@ def run(tcp, suppress, tls="http"):
                     if name.startswith("unifi-"):
                         assert event["host"] == "ap-fixture", event
                         assert event["syslog_source_ip"] == "127.0.0.1", event
+                    if name == "postgresql-utc":
+                        assert event["_time"] == "2026-09-28T10:30:45.123Z", event
+                        assert event["message"] == "checkpoint starting: time", event
+                    if name == "postgresql-local":
+                        # EDT is UTC-4 in POSTGRES_ZONE on that date.
+                        assert event["_time"] == "2026-09-28T14:30:45.123Z", event
+                        assert event["user_name"] == "alice", event
+                    if name == "postgresql":
+                        assert "_time" not in event, event
                 print(f"PASS {tls} {'UDP + TCP' if tcp else 'UDP only'}: {len(events)} synthetic inputs, "
                       f"{len(ports)} syslog inputs, {len(received)} HTTP events, zero duplicates; "
                       f"{5 if suppress else 0} journal events filtered")
@@ -318,10 +342,78 @@ def run(tcp, suppress, tls="http"):
             server.server_close()
 
 
-def capture_block():
-    """The capture recipe exactly as the guide prints it, list indent removed."""
-    lines = GUIDE.read_text().splitlines()
-    starts = [i for i, line in enumerate(lines) if line.strip() == CAPTURE_MARKER]
+def postgresql_zones():
+    """Run the postgresql transform under two collector zones.
+
+    A line keeps its own time only when its zone name proves the offset; any
+    other line keeps the time Vector read it, like a line that does not parse.
+    """
+    transform = load(False)["transforms"]["trawl_postgresql"]
+    line = "2026-09-28 10:30:45.123 {} [4242] alice@app LOG:  checkpoint starting"
+    read = "read time"
+    cases = {
+        "America/New_York": {"UTC": "2026-09-28T10:30:45.123Z", "GMT": "2026-09-28T10:30:45.123Z",
+                             # EDT is UTC-4 in America/New_York on that date.
+                             "EDT": "2026-09-28T14:30:45.123Z", "EST": read, "CEST": read,
+                             "-03": "2026-09-28T13:30:45.123Z", "+0545": "2026-09-28T04:45:45.123Z"},
+        "UTC": {"UTC": "2026-09-28T10:30:45.123Z", "EDT": read, "CEST": read,
+                "+0545": "2026-09-28T04:45:45.123Z"},
+    }
+    wrong = []
+    with tempfile.TemporaryDirectory(prefix="trawl-postgresql-", dir=FIXTURES) as name:
+        for zone, expected in cases.items():
+            config = {"data_dir": name,
+                      "sources": {"fixture": {"type": "stdin", "decoding": {"codec": "json"}}},
+                      "transforms": {"pg": dict(transform, inputs=["fixture"])},
+                      "sinks": {"out": {"type": "console", "inputs": ["pg"], "target": "stdout",
+                                        "encoding": {"codec": "json"}}}}
+            path = Path(name) / "postgresql.json"
+            path.write_text(json.dumps(config))
+            started = time.time()
+            stdin = "".join(json.dumps({"message": line.format(tz), "tz": tz}) + "\n"
+                            for tz in expected)
+            result = subprocess.run([VECTOR, "--config", str(path)], env=dict(ENV, TZ=zone),
+                                    input=stdin, capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+            events = {e["tz"]: e for e in map(json.loads, result.stdout.splitlines())}
+            assert events.keys() == expected.keys(), (events, result.stderr)
+            for tz, want in expected.items():
+                event = events[tz]
+                if (event["message"], event.get("user_name")) != ("checkpoint starting", "alice"):
+                    wrong.append(f"collector TZ={zone}, line zone {tz}: not parsed: {event}")
+                    continue
+                got = event.get("_time", read)
+                if got == read:
+                    # The read time the stdin source stamped, as for any line
+                    # without a time of its own.
+                    stamped = datetime.datetime.fromisoformat(event["timestamp"]).timestamp()
+                    assert started - 1 <= stamped <= time.time() + 1, event
+                if got != want:
+                    wrong.append(f"collector TZ={zone}, line zone {tz}: _time {got}, want {want}")
+    assert not wrong, "\n".join(wrong)
+    print("PASS postgresql line zones: UTC, GMT, and numeric offsets exact; a named zone only "
+          "when the collector's zone names it; otherwise the read time")
+
+
+def development_page(raw):
+    """The page as a development docs build renders its release pins.
+
+    Match the plugin's whitespace around version pairs. This source helper
+    cannot distinguish code from prose; the docs build rejects prose pairs.
+    """
+    page = re.sub(r"[ \t]*--version \{\{release\.version\}\}", "", raw)
+    page = page.replace("{{release.tag}}", "main")
+    assert "{{release." not in page, "a release placeholder the docs plugin rejects"
+    return page
+
+
+def capture_block(marker=CAPTURE_MARKER):
+    """A marked block exactly as the guide prints it, list indent removed.
+
+    By default, the capture recipe.
+    """
+    lines = development_page(GUIDE.read_text()).splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == marker]
     assert len(starts) == 1, starts
     marker = lines[starts[0]]
     indent = marker[:len(marker) - len(marker.lstrip())]
@@ -386,7 +478,7 @@ def fixture_collector(directory, live_data, receiver_url, spelling=None):
             text += (f"\n[transforms.{name}]\ntype = \"filter\"\ninputs = [\"fixture\"]\n"
                      f"condition = {json.dumps(f'.fixture_source == {json.dumps(name)}')}\n")
         (live / path.name).write_text(text)
-    env_file = directory / "default-vector"
+    env_file = directory / "trawl.env"
     env_file.write_text(
         f"VECTOR_CONFIG_DIR={live}\n"
         "VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION=true\n"
@@ -398,13 +490,15 @@ def fixture_collector(directory, live_data, receiver_url, spelling=None):
     return live, env_file
 
 
-def clean_env(directory, crash=False, full=False):
+def clean_env(directory, crash=False, full=False, noconfig=False):
     """An environment without inherited Vector or Trawl settings.
 
     With `crash`, a `vector` run (not `vector config` or `vector vrl`) is
     killed with SIGKILL after Vector has written every event, as the kernel's
     OOM killer would end it. With `full`, `head` runs under a 1 KiB file size
-    limit, so writing the capture file fails partway, as on a full disk.
+    limit, so writing the capture file fails partway, as on a full disk. With
+    `noconfig`, `vector config` fails as it does on Vector 0.58 and later,
+    which removed it, and every other command runs the real Vector.
     """
     shims = directory / "bin"
     shims.mkdir(exist_ok=True)
@@ -416,6 +510,15 @@ def clean_env(directory, crash=False, full=False):
             "#!/bin/sh\n"
             f"{shlex.quote(vector)} \"$@\"\n"
             'if [ "$1" = --config-dir ]; then kill -KILL $$; fi\n')
+        (shims / "vector").chmod(0o755)
+    elif noconfig:
+        (shims / "vector").write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = config ]; then\n'
+            "  echo \"error: unrecognized subcommand 'config'\" >&2\n"
+            "  exit 2\n"
+            "fi\n"
+            f"exec {shlex.quote(vector)} \"$@\"\n")
         (shims / "vector").chmod(0o755)
     else:
         (shims / "vector").symlink_to(vector)
@@ -429,12 +532,14 @@ def clean_env(directory, crash=False, full=False):
             "TMPDIR": str(directory), "LC_ALL": "C.UTF-8"}
 
 
-def run_capture(directory, live, env_file, inputs, crash=False, full=False):
+def run_capture(directory, live, env_file, inputs, crash=False, full=False, noconfig=False,
+                prelude="", sudo='sudo() { "$@"; }'):
     """Run the guide's capture block against the fixture collector.
 
     The block's host paths point at the fixture copies, and `sudo` runs its
     command as this user. Nothing else in the block changes, and no shell
-    option is set around it. Vector reads the
+    option is set around it. `prelude` runs first in the same shell, as an
+    operator runs a variant's block before the capture block. Vector reads the
     fixture stream on stdin, which it inherits through the block. Returns the
     finished process, the block's private directory, and the operator's
     working directory.
@@ -442,12 +547,13 @@ def run_capture(directory, live, env_file, inputs, crash=False, full=False):
     block = capture_block()
     for path in (LIVE_CONFIG_DIR, LIVE_ENV_FILE):
         assert path in block, f"the capture block no longer reads {path}"
-    script = ("sudo() { \"$@\"; }\n"
+    script = (sudo + "\n" + prelude
               + block.replace(LIVE_CONFIG_DIR, str(live)).replace(LIVE_ENV_FILE, str(env_file)))
     work = directory / "operator"
     work.mkdir()
     with inputs.open("rb") as stdin:
-        result = subprocess.run(["bash", "-c", script], cwd=work, env=clean_env(directory, crash, full),
+        result = subprocess.run(["bash", "-c", script], cwd=work,
+                                env=clean_env(directory, crash, full, noconfig),
                                 stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 timeout=90)
     assert result.stdout == b"", "the capture leaked events to the terminal"
@@ -530,6 +636,9 @@ def capture_recipe():
 
             raw, log = capture_events(directory, live, env_file, inputs)
             assert "ERROR" not in log, log
+            # Without CAPTURE_SINCE, the journald source reads the whole boot.
+            [capture] = directory.glob("tmp.*")
+            assert "extra_args" not in (capture / "config/base.toml").read_text()
             assert not requests, "the capture posted to trawld"
             assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
             captured = preview_input(raw)
@@ -577,7 +686,136 @@ def capture_recipe():
             ids = [event["fixture_id"] for event in captured]
             assert len(ids) == MAX_PREVIEW_EVENTS == len(set(ids)), len(ids)
             assert set(ids) <= {event["fixture_id"] for event in many}
-            print(f"PASS capture recipe cut: {len(many)} inputs, {len(captured)} captured lines")
+            print(f"PASS capture recipe cut: {len(many)} inputs, {len(captured)} captured lines, "
+                  f"{len(raw)} bytes")
+
+        # Lines long enough that the byte limit, not the event limit, ends the
+        # capture. Each message is mostly two-byte characters, so a cap that
+        # counted characters instead of bytes would pass the limit.
+        requests.clear()
+        with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+            directory = Path(name)
+            live_data = directory / "var-lib-vector"
+            live_data.mkdir()
+            live, env_file = fixture_collector(
+                directory, live_data, f"http://127.0.0.1:{server.server_port}")
+            inputs = directory / "fixtures.ndjson"
+            long = [dict(message=f"long {i} " + "\u00fc" * 500, fixture_id=f"long-{i}",
+                         fixture_source="journald", host="fixture-host", PRIORITY="6",
+                         SYSLOG_IDENTIFIER="long")
+                    for i in range(MAX_PREVIEW_EVENTS + 100)]
+            inputs.write_text("".join(json.dumps(e) + "\n" for e in long))
+            raw, log = capture_events(directory, live, env_file, inputs)
+            assert "capture:" not in log, log
+            assert not requests, "the capture posted to trawld"
+            assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
+            captured = preview_input(raw)
+            ids = [event["fixture_id"] for event in captured]
+            assert len(ids) < MAX_PREVIEW_EVENTS and len(set(ids)) == len(ids), len(ids)
+            # The cut is the byte limit: one more line would not have fit.
+            longest = max(len(line) + 1 for line in raw.split(b"\n"))
+            assert len(raw) > MAX_PREVIEW_BODY_BYTES - longest, (len(raw), longest)
+            print(f"PASS capture recipe byte limit: {len(long)} inputs of about {longest} bytes, "
+                  f"{len(captured)} captured lines, {len(raw)} bytes")
+
+        # The first event alone is larger than the limit: the capture is empty,
+        # and the block says so instead of leaving an empty sample. Every
+        # event takes the journald path, so none overtakes the first, and the
+        # events after it are more than a pipe buffer holds, so Vector is
+        # still writing when the cap closes the pipe.
+        requests.clear()
+        with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+            directory = Path(name)
+            live_data = directory / "var-lib-vector"
+            live_data.mkdir()
+            live, env_file = fixture_collector(
+                directory, live_data, f"http://127.0.0.1:{server.server_port}")
+            # The stdin source drops a line over 100 KiB by default.
+            base = live / "base.toml"
+            fixture = '[sources.fixture]\ntype = "stdin"\n'
+            assert base.read_text().count(fixture) == 1
+            base.write_text(base.read_text().replace(fixture, fixture + (
+                'framing.method = "newline_delimited"\n'
+                "framing.newline_delimited.max_length = 1048576\n")))
+            inputs = directory / "fixtures.ndjson"
+            first = [dict(message=("x" * MAX_PREVIEW_BODY_BYTES if i == 0 else f"small {i}"),
+                          fixture_id=f"first-{i}", fixture_source="journald",
+                          host="fixture-host", PRIORITY="6", SYSLOG_IDENTIFIER="first")
+                     for i in range(3000)]
+            inputs.write_text("".join(json.dumps(e) + "\n" for e in first))
+            result, capture, _work = run_capture(directory, live, env_file, inputs)
+            log = result.stderr.decode(errors="replace")
+            assert result.returncode != 0, log
+            assert "capture: the capture is empty" in log, log
+            # The cap, not a dropped input, emptied it: Vector wrote the event
+            # and found the pipe closed when it wrote the next one.
+            assert "Broken pipe" in log, log
+            assert (capture / "capture.ndjson").read_bytes() == b""
+            assert not requests, "the capture posted to trawld"
+            print(f"PASS capture refuses an empty sample: exit {result.returncode} when the first "
+                  f"event alone is over {MAX_PREVIEW_BODY_BYTES} bytes")
+
+        # Vector 0.58 and later have no `vector config`: the block names the
+        # pinned release and starts nothing.
+        requests.clear()
+        with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+            directory = Path(name)
+            live_data = directory / "var-lib-vector"
+            live_data.mkdir()
+            live, env_file = fixture_collector(
+                directory, live_data, f"http://127.0.0.1:{server.server_port}")
+            inputs = directory / "fixtures.ndjson"
+            inputs.write_text("".join(json.dumps(e) + "\n" for e in events))
+            result, capture, _work = run_capture(directory, live, env_file, inputs, noconfig=True)
+            log = result.stderr.decode(errors="replace")
+            time.sleep(1)
+            assert result.returncode != 0, log
+            assert PINNED_PACKAGE in log and "Vector did not start" in log, log
+            assert "unrecognized subcommand" not in log, "the version check let `vector config` run"
+            assert (capture / "capture.ndjson").read_bytes() == b""
+            assert not any((capture / "data").iterdir()), "Vector ran"
+            assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
+            assert not requests, "the capture posted to trawld"
+            print(f"PASS capture refuses a Vector without vector config: exit {result.returncode}, "
+                  f"names {PINNED_PACKAGE}, {len(requests)} requests, empty capture")
+
+        # The recent-window variant, as the guide prints it, on the shipped
+        # files with their sources: `sudo` runs nothing, so the block only
+        # prepares the copy, and no host journal is read.
+        with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
+            directory = Path(name)
+            live = directory / "vector.d"
+            live.mkdir()
+            for path in CONFIG.glob("*.toml"):
+                shutil.copy(path, live)
+            env_file = directory / "trawl.env"
+            env_file.write_text("TRAWL_ENV=lab\n")
+            inputs = directory / "fixtures.ndjson"
+            inputs.write_text("")
+            variant = capture_block(CAPTURE_RECENT_MARKER)
+            result, capture, _work = run_capture(directory, live, env_file, inputs,
+                                                 prelude=variant, sudo="sudo() { :; }")
+            # `sudo` ran nothing, so the block ends on its empty-capture refusal.
+            log = result.stderr.decode(errors="replace")
+            assert result.returncode == 1, log
+            assert "capture: the capture is empty" in log, log
+            copy = capture / "config"
+            journald = tomllib.loads((copy / "base.toml").read_text())["sources"]["journald"]
+            assert journald["extra_args"] == ["--since=-15min"], journald
+            assert journald["current_boot_only"] is True, journald
+            env = dict(ENV, CAPTURE=str(capture))
+            subprocess.run([VECTOR, "validate", "--no-environment", "--config-dir", str(copy)],
+                           env=env, check=True, stdout=subprocess.DEVNULL)
+            # The block's own sink check accepts the copy.
+            resolved = subprocess.run([VECTOR, "config", "--config-dir", str(copy)], env=env,
+                                      check=True, stdout=subprocess.PIPE, text=True).stdout
+            checked = subprocess.run([VECTOR, "vrl", "--input", "/dev/stdin", "--program",
+                                      str(capture / "check.vrl")], env=env, input=resolved,
+                                     check=True, stdout=subprocess.PIPE, text=True).stdout
+            assert checked.strip() == "true", checked
+            print(f"PASS capture recent window: {variant.strip()} adds "
+                  f"extra_args = {journald['extra_args']} to the copy's journald source; "
+                  "the copy validates and passes the sink check")
 
         # A sink the awk filter misses: Vector's own reading of the copy
         # refuses it before Vector starts, so nothing is posted or captured.
@@ -685,6 +923,78 @@ def capture_recipe():
         server.server_close()
 
 
+def varlog_glob():
+    """base.toml's catch-all never reads /var/log/private.
+
+    The include and exclude patterns run on 0.57 as shipped, with /var/log
+    moved to a fixture root whose `private` directory no one can read, so
+    Vector's walk would fail there with "Failed to glob path". The shipped
+    patterns must collect every other file, and the old single `**` include
+    shows the fixture reproduces the failure.
+    """
+    if os.geteuid() == 0:
+        print("SKIP varlog catch-all skips /var/log/private: root reads a mode 000 directory")
+        return
+    varlog = tomllib.loads((CONFIG / "base.toml").read_text())["sources"]["varlog"]
+    assert "/var/log/private/**" in varlog["exclude"], varlog["exclude"]
+    with tempfile.TemporaryDirectory(prefix="trawl-varlog-", dir=FIXTURES) as name:
+        root = Path(name) / "log"
+        wanted = ["dpkg.log", "private.log", "apt/history.log", "apt/private/x.log",
+                  "unattended-upgrades/unattended-upgrades-dpkg.log", "p/x.log", "prix/x.log",
+                  "privat/x.log", "privates/x.log", "a/b/c.log"]
+        for relative in wanted + ["private/secret.log", "nginx/access.log", "apt/history.txt"]:
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).write_text(f"fixture line for {relative}\n")
+        (root / "private").chmod(0)
+
+        def collect(include):
+            data = Path(tempfile.mkdtemp(prefix="data-", dir=name))
+            moved = lambda patterns: [p.replace("/var/log/", f"{root}/", 1) for p in patterns]
+            for pattern in include + varlog["exclude"]:
+                assert pattern.startswith("/var/log/"), pattern
+            config = {"data_dir": str(data),
+                      "sources": {"varlog": dict(varlog, include=moved(include),
+                                                 exclude=moved(varlog["exclude"]),
+                                                 read_from="beginning")},
+                      "sinks": {"out": {"type": "console", "inputs": ["varlog"], "target": "stdout",
+                                        "encoding": {"codec": "json"}}}}
+            path = Path(name) / "varlog.json"
+            path.write_text(json.dumps(config))
+            with (Path(name) / "vector.out").open("w+") as out, \
+                    (Path(name) / "vector.log").open("w+") as log:
+                process = subprocess.Popen([VECTOR, "--config", str(path)], env=ENV,
+                                           stdout=out, stderr=log)
+                try:
+                    deadline = time.monotonic() + 20
+                    while True:
+                        out.seek(0)
+                        files = sorted(str(Path(json.loads(line)["file"]).relative_to(root))
+                                       for line in out.read().splitlines() if line.strip())
+                        if len(files) >= len(wanted) or time.monotonic() > deadline:
+                            break
+                        assert process.poll() is None
+                        time.sleep(0.1)
+                    # A second scan of the paths, which logs any glob error again.
+                    time.sleep(1.5)
+                finally:
+                    process.send_signal(signal.SIGTERM)
+                    process.communicate(timeout=15)
+                log.seek(0)
+                return files, log.read()
+
+        try:
+            files, log = collect(varlog["include"])
+            old_files, old_log = collect(["/var/log/**/*.log"])
+        finally:
+            (root / "private").chmod(0o755)
+        assert "Failed to glob path" not in log, log
+        assert files == sorted(wanted), files
+        assert "Failed to glob path" in old_log, "the fixture no longer reproduces the glob error"
+        assert old_files == files, (old_files, files)
+        print(f"PASS varlog catch-all skips /var/log/private: {len(files)} files collected, "
+              "no glob error; a single ** include logs one for the same tree")
+
+
 if __name__ == "__main__":
     version = subprocess.check_output([VECTOR, "--version"], text=True).strip()
     assert version.startswith("vector 0.57.0 "), version
@@ -697,4 +1007,6 @@ if __name__ == "__main__":
             run(tcp, suppress)
     run(True, False, "trusted")
     run(False, False, "untrusted")
+    postgresql_zones()
+    varlog_glob()
     capture_recipe()

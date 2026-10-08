@@ -180,7 +180,7 @@ Capture is Linux-only.
 The chart values are `crashDump.enabled`, `crashDump.size`,
 `crashDump.storageClass`, `crashDump.mountPath`, and `crashDump.retain`. Their
 defaults are `false`, `2Gi`, `""`, `/var/lib/trawl/cores`, and `10`. The
-[chart README](https://github.com/jakub/trawl/blob/main/chart/trawl/README.md)
+[chart README](https://github.com/jakub/trawl/blob/{{release.tag}}/chart/trawl/README.md)
 lists every value.
 
 ### Capabilities the unit grants

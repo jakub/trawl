@@ -28,6 +28,17 @@ for package in packages:
     if package != runtime:
         depends = subprocess.check_output(['dpkg-deb', '-f', str(package), 'Depends'], text=True)
         assert f'trawl-runtime (= {version})' in depends
+# The Vector guide copies these from the trawld host. This image excludes
+# /usr/share/doc/* from unpacking, so read the archive, not the filesystem.
+# The names are listed here because this job checks out only scripts/release.
+server = next(p for p in packages if p.name.startswith('trawl-server_'))
+modes = {}
+for line in subprocess.check_output(['dpkg-deb', '-c', str(server)], text=True).splitlines():
+    fields = line.split()
+    modes[fields[-1]] = fields[0]
+for name in ('apache', 'base', 'docker', 'fail2ban', 'mysql', 'nginx', 'postgresql', 'redis', 'unifi-syslog'):
+    path = f'./usr/share/doc/trawl-server/examples/vector/{name}.toml'
+    assert modes.get(path) == '-rw-r--r--', f'{server.name}: {path} is {modes.get(path)!r}, expected a 0644 file'
 assert subprocess.check_output(['dpkg-query', '-S', '/usr/lib/trawl/libduckdb.so'], text=True).strip() == 'trawl-runtime: /usr/lib/trawl/libduckdb.so'
 PY
 python3 "$tooling/smoke-cli.py" /usr/bin/trawl "$tooling/fixtures/cli.parquet"

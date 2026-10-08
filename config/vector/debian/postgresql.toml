@@ -30,9 +30,42 @@ source = '''
 #   2024-01-15 10:30:45.123 UTC [12345] LOG:  autovacuum launcher started
 parsed, err = parse_regex(
   .message,
-  r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \w+) \[(?P<pid>\d+)\] (?:(?P<user>\w+)@(?P<db>\w+) )?(?P<level>\w+):\s+(?P<msg>.*)'
+  r'^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) (?P<tz>[A-Za-z]+|[+-]\d{2}(?:\d{2})?) \[(?P<pid>\d+)\] (?:(?P<user>\w+)@(?P<db>\w+) )?(?P<level>\w+):\s+(?P<msg>.*)'
 )
 if err == null {
+  # The line's own time, not the time Vector read it. PostgreSQL stamps the
+  # log_timezone abbreviation. Supported log_timezone values are IANA zone
+  # names (initdb copies the host's), UTC, and the numeric Etc/GMT+-N forms.
+  # UTC is exact, and so are the numeric names, such as -03 or +0545, of zones
+  # without an abbreviation. Other names, such as EDT or CEST, name no fixed
+  # offset: read the time in the collector's zone (TZ, else the host's zone)
+  # and keep it only if that zone has the line's abbreviation at that
+  # instant. An abbreviation that two zones share, such as CST, cannot be told
+  # apart. POSIX offset strings, such as GMT+3 or UTC+3, are not supported:
+  # they stamp GMT or UTC at a non-zero offset, with the sign inverted.
+  # Otherwise, or if the timestamp does not parse, such as in the hour a
+  # change from summer time repeats, keep the read time. Set
+  # log_timezone = 'UTC' for exact times.
+  time = null
+  tz = string!(parsed.tz)
+  if tz == "UTC" || tz == "GMT" {
+    time = parse_timestamp(parsed.ts, "%Y-%m-%d %H:%M:%S%.f", timezone: "UTC") ?? null
+  } else if starts_with(tz, "+") || starts_with(tz, "-") {
+    time = parse_timestamp(string!(parsed.ts) + " " + tz, "%Y-%m-%d %H:%M:%S%.f %#z") ?? null
+  } else {
+    zone = get_env_var("TZ") ?? get_timezone_name() ?? ""
+    if starts_with(zone, ":") {
+      zone = slice!(zone, 1)
+    }
+    local, local_err = parse_timestamp(parsed.ts, "%Y-%m-%d %H:%M:%S%.f", timezone: zone)
+    if local_err == null && (format_timestamp(local, "%Z", timezone: zone) ?? null) == tz {
+      time = local
+    }
+  }
+  if time != null {
+    ._time = time
+  }
+
   .message = parsed.msg
 
   if parsed.user != null {

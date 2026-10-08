@@ -155,6 +155,17 @@ assets = [
     # the source path for tmpfiles.d assets too.
     ["debian/trawl.tmpfiles", "usr/lib/tmpfiles.d/trawl.conf", "644"],
     ["debian/crashdump.conf", "usr/share/doc/trawl-server/examples/crashdump.conf", "644"],
+    # The Vector sender files the guide copies (getting-started/vector-integration).
+    # One line each: scripts/release/test-installed-debian.sh lists the same names.
+    ["../../config/vector/debian/apache.toml", "usr/share/doc/trawl-server/examples/vector/apache.toml", "644"],
+    ["../../config/vector/debian/base.toml", "usr/share/doc/trawl-server/examples/vector/base.toml", "644"],
+    ["../../config/vector/debian/docker.toml", "usr/share/doc/trawl-server/examples/vector/docker.toml", "644"],
+    ["../../config/vector/debian/fail2ban.toml", "usr/share/doc/trawl-server/examples/vector/fail2ban.toml", "644"],
+    ["../../config/vector/debian/mysql.toml", "usr/share/doc/trawl-server/examples/vector/mysql.toml", "644"],
+    ["../../config/vector/debian/nginx.toml", "usr/share/doc/trawl-server/examples/vector/nginx.toml", "644"],
+    ["../../config/vector/debian/postgresql.toml", "usr/share/doc/trawl-server/examples/vector/postgresql.toml", "644"],
+    ["../../config/vector/debian/redis.toml", "usr/share/doc/trawl-server/examples/vector/redis.toml", "644"],
+    ["../../config/vector/debian/unifi-syslog.toml", "usr/share/doc/trawl-server/examples/vector/unifi-syslog.toml", "644"],
 ]
 
 [lints]

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Check built documentation links and small source-owned inventories."""
-from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 import re
 import sys
 import tomllib
+
+from rendered_page import Page
+from source_rules import TOKEN_ON_ARGV
 
 DOCS = Path(__file__).resolve().parents[1]
 ROOT = DOCS.parent
@@ -13,22 +15,15 @@ DIST = DOCS / 'dist'
 errors = []
 
 
-class Page(HTMLParser):
-    def __init__(self, source):
-        super().__init__(convert_charrefs=True)
-        self.ids = set()
-        self.links = []
-        self.feed(source)
-
-    def handle_starttag(self, tag, attributes):
-        attrs = dict(attributes)
-        if attrs.get('id'):
-            self.ids.add(attrs['id'])
-        if tag == 'a' and attrs.get('href'):
-            self.links.append(attrs['href'])
-
-
-pages = {path: Page(path.read_text()) for path in DIST.rglob('*.html')}
+pages = {}
+for path in DIST.rglob('*.html'):
+    source = path.read_text()
+    if re.search(r'\{\{release\.|%7b%7brelease\.', source, re.I):
+        errors.append(f'{path.relative_to(DIST)}: unrendered release placeholder')
+    page = Page(source)
+    if page.empty_markdown:
+        errors.append(f'{path.relative_to(DIST)}: empty markdown content; check the build log for a rendering error')
+    pages[path] = page
 if not pages:
     sys.exit('No built HTML found. Run npm run build first.')
 links = 0
@@ -118,6 +113,12 @@ for path in (DOCS / 'src/content/docs').rglob('*'):
     if path.suffix not in ('.md', '.mdx'):
         continue
     source = path.read_text()
+    if path.suffix == '.mdx' and '{{release.' in source:
+        errors.append(f'{path.relative_to(ROOT)}: unrendered release placeholder in MDX source')
+    for match in TOKEN_ON_ARGV.finditer(source):
+        line = source[:match.start()].count('\n') + 1
+        errors.append(f'{path.relative_to(ROOT)}:{line}: bearer token expanded onto a command line; '
+                      'use the curl config file from operate/access.md')
     frontmatter = re.match(r'^---\n(.*?)\n---', source, re.S)
     if not frontmatter or any(not re.search(rf'^{key}:\s*\S', frontmatter[1], re.M)
                               for key in ('title', 'description')):

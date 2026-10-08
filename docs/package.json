@@ -5,11 +5,13 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
+    "test": "node --test scripts/release-pins.test.mjs && python3 -m unittest discover -s scripts -p 'test_*.py'",
     "check": "astro build && python3 scripts/check-docs.py",
     "preview": "astro preview",
     "astro": "astro"
   },
   "dependencies": {
+    "@astrojs/markdown-satteri": "0.3.8",
     "astro": "^7.1.0",
     "@astrojs/starlight": "^0.41.0",
     "sharp": "^0.35.0"

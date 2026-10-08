@@ -1,7 +1,10 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
+import { satteri } from '@astrojs/markdown-satteri';
+import { releasePins, releasePinsPlugin } from './scripts/release-pins.mjs';
 
 const preview = process.env.TRAWL_DOCS_PREVIEW === '1';
+const pins = releasePins(process.env);
 const allowedHosts = (process.env.TRAWL_DOCS_ALLOWED_HOSTS || '')
   .split(',').map((host) => host.trim()).filter(Boolean);
 
@@ -9,6 +12,9 @@ export default defineConfig({
   site: 'https://trawl.sh',
   server: { allowedHosts },
   devToolbar: { enabled: false },
+  markdown: { processor: satteri({
+    mdastPlugins: [releasePinsPlugin(pins)],
+  }) },
   integrations: [
     starlight({
       title: 'trawl',

@@ -59,7 +59,7 @@ every network loss, or every disk failure.
 
 ## Load rules into plain Prometheus
 
-1. Copy [trawl.rules.yml](https://github.com/jakub/trawl/blob/main/monitoring/prometheus/trawl.rules.yml)
+1. Copy [trawl.rules.yml](https://github.com/jakub/trawl/blob/{{release.tag}}/monitoring/prometheus/trawl.rules.yml)
    from your Trawl version into your existing Prometheus configuration directory.
 2. Merge the following example into that Prometheus configuration. Replace the
    target and CA path with the daemon endpoint and a CA trusted by Prometheus.
