@@ -1,6 +1,6 @@
 {
-  "source_sha": "ddd011bdc5479efacb5975e794605e6595fb3386",
-  "workflow_sha": "ddd011bdc5479efacb5975e794605e6595fb3386",
-  "release_tag": "v0.9.1",
+  "source_sha": "32c6fac6537e4d2cc2421a693ae5053500919246",
+  "workflow_sha": "32c6fac6537e4d2cc2421a693ae5053500919246",
+  "release_tag": "v0.9.2",
   "channel": "release"
 }
