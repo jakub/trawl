@@ -924,9 +924,11 @@ widen `last=1d`.
    trawl -p prod query 'service=trawld _producer=trawld last=1d | stats count() by _severity'
    ```
 
-   `_severity` is the OpenTelemetry severity number: 9 is info, 13 is warn,
-   and 17 is error. A server that uses its generated certificate logs warn
-   events that say so.
+   `_severity` is stored as the OpenTelemetry severity number: 9 is info,
+   13 is warn, and 17 is error. The table shows the name, such as `info`,
+   and `--format json` or `csv` shows the number. A filter accepts either,
+   such as `_severity>=warn`. A server that uses its generated certificate
+   logs warn events that say so.
 
 3. Read trawld's messages with their severity:
 
