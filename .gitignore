@@ -31,7 +31,8 @@ core.*
 
 # generated test fixtures
 crates/trawl-engine/tests/fixtures/
-crates/trawl-server/tests/fixtures/startup/
+crates/trawl-server/tests/fixtures/*
+!crates/trawl-server/tests/fixtures/vector-capture/
 
 # vector log data
 data/
