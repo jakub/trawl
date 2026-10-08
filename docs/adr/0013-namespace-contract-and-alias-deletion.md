@@ -439,3 +439,13 @@ decisions. Where a ruling amends this ADR's text, the amendment is stated.
   table, in-memory mirror, probe matrix, wire types, rendering) — priced
   into slice 1 deliberately, because without it the token vocabulary would
   need a name-special-case, which is the disease this ADR exists to cure.
+
+## Amendment: status-only collectors, 2026-10-08
+
+Ruling 4 keeps per-event rejection on HTTP because an HTTP sender can fix and
+resend. Vector's `http` sink reads only the status code, so it never sees a
+refusal inside a 200 response, and the refused event is lost. HTTP keeps
+per-event rejection and its 200 response. For the configs trawl ships, trawl
+owns validity at the sender instead: ADR-0053 makes every shipped
+transform that derives `service` send only names trawld accepts, and the
+per-event rejection alert of ADR-0034 reports the senders it does not cover.

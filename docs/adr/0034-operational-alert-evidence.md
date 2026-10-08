@@ -79,3 +79,17 @@ change to ingest and storage failure behavior. The issue records the bounded
 failure paths, rule configuration, runbooks and required evidence. Metric
 names and concrete helper placement for new measurements are implementation
 choices within these semantic and cardinality bounds.
+
+## Amendment: per-event rejection alert, 2026-10-08
+
+Ordinary malformed input no longer stays a diagnostic metric only. A sender
+that reads only HTTP status codes, such as Vector, counts a 200 response with
+per-event rejections as success, so a refused event is lost with no error
+(#294, ADR-0053). The pack gains a warning alert on any increase of
+`trawl_ingest_events_rejected_total` for a per-event reason. The match
+excludes `wal_failure`, which keeps its own alert, and the whole-request
+refusals `hot_buffer_full` and `ingest_batch_too_large`, which the sender sees
+as a 503 or a 413. New per-event reasons alert without a rule edit. A test
+classifies every `RejectReason` as per-event or excluded, so a new reason
+fails CI until someone classifies it. The alert has the chart's per-alert
+switch and a runbook section, like the rest of the pack.
