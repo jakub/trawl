@@ -170,8 +170,15 @@ impl fmt::Display for RejectReason {
 pub struct Rejection {
     /// The typed reason, a closed label set.
     pub reason: RejectReason,
-    /// The human-readable explanation. It may quote a bounded client value,
-    /// so it belongs in a response to that client and never in a log line.
+    /// The human-readable explanation. It may quote a client value, always
+    /// a bounded one: a service name only after the length check (at most
+    /// 128 bytes), an `env` only after the 32-character rule or cut by
+    /// `echo` at 64 characters, and a wrong-typed value by its JSON type
+    /// alone. An unparseable line is serde's position text, and the line is
+    /// not quoted. The message belongs in the response to that client. The
+    /// one log line that may carry it is the `ingest_rejections` warning,
+    /// whose `samples` field quotes up to five of these messages
+    /// (ADR-0053); no other log line takes one.
     pub message: String,
     /// The event had no `host` (absent or JSON `null`) once its names were
     /// normalized, under the same rule [`Canonical::host_absent`] uses.
