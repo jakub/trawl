@@ -8,7 +8,8 @@
 //! creates under its roots is owner-only. An installation started under an
 //! older trawld, or a root another tool made, can still carry group or other
 //! bits. Boot closes each root to its owner before it reads or writes the
-//! corpus, and refuses to start when it cannot. Closing the root is enough:
+//! corpus, and refuses to start when it cannot. A refused root does not
+//! stop the others closing. Closing the root is enough:
 //! an older 0644 file beneath a 0700 root cannot be reached by another user,
 //! so nothing beneath a root is ever chmodded. A recursive repair would race
 //! the writers and follow links planted under a directory trawld can write.
@@ -473,17 +474,20 @@ pub fn fchmod(fd: BorrowedFd<'_>, mode: Mode) -> io::Result<()> {
 /// Close every root in `roots` to its owner, for a trawld running as `euid`.
 /// Boot only: the doctor calls [`predict`].
 ///
-/// Every root is observed and judged before any is changed, so a root that
-/// is refused for its type, its owner or a failed open leaves every mode as
-/// it was. A chmod that fails leaves the roots before it closed. A root
-/// that needs closing gets
+/// Each root is judged and, when it can be, closed, whatever another root's
+/// verdict: a refused WAL directory or repin sibling never keeps the data
+/// root open, nor does a chmod that failed on one root stop the next. A
+/// root that is refused for its type, its owner or a failed open is left as
+/// it was. A root that needs closing gets
 /// `mode & !0o077` through `chmod` on its open handle, which keeps the
 /// owner's bits as they are and keeps setgid and sticky (a Kubernetes
 /// `fsGroup` sets setgid). The mode is read back afterwards, and a group or
-/// other bit that survived refuses. The result is in `roots` order.
+/// other bit that survived refuses. Every root it closes is logged as it
+/// closes, refusal or not. The result is in `roots` order.
 ///
 /// # Errors
-/// The first root that cannot be kept owner-only, as an [`OwnerOnlyError`].
+/// The first root in `roots` order that cannot be kept owner-only, as an
+/// [`OwnerOnlyError`], once every other root has been closed.
 pub fn close<F>(
     roots: &[ProtectedRoot],
     euid: u32,
@@ -492,45 +496,47 @@ pub fn close<F>(
 where
     F: FnMut(BorrowedFd<'_>, Mode) -> io::Result<()>,
 {
-    enum Pending {
-        Done(Closed),
-        Tighten(Directory),
-    }
-
-    let mut pending = Vec::with_capacity(roots.len());
+    let mut closed = Vec::with_capacity(roots.len());
+    let mut refusal = None;
     for root in roots {
-        let refuse = |dir: Option<&Directory>, cause| OwnerOnlyError::new(root, dir, euid, cause);
-        let state = match observe(&root.path) {
-            Err(e) => return Err(refuse(None, Cause::Inspect(e))),
-            Ok(Observation::Absent) => Pending::Done(Closed::Absent),
-            Ok(Observation::NotDirectory) if root.kind.epoch_gate_judges_non_directory() => {
-                Pending::Done(Closed::NotDirectory)
+        match close_one(root, euid, &mut chmod) {
+            Ok(outcome) => {
+                log_closed(root, outcome);
+                closed.push(outcome);
             }
-            Ok(Observation::NotDirectory) => return Err(refuse(None, Cause::NotDirectory)),
-            Ok(Observation::Symlink) => return Err(refuse(None, Cause::Symlink)),
-            Ok(Observation::BadPath) => return Err(refuse(None, Cause::BadPath)),
-            Ok(Observation::Directory(dir)) => match judge(dir.owner, dir.mode, euid) {
-                Verdict::OwnerOnly => Pending::Done(Closed::OwnerOnly),
-                Verdict::WillTighten => Pending::Tighten(dir),
-                Verdict::ForeignOwner { .. } => {
-                    return Err(refuse(Some(&dir), Cause::ForeignOwner));
-                }
-            },
-        };
-        pending.push((root, state));
+            Err(error) => {
+                refusal.get_or_insert(error);
+            }
+        }
     }
+    refusal.map_or(Ok(closed), Err)
+}
 
-    pending
-        .into_iter()
-        .map(|(root, state)| match state {
-            Pending::Done(closed) => Ok(closed),
-            Pending::Tighten(dir) => tighten(root, &dir, euid, &mut chmod),
-        })
-        .collect()
+/// Judge one root and close it if it needs closing.
+fn close_one<F>(root: &ProtectedRoot, euid: u32, chmod: &mut F) -> Result<Closed, OwnerOnlyError>
+where
+    F: FnMut(BorrowedFd<'_>, Mode) -> io::Result<()>,
+{
+    let refuse = |dir: Option<&Directory>, cause| OwnerOnlyError::new(root, dir, euid, cause);
+    match observe(&root.path) {
+        Err(e) => Err(refuse(None, Cause::Inspect(e))),
+        Ok(Observation::Absent) => Ok(Closed::Absent),
+        Ok(Observation::NotDirectory) if root.kind.epoch_gate_judges_non_directory() => {
+            Ok(Closed::NotDirectory)
+        }
+        Ok(Observation::NotDirectory) => Err(refuse(None, Cause::NotDirectory)),
+        Ok(Observation::Symlink) => Err(refuse(None, Cause::Symlink)),
+        Ok(Observation::BadPath) => Err(refuse(None, Cause::BadPath)),
+        Ok(Observation::Directory(dir)) => match judge(dir.owner, dir.mode, euid) {
+            Verdict::OwnerOnly => Ok(Closed::OwnerOnly),
+            Verdict::WillTighten => tighten(root, &dir, euid, chmod),
+            Verdict::ForeignOwner { .. } => Err(refuse(Some(&dir), Cause::ForeignOwner)),
+        },
+    }
 }
 
 /// Close a root trawld has just created, for a trawld running as its own
-/// euid, and log it if it had to be tightened.
+/// euid. [`close`] logs it if it had to be tightened.
 ///
 /// A repin calls this right after it creates its shadow or aside root,
 /// before anything enters it. The umask makes a new directory owner-only
@@ -556,16 +562,13 @@ pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> 
             Cause::Inspect(Errno::NOENT.into()),
         )),
         [Closed::NotDirectory] => Err(OwnerOnlyError::new(&root, None, euid, Cause::NotDirectory)),
-        [closed] => {
-            log_closed(&root, *closed);
-            Ok(())
-        }
+        [_] => Ok(()),
         _ => unreachable!("one root closed, one result"),
     }
 }
 
 /// Log a root [`close`] had to tighten, so the operator learns it was open.
-pub fn log_closed(root: &ProtectedRoot, closed: Closed) {
+fn log_closed(root: &ProtectedRoot, closed: Closed) {
     if let Closed::Tightened { from, to } = closed {
         tracing::warn!(
             event_type = "storage_root_closed",
@@ -1137,33 +1140,82 @@ mod tests {
         );
     }
 
+    /// A refused root keeps no other root open: every root that can be
+    /// closed is closed, and the first refusal in `roots` order is returned
+    /// afterwards. A data root left 0755 behind a refused WAL directory or
+    /// repin sibling would stay open to other users across every refused
+    /// restart.
     #[test]
-    fn every_root_is_judged_before_any_is_changed() {
+    fn a_refused_root_leaves_every_closable_root_closed() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         std::fs::create_dir(&data).unwrap();
         set_mode(&data, 0o755);
         let real = tmp.path().join("real-wal");
         std::fs::create_dir(&real).unwrap();
+        set_mode(&real, 0o755);
         let wal = tmp.path().join("wal");
         std::os::unix::fs::symlink(&real, &wal).unwrap();
+        let shadow = tmp.path().join("data.repin-next");
+        std::fs::write(&shadow, b"not a directory").unwrap();
+        set_mode(&shadow, 0o644);
+        let aside = tmp.path().join("data.repin-aside");
+        std::fs::create_dir(&aside).unwrap();
+        set_mode(&aside, 0o755);
         let roots = [
+            (RootKind::DataRoot, &data),
+            (RootKind::WalDir, &wal),
+            (RootKind::RepinShadow, &shadow),
+            (RootKind::RepinAside, &aside),
+        ]
+        .map(|(kind, path)| ProtectedRoot {
+            kind,
+            path: path.clone(),
+        });
+
+        let error = close(&roots, euid(), fchmod).unwrap_err();
+
+        assert_eq!(error.kind, RootKind::WalDir, "the first refusal: {error}");
+        assert!(matches!(error.cause, Cause::Symlink), "{error}");
+        assert_eq!(mode_of(&data), 0o700, "the data root closes anyway");
+        assert_eq!(mode_of(&aside), 0o700, "a root after the refusals closes");
+        assert_eq!(mode_of(&real), 0o755, "the link target is untouched");
+        assert_eq!(mode_of(&shadow), 0o644, "the refused file is untouched");
+    }
+
+    /// A chmod that fails on one root does not stop the next from closing,
+    /// and the failure is still the refusal.
+    #[test]
+    fn a_failed_chmod_does_not_stop_the_other_roots_closing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = tmp.path().join("wal");
+        for dir in [&data, &wal] {
+            std::fs::create_dir(dir).unwrap();
+            set_mode(dir, 0o755);
+        }
+        let roots = [(RootKind::DataRoot, &data), (RootKind::WalDir, &wal)].map(|(kind, path)| {
             ProtectedRoot {
-                kind: RootKind::DataRoot,
-                path: data.clone(),
-            },
-            ProtectedRoot {
-                kind: RootKind::WalDir,
-                path: wal,
-            },
-        ];
-        let error = close(&roots, euid(), no_chmod).unwrap_err();
-        assert_eq!(error.kind, RootKind::WalDir);
-        assert_eq!(
-            mode_of(&data),
-            0o755,
-            "the data root waits for every verdict"
-        );
+                kind,
+                path: path.clone(),
+            }
+        });
+        let calls = Cell::new(0);
+
+        let error = close(&roots, euid(), |fd, mode| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(Errno::PERM.into())
+            } else {
+                fchmod(fd, mode)
+            }
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind, RootKind::DataRoot, "{error}");
+        assert!(matches!(error.cause, Cause::TightenDenied(_)), "{error}");
+        assert_eq!(mode_of(&data), 0o755);
+        assert_eq!(mode_of(&wal), 0o700, "the WAL directory closes anyway");
     }
 
     #[test]

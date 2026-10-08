@@ -692,10 +692,7 @@ fn close_storage_roots(
 
     let roots = owner_only::protected_roots(data_root, wal_dir, ingest_enabled);
     let euid = rustix::process::geteuid().as_raw();
-    let closed = owner_only::close(&roots, euid, owner_only::fchmod).map_err(|e| e.to_string())?;
-    for (root, closed) in roots.iter().zip(closed) {
-        owner_only::log_closed(root, closed);
-    }
+    owner_only::close(&roots, euid, owner_only::fchmod).map_err(|e| e.to_string())?;
     Ok(())
 }
 
