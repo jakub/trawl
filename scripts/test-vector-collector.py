@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Run the Debian collector with Vector 0.57.0 and disposable loopback inputs.
 
+The events the all-source run delivers must equal the committed capture
+(CAPTURE) byte for byte. trawl-server's ingest preview test reads that file,
+so trawld's own canonicalizer proves it accepts what the shipped configs
+send. `--regenerate-capture` rewrites the file after the run's asserts pass.
+
 Also run the Vector guide's sample capture recipe, as written, and prove that it
 captures the events the `trawld` sink posts, and prove that `base.toml`'s
 `/var/log` catch-all never reads `/var/log/private`.
@@ -10,8 +15,10 @@ PATH). No host journal, application files, Docker socket, credentials, or runnin
 collector are used.
 """
 
+import argparse
 import collections
 import datetime
+import difflib
 import gzip
 import http.server
 import json
@@ -33,6 +40,12 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config/vector/debian"
 FIXTURES = ROOT / "target/vector-collector-tests"
+# The delivered events of the all-source run, which
+# crates/trawl-server/tests/ingest_preview.rs posts to a real trawld.
+CAPTURE = ROOT / "crates/trawl-server/tests/fixtures/vector-capture/debian.ndjson"
+REGENERATE = "--regenerate-capture"
+# The most diff text a capture mismatch prints.
+MAX_CAPTURE_DIFF = 20000
 VECTOR = os.environ.get("VECTOR_BIN", "vector")
 ENV = dict(os.environ, VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION="true",
            TRAWL_URL="http://127.0.0.1:1", TRAWL_INGEST_TOKEN="fixture-token",
@@ -716,6 +729,37 @@ def canonical(event):
     return json.dumps(event, sort_keys=True)
 
 
+def check_capture(received, regenerate):
+    """Compare the delivered events to CAPTURE, or rewrite it.
+
+    One canonical object per line, lines sorted, so Vector's batching and
+    transform interleaving do not change the file. Call only after the run
+    that delivered `received` passed every assert, so regeneration never
+    blesses a run that failed.
+    """
+    text = "".join(line + "\n" for line in sorted(map(canonical, received)))
+    raw = text.encode()
+    # The capture must fit one ingest preview.
+    events = preview_input(raw)
+    relative = CAPTURE.relative_to(ROOT)
+    if regenerate:
+        CAPTURE.parent.mkdir(parents=True, exist_ok=True)
+        CAPTURE.write_bytes(raw)
+        print(f"WROTE {relative} ({len(events)} events, {len(raw)} bytes)")
+        return
+    committed = CAPTURE.read_bytes().decode() if CAPTURE.exists() else ""
+    if committed != text:
+        diff = "".join(difflib.unified_diff(committed.splitlines(True), text.splitlines(True),
+                                            f"{relative} (committed)", "delivered"))
+        if len(diff) > MAX_CAPTURE_DIFF:
+            diff = diff[:MAX_CAPTURE_DIFF] + f"\n... diff cut at {MAX_CAPTURE_DIFF} characters\n"
+        raise AssertionError(
+            f"{relative} differs from the events the shipped Vector configs delivered. Rerun "
+            f"VECTOR_BIN=<vector 0.57.0> python3 scripts/test-vector-collector.py {REGENERATE}, "
+            f"review the diff, and commit the file.\n{diff}")
+    print(f"PASS capture: {len(events)} delivered events equal {relative} byte for byte")
+
+
 def capture_recipe():
     events, expected = fixtures(False)
     requests = []
@@ -1105,6 +1149,11 @@ def varlog_glob():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(REGENERATE, action="store_true", dest="regenerate",
+                        help=f"rewrite {CAPTURE.relative_to(ROOT)} from the all-source run "
+                             "after its asserts pass, instead of comparing to it")
+    args = parser.parse_args()
     version = subprocess.check_output([VECTOR, "--version"], text=True).strip()
     assert version.startswith("vector 0.57.0 "), version
     print(version, flush=True)
@@ -1113,7 +1162,11 @@ if __name__ == "__main__":
     FIXTURES.mkdir(parents=True, exist_ok=True)
     for tcp in (False, True):
         for suppress in (False, True):
-            run(tcp, suppress)
+            received = run(tcp, suppress)
+            # The all-source run: journald, varlog, Docker, the drop-ins, and
+            # UniFi over both loopback transports, noise suppression off.
+            if tcp and not suppress:
+                check_capture(received, args.regenerate)
     run(True, False, "trusted")
     run(False, False, "untrusted")
     postgresql_zones()

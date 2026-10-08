@@ -134,7 +134,7 @@ jobs:
         run: bash chart/trawl/tests/render.sh
         env:
           PROMTOOL: ${{ runner.temp }}/prometheus-3.14.0.linux-amd64/promtool
-      - name: Vector collector delivery (Debian collector with Vector 0.57.0)
+      - name: Vector collector delivery and capture (Debian collector with Vector 0.57.0)
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         shell: bash
