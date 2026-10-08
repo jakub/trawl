@@ -351,10 +351,10 @@ cluster.
    ingress with `ingress.backend: trawld`. The [chart README](https://github.com/jakub/trawl/blob/{{release.tag}}/chart/trawl/README.md)
    lists every value.
 
-   Before installation, supply the browser ingress Secret named
-   `trawl-browser-tls` in namespace `trawl`, with a certificate for
-   `trawl.example.com`. Your ingress controller can manage it, or create it
-   from your certificate files:
+   With the `ingress` block above, supply the browser ingress Secret named
+   `trawl-browser-tls` in namespace `trawl` before installation, with a
+   certificate for `trawl.example.com`. Your ingress controller can manage
+   it, or create it from your certificate files:
 
    ```bash
    kubectl -n trawl create secret tls trawl-browser-tls \
@@ -380,7 +380,8 @@ cluster.
        - trawl.example.com
    ```
 
-   The gateway terminates browser TLS for that hostname. `backend: trawld`
+   The gateway terminates browser TLS for that hostname with its listener's
+   certificate, so skip the `trawl-browser-tls` Secret. `backend: trawld`
    routes to the HTTPS API instead, and the gateway then needs a
    `BackendTLSPolicy` that trusts trawld's certificate.
 
