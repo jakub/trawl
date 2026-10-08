@@ -7,6 +7,7 @@ import sys
 import tomllib
 
 from rendered_page import Page
+from source_rules import TOKEN_ON_ARGV
 
 DOCS = Path(__file__).resolve().parents[1]
 ROOT = DOCS.parent
@@ -114,7 +115,7 @@ for path in (DOCS / 'src/content/docs').rglob('*'):
     source = path.read_text()
     if path.suffix == '.mdx' and '{{release.' in source:
         errors.append(f'{path.relative_to(ROOT)}: unrendered release placeholder in MDX source')
-    for match in re.finditer(r'Bearer\s+\$\(', source):
+    for match in TOKEN_ON_ARGV.finditer(source):
         line = source[:match.start()].count('\n') + 1
         errors.append(f'{path.relative_to(ROOT)}:{line}: bearer token expanded onto a command line; '
                       'use the curl config file from operate/access.md')
