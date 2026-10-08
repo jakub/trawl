@@ -88,7 +88,9 @@ per service: `apache.toml`, `docker.toml`, `fail2ban.toml`, `mysql.toml`,
    instead.
 
    `base.toml` reads journald and every `*.log` file under `/var/log`, except
-   in `/var/log/private`, which systemd keeps root-only. It derives `service`
+   in `/var/log/private`, which systemd keeps root-only, and `/var/log/trawl`,
+   which `trawld.service` keeps owner-only. trawld's own events arrive through
+   its internal telemetry instead. It derives `service`
    as [Service names](#service-names) describes, maps `PRIORITY` to
    `severity_text`, and defines the `trawld` sink.
    The sink takes input from every final transform named `trawl_*`, so a

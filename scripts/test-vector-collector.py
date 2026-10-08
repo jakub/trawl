@@ -8,7 +8,7 @@ send. `--regenerate-capture` rewrites the file after the run's asserts pass.
 
 Also run the Vector guide's sample capture recipe, as written, and prove that it
 captures the events the `trawld` sink posts, and prove that `base.toml`'s
-`/var/log` catch-all never reads `/var/log/private`.
+`/var/log` catch-all never reads `/var/log/private` or `/var/log/trawl`.
 
 Requires Python 3.11+, OpenSSL, bash, awk, coreutils, and VECTOR_BIN (or vector on
 PATH). No host journal, application files, Docker socket, credentials, or running
@@ -1093,28 +1093,34 @@ def capture_recipe():
 
 
 def varlog_glob():
-    """base.toml's catch-all never reads /var/log/private.
+    """base.toml's catch-all never reads /var/log/private or /var/log/trawl.
 
     The include and exclude patterns run on 0.57 as shipped, with /var/log
-    moved to a fixture root whose `private` directory no one can read, so
-    Vector's walk would fail there with "Failed to glob path". The shipped
+    moved to a fixture root whose `private` and `trawl` directories no one can
+    read, so Vector's walk would fail there with "Failed to glob path". The shipped
     patterns must collect every other file, and the old single `**` include
     shows the fixture reproduces the failure.
     """
     if os.geteuid() == 0:
-        print("SKIP varlog catch-all skips /var/log/private: root reads a mode 000 directory")
+        print("SKIP varlog catch-all skips /var/log/private and /var/log/trawl: "
+              "root reads a mode 000 directory")
         return
     varlog = tomllib.loads((CONFIG / "base.toml").read_text())["sources"]["varlog"]
-    assert "/var/log/private/**" in varlog["exclude"], varlog["exclude"]
+    owner_only = ["private", "trawl"]
+    for directory in owner_only:
+        assert f"/var/log/{directory}/**" in varlog["exclude"], varlog["exclude"]
     with tempfile.TemporaryDirectory(prefix="trawl-varlog-", dir=FIXTURES) as name:
         root = Path(name) / "log"
         wanted = ["dpkg.log", "private.log", "apt/history.log", "apt/private/x.log",
                   "unattended-upgrades/unattended-upgrades-dpkg.log", "p/x.log", "prix/x.log",
-                  "privat/x.log", "privates/x.log", "a/b/c.log"]
-        for relative in wanted + ["private/secret.log", "nginx/access.log", "apt/history.txt"]:
+                  "privat/x.log", "privates/x.log", "a/b/c.log", "trawl.log", "apt/trawl/x.log",
+                  "t/x.log", "trax/x.log", "traw/x.log", "trawls/x.log"]
+        for relative in wanted + ["private/secret.log", "trawl/trawld.log", "nginx/access.log",
+                                  "apt/history.txt"]:
             (root / relative).parent.mkdir(parents=True, exist_ok=True)
             (root / relative).write_text(f"fixture line for {relative}\n")
-        (root / "private").chmod(0)
+        for directory in owner_only:
+            (root / directory).chmod(0)
 
         def collect(include):
             data = Path(tempfile.mkdtemp(prefix="data-", dir=name))
@@ -1155,12 +1161,14 @@ def varlog_glob():
             files, log = collect(varlog["include"])
             old_files, old_log = collect(["/var/log/**/*.log"])
         finally:
-            (root / "private").chmod(0o755)
+            for directory in owner_only:
+                (root / directory).chmod(0o755)
         assert "Failed to glob path" not in log, log
         assert files == sorted(wanted), files
         assert "Failed to glob path" in old_log, "the fixture no longer reproduces the glob error"
         assert old_files == files, (old_files, files)
-        print(f"PASS varlog catch-all skips /var/log/private: {len(files)} files collected, "
+        print(f"PASS varlog catch-all skips /var/log/private and /var/log/trawl: "
+              f"{len(files)} files collected, "
               "no glob error; a single ** include logs one for the same tree")
 
 

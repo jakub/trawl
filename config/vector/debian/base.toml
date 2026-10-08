@@ -65,18 +65,20 @@ current_boot_only = true
 # read_from=end collects newly appended lines, not existing file history.
 #
 # The include is every *.log under /var/log except under /var/log/private,
-# which systemd keeps root-only (0700) for DynamicUser services. Vector reads
+# which systemd keeps root-only (0700) for DynamicUser services, and
+# /var/log/trawl, which trawld.service keeps owner-only (0700). trawld's own
+# events reach trawl through its internal telemetry instead. Vector reads
 # every directory a `**` pattern reaches before it applies `exclude`, so
-# "/var/log/**/*.log" logs "Failed to glob path" for /var/log/private on every
-# scan. Each pattern below names the subdirectories it may enter: [!p]* is
-# every name not starting with "p", and the rest spell out the "p" names one
-# letter at a time, so no pattern ever matches "private" itself.
+# "/var/log/**/*.log" logs "Failed to glob path" for both on every scan. Each
+# pattern below names the subdirectories it may enter: [!pt]* is every name
+# not starting with "p" or "t", and the rest spell out the "p" and "t" names
+# one letter at a time, so no pattern ever matches "private" or "trawl" itself.
 
 [sources.varlog]
 type = "file"
 include = [
   "/var/log/*.log",
-  "/var/log/[!p]*/**/*.log",
+  "/var/log/[!pt]*/**/*.log",
   "/var/log/p/**/*.log",
   "/var/log/p[!r]*/**/*.log",
   "/var/log/pr/**/*.log",
@@ -90,11 +92,21 @@ include = [
   "/var/log/privat/**/*.log",
   "/var/log/privat[!e]*/**/*.log",
   "/var/log/private?*/**/*.log",
+  "/var/log/t/**/*.log",
+  "/var/log/t[!r]*/**/*.log",
+  "/var/log/tr/**/*.log",
+  "/var/log/tr[!a]*/**/*.log",
+  "/var/log/tra/**/*.log",
+  "/var/log/tra[!w]*/**/*.log",
+  "/var/log/traw/**/*.log",
+  "/var/log/traw[!l]*/**/*.log",
+  "/var/log/trawl?*/**/*.log",
 ]
 read_from = "end"
 exclude = [
-  # root-only logs of systemd DynamicUser services (see the include above)
+  # owner-only directories the include never enters (see the include above)
   "/var/log/private/**",
+  "/var/log/trawl/**",
 
   # rsyslog-managed files (already captured via journald)
   "/var/log/syslog*",
