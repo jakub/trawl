@@ -307,11 +307,29 @@ async fn doctor_boot_refusals_fail() {
 }
 
 /// An ingest node's data root holding `EPOCH` 3 and its WAL inside it.
+/// The root is owner-only, as trawld's umask and boot's close step leave
+/// it, whatever this test process's umask is.
 fn current_ingest_root(dir: &Path) -> DoctorConfig {
     let config = DoctorConfig::in_dir(dir);
     write(&config.data_path.join("EPOCH"), b"3\n");
     std::fs::create_dir_all(config.data_path.join("wal/prod")).unwrap();
+    #[cfg(unix)]
+    set_mode(&config.data_path, 0o700);
     config
+}
+
+/// Give `path` mode `mode`.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// The permission bits of `path`, without following a final symlink.
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
 }
 
 /// A well-formed publication marker for `prod`/`nginx`, from the encoder
@@ -656,6 +674,9 @@ async fn doctor_wal_outside_the_data_root() {
             ..current_ingest_root(dir.path())
         };
         std::fs::create_dir_all(dir.path().join(sealed.unwrap_or(wal))).unwrap();
+        if sealed.is_none() {
+            set_mode(&dir.path().join(wal), 0o700);
+        }
         let sealed = sealed.map(|sealed| dir.path().join(sealed));
         if let Some(sealed) = &sealed {
             std::fs::set_permissions(sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
@@ -685,4 +706,71 @@ async fn doctor_wal_outside_the_data_root() {
             }
         }
     }
+}
+
+/// `doctor_predicts_the_root_close`: `server.data.root` predicts boot's
+/// closing of the storage roots without changing a mode (ADR-0052). An
+/// owner-only root is `complete`; one with group or other bits is
+/// `complete`, `will_tighten`, on both node types; a symlinked root fails,
+/// exit 1, and the link and its target stay as they were. A run as euid 0
+/// does not judge modes or owners, but a symlink refuses whoever runs.
+#[cfg(unix)]
+#[tokio::test]
+async fn doctor_predicts_the_root_close() {
+    const CHECK: &str = "server.data.root";
+    let dbs = migrated_databases().await;
+    let root = nix::unistd::geteuid().is_root();
+    for ingest in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = DoctorConfig {
+            ingest,
+            ..current_ingest_root(dir.path())
+        };
+        for (mode, expected) in [(0o700, None), (0o755, Some(reason::WILL_TIGHTEN))] {
+            set_mode(&config.data_path, mode);
+            let run = doctor(dir.path(), &config, &dbs).await;
+            let label = format!("mode {mode:o}, ingest {ingest}");
+            assert_eq!(
+                mode_of(&config.data_path),
+                mode,
+                "{label}: the doctor changed it"
+            );
+            if root {
+                assert_eq!(
+                    run.outcome(CHECK),
+                    (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
+                    "{label}"
+                );
+            } else {
+                assert_eq!(run.outcome(CHECK), (Outcome::Complete, expected), "{label}");
+            }
+            assert_ne!(run.code, 1, "{label}: {:?}", run.report.checks());
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = current_ingest_root(dir.path());
+    let real = dir.path().join("real");
+    std::fs::rename(&config.data_path, &real).unwrap();
+    set_mode(&real, 0o755);
+    std::os::unix::fs::symlink(&real, &config.data_path).unwrap();
+    let run = doctor(dir.path(), &config, &dbs).await;
+    assert_eq!(
+        run.outcome(CHECK),
+        (
+            Outcome::Failed,
+            Some("the data root is a symlink, and trawld does not follow one at a storage root")
+        )
+    );
+    assert_eq!(run.code, 1);
+    assert!(
+        std::fs::symlink_metadata(&config.data_path)
+            .unwrap()
+            .is_symlink()
+    );
+    assert_eq!(
+        mode_of(&real),
+        0o755,
+        "the doctor changed the link's target"
+    );
 }

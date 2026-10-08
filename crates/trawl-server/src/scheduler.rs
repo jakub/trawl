@@ -1027,7 +1027,8 @@ mod tests {
 
         let data = tempfile::tempdir().unwrap();
         let executors =
-            crate::pool::ExecutorPool::new(data.path().to_str().unwrap().into(), 1, 100_000, None);
+            crate::pool::ExecutorPool::new(data.path().to_str().unwrap().into(), 1, 100_000, None)
+                .unwrap();
         let (store, _, succeeded) = super::pg_tests::seed_run(&pool, "timed_ok").await;
         let (_, _, failed) = super::pg_tests::seed_run(&pool, "timed_failure").await;
 

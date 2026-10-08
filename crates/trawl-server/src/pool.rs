@@ -1280,21 +1280,23 @@ impl ExecutorPool {
     /// Create a pool with the given concurrency limit and base data directory.
     ///
     /// Pre-creates `max_concurrent` executors sharing the same in-memory
-    /// `DuckDB` database. Panics if the database cannot be initialized
-    /// (fatal at startup — the server cannot function without `DuckDB`).
+    /// `DuckDB` database.
+    ///
+    /// # Errors
+    /// The database or its spill directory could not be set up, as when the
+    /// spill directory is not private ([`Executor::new`]). Fatal at startup:
+    /// the server cannot function without `DuckDB`, and the start fails
+    /// with this error.
     pub fn new(
         base_dir: String,
         max_concurrent: usize,
         max_result_rows: usize,
         hot_buffer: Option<Arc<HotBuffer>>,
-    ) -> Self {
-        let root = Executor::new().expect("failed to create DuckDB connection at startup");
+    ) -> Result<Self, trawl_engine::error::EngineError> {
+        let root = Executor::new()?;
         let mut executors = Vec::with_capacity(max_concurrent);
         for _ in 1..max_concurrent {
-            executors.push(
-                root.try_clone()
-                    .expect("failed to clone DuckDB connection at startup"),
-            );
+            executors.push(root.try_clone()?);
         }
         executors.push(root);
 
@@ -1306,7 +1308,7 @@ impl ExecutorPool {
             |buffer| buffer.publication(),
         );
         publication.initialize(std::path::Path::new(&base_dir));
-        Self {
+        Ok(Self {
             publication,
             base_dir: Arc::from(base_dir),
             fallback_glob,
@@ -1324,7 +1326,7 @@ impl ExecutorPool {
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
             #[cfg(any(test, feature = "test-support"))]
             seams: Arc::new(seam::Table::default()),
-        }
+        })
     }
 
     /// Take this pool's worker seams for one test (see [`seam`]).
@@ -2456,7 +2458,7 @@ mod tests {
             byte_size: 64,
             events: vec![event],
         }));
-        ExecutorPool::new("/nonexistent".into(), max_concurrent, 100_000, Some(hot))
+        ExecutorPool::new("/nonexistent".into(), max_concurrent, 100_000, Some(hot)).unwrap()
     }
 
     /// Wait for a blocking thread to reach a state, without letting paused
@@ -2764,6 +2766,7 @@ mod tests {
         }));
 
         let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, Some(Arc::clone(&hot)))
+            .unwrap()
             .with_field_catalog(Arc::clone(&catalog));
 
         let outcome = pool
@@ -2836,7 +2839,7 @@ mod tests {
             events: vec![event],
         }));
 
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, Some(hot));
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, Some(hot)).unwrap();
         let outcome = pool
             .execute(
                 pool.allocate_query_id(),
@@ -2916,7 +2919,8 @@ mod tests {
             1,
             100_000,
             Some(Arc::clone(&hot)),
-        );
+        )
+        .unwrap();
         (dir, hot, pool)
     }
 
@@ -3059,6 +3063,7 @@ mod tests {
         let catalog = Arc::new(crate::catalog::FieldCatalog::new());
         catalog.repin("lvl", trawl_core::schema::CanonicalType::Severity);
         let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None)
+            .unwrap()
             .with_field_catalog(Arc::clone(&catalog));
 
         // A parse error: reported by execution, so the walk is skipped.
@@ -3117,7 +3122,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_rejects_invalid_dsl() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
         // Must start with `|` to trigger a parse error — bare text is valid DSL.
         let outcome = pool
             .execute(
@@ -3134,7 +3139,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_respects_concurrency_limit() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
         // just verifying it doesn't panic with a single permit
         let _ = pool
             .execute(
@@ -3150,7 +3155,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_reuses_executors() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
 
         // Run two sequential queries — both should succeed and the pool
         // should have the same number of idle executors before and after.
@@ -3185,13 +3190,13 @@ mod tests {
 
     #[test]
     fn fallback_glob_derived_from_base_dir() {
-        let pool = ExecutorPool::new("/var/lib/trawl/data".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/var/lib/trawl/data".into(), 1, 100_000, None).unwrap();
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
     #[test]
     fn fallback_glob_strips_trailing_slash() {
-        let pool = ExecutorPool::new("/var/lib/trawl/data/".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/var/lib/trawl/data/".into(), 1, 100_000, None).unwrap();
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
@@ -3208,7 +3213,7 @@ mod tests {
     /// query timeout.
     #[tokio::test(start_paused = true)]
     async fn queue_wait_counts_against_the_deadline() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
         let idle_before = idle_len(&pool);
         // The pool's one permit, held by someone else for the duration.
         let held = pool
@@ -3249,7 +3254,7 @@ mod tests {
     /// so still a capacity refusal.
     #[tokio::test(start_paused = true)]
     async fn publication_wait_counts_against_the_deadline() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
         let idle_before = idle_len(&pool);
         let writer = pool.publication.write().await;
 
@@ -3290,7 +3295,7 @@ mod tests {
         // The worker is held past its work-start transition, so what the
         // request reports is a timeout on work that really is running.
         // Sleeping instead would race the blocking pool's own startup.
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
         let seams = pool.seams();
         let started = seams.hold(Seam::Started);
         let id = pool.allocate_query_id();
@@ -3320,7 +3325,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pool_executor_reclaimed_after_timeout() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
         let seams = pool.seams();
         let started = seams.hold(Seam::Started);
         let idle_before = idle_len(&pool);
@@ -3361,7 +3366,7 @@ mod tests {
     /// forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_drains_queries_and_blocks_new_ones() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
 
         // Nothing in flight: exclusivity is immediate.
         let guard = pool
@@ -3400,7 +3405,7 @@ mod tests {
     /// per-env swap and read after it, sampling a half-swapped corpus.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_blocks_field_value_sampling() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
         let guard = pool
             .exclusive(Duration::from_secs(1))
             .await
@@ -3431,7 +3436,7 @@ mod tests {
 
     #[tokio::test]
     async fn field_value_sampling_publication_timeout_releases_permit() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
         let writer = pool.publication.write().await;
         let idle_before = idle_len(&pool);
 
@@ -3475,7 +3480,7 @@ mod tests {
     /// the job's `blocked` outcome), never an indefinite wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_times_out_bounded_while_a_query_runs() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
         // This pool's own seam holds the query mid-flight: waiting a fixed
         // 50 ms for it to take its permit, and relying on a delay any
         // sibling test could reset, is a bet on how busy the runner is.
@@ -4589,7 +4594,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_clears_interrupts() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
         // No active queries — cancel_all should be a no-op.
         pool.cancel_all();
         assert!(pool.registry.lock().interrupts.is_empty());
@@ -4669,7 +4674,7 @@ mod tests {
     /// ran out and no worker phase: nothing started (ADR-0046).
     #[tokio::test(start_paused = true)]
     async fn capacity_refusal_reports_wait_phases() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None);
+        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
 
         // Refused in the queue: the pool's one permit is held elsewhere.
         let held = pool

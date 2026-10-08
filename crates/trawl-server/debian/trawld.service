@@ -13,7 +13,11 @@ EnvironmentFile=-/etc/default/trawld
 
 # State & logging
 StateDirectory=trawl
+# trawl-web traverses this directory for web.cookie and tls/; systemd reapplies this on every start.
+StateDirectoryMode=0750
 LogsDirectory=trawl
+# Only trawld writes logs; systemd reapplies this on every start, including upgrades.
+LogsDirectoryMode=0700
 WorkingDirectory=/var/lib/trawl
 
 # Restart policy

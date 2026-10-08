@@ -274,38 +274,135 @@ impl Cancellable<'_> {
     }
 }
 
-/// The directory `DuckDB` spills query state into.
+/// The directory `DuckDB` spills query state under: the system temp dir.
 ///
-/// The one source of that path: [`Executor::new`] points every connection
-/// at it, and the server's headroom measurement stats the filesystem under
-/// it (ADR-0042), so the two can never name different directories.
+/// The one source of that path: [`Executor::new`] makes each database's
+/// private spill directory in it, and the server's headroom measurement
+/// stats the filesystem under it (ADR-0042). A directory made in it is on
+/// its filesystem, so the two can never measure different devices.
 #[must_use]
 pub fn spill_dir() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
+/// Make a directory in [`spill_dir`] that only this process's user can
+/// enter, with a fresh random name.
+fn private_spill_dir() -> std::io::Result<tempfile::TempDir> {
+    private_dir_in(&spill_dir(), |_| Ok(()))
+}
+
+/// The `SET temp_directory` statement for `dir`.
+///
+/// The path goes into SQL as text, so one that is not UTF-8 is refused
+/// rather than converted: a lossy conversion would point `DuckDB` at a
+/// different path than the private directory that was checked (ADR-0052).
+fn temp_directory_statement(dir: &Path) -> std::io::Result<String> {
+    let text = dir.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "the query spill directory {} is not valid UTF-8, so it cannot be \
+                 handed to the query engine; point TMPDIR at a path that is",
+                dir.display()
+            ),
+        )
+    })?;
+    Ok(format!("SET temp_directory='{}'", text.replace('\'', "''")))
+}
+
+/// Make a private directory in `parent`, run `after_create` on it (tests
+/// stand in a filesystem that ignores the requested mode), then check it.
+///
+/// The directory is asked for at 0700, and a filesystem can still answer
+/// otherwise: a fixed-mode mount ignores the mode. So it is opened
+/// no-follow and its owner and mode are read from that handle: it must
+/// belong to this process's euid and carry no group or other bit, or it is
+/// refused and removed.
+fn private_dir_in(
+    parent: &Path,
+    after_create: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("trawl-spill-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let dir = builder.tempdir_in(parent)?;
+    after_create(dir.path())?;
+    #[cfg(unix)]
+    check_private(dir.path(), rustix::process::geteuid().as_raw())?;
+    Ok(dir)
+}
+
+/// Refuse the directory at `path` unless `euid` owns it and it has no group
+/// or other bit, read through a handle opened without following a symlink.
+#[cfg(unix)]
+fn check_private(path: &Path, euid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    use rustix::fs::{Mode, OFlags};
+    /// The group and other permission bits.
+    const GROUP_OTHER: u32 = 0o077;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let handle = std::fs::File::from(rustix::fs::open(path, flags, Mode::empty())?);
+    let meta = handle.metadata()?;
+    let (owner, mode) = (meta.uid(), meta.mode() & 0o7777);
+    if owner == euid && mode & GROUP_OTHER == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "the query spill directory {} is not private to uid {euid}, the user \
+             trawld runs as (owner uid {}, mode {mode:04o}), so other users could \
+             read spilled query state; point TMPDIR at a directory on a \
+             filesystem that keeps Unix modes",
+            path.display(),
+            owner,
+        ),
+    ))
+}
+
 /// Query executor backed by an in-memory `DuckDB` connection.
 #[derive(Debug)]
 pub struct Executor {
+    // Declared first, so it drops first: `DuckDB` closes and removes its
+    // spill files before the directory holding them goes.
     conn: Connection,
+    /// The database's private spill directory, shared with every clone
+    /// and removed when the last of them drops.
+    spill: Arc<tempfile::TempDir>,
 }
 
 impl Executor {
     /// Create a new executor with an in-memory `DuckDB` connection.
     ///
-    /// Sets `temp_directory` to [`spill_dir`], the system temp dir, so
-    /// `DuckDB` can spill to disk even when the process working directory
-    /// is read-only (e.g. container overlay filesystems), and pins the
-    /// session time zone ([`Self::configure`]).
+    /// Points `temp_directory` at a private directory made for this
+    /// database in [`spill_dir`], so `DuckDB` can spill to disk even when
+    /// the process working directory is read-only (e.g. container overlay
+    /// filesystems), and pins the session time zone ([`Self::configure`]).
+    ///
+    /// The directory is made with a random name and mode 0700, never
+    /// reused, and refused unless its handle shows it owner-only and owned
+    /// by this process's euid. `DuckDB` opens its spill files by predictable names and
+    /// without `O_EXCL`, and the umask does not tighten a file that exists,
+    /// so spilling into the shared temp dir would reuse a file another user
+    /// planted, or one an older process left readable (ADR-0052). It is
+    /// removed when the last executor sharing this database drops. A process
+    /// that exits without dropping it, as on a wedged shutdown, leaves the
+    /// empty directory behind; `DuckDB` deletes its own files when the
+    /// database closes.
     pub fn new() -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
-        let tmp = spill_dir();
-        conn.execute_batch(&format!(
-            "SET temp_directory='{}'",
-            tmp.to_string_lossy().replace('\'', "''")
-        ))?;
+        let spill = private_spill_dir()?;
+        conn.execute_batch(&temp_directory_statement(spill.path())?)?;
         Self::configure(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            spill: Arc::new(spill),
+        })
     }
 
     /// Create a new executor sharing the same underlying database.
@@ -320,7 +417,10 @@ impl Executor {
     pub fn try_clone(&self) -> Result<Self, EngineError> {
         let conn = self.conn.try_clone()?;
         Self::configure(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            spill: Arc::clone(&self.spill),
+        })
     }
 
     /// Pin the settings a query's answer depends on: currently the session
@@ -2338,6 +2438,104 @@ fn timechart_fixture(dir: &tempfile::TempDir) -> String {
         ))
         .expect("fixture writes");
     path
+}
+
+/// The directory `DuckDB` spills `exec`'s database into, as it reads it.
+#[cfg(test)]
+fn temp_directory(exec: &Executor) -> std::path::PathBuf {
+    exec.conn
+        .query_row("SELECT current_setting('temp_directory')", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("temp_directory")
+        .into()
+}
+
+/// A query spills into a directory only this process's user can enter,
+/// made for its database: `DuckDB` opens its spill files by predictable
+/// names without `O_EXCL`, so a shared temp directory would let another
+/// user plant or read one (ADR-0052). The directory sits in [`spill_dir`],
+/// on the filesystem the headroom measurement stats (ADR-0042). A clone
+/// shares its database and so its directory, which goes when the last of
+/// them does.
+#[cfg(unix)]
+#[test]
+fn an_executor_spills_into_a_private_directory_of_its_own() {
+    use std::os::unix::fs::MetadataExt as _;
+    let me = tempfile::tempfile()
+        .expect("probe file")
+        .metadata()
+        .unwrap()
+        .uid();
+    let exec = Executor::new().expect("executor");
+    let dir = temp_directory(&exec);
+    let meta = std::fs::symlink_metadata(&dir).expect("the spill directory exists");
+    assert!(meta.is_dir(), "{}", dir.display());
+    assert_eq!(meta.mode() & 0o7777, 0o700, "{}", dir.display());
+    assert_eq!(meta.uid(), me, "{}", dir.display());
+    assert_ne!(dir, spill_dir(), "not the shared temp directory itself");
+    assert_eq!(dir.parent(), Some(spill_dir().as_path()));
+
+    let clone = exec.try_clone().expect("clone");
+    assert_eq!(temp_directory(&clone), dir, "a clone shares the directory");
+    let other = Executor::new().expect("a second executor");
+    assert_ne!(temp_directory(&other), dir, "another database has its own");
+    drop(exec);
+    assert!(dir.is_dir(), "the clone still holds it");
+    drop(clone);
+    assert!(!dir.exists(), "the last clone removed it");
+}
+
+/// A spill path that is not UTF-8 is refused, not converted, so `DuckDB`
+/// never spills somewhere other than the checked directory (ADR-0052).
+#[cfg(unix)]
+#[test]
+fn a_spill_path_that_is_not_utf8_is_refused() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/trawl-spill-\xff"));
+    let error = temp_directory_statement(dir).expect_err("a non-UTF-8 spill path");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains("TMPDIR"), "{error}");
+    assert_eq!(
+        temp_directory_statement(Path::new("/tmp/it's")).expect("a UTF-8 path"),
+        "SET temp_directory='/tmp/it''s'"
+    );
+}
+
+/// A spill directory the filesystem leaves open, as a fixed-mode mount
+/// does whatever mode was asked for, is refused and removed rather than
+/// handed to `DuckDB` (ADR-0052).
+#[cfg(unix)]
+#[test]
+fn a_spill_directory_left_open_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let parent = tempfile::tempdir().expect("parent");
+    let mut made = None;
+    let error = private_dir_in(parent.path(), |dir| {
+        made = Some(dir.to_owned());
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+    })
+    .expect_err("a 0755 spill directory");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    let text = error.to_string();
+    assert!(text.contains("mode 0755"), "{text}");
+    assert!(text.contains("TMPDIR"), "{text}");
+    assert!(
+        !made.expect("created").exists(),
+        "the refused directory is removed"
+    );
+}
+
+/// A spill directory another user owns is refused whatever its mode.
+#[cfg(unix)]
+#[test]
+fn a_spill_directory_another_user_owns_is_refused() {
+    let parent = tempfile::tempdir().expect("parent");
+    let dir = private_dir_in(parent.path(), |_| Ok(())).expect("private");
+    let euid = rustix::process::geteuid().as_raw();
+    check_private(dir.path(), euid).expect("its own");
+    let error = check_private(dir.path(), euid.wrapping_add(1)).expect_err("another uid");
+    assert!(error.to_string().contains("mode 0700"), "{error}");
 }
 
 /// The message of the bucket-type refusal `dsl` earns, or a panic

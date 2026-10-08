@@ -27,7 +27,7 @@ async fn queries_and_exports_wait_for_publish_and_drain() {
         max_events: 100,
         max_bytes: 100_000,
     }));
-    let pool = ExecutorPool::new(data.to_str().unwrap().into(), 3, 100, Some(hot.clone()));
+    let pool = ExecutorPool::new(data.to_str().unwrap().into(), 3, 100, Some(hot.clone())).unwrap();
     // Identical payloads are distinct accepted events. DISTINCT would fail.
     let event = json!({"_time":"2026-02-15T12:00:00Z",
         "_ingested":"2026-02-15T12:00:01Z", "service":"nginx",
@@ -162,7 +162,7 @@ async fn query_only_pool_refuses_incomplete_rollup_after_restart() {
     std::fs::create_dir_all(&day).unwrap();
     let marker = day.join(".rollup-nginx");
     std::fs::write(&marker, "unfinished").unwrap();
-    let pool = ExecutorPool::new(root.path().to_str().unwrap().into(), 1, 100, None);
+    let pool = ExecutorPool::new(root.path().to_str().unwrap().into(), 1, 100, None).unwrap();
     let result = pool
         .execute(
             pool.allocate_query_id(),
@@ -224,7 +224,7 @@ async fn query_timeout_keeps_publication_guard_until_duckdb_task_finishes() {
     }
     let _reset = Reset;
     let root = tempfile::tempdir().unwrap();
-    let pool = ExecutorPool::new(root.path().to_str().unwrap().into(), 1, 100, None);
+    let pool = ExecutorPool::new(root.path().to_str().unwrap().into(), 1, 100, None).unwrap();
     TEST_QUERY_DELAY_MS.store(500, Ordering::Relaxed);
     let result = pool
         .execute(
@@ -261,7 +261,7 @@ async fn aborting_request_keeps_running_reader_protected() {
     }
     let _reset = Reset;
     let root = tempfile::tempdir().unwrap();
-    let pool = ExecutorPool::new(root.path().to_str().unwrap().into(), 1, 100, None);
+    let pool = ExecutorPool::new(root.path().to_str().unwrap().into(), 1, 100, None).unwrap();
     TEST_QUERY_DELAY_MS.store(1000, Ordering::Relaxed);
     let seams = pool.seams();
     let started = seams.watch(seam::Seam::Started);

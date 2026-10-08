@@ -306,6 +306,10 @@ pub mod reason {
     /// With `complete`: trawld's boot creates or brings this state current
     /// on its next start, and accepts it as it is.
     pub const WILL_INITIALIZE: &str = "will_initialize";
+    /// With `complete`: a storage root other users may reach that trawld's
+    /// boot closes to its owner on its next start. A prediction: boot's
+    /// change is the authority.
+    pub const WILL_TIGHTEN: &str = "will_tighten";
     /// With `complete`: a well-formed recovery marker that trawld's boot
     /// finishes on its next start.
     pub const PENDING_AT_NEXT_BOOT: &str = "pending_at_next_boot";

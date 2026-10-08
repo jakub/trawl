@@ -31,6 +31,8 @@ use super::{Ctx, Runner, ServerCheck};
 use crate::catalog::conform::{self, IdentityJudgement};
 use crate::epoch::{self, DataRootState, RootFault, RootReader};
 use crate::ingest::{compaction, publication_marker};
+#[cfg(unix)]
+use crate::owner_only::{self, Prediction, Refusal, RootKind};
 use crate::repin::marker;
 
 /// This group's checks, in [`ServerCheck::ALL`] order.
@@ -206,23 +208,241 @@ impl RootSeen {
 /// is evaluated: each directory is a directory, or absent below a directory
 /// boot could create it in. When that holds the row is `not_sampled`,
 /// reason `ran_as_root`, and the checks that wait on it still look.
+///
+/// When both hold, the row predicts what boot's closing of the storage
+/// roots does (ADR-0052), through [`owner_only::predict`] over the roots
+/// boot closes; see [`closing`]. A root boot would refuse fails the
+/// row; one it would close makes it `complete`, reason `will_tighten`.
 async fn check_root(data_root: PathBuf, wal_dir: PathBuf, ingest: bool, ask_access: bool) -> Row {
     let check = ServerCheck::DataRoot;
-    let wal_dir = ingest.then_some(wal_dir);
     let observed = look(move || {
         let root = observe_root(&data_root, ingest, ask_access);
-        let wal = wal_dir
-            .filter(|_| root.holds())
-            .map(|wal_dir| observe_root(&wal_dir, true, ask_access));
-        (root, wal)
+        let wal = (ingest && root.holds()).then(|| observe_root(&wal_dir, true, ask_access));
+        let closed = (root.holds() && wal.is_none_or(RootSeen::holds))
+            .then(|| closing(&data_root, &wal_dir, ingest, ask_access))
+            .flatten();
+        (root, wal, closed)
     })
     .await;
     match observed {
-        Ok((root, wal)) => wal
+        Ok((root, wal, closed)) => wal
             .and_then(wal_row)
+            .or(closed)
             .unwrap_or_else(|| root_row(root, ingest)),
         Err(why) => missed(check, why),
     }
+}
+
+/// The `server.data.root` row for boot's closing of the storage roots, or
+/// `None` when it changes nothing.
+#[cfg(unix)]
+fn closing(data_root: &Path, wal_dir: &Path, ingest: bool, ask_access: bool) -> Option<Row> {
+    closing_row(predict_closing(data_root, wal_dir, ingest, ask_access))
+}
+
+/// Off Unix there are no modes to close.
+#[cfg(not(unix))]
+fn closing(_: &Path, _: &Path, _: bool, _: bool) -> Option<Row> {
+    None
+}
+
+/// What boot's closing of the storage roots would do, predicted without
+/// changing anything.
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Closing {
+    /// Every root is owner-only, absent, or another check's to judge.
+    Unchanged,
+    /// Boot would remove group and other permissions from these roots.
+    WillTighten(Vec<RootKind>),
+    /// Boot would refuse to start over this root.
+    Refused(RootKind, Unclosable),
+}
+
+/// Why boot could not keep a root owner-only. It carries no path and no
+/// uid, so no row can name one.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unclosable {
+    /// The final component is a symbolic link.
+    Symlink,
+    /// The configured path does not end in a directory name.
+    BadPath,
+    /// Something other than a directory is there.
+    NotDirectory,
+    /// Another user owns it.
+    ForeignOwner,
+    /// It needs closing and sits on a read-only mount.
+    ReadOnlyFilesystem,
+    /// It could not be opened to read its owner and mode.
+    Uninspectable,
+}
+
+#[cfg(unix)]
+impl From<Refusal> for Unclosable {
+    fn from(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::Symlink => Self::Symlink,
+            Refusal::BadPath => Self::BadPath,
+            Refusal::ForeignOwner { .. } => Self::ForeignOwner,
+            Refusal::ReadOnlyFilesystem => Self::ReadOnlyFilesystem,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Unclosable {
+    /// Whether boot refuses it whoever runs trawld. Only these count in a
+    /// root run: the owner trawld compares against is the service user,
+    /// not root, and a root run's opens prove nothing about the service
+    /// user's.
+    const fn structural(self) -> bool {
+        matches!(self, Self::Symlink | Self::BadPath | Self::NotDirectory)
+    }
+}
+
+/// Predict boot's closing of the roots [`owner_only::protected_roots`]
+/// lists, in its order, with [`owner_only::predict`], which opens and stats
+/// and never changes a mode. The first root boot would refuse is the
+/// answer; otherwise every root it would close. Unless `ask_access`, only a
+/// [structural](Unclosable::structural) refusal counts.
+#[cfg(unix)]
+fn predict_closing(data_root: &Path, wal_dir: &Path, ingest: bool, ask_access: bool) -> Closing {
+    let euid = rustix::process::geteuid().as_raw();
+    let mut tighten = Vec::new();
+    for root in owner_only::protected_roots(data_root, wal_dir, ingest) {
+        let refused = match owner_only::predict(&root.path, euid) {
+            Ok(Prediction::WillTighten) => {
+                tighten.push(root.kind);
+                continue;
+            }
+            Ok(Prediction::NotDirectory) if root.kind.epoch_gate_judges_non_directory() => {
+                continue;
+            }
+            Ok(Prediction::NotDirectory) => Unclosable::NotDirectory,
+            Ok(Prediction::Absent | Prediction::OwnerOnly) => continue,
+            Ok(Prediction::Refused(refusal)) => Unclosable::from(refusal),
+            Err(_) => Unclosable::Uninspectable,
+        };
+        if ask_access || refused.structural() {
+            return Closing::Refused(root.kind, refused);
+        }
+    }
+    if tighten.is_empty() || !ask_access {
+        Closing::Unchanged
+    } else {
+        Closing::WillTighten(tighten)
+    }
+}
+
+/// A root's name in a row's fixed text.
+#[cfg(unix)]
+const fn root_name(kind: RootKind) -> &'static str {
+    match kind {
+        RootKind::DataRoot => "the data root",
+        RootKind::WalDir => "the WAL directory",
+        RootKind::RepinShadow => "the repin shadow root",
+        RootKind::RepinAside => "the repin aside root",
+    }
+}
+
+/// The `server.data.root` row for what boot's closing would do, or `None`
+/// when it changes nothing. Its sentences name the root by kind, never by
+/// path, and never an owner.
+#[cfg(unix)]
+fn closing_row(closing: Closing) -> Option<Row> {
+    /// A fixed sentence about one root, by kind: `$rest` follows the
+    /// root's name, which [`root_name`] spells.
+    macro_rules! about {
+        ($kind:expr, $rest:literal) => {
+            match $kind {
+                RootKind::DataRoot => concat!("the data root ", $rest),
+                RootKind::WalDir => concat!("the WAL directory ", $rest),
+                RootKind::RepinShadow => concat!("the repin shadow root ", $rest),
+                RootKind::RepinAside => concat!("the repin aside root ", $rest),
+            }
+        };
+    }
+    let check = ServerCheck::DataRoot;
+    let row = match closing {
+        Closing::Unchanged => return None,
+        Closing::WillTighten(kinds) => {
+            let mut detail = Text::new("group or other permissions on ");
+            for (at, kind) in kinds.iter().enumerate() {
+                if at > 0 {
+                    detail = detail.lit(", ");
+                }
+                detail = detail.lit(root_name(*kind));
+            }
+            Row::complete_because(check, reason::WILL_TIGHTEN).detail(
+                detail.lit(": trawld removes them at its next start, and nothing beneath changes"),
+            )
+        }
+        Closing::Refused(kind, Unclosable::Symlink) => Row::failed(
+            check,
+            about!(
+                kind,
+                "is a symlink, and trawld does not follow one at a storage root"
+            ),
+        )
+        .next(Text::new(match kind {
+            RootKind::DataRoot => "point [data] path at the directory itself, not a symlink",
+            RootKind::WalDir => "point [ingest] wal_dir at the directory itself, not a symlink",
+            RootKind::RepinShadow | RootKind::RepinAside => {
+                "replace the link with the directory it points to, or remove it"
+            }
+        })),
+        Closing::Refused(kind, Unclosable::BadPath) => {
+            Row::failed(check, about!(kind, "path does not end in a directory name")).next(
+                Text::new(match kind {
+                    RootKind::WalDir => "set [ingest] wal_dir to the directory itself",
+                    _ => "set [data] path to the directory itself",
+                }),
+            )
+        }
+        Closing::Refused(kind, Unclosable::NotDirectory) => {
+            Row::failed(check, about!(kind, "is not a directory")).next(Text::new(match kind {
+                RootKind::DataRoot => "point [data] path at a directory",
+                RootKind::WalDir => {
+                    "point [ingest] wal_dir at a directory, or move what is there aside so \
+                     trawld can create it"
+                }
+                RootKind::RepinShadow | RootKind::RepinAside => {
+                    "move it aside; trawld creates the repin roots when a repin runs"
+                }
+            }))
+        }
+        Closing::Refused(kind, Unclosable::ForeignOwner) => Row::failed(
+            check,
+            about!(
+                kind,
+                "is owned by another user, and trawld does not take over a directory it does \
+                 not own"
+            ),
+        )
+        .next(Text::new(
+            "chown it to the user that runs trawld, or run trawld as its owner",
+        )),
+        Closing::Refused(kind, Unclosable::ReadOnlyFilesystem) => Row::failed(
+            check,
+            about!(
+                kind,
+                "has group or other permissions on a read-only filesystem, so trawld cannot \
+                 close it"
+            ),
+        )
+        .next(Text::new(
+            "mount it read-write, or chmod it 0700 before mounting it read-only",
+        )),
+        Closing::Refused(kind, Unclosable::Uninspectable) => Row::failed(
+            check,
+            about!(kind, "could not be opened to read its owner and mode"),
+        )
+        .next(Text::new(
+            "make it a directory the user that runs trawld owns and can read",
+        )),
+    };
+    Some(row)
 }
 
 /// The `server.data.root` row for what was seen at the WAL directory, or
@@ -1808,6 +2028,8 @@ mod tests {
         let row = root_check(data.clone(), false, true).await;
         assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
         std::fs::create_dir_all(&data).unwrap();
+        #[cfg(unix)]
+        owner_only_mode(&data);
         for ingest in [false, true] {
             let row = root_check(data.clone(), ingest, true).await;
             assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
@@ -1983,12 +2205,14 @@ mod tests {
         let privileged = privileged_over(&tmp);
         let data = tmp.path().join("data");
         std::fs::create_dir(&data).unwrap();
+        owner_only_mode(&data);
         let sealed = tmp.path().join("sealed");
         std::fs::create_dir(&sealed).unwrap();
         let unwritable = tmp.path().join("unwritable");
         std::fs::create_dir(&unwritable).unwrap();
         let writable = tmp.path().join("writable");
         std::fs::create_dir(&writable).unwrap();
+        owner_only_mode(&writable);
         let cases = [
             ("writable", writable.clone(), None),
             (
@@ -2078,9 +2302,11 @@ mod tests {
 
     /// A WAL path that starts with the data root is judged on its own: `..`
     /// or a symlink takes it out of the root, and a child that exists has
-    /// its own modes. When the root fails too, the row reports the root's
-    /// failure once. A privileged user may do everything the modes forbid;
-    /// the test asserts whichever the running user is.
+    /// its own modes. A symlink there is also a storage root of its own,
+    /// which boot refuses whoever runs it, so a root run fails it too. When
+    /// the root fails too, the row reports the root's failure once. A
+    /// privileged user may do everything the modes forbid; the test asserts
+    /// whichever the running user is.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_wal_directory_under_the_root_path_is_judged_on_its_own() {
@@ -2089,6 +2315,7 @@ mod tests {
         let privileged = privileged_over(&tmp);
         let data = tmp.path().join("data");
         std::fs::create_dir(&data).unwrap();
+        owner_only_mode(&data);
         let unwritable = tmp.path().join("unwritable");
         std::fs::create_dir(&unwritable).unwrap();
         let sealed = tmp.path().join("sealed");
@@ -2098,21 +2325,39 @@ mod tests {
         let link = data.join("link");
         std::os::unix::fs::symlink(&unwritable, &link).unwrap();
         let write = "the running user cannot write the WAL directory";
+        // The case, its WAL path, the access failure, and the refusal boot
+        // gives whoever runs it.
         let cases = [
-            ("escapes through ..", data.join("../unwritable"), write),
+            (
+                "escapes through ..",
+                data.join("../unwritable"),
+                write,
+                None,
+            ),
             (
                 "absent, escapes through ..",
                 data.join("../sealed/wal"),
                 "the running user cannot create the WAL directory in the directory above it",
+                None,
             ),
-            ("a symlink under the root", link.clone(), write),
-            ("an unwritable child of the root", child.clone(), write),
+            (
+                "a symlink under the root",
+                link.clone(),
+                write,
+                Some(WAL_LINK),
+            ),
+            (
+                "an unwritable child of the root",
+                child.clone(),
+                write,
+                None,
+            ),
         ];
         for dir in [&unwritable, &sealed, &child] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         }
         let mut seen = Vec::new();
-        for (name, wal, _) in &cases {
+        for (name, wal, _, _) in &cases {
             let asked = check_root(data.clone(), wal.clone(), true, true).await;
             let root_run = check_root(data.clone(), wal.clone(), true, false).await;
             seen.push((*name, asked, root_run));
@@ -2123,18 +2368,18 @@ mod tests {
         for dir in [&data, &unwritable, &sealed, &child] {
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        for ((name, asked, root_run), (_, _, why)) in seen.into_iter().zip(cases) {
-            let expected = if privileged {
-                (Outcome::Complete, None)
-            } else {
-                (Outcome::Failed, Some(why))
+        for ((name, asked, root_run), (_, _, why, refused)) in seen.into_iter().zip(cases) {
+            let expected = match (privileged, refused) {
+                (false, _) => (Outcome::Failed, Some(why)),
+                (true, Some(refused)) => (Outcome::Failed, Some(refused)),
+                (true, None) => (Outcome::Complete, None),
             };
             assert_eq!((asked.outcome(), asked.reason()), expected, "{name}");
-            assert_eq!(
-                (root_run.outcome(), root_run.reason()),
+            let expected = refused.map_or(
                 (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
-                "{name}"
+                |refused| (Outcome::Failed, Some(refused)),
             );
+            assert_eq!((root_run.outcome(), root_run.reason()), expected, "{name}");
         }
         let expected = if privileged {
             (Outcome::Complete, None)
@@ -2145,5 +2390,348 @@ mod tests {
             )
         };
         assert_eq!((both.outcome(), both.reason()), expected, "{both:?}");
+    }
+
+    /// Give `dir` mode `mode`.
+    #[cfg(unix)]
+    fn set_mode(dir: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Give `dir` mode 0700, as trawld's umask leaves what it creates. The
+    /// test's ambient umask may leave group or other bits, which boot's
+    /// closing would remove and the row would report.
+    #[cfg(unix)]
+    fn owner_only_mode(dir: &Path) {
+        set_mode(dir, 0o700);
+    }
+
+    /// The permission bits of `root` and of everything beneath it, read
+    /// without following a symlink.
+    #[cfg(unix)]
+    fn modes(root: &Path) -> Vec<(PathBuf, u32)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut found = Vec::new();
+        let mut stack = vec![root.to_owned()];
+        while let Some(path) = stack.pop() {
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            found.push((path.clone(), meta.mode() & 0o7777));
+            if meta.is_dir() {
+                stack.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// `server.data.root` over `data_root` and `wal_dir`, asserting that the
+    /// look changed no mode anywhere under `tmp` (AC6: the doctor predicts
+    /// boot's closing and never closes anything itself).
+    #[cfg(unix)]
+    async fn unchanged(
+        tmp: &tempfile::TempDir,
+        data_root: &Path,
+        wal_dir: &Path,
+        ingest: bool,
+        ask_access: bool,
+    ) -> (Outcome, Option<&'static str>) {
+        let before = modes(tmp.path());
+        let row = check_root(data_root.to_owned(), wal_dir.to_owned(), ingest, ask_access).await;
+        assert_eq!(
+            modes(tmp.path()),
+            before,
+            "the doctor changed a mode: {row:?}"
+        );
+        (row.outcome(), row.reason())
+    }
+
+    const ROOT_LINK: &str = "the data root is a symlink, and trawld does not follow one at a \
+                             storage root";
+    const WAL_LINK: &str = "the WAL directory is a symlink, and trawld does not follow one at a \
+                            storage root";
+    const ASIDE_LINK: &str = "the repin aside root is a symlink, and trawld does not follow one \
+                              at a storage root";
+
+    /// An owner-only root is `complete` with no reason. One with a group or
+    /// other bit is `complete`, `will_tighten`, on both node types: boot
+    /// closes the data root of a query-only node too. A root run reports
+    /// `ran_as_root` either way, since the service user, not root, is the
+    /// owner boot compares against. No mode changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_root_boot_would_close_is_will_tighten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(&data.join("EPOCH"), b"3\n");
+        let wal = data.join("wal");
+        std::fs::create_dir(&wal).unwrap();
+        set_mode(&wal, 0o755);
+        for (mode, expected) in [
+            (0o700, None),
+            (0o500, None),
+            (0o755, Some(reason::WILL_TIGHTEN)),
+            (0o750, Some(reason::WILL_TIGHTEN)),
+            (0o701, Some(reason::WILL_TIGHTEN)),
+        ] {
+            set_mode(&data, mode);
+            for ingest in [false, true] {
+                // A 0500 root fails an ingest node's write check first.
+                if mode == 0o500 && ingest {
+                    continue;
+                }
+                assert_eq!(
+                    unchanged(&tmp, &data, &wal, ingest, true).await,
+                    (Outcome::Complete, expected),
+                    "mode {mode:o}, ingest {ingest}"
+                );
+                assert_eq!(
+                    unchanged(&tmp, &data, &wal, ingest, false).await,
+                    (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
+                    "mode {mode:o}, ingest {ingest}"
+                );
+            }
+        }
+        set_mode(&data, 0o755);
+        let row = root_check(data.clone(), true, true).await;
+        let detail = row.clone().into_check().detail.unwrap();
+        assert!(
+            detail.starts_with("group or other permissions on the data root:"),
+            "{detail}"
+        );
+        assert!(!detail.contains(tmp.path().to_str().unwrap()), "{detail}");
+    }
+
+    /// A WAL directory outside the data root is closed on its own, and a
+    /// real directory nested in it is covered by the root and never judged.
+    /// One reached through a symlink under the root is outside it, and is
+    /// closed on its own too. The repin
+    /// siblings are closed when they exist. Every root boot would close is
+    /// named, and a refusal anywhere beats them. No mode changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_root_boot_closes_is_predicted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(&data.join("EPOCH"), b"3\n");
+        owner_only_mode(&data);
+        let nested = data.join("wal");
+        std::fs::create_dir(&nested).unwrap();
+        set_mode(&nested, 0o755);
+        let outside = tmp.path().join("spool");
+        std::fs::create_dir(&outside).unwrap();
+        set_mode(&outside, 0o755);
+
+        assert_eq!(
+            unchanged(&tmp, &data, &nested, true, true).await,
+            (Outcome::Complete, None),
+            "a nested WAL directory is the root's"
+        );
+        assert_eq!(
+            unchanged(&tmp, &data, &outside, true, true).await,
+            (Outcome::Complete, Some(reason::WILL_TIGHTEN))
+        );
+        assert_eq!(
+            unchanged(&tmp, &data, &outside, false, true).await,
+            (Outcome::Complete, None),
+            "a query-only node has no WAL directory"
+        );
+        let hop = data.join("hop");
+        std::os::unix::fs::symlink(tmp.path(), &hop).unwrap();
+        assert_eq!(
+            unchanged(&tmp, &data, &hop.join("spool"), true, true).await,
+            (Outcome::Complete, Some(reason::WILL_TIGHTEN)),
+            "a WAL directory reached through a symlink is its own root"
+        );
+        std::fs::remove_file(&hop).unwrap();
+
+        let shadow = marker::shadow_root(&data);
+        std::fs::create_dir(&shadow).unwrap();
+        set_mode(&shadow, 0o755);
+        for ingest in [false, true] {
+            assert_eq!(
+                unchanged(&tmp, &data, &nested, ingest, true).await,
+                (Outcome::Complete, Some(reason::WILL_TIGHTEN)),
+                "a repin sibling, ingest {ingest}"
+            );
+        }
+        set_mode(&data, 0o755);
+        let row = check_root(data.clone(), outside.clone(), true, true).await;
+        assert_eq!(
+            row.into_check().detail.as_deref(),
+            Some(
+                "group or other permissions on the data root, the WAL directory, the repin \
+                 shadow root: trawld removes them at its next start, and nothing beneath \
+                 changes"
+            )
+        );
+
+        // A symlinked sibling refuses, and beats every root boot would close.
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        owner_only_mode(&real);
+        std::os::unix::fs::symlink(&real, marker::aside_root(&data)).unwrap();
+        for ask_access in [false, true] {
+            assert_eq!(
+                unchanged(&tmp, &data, &outside, true, ask_access).await,
+                (Outcome::Failed, Some(ASIDE_LINK)),
+                "ask_access {ask_access}"
+            );
+        }
+    }
+
+    /// A repin sibling that is not a directory refuses at boot whoever runs
+    /// trawld, so the row fails in a root run too, and the file is left as
+    /// it was. A data root that is not a directory stays the structural
+    /// check's to report.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_repin_sibling_that_is_not_a_directory_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(&data.join("EPOCH"), b"3\n");
+        owner_only_mode(&data);
+        let shadow = marker::shadow_root(&data);
+        std::fs::write(&shadow, b"not a directory").unwrap();
+        for ask_access in [false, true] {
+            let row = check_root(data.clone(), data.join("wal"), true, ask_access).await;
+            assert_eq!(
+                (row.outcome(), row.reason()),
+                (
+                    Outcome::Failed,
+                    Some("the repin shadow root is not a directory")
+                ),
+                "ask_access {ask_access}"
+            );
+        }
+        assert_eq!(std::fs::read(&shadow).unwrap(), b"not a directory");
+    }
+
+    /// A storage root whose final component is a symlink refuses at boot,
+    /// so the row fails, in a root run too: boot refuses it whoever runs
+    /// trawld. The link and its target are left as they were. A symlink
+    /// above the root is trusted storage and followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_root_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        write(&real.join("EPOCH"), b"3\n");
+        set_mode(&real, 0o755);
+        let data = tmp.path().join("data");
+        std::os::unix::fs::symlink(&real, &data).unwrap();
+        let wal = data.join("wal");
+        for ingest in [false, true] {
+            for ask_access in [false, true] {
+                assert_eq!(
+                    unchanged(&tmp, &data, &wal, ingest, ask_access).await,
+                    (Outcome::Failed, Some(ROOT_LINK)),
+                    "ingest {ingest}, ask_access {ask_access}"
+                );
+            }
+        }
+        assert!(std::fs::symlink_metadata(&data).unwrap().is_symlink());
+
+        // Reached through a symlinked parent, the root itself is judged.
+        owner_only_mode(&real);
+        let parent = tmp.path().join("parent");
+        std::os::unix::fs::symlink(tmp.path(), &parent).unwrap();
+        let through = parent.join("real");
+        assert_eq!(
+            unchanged(&tmp, &through, &through.join("wal"), true, true).await,
+            (Outcome::Complete, None)
+        );
+
+        // An out-of-root WAL directory that is a symlink fails on an ingest
+        // node, and a query-only node does not look at it.
+        let wal_real = tmp.path().join("wal-real");
+        std::fs::create_dir(&wal_real).unwrap();
+        owner_only_mode(&wal_real);
+        let wal_link = tmp.path().join("wal");
+        std::os::unix::fs::symlink(&wal_real, &wal_link).unwrap();
+        for ask_access in [false, true] {
+            assert_eq!(
+                unchanged(&tmp, &real, &wal_link, true, ask_access).await,
+                (Outcome::Failed, Some(WAL_LINK)),
+                "ask_access {ask_access}"
+            );
+        }
+        assert_eq!(
+            unchanged(&tmp, &real, &wal_link, false, true).await,
+            (Outcome::Complete, None)
+        );
+    }
+
+    /// A root another user owns refuses at boot, even for root, so the row
+    /// fails when the doctor asks as the service user. A root run does not
+    /// judge ownership: the owner boot compares against is the service
+    /// user. `/usr` stands in for a foreign root where the test is not run
+    /// by its owner.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_root_another_user_owns_fails() {
+        use std::os::unix::fs::MetadataExt as _;
+        let usr = Path::new("/usr");
+        let euid = rustix::process::geteuid().as_raw();
+        if std::fs::symlink_metadata(usr).map_or(true, |m| !m.is_dir() || m.uid() == euid) {
+            return;
+        }
+        let row = check_root(usr.to_owned(), usr.join("wal"), false, true).await;
+        assert_eq!(
+            (row.outcome(), row.reason()),
+            (
+                Outcome::Failed,
+                Some(
+                    "the data root is owned by another user, and trawld does not take over a \
+                     directory it does not own"
+                )
+            )
+        );
+        let row = check_root(usr.to_owned(), usr.join("wal"), false, false).await;
+        assert_eq!(
+            (row.outcome(), row.reason()),
+            (Outcome::NotSampled, Some(reason::RAN_AS_ROOT))
+        );
+    }
+
+    /// Every refusal row is a fixed sentence and a fix that name the root
+    /// by kind, never by path or uid.
+    #[cfg(unix)]
+    #[test]
+    fn refusal_rows_name_the_root_by_kind_only() {
+        let kinds = [
+            RootKind::DataRoot,
+            RootKind::WalDir,
+            RootKind::RepinShadow,
+            RootKind::RepinAside,
+        ];
+        let causes = [
+            Unclosable::Symlink,
+            Unclosable::BadPath,
+            Unclosable::NotDirectory,
+            Unclosable::ForeignOwner,
+            Unclosable::ReadOnlyFilesystem,
+            Unclosable::Uninspectable,
+        ];
+        for kind in kinds {
+            for cause in causes {
+                let row = closing_row(Closing::Refused(kind, cause)).unwrap();
+                assert_eq!(row.outcome(), Outcome::Failed);
+                let check = row.into_check();
+                let reason = check.reason.unwrap();
+                let next = check.next_action.unwrap();
+                for text in [&reason, &next] {
+                    assert!(
+                        !text.contains('/') && !text.contains("uid"),
+                        "{kind:?} {cause:?}: {text}"
+                    );
+                }
+                assert!(
+                    reason.starts_with(&format!("{} ", root_name(kind))),
+                    "{reason}"
+                );
+            }
+        }
+        assert!(closing_row(Closing::Unchanged).is_none());
     }
 }

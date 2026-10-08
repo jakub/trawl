@@ -26,6 +26,14 @@ Leave out `/var/lib/trawl/cores`. A crash dump is a copy of process memory.
 The `fleet` dump and `web.cookie` are credentials, so encrypt the backup and
 keep it private.
 
+Run a file-level backup or restore of `/var/lib/trawl` as the `trawl` user or
+as root. The data root and everything beneath it are owner-only, so a member
+of group `trawl`, such as `trawl-web`, cannot read them. A backup agent that
+runs as another user cannot make a complete backup. As a member of group
+`trawl` it can read `web.cookie` and `tls/cert.pem`, but none of the stored
+data. On Kubernetes, the mover must run as
+trawld's uid, `podSecurityContext.runAsUser` in the chart, 1000 by default.
+
 ## Create a backup
 
 You need `pg_dump` at least as new as the PostgreSQL server, the two DSNs in
@@ -121,6 +129,16 @@ database, restore the `trawl` dump only and reconcile keys by hand.
 
    The archive replaces the package-generated `web.cookie` with the backed-up
    key, so browser sessions and shared Fleet sessions keep working.
+
+   The restored data root must be owned by the user that runs trawld, `trawl`
+   on a Debian host. `tar` as root restores the archived owner by name, so
+   the packaged user gets it right. If trawld runs as another user on this
+   host, run `chown -R` on `/var/lib/trawl/data` to that user before you
+   start trawld. Do the same for `/var/lib/trawl/tls` and
+   `/var/lib/trawl/tls-key` if they exist. They exist only when trawld
+   generated its own certificate. trawld
+   refuses to start on a data root or TLS directory owned by another user,
+   and its error names the path, the owner, and the fix.
 
 4. Edit the restored configuration for this host: the DSNs in
    `/etc/default/trawld`, `http_addr`, the TLS paths, and `public_origins`.

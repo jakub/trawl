@@ -68,6 +68,20 @@ if ! grep -E '^[[:space:]]*ReadWritePaths[[:space:]]*=.*/var/lib/trawl' "$servic
   fail "crates/trawl-server/debian/trawld.service has no ReadWritePaths covering /var/lib/trawl — the crash-dump drop-in writes under that tree"
 fi
 
+# systemd reapplies these modes on every start. Keep exactly one active value
+# of each, and leave the web unit without a competing directory owner.
+state_modes=$(grep -Ec '^[[:space:]]*StateDirectoryMode[[:space:]]*=[[:space:]]*0750[[:space:]]*$' "$service" || true)
+log_modes=$(grep -Ec '^[[:space:]]*LogsDirectoryMode[[:space:]]*=[[:space:]]*0700[[:space:]]*$' "$service" || true)
+[[ "$state_modes" -eq 1 ]] || fail "trawld.service needs exactly one active StateDirectoryMode=0750"
+[[ "$log_modes" -eq 1 ]] || fail "trawld.service needs exactly one active LogsDirectoryMode=0700"
+for directive in StateDirectoryMode LogsDirectoryMode; do
+  count=$(grep -Ec "^[[:space:]]*${directive}[[:space:]]*=" "$service" || true)
+  [[ "$count" -eq 1 ]] || fail "trawld.service needs exactly one active $directive directive"
+done
+if grep -Eq '^[[:space:]]*(StateDirectory|LogsDirectory|StateDirectoryMode|LogsDirectoryMode)[[:space:]]*=' "$web_service"; then
+  fail "trawl-web.service must not declare StateDirectory or LogsDirectory directives"
+fi
+
 # -- 5. crashdump.conf carries exactly the four directive lines, in order -
 
 if [[ ! -f "$crashdump_conf" ]]; then

@@ -33,6 +33,12 @@ pub(crate) fn swap_envs(data_dir: &Path, shadow: &Path, aside: &Path) -> Result<
     };
     std::fs::create_dir_all(aside)
         .map_err(|e| format!("failed to create {}: {e}", aside.display()))?;
+    // Owner-only before any env is renamed into it (ADR-0052). Past the
+    // cutover marker a refusal is fatal like any other swap failure, and
+    // the boot replay refuses the start until the operator fixes the root.
+    #[cfg(unix)]
+    crate::owner_only::close_created(crate::owner_only::RootKind::RepinAside, aside)
+        .map_err(|e| e.to_string())?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("failed to read {}: {e}", shadow.display()))?;
@@ -204,6 +210,11 @@ pub(crate) fn prepare_shadow_root(data_dir: &Path) -> Result<PathBuf, String> {
         ));
     }
     std::fs::create_dir_all(&shadow).map_err(|e| format!("failed to create shadow root: {e}"))?;
+    // Owner-only before the build links or writes anything into it
+    // (ADR-0052); a refusal fails the job with the corpus untouched.
+    #[cfg(unix)]
+    crate::owner_only::close_created(crate::owner_only::RootKind::RepinShadow, &shadow)
+        .map_err(|e| e.to_string())?;
     Ok(shadow)
 }
 
@@ -382,6 +393,83 @@ mod tests {
         assert_eq!(root, shadow);
         assert!(root.is_dir());
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "empty root");
+    }
+
+    /// The permission bits at `path`, not following a final symlink.
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    /// A shadow root the build creates is owner-only before anything enters
+    /// it, even where the parent's default ACL makes a new directory 0755
+    /// whatever trawld's umask (ADR-0052).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_shadow_root_is_closed_when_the_build_creates_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::owner_only::inherit_0755(tmp.path());
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+
+        let shadow = prepare_shadow_root(&data).unwrap();
+
+        assert_eq!(mode_of(&shadow), 0o700);
+        assert_eq!(std::fs::read_dir(&shadow).unwrap().count(), 0);
+    }
+
+    /// The aside root the swap creates is owner-only before any env is
+    /// renamed into it, even under a parent default ACL of 0755.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_aside_root_is_closed_when_the_swap_creates_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let shadow = tmp.path().join("data.repin-next");
+        let aside = tmp.path().join("data.repin-aside");
+        write(&data.join("prod/2026-01-01/10/svc.parquet"), b"current");
+        write(&shadow.join("prod/2026-01-01/10/svc.parquet"), b"new");
+        crate::owner_only::inherit_0755(tmp.path());
+
+        swap_envs(&data, &shadow, &aside).unwrap();
+
+        assert_eq!(mode_of(&aside), 0o700);
+        assert_eq!(
+            std::fs::read(aside.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
+            b"current"
+        );
+    }
+
+    /// An aside root that cannot be kept owner-only, here a symlink to a
+    /// 0755 directory, stops the swap before anything is renamed: the live
+    /// generation stays in place and nothing enters the link's target.
+    #[cfg(unix)]
+    #[test]
+    fn an_aside_root_that_cannot_be_closed_stops_the_swap() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let shadow = tmp.path().join("data.repin-next");
+        let aside = tmp.path().join("data.repin-aside");
+        let elsewhere = tmp.path().join("elsewhere");
+        write(&data.join("prod/2026-01-01/10/svc.parquet"), b"current");
+        write(&shadow.join("prod/2026-01-01/10/svc.parquet"), b"new");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &aside).unwrap();
+
+        let err = swap_envs(&data, &shadow, &aside).expect_err("the swap is refused");
+
+        assert!(err.contains("repin aside root"), "{err}");
+        assert!(err.contains("symbolic link"), "{err}");
+        assert_eq!(
+            std::fs::read(data.join("prod/2026-01-01/10/svc.parquet")).unwrap(),
+            b"current"
+        );
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert_eq!(mode_of(&elsewhere), 0o755);
     }
 
     /// A leftover `aside/{env}` from an earlier job's failed sweep must not

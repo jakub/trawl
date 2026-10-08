@@ -29,3 +29,37 @@ A walk of the published v0.9.1 manual on a fresh Debian 13 host found every stor
 ## Consequences
 
 A backup agent must run as the trawl user or as root. Homelab volsync already runs its mover as uid 1000, the chart's trawld uid. The deployment guide's file table gives every row a mode and says which entries trawld creates at first start. The tarball section no longer asks the supervisor for a umask.
+
+## Amendment (2026-10-06)
+
+The implementation of #282 settled the rules the body left open.
+
+**Which roots trawld closes.** The data root on every node, ingest or query-only. On an ingest node, the WAL directory unless the data root provably holds it. A name under the data root is not proof: `data/wal` can be a symlink out of the root, or a mount that other users reach by another path. The WAL directory is held by the root only when trawld reaches it from the open data root by descriptor, one `openat(O_DIRECTORY | O_NOFOLLOW)` per component, and every directory on the way is on the data root's filesystem and, on Linux, in its mount. A path with a `..` component is never held. A WAL directory the root holds is never chmodded. Any other WAL directory is a root of its own. The repin siblings, `data.repin-next` and `data.repin-aside`, are closed when they exist. A query-only node whose root does not exist leaves it absent.
+
+**A root trawld creates is checked once it exists.** The umask makes a new root owner-only only where the filesystem lets it. A fixed-mode mount or a default ACL on the parent decides the mode instead. So boot closes the roots again after the epoch gate creates the data root and after it creates the WAL directory, before any producer or listener starts.
+
+**Only the final path component is held no-follow.** trawld opens the last component of each root with `O_NOFOLLOW` and judges and tightens through that handle. The directories above it are operator-trusted storage, as ADR-0041 rules, so a symlink among them is followed. The components between the data root and a WAL directory under it are not trusted this way: they decide whether the root holds the WAL directory, as above. A root whose final component is a symlink refuses, at boot and in the doctor. Boot followed it before. This is a deliberate change.
+
+**How trawld tightens.** It clears the group and other bits, `mode & !0o077`, through the handle, and keeps the owner bits and the setgid and sticky bits, which Kubernetes `fsGroup` sets. After the change it reads the mode again and refuses if any group or other bit survives, as on a filesystem that ignores `fchmod`. A root owned by another user refuses before any change, even when trawld runs as root.
+
+**Files outside the roots.** The query engine spills into a directory it makes for each database in the system temp directory, with a random name and mode 0700, and removes it when the database closes. `DuckDB` opens its spill files by predictable names without `O_EXCL`, so the shared temp directory would reuse a file another user planted or an older process left readable. Compaction and the conform pass already spill under the data root. `[server] log_file` opens like the query debug log: 0600 at creation, and an existing looser file is tightened, since it can sit outside every directory trawld or systemd closes.
+
+**The doctor predicts, boot decides.** `will_tighten` is a read-only prediction from the root's owner and mode, plus a read-only-filesystem check. Boot does not pre-judge the filesystem. Its `fchmod` is the authority, and its result is what refuses or serves.
+
+## Amendment (2026-10-07)
+
+Review of #282 moved the start-time close and widened what it covers.
+
+**trawld closes the roots before it waits on PostgreSQL.** The first close runs once the configuration is loaded, before the database admission that takes the sole-writer lock. The earlier placement, after the lock, kept a corpus open for as long as a database was down, across every restart. The lock is not needed: the close only removes group and other bits, so a second trawld that runs it and then loses the lock has changed nothing the winner would not. The checks after the epoch gate creates the data root and after boot creates the WAL directory stay where they are.
+
+**A repin closes its staging roots when it creates them.** A repin makes `data.repin-next` and `data.repin-aside` while trawld serves, after the start-time close. Each is closed through the same no-follow handle as soon as it exists, before anything is linked, written or renamed into it. A refused shadow root fails the job with the corpus untouched. A refused aside root comes after the cutover marker, so it ends the process like any other swap failure, and the boot replay refuses the start until the operator fixes the root.
+
+**An unknown mount does not prove containment.** On Linux a WAL directory is held by the data root only when `statx` names the mount of every directory on the way. A kernel before 5.8 does not, and the device alone cannot tell a bind mount from a plain directory, so the WAL directory is then a root of its own.
+
+**A WAL directory or repin sibling that is not a directory refuses the start**, at boot and in the doctor. A data root that is not a directory stays the epoch gate's to refuse.
+
+**A refused root does not keep the others open.** Boot closes every root it can, and only then reports the first refusal, data root first. A refused WAL directory or repin sibling therefore never leaves the data root open across the restarts it causes.
+
+**trawld checks the spill directory and the diagnostic logs on their descriptors.** The spill directory is opened no-follow after it is made, and refused unless trawld's euid owns it and it has no group or other bit. `[server] log_file` and the query debug log are judged on the opened descriptor after the chmod, whatever the chmod returned: a file another user owns, or one with a group or other bit left, refuses the open. A file another user owns is refused even when it is already tight, since its owner can loosen it at any time. The deployment guide asks for a `TMPDIR` in which other users cannot rename entries, such as the sticky `/tmp`. The Helm chart gives the `trawl-web` sidecar its own `/tmp` emptyDir, because an emptyDir is 0777 without the sticky bit and a shared one would let the sidecar's uid rename trawld's spill directory. This is a chart change the issue first ruled out on the belief that the sidecar mounted only `tls/`; the human ruled for the split on 2026-10-07.
+
+**What the close does not do.** It governs opens by path from the first start of a trawld that closes the roots. It does not revoke a descriptor another user opened earlier: a directory handle on an open data root, or a handle on a loose `[server] log_file` or query log, keeps working after the mode changes, and new lines appended to that log stay readable through it. Replacing the log with a fresh inode at that start was considered and rejected by the operator on 2026-10-07: the same limit holds for the data root, which no rename can fix, and the upgrade guide tells the operator to restart or reboot. A root whose owner lacks read permission, such as 0305, cannot be opened for the close and refuses the start with its fix. It is not tightened through a path-only handle.

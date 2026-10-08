@@ -286,7 +286,8 @@ async fn scheduler_harness() -> SchedulerHarness {
             2,
             100_000,
             None,
-        ),
+        )
+        .unwrap(),
         _dir: dir,
         key_id: key.info.id,
         key_store,

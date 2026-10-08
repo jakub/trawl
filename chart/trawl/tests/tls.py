@@ -127,6 +127,22 @@ class TLS(unittest.TestCase):
         self.assertEqual(data[0]["mountPath"], f"{state_dir}/tls")
         self.assertEqual(f"/var/lib/trawl/{data[0]['subPath']}", f"{state_dir}/tls")
         key_dir = f"{state_dir}/tls-key"
+        # Nothing the sidecar can write is a volume trawld mounts too: a
+        # shared emptyDir /tmp would let this uid rename trawld's private
+        # query spill directory (ADR-0052).
+        daemon_mounts = container(objects, "trawld")["volumeMounts"]
+        daemon = {m["name"] for m in daemon_mounts}
+        for mount in mounts:
+            with self.subTest(shared=mount["name"]):
+                self.assertTrue(mount["name"] not in daemon or mount.get("readOnly"), mount)
+        # Both containers have a /tmp, each on a volume of its own.
+        tmp = {
+            name: [m["name"] for m in found if m["mountPath"] == "/tmp"]
+            for name, found in (("trawld", daemon_mounts), ("trawl-web", mounts))
+        }
+        self.assertEqual(len(tmp["trawld"]), 1, tmp)
+        self.assertEqual(len(tmp["trawl-web"]), 1, tmp)
+        self.assertNotEqual(tmp["trawld"], tmp["trawl-web"], tmp)
         for mount in mounts:
             path = mount["mountPath"].rstrip("/")
             with self.subTest(mount=mount["name"]):

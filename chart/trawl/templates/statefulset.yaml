@@ -304,7 +304,10 @@ spec:
           resources:
             {{- toYaml .Values.web.resources | nindent 12 }}
           volumeMounts:
-            - name: tmp
+            # Its own /tmp, never trawld's: an emptyDir is 0777 without the
+            # sticky bit, so a shared one would let this uid rename trawld's
+            # private query spill directory and plant its own (ADR-0052).
+            - name: web-tmp
               mountPath: /tmp
             - name: config
               mountPath: /etc/trawl/trawld.toml
@@ -351,6 +354,9 @@ spec:
             secretName: {{ include "trawl.tlsSecretName" . }}
         {{- end }}
         {{- if .Values.web.enabled }}
+        - name: web-tmp
+          emptyDir:
+            sizeLimit: 64Mi
         - name: web-cookie
           secret:
             secretName: {{ if .Values.web.cookieSecret.existingSecret }}{{ .Values.web.cookieSecret.existingSecret }}{{ else }}{{ printf "%s-web" (include "trawl.fullname" .) }}{{ end }}

@@ -72,6 +72,16 @@ struct Cli {
 const RUNTIME_SHUTDOWN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Stored data is owner-only (ADR-0052). Setting the umask here, first,
+    // puts it ahead of every file and thread trawld's own code creates: the
+    // crash-dump monitor re-execs into this line, the runtime's workers are
+    // built below, and DuckDB's `COPY ... TO` Parquet takes `0666 & !umask`
+    // with no other creation-time control. It is never restored. It cannot
+    // reach work a linked library does in a constructor before `main`. Paths
+    // whose modes must differ (`tls/`, `cert.pem`, the query log, `cores/`)
+    // set them explicitly, and the check modes create nothing.
+    #[cfg(unix)]
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
     // Inspect only arguments before choosing the seal. The monitor re-exec
     // carries no arguments, so it always reaches normal crash-dump init.
     // Both paths seal before config reads or threads. Check mode must not
@@ -333,6 +343,18 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             prom_handle.run_upkeep();
         }
     });
+
+    // Close the storage roots before anything waits on PostgreSQL, so a
+    // database that is down or slow never leaves the corpus open to other
+    // users while trawld waits or restarts (ADR-0052). The close only ever
+    // removes group and other bits, so it needs no sole-writer lock: a
+    // second trawld that runs it and then loses the lock has done no harm.
+    #[cfg(unix)]
+    close_storage_roots(
+        &config.data.base_dir(),
+        &config.wal_dir(),
+        config.ingest.enabled,
+    )?;
 
     // Admit both databases before the epoch gate can initialize a fresh
     // root or repin recovery can rename/sweep an existing corpus. This exact
@@ -632,11 +654,46 @@ fn prepare_data_root(
     String,
 > {
     let epoch = trawl_server::epoch::ensure_current_epoch(data_root, wal_dir, ingest_enabled)?;
+    // The gate creates a data root that was absent, and the umask decides
+    // its mode only where the filesystem lets it: a fixed-mode mount or a
+    // default ACL on the parent does not. Check it now that it exists,
+    // before recovery or any writer uses it.
+    #[cfg(unix)]
+    if epoch == trawl_server::epoch::Outcome::FreshRoot {
+        close_storage_roots(data_root, wal_dir, ingest_enabled)?;
+    }
     let recovered = trawl_server::repin::recover::recover_filesystem(data_root, ingest_enabled)?;
     if ingest_enabled {
         recover_publications_at_boot(wal_dir, data_root)?;
     }
     Ok((epoch, recovered))
+}
+
+/// Close every storage root to its owner, or refuse the start (ADR-0052).
+///
+/// Boot runs this once the configuration is loaded and before it waits on
+/// PostgreSQL, so a database that is down never keeps the corpus open. That
+/// is before the sole-writer lock, and safe there: the close only removes
+/// group and other bits, so a second trawld that runs it and then loses the
+/// lock has changed nothing the winner would not. It runs on ingest and
+/// query-only nodes alike, before the epoch gate, recovery or any reader
+/// touches the corpus, and before any listener binds. A root absent then is
+/// left for boot to create, and closed again once it exists: after the epoch
+/// gate creates the data root, and in [`create_wal_dir`]. A root that is
+/// already owner-only is only looked at, so a second pass changes nothing it
+/// did not have to.
+#[cfg(unix)]
+fn close_storage_roots(
+    data_root: &std::path::Path,
+    wal_dir: &std::path::Path,
+    ingest_enabled: bool,
+) -> Result<(), String> {
+    use trawl_server::owner_only;
+
+    let roots = owner_only::protected_roots(data_root, wal_dir, ingest_enabled);
+    let euid = rustix::process::geteuid().as_raw();
+    owner_only::close(&roots, euid, owner_only::fchmod).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Finish or roll back every compaction publish a crash interrupted, before
@@ -694,9 +751,7 @@ fn spawn_ingest_pipeline(
     let wal_dir = config.wal_dir();
 
     if let Some(writer) = &state.ingest.wal_writer {
-        writer
-            .ensure_dir()
-            .map_err(|e| format!("failed to create WAL directory {}: {e}", wal_dir.display()))?;
+        create_wal_dir(writer, &config.data.base_dir())?;
     }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -734,6 +789,30 @@ fn spawn_ingest_pipeline(
     );
 
     Ok(Some((handle, shutdown_tx)))
+}
+
+/// Create the WAL directory if it is missing, then close the storage roots
+/// again, before any producer or listener exists.
+///
+/// The first close found a missing WAL directory absent and left it for
+/// this step. The umask makes a directory trawld creates owner-only, unless
+/// a fixed-mode mount or a default ACL on its parent overrides it, so the
+/// new directory goes through the same check as a root that existed.
+fn create_wal_dir(
+    writer: &trawl_server::ingest::wal::WalWriter,
+    data_root: &std::path::Path,
+) -> Result<(), String> {
+    writer.ensure_dir().map_err(|e| {
+        format!(
+            "failed to create WAL directory {}: {e}",
+            writer.dir().display()
+        )
+    })?;
+    #[cfg(unix)]
+    close_storage_roots(data_root, writer.dir(), true)?;
+    #[cfg(not(unix))]
+    let _ = data_root;
+    Ok(())
 }
 
 /// Directory names directly under the data root, or `None` when the root
@@ -828,10 +907,10 @@ impl FileLog {
         if let Some(parent) = path.parent().filter(|path| !path.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        // Owner-only, like the query log: `0600` at creation, and a file an
+        // older trawld left looser is tightened (ADR-0052). It may sit
+        // outside every directory trawld or systemd closes.
+        let file = trawl_server::query_log::open_append_owner_only(&path, "log_file_chmod_failed")?;
         // Check the opened file too, before installing a writer that can
         // append bytes. This also detects existing hard-link aliases.
         #[cfg(unix)]
@@ -1113,6 +1192,103 @@ mod tests {
         assert!(recovered.is_some());
         assert_eq!(std::fs::read(data.join("prod/a.parquet")).unwrap(), b"new");
         assert_eq!(std::fs::read(data.join("EPOCH")).unwrap(), b"3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_storage_roots_closes_the_roots_and_refuses_a_symlink() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let mode =
+            |path: &std::path::Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+        let set = |path: &std::path::Path, mode: u32| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let wal = tmp.path().join("wal");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&wal).unwrap();
+        std::fs::write(data.join("EPOCH"), "3").unwrap();
+        set(&data.join("EPOCH"), 0o644);
+        set(&data, 0o755);
+        set(&wal, 0o755);
+
+        close_storage_roots(&data, &wal, true).unwrap();
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&wal), 0o700);
+        assert_eq!(mode(&data.join("EPOCH")), 0o644, "nothing beneath a root");
+
+        // A symlinked data root refuses, so the gate never follows it.
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        set(&data, 0o755);
+        let error = close_storage_roots(&link, &wal, true).unwrap_err();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(mode(&data), 0o755);
+    }
+
+    /// Give `dir` a default ACL of `u::rwx,g::r-x,o::r-x`, so a directory
+    /// created in it is 0755 whatever the umask: the real-filesystem stand-in
+    /// for a mount whose modes trawld's umask does not decide.
+    #[cfg(target_os = "linux")]
+    fn inherit_0755(dir: &std::path::Path) {
+        const USER_OBJ: u16 = 0x01;
+        const GROUP_OBJ: u16 = 0x04;
+        const OTHER: u16 = 0x20;
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, perm) in [(USER_OBJ, 7_u16), (GROUP_OBJ, 5), (OTHER, 5)] {
+            acl.extend(tag.to_le_bytes());
+            acl.extend(perm.to_le_bytes());
+            acl.extend(u32::MAX.to_le_bytes());
+        }
+        rustix::fs::setxattr(
+            dir,
+            "system.posix_acl_default",
+            &acl,
+            rustix::fs::XattrFlags::empty(),
+        )
+        .expect("the test filesystem must support default ACLs");
+        let probe = dir.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        assert_eq!(mode_of(&probe), 0o755, "the default ACL decides the mode");
+        std::fs::remove_dir(&probe).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_data_root_the_epoch_gate_creates_is_closed_before_it_is_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        inherit_0755(tmp.path());
+        let data = tmp.path().join("data");
+        let wal = data.join("wal");
+
+        let (epoch, _) = prepare_data_root(&data, &wal, true).unwrap();
+
+        assert_eq!(epoch, trawl_server::epoch::Outcome::FreshRoot);
+        assert_eq!(mode_of(&data), 0o700, "the root the gate created");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_outside_wal_dir_boot_creates_is_closed_before_it_is_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let parent = tmp.path().join("spool");
+        std::fs::create_dir(&parent).unwrap();
+        inherit_0755(&parent);
+        let wal = parent.join("wal");
+        let writer = trawl_server::ingest::wal::WalWriter::new(wal.clone());
+
+        create_wal_dir(&writer, &data).unwrap();
+
+        assert_eq!(mode_of(&wal), 0o700, "the WAL directory boot created");
     }
 
     fn config_with(retention: &str, ingest: &str) -> Config {
