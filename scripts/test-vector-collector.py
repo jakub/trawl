@@ -795,6 +795,10 @@ def capture_recipe():
             variant = capture_block(CAPTURE_RECENT_MARKER)
             result, capture, _work = run_capture(directory, live, env_file, inputs,
                                                  prelude=variant, sudo="sudo() { :; }")
+            # `sudo` ran nothing, so the block ends on its empty-capture refusal.
+            log = result.stderr.decode(errors="replace")
+            assert result.returncode == 1, log
+            assert "capture: the capture is empty" in log, log
             copy = capture / "config"
             journald = tomllib.loads((copy / "base.toml").read_text())["sources"]["journald"]
             assert journald["extra_args"] == ["--since=-15min"], journald
