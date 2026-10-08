@@ -88,9 +88,9 @@ per service: `apache.toml`, `docker.toml`, `fail2ban.toml`, `mysql.toml`,
    instead.
 
    `base.toml` reads journald and every `*.log` file under `/var/log`, except
-   in `/var/log/private`, which systemd keeps root-only. It maps
-   `_SYSTEMD_UNIT` to `service` and `PRIORITY` to `severity_text`, and defines
-   the `trawld` sink.
+   in `/var/log/private`, which systemd keeps root-only. It derives `service`
+   as [Service names](#service-names) describes, maps `PRIORITY` to
+   `severity_text`, and defines the `trawld` sink.
    The sink takes input from every final transform named `trawl_*`, so a
    drop-in needs no change to `base.toml`. Use another prefix for intermediate
    transforms, such as `journal_enriched`, to prevent duplicate delivery and
@@ -106,11 +106,17 @@ per service: `apache.toml`, `docker.toml`, `fail2ban.toml`, `mysql.toml`,
    Journal collection covers the current boot. By default, every normalized
    journal event passes through. To enable the optional homelab noise policy,
    set `TRAWL_SUPPRESS_HOMELAB_NOISE=true` in `/etc/vector/trawl.env` and
-   restart Vector. This drops `serial-getty@ttyS0` events, `init` messages containing
-   `serial-getty`, and container-network churn from `networkd-dispatcher`,
-   `NetworkManager`, and `systemd-networkd`. Review the conditions in
+   restart Vector. This drops events whose `systemd_unit` is
+   `serial-getty@ttyS0.service`, `init` messages containing `serial-getty`,
+   and container-network churn from `networkd-dispatcher`, `NetworkManager`,
+   and `systemd-networkd`. Other serial gettys, such as
+   `serial-getty@ttyS1.service`, still arrive. Review the conditions in
    `transforms.trawl_journal` before enabling them. Leave the variable unset
    to keep these events.
+
+   The package updates only the examples directory. After an upgrade of
+   `trawl-server`, copy the files again, as in
+   [Upgrade the configuration](#upgrade-the-configuration).
 
 2. Put the ingest key in `/etc/vector/trawl.env`. Run these commands in the
    directory that holds `vector.token`:
@@ -423,6 +429,17 @@ arrived after you start Vector.
 
 ## Start Vector
 
+Save trawld's rejection counter first, so that you can
+[check for refused events](#check-for-refused-events) after the start. Use
+the address in `TRAWL_URL`. `/metrics` needs no key:
+
+```bash
+curl -fsS https://trawl.example.com:5514/metrics | grep '^trawl_ingest_events_rejected_total' > rejected-before.txt
+```
+
+For a private CA, or for trawld's generated certificate, add
+`--cacert /etc/vector/trawl-ca.pem`.
+
 Record the start time in UTC, then start and enable the service:
 
 <!-- proof:vector-start -->
@@ -447,6 +464,31 @@ The shipped sink behaves as follows:
 | Retries | `5xx`, `408`, and `429`, with 1 to 30 second backoff. Other `4xx` responses drop the batch. |
 | Concurrency | Adaptive |
 | Acknowledgements | Enabled. The journald and file sources advance only after trawld accepts the batch. Vector 0.57's `docker_logs` source does not support acknowledgements, so a Docker line in a batch that trawld refuses is lost. |
+
+### Check for refused events
+
+trawld checks each event on its own. It refuses an event that breaks the
+[event contract](/reference/events/#rejection-reasons), stores the rest of
+the batch, and answers `200`. Vector reads only the status code, so it logs
+no error, and the refused event is lost. trawld counts each refusal in
+`trawl_ingest_events_rejected_total{reason}`.
+
+Wait at least five minutes after the start. On a host with a long journal,
+wait until the [first-start backfill](#what-arrives-from-before) is done.
+Then compare the counter with the copy you saved:
+
+```bash
+curl -fsS https://trawl.example.com:5514/metrics | grep '^trawl_ingest_events_rejected_total' | diff rejected-before.txt - && echo "no new rejections"
+```
+
+Expect `no new rejections`. A changed line names the `reason` that rose. See
+[Troubleshoot delivery](#troubleshoot-delivery). The counter covers every
+sender of this trawld, so a rise can come from another host.
+[Preview a sample](#preview-a-sample) from this host to tell. When the check
+passes, delete the file with `rm rejected-before.txt`.
+
+The [operational alert pack](/operate/operational-alerts/#ingest-events-rejected)
+warns when this counter rises.
 
 ## Prove the first event arrived
 
@@ -729,6 +771,112 @@ keeps only events that arrived after Vector started. A service whose
 Docker events do not appear here, because their `host` is the container's
 identity.
 
+## Service names
+
+trawld accepts a `service` of 1 to 128 ASCII letters, digits, `.`, `_`, and
+`-` that does not start with a dot. It refuses any other event, and Vector
+logs no error (see [Check for refused events](#check-for-refused-events)).
+Every shipped transform that takes `service` from the event therefore checks
+the value against that rule before it sends it. A value that fails is never
+rewritten, unescaped, or cut. The transform uses its next candidate or a
+marked fallback, and the original values stay on the event:
+
+| Source | `service` | Original values kept | Fallback |
+| --- | --- | --- | --- |
+| journald (`base.toml`) | The first valid candidate: the unit, then `SYSLOG_IDENTIFIER`, then `_COMM` | `systemd_unit`, `systemd_user_unit`, `syslog_identifier`, `comm` | `journal-unidentified` |
+| `/var/log` files (`base.toml`) | The first directory under `/var/log`, or the file name without `.log` | `file` | `varlog-unidentified` |
+| Docker (`docker.toml`) | The first that is set: Compose service, Swarm service with `_` replaced by `-`, container name, image name | `container_name`, `image`, `docker_compose_service`, `docker_swarm_service` | `docker-unidentified` |
+| UniFi syslog (`unifi-syslog.toml`) | `unifi-` and the device model in lowercase, or the APP-NAME of another device | `syslog_appname` | `syslog-unidentified` |
+
+A fallback marks events that carry no name trawld accepts. Find the
+original in the kept fields, for example
+`service=varlog-unidentified | stats count() by file`. Docker and UniFi do
+not try a second candidate. A Compose service named `my web` gives
+`docker-unidentified` and keeps `docker_compose_service`. The image name is
+the last path component of the image reference, without a tag or digest:
+`registry.example:5000/org/redis:7` gives `redis`.
+
+For journald, the unit candidate is `_SYSTEMD_USER_UNIT` when it is set and
+is not `init.scope`, else `_SYSTEMD_UNIT`. One trailing `.service`, `.scope`,
+`.slice`, `.socket`, or `.target` comes off, then everything from the first
+`@`. For `SYSLOG_IDENTIFIER` and `_COMM`, one pair of parentheses around the
+whole value comes off. Some results:
+
+| Journal fields | `service` |
+| --- | --- |
+| `_SYSTEMD_UNIT=postgresql@17-main.service` | `postgresql` |
+| `_SYSTEMD_UNIT=serial-getty@ttyS0.service` | `serial-getty` |
+| `_SYSTEMD_UNIT=user@1000.service`, `_SYSTEMD_USER_UNIT=pipewire.service` | `pipewire` |
+| `_SYSTEMD_UNIT=user@1000.service`, with no user unit or `_SYSTEMD_USER_UNIT=init.scope` | `user` |
+| `_SYSTEMD_UNIT=init.scope`, PID 1 | `init` |
+| No unit, `SYSLOG_IDENTIFIER=(sd-pam)` | `sd-pam` |
+| `_SYSTEMD_UNIT=systemd-fsck@dev-disk-by\x2duuid-0f1e.service` | `systemd-fsck` |
+| `_SYSTEMD_UNIT=mnt-my\x2ddisk.mount`, `SYSLOG_IDENTIFIER=mount` | `mount` |
+| A unit name over 128 bytes, `SYSLOG_IDENTIFIER=long-unit` | `long-unit` |
+| No unit, `SYSLOG_IDENTIFIER=/usr/bin/x y`, `_COMM=(a b)` | `journal-unidentified` |
+
+The kept journal fields hold the source values unchanged, and each is set
+only when its source field is not empty. To tell the instances of a template
+apart, group by the kept unit, for example
+`service=postgresql | stats count() by systemd_unit`. No kept field is named
+`unit`: journald's own `UNIT` field, the unit that a systemd manager message
+is about, arrives as `unit`.
+
+A user unit names its service. The owner of a user unit chooses its name,
+so any local user can run a unit named `sshd.service`, and its lines arrive
+as `service=sshd`. Those lines keep `systemd_unit=user@1000.service`, where
+`1000` is the user's uid. To see only the system's `sshd`, filter on
+`service=sshd systemd_unit=sshd.service`.
+
+## Upgrade the configuration
+
+The `trawl-server` package updates only
+`/usr/share/doc/trawl-server/examples/vector/`. Vector keeps running the
+copies in `/etc/vector/vector.d/` until you replace them. After each upgrade
+of `trawl-server`, copy the files again and restart Vector:
+
+1. Set `NEW` to the directory that holds the new files. On the trawld host,
+   that is the examples directory. On a collector host, copy the files from
+   the trawld host into a directory of your own first, as in
+   [Load the Trawl configuration](#load-the-trawl-configuration), and set
+   `NEW` to that directory.
+
+   ```bash
+   NEW=/usr/share/doc/trawl-server/examples/vector
+   ```
+
+2. List your edits to the current copies, such as the `ca_file` line in
+   `[sinks.trawld.tls]`. The copy in step 3 replaces them:
+
+   ```bash
+   for file in /etc/vector/vector.d/*.toml; do
+     diff -u "$file" "$NEW/$(basename "$file")"
+   done
+   ```
+
+   `diff` reports a missing file for a drop-in of your own. The copy leaves
+   that file alone.
+
+3. Copy the same files you installed:
+
+   ```bash
+   sudo install -m 0644 -t /etc/vector/vector.d "$NEW/base.toml" "$NEW/nginx.toml"
+   ```
+
+   Make your edits from step 2 again with `sudoedit`.
+
+4. Save the rejection counter, as in [Start Vector](#start-vector), then
+   restart Vector:
+
+   ```bash
+   sudo systemctl restart vector
+   ```
+
+5. [Check for refused events](#check-for-refused-events).
+
+A new release can change the service names that the configuration derives.
+Update saved searches and filters that use an old name.
+
 ## Troubleshoot delivery
 
 Vector logs sink errors to its journal. Read them with `journalctl -u vector`.
@@ -746,6 +894,7 @@ reason and message, without waiting for the counter.
 | Vector logs `403` | The key lacks `trawl:ingest`. Give its role that permission, or create a key with the `trawl-ingest` role. Vector does not retry a `403`. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="invalid_env"` rises | `TRAWL_ENV` fails the env name rule: 1 to 32 characters from `a-z`, `0-9`, `_`, and `-`. `Prod` fails it. Fix `TRAWL_ENV` and restart Vector. |
 | Vector logs no error, the check finds nothing, and the rejection counter with `reason="env_not_allowed"` rises | `TRAWL_ENV` is not in trawld's `[ingest] envs`. Keys are not scoped to an env, so the list is the only check. Add the env to the list and restart trawld, or fix `TRAWL_ENV`. |
+| Vector logs no error, and the rejection counter rises with `reason="invalid_chars"` or `reason="service_too_long"` | Vector runs an old or edited copy of the shipped configuration, which sends a `service` that trawld refuses. The current files check every `service` they derive, as [Service names](#service-names) describes. Copy them again and restart Vector, as in [Upgrade the configuration](#upgrade-the-configuration). Then [preview a sample](#preview-a-sample) and expect `0` rejected. A drop-in of your own that derives `service` must end in the check from [Add your own source](#add-your-own-source). |
 | The check finds nothing, and the rejection counter rises with another `reason` | For a rule an event broke, trawld answered `200` with `rejected` in the body, and Vector counted the batch as a success. The `reason` label names the rule. See the [event contract](/reference/events/). To see which events trawld rejects and why, [preview a sample](#preview-a-sample). Three reasons refuse the whole request instead, and Vector logs the status. |
 | Vector logs `503`, and `trawl_hot_buffer_admission_refusals_total{producer="http",kind="full"}` or the rejection counter with `reason="hot_buffer_full"` rises | trawld's hot buffer is full. A request refused before trawld parses it raises only the admission counter. Vector retries. If it persists, check compaction and disk headroom on the [Health page](/operate/health/). |
 | Vector logs `413` | One request is too large, and Vector drops that batch. Lower the sink's `batch.max_bytes`. If `trawl_hot_buffer_admission_refusals_total{producer="http",kind="oversized"}` or the rejection counter with `reason="ingest_batch_too_large"` rises, the request holds more than the hot buffer admits at once. If neither rises, the body exceeds trawld's `[ingest] max_body_bytes`, as sent (code `request_too_large`) or once gzip is decoded. A decoded body over the limit logs `ingest_body_too_large` on trawld. |
@@ -759,7 +908,9 @@ reason and message, without waiting for the counter.
 Deploy `unifi-syslog.toml` and point the devices at the Vector host on UDP port
 1514. To also receive TCP on that port, uncomment the complete
 `sources.unifi_syslog_tcp` block. The `unifi_syslog*` input sends both sources
-through the same normalizer before HTTP forwarding.
+through the same normalizer before HTTP forwarding. An APP-NAME that trawld
+would refuse as a `service`, such as `foo/bar`, arrives as
+`syslog-unidentified`, with the original in `syslog_appname`.
 
 For a gateway with a fixed service name, enable the gateway override in that
 normalizer and set its source IP. The daemon's `source_service_map` applies
@@ -792,7 +943,36 @@ Vector's sources set `timestamp` and `host`, and trawld derives `_time` from
 `timestamp`. Set `severity_text`, `severity`, or `level` from the line when
 the source has one. trawld derives `_severity` from the first that maps.
 `service`, `env`, `host`, and `message` are the envelope, and names that start
-with `_` belong to Trawl. [Preview a sample](#preview-a-sample) of the new
+with `_` belong to Trawl.
+
+A transform that takes `service` from the event, not from a constant, must
+end in the check that the shipped transforms use (see
+[Service names](#service-names)). Otherwise trawld refuses each event whose
+value breaks the rule, and Vector logs no error. Bind the rule once, test the
+value, and fall back to a marked name of your own. This example takes
+`service` from a field `app` that an earlier parser set, and keeps `app` on
+the event:
+
+```toml
+[transforms.trawl_myapp]
+type = "remap"
+inputs = ["myapp_parsed"]
+source = '''
+gate = r'^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$'
+service = to_string(.app) ?? ""
+if !match(service, gate) {
+  service = "myapp-unidentified"
+}
+.service = service
+.env = "${TRAWL_ENV:-prod}"
+del(.source_type)
+'''
+```
+
+Do not repair a failing value by replacing or cutting characters. Two
+different names can then become the same service.
+
+[Preview a sample](#preview-a-sample) of the new
 mapping, then test one host with the
 [proof pattern](#prove-the-first-event-arrived) before you roll it out to
 every sender.
