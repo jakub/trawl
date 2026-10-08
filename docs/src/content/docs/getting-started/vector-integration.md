@@ -434,11 +434,13 @@ Save trawld's rejection counter first, so that you can
 the address in `TRAWL_URL`. `/metrics` needs no key:
 
 ```bash
-curl -fsS https://trawl.example.com:5514/metrics | grep '^trawl_ingest_events_rejected_total' > rejected-before.txt
+body="$(curl -fsS https://trawl.example.com:5514/metrics)" && printf '%s\n' "$body" | grep '^trawl_ingest_events_rejected_total' > rejected-before.txt || { rm -f rejected-before.txt; echo "no baseline saved: fix the address or add --cacert, then rerun" >&2; false; }
 ```
 
 For a private CA, or for trawld's generated certificate, add
-`--cacert /etc/vector/trawl-ca.pem`.
+`--cacert /etc/vector/trawl-ca.pem`. A scrape that fails, or that returns no
+counter line, saves no file and prints the error above. Fix the cause and run
+the command again before you start Vector.
 
 Record the start time in UTC, then start and enable the service:
 
@@ -478,10 +480,16 @@ wait until the [first-start backfill](#what-arrives-from-before) is done.
 Then compare the counter with the copy you saved:
 
 ```bash
-curl -fsS https://trawl.example.com:5514/metrics | grep '^trawl_ingest_events_rejected_total' | diff rejected-before.txt - && echo "no new rejections"
+if [ -s rejected-before.txt ] && now="$(curl -fsS https://trawl.example.com:5514/metrics)"; then printf '%s\n' "$now" | grep '^trawl_ingest_events_rejected_total' | diff rejected-before.txt - && echo "no new rejections"; else echo "cannot compare: no saved baseline, or the scrape failed; fix the address or add --cacert, then rerun" >&2; false; fi
 ```
 
-Expect `no new rejections`. A changed line names the `reason` that rose. See
+Expect `no new rejections`. A changed line names the `reason` that rose. The
+message `cannot compare` means the check observed nothing: the baseline file is
+missing or empty, or the scrape failed. For a scrape error, fix the address or
+add `--cacert`, then run the check again. Without a baseline, save one now with
+the command above and check again later. A fresh baseline does not count the
+refusals from before it, so [preview a sample](#preview-a-sample) as well. Only
+the `no new rejections` line is a pass. See
 [Troubleshoot delivery](#troubleshoot-delivery). The counter covers every
 sender of this trawld, so a rise can come from another host.
 [Preview a sample](#preview-a-sample) from this host to tell. When the check
