@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-admin"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "chrono",
  "clap",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-auth"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "argon2",
  "axum",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-dev"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "clap",
  "fleet-auth",
@@ -1944,7 +1944,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-ui"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "chrono",
  "gloo-timers",
@@ -6274,7 +6274,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-admin"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "clap",
  "rcgen",
@@ -6285,7 +6285,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-api"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -6293,7 +6293,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-cli"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "arboard",
  "axum",
@@ -6339,7 +6339,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-client"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "async-stream",
  "futures",
@@ -6358,7 +6358,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-config"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "chrono",
  "libc",
@@ -6372,7 +6372,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-core"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "aho-corasick",
  "chrono",
@@ -6387,7 +6387,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-crashdump"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "crash-handler",
  "libc",
@@ -6396,7 +6396,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-dashboard"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "insta",
  "ratatui",
@@ -6406,7 +6406,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-engine"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "chrono",
  "duckdb",
@@ -6426,7 +6426,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-server"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "async-stream",
  "axum",
@@ -6492,7 +6492,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-web"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "axum",
  "blake3",
@@ -6528,7 +6528,7 @@ dependencies = [
 
 [[package]]
 name = "trawl-web-ui"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "base64ct",
  "chrono",
@@ -7433,7 +7433,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "base64ct",
  "brotli",

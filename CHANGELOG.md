@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.2
+
+See the [0.9.2 release notes](docs/releases/v0.9.2.md) for the fixes from the
+0.9.1 install walk, the syslog time-zone change, and what existing Debian and
+Helm installations should check before upgrading.
+
 ## 0.9.1
 
 See the [0.9.1 release notes](docs/releases/v0.9.1.md) for shipped capabilities,
