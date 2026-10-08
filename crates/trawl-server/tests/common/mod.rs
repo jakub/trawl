@@ -925,6 +925,26 @@ impl RawResponse {
     }
 }
 
+/// Assert `resp` is a body limit's refusal: a 413 carrying the JSON error
+/// envelope with code `request_too_large` and exactly `message`, which
+/// names the setting and the value it enforced.
+pub fn assert_request_too_large(resp: &RawResponse, message: &str, what: &str) {
+    assert_eq!(resp.status, 413, "{what}: status");
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/json"),
+        "{what}: Content-Type"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap_or_else(|e| {
+        panic!(
+            "{what}: the body is not JSON ({e}): {}",
+            String::from_utf8_lossy(&resp.body)
+        )
+    });
+    assert_eq!(body["error"]["code"], "request_too_large", "{what}: code");
+    assert_eq!(body["error"]["message"], message, "{what}: message");
+}
+
 /// Write `request` verbatim to the fixture server at `url`
 /// (`https://host:port`) over one TLS connection that trusts the
 /// [`ensure_test_cert`] certificate, then read one HTTP/1.1 response,
@@ -1426,6 +1446,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         timeout_secs,
         true,
         RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
         SchedulerConfig::default(),
         None,
         None,
@@ -1460,6 +1481,49 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
         caps,
+        BodyLimits::DEFAULT,
+        SchedulerConfig::default(),
+        None,
+        None,
+        &[],
+    )
+    .await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
+}
+
+/// The two body limits a fixture boots with: `[server]
+/// max_request_body_bytes` on the interactive router and `[ingest]
+/// max_body_bytes` on the ingest router.
+#[derive(Debug, Clone, Copy)]
+pub struct BodyLimits {
+    pub max_request_body_bytes: usize,
+    pub ingest_max_body_bytes: usize,
+}
+
+impl BodyLimits {
+    /// The limits every fixture uses unless a test needs to reach one: a
+    /// 128 KiB interactive limit and the shipped ingest default.
+    pub const DEFAULT: Self = Self {
+        max_request_body_bytes: 128 * 1024,
+        ingest_max_body_bytes: trawl_server::config::DEFAULT_INGEST_MAX_BODY_BYTES,
+    };
+}
+
+/// A fixture with its own body limits, for tests that must send a whole
+/// body past a limit: a body small enough that trawld's first read takes
+/// all of it, so the server's close leaves nothing unread.
+pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let server = setup_with_ingest_config(
+        tmp.path(),
+        seed_data_root(tmp.path()),
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        RowCaps::DEFAULT,
+        limits,
         SchedulerConfig::default(),
         None,
         None,
@@ -1481,6 +1545,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         DEFAULT_TEST_TIMEOUT_SECS,
         enabled,
         RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
         SchedulerConfig::default(),
         None,
         None,
@@ -1501,6 +1566,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
         RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
         scheduler,
         None,
         None,
@@ -1524,6 +1590,7 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
         RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
         SchedulerConfig::default(),
         None,
         None,
@@ -1568,6 +1635,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
         RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
         SchedulerConfig::default(),
         Some(knobs),
         None,
@@ -1594,6 +1662,7 @@ pub async fn setup_observing_boot(
         DEFAULT_TEST_TIMEOUT_SECS,
         true,
         RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
         SchedulerConfig::default(),
         knobs,
         Some(before_boot),
@@ -1611,6 +1680,7 @@ async fn setup_with_ingest_config(
     timeout_secs: u64,
     ingest_enabled: bool,
     row_caps: RowCaps,
+    body_limits: BodyLimits,
     scheduler: SchedulerConfig,
     hot_buffer: Option<HotBufferKnobs>,
     before_boot: Option<&mut dyn FnMut(&AppState)>,
@@ -1670,7 +1740,7 @@ async fn setup_with_ingest_config(
             max_concurrent_queries: 2,
             max_result_rows: row_caps.max_result_rows,
             max_export_rows: row_caps.max_export_rows,
-            max_request_body_bytes: 128 * 1024,
+            max_request_body_bytes: body_limits.max_request_body_bytes,
             max_concurrent_requests: 256,
             shutdown_drain_secs: 5,
             log_file: None,
@@ -1698,6 +1768,7 @@ async fn setup_with_ingest_config(
                 enabled: ingest_enabled,
                 wal_dir: Some(wal_dir),
                 trusted_relays: trusted_relays.iter().map(|c| (*c).to_owned()).collect(),
+                max_body_bytes: body_limits.ingest_max_body_bytes,
                 ..IngestConfig::default()
             };
             if let Some(knobs) = hot_buffer {

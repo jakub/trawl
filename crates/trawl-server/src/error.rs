@@ -136,6 +136,18 @@ pub enum ServerError {
         limit: usize,
     },
 
+    /// A request body larger than the route's configured body limit
+    /// (413, code `request_too_large`). The refusal comes from the body
+    /// limit layers, before any handler runs; the message names the
+    /// setting and the exact value it enforced, nothing from the request.
+    #[error("request body exceeds {setting} ({limit} bytes)")]
+    RequestTooLarge {
+        /// The setting's name as an operator writes it in the config.
+        setting: &'static str,
+        /// The limit the layer enforced, in bytes.
+        limit: usize,
+    },
+
     /// Rate limit exceeded (429).
     #[error("rate limit exceeded")]
     RateLimited,
@@ -493,10 +505,10 @@ impl ServerError {
             // unable to tell a capacity refusal from any other 503.
             Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
-            // `IngestBodyTooLarge`, `HotBufferFull`, `IngestBatchTooLarge`,
-            // `PreviewTooLarge`, `UnsupportedEncoding`, `CorpusRecovering`
-            // and `HotSnapshot` render fixed text and counts, with nothing
-            // to redact.
+            // `IngestBodyTooLarge`, `RequestTooLarge`, `HotBufferFull`,
+            // `IngestBatchTooLarge`, `PreviewTooLarge`, `UnsupportedEncoding`,
+            // `CorpusRecovering` and `HotSnapshot` render fixed text and
+            // counts, with nothing to redact.
             other => other.to_string(),
         }
     }
@@ -547,6 +559,7 @@ impl ServerError {
             | Self::HotSnapshot(_) => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::PreviewTooLarge { .. } => "preview_too_large",
+            Self::RequestTooLarge { .. } => "request_too_large",
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::Internal(_) => "internal",
             Self::Panicked(_) => "panic",
@@ -590,6 +603,7 @@ impl ServerError {
             | Self::TooManyStreams
             | Self::IngestBatchTooLarge { .. }
             | Self::PreviewTooLarge { .. }
+            | Self::RequestTooLarge { .. }
             | Self::UnsupportedEncoding
             | Self::Panicked(_) => CauseKind::None,
         }
@@ -965,6 +979,11 @@ impl IntoResponse for ServerError {
             Self::PreviewTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorEnvelope::simple(ErrorCode::PreviewTooLarge, self.to_string()),
+            ),
+            // Fixed text, the setting and its value: nothing from the request.
+            Self::RequestTooLarge { .. } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorEnvelope::simple(ErrorCode::RequestTooLarge, self.to_string()),
             ),
             Self::UnsupportedEncoding => (
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -1565,6 +1584,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(body["error"]["code"], "unsupported_encoding");
+    }
+
+    /// A body-limit refusal: 413 with its own code, a message naming the
+    /// setting and the number it enforced, and no cause beneath it.
+    #[tokio::test]
+    async fn a_body_limit_refusal_is_413_naming_the_setting_and_limit() {
+        let too_large = ServerError::RequestTooLarge {
+            setting: "[server] max_request_body_bytes",
+            limit: 131_072,
+        };
+        assert_eq!(too_large.error_class(), "request_too_large");
+        assert_eq!(too_large.cause_kind(), CauseKind::None);
+        assert_eq!(too_large.safe_message(), too_large.to_string());
+        let response = too_large.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "request_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "request body exceeds [server] max_request_body_bytes (131072 bytes)"
+        );
     }
 
     /// An engine refusal is the caller's mistake, not the server's: 400,

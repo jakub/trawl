@@ -126,7 +126,7 @@ async fn cancelled_http_handler_keeps_wal_and_hot_insert_together() {
     let task = tokio::spawn(async move {
         let response = trawl_server::ingest::handler::ingest(
             axum::extract::State(state),
-            axum::Extension(verified),
+            trawl_server::ingest::handler::IngestKey::new(verified).unwrap(),
             axum::Extension("127.0.0.1:12345".parse().unwrap()),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(
@@ -210,7 +210,7 @@ async fn http_handler_wal_failure_emits_rejections_and_publishes_only_successful
     );
     let error = trawl_server::ingest::handler::ingest(
         axum::extract::State(state),
-        axum::Extension(verified),
+        trawl_server::ingest::handler::IngestKey::new(verified).unwrap(),
         axum::Extension("127.0.0.1:12345".parse().unwrap()),
         axum::http::HeaderMap::new(),
         axum::body::Bytes::from_static(
@@ -312,7 +312,7 @@ async fn http_handler_directory_sync_failure_is_a_redacted_500_after_publishing_
     wal.fail_next_directory_sync_for_test();
     let error = trawl_server::ingest::handler::ingest(
         axum::extract::State(state),
-        axum::Extension(verified),
+        trawl_server::ingest::handler::IngestKey::new(verified).unwrap(),
         axum::Extension("127.0.0.1:12345".parse().unwrap()),
         axum::http::HeaderMap::new(),
         axum::body::Bytes::from_static(
@@ -379,7 +379,7 @@ fn waiting_http_ingest_leaves_blocking_pool_available() {
         let writer = publication.write().await;
         let mut request = Box::pin(trawl_server::ingest::handler::ingest(
             axum::extract::State(server.state.clone()),
-            axum::Extension(verified),
+            trawl_server::ingest::handler::IngestKey::new(verified).unwrap(),
             axum::Extension("127.0.0.1:12345".parse().unwrap()),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"{\"service\":\"http\",\"message\":\"wait\"}\n"),

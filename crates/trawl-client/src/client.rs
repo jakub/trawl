@@ -751,7 +751,7 @@ impl HttpClient {
             .header("Authorization", self.auth_header_value())
             .send()
             .await
-            .map_err(sanitize_reqwest_error)?;
+            .map_err(sanitize_upload_error)?;
 
         let status = resp.status().as_u16();
         if status == 409 {
@@ -899,7 +899,7 @@ impl HttpClient {
             .body(ndjson)
             .send()
             .await
-            .map_err(sanitize_reqwest_error)?;
+            .map_err(sanitize_upload_error)?;
 
         let resp = check_status(resp).await?;
         resp.json().await.map_err(body_read_error)
@@ -933,7 +933,7 @@ impl HttpClient {
         if let Some(ip) = peer_ip {
             req = req.query(&[("peer_ip", ip.to_string())]);
         }
-        let resp = req.send().await.map_err(sanitize_reqwest_error)?;
+        let resp = req.send().await.map_err(sanitize_upload_error)?;
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(body_read_error)?;
         if status != reqwest::StatusCode::OK {
@@ -962,7 +962,7 @@ impl HttpClient {
             .json(&body)
             .send()
             .await
-            .map_err(sanitize_reqwest_error)?;
+            .map_err(sanitize_upload_error)?;
 
         let resp = check_status(resp).await?;
         resp.bytes()
@@ -1079,15 +1079,24 @@ impl HttpClient {
     }
 
     /// Send an authenticated request, check for errors, and deserialize the response.
+    ///
+    /// The request is built before it is sent so its body decides how a
+    /// send failure reads: only a request that uploads something can have
+    /// its upload cut off (see [`sanitize_upload_error`]).
     async fn send_authenticated<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, ClientError> {
-        let resp = req
+        let request = req
             .header("Authorization", self.auth_header_value())
-            .send()
-            .await
+            .build()
             .map_err(sanitize_reqwest_error)?;
+        let sanitize = if request.body().is_some() {
+            sanitize_upload_error
+        } else {
+            sanitize_reqwest_error
+        };
+        let resp = self.client.execute(request).await.map_err(sanitize)?;
 
         let resp = check_status(resp).await?;
         resp.json().await.map_err(body_read_error)
@@ -1417,29 +1426,79 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
     ClientError::Network(NetworkError::new(kind, message))
 }
 
+/// What a send failure of a request that carries a body says when the
+/// server reset or closed the connection under it. It claims no 413 it did
+/// not read, and names no URL or transport internals.
+const UPLOAD_CUT_OFF: &str = "the server closed the connection before the upload finished; \
+                              the request may exceed the server's request size limit";
+
+/// Categorize a send failure of a request that carries a body.
+///
+/// trawld refuses an oversized body with a 413 and hangs up without
+/// draining the rest, so a client still writing the body can meet the
+/// reset before it reads the answer. That failure becomes
+/// [`NetworkKind::UploadCutOff`]; everything else reads as
+/// [`sanitize_reqwest_error`] has it. An untrusted certificate, a timeout
+/// and a failed connect come first, so a reset during the TLS handshake
+/// stays a connect failure.
+///
+/// Whether the reset came while the body was being written cannot be told
+/// from the error: hyper's `Kind::BodyWrite` is private, and a reset the
+/// read side sees mid-upload is a plain I/O error. So the request carrying
+/// a body stands in for it, and callers pick this sanitizer only at sites
+/// that send one. A body-carrying request reset after a complete upload
+/// reads the same, which is why the message says the size "may" be the
+/// cause.
+#[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_upload_error)`
+fn sanitize_upload_error(e: reqwest::Error) -> ClientError {
+    if !e.is_timeout() && !e.is_connect() && connection_cut(&e) {
+        return ClientError::Network(NetworkError::new(NetworkKind::UploadCutOff, UPLOAD_CUT_OFF));
+    }
+    sanitize_reqwest_error(e)
+}
+
+/// The source chain of `e`, `e` first.
+///
+/// `io::Error::source` skips the error an `io::Error` wraps, so an
+/// `io::Error` is stepped into with `get_ref` instead: the TLS connector
+/// and hyper both report a failure inside one or more of them.
+fn source_chain<'a>(
+    e: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(e), |err| match err.downcast_ref::<std::io::Error>() {
+        Some(io) => io.get_ref().map(|inner| inner as _),
+        None => err.source(),
+    })
+}
+
 /// Whether `e` failed because rustls did not accept the server's
 /// certificate: an unknown issuer, a name it does not cover, an expired
 /// certificate, and the like.
 ///
 /// A typed check over the source chain, never the Display text. The TLS
 /// connector reports a handshake failure as a [`rustls::Error`] inside one
-/// or more [`std::io::Error`]s, and `io::Error::source` skips the error it
-/// wraps, so an `io::Error` is stepped into with `get_ref` instead.
+/// or more [`std::io::Error`]s.
 fn rejected_certificate(e: &reqwest::Error) -> bool {
-    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(e);
-    while let Some(err) = next {
-        if matches!(
+    source_chain(e).any(|err| {
+        matches!(
             err.downcast_ref::<rustls::Error>(),
             Some(rustls::Error::InvalidCertificate(_))
-        ) {
-            return true;
-        }
-        next = match err.downcast_ref::<std::io::Error>() {
-            Some(io) => io.get_ref().map(|inner| inner as _),
-            None => err.source(),
-        };
-    }
-    false
+        )
+    })
+}
+
+/// Whether `e` failed because the peer reset or closed the connection: an
+/// [`std::io::Error`] of kind `ConnectionReset` or `BrokenPipe` somewhere in
+/// the source chain. A typed check, never the Display text.
+fn connection_cut(e: &(dyn std::error::Error + 'static)) -> bool {
+    source_chain(e).any(|err| {
+        err.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            )
+        })
+    })
 }
 
 /// Decode a successful repin trigger response: the status code plus the
@@ -2631,6 +2690,97 @@ mod tests {
             sanitize_reqwest_error(error).to_string(),
             "network error: invalid request configuration"
         );
+    }
+
+    /// An error that is not an `io::Error`, with a chosen Display and an
+    /// optional source: the shape of the hyper and reqwest layers.
+    #[derive(Debug)]
+    struct Layer {
+        text: &'static str,
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    }
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.text)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.as_deref().map(|e| e as _)
+        }
+    }
+
+    /// `kind` as the OS reports it, inside an `io::Error` wrapper, inside a
+    /// library layer, inside another `io::Error` wrapper. Each wrapper's
+    /// `source` skips the error it wraps, so a walk by `source` alone never
+    /// reaches `kind`; only `get_ref` does.
+    fn nested(kind: std::io::ErrorKind) -> std::io::Error {
+        let inner = std::io::Error::other(std::io::Error::from(kind));
+        std::io::Error::other(Layer {
+            text: "connection error",
+            source: Some(Box::new(inner)),
+        })
+    }
+
+    /// A reset or a broken pipe is found through nested `io::Error`
+    /// wrappers and library layers alike.
+    #[test]
+    fn connection_cut_finds_a_reset_or_broken_pipe_in_the_chain() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let wrapped = nested(kind);
+            let mut by_source = std::iter::successors(
+                Some(&wrapped as &(dyn std::error::Error + 'static)),
+                |err| err.source(),
+            );
+            assert!(
+                !by_source.any(|err| err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == kind)),
+                "a walk by source alone must miss {kind:?}, or this proves nothing"
+            );
+            assert!(connection_cut(&wrapped), "{kind:?}");
+            let layered = Layer {
+                text: "request failed",
+                source: Some(Box::new(nested(kind))),
+            };
+            assert!(connection_cut(&layered), "{kind:?} under a layer");
+        }
+    }
+
+    /// Other I/O failures are not a cut connection: a timeout, or a peer
+    /// that closed without a reset.
+    #[test]
+    fn connection_cut_ignores_other_io_kinds() {
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::ConnectionRefused,
+        ] {
+            assert!(!connection_cut(&nested(kind)), "{kind:?}");
+        }
+    }
+
+    /// The check reads kinds, never text: an error that only says
+    /// "connection reset" is not one.
+    #[test]
+    fn connection_cut_ignores_display_text() {
+        let layer = Layer {
+            text: "connection reset by peer",
+            source: None,
+        };
+        assert!(!connection_cut(&layer));
+        let io = std::io::Error::other("connection reset by peer (os error 104)");
+        assert!(!connection_cut(&io));
+        let broken = std::io::Error::other(Layer {
+            text: "broken pipe",
+            source: None,
+        });
+        assert!(!connection_cut(&broken));
     }
 
     // ── endpoint URL construction ───────────────────────────────────────

@@ -153,7 +153,10 @@ shipped Vector configuration sets `host` on every event.
 ### Bounds
 
 - The body limit is `[server] max_request_body_bytes`, 128K by default, not
-  the ingest limit. A larger body answers `413`.
+  the ingest limit. A larger body answers `413 request_too_large`, and the
+  message names the setting. If the connection resets while the upload is
+  still running, the CLI reports that the server closed the connection before
+  the upload finished. `trawl preview-ingest` exits 2 either way.
 - A sample holds at most 500 events. A line that is not valid JSON counts.
   A blank line does not. A larger sample answers `413 preview_too_large`.
   trawld refuses the whole sample and never truncates it.

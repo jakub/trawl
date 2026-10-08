@@ -564,7 +564,7 @@ async fn five_xx_levels_map_503_504_to_warn() {
 /// Exactly one `http_failure` per 5xx, and none for anything else.
 #[tokio::test]
 async fn exactly_one_http_failure_per_5xx() {
-    for code in [200, 400, 404, 429, 499] {
+    for code in [200, 400, 404, 413, 429, 499] {
         let response = edge_call(
             Request::get(format!("/status/{code}"))
                 .body(Body::empty())

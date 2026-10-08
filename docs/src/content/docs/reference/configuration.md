@@ -421,7 +421,7 @@ The HTTPS listener, query limits, TLS, and logging.
 | `max_concurrent_queries` | integer | *(CPU count)* | DuckDB executor pool size. Must be greater than 0 |
 | `max_result_rows` | integer | `100000` | Rows a query may return before trawld rejects it |
 | `max_export_rows` | integer | `1000000` | Rows an export may return. Exports do not use `max_result_rows` |
-| `max_request_body_bytes` | byte size | `"128K"` | Request body limit on every route except ingest |
+| `max_request_body_bytes` | byte size | `"128K"` | Request body limit on every route except `/api/v1/ingest`, which has `[ingest] max_body_bytes`. `/api/v1/health` and `/metrics` read no body, so no body limit applies to them. A route that reads a body reads it before it checks the route's own permission, so any key with a trawl permission can make one request hold up to this many bytes |
 | `max_concurrent_requests` | integer | `256` | Concurrent HTTP requests. Past it trawld answers 503 |
 | `shutdown_drain_secs` | integer | `30` | Graceful shutdown budget for in-flight requests |
 | `log_file` | path | *(none)* | JSON log file. Opened when `[ingest] enabled` or `internal_telemetry` is false. When both are true, server events use the ingest pipeline and this path is not opened. File logging starts after database and storage admission; earlier JSON events go to stderr. Must not name or alias the data root's `EPOCH`, `CATALOG`, or `REPIN` marker. Owner-only: trawld creates it 0600 and tightens an existing looser file when it opens it. A symlink at the path, or a file that trawld does not own or cannot make owner-only, refuses the start |
@@ -543,7 +543,7 @@ Notes:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable `POST /api/v1/ingest` |
-| `max_body_bytes` | byte size | `"16M"` | Request body limit for ingest |
+| `max_body_bytes` | byte size | `"16M"` | Request body limit for ingest, as sent and once gzip is decoded. A gzip request can hold its wire body and its decoded body at once, up to twice this value. A key without the `ingest` permission is refused before its body is read |
 | `wal_dir` | path | `{data.path}/wal/` | Write-ahead log directory |
 | `compaction_interval_secs` | integer | `10` | How often the WAL-to-parquet compaction task runs. Must be greater than `0` when ingest is enabled |
 | `internal_telemetry` | bool | `true` | Write server events into the ingest pipeline as `service=trawld` |
