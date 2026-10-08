@@ -98,6 +98,49 @@
     }
   },
   {
+    "alert": "TrawlIngestEventsRejected",
+    "family": "increase",
+    "metric": "trawl_ingest_events_rejected_total",
+    "matcher": "reason!~\"wal_failure|hot_buffer_full|ingest_batch_too_large\"",
+    "variants": [
+      {
+        "reason": "missing_service"
+      },
+      {
+        "reason": "service_not_string"
+      },
+      {
+        "reason": "empty_service"
+      },
+      {
+        "reason": "service_too_long"
+      },
+      {
+        "reason": "invalid_chars"
+      },
+      {
+        "reason": "invalid_env"
+      },
+      {
+        "reason": "env_not_allowed"
+      },
+      {
+        "reason": "host_missing_from_relay"
+      },
+      {
+        "reason": "not_object"
+      },
+      {
+        "reason": "invalid_json"
+      }
+    ],
+    "annotations": {
+      "summary": "Ingest refused events on {{ $labels.instance }}",
+      "description": "Target {{ $labels.job }}/{{ $labels.instance }}: trawld refused events for reason {{ $labels.reason }} and stored none of them. The response listed the refusals in its body, which a sender that reads only status codes, such as Vector, does not see. An increase was observed in the last 10 minutes; resolution does not establish recovery.",
+      "runbook_url": "https://trawl.sh/operate/operational-alerts/#ingest-events-rejected"
+    }
+  },
+  {
     "alert": "TrawlTelemetryWalWriteFailure",
     "family": "increase",
     "metric": "trawl_telemetry_wal_write_failures_total",
