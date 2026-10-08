@@ -112,7 +112,7 @@ prometheusRule:
       enabled: false
 ```
 
-All fourteen alerts default to enabled. `TrawlHotBufferDrainStalled` defaults to
+All fifteen alerts default to enabled. `TrawlHotBufferDrainStalled` defaults to
 `severity: critical`, and the others to `severity: warning`. Each entry accepts
 only `enabled` and `severity`. Severity is a nonblank static routing string,
 not an enum; `{{` and `}}` template delimiters are rejected. Unknown alert
@@ -131,6 +131,7 @@ Accepted alert keys are:
 - `TrawlSyslogWriteOutcomeUncertain`
 - `TrawlTelemetryWriteOutcomeUncertain`
 - `TrawlHttpPersistenceRejection`
+- `TrawlIngestEventsRejected`
 - `TrawlTelemetryWalWriteFailure`
 - `TrawlWalDurabilityDegraded`
 - `TrawlCompactionOperationFailure`
@@ -140,7 +141,7 @@ Accepted alert keys are:
 - `TrawlHotBufferDrainStalled`
 - `TrawlCorpusUnsettled`
 
-Eleven rules use a fixed `increase(counter[10m]) > 0`, without a `for` delay.
+Twelve rules use a fixed `increase(counter[10m]) > 0`, without a `for` delay.
 `TrawlIngestAdmissionRefusing` sums hot-buffer refusals over producers and waits
 ten minutes. `TrawlHotBufferDrainStalled` compares the oldest hot-buffer batch's
 age with ten compaction intervals and waits two minutes. `TrawlCorpusUnsettled`
@@ -317,10 +318,10 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `serviceMonitor.interval` | string | `30s` | Scrape interval |
 | `serviceMonitor.scrapeTimeout` | string | `10s` | Scrape timeout |
 | `serviceMonitor.namespace` | string | `""` | ServiceMonitor namespace. Empty uses the release namespace |
-| `prometheusRule.enabled` | bool | `false` | Create the fourteen operational alert rules: `TrawlHotBufferDrainStalled` at `critical`, the others at `warning`; independent of ServiceMonitor creation |
+| `prometheusRule.enabled` | bool | `false` | Create the fifteen operational alert rules: `TrawlHotBufferDrainStalled` at `critical`, the others at `warning`; independent of ServiceMonitor creation |
 | `prometheusRule.namespace` | string | `""` | Rule object namespace. Empty uses the release namespace; never changes workload selectors |
 | `prometheusRule.additionalLabels` | map of strings | `{}` | Rule-resource discovery labels. Invalid Kubernetes label keys or values and conflicting chart label overrides are rejected |
-| `prometheusRule.alerts.<alert>.enabled` | bool | `true` | Enable one of the fourteen alert keys listed above |
+| `prometheusRule.alerts.<alert>.enabled` | bool | `true` | Enable one of the fifteen alert keys listed above |
 | `prometheusRule.alerts.<alert>.severity` | string | `warning`; `critical` for `TrawlHotBufferDrainStalled` | Nonblank static routing value; template delimiters are rejected |
 | `serviceAccount.create` | bool | `true` | Create a ServiceAccount |
 | `serviceAccount.annotations` | object | `{}` | ServiceAccount annotations |

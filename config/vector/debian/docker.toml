@@ -6,6 +6,9 @@
 # service name priority: compose service label > swarm service label >
 # container name > image name. swarm labels avoid the cardinality explosion
 # from task IDs in container names (e.g. uptime-kuma_uptime-kuma.1.abc123).
+# A name trawld refuses gives "docker-unidentified"; the compose and swarm
+# service labels stay on the event as docker_compose_service and
+# docker_swarm_service, beside container_name and image.
 #
 # retries socket connection if docker is not installed or not running —
 # safe to deploy on non-docker hosts.
@@ -32,17 +35,21 @@ type = "remap"
 inputs = ["docker"]
 source = '''
 # --- service name: best available identifier ---
+# The gate is trawld's service rule (trawl_config::is_valid_service_name):
+# 1 to 128 bytes of [A-Za-z0-9._-], not starting with a dot (ADR-0053).
+gate = r'^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$'
 # priority: compose label > swarm label > container name > image name
 compose_svc = to_string(.label."com.docker.compose.service") ?? ""
 swarm_svc = to_string(.label."com.docker.swarm.service.name") ?? ""
 container = to_string(.container_name) ?? ""
 image = to_string(.image) ?? ""
+service = ""
 
 if compose_svc != "" {
-  .service = compose_svc
+  service = compose_svc
 } else if swarm_svc != "" {
   # swarm format: {stack}_{service} — normalize to hyphenated name
-  .service = replace(swarm_svc, "_", "-")
+  service = replace(swarm_svc, "_", "-")
 } else if container != "" {
   # strip leading / from container name (docker API includes it)
   clean = replace(container, r'^/', "")
@@ -55,19 +62,24 @@ if compose_svc != "" {
     # strip trailing .{digit} replica number if present
     base = replace(base, r'\.\d+$', "")
     # normalize {stack}_{service} to hyphenated name
-    .service = replace(base, "_", "-")
+    service = replace(base, "_", "-")
   } else {
-    .service = clean
+    service = clean
   }
 } else if image != "" {
-  # strip tag and registry prefix: registry.io/org/name:tag → name
-  parts = split(image, ":")
-  name = string!(parts[0])
-  name_parts = split(name, "/")
-  .service = name_parts[-1]
-} else {
-  .service = "docker"
+  # image reference: [registry[:port]/]path/name[:tag][@digest]. Drop the
+  # digest, keep the last path component, then drop the tag:
+  # registry.example:5000/org/redis:7 → redis
+  name = replace(image, r'(?s)@.*', "")
+  name = replace(name, r'(?s)^.*/', "")
+  service = replace(name, r'(?s):.*', "")
 }
+# the priority stays: a name trawld refuses is marked, not passed down to the
+# next identifier; the labels, container_name and image keep the originals
+if !match(service, gate) {
+  service = "docker-unidentified"
+}
+.service = service
 
 # --- host: compose project, swarm stack, or container name ---
 compose_project = to_string(.label."com.docker.compose.project") ?? ""
@@ -112,6 +124,8 @@ if stream == "stderr" {
 .container_name = replace(container, r'^/', "")
 .container_id = to_string(.container_id) ?? null
 .image = image
+if compose_svc != "" { .docker_compose_service = compose_svc }
+if swarm_svc != "" { .docker_swarm_service = swarm_svc }
 
 # clean up docker-internal fields
 del(.label)

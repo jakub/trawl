@@ -109,6 +109,9 @@ insta = { workspace = true }
 # `tests/span_context.rs` probes the `log` bridge the way sqlx's statement
 # logger does. Already in the graph through sqlx and tracing-log.
 log = { workspace = true }
+# `tests/vector_service_gate_contract.rs` runs the shipped Vector configs'
+# service gate through the engine VRL `match` uses. Already in the graph.
+regex = { workspace = true }
 
 # Tests that lock a directory with mode bits drop the DAC capabilities
 # from the test thread, so the lock binds when the suite runs as root.

@@ -135,24 +135,60 @@ exclude = [
 type = "remap"
 inputs = ["journald"]
 source = '''
-# --- service name: best available identifier ---
-unit = to_string(._SYSTEMD_UNIT) ?? ""
-if unit != "" {
-  # strip .service, .scope, .slice, .socket, .target suffixes
-  unit = replace(unit, r'\.(?:service|scope|slice|socket|target)$', "")
-}
-syslog_id = to_string(.SYSLOG_IDENTIFIER) ?? ""
-comm = to_string(._COMM) ?? ""
+# --- service: the first candidate trawld accepts (ADR-0053) ---
+# The gate is trawld's service rule (trawl_config::is_valid_service_name):
+# 1 to 128 bytes of [A-Za-z0-9._-], not starting with a dot. VRL has no
+# functions, so each transform that derives service keeps its own copy.
+gate = r'^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$'
+service = ""
 
-if unit != "" {
-  .service = unit
-} else if syslog_id != "" {
-  .service = syslog_id
-} else if comm != "" {
-  .service = comm
-} else {
-  .service = "unknown"
+# 1. The unit: the user unit unless it is the user manager's own
+#    init.scope, else the system unit. One unit-type suffix comes off,
+#    then everything from the template "@":
+#    postgresql@17-main.service gives postgresql.
+unit = to_string(._SYSTEMD_USER_UNIT) ?? ""
+if unit == "" || unit == "init.scope" {
+  unit = to_string(._SYSTEMD_UNIT) ?? ""
 }
+unit = replace(unit, r'\.(?:service|scope|slice|socket|target)$', "")
+unit = replace(unit, r'(?s)@.*', "")
+if match(unit, gate) {
+  service = unit
+}
+
+# 2. SYSLOG_IDENTIFIER, then 3. _COMM, each without one pair of
+#    parentheses around the whole value: "(sd-pam)" gives "sd-pam".
+if service == "" {
+  identifier = to_string(.SYSLOG_IDENTIFIER) ?? ""
+  enclosed, err = parse_regex(identifier, r'^\((?P<inner>.+)\)$')
+  if err == null { identifier = string!(enclosed.inner) }
+  if match(identifier, gate) { service = identifier }
+}
+if service == "" {
+  comm = to_string(._COMM) ?? ""
+  enclosed, err = parse_regex(comm, r'^\((?P<inner>.+)\)$')
+  if err == null { comm = string!(enclosed.inner) }
+  if match(comm, gate) { service = comm }
+}
+
+# Nothing is rewritten, unescaped or truncated. When no candidate passes,
+# the fallback is marked, and the originals below tell such events apart.
+if service == "" {
+  service = "journal-unidentified"
+}
+.service = service
+
+# --- the journal's identity fields, verbatim, under trawld's own names ---
+# Each is kept only when the journal set it. Never name one `unit`: trawld
+# folds journald's own UNIT field to that name.
+.systemd_unit = del(._SYSTEMD_UNIT)
+if .systemd_unit == null || .systemd_unit == "" { del(.systemd_unit) }
+.systemd_user_unit = del(._SYSTEMD_USER_UNIT)
+if .systemd_user_unit == null || .systemd_user_unit == "" { del(.systemd_user_unit) }
+.syslog_identifier = del(.SYSLOG_IDENTIFIER)
+if .syslog_identifier == null || .syslog_identifier == "" { del(.syslog_identifier) }
+.comm = del(._COMM)
+if .comm == null || .comm == "" { del(.comm) }
 
 # --- log level from journal PRIORITY ---
 # 0=emerg, 1=alert, 2=crit, 3=error, 4=warn, 5=notice, 6=info, 7=debug
@@ -203,14 +239,14 @@ if contains(msg, "[UFW ") {
 
 # --- drop internal journal metadata ---
 # systemd-prefixed fields are internal identifiers, not useful downstream.
-# listed explicitly because VRL closures can't mutate the event.
+# listed explicitly because VRL closures can't mutate the event. The identity
+# fields already moved to their kept names above.
 del(.__CURSOR)
 del(.__MONOTONIC_TIMESTAMP)
 del(.__REALTIME_TIMESTAMP)
 del(._BOOT_ID)
 del(._CAP_EFFECTIVE)
 del(._CMDLINE)
-del(._COMM)
 del(._EXE)
 del(._GID)
 del(._HOSTNAME)
@@ -223,11 +259,9 @@ del(._STREAM_ID)
 del(._SYSTEMD_CGROUP)
 del(._SYSTEMD_INVOCATION_ID)
 del(._SYSTEMD_SLICE)
-del(._SYSTEMD_UNIT)
 del(._TRANSPORT)
 del(._UID)
 del(.PRIORITY)
-del(.SYSLOG_IDENTIFIER)
 .env = "${TRAWL_ENV:-prod}"
 del(.source_type)
 '''
@@ -243,11 +277,13 @@ inputs = ["journal_enriched"]
 condition = '''
 if "${TRAWL_SUPPRESS_HOMELAB_NOISE:-false}" != "true" { return true }
 
+unit = to_string(.systemd_unit) ?? ""
 svc = to_string(.service) ?? ""
 msg = to_string(.message) ?? ""
 
-# drop serial-getty crash loop (the service itself + init reporting restarts)
-if svc == "serial-getty@ttyS0" { return false }
+# drop the ttyS0 serial-getty crash loop (the unit itself + init reporting
+# restarts); other serial gettys still arrive
+if unit == "serial-getty@ttyS0.service" { return false }
 if svc == "init" && contains(msg, "serial-getty") { return false }
 
 # drop docker network churn from networkd/NM/systemd-networkd
@@ -263,11 +299,16 @@ true
 #   /var/log/dpkg.log → "dpkg"
 #   /var/log/apt/history.log → "apt"
 #   /var/log/unattended-upgrades/unattended-upgrades.log → "unattended-upgrades"
+# a name trawld refuses, such as "my app", gives "varlog-unidentified" (ADR-0053)
 
 [transforms.trawl_varlog]
 type = "remap"
 inputs = ["varlog"]
 source = '''
+# the gate is trawld's service rule (trawl_config::is_valid_service_name)
+gate = r'^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$'
+service = ""
+
 # derive service from file path
 filepath = to_string(.file) ?? ""
 if filepath != "" {
@@ -276,14 +317,17 @@ if filepath != "" {
   parts = split(stripped, "/")
   if length(parts) > 1 {
     # subdirectory: use directory name (e.g. apt/history.log → apt)
-    .service = parts[0]
+    service = string!(parts[0])
   } else {
     # top-level: strip .log extension (e.g. dpkg.log → dpkg)
-    .service = replace(string!(parts[0]), r'\.log$', "")
+    service = replace(string!(parts[0]), r'\.log$', "")
   }
-} else {
-  .service = "varlog"
 }
+# a path component trawld refuses is marked; `file` keeps the original
+if !match(service, gate) {
+  service = "varlog-unidentified"
+}
+.service = service
 
 # scan message for log level keywords
 msg = downcase(to_string(.message) ?? "")

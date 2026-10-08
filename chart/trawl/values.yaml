@@ -488,6 +488,9 @@ prometheusRule:
     TrawlHttpPersistenceRejection:
       enabled: true
       severity: warning
+    TrawlIngestEventsRejected:
+      enabled: true
+      severity: warning
     TrawlTelemetryWalWriteFailure:
       enabled: true
       severity: warning

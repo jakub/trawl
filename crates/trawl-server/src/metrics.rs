@@ -299,7 +299,10 @@ pub fn prometheus_builder() -> metrics_exporter_prometheus::PrometheusBuilder {
 }
 
 /// Publish every series selected by the starter alerts, regardless of which
-/// producers are enabled. Call after recorder installation, before serving.
+/// producers are enabled. That includes every `trawl_ingest_events_rejected_total`
+/// reason, the three request-level ones and each per-event one, so an
+/// `increase()` over the counter sees a reason's first refusal against a
+/// published zero. Call after recorder installation, before serving.
 /// Repeated calls only register/increment by zero; they never reset counters.
 /// This cannot reconstruct increments made before recorder installation.
 pub fn init_operational_alert_metrics() {
@@ -325,11 +328,7 @@ pub fn init_operational_alert_metrics() {
     for reason in TelemetryDropReason::ALL {
         metrics::counter!(TELEMETRY_EVENTS_DROPPED_TOTAL, "reason" => reason.label()).increment(0);
     }
-    for reason in [
-        crate::ingest::envelope::RejectReason::WalFailure,
-        crate::ingest::envelope::RejectReason::HotBufferFull,
-        crate::ingest::envelope::RejectReason::IngestBatchTooLarge,
-    ] {
+    for reason in crate::ingest::envelope::RejectReason::ALL {
         metrics::counter!(INGEST_EVENTS_REJECTED_TOTAL, "reason" => reason.as_str()).increment(0);
     }
     for operation in WalDurabilityOperation::ALL {
@@ -2609,9 +2608,6 @@ mod tests {
                 "trawl_telemetry_events_dropped_total{reason=\"buffer_cap\"}",
                 "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}",
                 "trawl_telemetry_events_dropped_total{reason=\"unmetered_cap\"}",
-                "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}",
-                "trawl_ingest_events_rejected_total{reason=\"hot_buffer_full\"}",
-                "trawl_ingest_events_rejected_total{reason=\"ingest_batch_too_large\"}",
                 "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}",
                 "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}",
                 "trawl_compaction_operation_failures_total{operation=\"wal_environment_scan\"}",
@@ -2639,7 +2635,24 @@ mod tests {
                 "trawl_hydration_files_total{outcome=\"claimed\"}",
                 "trawl_hydration_files_total{outcome=\"unlisted\"}",
             ];
-            for series in selected {
+            // Every per-event refusal reason, not only the three the
+            // earlier alerts select: `increase()` sees a first refusal
+            // only against a published zero.
+            let selected: Vec<String> = selected
+                .into_iter()
+                .map(str::to_owned)
+                .chain(
+                    crate::ingest::envelope::RejectReason::ALL
+                        .iter()
+                        .map(|reason| {
+                            format!(
+                                "{INGEST_EVENTS_REJECTED_TOTAL}{{reason=\"{}\"}}",
+                                reason.as_str()
+                            )
+                        }),
+                )
+                .collect();
+            for series in &selected {
                 assert_eq!(test_support::sample(&handle, series), 0);
             }
             // Exercise idle upkeep with today's production configuration,
@@ -2647,10 +2660,13 @@ mod tests {
             // survival past an arbitrary timeout added in a future change.
             std::thread::sleep(std::time::Duration::from_millis(10));
             handle.run_upkeep();
-            for series in selected {
+            for series in &selected {
                 assert_eq!(test_support::sample(&handle, series), 0);
             }
             metrics::counter!(SYSLOG_WAL_EVENTS_DISCARDED_TOTAL).increment(3);
+            metrics::counter!(INGEST_EVENTS_REJECTED_TOTAL,
+                "reason" => crate::ingest::envelope::RejectReason::InvalidChars.as_str())
+            .increment(5);
             metrics::counter!(TELEMETRY_EVENTS_DROPPED_TOTAL,
                 "reason" => TelemetryDropReason::WriteCrashed.label())
             .increment(2);
@@ -2658,9 +2674,10 @@ mod tests {
             init_operational_alert_metrics();
             init_retention_metrics(0);
             handle.run_upkeep();
-            for series in selected {
-                let expected = match series {
+            for series in &selected {
+                let expected = match series.as_str() {
                     "trawl_syslog_wal_events_discarded_total" => 3,
+                    "trawl_ingest_events_rejected_total{reason=\"invalid_chars\"}" => 5,
                     "trawl_telemetry_events_dropped_total{reason=\"write_crashed\"}" => 2,
                     "trawl_retention_pressure_attempts_total" => 4,
                     _ => 0,

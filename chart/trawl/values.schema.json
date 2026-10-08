@@ -158,6 +158,7 @@
             "TrawlSyslogWriteOutcomeUncertain",
             "TrawlTelemetryWriteOutcomeUncertain",
             "TrawlHttpPersistenceRejection",
+            "TrawlIngestEventsRejected",
             "TrawlTelemetryWalWriteFailure",
             "TrawlWalDurabilityDegraded",
             "TrawlCompactionOperationFailure",
@@ -184,6 +185,9 @@
               "$ref": "#/definitions/operationalAlert"
             },
             "TrawlHttpPersistenceRejection": {
+              "$ref": "#/definitions/operationalAlert"
+            },
+            "TrawlIngestEventsRejected": {
               "$ref": "#/definitions/operationalAlert"
             },
             "TrawlTelemetryWalWriteFailure": {

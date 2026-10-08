@@ -1130,3 +1130,67 @@ async fn previewed_services_never_take_a_repair_label() {
         "no previewed service reached /metrics"
     );
 }
+
+// -- the shipped Vector configs ---------------------------------------------------
+
+/// The events the shipped Debian Vector configs delivered in the collector
+/// test's all-source run (`scripts/test-vector-collector.py`, ADR-0053).
+const VECTOR_CAPTURE: &str = include_str!("fixtures/vector-capture/debian.ndjson");
+
+/// What the shipped configs send is what trawld accepts: every captured
+/// event is accepted under the service Vector sent, with no profile
+/// fallback and no folded field-name collision.
+#[tokio::test(flavor = "multi_thread")]
+async fn shipped_vector_capture_is_accepted_under_the_services_it_sent() {
+    let sent: Vec<Value> = VECTOR_CAPTURE
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!sent.is_empty(), "the committed capture is empty");
+    assert!(sent.len() <= MAX_PREVIEW_EVENTS, "{} events", sent.len());
+    assert!(
+        VECTOR_CAPTURE.len() <= INTERACTIVE_BODY_LIMIT,
+        "the capture is {} bytes",
+        VECTOR_CAPTURE.len()
+    );
+
+    let server = setup().await;
+    let report = preview_ok(&server, "", VECTOR_CAPTURE).await;
+    let refused: Vec<String> = report
+        .events
+        .iter()
+        .filter(|event| matches!(event, PreviewEvent::Rejected { .. }))
+        .map(|event| {
+            let (index, _, reason, message, _) = rejected(event);
+            format!("line {index}: {reason}: {message}")
+        })
+        .collect();
+    assert_eq!(
+        (report.accepted, report.rejected),
+        (sent.len(), 0),
+        "trawld refused shipped-config events: {refused:#?}"
+    );
+
+    for (position, (event, input)) in report.events.iter().zip(&sent).enumerate() {
+        let (canonical, repairs, _) = accepted(event);
+        assert_eq!(canonical["service"], input["service"], "line {position}");
+        for code in [
+            RepairCode::ServiceFromProfile,
+            RepairCode::FieldNameCaseCollision,
+        ] {
+            assert!(
+                !repairs.iter().any(|repair| repair == code.as_str()),
+                "line {position}: {repairs:?}"
+            );
+        }
+    }
+
+    // journald's `UNIT` folds to `unit`, beside the kept `systemd_unit`.
+    let pid1 = sent
+        .iter()
+        .position(|event| event["fixture_id"] == "journal-pid1")
+        .expect("the capture carries the PID 1 event");
+    let (canonical, _, _) = accepted(&report.events[pid1]);
+    assert_eq!(canonical["unit"], json!("foo.service"));
+    assert_eq!(canonical["systemd_unit"], json!("init.scope"));
+}

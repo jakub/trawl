@@ -516,7 +516,9 @@ fn finalize_ingest(
 
         let reasons = parsed.reject_counts.summary();
         // Sample up to 5 error messages so rejection causes are queryable
-        // without flooding telemetry with per-event detail.
+        // without flooding telemetry with per-event detail. A message may
+        // quote a bounded client value (`Rejection::message`), which is why
+        // this is the one log line allowed to carry one.
         let samples: Vec<&str> = parsed
             .errors
             .iter()

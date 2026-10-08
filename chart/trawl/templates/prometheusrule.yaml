@@ -96,6 +96,16 @@ spec:
             description: "Target {{ `{{ $labels.job }}` }}/{{ `{{ $labels.instance }}` }}: The server rejected persistence for reason {{ `{{ $labels.reason }}` }}. The sender may retry; permanent loss is not established. An increase was observed in the last 10 minutes; resolution does not establish recovery."
             runbook_url: "https://trawl.sh/operate/operational-alerts/#http-persistence-rejection"
         {{- end }}
+        {{- if .Values.prometheusRule.alerts.TrawlIngestEventsRejected.enabled }}
+        - alert: TrawlIngestEventsRejected
+          expr: increase(trawl_ingest_events_rejected_total{namespace={{ .Release.Namespace | quote }},service={{ include "trawl.fullname" . | quote }},reason!~"wal_failure|hot_buffer_full|ingest_batch_too_large"}[10m]) > 0
+          labels:
+            severity: {{ .Values.prometheusRule.alerts.TrawlIngestEventsRejected.severity | quote }}
+          annotations:
+            summary: "Ingest refused events on {{ `{{ $labels.instance }}` }}"
+            description: "Target {{ `{{ $labels.job }}` }}/{{ `{{ $labels.instance }}` }}: trawld refused events for reason {{ `{{ $labels.reason }}` }} and stored none of them. The response listed the refusals in its body, which a sender that reads only status codes, such as Vector, does not see. An increase was observed in the last 10 minutes; resolution does not establish recovery."
+            runbook_url: "https://trawl.sh/operate/operational-alerts/#ingest-events-rejected"
+        {{- end }}
         {{- if .Values.prometheusRule.alerts.TrawlTelemetryWalWriteFailure.enabled }}
         - alert: TrawlTelemetryWalWriteFailure
           expr: increase(trawl_telemetry_wal_write_failures_total{namespace={{ .Release.Namespace | quote }},service={{ include "trawl.fullname" . | quote }}}[10m]) > 0

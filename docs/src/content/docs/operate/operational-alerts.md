@@ -1,18 +1,19 @@
 ---
 title: Respond to operational alerts
-description: Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, quarantined files, ingest refusals, and refused searches.
+description: Load Trawl's reported-failure rules into existing Prometheus monitoring and investigate discards, uncertain writes, failures, quarantined files, refused events, ingest refusals, and refused searches.
 ---
 
 Use this pack to receive alerts when Trawl reports a discard, persistence
-failure, compaction failure, or successful quarantine, when ingest is refused
-for lack of hot-buffer space, when the hot buffer stops draining, or when
-search stays refused because the corpus is unsettled. It adds no monitoring
+failure, compaction failure, or successful quarantine, when trawld refuses
+events that a sender posted, when ingest is refused for lack of hot-buffer
+space, when the hot buffer stops draining, or when search stays refused
+because the corpus is unsettled. It adds no monitoring
 server, receiver, notification route, or automatic repair. Use your existing
 monitoring system to detect failed scrapes and stopped targets.
 
 ## Read the observation window
 
-Eleven rules evaluate `increase(counter[10m]) > 0` separately for each source
+Twelve rules evaluate `increase(counter[10m]) > 0` separately for each source
 series. They have no `for` delay. One observed increment fires at the next
 evaluation once enough samples exist. Repeated increments can keep it firing.
 Use **30-second scrape and evaluation intervals**, no greater than **two
@@ -91,7 +92,7 @@ every network loss, or every disk failure.
 3. Check the rule file with `promtool check rules /etc/prometheus/rules/trawl.rules.yml`.
 4. Reload Prometheus through your existing configuration process.
 5. Check that its Targets page shows the `trawl` job as up and its Rules page
-   lists all fourteen Trawl alerts without evaluation errors.
+   lists all fifteen Trawl alerts without evaluation errors.
 
 The plain expressions select `job="trawl"`. If you choose another job name,
 replace that matcher in every rule. Edit ordinary rule fields to change
@@ -123,7 +124,7 @@ prometheusRule:
       enabled: false
 ```
 
-All fourteen alerts are enabled when the pack is enabled.
+All fifteen alerts are enabled when the pack is enabled.
 `TrawlHotBufferDrainStalled` has severity `critical`, and the others have `warning`.
 Use the exact alert names in the [metric mapping](/reference/api/#operational-alert-counters)
 as keys under `prometheusRule.alerts`. Each entry accepts only `enabled` and
@@ -369,6 +370,61 @@ producer policy rejections, and field-conformance outcomes are excluded.
 
 Resolution means no new persistence rejections were observed. It does not
 prove that the sender retried or that rejected data reached storage.
+
+## Ingest events rejected
+
+`TrawlIngestEventsRejected` observes `trawl_ingest_events_rejected_total`
+for every `reason` except `wal_failure`, `hot_buffer_full`, and
+`ingest_batch_too_large`, in events. trawld checks each event of an ingest
+request on its own. It refuses an event that breaks the
+[event contract](/reference/events/#rejection-reasons), stores the rest, and
+lists the refusals in the response body. A refused event is never stored. A
+sender that reads only the status code, such as Vector, logs no error and
+does not send the event again. The alert fires separately for each reason.
+A new reason fires it without a rule change.
+
+The three excluded reasons refuse a whole request or group, and the sender
+sees the status. `wal_failure` fires
+[HTTP persistence rejection](#http-persistence-rejection). `hot_buffer_full`
+answers 503, which the sender retries; see
+[ingest admission refusing](#ingest-admission-refusing).
+`ingest_batch_too_large` answers 413.
+
+1. Read the `reason` label. [Rejection reasons](/reference/events/#rejection-reasons)
+   explains each one.
+2. Find the sender. trawld logs one `ingest_rejections` warning for each
+   request with refusals. `user` names the key that sent it, `rejected`
+   counts the refused events, and `reasons` counts them by reason, such as
+   `invalid_chars:3`. `samples` holds up to five refusal messages, separated
+   by `; `. A message can quote the refused value, such as the `service`.
+   Keep samples in restricted incident notes. When
+   `[ingest] internal_telemetry` is on, the default, trawld stores the
+   warning as its own telemetry. Set `TRAWL_PROFILE` to a CLI profile whose
+   key has `trawl:query`, then search for it:
+
+   ```bash
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld event_type=ingest_rejections last=1h | table _time, user, rejected, reasons, samples'
+   ```
+
+   With internal telemetry off, read the warning in the daemon output, as in
+   [Inspect the affected target](#inspect-the-affected-target).
+3. If the sender runs the shipped Vector configuration, and the reason is
+   `invalid_chars` or `service_too_long`, the host runs an old or edited
+   copy. Copy the files again and restart Vector, as in
+   [Upgrade the configuration](/getting-started/vector-integration/#upgrade-the-configuration).
+   Then capture a sample and preview it, as in
+   [Preview a sample](/getting-started/vector-integration/#preview-a-sample).
+   Expect `0` rejected. For other reasons, follow
+   [Troubleshoot delivery](/getting-started/vector-integration/#troubleshoot-delivery).
+4. For another sender, run an [ingest preview](/operate/ingestion/#ingest-preview)
+   on a sample of what it sends. The preview shows each refused event with
+   its reason and message. It stores nothing and counts nothing, so it does
+   not fire this alert. Fix the sender, then preview again until nothing is
+   refused.
+
+Resolution means no new refusals were observed in the window. It does not
+recover refused events. Resend them from the sender's own copy, if it keeps
+one.
 
 ## Telemetry WAL write failure
 

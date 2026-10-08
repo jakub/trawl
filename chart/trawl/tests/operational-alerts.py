@@ -124,7 +124,7 @@ class OperationalAlerts(unittest.TestCase):
             self.assertEqual(len(pack["groups"]), 1)
             self.assertEqual(pack["groups"][0]["name"], "trawl.operational")
             rules = pack["groups"][0]["rules"]
-            self.assertEqual(len(rules), 14)
+            self.assertEqual(len(rules), 15)
             for actual, expected in zip(rules, EXPECTED, strict=True):
                 self.assertEqual(actual, expected_rule(expected, selector))
         normalized = copy.deepcopy(self.helm["spec"])
@@ -372,6 +372,40 @@ class OperationalAlerts(unittest.TestCase):
                         check["exp_alerts"] = [{"exp_labels": {**selected, "severity": "warning"},
                                                 "exp_annotations": expanded_annotations(expected["annotations"], selected)}]
                 tests.append(case)
+            self.run_promtool(pack, tests)
+
+    def test_promtool_ingest_rejection_reasons(self):
+        """Each reason fires exactly the alerts that own it, including unclassified ones.
+
+        The rule excludes the reasons that have another owner or never describe
+        one refused event. A reason added to trawld later is therefore alerted
+        on without a rule edit.
+        """
+        (rule,) = [e for e in EXPECTED if e["alert"] == "TrawlIngestEventsRejected"]
+        excluded = re.fullmatch(r'reason!~"([a-z_|]+)"', rule["matcher"])[1].split("|")
+        alerted = [variant["reason"] for variant in rule["variants"]]
+        self.assertEqual(set(excluded) & set(alerted), set())
+        owners = {"wal_failure": ["TrawlHttpPersistenceRejection"]}
+        labels = {"job": "trawl", "instance": "10.0.0.1:5514", "namespace": "example",
+                  "service": "launch-trawl", "pod": "launch-trawl-0", "cluster": "home"}
+        for pack in [self.plain, self.helm["spec"]]:
+            tests = []
+            for reason in excluded + ["future_per_event_reason"]:
+                names = owners.get(reason, [])
+                if reason not in excluded:
+                    names = ["TrawlIngestEventsRejected"]
+                selected = {**labels, "reason": reason}
+                checks = []
+                for expected in EXPECTED:
+                    alerts = []
+                    if expected["alert"] in names:
+                        alerts = [{"exp_labels": {**selected, "severity": severity_of(expected)},
+                                   "exp_annotations": expanded_annotations(expected["annotations"], selected)}]
+                    checks.append({"eval_time": "30s", "alertname": expected["alert"], "exp_alerts": alerts})
+                tests.append({"name": f"ingest rejection reason {reason}", "interval": "30s",
+                              "input_series": [{"series": series("trawl_ingest_events_rejected_total", selected),
+                                                "values": "0 1"}],
+                              "alert_rule_test": checks})
             self.run_promtool(pack, tests)
 
 
