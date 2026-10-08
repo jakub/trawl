@@ -270,9 +270,12 @@ The recipe depends on three settings:
 - **Buffering is off.** Live tail and the dashboard use server-sent events.
   With `proxy_buffering off`, nginx sends each event when it arrives.
   `trawl-web` also sends `X-Accel-Buffering: no` on those responses.
-- **The read timeout is longer than the keepalive.** trawld sends a keepalive
-  on an idle event stream every 15 seconds. A `proxy_read_timeout` of 60
-  seconds keeps a quiet stream open.
+- **The read timeout is longer than the keepalive and the query deadline.**
+  trawld sends a keepalive on an idle event stream every 15 seconds. A
+  search, by contrast, sends nothing until it finishes, which can take up to
+  `[server] timeout_secs` (30 seconds by default). A `proxy_read_timeout` of
+  60 seconds covers both. If you raise `timeout_secs` past 60, raise
+  `proxy_read_timeout` above it too, or nginx answers a long search with 504.
 
 ## Install with Helm
 
