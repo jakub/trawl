@@ -1,50 +1,17 @@
 #!/usr/bin/env python3
 """Check built documentation links and small source-owned inventories."""
-from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 import re
 import sys
 import tomllib
 
+from rendered_page import Page
+
 DOCS = Path(__file__).resolve().parents[1]
 ROOT = DOCS.parent
 DIST = DOCS / 'dist'
 errors = []
-
-
-class Page(HTMLParser):
-    def __init__(self, source):
-        super().__init__(convert_charrefs=True)
-        self.ids = set()
-        self.links = []
-        self.markdown_depth = 0
-        self.markdown_has_body = False
-        self.empty_markdown = False
-        self.feed(source)
-
-    def handle_starttag(self, tag, attributes):
-        attrs = dict(attributes)
-        if self.markdown_depth:
-            self.markdown_has_body = True
-            self.markdown_depth += 1
-        elif 'sl-markdown-content' in attrs.get('class', '').split():
-            self.markdown_depth = 1
-            self.markdown_has_body = False
-        if attrs.get('id'):
-            self.ids.add(attrs['id'])
-        if tag == 'a' and attrs.get('href'):
-            self.links.append(attrs['href'])
-
-    def handle_data(self, data):
-        if self.markdown_depth and data.strip():
-            self.markdown_has_body = True
-
-    def handle_endtag(self, tag):
-        if self.markdown_depth:
-            self.markdown_depth -= 1
-            if not self.markdown_depth and not self.markdown_has_body:
-                self.empty_markdown = True
 
 
 pages = {}

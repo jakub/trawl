@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
-    "test": "node --test scripts/release-pins.test.mjs",
+    "test": "node --test scripts/release-pins.test.mjs && python3 -m unittest discover -s scripts -p 'test_*.py'",
     "check": "astro build && python3 scripts/check-docs.py",
     "preview": "astro preview",
     "astro": "astro"
