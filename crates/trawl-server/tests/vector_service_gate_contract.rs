@@ -12,11 +12,25 @@
 //! derives `service` without a gate. The behaviour of the configs runs
 //! under the real Vector binary in `scripts/test-vector-collector.py`.
 //!
-//! The scanner is conservative. It lexes each remap, finds every write to
-//! `service` (any position, any whitespace, quoted paths, destructuring,
-//! merge-assignment, whole-event assignment, and calls to `set` or `merge`),
-//! and accepts only a literal name trawld takes or the gated `service`
-//! variable. A write it cannot classify fails the test.
+//! # Threat model
+//!
+//! The test guards plausible maintainer edits to the shipped configs: a new
+//! transform that derives `service`, a gate copy that is dropped or drifts
+//! from the pinned literal, and a literal service name trawld refuses.
+//!
+//! It is not a VRL verifier, and it does not try to resist an author who
+//! spells a write to evade it. The scanner lexes each remap and finds writes
+//! to `.service`. It accepts only an assignment to exactly `.service` of a
+//! literal name trawld takes or of the gated `service` variable. It refuses
+//! what it cannot classify instead of guessing: operator, destructuring and
+//! whole-event assignments, `set` and `merge` calls, paths below `.service`,
+//! and any quoted path segment with a backslash (it does not decode
+//! escapes). The shipped configs use none of these.
+//!
+//! Runtime behaviour has other evidence. The collector fixtures run the
+//! configs under the real Vector 0.57.0 in `scripts/test-vector-collector.py`.
+//! `tests/ingest_preview.rs` previews the committed capture against the real
+//! trawld.
 
 use std::collections::BTreeSet;
 
@@ -307,6 +321,13 @@ fn service_writes(source: &str) -> Vec<ServiceWrite> {
                     "calls a function that can write any field of the event",
                 ))
             }
+            Tok::Str(name)
+                if name.contains('\\') && adjacent(&tokens, i) && is_punct(&tokens, i - 1, ".") =>
+            {
+                Some(Write::Refused(
+                    "a quoted path segment contains a backslash, which the scanner does not decode",
+                ))
+            }
             Tok::Punct(p) if p == "." && !continues_path(&tokens, i) => {
                 let field = tokens
                     .get(i + 1)
@@ -327,13 +348,17 @@ fn service_writes(source: &str) -> Vec<ServiceWrite> {
                     }
                     None => (true, i + 1),
                 };
+                // The target continues below `.service`: `.service.x`, `.service[0]`.
+                let descends = !whole_event && end > i + 2;
                 match tokens.get(end).map(|t| &t.tok) {
-                    Some(Tok::Punct(op)) if op == "=" && !whole_event => {
+                    Some(Tok::Punct(op)) if op == "=" && !whole_event && !descends => {
                         Some(classify_rhs(&tokens, end + 1))
                     }
                     Some(Tok::Punct(op)) if ASSIGN.contains(&op.as_str()) => {
                         Some(Write::Refused(if whole_event {
                             "assigns the whole event, which can set `service`"
+                        } else if descends {
+                            "assigns a path below `.service`, which makes it a non-string"
                         } else {
                             "assigns `.service` with an operator the scanner cannot classify"
                         }))
@@ -476,6 +501,11 @@ fn the_scanner_refuses_every_write_it_cannot_classify() {
         ".service |= \"a\"",
         ".service ??= .x",
         ".service[0] = .x",
+        ".\"\\u{73}ervice\" = \"foo/bar\"",
+        ".\"ser\\u{76}ice\" = .x",
+        ".service.child = \"ok\"",
+        ".service[0] = \"ok\"",
+        ".\"service\".child = \"ok\"",
         "if .a { .b = 1 } else { .service = .x }",
         ". = merge(., {\"service\": .x})",
         ". |= {\"service\": .x}",
@@ -530,6 +560,7 @@ fn the_scanner_ignores_reads_comparisons_and_other_fields() {
         "service = \"x\"",
         "# .service = .x",
         "msg = \"a .service = b\"",
+        "msg = \"a\\nb\"",
         "re = r'.service = x'",
         "unit = replace(unit, r'\\.(?:service|scope)$', \"\")",
         "settings = 1\nmerged = 2",
