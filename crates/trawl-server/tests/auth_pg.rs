@@ -772,7 +772,7 @@ async fn scheduler_runs_after(
     // under `scheduled/`, which no other test may see.
     let data_dir = tempfile::tempdir().expect("scheduler data root");
     let base_dir = seed_data_root(data_dir.path());
-    let exec_pool = trawl_server::pool::ExecutorPool::new(base_dir, 1, 1000, None);
+    let exec_pool = trawl_server::pool::ExecutorPool::new(base_dir, 1, 1000, None).unwrap();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let handle = trawl_server::scheduler::spawn_scheduler(

@@ -45,6 +45,9 @@ struct Fixture {
     query_log: Option<PathBuf>,
     /// `[ingest] wal_dir`, when not `wal` beside the data root.
     wal_dir: Option<PathBuf>,
+    /// The daemon's `TMPDIR`, where the query engine makes its spill
+    /// directory; unset leaves the system default.
+    tmpdir: Option<PathBuf>,
 }
 
 /// The certificate a spawned daemon serves.
@@ -86,6 +89,7 @@ impl Fixture {
             tls: Tls::Shared,
             query_log: None,
             wal_dir: None,
+            tmpdir: None,
         }
     }
 
@@ -297,6 +301,9 @@ impl Fixture {
         }
         if let Some(point) = self.crash_at {
             command.env("TRAWL_TEST_CRASH_AT", point);
+        }
+        if let Some(dir) = &self.tmpdir {
+            command.env("TMPDIR", dir);
         }
         if hold_boot_pass {
             let release = self.root.path().join(BOOT_PASS_RELEASE);
@@ -2432,5 +2439,33 @@ async fn a_repin_sibling_that_is_not_a_directory_refuses_the_start() {
     }
     assert_eq!(std::fs::read(&shadow).unwrap(), b"not a directory");
     assert_mode(&shadow, 0o644);
+    fixture.assert_lock_free().await;
+}
+
+/// #282: a query engine that cannot make its spill directory fails the
+/// start with a named error that gives the path, before any listener,
+/// rather than a panic whose message the panic hook drops. A spill
+/// directory refused as not private takes the same path, but an
+/// unprivileged test cannot produce one: the engine asks for mode 0700,
+/// and only a mount that ignores modes answers otherwise. A `TMPDIR` that
+/// does not exist stands in for it.
+#[tokio::test]
+async fn a_spill_directory_that_cannot_be_made_refuses_the_start() {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let tmpdir = fixture.root.path().join("no-such-tmp");
+    fixture.tmpdir = Some(tmpdir.clone());
+
+    let mut daemon = fixture.spawn();
+    daemon.refused("failed to start the query engine").await;
+    let log = daemon.log();
+    assert!(
+        log.contains(&tmpdir.display().to_string()),
+        "the error names the spill directory's parent: {log}"
+    );
+    assert!(
+        !log.contains("event_type=\"panic\""),
+        "the start failed by panicking: {log}"
+    );
     fixture.assert_lock_free().await;
 }

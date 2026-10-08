@@ -705,18 +705,26 @@ impl AppState {
         // server built from a config exposes them on /metrics.
         crate::metrics::init_retention_metrics(config.retention.min_free_disk_bytes);
 
+        // A query engine that cannot start, as when its spill directory is
+        // refused (ADR-0052), fails the start with the engine's own message.
+        let pool = ExecutorPool::new(
+            config.data.base_dir().to_string_lossy().into_owned(),
+            config.server.max_concurrent_queries,
+            config.server.max_result_rows,
+            hot_buffer.clone(),
+        )
+        .map_err(|e| {
+            crate::error::ServerError::ServiceUnavailable(format!(
+                "failed to start the query engine: {e}"
+            ))
+        })?;
+
         let state = Self {
             query: QueryState {
-                pool: ExecutorPool::new(
-                    config.data.base_dir().to_string_lossy().into_owned(),
-                    config.server.max_concurrent_queries,
-                    config.server.max_result_rows,
-                    hot_buffer.clone(),
-                )
                 // Comparison typing: the pool snapshots the full pin set per
                 // query. The catalog is constructed unconditionally above,
                 // so query-only nodes are covered.
-                .with_field_catalog(Arc::clone(&field_catalog)),
+                pool: pool.with_field_catalog(Arc::clone(&field_catalog)),
                 timeout_secs: config.server.timeout_secs,
                 max_catchup_intervals: config.scheduler.max_catchup_intervals,
                 tracker: Arc::new(QueryTracker::with_capacity(config.server.max_query_history)),

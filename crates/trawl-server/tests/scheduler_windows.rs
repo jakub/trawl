@@ -229,7 +229,8 @@ async fn harness() -> Harness {
             2,
             100_000,
             None,
-        ),
+        )
+        .unwrap(),
         data_dir,
         _dir: dir,
         key_id: key.info.id,

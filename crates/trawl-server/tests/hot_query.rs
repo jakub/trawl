@@ -58,7 +58,8 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         1,    // single executor for test
         1000, // max result rows
         Some(Arc::clone(&hot_buffer)),
-    );
+    )
+    .unwrap();
 
     // --- ingest events ---
 
@@ -176,7 +177,8 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         1,
         1000,
         Some(Arc::clone(&hot_buffer)),
-    );
+    )
+    .unwrap();
 
     // --- first batch: ingest + compact ---
 
@@ -281,7 +283,8 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
         1,
         1000,
         Some(Arc::clone(&hot_buffer)),
-    );
+    )
+    .unwrap();
 
     // Cold batch: integer durations, compacted with the catalog wired —
     // the tick seeds the BIGINT pin.
@@ -492,7 +495,7 @@ async fn query_works_without_hot_buffer() {
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // Pool without hot buffer.
-    let pool = ExecutorPool::new(data_dir.to_str().unwrap().to_owned(), 1, 1000, None);
+    let pool = ExecutorPool::new(data_dir.to_str().unwrap().to_owned(), 1, 1000, None).unwrap();
 
     // Write WAL and compact directly (no bus, no hot buffer).
     let events = vec![make_event("nginx", "standalone event")];
@@ -550,7 +553,7 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let pool = ExecutorPool::new(data_dir.to_str().unwrap().to_owned(), 1, 1000, None);
+    let pool = ExecutorPool::new(data_dir.to_str().unwrap().to_owned(), 1, 1000, None).unwrap();
 
     // One nginx event, timestamped now so it lands in the current hour
     // partition and inside a `last=6h` window.
@@ -655,6 +658,7 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         1000,
         Some(Arc::clone(&hot_buffer)),
     )
+    .unwrap()
     .with_field_catalog(Arc::clone(&catalog));
 
     // Three events: numeric-text, below-threshold, and no-reading.
@@ -812,6 +816,7 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         1000,
         Some(Arc::clone(&hot_buffer)),
     )
+    .unwrap()
     .with_field_catalog(Arc::clone(&catalog));
 
     // One row per band edge, plus the game-server row that derives none.
