@@ -61,6 +61,14 @@ MAX_PREVIEW_EVENTS = 500
 MAX_PREVIEW_BODY_BYTES = 128 * 1024
 # A zone that is never UTC, for the postgresql drop-in's line times.
 POSTGRES_ZONE = "America/New_York"
+# The read time every stdin fixture carries.
+FIXTURE_TIME = "2026-09-28T10:30:45.123456Z"
+# A kept-field expectation: the delivered event has no such key.
+MISSING = object()
+# The journal identity fields and the names journal_enriched keeps them
+# under, verbatim, whenever the journal set them (ADR-0053).
+JOURNAL_KEPT = [("_SYSTEMD_UNIT", "systemd_unit"), ("_SYSTEMD_USER_UNIT", "systemd_user_unit"),
+                ("SYSLOG_IDENTIFIER", "syslog_identifier"), ("_COMM", "comm")]
 
 
 def load(tcp):
@@ -84,30 +92,111 @@ def load(tcp):
 
 
 def fixtures(suppress):
+    """The stdin fixture events, and what each delivers.
+
+    `expected` maps a fixture id to (service, severity, kept): `kept` holds
+    fields the delivered event must carry with exactly these values, or
+    MISSING for a field it must not carry. An id absent from `expected` is
+    one the noise policy drops.
+    """
     events, expected = [], {}
 
-    def add(source, name, service, severity="info", **fields):
+    def add(source, name, service, severity="info", kept=None, **fields):
         if source == "journald":
             fields.setdefault("PRIORITY", "6")
+        # A journal entry carries its own time. Give every fixture one, so
+        # each run posts the same `timestamp` instead of the moment Vector
+        # read it.
+        fields.setdefault("timestamp", FIXTURE_TIME)
         event = dict(message=fields.pop("message", name), fixture_id=name, fixture_source=source,
                      host="fixture-host", **fields)
         events.append(event)
         if service is not None:
-            expected[name] = (service, severity)
+            expected[name] = (service, severity, kept or {})
 
     add("journald", "journal-accepted", "sshd", _SYSTEMD_UNIT="sshd.service", PRIORITY="6")
     add("journald", "journal-warning", "sshd", "warn", SYSLOG_IDENTIFIER="sshd", PRIORITY="4")
-    add("journald", "serial-console", None if suppress else "serial-getty@ttyS0",
+    # The noise policy drops only ttyS0's serial getty, by its unit.
+    add("journald", "serial-console", None if suppress else "serial-getty",
+        kept={"systemd_unit": "serial-getty@ttyS0.service"},
         _SYSTEMD_UNIT="serial-getty@ttyS0.service")
+    add("journald", "serial-console-ttyS1", "serial-getty",
+        kept={"systemd_unit": "serial-getty@ttyS1.service"},
+        _SYSTEMD_UNIT="serial-getty@ttyS1.service")
     add("journald", "serial-getty restart", None if suppress else "init", SYSLOG_IDENTIFIER="init")
+    # The journal service is the first candidate trawld accepts (ADR-0053):
+    # the unit, then SYSLOG_IDENTIFIER, then _COMM, else the marked fallback.
+    # Backslashes are the journal's literal systemd escapes.
+    add("journald", "template-postgresql", "postgresql",
+        kept={"systemd_unit": "postgresql@17-main.service"},
+        _SYSTEMD_UNIT="postgresql@17-main.service")
+    add("journald", "template-getty", "getty",
+        kept={"systemd_unit": "getty@tty1.service"}, _SYSTEMD_UNIT="getty@tty1.service")
+    add("journald", "user-unit", "pipewire",
+        kept={"systemd_unit": "user@1000.service", "systemd_user_unit": "pipewire.service"},
+        _SYSTEMD_UNIT="user@1000.service", _SYSTEMD_USER_UNIT="pipewire.service")
+    add("journald", "user-manager", "user",
+        kept={"systemd_unit": "user@1000.service", "systemd_user_unit": "init.scope"},
+        _SYSTEMD_UNIT="user@1000.service", _SYSTEMD_USER_UNIT="init.scope")
+    add("journald", "user-instance", "user",
+        kept={"systemd_unit": "user@1000.service", "systemd_user_unit": MISSING},
+        _SYSTEMD_UNIT="user@1000.service")
+    add("journald", "desktop-scope", "steam",
+        kept={"systemd_user_unit": "app-gnome-steam-gtk\\x2dlaunch-4242.scope",
+              "syslog_identifier": "steam"},
+        _SYSTEMD_UNIT="user@1000.service",
+        _SYSTEMD_USER_UNIT="app-gnome-steam-gtk\\x2dlaunch-4242.scope", SYSLOG_IDENTIFIER="steam")
+    add("journald", "sd-pam", "sd-pam",
+        kept={"systemd_unit": MISSING, "syslog_identifier": "(sd-pam)", "comm": "(sd-pam)"},
+        SYSLOG_IDENTIFIER="(sd-pam)", _COMM="(sd-pam)")
+    fsck = "systemd-fsck@dev-disk-by\\x2duuid-0f1e2d3c\\x2d4b5a\\x2d6978\\x2d8796\\x2da5b4c3d2e1f0.service"
+    add("journald", "escaped-template", "systemd-fsck", kept={"systemd_unit": fsck},
+        _SYSTEMD_UNIT=fsck)
+    add("journald", "escaped-mount", "mount",
+        kept={"systemd_unit": "mnt-my\\x2ddisk.mount", "syslog_identifier": "mount"},
+        _SYSTEMD_UNIT="mnt-my\\x2ddisk.mount", SYSLOG_IDENTIFIER="mount")
+    add("journald", "unit-128", "u" * 128, kept={"systemd_unit": "u" * 128 + ".service"},
+        _SYSTEMD_UNIT="u" * 128 + ".service")
+    add("journald", "unit-129", "long-unit",
+        kept={"systemd_unit": "u" * 129 + ".service", "syslog_identifier": "long-unit"},
+        _SYSTEMD_UNIT="u" * 129 + ".service", SYSLOG_IDENTIFIER="long-unit")
+    add("journald", "unidentified", "journal-unidentified",
+        kept={"syslog_identifier": "/usr/bin/x y", "comm": "(a b)"},
+        SYSLOG_IDENTIFIER="/usr/bin/x y", _COMM="(a b)")
+    add("journald", "no-identity", "journal-unidentified",
+        kept={k: MISSING for k in ("systemd_unit", "systemd_user_unit", "syslog_identifier", "comm")})
+    # PID1 reports on another unit in journald's own UNIT field, which stays
+    # beside the kept systemd_unit; trawld folds it to `unit`.
+    add("journald", "journal-pid1", "init",
+        kept={"UNIT": "foo.service", "systemd_unit": "init.scope", "unit": MISSING},
+        _SYSTEMD_UNIT="init.scope", UNIT="foo.service", SYSLOG_IDENTIFIER="systemd",
+        _COMM="systemd")
     for service in ("networkd-dispatcher", "NetworkManager", "systemd-networkd"):
         add("journald", f"veth churn {service}", None if suppress else service, SYSLOG_IDENTIFIER=service)
         add("journald", f"normal {service}", service, SYSLOG_IDENTIFIER=service)
     add("journald", "ufw", "ufw", "warn", message="[UFW BLOCK] SRC=192.0.2.1 DST=192.0.2.2 PROTO=TCP SPT=123 DPT=443")
     add("varlog", "varlog", "dpkg", file="/var/log/dpkg.log")
     add("varlog", "varlog-subdir", "apt", file="/var/log/apt/history.log")
-    add("docker", "docker-compose", "web", label={"com.docker.compose.service": "web"})
+    add("varlog", "varlog-unusable", "varlog-unidentified",
+        kept={"file": "/var/log/my app/x.log"}, file="/var/log/my app/x.log")
+    add("docker", "docker-compose", "web", kept={"docker_compose_service": "web"},
+        label={"com.docker.compose.service": "web"})
     add("docker", "docker-image", "redis", image="registry.example/library/redis:7")
+    add("docker", "docker-image-port", "redis",
+        kept={"image": "registry.example:5000/org/redis:7"},
+        image="registry.example:5000/org/redis:7")
+    digest = "redis@sha256:" + "0123456789abcdef" * 4
+    add("docker", "docker-image-digest", "redis", kept={"image": digest}, image=digest)
+    add("docker", "docker-image-unusable", "docker-unidentified",
+        kept={"image": "registry.example/"}, image="registry.example/")
+    # The priority does not fall through: a refused compose label is marked
+    # even beside a valid container name.
+    add("docker", "docker-compose-invalid", "docker-unidentified",
+        kept={"docker_compose_service": "my web", "container_name": "ok"},
+        label={"com.docker.compose.service": "my web"}, container_name="/ok")
+    add("docker", "docker-swarm-label", "stack-web",
+        kept={"docker_swarm_service": "stack_web", "docker_compose_service": MISSING},
+        label={"com.docker.swarm.service.name": "stack_web"})
     add("docker", "docker-swarm", "stack-web",
         container_name="/stack_web.1." + "a" * 25 + "." + "b" * 25)
     for service in ("apache", "nginx"):
@@ -271,15 +360,21 @@ def run(tcp, suppress, tls="http"):
                     time.sleep(0.05)
                 process.stdin.write("".join(json.dumps(e) + "\n" for e in events))
                 process.stdin.flush()
+                # Each frame carries its own time and hostname. The message
+                # names the fixture.
+                frames = [("unifi-{}", "f492bfa1554cU6-Lite-6.7.4915634", "unifi-u6-lite"),
+                          ("unifi-plain-{}", "sshd", "sshd"),
+                          ("unifi-appname-{}", "foo/bar", "syslog-unidentified")]
                 for mode, port in ports.items():
-                    name = "unifi-" + mode
-                    expected[name] = ("unifi-u6-lite", "info")
-                    message = f"<14>1 2026-09-13T00:00:00Z ap-fixture f492bfa1554cU6-Lite-6.7.4915634 - - - {name}\n"
                     kind = socket.SOCK_STREAM if mode == "tcp" else socket.SOCK_DGRAM
-                    with socket.socket(socket.AF_INET, kind) as sender:
-                        sender.settimeout(3)
-                        sender.connect(("127.0.0.1", port))
-                        sender.sendall(message.encode())
+                    for template, appname, service in frames:
+                        name = template.format(mode)
+                        expected[name] = (service, "info", {"syslog_appname": appname})
+                        message = f"<14>1 2026-09-13T00:00:00Z ap-fixture {appname} - - - {name}\n"
+                        with socket.socket(socket.AF_INET, kind) as sender:
+                            sender.settimeout(3)
+                            sender.connect(("127.0.0.1", port))
+                            sender.sendall(message.encode())
                 deadline = time.monotonic() + 15
                 while len(received) < len(expected) and time.monotonic() < deadline:
                     assert process.poll() is None
@@ -292,10 +387,27 @@ def run(tcp, suppress, tls="http"):
                 assert not failures, failures
                 counts = collections.Counter(e.get("fixture_id", e.get("message")) for e in received)
                 assert counts == collections.Counter({name: 1 for name in expected}), (counts, expected, output)
+                sent = {e["fixture_id"]: e for e in events}
                 for event in received:
                     name = event.get("fixture_id", event["message"])
-                    assert (event["service"], event["severity_text"]) == expected[name], event
+                    service, severity, kept = expected[name]
+                    assert (event["service"], event["severity_text"]) == (service, severity), event
                     assert event["env"] == "prod", event
+                    for key, value in kept.items():
+                        if value is MISSING:
+                            assert key not in event, (key, event)
+                        else:
+                            assert event.get(key, MISSING) == value, (key, event)
+                    # No journal original leaves under its journald name.
+                    leaked = [k for k in event
+                              if k.startswith("_SYSTEMD_") or k in ("SYSLOG_IDENTIFIER", "_COMM")]
+                    assert not leaked, (leaked, event)
+                    if name in sent and sent[name]["fixture_source"] == "journald":
+                        for source, kept_as in JOURNAL_KEPT:
+                            if sent[name].get(source) not in (None, ""):
+                                assert event.get(kept_as) == sent[name][source], (kept_as, event)
+                            else:
+                                assert kept_as not in event, (kept_as, event)
                     if name.endswith("-parsed"):
                         assert event["status"] == 404 and event["user_name"] == "alice", event
                         assert (event["method"], event["uri"]) == ("GET", "/test"), event
@@ -329,8 +441,9 @@ def run(tcp, suppress, tls="http"):
                     if name == "postgresql":
                         assert "_time" not in event, event
                 print(f"PASS {tls} {'UDP + TCP' if tcp else 'UDP only'}: {len(events)} synthetic inputs, "
-                      f"{len(ports)} syslog inputs, {len(received)} HTTP events, zero duplicates; "
-                      f"{5 if suppress else 0} journal events filtered")
+                      f"{len(frames) * len(ports)} syslog inputs, {len(received)} HTTP events, "
+                      f"zero duplicates; {5 if suppress else 0} journal events filtered")
+                return received
         finally:
             if process and process.poll() is None:
                 process.kill()
@@ -605,10 +718,6 @@ def canonical(event):
 
 def capture_recipe():
     events, expected = fixtures(False)
-    # A journal entry carries its own time. Give every fixture one, so both
-    # runs post the same `timestamp` instead of the moment Vector read it.
-    for event in events:
-        event["timestamp"] = "2026-09-28T10:30:45.123456Z"
     requests = []
 
     class Receiver(http.server.BaseHTTPRequestHandler):
