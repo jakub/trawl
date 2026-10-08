@@ -162,6 +162,22 @@ def fixtures(suppress):
     add("journald", "sd-pam", "sd-pam",
         kept={"systemd_unit": MISSING, "syslog_identifier": "(sd-pam)", "comm": "(sd-pam)"},
         SYSLOG_IDENTIFIER="(sd-pam)", _COMM="(sd-pam)")
+    # These reach `service` only through the third candidate, _COMM: there is
+    # no unit and no accepted SYSLOG_IDENTIFIER to supply it.
+    add("journald", "comm-only", "sd-pam",
+        kept={"systemd_unit": MISSING, "syslog_identifier": MISSING, "comm": "(sd-pam)"},
+        _COMM="(sd-pam)")
+    add("journald", "comm-after-bad-identifier", "cron",
+        kept={"systemd_unit": MISSING, "syslog_identifier": "/usr/bin/x y", "comm": "cron"},
+        SYSLOG_IDENTIFIER="/usr/bin/x y", _COMM="cron")
+    add("journald", "comm-after-bad-unit", "mount",
+        kept={"systemd_unit": "mnt-my\\x2ddisk.mount", "syslog_identifier": MISSING,
+              "comm": "mount"},
+        _SYSTEMD_UNIT="mnt-my\\x2ddisk.mount", _COMM="mount")
+    add("journald", "comm-after-unit-129", "worker",
+        kept={"systemd_unit": "u" * 129 + ".service", "syslog_identifier": MISSING,
+              "comm": "worker"},
+        _SYSTEMD_UNIT="u" * 129 + ".service", _COMM="worker")
     fsck = "systemd-fsck@dev-disk-by\\x2duuid-0f1e2d3c\\x2d4b5a\\x2d6978\\x2d8796\\x2da5b4c3d2e1f0.service"
     add("journald", "escaped-template", "systemd-fsck", kept={"systemd_unit": fsck},
         _SYSTEMD_UNIT=fsck)
