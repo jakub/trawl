@@ -43,9 +43,13 @@ PostgreSQL 17, the version Debian 13 installs, and with PostgreSQL 18.
    `%25`.
 
 4. Apply the Fleet schema. On Helm, skip this step: the `init-auth` init
-   container runs `fleet-admin migrate` on every pod start. `fleet-admin`
-   reads the Fleet DSN from `DATABASE_URL`, and `read` keeps the password out
-   of your shell history:
+   container runs `fleet-admin migrate` on every pod start. Elsewhere,
+   `fleet-admin` comes with the `trawl-server` package or the release
+   tarball, so run this step after step 1 of
+   [Install the Debian package](#install-the-debian-package) or after you
+   [install from a tarball](#install-from-a-tarball). `fleet-admin` reads the
+   Fleet DSN from `DATABASE_URL`, and `read` keeps the password out of your
+   shell history:
 
    ```bash
    read -r -s -p 'Fleet DSN: ' DATABASE_URL && export DATABASE_URL
