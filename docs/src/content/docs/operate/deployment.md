@@ -206,6 +206,11 @@ takes this place.
 2. Put a certificate for the browser's host name, with its full chain, at
    `/etc/ssl/trawl/fullchain.pem`, and its key at
    `/etc/ssl/trawl/privkey.pem`. Make the key readable by root only.
+   Get the certificate from your ACME client, such as certbot, or from your
+   private CA. For a short test, a self-signed certificate works after the
+   browser warns about it, but `trawl doctor --web-url` then fails on it:
+   [verify the installation](#verify-the-installation) through the loopback
+   origin instead.
 
 3. Write `/etc/nginx/conf.d/trawl.conf`:
 
