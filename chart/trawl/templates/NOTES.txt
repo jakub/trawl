@@ -40,8 +40,6 @@ The daemon generates a self-signed certificate. For trusted remote API access, c
   https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
 {{- end }}
 
-Browser-ingress TLS is configured separately through ingress.tls.
-
 Check the HTTPS API through a local port-forward:
 
   kubectl port-forward --namespace {{ .Release.Namespace }} svc/{{ include "trawl.fullname" . }} 5514:{{ .Values.service.port }}
@@ -64,6 +62,7 @@ API ingress hosts (for bearer-token clients):
 {{- range .Values.ingress.hosts }}
   {{ .host }}
 {{- end }}
+TLS for these hosts is configured separately through ingress.tls.
 {{- end }}
 {{- if .Values.httpRoute.enabled }}
 {{- if eq (.Values.httpRoute.backend | default "web") "web" }}

@@ -143,7 +143,8 @@ class InstallNotes(unittest.TestCase):
             "httpRoute.backend": "trawld",
             "httpRoute.hostnames[0]": "api.example.com",
         })
-        self.assertIn("Browser ingress hosts:\n  logs.example.com", notes)
+        self.assertIn("Browser ingress hosts:\n  logs.example.com\n"
+                      "TLS for these hosts is configured separately through ingress.tls.", notes)
         self.assertIn("API HTTPRoute hosts (for bearer-token clients):\n  api.example.com", notes)
         self.assertNotIn("Browser HTTPRoute", notes)
         self.assertIn("kind: Ingress", manifest)
@@ -162,6 +163,8 @@ class InstallNotes(unittest.TestCase):
                 })
                 self.assertIn("Browser HTTPRoute hosts:\n  logs.example.com", notes)
                 self.assertNotIn("API HTTPRoute", notes)
+                # The gateway listener terminates browser TLS on this path.
+                self.assertNotIn("ingress.tls", notes)
 
     def test_daemon_ingress_is_identified_as_an_api(self):
         notes, _ = render(**{
@@ -170,7 +173,8 @@ class InstallNotes(unittest.TestCase):
             "ingress.hosts[0].paths[0].path": "/",
             "ingress.hosts[0].paths[0].pathType": "Prefix",
         })
-        self.assertIn("API ingress hosts (for bearer-token clients):\n  api.example.com", notes)
+        self.assertIn("API ingress hosts (for bearer-token clients):\n  api.example.com\n"
+                      "TLS for these hosts is configured separately through ingress.tls.", notes)
         self.assertNotIn("Browser ingress", notes)
 
 
