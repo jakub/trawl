@@ -294,15 +294,26 @@ cluster.
 
 1. Create the namespace and one Secret per DSN. The key names are the chart
    defaults for `auth.database.existingSecretKey` and
-   `storage.database.existingSecretKey`:
+   `storage.database.existingSecretKey`. Enter the Fleet DSN, such as
+   `postgres://fleet:PASSWORD@db.example.com:5432/fleet`, at the first
+   prompt, and the app-state DSN, such as
+   `postgres://trawl:PASSWORD@db.example.com:5432/trawl`, at the second:
 
    ```bash
    kubectl create namespace trawl
-   kubectl -n trawl create secret generic fleet-db \
-     --from-literal=DATABASE_URL='postgres://fleet:PASSWORD@db.example.com:5432/fleet'
-   kubectl -n trawl create secret generic trawl-db \
-     --from-literal=TRAWL_DATABASE_URL='postgres://trawl:PASSWORD@db.example.com:5432/trawl'
+   install -m 0600 /dev/null fleet.dsn &&
+     read -r -s -p 'Fleet DSN: ' dsn && printf '%s' "$dsn" > fleet.dsn; echo
+   install -m 0600 /dev/null trawl.dsn &&
+     read -r -s -p 'Trawl DSN: ' dsn && printf '%s' "$dsn" > trawl.dsn; echo
+   unset dsn
+   kubectl -n trawl create secret generic fleet-db --from-file=DATABASE_URL=fleet.dsn
+   kubectl -n trawl create secret generic trawl-db --from-file=TRAWL_DATABASE_URL=trawl.dsn
+   rm fleet.dsn trawl.dsn
    ```
+
+   `install` creates each file readable by you alone before the DSN is
+   written. `read` and the `printf` builtin keep the password out of
+   kubectl's arguments and your shell history.
 
 2. Write `trawl-values.yaml`. `web.publicOrigins` is required while
    `web.enabled` is true, and the chart never derives it from the ingress host:
