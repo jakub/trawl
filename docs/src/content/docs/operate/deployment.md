@@ -566,7 +566,13 @@ root or its scheduled report results.
 Whether the daemon ingests or only queries, an existing root must be owned by
 the user that runs trawld. trawld closes the root to owner-only at every start
 and refuses to start when it cannot. A root on a read-only mount must already
-be owner-only, because trawld cannot change its mode there.
+be owner-only, because trawld cannot change its mode there. A root its owner
+cannot read, such as mode 0305, refuses too. Run `chmod 0700` on it.
+
+Closing a root or a log file stops new opens by path. It does not revoke a
+file or directory another user opened before the first start of a trawld
+that closes them. After the upgrade, restart or log out anything that may
+hold such a handle, or reboot the host to be sure.
 
 Current WAL batches live under environment directories. A batch directly
 under the configured WAL directory causes startup to refuse before storage
