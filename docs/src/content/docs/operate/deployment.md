@@ -411,6 +411,12 @@ cluster.
    `kubectl -n trawl port-forward svc/trawl 5514:5514` if port 5514 is not
    published.
 
+Stored data is owner-only on Helm too, but the modes differ from the
+[Debian table](#install-the-debian-package). The chart's `fsGroup` makes the
+volume root at `/var/lib/trawl` group-owned and setgid. The data root and
+its subdirectories inherit the setgid bit, so they show as 02700
+(`drwx--S---`), not 0700. The setgid bit gives the group no access.
+
 [Crash dumps](/reference/crash-dumps/) add `SYS_PTRACE` to the trawld
 container, which Pod Security `baseline` and `restricted` both refuse, so
 `crashDump.enabled` needs a namespace that allows it, in practice
