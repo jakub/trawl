@@ -545,6 +545,11 @@ where
 /// that is gone again, or is no longer a directory, refuses too: something
 /// replaced it after its creation.
 ///
+/// A refused shadow root refuses the repin: the build has not begun, so
+/// the job fails and trawld keeps serving. The aside root is created past
+/// the cutover marker, where a refusal ends the process and the boot replay
+/// refuses the start, so its refusal is the start's.
+///
 /// # Errors
 /// The root cannot be kept owner-only, as an [`OwnerOnlyError`].
 pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> {
@@ -553,15 +558,21 @@ pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> 
         path: path.to_owned(),
     };
     let euid = rustix::process::geteuid().as_raw();
-    let closed = close(std::slice::from_ref(&root), euid, fchmod)?;
+    let refuses = match kind {
+        RootKind::RepinShadow => Refuses::Repin,
+        RootKind::DataRoot | RootKind::WalDir | RootKind::RepinAside => Refuses::Start,
+    };
+    let closed = close(std::slice::from_ref(&root), euid, fchmod).map_err(|mut e| {
+        e.refuses = refuses;
+        e
+    })?;
+    let refuse = |cause| OwnerOnlyError {
+        refuses,
+        ..OwnerOnlyError::new(&root, None, euid, cause)
+    };
     match closed.as_slice() {
-        [Closed::Absent] => Err(OwnerOnlyError::new(
-            &root,
-            None,
-            euid,
-            Cause::Inspect(Errno::NOENT.into()),
-        )),
-        [Closed::NotDirectory] => Err(OwnerOnlyError::new(&root, None, euid, Cause::NotDirectory)),
+        [Closed::Absent] => Err(refuse(Cause::Inspect(Errno::NOENT.into()))),
+        [Closed::NotDirectory] => Err(refuse(Cause::NotDirectory)),
         [_] => Ok(()),
         _ => unreachable!("one root closed, one result"),
     }
@@ -652,11 +663,24 @@ pub enum Cause {
     },
 }
 
-/// A storage root boot could not keep owner-only. trawld refuses to start.
+/// What a refused root stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refuses {
+    /// trawld's start: boot's close, and a repin past its cutover marker,
+    /// whose failure ends the process and whose replay refuses the start.
+    Start,
+    /// A repin before its cutover marker: the job fails with the corpus
+    /// untouched, and trawld keeps serving.
+    Repin,
+}
+
+/// A storage root trawld could not keep owner-only. trawld refuses to start,
+/// or a repin refuses to stage, as [`Self::refuses`] says.
 ///
 /// The message names the root, its path, its owner and mode when a handle
-/// was obtained, the uid trawld runs as, the cause and a fix. It is for the
-/// boot log and stderr; the doctor's rows use fixed sentences instead.
+/// was obtained, the uid trawld runs as, the cause, what is refused and a
+/// fix. It is for the log and stderr; the doctor's rows use fixed sentences
+/// instead.
 #[derive(Debug)]
 pub struct OwnerOnlyError {
     /// Which root.
@@ -671,6 +695,8 @@ pub struct OwnerOnlyError {
     pub euid: u32,
     /// Why it was refused.
     pub cause: Cause,
+    /// What the refusal stops.
+    pub refuses: Refuses,
 }
 
 impl OwnerOnlyError {
@@ -682,6 +708,7 @@ impl OwnerOnlyError {
             mode: dir.map(|d| d.mode),
             euid,
             cause,
+            refuses: Refuses::Start,
         }
     }
 
@@ -777,12 +804,15 @@ impl fmt::Display for OwnerOnlyError {
                 "the filesystem accepted the change and still reports mode {after:04o}"
             ),
         }?;
-        write!(
-            f,
-            ". Refusing to start, because stored logs must not be readable by other local \
-             users. Fix: {}.",
-            self.fix()
-        )
+        let reason = "because stored logs must not be readable by other local users";
+        match self.refuses {
+            Refuses::Start => write!(f, ". Refusing to start, {reason}.")?,
+            Refuses::Repin => write!(
+                f,
+                ". Refusing the repin, {reason}; the corpus is untouched."
+            )?,
+        }
+        write!(f, " Fix: {}.", self.fix())
     }
 }
 
@@ -1255,6 +1285,51 @@ mod tests {
         ] {
             assert!(text.contains(&needle), "{needle:?} missing from {text}");
         }
+    }
+
+    /// A repin shadow root that cannot be closed refuses the repin, not the
+    /// start: the job fails before anything enters it, and trawld keeps
+    /// serving. The aside root comes after the cutover marker, where a
+    /// refusal ends the process and the boot replay refuses the start, so
+    /// it keeps the start's wording.
+    #[test]
+    fn a_repin_staging_refusal_names_what_it_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let shadow = tmp.path().join("data.repin-next");
+        let aside = tmp.path().join("data.repin-aside");
+        for link in [&shadow, &aside] {
+            std::os::unix::fs::symlink(&target, link).unwrap();
+        }
+
+        let text = close_created(RootKind::RepinShadow, &shadow)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains(&format!("repin shadow root {}", shadow.display())),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                ". Refusing the repin, because stored logs must not be readable by other \
+                 local users; the corpus is untouched. Fix: replace"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Refusing to start"), "{text}");
+
+        let text = close_created(RootKind::RepinAside, &aside)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains(
+                ". Refusing to start, because stored logs must not be readable by other \
+                 local users. Fix: replace"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Refusing the repin"), "{text}");
     }
 
     #[test]
