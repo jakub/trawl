@@ -864,3 +864,163 @@ async fn sentinels_never_reach_http_failure() {
 
     assert_no_failure_carries(&[DSL, DB_ERROR, HEADER, USER_AGENT, PATH, METHOD]);
 }
+
+// -- #293: the request-limit refusal --------------------------------------------
+
+/// The regular refusal's message, word for word.
+const REQUEST_LIMIT_MESSAGE: &str = "trawld is at its HTTP request limit \
+     ([server] max_concurrent_requests); the request was not processed; retry later with backoff";
+
+/// A request through the production router, carrying the peer the accept
+/// loop would insert.
+fn production_request(uri: &str, token: &str, body: Body) -> Request<Body> {
+    let mut request = Request::get(uri)
+        .header("authorization", format!("Bearer {token}"))
+        .body(body)
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(std::net::SocketAddr::from(([127, 0, 0, 1], 40_293)));
+    request
+}
+
+/// Every `trawl_auth_failures_total` sample a recorder renders.
+fn auth_failure_samples(handle: &metrics_exporter_prometheus::PrometheusHandle) -> Vec<String> {
+    handle
+        .render()
+        .lines()
+        .filter(|line| line.starts_with("trawl_auth_failures_total{"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Assert `request_id` emitted exactly one request-limit `http_failure`,
+/// on stdout and persisted, naming `route` when the request matched one.
+fn assert_one_request_limit_failure(request_id: &str, route: Option<&str>) {
+    let lines = stdout_failures_for(request_id);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(level(line), "WARN", "{line}");
+    assert!(line.contains(UNMETERED_FAILURE_TARGET), "{line}");
+    for (name, value) in [
+        ("status", "503"),
+        ("error_class", "service_unavailable"),
+        ("cause_kind", "request_limit_reached"),
+        ("stage", "pre_admission"),
+    ] {
+        assert_eq!(field(line, name).as_deref(), Some(value), "{line}");
+    }
+    assert_eq!(field(line, "key_id"), None, "{line}");
+    if let Some(route) = route {
+        assert_eq!(field(line, "route").as_deref(), Some(route), "{line}");
+    }
+
+    let records = wal_failures_for(request_id);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["target"], UNMETERED_FAILURE_TARGET);
+    assert_eq!(records[0]["level"], "warn");
+    assert_eq!(records[0]["cause_kind"], "request_limit_reached");
+    assert_eq!(records[0]["stage"], "pre_admission");
+}
+
+/// Each request-limit refusal is exactly one `http_failure`: class
+/// `service_unavailable`, cause `request_limit_reached`, stage
+/// `pre_admission`, at WARN, on the unmetered target, and persisted under
+/// the unmetered cap. On an authenticated route with a bad token the
+/// refusal is not rewritten to an auth answer, and
+/// `trawl_auth_failures_total` does not move.
+///
+/// ONE production router serves every request, so the request holding the
+/// count and the refused ones share it. The auth-failure counter is read
+/// from a recorder of this thread's own: the requests whose metrics it
+/// reads are driven on the test's own thread, and no other test in the
+/// process can move it. The same bad token with the count free is the
+/// control that the counter counts.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_limit_refusal_is_one_unmetered_warn() {
+    const BAD_TOKEN: &str = "flt_zzzzzzzz_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+    sinks();
+    let server = common::setup().await;
+    let app = server.router_with(|http| http.max_concurrent_requests = 1);
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+
+    // Control: with the count free, the bad token is a counted 401.
+    let unauthorized = app
+        .clone()
+        .oneshot(production_request(
+            "/api/v1/whoami",
+            BAD_TOKEN,
+            Body::empty(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let counted = auth_failure_samples(&handle);
+    assert_eq!(counted.len(), 1, "{counted:?}");
+    assert!(counted[0].ends_with(" 1"), "{counted:?}");
+
+    // Hold the count: an admitted request whose body the client holds open.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::clone(&release);
+    let held_body = Body::from_stream(async_stream::stream! {
+        let _ = entered_tx.send(());
+        gate.notified().await;
+        yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(br#"{"query":"*"}"#));
+    });
+    let mut held_request = production_request("/api/v1/validate", &server.admin_token, held_body);
+    *held_request.method_mut() = axum::http::Method::POST;
+    held_request
+        .headers_mut()
+        .insert("content-type", "application/json".parse().unwrap());
+    let held = tokio::spawn(app.clone().oneshot(held_request));
+    tokio::time::timeout(std::time::Duration::from_secs(20), entered_rx)
+        .await
+        .expect("the held body was polled before the deadline")
+        .unwrap();
+
+    // Two refusals: one unauthenticated, one with a bad token on an
+    // authenticated route.
+    let mut refused_ids = Vec::new();
+    for (uri, token) in [("/zz-nowhere", ""), ("/api/v1/whoami", BAD_TOKEN)] {
+        let response = app
+            .clone()
+            .oneshot(production_request(uri, token, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        let request_id = edge_request_id(&response);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["error"]["code"], "request_limit_reached",
+            "{uri}: {body}"
+        );
+        assert_eq!(
+            body["error"]["message"], REQUEST_LIMIT_MESSAGE,
+            "{uri}: {body}"
+        );
+        refused_ids.push((uri, request_id));
+    }
+
+    assert_one_request_limit_failure(&refused_ids[0].1, None);
+    assert_one_request_limit_failure(&refused_ids[1].1, Some("/api/v1/whoami"));
+
+    // The refusals counted no auth failure: still the control's one.
+    assert_eq!(auth_failure_samples(&handle), counted);
+
+    release.notify_one();
+    let held = tokio::time::timeout(std::time::Duration::from_secs(20), held)
+        .await
+        .expect("the held request finished")
+        .unwrap()
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::OK);
+}
