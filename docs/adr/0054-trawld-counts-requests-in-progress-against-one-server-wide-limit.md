@@ -1,6 +1,6 @@
 # trawld counts requests in progress against one server-wide limit
 
-status: accepted (2026-10-08), prep record for #293
+status: accepted (2026-10-08), prep record for #293; amended (2026-10-08): probes and query control have separate allowances, prep record for #298, see the Amendment
 
 `[server] max_concurrent_requests` (default 256) was meant to cap the HTTP requests trawld works on at once. It did not. `with_edge_layers` added tower's `ConcurrencyLimitLayer` through `Router::layer`, and axum applies a layer once per route and once per method on that route. Each application built its own semaphore. That gave about 40 independent budgets of 256, so the real ceiling was near 10,000. The layer also never refused anything. It waits for a permit inside `poll_ready`, and axum's `Route` always reports ready, so a request over the limit waited with no deadline. The configuration reference, `config/trawld.reference.toml` and the Debian example all said "past it trawld answers 503", which was false. A value of 0 was accepted and made every request wait forever.
 
@@ -88,3 +88,41 @@ The setting's meaning changes, and its default drops from 256 to 32. A deploymen
 The integration tests that build `HttpConfig` with `max_concurrent_requests: 256` keep compiling. A test that saturates the count must hold requests on more than one route and more than one method, or it would also pass against per-route semaphores.
 
 A disconnected ingest request can keep the count for as long as its decode or WAL write runs. The gauge reports that time as in progress.
+
+## Amendment: probes and query control have separate allowances, 2026-10-08
+
+Prep record for #298.
+
+The control allowance mixed two kinds of caller. Health and `/metrics` need no key. Query listing and cancellation need a key, but trawld takes the count before authentication. A request whose bearer token is `flt_` and at least 8 more bytes, with a prefix that matches no key, keeps its control place through the prefix lookup, the wait for one of fleet-auth's 4 argon2 permits and the dummy check. Failed checks are never cached, so one junk token can be sent again and again. Four such requests, sent again as each one ends, keep the allowance full. One HTTP/2 connection is enough, and `HEAD` costs the sender no response body. Health and `/metrics` then answer 503 `request_limit_reached`. The chart's liveness probe restarts the pod after three refused periods, and scrapes fail at the moment an operator needs them.
+
+**Two allowances replace the control allowance.** No allowance borrows from another, and none borrows from the regular count.
+
+- **A probe allowance of 3**: `GET` and `HEAD /api/v1/health`, `GET` and `HEAD /metrics`. Three covers the chart's liveness probe, its readiness probe and one scrape. The startup probe replaces the other two while it runs. A doctor run and a browser health read also use the probe allowance. When one of them meets liveness, readiness and a scrape at the same moment, the last to arrive gets the 503. A single refusal restarts nothing, because liveness needs three refusals in a row.
+- **A control allowance of 4**: `GET` and `HEAD /api/v1/queries`, `DELETE /api/v1/queries/{id}`. The size is the human's ruling. Two administrators on the health page, or a script that lists while someone cancels, do not refuse each other. `trawl-client` does not retry a 503 on these routes, so a collision would be a visible error.
+
+Membership, the try-acquire, the refusal contract and the count's lifetime stay as decided above. The count is still taken before authentication, for the reason in the considered options: after authentication, a flood of bad tokens could run any number of argon2 checks. A route added later is regular unless someone adds it to one of the two tables.
+
+A probe refusal has its own message: `trawld is at its HTTP probe allowance; the request was not processed; retry later with backoff`. The control and regular messages do not change. No message names a size. All three refusals keep the code `request_limit_reached`, the headers and the failure event. The `allowance` label on the three metric series takes `regular`, `probe` or `control`, and the size gauge reports 3 for `probe` and 4 for `control`. The cap of 60 unmetered failure events a minute is shared by all three. During a flood, the refusal counter, not the failure log, gives the exact rate for each allowance.
+
+**The reserve grows from 4 to 7.** A caller without a key can now hold 7 requests in progress beyond the regular count, where it could hold 4. This is the human's ruling. It overrides the rejection of "a control allowance of 8" in part. That option grew one shared pool, so junk tokens could still have filled the places the probes need. Here a junk token can fill the control allowance and nothing else. Only requests to health and `/metrics` can fill the probe allowance.
+
+**fleet-auth does not change.** Its limit of 4, its untimed wait and its dummy check stay. The sentence "A request that waits for a permit is already counted, so the wait is bounded too" was wrong. The count bounds how many requests can wait for an argon2 permit. It does not bound how long one waits. A deadline on that wait would not fix #298: a caller refills a shared reserve as fast as its holds end. Separate reserves fix it.
+
+**What the allowances do not promise.** Both are the human's rulings.
+
+- Any caller who can reach the listener can fill the probe allowance with requests to health or `/metrics`. Health shares a port with the whole API, so a network policy cannot fence health without fencing ingest. This is an accepted non-goal.
+- The control allowance keeps query listing and cancellation reachable while admitted work fills the regular count. It does not keep them reachable while callers with junk tokens fill the control allowance. trawld cannot tell a junk token from a valid one before the check that the count must cover. Under such a flood, block the source at the network.
+
+**What this supersedes.** The section "A control allowance of 4" now describes two allowances. Its sentence "It covers liveness and readiness probes, one scrape and one operator request" now applies to the probe allowance and one more operator request. "A larger allowance would give unauthenticated callers more room" stays true, and the human accepted that room. The labels in "How the refusal is recorded" become `regular`, `probe` or `control`. The considered option "A control allowance of 8" is overridden as described above.
+
+**Considered for this amendment.**
+
+- Separate health and `/metrics` allowances, rejected. A slow scrape can push out liveness only when several scrapers meet a storage walk that misses the cache. The probe refusal counter shows if that happens.
+- Keep the reserve at 4 with probe 3 and control 1, rejected by the human. Two concurrent list or cancel requests would refuse each other.
+- A deadline or a try-acquire on fleet-auth's argon2 wait, rejected. It shortens one hold, but the reserve refills. It also refuses valid uncached keys under load, and it changes trawl-web's login and Coastwatch.
+- Refuse unknown prefixes before the dummy check, rejected. Response timing would show which prefixes exist again.
+- Leave health out of the count, rejected. A caller could then start any number of health checks, each taking an executor permit.
+- Fairness by peer address, rejected. Kubernetes, NAT and trawl-web put many callers behind one address, and a table keyed by peer is a new target.
+- A separate listener for probes, rejected. It adds a port, TLS, chart and doctor surface. It is the fence if probe floods ever matter.
+
+**Proof of the fix.** A test on the production router locks the `api_keys` table in an open transaction, which parks a junk-token query-list request inside the key check, before any decision. With the control allowance full of such requests, health and `/metrics` answer 200. At `c8675375` the same test fails.

@@ -216,9 +216,13 @@ _Avoid_: authenticated (a request can be authenticated and still refused before 
 One HTTP request or HTTP/2 stream that trawld has taken into its server-wide count and not yet answered. It still counts while blocking work that holds its body keeps running after the client has gone.
 _Avoid_: slot (that is a declared envelope field), permit (that is the executor pool), admission (that is the hot buffer), in-flight
 
+**Probe allowance**:
+The fixed number of requests in progress kept apart for health and metrics, the routes that need no key, so that probes and scrapes stay reachable while keyed requests fill the regular count or the control allowance. It grants capacity, never permission or a healthy answer, and any caller who can reach the server can fill it.
+_Avoid_: health reserve (metrics shares it), liveness allowance (readiness and scrapes share it), lane, exemption (the allowance is bounded)
+
 **Control allowance**:
-The fixed number of requests in progress kept apart for health, metrics and query listing and cancellation, so that they stay reachable while regular requests fill the count. It grants capacity, never permission.
-_Avoid_: operator reserve (callers need not be operators), exemption (the allowance is bounded)
+The fixed number of requests in progress kept apart for query listing and cancellation, so that they stay reachable while regular requests fill the count. It is chosen before any key is checked, so it grants capacity, never permission.
+_Avoid_: operator reserve, operator allowance (callers need a key, not the operator role), lane, exemption (the allowance is bounded)
 
 **Query phase**:
 One named kind of work in the life of one executed query, such as waiting for a permit, binding, or executing. A query's time is split across its phases; repeated work of the same kind adds to one phase.
