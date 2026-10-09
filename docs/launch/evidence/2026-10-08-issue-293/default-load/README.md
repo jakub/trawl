@@ -58,16 +58,34 @@ never counted as 0. The run also fails if:
 
 - trawld logged any `http_failure` with `cause_kind=request_limit_reached`,
   or a Vector log mentions `request_limit_reached`;
-- a written event was not stored;
+- `trawl_http_request_allowance` in the terminal snapshot is missing or is
+  not 32 for `regular` and 4 for `control`;
+- no sample read a regular `trawl_http_requests_in_progress` of at least 1;
+- the senders are not exactly `vector-1`, `vector-2` and `vector-3`, a
+  sender wrote no events, a sender stopped reading its input, or a written
+  event was not stored;
+- no search query ran, or any query answered something other than 200.
+  A 400, a 5xx or a client-side failure each fail the run;
+- no `compaction_complete` or no `rollup_complete` event falls between the
+  start of the measured session and the moment every event was stored;
 - a scrape failed, or the terminal snapshot is missing;
-- collecting the evidence raised an error;
+- the run stopped with an error, or collecting the evidence raised one;
 - the query loop or the scraper was still running at the terminal snapshot;
-- cleanup of the processes, the container or `--work` failed.
+- cleanup of the processes, the container or `--work` failed. The container
+  counts as removed only after `docker rm` succeeds, or when `docker
+  inspect` reports no such container. Any other Docker error, such as an
+  unreachable daemon, fails the run.
 
 `run.py` exits 0 and writes `"status": "passed"` only when none of these
 happened. Otherwise `summary.json` lists each reason under
 `failureReasons`. If a run refuses requests at 32, that is a finding to
 report. The run does not change any setting to make the run pass.
+
+`--check-summary` applies the same check to an existing `summary.json` and
+runs nothing. [`output/predicate-check.txt`](output/predicate-check.txt)
+is its result on the committed summary: passed. It records the command,
+the git blob SHA of the `run.py` that ran the check, and the SHA-256 of the
+summary.
 
 ## What ran
 
@@ -212,8 +230,9 @@ under `seededHistory`.
 
 ## What changed in the script
 
-Review found two defects in the script of the earlier runs. This run is
-the first on the corrected script, and `output/` comes from it.
+Review found two defects in the script of the earlier runs. Run 5 was the
+first on the corrected script, and `output/` comes from it. A later review
+found three more, fixed after run 5 without a new run (see below).
 
 - **The script could delete a directory it did not create.** The old
   script refused an existing `--work`, but its cleanup still ran and
@@ -229,10 +248,50 @@ the first on the corrected script, and `output/` comes from it.
   senders still ran, so a late refusal could be missed. The new check is
   in [Hypothesis and threshold](#hypothesis-and-threshold).
 
+After run 5:
+
+- **The pass check did not require the workload it measures.** It passed
+  with an allowance other than 32, with no in-progress reading, with
+  failed or missing search queries, and with no compaction or rollup
+  during ingest. It now requires each of these, and three senders that
+  each delivered.
+- **A Docker error read as a removed container.** Any failed `docker
+  inspect` counted as proof that the container was gone, so an unreachable
+  daemon passed cleanup. Only a successful `docker rm`, or Docker reporting
+  no such container, now counts.
+- **A swapped work directory.** Between the inode check and `rmtree`,
+  another process could replace `--work` with a different directory. The
+  script now refuses a `--work` whose parent another uid can write to. The
+  remaining window is covered in [Threat model](#threat-model).
+
+Run 5's summary has every field the new check reads.
+`output/predicate-check.txt` shows that it passes, so `output/` was not
+re-run. Run 5 judged container cleanup by the old rule. After the fix, no
+container with the script's `trawl.experiment` label existed on the
+Docker host.
+
 [`test_run.py`](test_run.py) runs the real `collect()` and `verdict()` on
-in-memory scrapes and a written trawld log. It also checks that the
-`--work` rules create and delete nothing they refuse. It needs no build,
-database or Vector.
+in-memory scrapes and a written trawld log, with one case for each pass
+condition. It runs `cleanup()` against stubbed Docker answers. It also
+checks that the `--work` rules create and delete nothing they refuse,
+including under a parent that is group- or other-writable or owned by
+another uid. It needs no build, database or Vector.
+
+## Threat model
+
+`run.py` runs as the invoking user. It creates `--work` itself, inside a
+parent that the invoking user owns and that group and other cannot write
+to. The script checks the parent before it creates `--work` and again
+before it deletes it.
+
+- **Other users** cannot rename or replace anything in that parent, so
+  they cannot swap `--work` for another directory.
+- **Processes running as the same user** are trusted. They can already
+  delete anything the user can, so the script does not defend against
+  them. One window remains: a same-user process could replace `--work`
+  between the inode check and `rmtree`. This is out of scope.
+- **Symlinks** are refused in `--work` and its path. `rmtree` is the
+  variant that does not follow symlinks inside the tree.
 
 ## Earlier runs
 
@@ -289,8 +348,9 @@ python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
 ```
 
 `--work` must not exist, must not be a symlink and must not be under
-`/tmp`. It holds the database password, the keys, the data and the raw
-logs. The script deletes it at the end unless `--keep-work` is given, and
+`/tmp`. Its parent must be owned by you and not writable by group or
+other. A missing parent is created with mode 0700. `--work` holds the
+database password, the keys, the data and the raw logs. The script deletes it at the end unless `--keep-work` is given, and
 it deletes only a `--work` it created. Only summaries reach `--out`, which
 defaults to `output/`. `--help` lists the workload options.
 
@@ -302,10 +362,18 @@ python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
     --vector ~/.cache/trawl-vector-0.57.0/vector-x86_64-unknown-linux-gnu/bin/vector
 ```
 
-To check the pass predicate and the `--work` rules without a full run:
+To check the pass predicate, the container cleanup and the `--work` rules
+without a full run:
 
 ```bash
 python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/test_run.py
+```
+
+To apply the pass check to the committed summary:
+
+```bash
+python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
+    --check-summary docs/launch/evidence/2026-10-08-issue-293/default-load/output/summary.json
 ```
 
 ## Files
@@ -313,9 +381,10 @@ python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/test_run.py
 | File | Contents |
 | --- | --- |
 | [`run.py`](run.py) | The run: build check, Postgres, keys, seed sessions, trawld, senders, query loop, scraper, terminal snapshot, summary, cleanup |
-| [`test_run.py`](test_run.py) | Checks of the pass predicate and the `--work` rules, without a full run |
+| [`test_run.py`](test_run.py) | Checks of the pass predicate, the container cleanup and the `--work` rules, without a full run |
 | [`trawld.toml`](trawld.toml) | trawld's configuration, with the data path filled in at run time |
 | [`output/summary.json`](output/summary.json) | Every number above |
+| [`output/predicate-check.txt`](output/predicate-check.txt) | The current pass check applied to `output/summary.json`, with the command and the `run.py` blob SHA |
 | [`output/metrics-samples.csv`](output/metrics-samples.csv) | Every `/metrics` sample: time, scrape latency, request counts and allowances, hot buffer, WAL and parquet file counts |
 | [`output/metrics-final.prom`](output/metrics-final.prom) | The terminal snapshot, request, hot-buffer, ingest, compaction and query series only |
 | [`output/compaction-rollup-events.ndjson`](output/compaction-rollup-events.ndjson) | trawld's `compaction_complete` and `rollup_complete` events, with timestamps |

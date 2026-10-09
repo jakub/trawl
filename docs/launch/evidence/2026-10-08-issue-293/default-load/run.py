@@ -26,7 +26,10 @@ A scraper reads /metrics at a fixed cadence. After delivery the script
 stops the query loop and the senders, then takes one more /metrics snapshot
 before it stops trawld. The run passes when trawl_http_requests_refused_total
 is present and 0 for both allowances in every sample and in that snapshot,
-trawld recorded no request_limit_reached failure, every event was stored,
+trawld recorded no request_limit_reached failure, the allowances read 32
+and 4, a regular in-progress peak of at least 1 was sampled, each of the
+three senders delivered every event, every search query answered 200, at
+least one compaction and one rollup completed while the senders delivered,
 and evidence collection and cleanup succeeded (see verdict).
 
 Usage, from the repository root:
@@ -36,13 +39,17 @@ Usage, from the repository root:
 
 --work is private: it holds the database password, the API keys, the data
 directory and the raw logs, and is deleted at the end unless --keep-work is
-given. The script deletes only a --work directory it created itself (see
-check_work_path and Run.remove_work). Only summaries reach --out. The script
-owns one Postgres container, one trawld and three Vector processes, and
-removes all of them on exit.
+given. Its parent must be owned by the invoking user and not writable by
+group or other. The script deletes only a --work directory it created
+itself (see check_work_path and Run.remove_work). Only summaries reach
+--out. The script owns one Postgres container, one trawld and three Vector
+processes, and removes all of them on exit.
 
-test_run.py, beside this file, checks the pass predicate and the --work
-rules without a full run.
+--check-summary output/summary.json applies the pass check to an existing
+summary and runs nothing.
+
+test_run.py, beside this file, checks the pass predicate, the container
+cleanup and the --work rules without a full run.
 """
 
 import argparse
@@ -57,6 +64,7 @@ import os
 import platform
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import ssl
@@ -98,6 +106,9 @@ SAMPLED = [
     ("wal_files", "trawl_wal_files", None),
     ("active_connections", "trawl_active_connections", None),
 ]
+# What AC23 measures: the default allowances, and three senders.
+REQUIRED_ALLOWANCE = {"regular": 32.0, "control": 4.0}
+REQUIRED_SENDERS = ["vector-1", "vector-2", "vector-3"]
 
 
 def log(message):
@@ -179,25 +190,67 @@ def refuse_dangerous(work):
             raise SystemExit(f"--work must not be under {forbidden}")
 
 
+def refuse_shared_parent(work):
+    """SystemExit unless the parent of work is a directory owned by the
+    effective uid and not writable by group or other.
+
+    Only a process with the invoking user's uid can then rename or replace
+    entries in it, and the script trusts those (see "Threat model" in
+    README.md)."""
+    parent = work.parent
+    try:
+        st = os.lstat(parent)
+    except OSError as error:
+        raise SystemExit(f"--work parent {parent}: {error.strerror}; refusing")
+    if not stat.S_ISDIR(st.st_mode):
+        raise SystemExit(f"--work parent {parent} is not a directory; refusing")
+    if st.st_uid != os.geteuid():
+        raise SystemExit(f"--work parent {parent} is owned by uid {st.st_uid}, "
+                         f"not {os.geteuid()}; refusing")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise SystemExit(f"--work parent {parent} is writable by group or other "
+                         f"(mode {stat.S_IMODE(st.st_mode):04o}); refusing")
+
+
 def check_work_path(raw):
     """The --work argument as an absolute path that does not exist yet.
 
     The path is made absolute lexically, so a symlink is never followed.
-    Anything refused here is never created or deleted by the script."""
+    Anything refused here is never created or deleted by the script. A
+    parent that does not exist yet is checked after claim_work creates it."""
     work = Path(os.path.abspath(raw))
     refuse_dangerous(work)
+    if os.path.lexists(work.parent):
+        refuse_shared_parent(work)
     if os.path.lexists(work):
         raise SystemExit(f"--work {work} already exists; remove it or pick another")
     return work
+
+
+def number(value):
+    """value as a float when it is a finite JSON number, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
 
 
 def verdict(summary):
     """Every reason the summary is not AC23 evidence. The run passes when
     the list is empty. A missing or unreadable observation is a reason."""
     reasons = []
+    if "error" in summary:
+        reasons.append(f"the run stopped with an error: {summary['error']}")
     if "collectError" in summary:
         reasons.append(f"collecting the evidence failed: {summary['collectError']}")
     m = summary.get("metrics") or {}
+    allowance = m.get("allowance") or {}
+    for name, expected in REQUIRED_ALLOWANCE.items():
+        if number(allowance.get(name)) != expected:
+            reasons.append(f"{name} allowance in the terminal snapshot: {allowance.get(name)}, "
+                           f"not {expected}")
+    peak = (m.get("sampledPeakInProgress") or {}).get("regular")
+    if number(peak) is None or number(peak) < 1:
+        reasons.append(f"no regular in-progress peak of at least 1 was sampled: {peak}")
     if not m.get("samples"):
         reasons.append("no /metrics samples")
     if m.get("failedScrapes") != 0:
@@ -221,13 +274,38 @@ def verdict(summary):
                           for v in (summary.get("vectorLogs") or {}).values())
     if vector_refusals:
         reasons.append(f"Vector logged request_limit_reached: {vector_refusals}")
-    if not (summary.get("delivery") or {}).get("complete"):
+    delivery = summary.get("delivery") or {}
+    if not delivery.get("complete"):
         reasons.append("delivery incomplete")
+    expected = delivery.get("expectedDistinct") or {}
+    counted = delivery.get("counted") or {}
+    if sorted(expected) != REQUIRED_SENDERS:
+        reasons.append(f"senders {sorted(expected)}, not {REQUIRED_SENDERS}")
+    for sender in REQUIRED_SENDERS:
+        written = expected.get(sender)
+        stored = (counted.get(sender) or {}).get("distinct")
+        if number(written) is None or written < 1 or stored != written:
+            reasons.append(f"{sender} did not deliver: wrote {written}, stored {stored} distinct")
+    if delivery.get("feedErrors"):
+        reasons.append(f"a sender stopped reading its input: {delivery['feedErrors']}")
+    # Every search query must answer 200. A 400, a 5xx or a client-side
+    # failure (status 0) fails the run, and so does a run without queries.
+    queries = summary.get("queries") or {}
+    count = queries.get("count")
+    if number(count) is None or count < 1:
+        reasons.append(f"no search query ran: {count}")
+    elif queries.get("byStatus") != {"200": count}:
+        reasons.append(f"search queries not all answered 200: {queries.get('byStatus')}")
+    work = summary.get("compactionAndRollup") or {}
+    for kind in ("compaction_complete", "rollup_complete"):
+        during = (work.get(kind) or {}).get("duringIngest")
+        if number(during) is None or during < 1:
+            reasons.append(f"{kind} events while the senders delivered: {during}")
     stopped = summary.get("producersStopped") or {}
     if stopped.get("threadsStillRunning") != []:
         reasons.append(f"producer threads still running: {stopped.get('threadsStillRunning')}")
     cleanup = summary.get("cleanup") or {}
-    if not (cleanup.get("processes") and cleanup.get("container")):
+    if not (cleanup.get("processes") is True and cleanup.get("container") is True):
         reasons.append(f"cleanup failed: {cleanup}")
     if cleanup.get("workDir") not in ("removed", "kept"):
         reasons.append(f"work directory: {cleanup.get('workDir')}")
@@ -302,7 +380,10 @@ class Run:
         self.work = check_work_path(self.args.work)
         if self.out == self.work or self.work in self.out.parents:
             raise SystemExit(f"--out must not be inside --work {self.work}")
-        self.work.parent.mkdir(parents=True, exist_ok=True)
+        # A missing parent is created owner-only; missing ancestors above it
+        # get the default mode, as with mkdir -p.
+        self.work.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        refuse_shared_parent(self.work)
         try:
             os.mkdir(self.work, 0o700)
         except FileExistsError:
@@ -314,15 +395,18 @@ class Run:
     def remove_work(self):
         """Delete --work if this invocation created it. Returns what happened.
 
-        The path must still be the directory claim_work made (same device
-        and inode, not a symlink), and rmtree must be the variant that does
-        not follow symlinks."""
+        The parent must still be owner-only, the path must still be the
+        directory claim_work made (same device and inode, not a symlink),
+        and rmtree must be the variant that does not follow symlinks. A
+        same-uid process could still swap the directory between the check
+        and rmtree; README.md's "Threat model" puts that out of scope."""
         if self.args.keep_work:
             return "kept"
         if self.work_owned is None:
             return "not created by this run; left in place"
         try:
             refuse_dangerous(self.work)
+            refuse_shared_parent(self.work)
         except SystemExit as refusal:
             return f"refused: {refusal.code}"
         try:
@@ -978,18 +1062,73 @@ class Run:
         for child in reversed(self.children):
             self.terminate(child)
             cleaned["processes"] &= child.poll() is not None
-        if subprocess.run(DOCKER + ["inspect", self.container], capture_output=True).returncode == 0:
-            subprocess.run(DOCKER + ["rm", "--force", self.container], capture_output=True, timeout=60)
-        cleaned["container"] = subprocess.run(DOCKER + ["inspect", self.container],
-                                              capture_output=True).returncode != 0
+        cleaned["container"], cleaned["containerState"] = self.remove_container()
         self.summary["cleanup"] = cleaned
+
+    def docker(self, *argv):
+        """(returncode, stderr) of one docker call; returncode None when
+        docker could not be run or timed out."""
+        try:
+            result = subprocess.run(DOCKER + list(argv), capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return None, error.__class__.__name__
+        return result.returncode, result.stderr.strip()
+
+    def container_state(self):
+        """"present", "absent" or "unknown: <docker's error>". Only docker
+        reporting no such container is absence; an unreachable daemon or a
+        permission error is unknown."""
+        code, err = self.docker("inspect", "--type", "container", self.container)
+        if code == 0:
+            return "present"
+        if code is not None and re.search(rf"no such (object|container): {re.escape(self.container)}",
+                                          err, re.IGNORECASE):
+            return "absent"
+        return f"unknown: {err[-300:]}"
+
+    def remove_container(self):
+        """(cleaned, how). Cleaned only after a successful docker rm or a
+        verified absence."""
+        state = self.container_state()
+        if state != "present":
+            return state == "absent", state
+        code, err = self.docker("rm", "--force", self.container)
+        if code == 0:
+            return True, "removed"
+        state = self.container_state()
+        return state == "absent", f"docker rm failed ({err[-300:]}); then {state}"
+
+
+def git_blob_sha(path):
+    """The git blob SHA-1 of a file's bytes, as git hash-object computes it."""
+    data = Path(path).read_bytes()
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+def check_summary(path):
+    """Apply verdict to an existing summary.json without running anything.
+    Prints the result and returns the exit code: 0 when it passes."""
+    command = ["python3", *(["-I"] if sys.flags.isolated else []), *sys.argv]
+    print(f"command: {shlex.join(command)}")
+    print(f"run.py git blob: {git_blob_sha(__file__)}")
+    print(f"summary: {path}")
+    print(f"summary sha256: {sha256(path)}")
+    summary = json.loads(Path(path).read_text())
+    print(f"recorded status: {summary.get('status')}")
+    reasons = verdict(summary)
+    print(f"pass check: {'failed' if reasons else 'passed'}")
+    for reason in reasons:
+        print(f"  {reason}")
+    return 1 if reasons else 0
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--work", required=True, help="private scratch directory (created; must not exist)")
+    p.add_argument("--check-summary", metavar="SUMMARY",
+                   help="apply the pass check to an existing summary.json and exit; runs nothing")
+    p.add_argument("--work", help="private scratch directory (created; must not exist)")
     p.add_argument("--out", default=str(HERE / "output"), help="summary directory")
-    p.add_argument("--vector", required=True, help="Vector 0.57.0 binary")
+    p.add_argument("--vector", help="Vector 0.57.0 binary")
     p.add_argument("--senders", type=int, default=3)
     p.add_argument("--seed-cycles", type=int, default=30, help="fixture cycles per seed session")
     p.add_argument("--steady-rate", type=int, default=268, help="events/s per sender (whole fixture cycles)")
@@ -999,7 +1138,12 @@ def main():
     p.add_argument("--query-think", type=float, default=1.0)
     p.add_argument("--drain-seconds", type=int, default=900)
     p.add_argument("--keep-work", action="store_true")
-    run = Run(p.parse_args())
+    args = p.parse_args()
+    if args.check_summary:
+        sys.exit(check_summary(args.check_summary))
+    if not (args.work and args.vector):
+        p.error("--work and --vector are required unless --check-summary is given")
+    run = Run(args)
     # A refused --work exits here, before anything exists to clean up, and
     # nothing is written to --out.
     run.claim_work()

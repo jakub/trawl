@@ -2,9 +2,11 @@
 """Checks for run.py that need no build, database or Vector.
 
 * The pass predicate: the real Run.collect() and verdict() over in-memory
-  /metrics bodies and a written trawld log.
-* The --work rules: a refused path is never created or deleted, and
-  Run.remove_work deletes only the directory its own claim created.
+  /metrics bodies and a written trawld log, and the --check-summary mode.
+* Container cleanup: Run.cleanup() over a stubbed docker command.
+* The --work rules: a refused path is never created or deleted,
+  Run.remove_work deletes only the directory its own claim created, and
+  a parent that another uid can write to is refused.
 
 Usage, from the repository root:
 
@@ -21,9 +23,11 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,29 +40,45 @@ spec.loader.exec_module(run)
 SCRATCH_ROOT = run.ROOT / ".flow-scratch"
 
 
-def metrics(regular=0, control=0):
-    """A /metrics body. None leaves a refusal series out; a string is
-    written verbatim as the value."""
-    lines = [
-        "# TYPE trawl_http_requests_in_progress gauge",
-        'trawl_http_requests_in_progress{allowance="regular"} 3',
+def metrics(regular=0, control=0, in_progress=3, allowance=(32, 4)):
+    """A /metrics body. None leaves a series out; a string is written
+    verbatim as the value."""
+    lines = ["# TYPE trawl_http_requests_in_progress gauge"]
+    if in_progress is not None:
+        lines.append(f'trawl_http_requests_in_progress{{allowance="regular"}} {in_progress}')
+    lines += [
         'trawl_http_requests_in_progress{allowance="control"} 1',
         "# TYPE trawl_http_requests_refused_total counter",
     ]
-    for allowance, value in (("regular", regular), ("control", control)):
+    for name, value in (("regular", regular), ("control", control)):
         if value is not None:
-            lines.append(f'trawl_http_requests_refused_total{{allowance="{allowance}"}} {value}')
-    lines += [
-        'trawl_http_request_allowance{allowance="regular"} 32',
-        'trawl_http_request_allowance{allowance="control"} 4',
-        "trawl_hot_buffer_events 10",
-    ]
+            lines.append(f'trawl_http_requests_refused_total{{allowance="{name}"}} {value}')
+    for name, value in zip(("regular", "control"), allowance):
+        if value is not None:
+            lines.append(f'trawl_http_request_allowance{{allowance="{name}"}} {value}')
+    lines.append("trawl_hot_buffer_events 10")
     return "\n".join(lines) + "\n"
 
 
-def log_line(**fields):
+def log_line(at="2026-10-08T12:00:01.000000Z", **fields):
     body = " ".join(f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}" for k, v in fields.items())
-    return f"2026-10-08T12:00:01.000000Z  WARN trawl_server::http: request failed {body}"
+    return f"{at}  INFO trawl_server: event {body}"
+
+
+# One compaction and one rollup inside the measured window, 12:00:00 to
+# 12:01:00 in judge().
+WORK_EVENTS = (log_line(event_type="compaction_complete", compact_service="nginx"),
+               log_line(event_type="rollup_complete", compact_service="nginx"))
+SENDERS = ("vector-1", "vector-2", "vector-3")
+
+
+def delivery(stored=100, senders=SENDERS):
+    return {"complete": True, "expectedDistinct": {s: 100 for s in senders},
+            "counted": {s: {"stored": stored, "distinct": stored} for s in senders}}
+
+
+def query(status=200):
+    return {"t": 1.0, "kind": "page", "status": status, "ms": 5.0}
 
 
 class Scratch(unittest.TestCase):
@@ -81,7 +101,8 @@ class Scratch(unittest.TestCase):
 class Predicate(Scratch):
     """collect() and verdict() on inputs that a full run would produce."""
 
-    def judge(self, samples, final, log_lines=(), collect_error=False):
+    def judge(self, samples, final, log_lines=(), collect_error=False, work_events=WORK_EVENTS,
+              queries=(query(), query()), deliveries=None):
         r = run.Run(self.args(keep_work=True))
         r.t0 = 0.0
         r.wall0 = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
@@ -93,11 +114,12 @@ class Predicate(Scratch):
             r.samples.append(row)
         r.final_metrics = {"t": 70.0, "status": 200 if final is not None else 0, "attempts": 1,
                            "text": final}
+        r.queries = list(queries)
         r.trawld_log = self.scratch / "trawld.log"
         if not collect_error:
-            r.trawld_log.write_text("".join(line + "\n" for line in log_lines))
+            r.trawld_log.write_text("".join(line + "\n" for line in (*work_events, *log_lines)))
         r.summary.update({
-            "delivery": {"complete": True},
+            "delivery": deliveries if deliveries is not None else delivery(),
             "producersStopped": {"threadsStillRunning": [], "vectorExitCodes": {}},
             "cleanup": {"processes": True, "container": True},
         })
@@ -159,6 +181,158 @@ class Predicate(Scratch):
         self.assertEqual(r_code, 1)
         self.assertIn("no terminal /metrics snapshot after the producers stopped",
                       summary["failureReasons"])
+
+    def test_missing_allowance_fails(self):
+        self.assertFails(self.judge([metrics()], metrics(allowance=(None, 4))),
+                         "regular allowance in the terminal snapshot: None, not 32")
+
+    def test_wrong_allowance_fails(self):
+        self.assertFails(self.judge([metrics()], metrics(allowance=(256, 4))),
+                         "regular allowance in the terminal snapshot: 256.0, not 32")
+        self.assertFails(self.judge([metrics()], metrics(allowance=(32, 8))),
+                         "control allowance in the terminal snapshot: 8.0, not 4")
+
+    def test_null_peak_fails(self):
+        self.assertFails(self.judge([metrics(in_progress=None)] * 2, metrics()),
+                         "no regular in-progress peak of at least 1 was sampled: None")
+
+    def test_zero_or_unreadable_peak_fails(self):
+        for value in (0, "NaN"):
+            with self.subTest(value=value):
+                self.assertFails(self.judge([metrics(in_progress=value)], metrics()),
+                                 "no regular in-progress peak of at least 1")
+
+    def test_no_compaction_during_ingest_fails(self):
+        self.assertFails(self.judge([metrics()], metrics(), work_events=WORK_EVENTS[1:]),
+                         "compaction_complete events while the senders delivered: None")
+
+    def test_no_rollup_during_ingest_fails(self):
+        self.assertFails(self.judge([metrics()], metrics(), work_events=WORK_EVENTS[:1]),
+                         "rollup_complete events while the senders delivered: None")
+
+    def test_rollup_after_delivery_fails(self):
+        late = log_line(at="2026-10-08T12:05:00.000000Z", event_type="rollup_complete")
+        self.assertFails(self.judge([metrics()], metrics(), work_events=(WORK_EVENTS[0], late)),
+                         "rollup_complete events while the senders delivered: 0")
+
+    def test_query_failures_fail(self):
+        for status in (0, 400, 500, 503, 504):
+            with self.subTest(status=status):
+                self.assertFails(self.judge([metrics()], metrics(),
+                                            queries=(query(), query(status))),
+                                 "search queries not all answered 200")
+
+    def test_no_queries_fails(self):
+        self.assertFails(self.judge([metrics()], metrics(), queries=()), "no search query ran: 0")
+
+    def test_missing_sender_fails(self):
+        self.assertFails(self.judge([metrics()], metrics(), deliveries=delivery(senders=SENDERS[:2])),
+                         "vector-3 did not deliver")
+
+    def test_short_delivery_fails(self):
+        self.assertFails(self.judge([metrics()], metrics(), deliveries=delivery(stored=99)),
+                         "vector-1 did not deliver: wrote 100, stored 99 distinct")
+
+    def test_feed_error_fails(self):
+        broken = dict(delivery(), feedErrors={"vector-2": "Vector closed stdin"})
+        self.assertFails(self.judge([metrics()], metrics(), deliveries=broken),
+                         "a sender stopped reading its input")
+
+    def test_check_summary_applies_the_same_check(self):
+        code, summary = self.judge([metrics()], metrics())
+        self.assertEqual(code, 0)
+        path = self.scratch / "out/summary.json"
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(run.check_summary(path), 0)
+        self.assertIn("pass check: passed", printed.getvalue())
+        self.assertIn(f"run.py git blob: {run.git_blob_sha(run.HERE / 'run.py')}",
+                      printed.getvalue())
+        broken = json.loads(path.read_text())
+        broken["compactionAndRollup"].pop("rollup_complete")
+        path.write_text(json.dumps(broken))
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(run.check_summary(path), 1)
+        self.assertIn("pass check: failed", printed.getvalue())
+        self.assertIn("rollup_complete events while the senders delivered", printed.getvalue())
+
+
+def docker_stub(*answers):
+    """A subprocess.run stand-in that answers each docker call in turn with
+    (returncode, stderr), and records the calls."""
+    calls = []
+    queue = list(answers)
+
+    def fake(argv, **_):
+        calls.append(argv[len(run.DOCKER):])
+        code, stderr = queue.pop(0)
+        return subprocess.CompletedProcess(argv, code, "", stderr)
+    return fake, calls
+
+
+class ContainerCleanup(Scratch):
+    """Only a removal or docker's own "no such container" counts as clean."""
+
+    def clean(self, *answers):
+        """Run.cleanup() with docker answering (returncode, stderr) in turn.
+        "{}" in a stderr becomes this run's container name."""
+        r = run.Run(self.args())
+        fake, calls = docker_stub(*[(code, err.format(r.container)) for code, err in answers])
+        with mock.patch.object(run.subprocess, "run", fake):
+            r.cleanup()
+        self.assertEqual(calls[0], ["inspect", "--type", "container", r.container])
+        return r.summary["cleanup"], calls, r
+
+    def test_removed(self):
+        cleanup, calls, _ = self.clean((0, ""), (0, ""))
+        self.assertEqual((cleanup["container"], cleanup["containerState"]), (True, "removed"))
+        self.assertEqual([c[0] for c in calls], ["inspect", "rm"])
+
+    def test_no_such_container_is_clean(self):
+        # Docker 29 says the first with --type container, the second without.
+        for message in ("Error response from daemon: No such container: {}",
+                        "error: no such object: {}"):
+            with self.subTest(message=message):
+                cleanup, calls, _ = self.clean((1, message))
+                self.assertEqual((cleanup["container"], cleanup["containerState"]),
+                                 (True, "absent"))
+                self.assertEqual([c[0] for c in calls], ["inspect"])
+
+    def test_no_such_other_container_is_not_clean(self):
+        cleanup, _, _ = self.clean((1, "Error response from daemon: No such container: someone-else"))
+        self.assertFalse(cleanup["container"])
+
+    def test_daemon_error_leaves_cleanup_failed(self):
+        unreachable = (1, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+                          "Is the docker daemon running?")
+        cleanup, calls, r = self.clean(unreachable)
+        self.assertFalse(cleanup["container"])
+        self.assertTrue(cleanup["containerState"].startswith("unknown: Cannot connect"))
+        self.assertEqual([c[0] for c in calls], ["inspect"])
+        r.summary["cleanup"]["workDir"] = "removed"
+        self.assertTrue(any(reason.startswith("cleanup failed") for reason in run.verdict(r.summary)))
+
+    def test_permission_error_leaves_cleanup_failed(self):
+        denied = (1, "permission denied while trying to connect to the docker API at "
+                     "unix:///var/run/docker.sock")
+        cleanup, _, _ = self.clean(denied)
+        self.assertFalse(cleanup["container"])
+
+    def test_failed_removal_then_unreachable_daemon_fails(self):
+        cleanup, calls, _ = self.clean((0, ""), (1, "Error response from daemon: busy"),
+                                       (1, "Cannot connect to the Docker daemon"))
+        self.assertFalse(cleanup["container"])
+        self.assertEqual([c[0] for c in calls], ["inspect", "rm", "inspect"])
+
+    def test_docker_missing_or_hung_fails(self):
+        for error in (FileNotFoundError(2, "docker"), subprocess.TimeoutExpired("docker", 60)):
+            with self.subTest(error=type(error).__name__):
+                r = run.Run(self.args())
+
+                def fake(argv, **_):
+                    raise error
+                with mock.patch.object(run.subprocess, "run", fake):
+                    r.cleanup()
+                self.assertFalse(r.summary["cleanup"]["container"])
 
 
 class WorkDirectory(Scratch):
@@ -251,6 +425,50 @@ class WorkDirectory(Scratch):
         keep = self.sentinel(r.work)
         self.assertEqual(r.remove_work(), "refused: no longer the directory this run created")
         self.assertTrue(keep.exists())
+
+    def test_group_or_other_writable_parent_is_refused(self):
+        shared = self.scratch / "shared"
+        shared.mkdir()
+        try:
+            for mode in (0o770, 0o707, 0o1777):
+                with self.subTest(mode=oct(mode)):
+                    shared.chmod(mode)
+                    with self.assertRaises(SystemExit) as raised:
+                        run.check_work_path(str(shared / "work"))
+                    self.assertIn("writable by group or other", str(raised.exception.code))
+                    r = run.Run(self.args(work=str(shared / "work")))
+                    with self.assertRaises(SystemExit):
+                        r.claim_work()
+                    self.assertFalse((shared / "work").exists())
+                    self.assertEqual(r.remove_work(), "not created by this run; left in place")
+        finally:
+            shared.chmod(0o700)
+
+    def test_parent_owned_by_another_uid_is_refused(self):
+        with mock.patch.object(run.os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(SystemExit) as raised:
+                run.check_work_path(str(self.scratch / "work"))
+            self.assertIn("is owned by uid", str(raised.exception.code))
+            r = run.Run(self.args())
+            with self.assertRaises(SystemExit):
+                r.claim_work()
+        self.assertFalse((self.scratch / "work").exists())
+
+    def test_missing_parent_is_created_owner_only(self):
+        r = run.Run(self.args(work=str(self.scratch / "new/work")))
+        r.claim_work()
+        self.assertEqual(os.stat(self.scratch / "new").st_mode & 0o777, 0o700)
+        self.assertEqual(r.remove_work(), "removed")
+
+    def test_remove_refuses_once_the_parent_is_shared(self):
+        r = run.Run(self.args())
+        r.claim_work()
+        self.scratch.chmod(0o777)
+        try:
+            self.assertTrue(r.remove_work().startswith("refused: --work parent"))
+            self.assertTrue((r.work / "private").exists())
+        finally:
+            self.scratch.chmod(0o700)
 
     def test_out_inside_work_is_refused(self):
         r = run.Run(self.args(out=str(self.scratch / "work/out")))

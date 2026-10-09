@@ -1,0 +1,6 @@
+command: python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py --check-summary docs/launch/evidence/2026-10-08-issue-293/default-load/output/summary.json
+run.py git blob: 475451461d420a01e601776a24c8d74189331c31
+summary: docs/launch/evidence/2026-10-08-issue-293/default-load/output/summary.json
+summary sha256: a1b00504ba89847c8d05b7e677089c13584d5b3b605f95ec03ba2574289be189
+recorded status: passed
+pass check: passed
