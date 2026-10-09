@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use trawl_config::{
-    Config, DEFAULT_SEVERITY_FROM, DEFAULT_TIME_FROM, DerivationSourceSpec, IngestConfig,
+    Config, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_SEVERITY_FROM, DEFAULT_TIME_FROM,
+    DerivationSourceSpec, IngestConfig,
 };
 
 fn repo_root() -> PathBuf {
@@ -69,6 +70,40 @@ fn toml_default(source: &str, key: &str, origin: &str) -> Vec<String> {
     quoted_strings(line)
 }
 
+/// The first scalar declaration of `key` in a TOML file, commented or not.
+///
+/// Same idiom as `toml_default`: the packaged files show every knob at its
+/// default, commented out. Prose comments never begin with `key = `, so the
+/// first line that does is the declaration.
+fn toml_scalar(source: &str, key: &str, origin: &str) -> String {
+    let marker = format!("{key} = ");
+    source
+        .lines()
+        .map(|l| l.trim_start_matches(['#', ' ']))
+        .find_map(|l| l.strip_prefix(&marker))
+        .unwrap_or_else(|| panic!("{origin} must state a default for {key}"))
+        .trim()
+        .to_owned()
+}
+
+/// The value of a scalar nested under `parent:` → `key:` in a simple YAML
+/// file, without a trailing comment.
+fn yaml_scalar(values: &str, parent: &str, key: &str) -> String {
+    let parent_marker = format!("{parent}:");
+    let key_marker = format!("{key}:");
+    let line = values
+        .lines()
+        .skip_while(|l| l.trim() != parent_marker)
+        .find_map(|l| l.trim().strip_prefix(&key_marker))
+        .unwrap_or_else(|| panic!("values.yaml must state {parent}.{key}"));
+    line.split('#')
+        .next()
+        .unwrap()
+        .trim()
+        .trim_matches('"')
+        .to_owned()
+}
+
 /// Every declaration of `key` in a TOML file — the default and each
 /// example — with the leading comment marker stripped, so an example can
 /// be handed back to the real deserializer.
@@ -103,8 +138,10 @@ fn yaml_list(values: &str, parent: &str, key: &str) -> Vec<String> {
     out
 }
 
-/// What the chart actually installs, rendered when possible.
-fn chart_defaults(key: &str, values_key: &str) -> Vec<String> {
+/// The chart's `templates/configmap.yaml` as rendered by `helm template`, or
+/// `None` when the binary is missing. A chart that fails to render is a
+/// failure, never a skip.
+fn rendered_configmap() -> Option<String> {
     let chart = repo_root().join("chart/trawl");
     let rendered = Command::new("helm")
         .args(["template", "trawl"])
@@ -128,13 +165,26 @@ fn chart_defaults(key: &str, values_key: &str) -> Vec<String> {
                 "helm template failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let manifest = String::from_utf8(out.stdout).expect("helm output must be UTF-8");
-            toml_default(&manifest, key, "the rendered chart ConfigMap")
+            Some(String::from_utf8(out.stdout).expect("helm output must be UTF-8"))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            yaml_list(&read("chart/trawl/values.yaml"), "ingest", values_key)
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => panic!("could not run helm: {e}"),
+    }
+}
+
+/// What the chart actually installs, rendered when possible.
+fn chart_defaults(key: &str, values_key: &str) -> Vec<String> {
+    match rendered_configmap() {
+        Some(manifest) => toml_default(&manifest, key, "the rendered chart ConfigMap"),
+        None => yaml_list(&read("chart/trawl/values.yaml"), "ingest", values_key),
+    }
+}
+
+/// The scalar counterpart of `chart_defaults`, under `config.server`.
+fn chart_server_scalar(key: &str, values_key: &str) -> String {
+    match rendered_configmap() {
+        Some(manifest) => toml_scalar(&manifest, key, "the rendered chart ConfigMap"),
+        None => yaml_scalar(&read("chart/trawl/values.yaml"), "server", values_key),
     }
 }
 
@@ -224,6 +274,47 @@ fn every_packaging_artifact_states_the_same_derivation_defaults() {
         assert_eq!(
             time, expected_time,
             "{origin} disagrees with trawl_config::DEFAULT_TIME_FROM"
+        );
+    }
+}
+
+/// `[server] max_concurrent_requests` is one number stated in the code, the
+/// annotated reference, the Debian example and the chart (ADR-0054). A drift
+/// between them ships an install whose documented limit is not its limit.
+#[test]
+fn every_packaging_artifact_states_the_same_request_limit_default() {
+    let expected = DEFAULT_MAX_CONCURRENT_REQUESTS.to_string();
+    assert_eq!(expected, "32", "ADR-0054 fixes the default at 32");
+
+    let key = "max_concurrent_requests";
+    let artifacts = [
+        (
+            "config/trawld.reference.toml",
+            toml_scalar(
+                &read("config/trawld.reference.toml"),
+                key,
+                "config/trawld.reference.toml",
+            ),
+        ),
+        (
+            "crates/trawl-server/debian/trawld.toml",
+            toml_scalar(
+                &read("crates/trawl-server/debian/trawld.toml"),
+                key,
+                "the Debian example",
+            ),
+        ),
+        (
+            "chart/trawl",
+            chart_server_scalar(key, "maxConcurrentRequests"),
+        ),
+    ];
+    for (origin, value) in artifacts {
+        assert_eq!(
+            value, expected,
+            "{origin} disagrees with trawl_config::DEFAULT_MAX_CONCURRENT_REQUESTS — \
+             the request limit is ONE cross-packaging contract; \
+             update every artifact or none"
         );
     }
 }
