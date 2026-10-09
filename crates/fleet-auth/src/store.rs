@@ -15,17 +15,31 @@
 //! [`from_pool`]: KeyStore::from_pool
 //! [`verify_key`]: KeyStore::verify_key
 
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::Row as _;
 use sqlx::postgres::{PgPool, PgRow};
+use tokio::sync::Semaphore;
 
 use crate::cache::{VerificationCache, VerificationCacheKey, VerificationCacheStats};
 use crate::error::AuthError;
 use crate::token;
 use crate::types::{ApiKeyInfo, CreatedKey, PrincipalKind, Role, RolePermission, VerifiedKey};
 use crate::validation::{validate_app_namespace, validate_permission, validate_role_name};
+
+/// How many argon2id checks may run at once in this process (ADR-0054).
+///
+/// Every hash and every verification counts, the dummy check on a prefix
+/// miss included. At the production parameters each check holds 128 MiB, so
+/// the limit bounds argon2 memory at 512 MiB however many callers hang up.
+const ARGON2_CHECK_LIMIT: usize = 4;
+
+/// The process-wide permits behind [`ARGON2_CHECK_LIMIT`]. Every
+/// [`KeyStore`] in the process shares them.
+static ARGON2_CHECKS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(ARGON2_CHECK_LIMIT)));
 
 /// Run argon2id hashing on the tokio blocking pool.
 ///
@@ -45,7 +59,21 @@ async fn verify_token_async(plaintext: &str, hash: &str) -> Result<bool, AuthErr
     on_blocking_pool(move || token::verify_token(&plaintext, &hash)).await
 }
 
-/// Run one argon2id step on the blocking pool.
+/// Run the timing-equalization check of a prefix miss on the blocking pool.
+///
+/// [`token::DUMMY_HASH`] is dereferenced inside the closure, so its
+/// first-use hash also runs on the blocking pool under a permit.
+async fn verify_dummy_async(plaintext: &str) -> Result<bool, AuthError> {
+    let plaintext = plaintext.to_owned();
+    on_blocking_pool(move || token::verify_token(&plaintext, &token::DUMMY_HASH)).await
+}
+
+/// Run one argon2id step on the blocking pool, under [`ARGON2_CHECK_LIMIT`].
+///
+/// The permit is taken before the task is spawned and moves into it. A
+/// caller dropped while it waits for a permit starts no work. A caller
+/// dropped after that cannot release the permit early: it is released when
+/// the step returns.
 ///
 /// A worker that did not return answers fixed text. `JoinError`'s
 /// `Display` quotes a panic payload, and the middleware logs this error on
@@ -55,7 +83,16 @@ where
     F: FnOnce() -> Result<T, AuthError> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f).await.map_err(|e| {
+    // Nothing closes the semaphore, so the error arm is unreachable.
+    let permit = Arc::clone(&ARGON2_CHECKS)
+        .acquire_owned()
+        .await
+        .map_err(|_| AuthError::Hash("argon2 limit is closed".to_owned()))?;
+    let step = move || {
+        let _permit = permit;
+        f()
+    };
+    tokio::task::spawn_blocking(step).await.map_err(|e| {
         let what = if e.is_panic() {
             "argon2 worker panicked"
         } else {
@@ -306,7 +343,7 @@ impl KeyStore {
             // SECURITY: equalize timing with the hit path so prefix existence
             // doesn't leak via response time. spawn_blocking so the argon2id
             // work doesn't block a tokio worker thread.
-            let _ = verify_token_async(plaintext, &token::DUMMY_HASH).await;
+            let _ = verify_dummy_async(plaintext).await;
             return Err(AuthError::InvalidKey("authentication failed".into()));
         };
 
@@ -1049,13 +1086,227 @@ fn row_to_api_key_info_no_roles(row: &PgRow) -> Result<ApiKeyInfo, AuthError> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::{Pin, pin};
+    use std::sync::mpsc;
+    use std::task::Poll;
+
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::task::JoinHandle;
+    use tokio::time::timeout;
+
     use super::*;
+
+    /// Failure deadline for a step that must happen. Never a wait for an
+    /// event to pass.
+    pub(super) const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Serializes the tests in this crate that take argon2 permits. Tests
+    /// that fill all four permits would otherwise deadlock each other, and
+    /// a permit held by an unrelated test would make the exact counts below
+    /// wrong.
+    pub(super) static ARGON2_LIMIT_TESTS: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    /// A check parked on the blocking pool while it holds an argon2 permit.
+    pub(super) struct Parked {
+        release: mpsc::Sender<()>,
+        caller: JoinHandle<Result<(), AuthError>>,
+    }
+
+    impl Parked {
+        /// Start a parking check through `on_blocking_pool` and wait until
+        /// its closure runs, so it holds a permit.
+        pub(super) async fn hold() -> Self {
+            let (entered, mut entered_rx) = unbounded_channel();
+            let (release, released) = mpsc::channel();
+            let caller = tokio::spawn(on_blocking_pool(park(entered, released)));
+            wait_entered(&mut entered_rx).await;
+            Self { release, caller }
+        }
+
+        /// Let the closure return, and wait until its caller has the result,
+        /// which is after the permit is released.
+        pub(super) async fn finish(self) {
+            self.release
+                .send(())
+                .expect("the parked closure is waiting");
+            timeout(DEADLINE, self.caller)
+                .await
+                .expect("the parked check returns")
+                .expect("the parked caller was not cancelled")
+                .expect("the parked check succeeds");
+        }
+    }
+
+    /// A closure that signals `entered` and then waits for `release`. A
+    /// dropped release sender also lets it return, so a failed test frees
+    /// its permits.
+    fn park(
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: mpsc::Receiver<()>,
+    ) -> impl FnOnce() -> Result<(), AuthError> + Send + 'static {
+        move || {
+            let _ = entered.send(());
+            let _ = release.recv();
+            Ok(())
+        }
+    }
+
+    async fn wait_entered(entered: &mut UnboundedReceiver<()>) {
+        timeout(DEADLINE, entered.recv())
+            .await
+            .expect("the parked closure runs")
+            .expect("the parked closure signals entry");
+    }
+
+    pub(super) fn available_permits() -> usize {
+        ARGON2_CHECKS.available_permits()
+    }
+
+    /// Poll a future exactly once. A check that finds no free permit
+    /// registers as a waiter on its first poll.
+    async fn poll_once<F: Future>(mut fut: Pin<&mut F>) -> Poll<F::Output> {
+        std::future::poll_fn(move |cx| Poll::Ready(fut.as_mut().poll(cx))).await
+    }
+
+    /// Run `check` as a fifth check while `parked` holds the limit. Its first
+    /// poll finds no free permit and registers it as a waiter. When one
+    /// parked check ends, its permit goes to the waiter and not back to the
+    /// pool: `check` is not polled in between, so it cannot have run and
+    /// released the permit yet. A check that bypassed the limit would leave
+    /// the freed permit in the pool. The limit is full again on return.
+    async fn waits_for_a_freed_permit<T>(
+        parked: &mut Vec<Parked>,
+        mut check: Pin<&mut impl Future<Output = Result<T, AuthError>>>,
+    ) -> T {
+        assert_eq!(available_permits(), 0, "the parked checks hold the limit");
+        assert!(poll_once(check.as_mut()).await.is_pending());
+        parked.pop().expect("a parked check").finish().await;
+        assert_eq!(
+            available_permits(),
+            0,
+            "the freed permit belongs to the waiting check"
+        );
+        let out = timeout(DEADLINE, check)
+            .await
+            .expect("the waiting check runs")
+            .expect("the check succeeds");
+        assert_eq!(available_permits(), 1, "the check released its permit");
+        parked.push(Parked::hold().await);
+        out
+    }
+
+    /// Four checks fill the limit and a fifth waits until one ends. Key
+    /// hashing, key verification and the dummy check of a prefix miss each
+    /// queue behind the same four permits.
+    #[tokio::test]
+    async fn argon2_checks_share_a_limit_of_four() {
+        let _serial = ARGON2_LIMIT_TESTS.lock().await;
+        assert_eq!(ARGON2_CHECK_LIMIT, 4);
+        assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
+
+        let key = token::generate_token();
+        let stored = hash_token_async(&key.plaintext)
+            .await
+            .expect("hash the key");
+        let stranger = token::generate_token();
+
+        let mut parked = Vec::new();
+        for _ in 0..ARGON2_CHECK_LIMIT {
+            parked.push(Parked::hold().await);
+        }
+        assert_eq!(available_permits(), 0, "four parked checks hold the limit");
+
+        // Each kind of check, run alone against a full limit, waits for a
+        // parked check to end and then runs on the permit it freed.
+        let hashed =
+            waits_for_a_freed_permit(&mut parked, pin!(hash_token_async("another key"))).await;
+        assert!(token::verify_token("another key", &hashed).expect("a PHC string"));
+        let verified = waits_for_a_freed_permit(
+            &mut parked,
+            pin!(verify_token_async(&key.plaintext, &stored)),
+        )
+        .await;
+        assert!(verified, "the key verifies against its own hash");
+        let dummy =
+            waits_for_a_freed_permit(&mut parked, pin!(verify_dummy_async(&stranger.plaintext)))
+                .await;
+        assert!(!dummy, "the dummy check never matches");
+        assert_eq!(available_permits(), 0, "four parked checks hold the limit");
+
+        for check in parked {
+            check.finish().await;
+        }
+        assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
+    }
+
+    /// The permit moves into the blocking step. A caller dropped after its
+    /// step started leaves the permit held until the step returns, and a
+    /// caller dropped while it waits for a permit starts no work at all.
+    #[tokio::test]
+    async fn argon2_permit_outlives_a_cancelled_caller() {
+        let _serial = ARGON2_LIMIT_TESTS.lock().await;
+        assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
+
+        // A caller whose step has started is cancelled and joined.
+        let (entered, mut entered_rx) = unbounded_channel();
+        let (release, released) = mpsc::channel();
+        let caller = tokio::spawn(on_blocking_pool(park(entered, released)));
+        wait_entered(&mut entered_rx).await;
+        caller.abort();
+        let cancelled = timeout(DEADLINE, caller)
+            .await
+            .expect("the cancelled caller is joined")
+            .expect_err("the caller was cancelled");
+        assert!(cancelled.is_cancelled());
+
+        // The orphaned step still holds its permit, so three more checks
+        // fill the limit.
+        assert_eq!(available_permits(), ARGON2_CHECK_LIMIT - 1);
+        let mut parked = Vec::new();
+        for _ in 1..ARGON2_CHECK_LIMIT {
+            parked.push(Parked::hold().await);
+        }
+        assert_eq!(available_permits(), 0, "the orphaned step keeps its permit");
+
+        // A check that is dropped while it waits for a permit never runs:
+        // its closure is dropped unrun, which closes its entry channel.
+        let (unrun_entered, mut unrun_entered_rx) = unbounded_channel();
+        let (_unrun_release, unrun_released) = mpsc::channel();
+        {
+            let mut waiting = pin!(on_blocking_pool(park(unrun_entered, unrun_released)));
+            assert!(poll_once(waiting.as_mut()).await.is_pending());
+        }
+        assert!(matches!(
+            unrun_entered_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        // A fifth check waits until the orphaned step returns, then runs on
+        // the permit that step released.
+        let mut fifth = pin!(hash_token_async("fifth"));
+        assert!(poll_once(fifth.as_mut()).await.is_pending());
+        release.send(()).expect("the orphaned step is waiting");
+        timeout(DEADLINE, fifth)
+            .await
+            .expect("the fifth check runs once the orphaned step returns")
+            .expect("hashing succeeds");
+
+        for check in parked {
+            check.finish().await;
+        }
+        assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
+    }
 
     /// A panicking worker answers `AuthError::Hash` with fixed text. The
     /// payload never enters the string: `JoinError`'s `Display` quotes it,
     /// and the middleware logs this error on the bearer request path.
     #[tokio::test]
     async fn a_panicking_worker_never_carries_its_payload() {
+        // It takes an argon2 permit, so it must not disturb the counts the
+        // limit tests assert.
+        let _serial = ARGON2_LIMIT_TESTS.lock().await;
         let err =
             on_blocking_pool(|| -> Result<(), AuthError> { panic!("zz_argon2_payload_sentinel") })
                 .await
@@ -1064,5 +1315,52 @@ mod tests {
         let shown = format!("{err} {err:?}");
         assert!(!shown.contains("zz_argon2_payload_sentinel"), "{shown}");
         assert!(shown.contains("argon2 worker panicked"), "{shown}");
+    }
+}
+
+/// The cached-key case of the argon2 limit. It needs a real key, so
+/// Postgres, and it needs the crate-internal permits, so it cannot live with
+/// the integration tests.
+#[cfg(test)]
+mod pg_tests {
+    use sqlx::PgPool;
+    use tokio::time::timeout;
+
+    use super::tests::{ARGON2_LIMIT_TESTS, DEADLINE, Parked, available_permits};
+    use super::{ARGON2_CHECK_LIMIT, KeyStore};
+    use crate::types::PrincipalKind;
+
+    /// A key whose check is cached runs no argon2, so it verifies while
+    /// parked checks hold all four permits.
+    #[sqlx::test]
+    async fn a_cached_key_never_waits_for_an_argon2_permit(pool: PgPool) {
+        let _serial = ARGON2_LIMIT_TESTS.lock().await;
+        let store = KeyStore::from_pool(pool);
+        let created = store
+            .create_key("cached", PrincipalKind::Service, &[], None)
+            .await
+            .expect("create");
+        store
+            .verify_key(&created.plaintext_token)
+            .await
+            .expect("the first check runs argon2 and caches the key");
+
+        let mut parked = Vec::new();
+        for _ in 0..ARGON2_CHECK_LIMIT {
+            parked.push(Parked::hold().await);
+        }
+        assert_eq!(available_permits(), 0, "four parked checks hold the limit");
+
+        let verified = timeout(DEADLINE, store.verify_key(&created.plaintext_token))
+            .await
+            .expect("a cached key does not wait for a permit")
+            .expect("the cached key verifies");
+        assert_eq!(verified.name, "cached");
+        assert_eq!(available_permits(), 0);
+
+        for check in parked {
+            check.finish().await;
+        }
+        assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
     }
 }
