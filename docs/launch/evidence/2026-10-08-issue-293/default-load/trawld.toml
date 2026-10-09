@@ -1,0 +1,21 @@
+# trawld configuration for the AC23 default-load run (issue #293).
+# run.py substitutes @DATA_DIR@ and writes the result into its private work
+# directory. Everything not set here is trawld's default, in particular:
+#   [server] max_concurrent_requests   (32, the value under test)
+#   [server] max_concurrent_queries    (the host's CPU count)
+#   [ingest] compaction_interval_secs  (10)
+#   [ingest] daily_rollup              (true)
+#   [ingest] internal_telemetry        (true)
+#   [ingest] max_body_bytes, hot_buffer_max_events, hot_buffer_max_bytes
+
+[server]
+# A free loopback port. run.py reads the bound address from the log.
+http_addr = "127.0.0.1:0"
+
+[data]
+path = "@DATA_DIR@"
+
+[retention]
+# The fixture's events carry 2024-01-15 and 2026-09 timestamps. Age-based
+# deletion would remove those date directories while the run rolls them up.
+max_age_days = 0
