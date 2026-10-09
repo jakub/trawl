@@ -418,24 +418,25 @@ async fn request_limit_precedes_auth_body_rate_and_routing() {
 
 // -- AC7 ------------------------------------------------------------------------------
 
-/// With the regular count full, every control route and method reaches
-/// its handler. Each handler is recognised by what only it produces:
-/// health's `DuckDB` probe arrives at the pool, `/metrics` answers
-/// Prometheus text, the query list answers its three lists, and a
+/// With the regular count full, every probe and control route and method
+/// reaches its handler. Each handler is recognised by what only it
+/// produces: health's `DuckDB` probe arrives at the pool, `/metrics`
+/// answers Prometheus text, the query list answers its three lists, and a
 /// cancellation answers a cancel result. HEAD carries the same
 /// representation without the body. Health is not required to be 200.
 ///
-/// Regular never borrows control: a regular request is refused while all
-/// four control places are free. The allowance grants nothing: a key that
-/// does not own a query still cannot cancel it.
+/// Regular never borrows the probe or control allowance: a regular request
+/// is refused while every probe and control place is free. The allowance
+/// grants nothing: a key that does not own a query still cannot cancel it.
 ///
 /// The count is full with one query parked in the pool at its work-start
-/// seam and one request holding its body open, on two routes. Four held
-/// control handlers are not built here: none of them can be held without
-/// a production seam, and the edge test
-/// `control_allowance_saturates_at_four` covers that case.
+/// seam and one request holding its body open, on two routes. Held probe
+/// and control handlers are not built here: none of them can be held
+/// without a production seam, and the edge tests
+/// `probe_allowance_saturates_at_three` and
+/// `control_allowance_saturates_at_four` cover those cases.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // one saturated window, every control route read in it
+#[allow(clippy::too_many_lines)] // one saturated window, every reserved route read in it
 async fn control_allowance_survives_regular_saturation() {
     let _scrape = SCRAPE.lock().await;
     let server = common::setup().await;
@@ -566,7 +567,8 @@ async fn control_allowance_survives_regular_saturation() {
         serde_json::json!({ "cancelled": true, "query_id": id })
     );
 
-    // Still full: every control request above came out of the allowance.
+    // Still full: every probe and control request above came out of its
+    // allowance.
     assert_regular_full(&app, &server.analyst_token).await;
 
     // Whatever the cancelled query answers, it answers once released.
@@ -590,11 +592,11 @@ async fn wait_for(mut done: impl FnMut() -> bool, what: &str) {
 
 // -- AC8 ------------------------------------------------------------------------------
 
-/// Control membership is the matched route and method. With the regular
-/// count full, a path that only spells a control route, a forged header
-/// and a control path under another method are all charged to regular and
-/// refused with its message. A query string on a real control route is
-/// still control and reaches the handler.
+/// Probe and control membership is the matched route and method. With the
+/// regular count full, a path that only spells a probe or control route, a
+/// forged header and a reserved path under another method are all charged
+/// to regular and refused with its message. A query string on a real
+/// probe or control route keeps its allowance and reaches the handler.
 #[tokio::test(flavor = "multi_thread")]
 async fn control_allowance_is_keyed_by_matched_route() {
     let server = common::setup().await;
@@ -632,7 +634,7 @@ async fn control_allowance_is_keyed_by_matched_route() {
         forged.headers_mut().insert(name, value.parse().unwrap());
         assert_refused(call(&app, forged).await, REGULAR_MESSAGE).await;
     }
-    // A method override on a control path does not make a POST control.
+    // A method override on a probe path does not make a POST a probe.
     let mut overridden = empty("POST", "/api/v1/health", None);
     overridden
         .headers_mut()
@@ -650,8 +652,8 @@ async fn control_allowance_is_keyed_by_matched_route() {
         assert_refused(response, REGULAR_MESSAGE).await;
     }
 
-    // A query string on a real control route: still control, so the
-    // handler answers.
+    // A query string on a real probe or control route keeps its
+    // allowance, so the handler answers.
     let health = call(&app, empty("GET", "/api/v1/health?zz=/api/v1/query", None)).await;
     let body = body_json(health).await;
     assert!(body["checks"].is_object(), "{body}");

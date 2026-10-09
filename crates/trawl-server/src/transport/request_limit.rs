@@ -5,10 +5,11 @@
 //! trawld's one count of requests in progress (ADR-0054).
 //!
 //! `[server] max_concurrent_requests` is the number of requests in progress
-//! on the HTTPS listener, across every route and method. A further four are
-//! the control allowance: health, `/metrics`, query listing and query
-//! cancellation, which neither use the regular count nor lend to it. A
-//! request over either count is refused at once with a 503
+//! on the HTTPS listener, across every route and method. Two fixed
+//! allowances sit beside it: the probe allowance of three for health and
+//! `/metrics`, and the control allowance of four for query listing and
+//! query cancellation. No count borrows from another or lends to one. A
+//! request over its count is refused at once with a 503
 //! `request_limit_reached`.
 //!
 //! [`count_request`] takes the count with a try-acquire and never waits.
@@ -35,43 +36,55 @@ use crate::metrics::{REQUEST_ALLOWANCE, REQUESTS_IN_PROGRESS, REQUESTS_REFUSED_T
 /// set is closed and carries nothing from the request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Allowance {
-    /// `[server] max_concurrent_requests`: every route not in the control
-    /// table.
+    /// `[server] max_concurrent_requests`: every route in neither table.
     Regular,
-    /// The fixed control allowance of [`CONTROL_ALLOWANCE`].
+    /// The fixed probe allowance of [`PROBE_ALLOWANCE`]: health and
+    /// `/metrics`.
+    Probe,
+    /// The fixed control allowance of [`CONTROL_ALLOWANCE`]: query listing
+    /// and cancellation.
     Control,
 }
 
 impl Allowance {
-    /// Both allowances, for metric registration and tests that enumerate.
-    pub const ALL: [Self; 2] = [Self::Regular, Self::Control];
+    /// Every allowance, for metric registration and tests that enumerate.
+    pub const ALL: [Self; 3] = [Self::Regular, Self::Probe, Self::Control];
 
     /// The fixed literal this allowance is labelled with.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Regular => "regular",
+            Self::Probe => "probe",
             Self::Control => "control",
         }
     }
 }
 
+/// Requests in progress reserved for the probe routes, fixed in code
+/// (ADR-0054): the liveness probe, the readiness probe and one scrape.
+pub const PROBE_ALLOWANCE: usize = 3;
+
 /// Requests in progress reserved for the control routes, fixed in code
-/// (ADR-0054): liveness and readiness probes, one scrape and one operator
-/// request.
+/// (ADR-0054): two operators listing or cancelling queries at once do not
+/// refuse each other.
 pub const CONTROL_ALLOWANCE: usize = 4;
 
-/// The control routes: trawld's matched route template and the method.
+/// The probe routes: trawld's matched route template and the method.
 ///
 /// Membership is read off the route the router matched, never the raw
 /// path, the query string or a header, so no spelling of a request can
-/// claim the allowance. A route added later is regular unless it is added
-/// here.
-static CONTROL_ROUTES: [(Method, &str); 7] = [
+/// claim an allowance. A route added later is regular unless it is added
+/// to this table or to [`CONTROL_ROUTES`].
+static PROBE_ROUTES: [(Method, &str); 4] = [
     (Method::GET, "/api/v1/health"),
     (Method::HEAD, "/api/v1/health"),
     (Method::GET, "/metrics"),
     (Method::HEAD, "/metrics"),
+];
+
+/// The control routes, matched as [`PROBE_ROUTES`] are.
+static CONTROL_ROUTES: [(Method, &str); 3] = [
     (Method::GET, "/api/v1/queries"),
     (Method::HEAD, "/api/v1/queries"),
     (Method::DELETE, "/api/v1/queries/{id}"),
@@ -83,34 +96,41 @@ fn allowance_of(request: &Request) -> Allowance {
     let Some(matched) = request.extensions().get::<MatchedPath>() else {
         return Allowance::Regular;
     };
-    let control = CONTROL_ROUTES
-        .iter()
-        .any(|(method, route)| method == request.method() && *route == matched.as_str());
-    if control {
+    let member = |table: &[(Method, &str)]| {
+        table
+            .iter()
+            .any(|(method, route)| method == request.method() && *route == matched.as_str())
+    };
+    if member(&PROBE_ROUTES) {
+        Allowance::Probe
+    } else if member(&CONTROL_ROUTES) {
         Allowance::Control
     } else {
         Allowance::Regular
     }
 }
 
-/// The two counts one listener shares.
+/// The three counts one listener shares.
 ///
 /// Built once per router by [`RequestLimit::new`], before any layer is
 /// added: axum clones a layer once per route and per method, so a count
 /// built inside a layer would be one count per route.
 pub(crate) struct RequestLimit {
     regular: Arc<Semaphore>,
+    probe: Arc<Semaphore>,
     control: Arc<Semaphore>,
 }
 
 impl RequestLimit {
-    /// A limit of `max_concurrent_requests` regular requests in progress
-    /// and [`CONTROL_ALLOWANCE`] control ones. Publishes both sizes and
-    /// both refusal counters at zero.
+    /// A limit of `max_concurrent_requests` regular requests in progress,
+    /// [`PROBE_ALLOWANCE`] probe ones and [`CONTROL_ALLOWANCE`] control
+    /// ones. Publishes every size, and every in-progress gauge and refusal
+    /// counter at zero.
     #[allow(clippy::cast_precision_loss)] // gauge values are f64; sizes stay far below 2^52
     pub(crate) fn new(max_concurrent_requests: usize) -> Arc<Self> {
         for (allowance, size) in [
             (Allowance::Regular, max_concurrent_requests),
+            (Allowance::Probe, PROBE_ALLOWANCE),
             (Allowance::Control, CONTROL_ALLOWANCE),
         ] {
             let label = allowance.label();
@@ -120,16 +140,19 @@ impl RequestLimit {
         }
         Arc::new(Self {
             regular: Arc::new(Semaphore::new(max_concurrent_requests)),
+            probe: Arc::new(Semaphore::new(PROBE_ALLOWANCE)),
             control: Arc::new(Semaphore::new(CONTROL_ALLOWANCE)),
         })
     }
 
     /// Take one request in progress from `allowance`, or `None` when it has
-    /// none free. One atomic try-acquire: never a wait, and never a check
-    /// followed by a separate take.
+    /// none free. One atomic try-acquire on that allowance's own count:
+    /// never a wait, never a check followed by a separate take, and never
+    /// a second count to fall back on.
     fn try_count(&self, allowance: Allowance) -> Option<RequestInProgress> {
         let semaphore = match allowance {
             Allowance::Regular => &self.regular,
+            Allowance::Probe => &self.probe,
             Allowance::Control => &self.control,
         };
         let permit = Arc::clone(semaphore).try_acquire_owned().ok()?;
@@ -348,13 +371,23 @@ mod tests {
         rx.recv().unwrap()
     }
 
-    /// The table, row by row, and what falls outside it.
+    /// Each table, row by row, and what falls outside both. The expected
+    /// rows are written out here, not read from the tables, so moving a
+    /// row between tables fails this test.
     #[test]
-    fn control_membership_is_the_matched_route_and_method() {
-        for (method, route) in &CONTROL_ROUTES {
+    fn allowance_membership_is_the_matched_route_and_method() {
+        for (method, route, allowance) in [
+            (Method::GET, "/api/v1/health", Allowance::Probe),
+            (Method::HEAD, "/api/v1/health", Allowance::Probe),
+            (Method::GET, "/metrics", Allowance::Probe),
+            (Method::HEAD, "/metrics", Allowance::Probe),
+            (Method::GET, "/api/v1/queries", Allowance::Control),
+            (Method::HEAD, "/api/v1/queries", Allowance::Control),
+            (Method::DELETE, "/api/v1/queries/{id}", Allowance::Control),
+        ] {
             assert_eq!(
                 allowance_of(&request(method.clone(), Some(route))),
-                Allowance::Control,
+                allowance,
                 "{method} {route}"
             );
         }

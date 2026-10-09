@@ -55,3 +55,26 @@ failing assertion is health's, not a scrape's.
         FAIL [   0.557s] (1/1) trawl-server::request_limit routes::junk_tokens_in_control_do_not_starve_probes
 error: test run failed
 exit=100
+
+## Fixed-tree run
+
+tree:            the commit that adds this section, fix(server): give probes and query control separate allowances (its parent is 0e2ce00892f25e007a87b71080a91434780adae7)
+test files in that tree:
+                 sha256 93021fe17bb6adb19b3d62fe7e1c4956ddf34db8afebf6954102ab0935a3b91d crates/trawl-server/tests/common/mod.rs
+                 sha256 885161bd4d07f653bf479ca633d449d745f142d35dc87e8d97cfb3383a9d4776 crates/trawl-server/tests/connection_budget.rs
+                 sha256 b7ebd6f10871fc556f9b9a343b9a4c3a6f696e27da9e42513f0f973ed710c846 crates/trawl-server/tests/request_limit/edge.rs
+                 sha256 cb8285240a8766d2cf007c3bbca2838deb1e305a752420c97d3520b8c651c91f crates/trawl-server/tests/request_limit/routes.rs
+                 sha256 7393d4a9550c0a472a6eb692e2bc62ce82d570ed04b61274ee41ca1f8e46e46c crates/trawl-server/tests/request_limit/support.rs
+junk-token section of routes.rs (from its "// -- junk tokens" banner to the next banner):
+                 sha256 7c31625ca22ae418f74ebc9fbe3a3561a0be7647d76c9ba6278e44b542e8db27 parent run
+                 sha256 7c31625ca22ae418f74ebc9fbe3a3561a0be7647d76c9ba6278e44b542e8db27 fixed-tree run
+                 (routes.rs differs elsewhere only in comments that now say probe for
+                 health and /metrics)
+command:         cargo nextest run -p trawl-server --test request_limit -E 'test(=routes::junk_tokens_in_control_do_not_starve_probes)'
+
+────────────
+    Starting 1 test across 1 binary (22 tests skipped)
+        PASS [   0.683s] (1/1) trawl-server::request_limit routes::junk_tokens_in_control_do_not_starve_probes
+────────────
+     Summary [   0.683s] 1 test run: 1 passed, 22 skipped
+exit=0

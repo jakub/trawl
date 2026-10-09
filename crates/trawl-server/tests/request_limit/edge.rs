@@ -301,7 +301,7 @@ async fn request_count_metrics_follow_ownership() {
     assert_eq!(series(&handle, "probe").1, 0);
     assert_eq!(series(&handle, "control").1, 0);
 
-    assert_refused(call(&app, request("HEAD", "/metrics")).await, PROBE_MESSAGE).await;
+    assert_refused(call(&app, request("GET", "/metrics")).await, PROBE_MESSAGE).await;
     assert_eq!(series(&handle, "probe"), (3, 1, 3));
     assert_eq!(series(&handle, "regular").1, 1);
     assert_eq!(series(&handle, "control").1, 0);
@@ -448,7 +448,7 @@ async fn response_bodies_and_streams_do_not_hold_the_count() {
 /// routes are mounted at the probe templates, so membership is read off
 /// their matched routes as in production.
 ///
-/// The refused probe request is `HEAD /metrics`, whose handler answers at
+/// The refused probe request is `GET /metrics`, whose handler answers at
 /// once. A larger probe allowance, or a probe request charged to the free
 /// regular count, would admit it and answer 200 instead of the refusal.
 #[tokio::test]
@@ -462,7 +462,7 @@ async fn probe_allowance_saturates_at_three() {
             )
             .route(
                 "/metrics",
-                get(holds.handler("get metrics")).head(holds.free("head metrics")),
+                get(holds.free("get metrics")).head(holds.handler("head metrics")),
             )
             .route("/api/v1/queries", get(holds.free("queries")))
             .route("/b", get(holds.free("get /b"))),
@@ -472,15 +472,15 @@ async fn probe_allowance_saturates_at_three() {
     // Three probe requests on both routes and both methods.
     let get_health = send(&app, request("GET", "/api/v1/health"));
     let head_health = send(&app, request("HEAD", "/api/v1/health"));
-    let get_metrics = send(&app, request("GET", "/metrics"));
+    let head_metrics = send(&app, request("HEAD", "/metrics"));
     assert_eq!(
         holds.entered_n(3).await,
-        ["get health", "get metrics", "head health"]
+        ["get health", "head health", "head metrics"]
     );
 
     // A fourth probe request gets the probe message, although the regular
     // count is free: probe never borrows regular.
-    assert_refused(call(&app, request("HEAD", "/metrics")).await, PROBE_MESSAGE).await;
+    assert_refused(call(&app, request("GET", "/metrics")).await, PROBE_MESSAGE).await;
     assert!(holds.nothing_entered());
 
     // A control request and a regular request are still admitted.
@@ -496,11 +496,11 @@ async fn probe_allowance_saturates_at_three() {
     assert_eq!(finish(get_health).await.status(), StatusCode::OK);
     let admitted = send(&app, request("GET", "/api/v1/health"));
     assert_eq!(holds.entered().await, "get health");
-    assert_refused(call(&app, request("HEAD", "/metrics")).await, PROBE_MESSAGE).await;
+    assert_refused(call(&app, request("GET", "/metrics")).await, PROBE_MESSAGE).await;
     assert!(holds.nothing_entered());
 
     holds.release_all();
-    for handle in [head_health, get_metrics, admitted] {
+    for handle in [head_health, head_metrics, admitted] {
         assert_eq!(finish(handle).await.status(), StatusCode::OK);
     }
 }
