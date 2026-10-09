@@ -218,3 +218,7 @@ not prove a universal bind-time deadline or make an in-process binder
 killable. It narrows ADR-0011's permit claim: concurrency limits work in
 flight, admission limits described amplification, and retained accounting
 reveals occupied capacity after the request ends.
+
+## Amendment: an HTTP request count is not an executor permit, 2026-10-08
+
+ADR-0054 adds a server-wide count of HTTP requests in progress. A query's count ends with its request. Its executor permit may stay retained after that, as this ADR describes. The two are separate charges with separate lifetimes, and the HTTP count does not follow retained executor work. Only blocking work that holds a request's body, which is ingest decode, the ingest WAL write and the preview report, keeps its request's count until that work ends.

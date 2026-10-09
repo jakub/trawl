@@ -212,6 +212,14 @@ _Avoid_: leaked permit, stuck query (the permit is the thing named)
 Counted by the per-key rate limiter. A metered request is attributable to a verified key and bounded by that key's rate; an unmetered one reached the server before any key was counted.
 _Avoid_: authenticated (a request can be authenticated and still refused before metering)
 
+**Request in progress**:
+One HTTP request or HTTP/2 stream that trawld has taken into its server-wide count and not yet answered. It still counts while blocking work that holds its body keeps running after the client has gone.
+_Avoid_: slot (that is a declared envelope field), permit (that is the executor pool), admission (that is the hot buffer), in-flight
+
+**Control allowance**:
+The fixed number of requests in progress kept apart for health, metrics and query listing and cancellation, so that they stay reachable while regular requests fill the count. It grants capacity, never permission.
+_Avoid_: operator reserve (callers need not be operators), exemption (the allowance is bounded)
+
 **Query phase**:
 One named kind of work in the life of one executed query, such as waiting for a permit, binding, or executing. A query's time is split across its phases; repeated work of the same kind adds to one phase.
 _Avoid_: stage (that is a DSL pipeline stage), lane, step

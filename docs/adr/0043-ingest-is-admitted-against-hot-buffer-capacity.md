@@ -52,3 +52,7 @@ When the hot buffer reaches its caps, it evicts its oldest batches. Those events
 ## Consequences
 
 ADR-0022's trade ("a stalled compactor stops WAL drain until the hot buffer evicts") becomes ingest refusal. A long repin pause (ADR-0011) can now refuse ingest once the buffer fills. The health `checks` object gains a fifth key. Pressure passes write more, smaller hourly files until the daily rollup merges them. Under continuous small writes, a large request that is legal can keep being refused. That is accepted at this scale.
+
+## Amendment: a full request count is a different 503, 2026-10-08
+
+ADR-0054 adds `request_limit_reached`, a second server-wide 503 on the ingest route. It is not `hot_buffer_full`. trawld answers it before it reads the body or checks the key, when the server-wide count of requests in progress is full. `hot_buffer_full` comes after the body is read and before it is decompressed. Only `hot_buffer_full` carries `Retry-After`, because only its recovery follows a known interval, the compaction interval. Admission and the request count are separate limits, and neither stands in for the other.
