@@ -960,19 +960,20 @@ async fn doctor_listener_health_rows() {
     );
 }
 
-/// trawld's request-limit refusal, under either allowance's message, is a
-/// capacity refusal and not a foreign answer: the health row is
-/// `not_sampled`/`request_limit_reached` with the shared text and a retry
-/// with backoff, the doctor invents no per-check rows, and no row says
-/// another service listens. The same code under a 200, and an unrelated
-/// 503 envelope, still fail as answers that are not trawld's (ADR-0054).
+/// trawld's request-limit refusal, under the regular or the probe
+/// message, is a capacity refusal and not a foreign answer: the health
+/// row is `not_sampled`/`request_limit_reached` with the shared text and
+/// a retry with backoff, the doctor invents no per-check rows, and no row
+/// says another service listens. The same code under a 200, and an
+/// unrelated 503 envelope, still fail as answers that are not trawld's
+/// (ADR-0054).
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_request_limit_refusal_is_not_sampled() {
     let dir = tempfile::tempdir().unwrap();
     let pair = Pair::new("limit-private-subject", &["localhost"]);
     let tls = pair.write(dir.path(), "limit");
     let regular: &[u8] = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
-    let control: &[u8] = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff","details":[]}}"#;
+    let probe: &[u8] = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP probe allowance; the request was not processed; retry later with backoff","details":[]}}"#;
     let run = async |response: Vec<u8>| {
         let addr = tls_listener(pair.serving(), response);
         let mut planted = pair.planted.clone();
@@ -981,7 +982,7 @@ async fn doctor_listener_request_limit_refusal_is_not_sampled() {
         doctor(&config, planted_env(dir.path()), &planted).await
     };
 
-    for body in [regular, control] {
+    for body in [regular, probe] {
         let report = run(http(503, body)).await;
         assert_eq!(outcome(&report, IDENTITY), (Outcome::Complete, None));
         assert_eq!(
