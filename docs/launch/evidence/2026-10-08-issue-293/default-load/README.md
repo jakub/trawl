@@ -264,6 +264,23 @@ After run 5:
   script now refuses a `--work` whose parent another uid can write to. The
   remaining window is covered in [Threat model](#threat-model).
 
+After PR #297's CodeQL scan:
+
+- **The database password was written to disk.** The script put it in
+  `private/postgres.env` for `docker run --env-file` and set the file to
+  mode 0600 afterwards, so the file existed for a moment at the umask's
+  permissions (CodeQL `py/clear-text-storage-sensitive-data`). The script
+  now writes no credential to a file. `docker run` gets `--env
+  POSTGRES_PASSWORD` with no value, and the value is set only in the
+  environment of that one `docker` process, not on the command line, which
+  any local user can read through `/proc`. The DSNs already reached
+  trawld, and the keys Vector, through their environments, and the
+  configs the script writes hold no secret. Those configs are still
+  created with `os.open(O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)`, so they
+  are owner-only from the moment they exist and the script refuses an
+  existing path or a symlink. This does not change what the script
+  measures, so `output/` was not re-run.
+
 Run 5's summary has every field the new check reads.
 `output/predicate-check.txt` shows that it passes, so `output/` was not
 re-run. Run 5 judged container cleanup by the old rule. After the fix, no
@@ -275,7 +292,9 @@ in-memory scrapes and a written trawld log, with one case for each pass
 condition. It runs `cleanup()` against stubbed Docker answers. It also
 checks that the `--work` rules create and delete nothing they refuse,
 including under a parent that is group- or other-writable or owned by
-another uid. It needs no build, database or Vector.
+another uid. It checks that the `docker run` command line never carries the
+password and that the private files are created 0600. It needs no build,
+database or Vector.
 
 ## Threat model
 
@@ -350,8 +369,8 @@ python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
 `--work` must not exist, must not be a symlink and must not be under
 `/tmp`. Its parent must be owned by you and not writable by group or
 other. A missing parent is created with mode 0700. `--work` holds the
-database password, the keys, the data and the raw logs. The script deletes it at the end unless `--keep-work` is given, and
-it deletes only a `--work` it created. Only summaries reach `--out`, which
+data, the configs and the raw logs, and no credential. The script deletes
+it at the end unless `--keep-work` is given, and it deletes only a `--work` it created. Only summaries reach `--out`, which
 defaults to `output/`. `--help` lists the workload options.
 
 This run used:

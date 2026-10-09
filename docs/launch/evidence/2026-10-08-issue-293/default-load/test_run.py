@@ -477,5 +477,102 @@ class WorkDirectory(Scratch):
         self.assertFalse((self.scratch / "work").exists())
 
 
+class Credentials(Scratch):
+    """No credential reaches a file or a command line."""
+
+    def test_docker_run_argv_never_carries_the_password(self):
+        password = "p" * 48
+        argv, env = run.postgres_run("trawl-ac23-test", "ac23-run", password)
+        self.assertEqual(env["POSTGRES_PASSWORD"], password)
+        self.assertFalse(any(password in arg for arg in argv), argv)
+        self.assertNotIn("--env-file", argv)
+        # --env NAME, with no =value, for every variable docker is given.
+        passed = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--env"]
+        self.assertEqual(sorted(passed), sorted(env))
+        self.assertTrue(all("=" not in name for name in passed), passed)
+
+    def test_start_postgres_hands_docker_the_password_through_its_environment(self):
+        r = run.Run(self.args())
+        r.claim_work()
+        seen = []
+
+        def fake(argv, **kwargs):
+            seen.append((argv, kwargs.get("env")))
+            raise RuntimeError("stop after docker run")
+        with mock.patch.object(run.subprocess, "run", fake):
+            with self.assertRaises(RuntimeError):
+                r.start_postgres()
+        argv, env = seen[0]
+        password = r.secrets[0]
+        self.assertFalse(any(password in arg for arg in argv), argv)
+        self.assertEqual(env["POSTGRES_PASSWORD"], password)
+        self.assertEqual(list((r.work / "private").iterdir()), [])
+        r.remove_work()
+
+    def test_private_file_is_owner_only_from_the_moment_it_exists(self):
+        path = self.scratch / "secret"
+        modes = []
+        real_fdopen = os.fdopen
+
+        def fdopen(fd, *a, **kw):
+            # Before the first byte: the file exists, empty, as created.
+            modes.append(os.fstat(fd).st_mode & 0o777)
+            return real_fdopen(fd, *a, **kw)
+        old = os.umask(0o000)
+        try:
+            with mock.patch.object(run.os, "fdopen", fdopen):
+                run.write_private(path, "hunter2\n")
+        finally:
+            os.umask(old)
+        self.assertEqual(modes, [0o600])
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(path.read_text(), "hunter2\n")
+
+    def test_private_file_refuses_an_existing_path(self):
+        path = self.scratch / "secret"
+        path.write_text("old")
+        with self.assertRaises(FileExistsError):
+            run.write_private(path, "new")
+        self.assertEqual(path.read_text(), "old")
+
+    def test_private_file_refuses_a_symlink(self):
+        target = self.scratch / "target"
+        for link_to in (target, self.scratch / "nowhere"):
+            with self.subTest(exists=link_to.exists()):
+                link = self.scratch / "link"
+                link.symlink_to(link_to)
+                if link_to == target:
+                    target.write_text("keep")
+                with self.assertRaises(OSError):
+                    run.write_private(link, "secret")
+                self.assertFalse((self.scratch / "nowhere").exists())
+                if link_to == target:
+                    self.assertEqual(target.read_text(), "keep")
+                link.unlink()
+
+    def test_trawld_and_vector_configs_are_written_through_write_private(self):
+        r = run.Run(self.args())
+        r.claim_work()
+        written = []
+        real = run.write_private
+
+        def spy(path, text):
+            written.append(Path(path).name)
+            real(path, text)
+        r.fleet_dsn = r.app_dsn = "postgres://x"
+        r.ingest_keys = ["k1", "k2", "k3"]
+        r.port, r.cert = 1, Path("/cert.pem")
+        # trawld "exits" at once, so start_trawld stops after the config write.
+        with mock.patch.object(run, "write_private", spy), \
+                mock.patch.object(r, "spawn", return_value=mock.Mock(poll=lambda: 1)):
+            with self.assertRaises(RuntimeError):
+                r.start_trawld("trawld.log")
+            r.start_vectors()
+        self.assertEqual(written, ["trawld.toml", "vector-1.json", "vector-2.json", "vector-3.json"])
+        for name in written:
+            self.assertEqual(os.stat(r.work / "private" / name).st_mode & 0o777, 0o600)
+        r.remove_work()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

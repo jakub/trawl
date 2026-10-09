@@ -37,13 +37,17 @@ Usage, from the repository root:
     python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \\
         --work .flow-scratch/default-load --vector /path/to/vector
 
---work is private: it holds the database password, the API keys, the data
-directory and the raw logs, and is deleted at the end unless --keep-work is
-given. Its parent must be owned by the invoking user and not writable by
-group or other. The script deletes only a --work directory it created
-itself (see check_work_path and Run.remove_work). Only summaries reach
---out. The script owns one Postgres container, one trawld and three Vector
-processes, and removes all of them on exit.
+--work is private: it holds the data directory, the trawld and Vector
+configs and the raw logs, and is deleted at the end unless --keep-work is
+given. The script writes no credential into it: the database password goes
+to docker through docker's own environment, the DSNs to trawld through its
+environment, and the API keys to Vector through its environment. The
+configs it does write are created owner-only (see write_private). Its
+parent must be owned by the invoking user and not writable by group or
+other. The script deletes only a --work directory it created itself (see
+check_work_path and Run.remove_work). Only summaries reach --out. The
+script owns one Postgres container, one trawld and three Vector processes,
+and removes all of them on exit.
 
 --check-summary output/summary.json applies the pass check to an existing
 summary and runs nothing.
@@ -122,6 +126,36 @@ def sha256(path):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def write_private(path, text):
+    """Create path, which must not exist, as an owner-only file and write
+    text through the descriptor.
+
+    The file has mode 0600 from the moment it exists; a write followed by
+    a chmod would leave a window at the umask's permissions. O_EXCL refuses
+    an existing path and a symlink, and O_NOFOLLOW refuses a symlink at the
+    last component outright."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def postgres_run(container, run_id, password):
+    """(argv, env) of the docker run that starts the disposable Postgres.
+
+    The credentials travel in docker's own environment, never in a file or
+    on the command line, which any local user can read through /proc: argv
+    names each variable with --env and no value, and docker takes the value
+    from env."""
+    names = {"POSTGRES_USER": "ac23", "POSTGRES_PASSWORD": password, "POSTGRES_DB": "fleet"}
+    argv = DOCKER + ["run", "--detach", "--name", container,
+                     "--label", f"trawl.experiment={run_id}",
+                     "--publish", "127.0.0.1::5432",
+                     *[a for name in names for a in ("--env", name)],
+                     "--memory", "1g", "--tmpfs", "/var/lib/postgresql:size=512m",
+                     POSTGRES_IMAGE]
+    return argv, names
 
 
 def parse_metrics(text):
@@ -459,15 +493,9 @@ class Run:
     def start_postgres(self):
         password = secrets.token_hex(24)
         self.secrets.append(password)
-        env_file = self.work / "private/postgres.env"
-        env_file.write_text(f"POSTGRES_USER=ac23\nPOSTGRES_PASSWORD={password}\nPOSTGRES_DB=fleet\n")
-        env_file.chmod(0o600)
         log(f"starting Postgres container {self.container}")
-        self.cmd(DOCKER + ["run", "--detach", "--name", self.container,
-                           "--label", f"trawl.experiment={self.run_id}",
-                           "--publish", "127.0.0.1::5432", "--env-file", str(env_file),
-                           "--memory", "1g", "--tmpfs", "/var/lib/postgresql:size=512m",
-                           POSTGRES_IMAGE])
+        argv, env = postgres_run(self.container, self.run_id, password)
+        self.cmd(argv, env=env)
         mapping = self.cmd(DOCKER + ["port", self.container, "5432/tcp"]).splitlines()[0]
         if not re.fullmatch(r"127\.0\.0\.1:\d+", mapping):
             raise RuntimeError(f"unexpected Postgres port mapping {mapping}")
@@ -511,7 +539,7 @@ class Run:
         self.data = state / "data"
         config = (HERE / "trawld.toml").read_text().replace("@DATA_DIR@", str(self.data))
         config_path = self.work / "private/trawld.toml"
-        config_path.write_text(config)
+        write_private(config_path, config)
         self.trawld_log = self.work / log_name
         env = {"FLEET_DATABASE_URL": self.fleet_dsn, "TRAWL_DATABASE_URL": self.app_dsn,
                "RUST_LOG": "trawl_server=info,fleet_auth=info", "NO_COLOR": "1"}
@@ -678,7 +706,7 @@ class Run:
         self.vectors = []
         for i in range(self.args.senders):
             path = self.work / f"private/vector-{i + 1}.json"
-            path.write_text(json.dumps(self.vector_config(i), indent=2))
+            write_private(path, json.dumps(self.vector_config(i), indent=2))
             env = {"TRAWL_URL": f"https://127.0.0.1:{self.port}",
                    "TRAWL_INGEST_TOKEN": self.ingest_keys[i], "VECTOR_LOG": "info",
                    "VECTOR_COLOR": "never",
