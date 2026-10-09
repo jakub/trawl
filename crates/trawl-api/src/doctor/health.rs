@@ -45,6 +45,10 @@ pub const HEALTH_CHECK_NAMES: [&str; 6] = [
 /// is a few hundred.
 pub const BODY_MAX: usize = 64 * 1024;
 
+/// What every vantage shows for [`Answer::RequestLimit`], so the doctors
+/// agree on what the refusal means.
+pub const REQUEST_LIMIT_REFUSED: &str = "probe refused: trawld at its request limit";
+
 /// A check name the report may show: `[a-z][a-z0-9_]{0,63}`.
 #[must_use]
 pub fn is_health_key(name: &str) -> bool {
@@ -172,6 +176,11 @@ pub enum Answer {
     /// A 503 `corpus_recovering` refusal: trawld's corpus is still
     /// recovering after a restart and it cannot answer for it yet.
     Recovering,
+    /// A 503 `request_limit_reached` refusal: trawld was at its count of
+    /// requests in progress, or at its control allowance, and refused the
+    /// probe before any handler ran (ADR-0054). It says nothing about the
+    /// checks, and it is not another service's answer: retry with backoff.
+    RequestLimit,
     /// An HTTP status trawld's health endpoint never sends, whatever the
     /// body.
     Status(u16),
@@ -192,7 +201,7 @@ impl Answer {
     pub fn outcome(&self) -> Outcome {
         match self {
             Self::Health(health) => health.outcome(),
-            Self::Recovering | Self::TooLarge => Outcome::NotSampled,
+            Self::Recovering | Self::RequestLimit | Self::TooLarge => Outcome::NotSampled,
             Self::Status(_) | Self::Disagrees | Self::Foreign => Outcome::Failed,
         }
     }
@@ -292,8 +301,10 @@ impl KeyAnswer {
 /// `checks` map keeps one [`KeyAnswer`] per known check, so a 503 from a
 /// failed `DuckDB` probe fails its own row, unless its `status` disagrees
 /// with the HTTP status. A 503 `corpus_recovering` refusal is
-/// [`Answer::Recovering`], as [`classify`] maps the corpus recovery values.
-/// Anything else is not trawld's health answer.
+/// [`Answer::Recovering`], as [`classify`] maps the corpus recovery values,
+/// and a 503 `request_limit_reached` refusal is [`Answer::RequestLimit`].
+/// Either code under any other status, like any other body, is not
+/// trawld's health answer.
 #[must_use]
 pub fn judge(http: u16, body: &[u8]) -> Answer {
     if !is_health_http_status(http) {
@@ -331,9 +342,12 @@ pub fn judge(http: u16, body: &[u8]) -> Answer {
     }
     if http == 503
         && let Ok(refusal) = serde_json::from_slice::<ErrorResponse>(body)
-        && refusal.error.code == ErrorCode::CorpusRecovering
     {
-        return Answer::Recovering;
+        match refusal.error.code {
+            ErrorCode::CorpusRecovering => return Answer::Recovering,
+            ErrorCode::RequestLimitReached => return Answer::RequestLimit,
+            _ => {}
+        }
     }
     Answer::Foreign
 }
@@ -609,6 +623,54 @@ mod tests {
         assert_eq!(degraded.http_status(), 200);
         assert_eq!(degraded.status(), &Degraded);
         assert!(!degraded.has_version());
+    }
+
+    /// trawld's request-limit refusal, under either allowance's message,
+    /// is a capacity refusal: not sampled, with no checks, and not a
+    /// foreign answer. Only the 503 with the typed code is; the same code
+    /// under another status, another code, and an unrelated body stay
+    /// what they were (ADR-0054).
+    #[test]
+    fn health_request_limit_refusal_is_not_sampled_and_not_foreign() {
+        let regular = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
+        let control = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff","details":[]}}"#;
+        for body in [regular.as_slice(), control.as_slice()] {
+            let judged = judge(503, body);
+            assert_eq!(judged, Answer::RequestLimit);
+            assert_eq!(judged.outcome(), Outcome::NotSampled);
+            let debug = format!("{judged:?}");
+            assert!(!debug.contains("max_concurrent_requests"), "{debug}");
+            assert!(!debug.contains("allowance"), "{debug}");
+        }
+        assert_eq!(
+            REQUEST_LIMIT_REFUSED,
+            "probe refused: trawld at its request limit"
+        );
+        assert_eq!(
+            crate::doctor::reason::REQUEST_LIMIT_REACHED,
+            "request_limit_reached"
+        );
+
+        // The code alone decides nothing: under a status trawld's health
+        // endpoint does not send it with, the answer is what it was.
+        assert_eq!(judge(200, regular), Answer::Foreign);
+        assert_eq!(judge(429, regular), Answer::Status(429));
+        assert_eq!(judge(500, regular), Answer::Status(500));
+        // Another code, an unknown one, and an unrelated body are foreign.
+        for body in [
+            br#"{"error":{"code":"internal_error","message":"x"}}"#.as_slice(),
+            br#"{"error":{"code":"request_limit","message":"x"}}"#,
+            br#"{"error":"request_limit_reached"}"#,
+            br#"{"code":"request_limit_reached"}"#,
+            b"<html>503 Service Unavailable</html>",
+        ] {
+            assert_eq!(
+                judge(503, body),
+                Answer::Foreign,
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]

@@ -2058,6 +2058,114 @@ fn doctor_identity_requires_exactly_200() {
     }
 }
 
+/// trawld's request-limit refusal (ADR-0054), under either allowance's
+/// message, is a capacity refusal: `api.health` is `not_sampled` with the
+/// reason `request_limit_reached`, the shared text, and a retry with
+/// backoff, never wrong-service advice. The health proof stays incomplete:
+/// no witness, no per-check rows, `api.identity` blocked, and the stub sees
+/// only the unkeyed probe. The run is incomplete, exit 3. On `whoami` the
+/// same refusal leaves `api.identity` not sampled. The typed code alone
+/// decides nothing: an unrelated 503 envelope still fails as not a health
+/// answer.
+#[test]
+fn doctor_request_limit_refusal_is_not_sampled() {
+    let regular = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
+    let control = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff","details":[]}}"#;
+    let assert_refused = |check: &serde_json::Value, case: &str| {
+        assert_eq!(check["outcome"], "not_sampled", "{case}: {check}");
+        assert_eq!(check["reason"], "request_limit_reached", "{case}: {check}");
+        assert_eq!(
+            check["detail"], "probe refused: trawld at its request limit",
+            "{case}: {check}"
+        );
+        let next = check["next_action"].as_str().unwrap_or_default();
+        assert!(next.contains("retry with backoff"), "{case}: {next}");
+        assert!(
+            !next.contains("another service") && !next.contains("proxy"),
+            "{case}: {next}"
+        );
+    };
+
+    for (case, body) in [("regular", regular), ("control", control)] {
+        let (output, stub) = doctor_against(vec![
+            (HEALTH_PATH, 503, body.to_owned()),
+            whoami(r#""query""#),
+        ]);
+        assert_eq!(output.status.code(), Some(3), "{case}: {}", text(&output));
+        let report = report(&output);
+        assert_eq!(report["verdict"], "incomplete", "{case}");
+        assert_eq!(
+            api_rows(&report),
+            [
+                own_row("api.transport", "complete", None, None),
+                own_row("api.tls", "complete", None, None),
+                own_row(
+                    "api.health",
+                    "not_sampled",
+                    Some("request_limit_reached"),
+                    None
+                ),
+                own_row(
+                    "api.identity",
+                    "not_sampled",
+                    Some("blocked"),
+                    Some("api.health")
+                ),
+            ],
+            "{case}"
+        );
+        assert_refused(check_by_id(&report, "api.health"), case);
+        assert!(
+            !rows(&report)
+                .iter()
+                .any(|(id, ..)| id.starts_with("api.health.")),
+            "{case}: no per-check rows are invented"
+        );
+        let all = text(&output);
+        assert!(!all.contains("another service"), "{case}: {all}");
+        assert!(!all.contains(PROFILE_TOKEN), "{case}");
+        let requests = stub.requests();
+        let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, [HEALTH_PATH], "{case}: only the unkeyed probe");
+        stub.assert_no_authorization(case);
+    }
+
+    // On whoami, after trawl's health answer: identity could not look.
+    let (output, _stub) = doctor_against(vec![healthy(), (WHOAMI_PATH, 503, regular.to_owned())]);
+    assert_eq!(output.status.code(), Some(3), "whoami: {}", text(&output));
+    assert_refused(
+        &check_by_id(&report(&output), "api.identity").clone(),
+        "whoami",
+    );
+
+    // Controls: an unrelated 503 envelope, or a code this CLI does not
+    // know, is still not a health answer.
+    for body in [
+        r#"{"error":{"code":"internal_error","message":"x"}}"#,
+        r#"{"error":{"code":"request_limit","message":"x"}}"#,
+    ] {
+        let (output, stub) = doctor_against(vec![
+            (HEALTH_PATH, 503, body.to_owned()),
+            whoami(r#""query""#),
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{body}: {}", text(&output));
+        let report = report(&output);
+        let health = check_by_id(&report, "api.health");
+        assert_eq!(health["outcome"], "failed", "{body}");
+        assert_eq!(
+            health["reason"], "HTTP 503 is not a health answer",
+            "{body}"
+        );
+        assert!(
+            health["next_action"]
+                .as_str()
+                .is_some_and(|next| next.contains("another service")),
+            "{body}: {health}"
+        );
+        stub.assert_no_authorization(body);
+    }
+}
+
 /// A 200 health or whoami body past the client's cap is not read: the
 /// check fails with `response too large`, and the run finishes with a
 /// report rather than a crash. An oversized health body blocks identity,

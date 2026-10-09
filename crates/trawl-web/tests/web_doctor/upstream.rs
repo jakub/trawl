@@ -366,6 +366,85 @@ async fn web_doctor_redirect_refused() {
     assert_anonymous_probes(elsewhere.mock(), 0).await;
 }
 
+/// trawld's request-limit refusal, under either allowance's message, is a
+/// capacity refusal and not a foreign answer: `proxy.upstream.health` is
+/// `not_sampled`/`request_limit_reached` with the shared text and a retry
+/// with backoff, no per-check row is invented, no row says another service
+/// answers, and the run is incomplete. One probe, no retry. The same code
+/// under a 200, and an unrelated 503 envelope, still fail as answers that
+/// are not trawld's (ADR-0054).
+#[tokio::test(flavor = "multi_thread")]
+async fn web_doctor_request_limit_refusal_is_not_sampled() {
+    let regular = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
+    let control = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff","details":[]}}"#;
+    let ca = TestCa::named(CA_SUBJECT);
+    let answer = |status: u16, body: &str| {
+        ResponseTemplate::new(status)
+            .insert_header("cache-control", "no-store")
+            .set_body_raw(body.to_owned(), "application/json")
+    };
+
+    for body in [regular, control] {
+        let upstream = TlsUpstream::issued_by(&ca).await;
+        serve_health(upstream.mock(), answer(503, body)).await;
+        let setup = Setup::pinned(upstream.url(), &ca);
+        let (code, report) = setup.run().await;
+        assert_eq!(code, 3, "{report:?}");
+        assert_eq!(
+            verdict(&report, "proxy.upstream.health"),
+            (Outcome::NotSampled, Some(reason::REQUEST_LIMIT_REACHED))
+        );
+        let health = row(&report, "proxy.upstream.health");
+        assert_eq!(
+            health.detail.as_deref(),
+            Some("probe refused: trawld at its request limit")
+        );
+        assert!(
+            health
+                .next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("retry with backoff")),
+            "{health:?}"
+        );
+        for check in report.checks() {
+            assert!(
+                !check.id.starts_with("proxy.upstream.health."),
+                "no per-check rows are invented: {check:?}"
+            );
+            let next = check.next_action.as_deref().unwrap_or_default();
+            assert!(!next.contains("another service"), "{check:?}");
+        }
+        upstream.front().settle().await;
+        assert_eq!(upstream.front().connections(), 1);
+        assert_anonymous_probes(upstream.mock(), 1).await;
+    }
+
+    // Controls: the code under a status trawld does not pair it with, and
+    // an unrelated envelope or body under a 503, are still not trawld's.
+    for (status, body) in [
+        (200, regular),
+        (503, r#"{"error":{"code":"internal_error","message":"x"}}"#),
+        (503, "<html>503 Service Unavailable</html>"),
+    ] {
+        let upstream = TlsUpstream::issued_by(&ca).await;
+        serve_health(upstream.mock(), answer(status, body)).await;
+        let setup = Setup::pinned(upstream.url(), &ca);
+        let (code, report) = setup.run().await;
+        assert_health_failed(
+            code,
+            &report,
+            "the health answer is not trawld's health body",
+        );
+        assert!(
+            row(&report, "proxy.upstream.health")
+                .next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("another service")),
+            "{report:?}"
+        );
+    }
+}
+
 /// Nothing accepts connections at the upstream's address. The port is held
 /// by a socket bound without listening for the whole run, so no other
 /// process can take it and answer: a connection to it is refused.
