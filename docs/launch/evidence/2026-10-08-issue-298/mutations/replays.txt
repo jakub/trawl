@@ -1,0 +1,67 @@
+# #298 mutation replays (AC12)
+
+tree:      2b70ab2c0a7d653ac0c6f6d271ca84213d412d66 (patches apply to crates/trawl-server/src/transport/request_limit.rs)
+toolchain: rustc 1.98.0 (88d9e12ae 2026-08-18)
+command:   cargo nextest run -p trawl-server --test request_limit --no-fail-fast --no-tests=fail -E '<filter>'
+kill:      nextest exit 100 (tests ran, one failed). 101 is a build failure and 4 an
+           empty filter; neither is a kill. Exit 0 means the mutation survived.
+deadline:  each target's refused request goes to a handler that answers at once, so a
+           kill presents as an assertion on the status, not as the 20 s DEADLINE.
+
+## Control: both filters on the pristine tree
+
+-E test(=routes::junk_tokens_in_control_do_not_starve_probes)
+exit=0
+        PASS [   0.591s] (1/1) trawl-server::request_limit routes::junk_tokens_in_control_do_not_starve_probes
+     Summary [   0.591s] 1 test run: 1 passed, 22 skipped
+
+-E test(=edge::probe_allowance_saturates_at_three)
+exit=0
+        PASS [   0.010s] (1/1) trawl-server::request_limit edge::probe_allowance_saturates_at_three
+     Summary [   0.011s] 1 test run: 1 passed, 22 skipped
+
+## 01-probe-rows-in-control.patch
+
+target:            -E test(=routes::junk_tokens_in_control_do_not_starve_probes)
+exit:              100 (killed)
+compiler warnings: 0
+deadline timeout:  no
+tree after revert: clean
+
+        FAIL [   0.579s] (1/1) trawl-server::request_limit routes::junk_tokens_in_control_do_not_starve_probes
+    thread 'routes::junk_tokens_in_control_do_not_starve_probes' (2679854) panicked at crates/trawl-server/tests/request_limit/routes.rs:779:5:
+    assertion `left == right` failed: GET /api/v1/health: {"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff"}}
+      left: 503
+     right: 200
+     Summary [   0.580s] 1 test run: 0 passed, 1 failed, 22 skipped
+
+## 02-probe-allowance-four.patch
+
+target:            -E test(=edge::probe_allowance_saturates_at_three)
+exit:              100 (killed)
+compiler warnings: 0
+deadline timeout:  no
+tree after revert: clean
+
+        FAIL [   0.010s] (1/1) trawl-server::request_limit edge::probe_allowance_saturates_at_three
+    thread 'edge::probe_allowance_saturates_at_three' (2683322) panicked at crates/trawl-server/tests/request_limit/support.rs:301:5:
+    assertion `left == right` failed
+      left: 200
+     right: 503
+     Summary [   0.011s] 1 test run: 0 passed, 1 failed, 22 skipped
+
+## 03-probe-borrows-regular.patch
+
+target:            -E test(=edge::probe_allowance_saturates_at_three)
+exit:              100 (killed)
+compiler warnings: 0
+deadline timeout:  no
+tree after revert: clean
+
+        FAIL [   0.010s] (1/1) trawl-server::request_limit edge::probe_allowance_saturates_at_three
+    thread 'edge::probe_allowance_saturates_at_three' (2686492) panicked at crates/trawl-server/tests/request_limit/support.rs:301:5:
+    assertion `left == right` failed
+      left: 200
+     right: 503
+     Summary [   0.010s] 1 test run: 0 passed, 1 failed, 22 skipped
+

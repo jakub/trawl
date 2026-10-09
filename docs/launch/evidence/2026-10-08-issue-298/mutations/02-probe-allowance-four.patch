@@ -1,0 +1,13 @@
+diff --git i/crates/trawl-server/src/transport/request_limit.rs w/crates/trawl-server/src/transport/request_limit.rs
+index 21073eae..d5ca194d 100644
+--- i/crates/trawl-server/src/transport/request_limit.rs
++++ w/crates/trawl-server/src/transport/request_limit.rs
+@@ -63,7 +63,7 @@ impl Allowance {
+ 
+ /// Requests in progress reserved for the probe routes, fixed in code
+ /// (ADR-0054): the liveness probe, the readiness probe and one scrape.
+-pub const PROBE_ALLOWANCE: usize = 3;
++pub const PROBE_ALLOWANCE: usize = 4;
+ 
+ /// Requests in progress reserved for the control routes, fixed in code
+ /// (ADR-0054): two operators listing or cancelling queries at once do not
