@@ -143,6 +143,7 @@ fn every_outcome_and_reason_code_is_documented() {
         reason::BLOCKED,
         reason::PERMISSION_DENIED,
         reason::RAN_AS_ROOT,
+        reason::REQUEST_LIMIT_REACHED,
         reason::TIMED_OUT,
     ] {
         assert_documented(&format!("`{code}`"), "the reason code");

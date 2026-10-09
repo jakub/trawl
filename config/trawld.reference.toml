@@ -28,9 +28,15 @@
 # Increase if POST /query payloads are large (e.g. complex DSL queries).
 # max_request_body_bytes = "128K"
 
-# Maximum concurrent HTTP requests. Returns 503 when exceeded.
-# Increase for high-traffic deployments; decrease to protect resources.
-# max_concurrent_requests = 256
+# Maximum HTTP requests in progress across the whole listener, 1 to 65536.
+# One count covers every route and method. When it is full, trawld refuses
+# the next request at once with 503 `request_limit_reached` and no
+# Retry-After; it never queues a request. Senders retry with backoff.
+# Four more requests are reserved for health, metrics, query listing and
+# query cancellation, so probes and scrapes still get through.
+# Ingest requests dominate memory: count x (wire body + decoded body),
+# 32 x 32 MiB = 1 GiB at the defaults. Lower it before raising it.
+# max_concurrent_requests = 32
 
 # Graceful shutdown drain timeout (seconds). In-flight requests get
 # this long to finish before being aborted.

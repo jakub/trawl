@@ -274,6 +274,10 @@ pub struct IngestState {
     /// and the handler refuses a gzip body that decompresses past it, so
     /// one request never holds more than this much body in memory.
     pub max_body_bytes: usize,
+    /// Test holds on the ingest and preview work that keeps a request's
+    /// count. Shared by this state's clones, never by another state.
+    #[cfg(any(test, feature = "test-support"))]
+    pub body_work_holds: Arc<crate::transport::request_limit::body_work::Holds>,
 }
 
 /// Parse `[ingest] trusted_relays` CIDRs, boot-fatally.
@@ -767,6 +771,8 @@ impl AppState {
                 repin_coordinator: repin_coordinator.clone(),
                 retry_after_secs: config.ingest.compaction_interval_secs,
                 max_body_bytes: config.ingest.max_body_bytes,
+                #[cfg(any(test, feature = "test-support"))]
+                body_work_holds: Arc::default(),
             },
             start_time: Instant::now(),
             total_queries: Arc::new(AtomicU64::new(0)),

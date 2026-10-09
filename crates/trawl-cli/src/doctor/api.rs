@@ -19,12 +19,12 @@
 //! sees a key.
 //!
 //! Every outcome is decided from [`ClientError::network_kind`] or a
-//! [`ClientError::Server`] status, never from an error's text, and no
-//! error's `Display` or `Debug` reaches the report. Strings the server sent
-//! pass through [`display_safe`] first, which also redacts any run of the
-//! selected key: a server that echoes the key, or its prefix, in a name, a
-//! permission, a check name or value, or its version does not get it into
-//! the report.
+//! [`ClientError::Server`] status and typed error code, never from an
+//! error's text, and no error's `Display` or `Debug` reaches the report.
+//! Strings the server sent pass through [`display_safe`] first, which also
+//! redacts any run of the selected key: a server that echoes the key, or its
+//! prefix, in a name, a permission, a check name or value, or its version
+//! does not get it into the report.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use trawl_api::doctor::health::{self, ValueClass, is_health_key, is_quotable_value};
 use trawl_api::doctor::{Check, Outcome, reason};
-use trawl_api::{HealthResponse, HealthStatus, WhoAmIResponse};
+use trawl_api::{ErrorCode, HealthResponse, HealthStatus, WhoAmIResponse};
 use trawl_client::{ClientError, NetworkKind, TlsTrust};
 
 use super::resolve::{Connection, Scheme};
@@ -371,7 +371,8 @@ impl<'a> ApiRun<'a> {
     /// health body, one that parses, carries both `checks` and `version`,
     /// and came under the HTTP status trawld sends with its `status`, mints
     /// the API witness, the only way `api.identity` can send the key;
-    /// anything else fails here and blocks it.
+    /// anything else, trawld's request-limit refusal included, fails or is
+    /// not sampled here and blocks it.
     pub fn health(&mut self) -> Vec<Check> {
         let tls = self
             .tls
@@ -582,6 +583,21 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
             with_next(
                 with_reason(check, reason::RATE_LIMITED),
                 "wait a minute, then run trawl doctor again",
+            )
+        }
+        // trawld's own capacity refusal (ADR-0054), told apart by its 503
+        // and typed code only: the doctor could not look, and the server
+        // is not another service. No witness was minted, so the key stays
+        // home.
+        ClientError::Server { status: 503, error }
+            if error.code == ErrorCode::RequestLimitReached =>
+        {
+            check.outcome = Outcome::NotSampled;
+            check.detail = Some(health::REQUEST_LIMIT_REFUSED.to_owned());
+            with_next(
+                with_reason(check, reason::REQUEST_LIMIT_REACHED),
+                "retry with backoff: run trawl doctor again after the server's requests in \
+                 progress drain",
             )
         }
         ClientError::Server { status, .. } if (300..400).contains(status) => with_next(

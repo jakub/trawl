@@ -76,7 +76,13 @@ pub struct ServerConfig {
     )]
     pub max_request_body_bytes: usize,
 
-    /// Maximum concurrent HTTP requests (default: 256).
+    /// Maximum HTTP requests in progress across the whole listener
+    /// (default: 32, range 1 to 65,536; ADR-0054).
+    ///
+    /// One count covers every route and method. When it is full, trawld
+    /// refuses the next request at once with 503 `request_limit_reached`
+    /// and no `Retry-After`; it never queues. Four further requests are
+    /// reserved for health, metrics and query list and cancel.
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 
@@ -1073,8 +1079,12 @@ pub const DEFAULT_MAX_RESULT_ROWS: usize = 100_000;
 pub const DEFAULT_MAX_EXPORT_ROWS: usize = 1_000_000;
 /// Default maximum request body size (128 KB).
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
-/// Default maximum concurrent HTTP requests.
-pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 256;
+/// Default maximum HTTP requests in progress.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 32;
+/// Largest accepted `server.max_concurrent_requests`. Tokio's semaphore
+/// caps its permits at `Semaphore::MAX_PERMITS`; a test holds this bound
+/// below that.
+pub const MAX_CONCURRENT_REQUESTS_LIMIT: usize = 65_536;
 /// Default graceful shutdown drain timeout (seconds).
 pub const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
 /// Default TLS certificate reload interval (seconds). 0 = disabled.
@@ -1827,6 +1837,14 @@ impl Config {
             ));
         }
 
+        if !(1..=MAX_CONCURRENT_REQUESTS_LIMIT).contains(&self.server.max_concurrent_requests) {
+            return Err(ConfigError::Validation(format!(
+                "server.max_concurrent_requests must be between 1 and \
+                 {MAX_CONCURRENT_REQUESTS_LIMIT}; got {}",
+                self.server.max_concurrent_requests
+            )));
+        }
+
         validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
         validate_max_catchup_intervals(self.scheduler.max_catchup_intervals)?;
 
@@ -2135,6 +2153,42 @@ path = "/data"
             config.server.log_file.as_deref(),
             Some(std::path::Path::new("/var/log/trawld.log"))
         );
+    }
+
+    #[test]
+    fn max_concurrent_requests_bounds() {
+        let with = |value: Option<usize>| -> Config {
+            let setting = value
+                .map(|v| format!("max_concurrent_requests = {v}"))
+                .unwrap_or_default();
+            toml::from_str(&format!(
+                "[server]\n{setting}\n[data]\npath = \"/data\"\n[auth]\n"
+            ))
+            .unwrap()
+        };
+
+        assert_eq!(DEFAULT_MAX_CONCURRENT_REQUESTS, 32);
+        assert_eq!(with(None).server.max_concurrent_requests, 32);
+        with(None).validate().unwrap();
+
+        for refused in [0, MAX_CONCURRENT_REQUESTS_LIMIT + 1] {
+            let message = with(Some(refused)).validate().unwrap_err().to_string();
+            assert!(
+                message.contains("server.max_concurrent_requests"),
+                "{refused}: the message must name the setting: {message}"
+            );
+            assert!(
+                message.contains("between 1 and 65536"),
+                "{refused}: the message must name the range: {message}"
+            );
+        }
+        for accepted in [1, MAX_CONCURRENT_REQUESTS_LIMIT] {
+            with(Some(accepted)).validate().unwrap();
+        }
+
+        assert_eq!(MAX_CONCURRENT_REQUESTS_LIMIT, 65_536);
+        // Both sides are constants, so the bound is checked at compile time.
+        const { assert!(MAX_CONCURRENT_REQUESTS_LIMIT <= tokio::sync::Semaphore::MAX_PERMITS) };
     }
 
     #[test]

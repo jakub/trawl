@@ -1394,7 +1394,9 @@ async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<
 /// answer, which trawld sends only with a 503, fails the check itself
 /// whatever its checks say, even when it reports none or only `ok` ones. A
 /// 503 `corpus_recovering` envelope is `recovering`, as the classifier maps
-/// the corpus recovery values. Anything else is not trawld's health answer.
+/// the corpus recovery values, and a 503 `request_limit_reached` envelope is
+/// `request_limit_reached` with no per-check rows. Anything else is not
+/// trawld's health answer.
 fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
     let check = ServerCheck::ListenerHealth;
     match health::judge(status, body) {
@@ -1423,6 +1425,17 @@ fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
                      restart",
                 ))
                 .next(Text::new("wait for trawld to finish recovery, then rerun")),
+            Vec::new(),
+        ),
+        // A capacity refusal is trawld's own answer, not another
+        // service's: the doctor could not look, and invents no checks.
+        health::Answer::RequestLimit => (
+            Row::not_sampled(check, reason::REQUEST_LIMIT_REACHED)
+                .detail(Text::new(health::REQUEST_LIMIT_REFUSED))
+                .next(Text::new(
+                    "retry with backoff: rerun the doctor after trawld's requests in progress \
+                     drain",
+                )),
             Vec::new(),
         ),
         health::Answer::Status(status) => (status_failure(status), Vec::new()),

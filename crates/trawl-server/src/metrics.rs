@@ -64,6 +64,16 @@ pub const HOT_BUFFER_DUPLICATE_BATCHES_TOTAL: &str = "trawl_hot_buffer_duplicate
 /// stall threshold to it.
 pub const COMPACTION_INTERVAL_SECONDS: &str = "trawl_compaction_interval_seconds";
 pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";
+/// Requests in progress on the HTTPS listener, labelled by `allowance`
+/// (`regular` or `control`, ADR-0054). Follows ownership: blocking ingest
+/// and preview work that holds a request's body keeps its request counted.
+pub const REQUESTS_IN_PROGRESS: &str = "trawl_http_requests_in_progress";
+/// Requests refused at once because their allowance was full, labelled by
+/// `allowance` (ADR-0054).
+pub const REQUESTS_REFUSED_TOTAL: &str = "trawl_http_requests_refused_total";
+/// The size of each allowance: `[server] max_concurrent_requests` for
+/// `regular`, the fixed control allowance for `control` (ADR-0054).
+pub const REQUEST_ALLOWANCE: &str = "trawl_http_request_allowance";
 /// Pool permits held by work whose request already answered (ADR-0024).
 ///
 /// A subset of the held permits, not an addition to them, and
@@ -493,6 +503,23 @@ pub fn describe_metrics() {
         "Configured compaction interval (ingest.compaction_interval_secs)"
     );
     describe_gauge!(ACTIVE_CONNECTIONS, "Number of in-flight HTTP requests");
+    describe_gauge!(
+        REQUESTS_IN_PROGRESS,
+        "HTTP requests in progress, by allowance (regular: \
+         server.max_concurrent_requests; control: health, metrics and query \
+         listing and cancellation). Ingest and preview work that holds a \
+         request's body keeps it counted after the client leaves"
+    );
+    describe_counter!(
+        REQUESTS_REFUSED_TOTAL,
+        "HTTP requests refused with 503 request_limit_reached because their \
+         allowance had no request in progress free, by allowance"
+    );
+    describe_gauge!(
+        REQUEST_ALLOWANCE,
+        "Size of each request allowance: server.max_concurrent_requests for \
+         regular, the fixed control allowance for control"
+    );
     describe_gauge!(
         QUERY_PERMITS_RETAINED,
         "Executor-pool permits held by query work whose request already \

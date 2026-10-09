@@ -1,0 +1,313 @@
+{
+  "runId": "ac23-20261009T043358Z-05e876",
+  "status": "passed",
+  "build": {
+    "head": "b38305242b361ec022252e5372869b018d2d2801",
+    "profile": "debug (cargo build --locked --no-default-features)",
+    "trawldSha256": "e98e3754606e4b05169f12f3bb7924f918b735b19c83d0c9c56eed775802b18d",
+    "vector": "vector 0.57.0 (x86_64-unknown-linux-gnu 8832452 2026-07-14 20:58:30.491174540)",
+    "vectorSha256": "79be503feab9ec57b010cbff2b0d9f4002ed442d16a6a5588e46f26ffba355c0"
+  },
+  "host": {
+    "platform": "Linux-7.2.5-3-omarchy-x86_64-with-glibc2.44",
+    "cpu": "x86_64",
+    "logicalCpus": 16,
+    "memTotalKiB": 32560004
+  },
+  "fixture": {
+    "path": "crates/trawl-server/tests/fixtures/vector-capture/debian.ndjson",
+    "events": 67,
+    "sha256": "46786dc9115fca6dbb532eb37ff0af614f70bc377bad22a6f0ba1498f291b66a",
+    "acceptedPerCycle": 67,
+    "rejectedPerCycle": 0
+  },
+  "seededHistory": [
+    {
+      "day": "2026-10-08",
+      "hour": "22",
+      "movedFrom": "2026-10-09/04",
+      "parquetFiles": 35
+    },
+    {
+      "day": "2026-10-08",
+      "hour": "23",
+      "movedFrom": "2026-10-09/04",
+      "parquetFiles": 35
+    }
+  ],
+  "measuredSessionStart": "2026-10-09T04:34:59.575976Z",
+  "vectorSink": {
+    "source": "config/vector/debian/base.toml [sinks.trawld], read at run time",
+    "shipped": {
+      "type": "http",
+      "inputs": [
+        "trawl_*"
+      ],
+      "uri": "${TRAWL_URL}/api/v1/ingest",
+      "method": "post",
+      "encoding": {
+        "codec": "json"
+      },
+      "auth": {
+        "strategy": "bearer",
+        "token": "${TRAWL_INGEST_TOKEN}"
+      },
+      "compression": {
+        "algorithm": "gzip"
+      },
+      "batch": {
+        "max_bytes": 1048576,
+        "timeout_secs": 5
+      },
+      "buffer": {
+        "type": "disk",
+        "max_size": 1073741824
+      },
+      "request": {
+        "retry_initial_backoff_secs": 1,
+        "retry_max_backoff_secs": 30,
+        "timeout_secs": 30,
+        "concurrency": "adaptive"
+      },
+      "tls": {
+        "verify_certificate": true,
+        "verify_hostname": true
+      }
+    },
+    "changed": {
+      "inputs": [
+        "replay"
+      ],
+      "tls.ca_file": "trawld's generated certificate"
+    },
+    "senders": 3
+  },
+  "workload": {
+    "phases": [
+      {
+        "kind": "backlog",
+        "cyclesPerSender": 1500
+      },
+      {
+        "kind": "steady",
+        "eventsPerSecondPerSender": 268,
+        "seconds": 180
+      }
+    ],
+    "scrapeIntervalSeconds": 0.25,
+    "queryThinkSeconds": 1.0
+  },
+  "producersStopped": {
+    "threadsStillRunning": [],
+    "vectorExitCodes": {
+      "vector-1": 0,
+      "vector-2": 0,
+      "vector-3": 0
+    }
+  },
+  "delivery": {
+    "expectedDistinct": {
+      "vector-1": 148740,
+      "vector-2": 148740,
+      "vector-3": 148740
+    },
+    "counted": {
+      "vector-2": {
+        "stored": 148740,
+        "distinct": 148740
+      },
+      "seed-2": {
+        "stored": 2010,
+        "distinct": 2010
+      },
+      "vector-1": {
+        "stored": 148740,
+        "distinct": 148740
+      },
+      "calibration": {
+        "stored": 67,
+        "distinct": 67
+      },
+      "seed-1": {
+        "stored": 2010,
+        "distinct": 2010
+      },
+      "vector-3": {
+        "stored": 148740,
+        "distinct": 148740
+      }
+    },
+    "complete": true,
+    "duplicates": {
+      "vector-1": 0,
+      "vector-2": 0,
+      "vector-3": 0
+    },
+    "written": {
+      "vector-1": 148740,
+      "vector-2": 148740,
+      "vector-3": 148740
+    },
+    "feedDoneSeconds": 181.06,
+    "deliveredSeconds": 192.735
+  },
+  "cleanup": {
+    "processes": true,
+    "container": true,
+    "containerState": "removed"
+  },
+  "metrics": {
+    "samples": 613,
+    "failedScrapes": 0,
+    "intervalSeconds": {
+      "target": 0.25,
+      "median": 0.25,
+      "max": 2.25
+    },
+    "terminalSnapshot": {
+      "t": 204.843,
+      "status": 200,
+      "attempts": 1
+    },
+    "allowance": {
+      "regular": 32.0,
+      "control": 4.0
+    },
+    "refusedTotalAtEnd": {
+      "regular": 0,
+      "control": 0
+    },
+    "refusedTotalMaxSeen": {
+      "regular": 0,
+      "control": 0
+    },
+    "invalidRefusalObservations": {
+      "regular": 0,
+      "control": 0
+    },
+    "sampledPeakInProgress": {
+      "regular": 9.0,
+      "atSeconds": 12.5,
+      "control": 1.0
+    },
+    "inProgressRegularHistogram": {
+      "0": 142,
+      "1": 172,
+      "2": 126,
+      "3": 85,
+      "4": 56,
+      "5": 8,
+      "6": 10,
+      "7": 12,
+      "8": 1,
+      "9": 1
+    },
+    "peakHotBufferEvents": 93605.0,
+    "hotBufferAdmissionStateSamples": {
+      "0": 255,
+      "1": 17,
+      "2": 341
+    },
+    "final": {
+      "trawl_ingest_events_rejected_total{reason=\"missing_service\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"empty_service\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"env_not_allowed\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_json\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"service_too_long\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_env\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"service_not_string\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"ingest_batch_too_large\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"host_missing_from_relay\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"hot_buffer_full\"}": 535418.0,
+      "trawl_ingest_events_rejected_total{reason=\"not_object\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_chars\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"pending_rollup_recovery\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"daily_rollup_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"daily_rollup_unit\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"chunk\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"consumed_wal_removal\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"wal_environment_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"pending_rollup_scan\"}": 0.0,
+      "trawl_queries_total{status=\"success\"}": 85.0,
+      "trawl_files_quarantined_total{kind=\"rollup_temporary\"}": 0.0,
+      "trawl_files_quarantined_total{kind=\"wal\"}": 0.0,
+      "trawl_files_quarantined_total{kind=\"parquet\"}": 0.0,
+      "trawl_ingest_events_total": 446220.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"full\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"oversized\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"full\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"oversized\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"full\"}": 198.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"oversized\"}": 0.0
+    }
+  },
+  "queries": {
+    "count": 82,
+    "byStatus": {
+      "200": 82
+    },
+    "msP50": 1370.4,
+    "msMax": 3278.7
+  },
+  "compactionAndRollup": {
+    "compaction_complete": {
+      "total": 316,
+      "duringIngest": 280
+    },
+    "rollup_complete": {
+      "total": 35,
+      "duringIngest": 35
+    },
+    "rollupWindow": [
+      "2026-10-09T04:36:07.519874Z",
+      "2026-10-09T04:36:10.581127Z"
+    ]
+  },
+  "ingestRequests": {
+    "accepted": 188,
+    "events": 446220,
+    "decodedBytes": {
+      "p50": 1052220,
+      "max": 1052399,
+      "atLeast900KB": 134
+    },
+    "wireBytes": {
+      "p50": 24227,
+      "max": 24751
+    },
+    "durationMs": {
+      "p50": 709,
+      "max": 1881
+    }
+  },
+  "httpFailuresFromTrawld": {
+    "/api/v1/ingest 503 hot_buffer_full": 198
+  },
+  "requestLimitRefusalEvents": 0,
+  "vectorLogs": {
+    "vector-1": {
+      "retryLines": 17,
+      "request_limit_reached": 0,
+      "hot_buffer_full": 0,
+      "requestTimeouts": 0,
+      "errorLines": 0
+    },
+    "vector-2": {
+      "retryLines": 24,
+      "request_limit_reached": 0,
+      "hot_buffer_full": 0,
+      "requestTimeouts": 0,
+      "errorLines": 0
+    },
+    "vector-3": {
+      "retryLines": 23,
+      "request_limit_reached": 0,
+      "hot_buffer_full": 0,
+      "requestTimeouts": 0,
+      "errorLines": 0
+    }
+  },
+  "failureReasons": []
+}

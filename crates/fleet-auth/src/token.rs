@@ -50,10 +50,12 @@ impl std::fmt::Debug for GeneratedToken {
     }
 }
 
-/// Pre-computed dummy argon2id hash for timing equalization on prefix miss.
+/// Dummy argon2id hash for timing equalization on prefix miss.
 ///
-/// Generated once at process start so the `verify_token` call on the miss
-/// path takes the same wall-clock as the hit path.
+/// The `verify_token` call on the miss path checks against it, so a miss
+/// takes the same wall-clock as a hit. It is hashed once, on first use. The
+/// key store dereferences it only inside a blocking-pool step that holds an
+/// argon2 permit, so that first hash runs under the process-wide limit too.
 pub static DUMMY_HASH: LazyLock<String> =
     LazyLock::new(|| hash_token("dummy-timing-equalization").expect("failed to hash dummy"));
 

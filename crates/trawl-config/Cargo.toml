@@ -20,6 +20,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Only `Semaphore::MAX_PERMITS`, for the request-limit bound test.
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true

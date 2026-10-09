@@ -1,0 +1,72 @@
+# AC1: the shared-count test against the parent commit's per-route limiter
+
+parent commit:   47c5273a8bd4a21f63f28b9754523d0654ee8b3f (with_edge_layers still uses tower's ConcurrencyLimitLayer through Router::layer)
+test source:     crates/trawl-server/tests/request_limit/{support,edge}.rs exactly as committed at 881da7acdde152c3de72bbb35a9e0080bba2264e
+                 sha256 support.rs 4f70f5a391c4c616d27eb76a9322318079b32a2362eff2f0d65e07ed95e6b12d
+                 sha256 edge.rs    a8accb76d2065d0dfc82a73ed1db4f9435c873853f82a43d364e10d0059d4f30
+test root:       a trimmed tests/request_limit.rs declaring only `mod support; mod edge;`
+                 (the other modules need fixtures that do not exist at the parent)
+toolchain:       rustc 1.98.0 (88d9e12ae 2026-08-18)
+command:         cargo test -p trawl-server --test request_limit -- --test-threads=1
+                 (run in a detached worktree at 47c5273a with the files above copied in)
+
+## Reading
+
+The edge tests use only parent-era APIs (with_edge_layers, HttpConfig, string literals),
+so they compile against the parent and fail behaviourally, not at build time.
+
+request_count_is_shared_across_routes_and_methods holds N=4 requests on GET /a, POST /a,
+GET /b and PUT /b, then sends GET /c and expects an immediate 503 request_limit_reached.
+On the parent, GET /c has its own semaphore of 4: it is admitted, enters its handler and
+holds there, so the call does not answer within the 20 s deadline
+("the response head arrived without waiting on a held request: Elapsed(())", edge.rs:71
+via support.rs:270). That is the per-route-and-per-method budget the issue describes.
+
+The other failures show the parent never refuses (waits instead of a 503) and exposes none
+of the new metrics. response_bodies_and_streams_do_not_hold_the_count passes on both,
+as expected: it only proves a response body does not hold a count.
+
+The fixed-tree run of the same tests is at the end of this file.
+
+## Parent run (test lines and panics; full log kept out of the tree)
+
+test edge::control_allowance_saturates_at_four ... FAILED
+test edge::request_count_is_shared_across_routes_and_methods ... FAILED
+test edge::request_count_metrics_follow_ownership ... FAILED
+test edge::request_count_released_on_end_error_panic_and_drop ... FAILED
+test edge::request_limit_refusal_contract ... FAILED
+test edge::request_limit_refuses_without_waiting ... FAILED
+test edge::response_bodies_and_streams_do_not_hold_the_count ... ok
+thread 'edge::control_allowance_saturates_at_four' (2804038) panicked at crates/trawl-server/tests/request_limit/support.rs:270:10:
+the response head arrived without waiting on a held request: Elapsed(())
+thread 'edge::request_count_is_shared_across_routes_and_methods' (2805849) panicked at crates/trawl-server/tests/request_limit/support.rs:270:10:
+the response head arrived without waiting on a held request: Elapsed(())
+thread 'edge::request_count_metrics_follow_ownership' (2807381) panicked at crates/trawl-server/tests/request_limit/edge.rs:232:28:
+thread 'edge::request_count_released_on_end_error_panic_and_drop' (2807382) panicked at crates/trawl-server/tests/request_limit/edge.rs:33:5:
+thread 'edge::request_count_released_on_end_error_panic_and_drop' (2807382) panicked at crates/trawl-server/tests/request_limit/edge.rs:33:5:
+thread 'edge::request_count_released_on_end_error_panic_and_drop' (2807382) panicked at crates/trawl-server/tests/request_limit/support.rs:297:5:
+thread 'edge::request_limit_refusal_contract' (2807383) panicked at crates/trawl-server/tests/request_limit/edge.rs:178:5:
+thread 'edge::request_limit_refuses_without_waiting' (2807384) panicked at crates/trawl-server/tests/request_limit/support.rs:297:5:
+test result: FAILED. 1 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.03s
+exit=101
+    
+    assertion `left == right` failed
+      left: 200
+      left: 413
+    no "trawl_http_requests_in_progress{allowance=\"regular\"} " in:
+    the response head arrived without waiting on a held request: Elapsed(())
+    zz-request-limit-panic
+
+## Fixed-tree run
+
+branch head:     7233847f640103892f6185d33d43cc2fd3009d07 (edge.rs and support.rs byte-identical to 881da7ac)
+command:         cargo test -p trawl-server --test request_limit -- edge:: --test-threads=1
+
+test edge::control_allowance_saturates_at_four ... ok
+test edge::request_count_is_shared_across_routes_and_methods ... ok
+test edge::request_count_metrics_follow_ownership ... ok
+test edge::request_count_released_on_end_error_panic_and_drop ... ok
+test edge::request_limit_refusal_contract ... ok
+test edge::request_limit_refuses_without_waiting ... ok
+test edge::response_bodies_and_streams_do_not_hold_the_count ... ok
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.01s

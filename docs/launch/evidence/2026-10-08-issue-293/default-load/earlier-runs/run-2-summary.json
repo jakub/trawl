@@ -1,0 +1,225 @@
+{
+  "runId": "ac23-20261009T021657Z-8e544a",
+  "status": "interrupted",
+  "build": {
+    "head": "02b6343a4be752486ef5f0a7bc0662aef40de949",
+    "profile": "debug (cargo build --locked --no-default-features)",
+    "trawldSha256": "a0ec227095135480ac41402c7daa33f14c620e3abbe08fd24e98d54ed9097e7f",
+    "vector": "vector 0.57.0 (x86_64-unknown-linux-gnu 8832452 2026-07-14 20:58:30.491174540)",
+    "vectorSha256": "79be503feab9ec57b010cbff2b0d9f4002ed442d16a6a5588e46f26ffba355c0"
+  },
+  "host": {
+    "platform": "Linux-7.2.5-3-omarchy-x86_64-with-glibc2.44",
+    "cpu": "x86_64",
+    "logicalCpus": 16,
+    "memTotalKiB": 32560004
+  },
+  "fixture": {
+    "path": "crates/trawl-server/tests/fixtures/vector-capture/debian.ndjson",
+    "events": 67,
+    "sha256": "46786dc9115fca6dbb532eb37ff0af614f70bc377bad22a6f0ba1498f291b66a",
+    "acceptedPerCycle": 67,
+    "rejectedPerCycle": 0
+  },
+  "seededHistory": [
+    {
+      "day": "2026-10-08",
+      "hour": "22",
+      "movedFrom": "2026-10-09/02",
+      "parquetFiles": 35
+    },
+    {
+      "day": "2026-10-08",
+      "hour": "23",
+      "movedFrom": "2026-10-09/02",
+      "parquetFiles": 35
+    }
+  ],
+  "vectorSink": {
+    "source": "config/vector/debian/base.toml [sinks.trawld], read at run time",
+    "shipped": {
+      "type": "http",
+      "inputs": [
+        "trawl_*"
+      ],
+      "uri": "${TRAWL_URL}/api/v1/ingest",
+      "method": "post",
+      "encoding": {
+        "codec": "json"
+      },
+      "auth": {
+        "strategy": "bearer",
+        "token": "${TRAWL_INGEST_TOKEN}"
+      },
+      "compression": {
+        "algorithm": "gzip"
+      },
+      "batch": {
+        "max_bytes": 1048576,
+        "timeout_secs": 5
+      },
+      "buffer": {
+        "type": "disk",
+        "max_size": 1073741824
+      },
+      "request": {
+        "retry_initial_backoff_secs": 1,
+        "retry_max_backoff_secs": 30,
+        "timeout_secs": 30,
+        "concurrency": "adaptive"
+      },
+      "tls": {
+        "verify_certificate": true,
+        "verify_hostname": true
+      }
+    },
+    "changed": {
+      "inputs": [
+        "replay"
+      ],
+      "tls.ca_file": "trawld's generated certificate"
+    },
+    "senders": 3
+  },
+  "workload": {
+    "phases": [
+      {
+        "kind": "backlog",
+        "cyclesPerSender": 1500
+      },
+      {
+        "kind": "steady",
+        "eventsPerSecondPerSender": 268,
+        "seconds": 180
+      }
+    ],
+    "scrapeIntervalSeconds": 0.25,
+    "queryThinkSeconds": 1.0
+  },
+  "cleanup": {
+    "processes": true,
+    "container": true
+  },
+  "metrics": {
+    "samples": 2233,
+    "failedScrapes": 0,
+    "intervalSeconds": {
+      "target": 0.25,
+      "median": 0.25,
+      "max": 3.25
+    },
+    "allowance": {
+      "regular": 32.0,
+      "control": 4.0
+    },
+    "refusedTotalAtEnd": {
+      "regular": 0.0,
+      "control": 0.0
+    },
+    "refusedTotalMaxSeen": {
+      "regular": 0,
+      "control": 0
+    },
+    "sampledPeakInProgress": {
+      "regular": 14.0,
+      "atSeconds": 202.5,
+      "control": 1.0
+    },
+    "inProgressRegularHistogram": {
+      "0": 1387,
+      "1": 302,
+      "2": 142,
+      "3": 108,
+      "4": 81,
+      "5": 21,
+      "6": 25,
+      "7": 48,
+      "8": 9,
+      "9": 21,
+      "11": 74,
+      "12": 1,
+      "13": 4,
+      "14": 10
+    },
+    "peakHotBufferEvents": 93708.0,
+    "hotBufferAdmissionStateSamples": {
+      "0": 1586,
+      "1": 18,
+      "2": 629
+    },
+    "final": {
+      "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"ingest_batch_too_large\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_env\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"service_not_string\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"empty_service\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"service_too_long\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"not_object\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"missing_service\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_chars\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"host_missing_from_relay\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"hot_buffer_full\"}": 383692.0,
+      "trawl_ingest_events_rejected_total{reason=\"env_not_allowed\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_json\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"wal_environment_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"pending_rollup_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"daily_rollup_unit\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"daily_rollup_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"chunk\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"consumed_wal_removal\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"pending_rollup_recovery\"}": 0.0,
+      "trawl_ingest_events_total": 453102.0,
+      "trawl_files_quarantined_total{kind=\"parquet\"}": 0.0,
+      "trawl_files_quarantined_total{kind=\"wal\"}": 0.0,
+      "trawl_files_quarantined_total{kind=\"rollup_temporary\"}": 0.0,
+      "trawl_queries_total{status=\"timeout\"}": 1.0,
+      "trawl_queries_total{status=\"success\"}": 475.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"full\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"full\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"oversized\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"oversized\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"oversized\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"full\"}": 142.0
+    }
+  },
+  "queries": {
+    "count": 396,
+    "byStatus": {
+      "200": 395,
+      "504": 1
+    },
+    "msP50": 228.5,
+    "msMax": 30650.5
+  },
+  "compactionAndRollup": {
+    "compaction_complete": {
+      "total": 248,
+      "duringIngest": 0
+    },
+    "rollup_complete": {
+      "total": 35,
+      "duringIngest": 0
+    }
+  },
+  "vectorLogs": {
+    "vector-1": {
+      "retryLines": 17,
+      "request_limit_reached": 0,
+      "hot_buffer_full": 0,
+      "errorLines": 0
+    },
+    "vector-2": {
+      "retryLines": 9,
+      "request_limit_reached": 0,
+      "hot_buffer_full": 0,
+      "errorLines": 0
+    },
+    "vector-3": {
+      "retryLines": 19,
+      "request_limit_reached": 0,
+      "hot_buffer_full": 0,
+      "errorLines": 0
+    }
+  }
+}

@@ -29,6 +29,9 @@ use crate::ingest::pipeline::{BatchKey, PipelineWriter, ServiceBatch};
 use crate::ingest::producer::ProducerKind;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
+#[cfg(any(test, feature = "test-support"))]
+use crate::transport::request_limit::body_work::BodyWork;
+use crate::transport::request_limit::{self, RequestInProgress};
 use trawl_api::{IngestEventError, IngestResponse};
 
 /// Per-reason rejection counts for labeled prometheus metrics.
@@ -236,6 +239,10 @@ fn ingest_key(parts: &Parts) -> Result<IngestKey, ServerError> {
 /// counted first: they are durable, and compaction will merge them. A 500
 /// is therefore not an atomic rollback. The failed groups' share of the
 /// reservation is released.
+///
+/// Both blocking tasks hold the request's body, so each keeps the
+/// request's count until it ends, even after the client hangs up
+/// (ADR-0054). The wait for the publication gate between them does not.
 pub async fn ingest(
     State(state): State<AppState>,
     IngestKey(verified): IngestKey,
@@ -243,6 +250,7 @@ pub async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<IngestResponse>, ServerError> {
+    let count = request_limit::current();
     let pipeline = state
         .ingest
         .pipeline
@@ -268,6 +276,7 @@ pub async fn ingest(
         peer_addr,
         compressed,
         body,
+        count.clone(),
         dispatch.clone(),
         request_span.clone(),
     )
@@ -298,7 +307,17 @@ pub async fn ingest(
         None => None,
     };
 
+    #[cfg(any(test, feature = "test-support"))]
+    let hold = state
+        .ingest
+        .body_work_holds
+        .take(BodyWork::IngestWrite, count.as_ref());
     let result = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+        let _count = count;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hold) = hold {
+            hold.wait();
+        }
         // Cancellation cannot split durability from insertion once this
         // task starts. The guard and the reservation stay here until both
         // steps finish.
@@ -353,12 +372,14 @@ struct Parsed {
 }
 
 /// Decompress and parse the body on a blocking thread, so CPU-bound gzip
-/// and JSON work does not hog tokio workers.
+/// and JSON work does not hog tokio workers. The thread keeps `count`, the
+/// request's count, for as long as it holds the body.
 async fn parse_request(
     state: &AppState,
     peer_addr: SocketAddr,
     compressed: bool,
     body: Bytes,
+    count: Option<RequestInProgress>,
     dispatch: tracing::Dispatch,
     span: tracing::Span,
 ) -> Result<Parsed, ServerError> {
@@ -366,7 +387,17 @@ async fn parse_request(
     // captured before moving into the blocking task.
     let request = HttpRequestContext::new(&state.ingest, peer_addr.ip());
     let max_body_bytes = state.ingest.max_body_bytes;
+    #[cfg(any(test, feature = "test-support"))]
+    let hold = state
+        .ingest
+        .body_work_holds
+        .take(BodyWork::IngestParse, count.as_ref());
     tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+        let _count = count;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hold) = hold {
+            hold.wait();
+        }
         let _dispatch = tracing::dispatcher::set_default(&dispatch);
         let _span = span.enter();
         let ctx = request.envelope();

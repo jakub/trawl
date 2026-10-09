@@ -112,6 +112,9 @@ log = { workspace = true }
 # `tests/vector_service_gate_contract.rs` runs the shipped Vector configs'
 # service gate through the engine VRL `match` uses. Already in the graph.
 regex = { workspace = true }
+# `tests/request_limit/` drives HTTP/2 streams on one explicit connection
+# and resets them with RST_STREAM. Already in the graph through hyper.
+h2 = "0.4.16"
 
 # Tests that lock a directory with mode bits drop the DAC capabilities
 # from the test thread, so the lock binds when the suite runs as root.

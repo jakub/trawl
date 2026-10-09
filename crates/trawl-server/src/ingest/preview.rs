@@ -41,6 +41,9 @@ use crate::ingest::envelope::{
 use crate::ingest::producer::{Derivation, ProducerKind};
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::state::AppState;
+use crate::transport::request_limit;
+#[cfg(any(test, feature = "test-support"))]
+use crate::transport::request_limit::body_work::BodyWork;
 
 /// The preview's query string. Unknown parameters are refused, so a
 /// misspelled `peer_ip` cannot silently fall back to the placeholder.
@@ -59,6 +62,9 @@ pub struct PreviewParams {
 /// error is 400 (the shared step's own); more than
 /// [`MAX_PREVIEW_EVENTS`] non-blank positions is 413 `preview_too_large`.
 /// An all-rejected sample is a 200.
+///
+/// The report's blocking task holds the sample, so it keeps the request's
+/// count until it ends, even after the client hangs up (ADR-0054).
 pub async fn preview(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -87,10 +93,23 @@ pub async fn preview(
     // The same context real ingest builds: one arrival instant, the peer
     // through `canonical_peer`, relay membership from server config.
     let request = HttpRequestContext::new(&state.ingest, peer);
-    tokio::task::spawn_blocking(move || report(&request, given, &body))
-        .await
-        .map_err(|e| ServerError::from_join("ingest preview", e))?
-        .map(Json)
+    let count = request_limit::current();
+    #[cfg(any(test, feature = "test-support"))]
+    let hold = state
+        .ingest
+        .body_work_holds
+        .take(BodyWork::Preview, count.as_ref());
+    tokio::task::spawn_blocking(move || {
+        let _count = count;
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(hold) = hold {
+            hold.wait();
+        }
+        report(&request, given, &body)
+    })
+    .await
+    .map_err(|e| ServerError::from_join("ingest preview", e))?
+    .map(Json)
 }
 
 /// Whether every `Content-Encoding` coding is `identity` (or there is

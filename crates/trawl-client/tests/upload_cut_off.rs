@@ -29,7 +29,8 @@ const TOKEN: &str = "flt_uploadcutofftesttoken";
 
 /// The whole rendered cut-off error: no origin, path or library text.
 const CUT_OFF: &str = "network error: the server closed the connection before the upload \
-                       finished; the request may exceed the server's request size limit";
+                       finished; the request may exceed the server's request size limit, \
+                       or the server may be at its request limit";
 
 /// Bound on every exchange, so a hang fails the test instead of wedging CI.
 const EXCHANGE: Duration = Duration::from_secs(30);
@@ -223,4 +224,42 @@ async fn a_read_413_is_the_server_refusal() {
     assert_eq!(*status, 413);
     assert_eq!(error.code, ErrorCode::RequestTooLarge);
     assert_eq!(error.message, message);
+}
+
+/// The 503 counterpart of `a_read_413_is_the_server_refusal`: a refusal the
+/// client does read is the server's own error, never the cut-off message,
+/// and it names neither a 413 nor anything else the client did not read.
+#[tokio::test]
+async fn a_read_503_request_limit_is_the_server_refusal() {
+    let message = "trawld is at its HTTP request limit ([server] max_concurrent_requests); \
+                   the request was not processed; retry later with backoff";
+    let envelope =
+        format!(r#"{{"error":{{"code":"request_limit_reached","message":"{message}"}}}}"#);
+    let response = format!(
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncache-control: no-store\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{envelope}",
+        envelope.len()
+    );
+    let (client, served) = serve_one(Answer::Respond(response.into_bytes())).await;
+    let body = vec![b'x'; 4 * 1024];
+    let error = exchange(client.ingest_preview(body, None), served)
+        .await
+        .expect_err("a 503 has no report");
+    assert_eq!(error.network_kind(), None, "{error:?}");
+    let ClientError::Server { status, error } = &error else {
+        panic!("a read 503 is a server error: {error:?}");
+    };
+    assert_eq!(*status, 503);
+    assert_eq!(error.message, message);
+    assert!(!error.message.contains("413"), "{}", error.message);
+    // The wire code is raw JSON on purpose: this test does not depend on
+    // the `ErrorCode` variant. Whatever the client maps it to, it is not
+    // the cut-off message.
+    assert_ne!(
+        ClientError::Server {
+            status: 503,
+            error: error.clone()
+        }
+        .to_string(),
+        CUT_OFF
+    );
 }

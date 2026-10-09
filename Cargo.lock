@@ -6159,7 +6159,6 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
- "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -6367,6 +6366,7 @@ dependencies = [
  "shellexpand",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
  "toml",
 ]
 
@@ -6442,6 +6442,7 @@ dependencies = [
  "fleet-auth",
  "fs4",
  "governor",
+ "h2",
  "hostname",
  "hyper",
  "hyper-util",

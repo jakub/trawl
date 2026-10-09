@@ -960,6 +960,79 @@ async fn doctor_listener_health_rows() {
     );
 }
 
+/// trawld's request-limit refusal, under either allowance's message, is a
+/// capacity refusal and not a foreign answer: the health row is
+/// `not_sampled`/`request_limit_reached` with the shared text and a retry
+/// with backoff, the doctor invents no per-check rows, and no row says
+/// another service listens. The same code under a 200, and an unrelated
+/// 503 envelope, still fail as answers that are not trawld's (ADR-0054).
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_listener_request_limit_refusal_is_not_sampled() {
+    let dir = tempfile::tempdir().unwrap();
+    let pair = Pair::new("limit-private-subject", &["localhost"]);
+    let tls = pair.write(dir.path(), "limit");
+    let regular: &[u8] = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
+    let control: &[u8] = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff","details":[]}}"#;
+    let run = async |response: Vec<u8>| {
+        let addr = tls_listener(pair.serving(), response);
+        let mut planted = pair.planted.clone();
+        planted.extend(address_values(addr));
+        let config = config_for(dir.path(), addr.to_string(), tls.clone());
+        doctor(&config, planted_env(dir.path()), &planted).await
+    };
+
+    for body in [regular, control] {
+        let report = run(http(503, body)).await;
+        assert_eq!(outcome(&report, IDENTITY), (Outcome::Complete, None));
+        assert_eq!(
+            outcome(&report, HEALTH),
+            (Outcome::NotSampled, Some("request_limit_reached"))
+        );
+        let health = row(&report, HEALTH);
+        assert_eq!(
+            health.detail.as_deref(),
+            Some("probe refused: trawld at its request limit")
+        );
+        assert!(
+            health
+                .next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("retry with backoff")),
+            "{health:?}"
+        );
+        assert_eq!(keyed(&report), [], "no per-check rows are invented");
+        for check in report.checks() {
+            let next = check.next_action.as_deref().unwrap_or_default();
+            assert!(!next.contains("another service"), "{check:?}");
+        }
+    }
+
+    // Controls: the code under a status trawld does not pair it with, and
+    // an unrelated envelope or body under a 503, are still not trawld's.
+    for response in [
+        http(200, regular),
+        http(503, br#"{"error":{"code":"internal_error","message":"x"}}"#),
+        http(503, b"<html>503 Service Unavailable</html>"),
+    ] {
+        let report = run(response).await;
+        assert_eq!(
+            outcome(&report, HEALTH),
+            (
+                Outcome::Failed,
+                Some("the health answer is not trawld's health body")
+            )
+        );
+        assert!(
+            row(&report, HEALTH)
+                .next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("another service")),
+            "{report:?}"
+        );
+        assert_eq!(keyed(&report), []);
+    }
+}
+
 /// An unknown health value is never shown, even one shaped like an
 /// identifier, which may still be a secret: its row fails with a fixed
 /// reason and says the value is not shown.

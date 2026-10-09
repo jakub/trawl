@@ -611,6 +611,17 @@ fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
                 .next(Text::new("wait for trawld to finish recovery, then rerun")),
             Vec::new(),
         ),
+        // A capacity refusal is trawld's own answer, not another
+        // service's: the doctor could not look, and invents no checks.
+        health::Answer::RequestLimit => (
+            Row::not_sampled(check, reason::REQUEST_LIMIT_REACHED)
+                .detail(Text::new(health::REQUEST_LIMIT_REFUSED))
+                .next(Text::new(
+                    "retry with backoff: rerun the doctor after trawld's requests in progress \
+                     drain",
+                )),
+            Vec::new(),
+        ),
         health::Answer::Status(status) => (status_failure(status), Vec::new()),
         health::Answer::TooLarge => (too_large_row(), Vec::new()),
         health::Answer::Disagrees => (

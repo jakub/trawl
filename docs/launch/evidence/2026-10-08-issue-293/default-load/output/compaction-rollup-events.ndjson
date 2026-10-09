@@ -1,0 +1,351 @@
+{"timestamp": "2026-10-09T04:34:59.400788Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "72", "wal_files": "4", "duration_ms": "55"}
+{"timestamp": "2026-10-09T04:35:08.615841Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "1974", "wal_files": "24", "duration_ms": "83"}
+{"timestamp": "2026-10-09T04:35:08.698887Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "987", "wal_files": "24", "duration_ms": "82"}
+{"timestamp": "2026-10-09T04:35:09.359438Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "3954", "wal_files": "24", "duration_ms": "658"}
+{"timestamp": "2026-10-09T04:35:11.450508Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "987", "wal_files": "24", "duration_ms": "2090"}
+{"timestamp": "2026-10-09T04:35:12.107535Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "5928", "wal_files": "24", "duration_ms": "655"}
+{"timestamp": "2026-10-09T04:35:12.234027Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "4938", "wal_files": "24", "duration_ms": "125"}
+{"timestamp": "2026-10-09T04:35:12.896051Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "1974", "wal_files": "24", "duration_ms": "660"}
+{"timestamp": "2026-10-09T04:35:15.232660Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "3948", "wal_files": "24", "duration_ms": "2335"}
+{"timestamp": "2026-10-09T04:35:15.559694Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "987", "wal_files": "24", "duration_ms": "326"}
+{"timestamp": "2026-10-09T04:35:15.882716Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "128", "wal_files": "6", "duration_ms": "322"}
+{"timestamp": "2026-10-09T04:35:16.208023Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "867", "wal_files": "21", "duration_ms": "321"}
+{"timestamp": "2026-10-09T04:35:18.671819Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "1974", "wal_files": "24", "duration_ms": "2462"}
+{"timestamp": "2026-10-09T04:35:18.756161Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "1974", "wal_files": "24", "duration_ms": "83"}
+{"timestamp": "2026-10-09T04:35:18.823798Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "1810", "wal_files": "22", "duration_ms": "66"}
+{"timestamp": "2026-10-09T04:35:18.891842Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "987", "wal_files": "24", "duration_ms": "67"}
+{"timestamp": "2026-10-09T04:35:19.237313Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "1898", "wal_files": "23", "duration_ms": "344"}
+{"timestamp": "2026-10-09T04:35:19.705717Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "1977", "wal_files": "24", "duration_ms": "467"}
+{"timestamp": "2026-10-09T04:35:22.036018Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "987", "wal_files": "24", "duration_ms": "2329"}
+{"timestamp": "2026-10-09T04:35:22.331038Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "987", "wal_files": "24", "duration_ms": "294"}
+{"timestamp": "2026-10-09T04:35:22.404992Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "1977", "wal_files": "24", "duration_ms": "73"}
+{"timestamp": "2026-10-09T04:35:22.483228Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "1974", "wal_files": "24", "duration_ms": "77"}
+{"timestamp": "2026-10-09T04:35:22.861770Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "987", "wal_files": "24", "duration_ms": "377"}
+{"timestamp": "2026-10-09T04:35:23.218029Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "1977", "wal_files": "24", "duration_ms": "355"}
+{"timestamp": "2026-10-09T04:35:25.585642Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "1977", "wal_files": "24", "duration_ms": "2366"}
+{"timestamp": "2026-10-09T04:35:25.676766Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "990", "wal_files": "24", "duration_ms": "90"}
+{"timestamp": "2026-10-09T04:35:25.770975Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "3957", "wal_files": "24", "duration_ms": "93"}
+{"timestamp": "2026-10-09T04:35:26.149474Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "1892", "wal_files": "23", "duration_ms": "377"}
+{"timestamp": "2026-10-09T04:35:26.765163Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "987", "wal_files": "24", "duration_ms": "614"}
+{"timestamp": "2026-10-09T04:35:29.149999Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "987", "wal_files": "24", "duration_ms": "2383"}
+{"timestamp": "2026-10-09T04:35:29.535889Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "987", "wal_files": "24", "duration_ms": "384"}
+{"timestamp": "2026-10-09T04:35:29.619727Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "1974", "wal_files": "24", "duration_ms": "82"}
+{"timestamp": "2026-10-09T04:35:29.699907Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "990", "wal_files": "24", "duration_ms": "79"}
+{"timestamp": "2026-10-09T04:35:30.073516Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "987", "wal_files": "24", "duration_ms": "372"}
+{"timestamp": "2026-10-09T04:35:32.546390Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "1974", "wal_files": "24", "duration_ms": "2471"}
+{"timestamp": "2026-10-09T04:35:33.111459Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "1977", "wal_files": "24", "duration_ms": "564"}
+{"timestamp": "2026-10-09T04:35:33.552971Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "4605", "wal_files": "32", "duration_ms": "438"}
+{"timestamp": "2026-10-09T04:35:35.848751Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "2303", "wal_files": "32", "duration_ms": "2294"}
+{"timestamp": "2026-10-09T04:35:36.013356Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "4600", "wal_files": "34", "duration_ms": "163"}
+{"timestamp": "2026-10-09T04:35:37.251954Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "2302", "wal_files": "35", "duration_ms": "1237"}
+{"timestamp": "2026-10-09T04:35:39.652724Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "4606", "wal_files": "33", "duration_ms": "2399"}
+{"timestamp": "2026-10-09T04:35:39.825523Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "2301", "wal_files": "32", "duration_ms": "171"}
+{"timestamp": "2026-10-09T04:35:40.914567Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "2301", "wal_files": "32", "duration_ms": "1087"}
+{"timestamp": "2026-10-09T04:35:43.167945Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "2299", "wal_files": "32", "duration_ms": "2252"}
+{"timestamp": "2026-10-09T04:35:43.264079Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "2303", "wal_files": "32", "duration_ms": "95"}
+{"timestamp": "2026-10-09T04:35:43.706833Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "4604", "wal_files": "32", "duration_ms": "441"}
+{"timestamp": "2026-10-09T04:35:43.818480Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "4603", "wal_files": "32", "duration_ms": "110"}
+{"timestamp": "2026-10-09T04:35:44.611847Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "13818", "wal_files": "32", "duration_ms": "792"}
+{"timestamp": "2026-10-09T04:35:47.078895Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "2301", "wal_files": "32", "duration_ms": "2465"}
+{"timestamp": "2026-10-09T04:35:47.876987Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "339", "wal_files": "10", "duration_ms": "796"}
+{"timestamp": "2026-10-09T04:35:47.989808Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "4686", "wal_files": "33", "duration_ms": "109"}
+{"timestamp": "2026-10-09T04:35:50.654184Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "4605", "wal_files": "32", "duration_ms": "2662"}
+{"timestamp": "2026-10-09T04:35:50.985250Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "2302", "wal_files": "32", "duration_ms": "329"}
+{"timestamp": "2026-10-09T04:35:51.063901Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "2301", "wal_files": "32", "duration_ms": "77"}
+{"timestamp": "2026-10-09T04:35:51.437313Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "4599", "wal_files": "33", "duration_ms": "372"}
+{"timestamp": "2026-10-09T04:35:53.907992Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "4601", "wal_files": "32", "duration_ms": "2469"}
+{"timestamp": "2026-10-09T04:35:54.234339Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "2303", "wal_files": "32", "duration_ms": "325"}
+{"timestamp": "2026-10-09T04:35:54.353461Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "9210", "wal_files": "32", "duration_ms": "118"}
+{"timestamp": "2026-10-09T04:35:54.979577Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "9206", "wal_files": "32", "duration_ms": "625"}
+{"timestamp": "2026-10-09T04:35:57.128088Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "4601", "wal_files": "32", "duration_ms": "2147"}
+{"timestamp": "2026-10-09T04:35:57.739901Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "4605", "wal_files": "32", "duration_ms": "610"}
+{"timestamp": "2026-10-09T04:35:58.101600Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "4598", "wal_files": "32", "duration_ms": "360"}
+{"timestamp": "2026-10-09T04:36:00.498434Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "11507", "wal_files": "32", "duration_ms": "2395"}
+{"timestamp": "2026-10-09T04:36:00.606323Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "4601", "wal_files": "32", "duration_ms": "106"}
+{"timestamp": "2026-10-09T04:36:00.983374Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "4604", "wal_files": "32", "duration_ms": "375"}
+{"timestamp": "2026-10-09T04:36:01.066155Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "2301", "wal_files": "32", "duration_ms": "81"}
+{"timestamp": "2026-10-09T04:36:01.502721Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "2301", "wal_files": "32", "duration_ms": "435"}
+{"timestamp": "2026-10-09T04:36:03.656870Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "4602", "wal_files": "32", "duration_ms": "2153"}
+{"timestamp": "2026-10-09T04:36:04.039759Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "9210", "wal_files": "32", "duration_ms": "382"}
+{"timestamp": "2026-10-09T04:36:04.401879Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "2303", "wal_files": "32", "duration_ms": "361"}
+{"timestamp": "2026-10-09T04:36:04.799681Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "2303", "wal_files": "32", "duration_ms": "396"}
+{"timestamp": "2026-10-09T04:36:07.519874Z", "event_type": "rollup_complete", "compact_service": "journal-unidentified", "hourly_files": "1", "duration_ms": "383"}
+{"timestamp": "2026-10-09T04:36:07.538748Z", "event_type": "rollup_complete", "compact_service": "getty", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:07.557796Z", "event_type": "rollup_complete", "compact_service": "systemd-networkd", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:07.577771Z", "event_type": "rollup_complete", "compact_service": "redis", "hourly_files": "1", "duration_ms": "18"}
+{"timestamp": "2026-10-09T04:36:07.603900Z", "event_type": "rollup_complete", "compact_service": "init", "hourly_files": "1", "duration_ms": "18"}
+{"timestamp": "2026-10-09T04:36:07.621811Z", "event_type": "rollup_complete", "compact_service": "unifi-u6-lite", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:07.639053Z", "event_type": "rollup_complete", "compact_service": "dpkg", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:07.661715Z", "event_type": "rollup_complete", "compact_service": "trawld", "hourly_files": "1", "duration_ms": "21"}
+{"timestamp": "2026-10-09T04:36:07.680387Z", "event_type": "rollup_complete", "compact_service": "ufw", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:07.703954Z", "event_type": "rollup_complete", "compact_service": "web", "hourly_files": "1", "duration_ms": "15"}
+{"timestamp": "2026-10-09T04:36:07.721457Z", "event_type": "rollup_complete", "compact_service": "mount", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:07.739260Z", "event_type": "rollup_complete", "compact_service": "varlog-unidentified", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:07.762969Z", "event_type": "rollup_complete", "compact_service": "long-unit", "hourly_files": "1", "duration_ms": "22"}
+{"timestamp": "2026-10-09T04:36:07.780879Z", "event_type": "rollup_complete", "compact_service": "systemd-fsck", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:07.805157Z", "event_type": "rollup_complete", "compact_service": "syslog-unidentified", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:07.824059Z", "event_type": "rollup_complete", "compact_service": "docker-unidentified", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:07.844965Z", "event_type": "rollup_complete", "compact_service": "nginx", "hourly_files": "1", "duration_ms": "20"}
+{"timestamp": "2026-10-09T04:36:07.863239Z", "event_type": "rollup_complete", "compact_service": "steam", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:07.880956Z", "event_type": "rollup_complete", "compact_service": "networkd-dispatcher", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:07.904127Z", "event_type": "rollup_complete", "compact_service": "sd-pam", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:07.922348Z", "event_type": "rollup_complete", "compact_service": "NetworkManager", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:07.940373Z", "event_type": "rollup_complete", "compact_service": "worker", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:07.958229Z", "event_type": "rollup_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:07.979293Z", "event_type": "rollup_complete", "compact_service": "sshd", "hourly_files": "1", "duration_ms": "20"}
+{"timestamp": "2026-10-09T04:36:08.003486Z", "event_type": "rollup_complete", "compact_service": "pipewire", "hourly_files": "1", "duration_ms": "23"}
+{"timestamp": "2026-10-09T04:36:08.021317Z", "event_type": "rollup_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:08.039466Z", "event_type": "rollup_complete", "compact_service": "serial-getty", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:08.056587Z", "event_type": "rollup_complete", "compact_service": "apt", "hourly_files": "1", "duration_ms": "16"}
+{"timestamp": "2026-10-09T04:36:08.084562Z", "event_type": "rollup_complete", "compact_service": "fail2ban", "hourly_files": "1", "duration_ms": "27"}
+{"timestamp": "2026-10-09T04:36:08.108772Z", "event_type": "rollup_complete", "compact_service": "user", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:08.127171Z", "event_type": "rollup_complete", "compact_service": "stack-web", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:08.145797Z", "event_type": "rollup_complete", "compact_service": "apache", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:10.531339Z", "event_type": "rollup_complete", "compact_service": "mysql", "hourly_files": "1", "duration_ms": "2384"}
+{"timestamp": "2026-10-09T04:36:10.562538Z", "event_type": "rollup_complete", "compact_service": "cron", "hourly_files": "1", "duration_ms": "18"}
+{"timestamp": "2026-10-09T04:36:10.581127Z", "event_type": "rollup_complete", "compact_service": "postgresql", "hourly_files": "1", "duration_ms": "17"}
+{"timestamp": "2026-10-09T04:36:10.696612Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "7362", "wal_files": "36", "duration_ms": "112"}
+{"timestamp": "2026-10-09T04:36:10.806337Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "7364", "wal_files": "36", "duration_ms": "108"}
+{"timestamp": "2026-10-09T04:36:10.892076Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "3681", "wal_files": "36", "duration_ms": "84"}
+{"timestamp": "2026-10-09T04:36:11.008367Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "7356", "wal_files": "36", "duration_ms": "115"}
+{"timestamp": "2026-10-09T04:36:12.468031Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "3681", "wal_files": "36", "duration_ms": "1458"}
+{"timestamp": "2026-10-09T04:36:14.879024Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "3681", "wal_files": "36", "duration_ms": "2409"}
+{"timestamp": "2026-10-09T04:36:15.992026Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "3681", "wal_files": "36", "duration_ms": "1111"}
+{"timestamp": "2026-10-09T04:36:18.293012Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "7362", "wal_files": "36", "duration_ms": "2299"}
+{"timestamp": "2026-10-09T04:36:18.396067Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "3681", "wal_files": "36", "duration_ms": "102"}
+{"timestamp": "2026-10-09T04:36:18.493056Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "3681", "wal_files": "36", "duration_ms": "95"}
+{"timestamp": "2026-10-09T04:36:18.602103Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "3680", "wal_files": "36", "duration_ms": "108"}
+{"timestamp": "2026-10-09T04:36:19.390129Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "14726", "wal_files": "36", "duration_ms": "787"}
+{"timestamp": "2026-10-09T04:36:21.826890Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "7359", "wal_files": "36", "duration_ms": "2435"}
+{"timestamp": "2026-10-09T04:36:22.188184Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "3679", "wal_files": "36", "duration_ms": "360"}
+{"timestamp": "2026-10-09T04:36:22.622169Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "7359", "wal_files": "36", "duration_ms": "433"}
+{"timestamp": "2026-10-09T04:36:22.720383Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "3681", "wal_files": "36", "duration_ms": "97"}
+{"timestamp": "2026-10-09T04:36:22.813862Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "3681", "wal_files": "36", "duration_ms": "92"}
+{"timestamp": "2026-10-09T04:36:25.104144Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "7362", "wal_files": "36", "duration_ms": "2289"}
+{"timestamp": "2026-10-09T04:36:25.532057Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "14724", "wal_files": "36", "duration_ms": "427"}
+{"timestamp": "2026-10-09T04:36:25.664588Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "7355", "wal_files": "36", "duration_ms": "131"}
+{"timestamp": "2026-10-09T04:36:26.180833Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "7360", "wal_files": "36", "duration_ms": "515"}
+{"timestamp": "2026-10-09T04:36:28.347857Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "7360", "wal_files": "36", "duration_ms": "2165"}
+{"timestamp": "2026-10-09T04:36:28.818278Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "18405", "wal_files": "36", "duration_ms": "469"}
+{"timestamp": "2026-10-09T04:36:29.282586Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "7362", "wal_files": "36", "duration_ms": "463"}
+{"timestamp": "2026-10-09T04:36:31.237884Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "7363", "wal_files": "36", "duration_ms": "1953"}
+{"timestamp": "2026-10-09T04:36:31.999945Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "3681", "wal_files": "36", "duration_ms": "761"}
+{"timestamp": "2026-10-09T04:36:32.367021Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "3681", "wal_files": "36", "duration_ms": "365"}
+{"timestamp": "2026-10-09T04:36:34.481000Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "3681", "wal_files": "36", "duration_ms": "2112"}
+{"timestamp": "2026-10-09T04:36:34.866583Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "7362", "wal_files": "36", "duration_ms": "384"}
+{"timestamp": "2026-10-09T04:36:34.988378Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "7362", "wal_files": "36", "duration_ms": "120"}
+{"timestamp": "2026-10-09T04:36:35.390855Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "14716", "wal_files": "36", "duration_ms": "401"}
+{"timestamp": "2026-10-09T04:36:37.317632Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "22088", "wal_files": "36", "duration_ms": "1925"}
+{"timestamp": "2026-10-09T04:36:37.952955Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "582", "wal_files": "15", "duration_ms": "634"}
+{"timestamp": "2026-10-09T04:36:38.301495Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "3681", "wal_files": "36", "duration_ms": "346"}
+{"timestamp": "2026-10-09T04:36:40.390334Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "7362", "wal_files": "35", "duration_ms": "2087"}
+{"timestamp": "2026-10-09T04:36:40.984488Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "4810", "wal_files": "32", "duration_ms": "590"}
+{"timestamp": "2026-10-09T04:36:41.096385Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "9701", "wal_files": "33", "duration_ms": "111"}
+{"timestamp": "2026-10-09T04:36:41.796714Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "4810", "wal_files": "32", "duration_ms": "699"}
+{"timestamp": "2026-10-09T04:36:44.009064Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "9620", "wal_files": "32", "duration_ms": "2211"}
+{"timestamp": "2026-10-09T04:36:44.626317Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "4810", "wal_files": "32", "duration_ms": "616"}
+{"timestamp": "2026-10-09T04:36:44.719898Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "4810", "wal_files": "32", "duration_ms": "92"}
+{"timestamp": "2026-10-09T04:36:45.160660Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "4810", "wal_files": "32", "duration_ms": "439"}
+{"timestamp": "2026-10-09T04:36:47.674911Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "9620", "wal_files": "32", "duration_ms": "2513"}
+{"timestamp": "2026-10-09T04:36:48.115163Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "9620", "wal_files": "32", "duration_ms": "439"}
+{"timestamp": "2026-10-09T04:36:48.211484Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "4810", "wal_files": "32", "duration_ms": "95"}
+{"timestamp": "2026-10-09T04:36:48.698032Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "4810", "wal_files": "32", "duration_ms": "485"}
+{"timestamp": "2026-10-09T04:36:51.226177Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "4810", "wal_files": "32", "duration_ms": "2527"}
+{"timestamp": "2026-10-09T04:36:51.433915Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "4810", "wal_files": "32", "duration_ms": "206"}
+{"timestamp": "2026-10-09T04:36:52.662577Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "9620", "wal_files": "32", "duration_ms": "1227"}
+{"timestamp": "2026-10-09T04:36:55.100789Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "9618", "wal_files": "32", "duration_ms": "2437"}
+{"timestamp": "2026-10-09T04:36:55.439716Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "9618", "wal_files": "32", "duration_ms": "338"}
+{"timestamp": "2026-10-09T04:36:55.847071Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "19240", "wal_files": "32", "duration_ms": "406"}
+{"timestamp": "2026-10-09T04:36:56.262357Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "4810", "wal_files": "32", "duration_ms": "414"}
+{"timestamp": "2026-10-09T04:36:58.511020Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "734", "wal_files": "12", "duration_ms": "2247"}
+{"timestamp": "2026-10-09T04:36:58.906461Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "9616", "wal_files": "32", "duration_ms": "393"}
+{"timestamp": "2026-10-09T04:36:59.444197Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "24050", "wal_files": "32", "duration_ms": "536"}
+{"timestamp": "2026-10-09T04:37:02.005393Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "9620", "wal_files": "32", "duration_ms": "2560"}
+{"timestamp": "2026-10-09T04:37:02.752349Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "4810", "wal_files": "32", "duration_ms": "746"}
+{"timestamp": "2026-10-09T04:37:02.932480Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "19236", "wal_files": "32", "duration_ms": "178"}
+{"timestamp": "2026-10-09T04:37:05.256484Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "9620", "wal_files": "32", "duration_ms": "2322"}
+{"timestamp": "2026-10-09T04:37:05.683875Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "4809", "wal_files": "32", "duration_ms": "426"}
+{"timestamp": "2026-10-09T04:37:05.786245Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "4810", "wal_files": "32", "duration_ms": "101"}
+{"timestamp": "2026-10-09T04:37:05.900589Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "9620", "wal_files": "32", "duration_ms": "112"}
+{"timestamp": "2026-10-09T04:37:06.019342Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "9701", "wal_files": "33", "duration_ms": "117"}
+{"timestamp": "2026-10-09T04:37:06.529133Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "9620", "wal_files": "32", "duration_ms": "508"}
+{"timestamp": "2026-10-09T04:37:08.986963Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "19240", "wal_files": "32", "duration_ms": "2456"}
+{"timestamp": "2026-10-09T04:37:09.726068Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "28860", "wal_files": "32", "duration_ms": "738"}
+{"timestamp": "2026-10-09T04:37:09.851450Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "9620", "wal_files": "32", "duration_ms": "124"}
+{"timestamp": "2026-10-09T04:37:12.083541Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "9620", "wal_files": "32", "duration_ms": "2231"}
+{"timestamp": "2026-10-09T04:37:12.812753Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "4810", "wal_files": "32", "duration_ms": "728"}
+{"timestamp": "2026-10-09T04:37:15.586739Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "6067", "wal_files": "35", "duration_ms": "2390"}
+{"timestamp": "2026-10-09T04:37:16.198454Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "12134", "wal_files": "35", "duration_ms": "610"}
+{"timestamp": "2026-10-09T04:37:16.316024Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "12134", "wal_files": "35", "duration_ms": "116"}
+{"timestamp": "2026-10-09T04:37:16.429515Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "12134", "wal_files": "35", "duration_ms": "112"}
+{"timestamp": "2026-10-09T04:37:16.556802Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "12134", "wal_files": "35", "duration_ms": "126"}
+{"timestamp": "2026-10-09T04:37:18.608206Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "6067", "wal_files": "35", "duration_ms": "2050"}
+{"timestamp": "2026-10-09T04:37:18.710141Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "6067", "wal_files": "35", "duration_ms": "101"}
+{"timestamp": "2026-10-09T04:37:19.082089Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "890", "wal_files": "14", "duration_ms": "370"}
+{"timestamp": "2026-10-09T04:37:19.170152Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "6067", "wal_files": "35", "duration_ms": "85"}
+{"timestamp": "2026-10-09T04:37:19.280992Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "12132", "wal_files": "34", "duration_ms": "109"}
+{"timestamp": "2026-10-09T04:37:19.377951Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "6067", "wal_files": "35", "duration_ms": "95"}
+{"timestamp": "2026-10-09T04:37:19.504535Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "12134", "wal_files": "35", "duration_ms": "125"}
+{"timestamp": "2026-10-09T04:37:21.628497Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "24268", "wal_files": "35", "duration_ms": "2122"}
+{"timestamp": "2026-10-09T04:37:22.154676Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "24267", "wal_files": "35", "duration_ms": "524"}
+{"timestamp": "2026-10-09T04:37:22.247757Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "6067", "wal_files": "35", "duration_ms": "92"}
+{"timestamp": "2026-10-09T04:37:22.341143Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "6067", "wal_files": "35", "duration_ms": "92"}
+{"timestamp": "2026-10-09T04:37:22.464334Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "12134", "wal_files": "35", "duration_ms": "122"}
+{"timestamp": "2026-10-09T04:37:22.583882Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "12134", "wal_files": "35", "duration_ms": "118"}
+{"timestamp": "2026-10-09T04:37:24.072687Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "6067", "wal_files": "35", "duration_ms": "1487"}
+{"timestamp": "2026-10-09T04:37:24.493250Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "24268", "wal_files": "35", "duration_ms": "419"}
+{"timestamp": "2026-10-09T04:37:24.620142Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "12134", "wal_files": "35", "duration_ms": "125"}
+{"timestamp": "2026-10-09T04:37:24.714555Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "6067", "wal_files": "35", "duration_ms": "93"}
+{"timestamp": "2026-10-09T04:37:24.815795Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "6067", "wal_files": "35", "duration_ms": "100"}
+{"timestamp": "2026-10-09T04:37:24.927466Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "12134", "wal_files": "35", "duration_ms": "110"}
+{"timestamp": "2026-10-09T04:37:25.050498Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "12134", "wal_files": "35", "duration_ms": "121"}
+{"timestamp": "2026-10-09T04:37:26.373321Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "36402", "wal_files": "35", "duration_ms": "1321"}
+{"timestamp": "2026-10-09T04:37:26.746734Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "6067", "wal_files": "35", "duration_ms": "372"}
+{"timestamp": "2026-10-09T04:37:26.841733Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "6067", "wal_files": "35", "duration_ms": "93"}
+{"timestamp": "2026-10-09T04:37:26.971302Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "12134", "wal_files": "35", "duration_ms": "128"}
+{"timestamp": "2026-10-09T04:37:27.162525Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "30335", "wal_files": "35", "duration_ms": "190"}
+{"timestamp": "2026-10-09T04:37:27.288251Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "12134", "wal_files": "35", "duration_ms": "124"}
+{"timestamp": "2026-10-09T04:37:27.980039Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "12134", "wal_files": "35", "duration_ms": "690"}
+{"timestamp": "2026-10-09T04:37:28.351588Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "6067", "wal_files": "35", "duration_ms": "370"}
+{"timestamp": "2026-10-09T04:37:28.473307Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "12134", "wal_files": "34", "duration_ms": "120"}
+{"timestamp": "2026-10-09T04:37:28.570903Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "6067", "wal_files": "35", "duration_ms": "96"}
+{"timestamp": "2026-10-09T04:37:28.671703Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "12224", "wal_files": "2", "duration_ms": "98"}
+{"timestamp": "2026-10-09T04:37:28.760184Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "12224", "wal_files": "2", "duration_ms": "87"}
+{"timestamp": "2026-10-09T04:37:28.869823Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "24448", "wal_files": "2", "duration_ms": "108"}
+{"timestamp": "2026-10-09T04:37:29.557035Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "12224", "wal_files": "2", "duration_ms": "686"}
+{"timestamp": "2026-10-09T04:37:29.651839Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "12224", "wal_files": "2", "duration_ms": "93"}
+{"timestamp": "2026-10-09T04:37:29.741875Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "6112", "wal_files": "2", "duration_ms": "89"}
+{"timestamp": "2026-10-09T04:37:30.131294Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "6112", "wal_files": "2", "duration_ms": "388"}
+{"timestamp": "2026-10-09T04:37:30.205537Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "6112", "wal_files": "2", "duration_ms": "73"}
+{"timestamp": "2026-10-09T04:37:30.289967Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "12224", "wal_files": "2", "duration_ms": "83"}
+{"timestamp": "2026-10-09T04:37:30.369730Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "12224", "wal_files": "2", "duration_ms": "78"}
+{"timestamp": "2026-10-09T04:37:30.443443Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "6112", "wal_files": "2", "duration_ms": "72"}
+{"timestamp": "2026-10-09T04:37:30.519764Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "6112", "wal_files": "2", "duration_ms": "75"}
+{"timestamp": "2026-10-09T04:37:31.026841Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "30560", "wal_files": "2", "duration_ms": "506"}
+{"timestamp": "2026-10-09T04:37:31.101974Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "6112", "wal_files": "2", "duration_ms": "74"}
+{"timestamp": "2026-10-09T04:37:31.189027Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "12224", "wal_files": "2", "duration_ms": "85"}
+{"timestamp": "2026-10-09T04:37:31.306995Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "24448", "wal_files": "2", "duration_ms": "117"}
+{"timestamp": "2026-10-09T04:37:31.377531Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "6112", "wal_files": "2", "duration_ms": "69"}
+{"timestamp": "2026-10-09T04:37:31.462841Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "12224", "wal_files": "2", "duration_ms": "84"}
+{"timestamp": "2026-10-09T04:37:31.549518Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "12224", "wal_files": "2", "duration_ms": "85"}
+{"timestamp": "2026-10-09T04:37:31.621107Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "6112", "wal_files": "2", "duration_ms": "70"}
+{"timestamp": "2026-10-09T04:37:31.706918Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "904", "wal_files": "2", "duration_ms": "84"}
+{"timestamp": "2026-10-09T04:37:32.076302Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "12224", "wal_files": "2", "duration_ms": "366"}
+{"timestamp": "2026-10-09T04:37:32.741787Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "24448", "wal_files": "2", "duration_ms": "664"}
+{"timestamp": "2026-10-09T04:37:32.817191Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "6112", "wal_files": "2", "duration_ms": "74"}
+{"timestamp": "2026-10-09T04:37:32.897416Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "12224", "wal_files": "2", "duration_ms": "79"}
+{"timestamp": "2026-10-09T04:37:32.961563Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "6112", "wal_files": "2", "duration_ms": "63"}
+{"timestamp": "2026-10-09T04:37:33.040787Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "12224", "wal_files": "2", "duration_ms": "78"}
+{"timestamp": "2026-10-09T04:37:33.119747Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "6112", "wal_files": "2", "duration_ms": "77"}
+{"timestamp": "2026-10-09T04:37:33.190547Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "6112", "wal_files": "2", "duration_ms": "69"}
+{"timestamp": "2026-10-09T04:37:33.270730Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "12224", "wal_files": "2", "duration_ms": "79"}
+{"timestamp": "2026-10-09T04:37:33.342178Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "6112", "wal_files": "2", "duration_ms": "70"}
+{"timestamp": "2026-10-09T04:37:33.408317Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "6112", "wal_files": "2", "duration_ms": "65"}
+{"timestamp": "2026-10-09T04:37:33.497323Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "12224", "wal_files": "2", "duration_ms": "88"}
+{"timestamp": "2026-10-09T04:37:33.940629Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "12224", "wal_files": "2", "duration_ms": "442"}
+{"timestamp": "2026-10-09T04:37:34.444110Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "36672", "wal_files": "2", "duration_ms": "502"}
+{"timestamp": "2026-10-09T04:37:44.777689Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "25280", "wal_files": "9", "duration_ms": "325"}
+{"timestamp": "2026-10-09T04:37:44.884113Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "6320", "wal_files": "9", "duration_ms": "105"}
+{"timestamp": "2026-10-09T04:37:44.983972Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "6320", "wal_files": "9", "duration_ms": "98"}
+{"timestamp": "2026-10-09T04:37:45.119748Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "12640", "wal_files": "9", "duration_ms": "134"}
+{"timestamp": "2026-10-09T04:37:45.256187Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "12640", "wal_files": "9", "duration_ms": "135"}
+{"timestamp": "2026-10-09T04:37:45.384659Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "6320", "wal_files": "9", "duration_ms": "127"}
+{"timestamp": "2026-10-09T04:37:46.418362Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "1019", "wal_files": "12", "duration_ms": "1032"}
+{"timestamp": "2026-10-09T04:37:46.591723Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "25280", "wal_files": "9", "duration_ms": "171"}
+{"timestamp": "2026-10-09T04:37:46.735625Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "6320", "wal_files": "9", "duration_ms": "142"}
+{"timestamp": "2026-10-09T04:37:47.459792Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "6320", "wal_files": "9", "duration_ms": "723"}
+{"timestamp": "2026-10-09T04:37:48.134716Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "6320", "wal_files": "9", "duration_ms": "674"}
+{"timestamp": "2026-10-09T04:37:48.213579Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "6320", "wal_files": "9", "duration_ms": "78"}
+{"timestamp": "2026-10-09T04:37:48.297705Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "12640", "wal_files": "9", "duration_ms": "83"}
+{"timestamp": "2026-10-09T04:37:48.379503Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "12640", "wal_files": "9", "duration_ms": "80"}
+{"timestamp": "2026-10-09T04:37:48.461736Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "6320", "wal_files": "9", "duration_ms": "81"}
+{"timestamp": "2026-10-09T04:37:48.544630Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "12640", "wal_files": "9", "duration_ms": "82"}
+{"timestamp": "2026-10-09T04:37:48.682406Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "37920", "wal_files": "9", "duration_ms": "136"}
+{"timestamp": "2026-10-09T04:37:48.767927Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "12640", "wal_files": "9", "duration_ms": "84"}
+{"timestamp": "2026-10-09T04:37:48.840821Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "6320", "wal_files": "9", "duration_ms": "71"}
+{"timestamp": "2026-10-09T04:37:48.926289Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "12640", "wal_files": "9", "duration_ms": "84"}
+{"timestamp": "2026-10-09T04:37:49.012878Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "12640", "wal_files": "9", "duration_ms": "85"}
+{"timestamp": "2026-10-09T04:37:49.079806Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "6320", "wal_files": "9", "duration_ms": "66"}
+{"timestamp": "2026-10-09T04:37:49.891994Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "12640", "wal_files": "9", "duration_ms": "811"}
+{"timestamp": "2026-10-09T04:37:50.499064Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "6320", "wal_files": "9", "duration_ms": "605"}
+{"timestamp": "2026-10-09T04:37:50.596071Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "12640", "wal_files": "9", "duration_ms": "96"}
+{"timestamp": "2026-10-09T04:37:50.752930Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "31600", "wal_files": "9", "duration_ms": "155"}
+{"timestamp": "2026-10-09T04:37:50.822500Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "6320", "wal_files": "9", "duration_ms": "68"}
+{"timestamp": "2026-10-09T04:37:51.473271Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "6320", "wal_files": "9", "duration_ms": "649"}
+{"timestamp": "2026-10-09T04:37:51.560191Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "12640", "wal_files": "9", "duration_ms": "86"}
+{"timestamp": "2026-10-09T04:37:51.666862Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "12640", "wal_files": "9", "duration_ms": "105"}
+{"timestamp": "2026-10-09T04:37:51.766077Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "12640", "wal_files": "9", "duration_ms": "98"}
+{"timestamp": "2026-10-09T04:37:51.886617Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "25280", "wal_files": "9", "duration_ms": "119"}
+{"timestamp": "2026-10-09T04:37:51.967686Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "12640", "wal_files": "9", "duration_ms": "80"}
+{"timestamp": "2026-10-09T04:37:52.045296Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "12640", "wal_files": "9", "duration_ms": "76"}
+{"timestamp": "2026-10-09T04:37:52.114455Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "6320", "wal_files": "9", "duration_ms": "68"}
+{"timestamp": "2026-10-09T04:38:02.227140Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "6524", "wal_files": "9", "duration_ms": "107"}
+{"timestamp": "2026-10-09T04:38:03.198685Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "26096", "wal_files": "9", "duration_ms": "970"}
+{"timestamp": "2026-10-09T04:38:03.739032Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "6524", "wal_files": "9", "duration_ms": "539"}
+{"timestamp": "2026-10-09T04:38:03.827397Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "1095", "wal_files": "14", "duration_ms": "87"}
+{"timestamp": "2026-10-09T04:38:03.911318Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "13048", "wal_files": "9", "duration_ms": "81"}
+{"timestamp": "2026-10-09T04:38:03.992638Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "13048", "wal_files": "9", "duration_ms": "80"}
+{"timestamp": "2026-10-09T04:38:04.078999Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "13048", "wal_files": "9", "duration_ms": "85"}
+{"timestamp": "2026-10-09T04:38:04.166271Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "13048", "wal_files": "9", "duration_ms": "86"}
+{"timestamp": "2026-10-09T04:38:04.851907Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "13048", "wal_files": "9", "duration_ms": "684"}
+{"timestamp": "2026-10-09T04:38:04.936540Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "13048", "wal_files": "9", "duration_ms": "83"}
+{"timestamp": "2026-10-09T04:38:05.047008Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "26096", "wal_files": "9", "duration_ms": "109"}
+{"timestamp": "2026-10-09T04:38:05.135205Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "6524", "wal_files": "9", "duration_ms": "87"}
+{"timestamp": "2026-10-09T04:38:05.220679Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "6524", "wal_files": "9", "duration_ms": "84"}
+{"timestamp": "2026-10-09T04:38:05.290451Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "6524", "wal_files": "9", "duration_ms": "68"}
+{"timestamp": "2026-10-09T04:38:05.362975Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "6524", "wal_files": "9", "duration_ms": "71"}
+{"timestamp": "2026-10-09T04:38:05.481041Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "26096", "wal_files": "9", "duration_ms": "117"}
+{"timestamp": "2026-10-09T04:38:05.565622Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "13048", "wal_files": "9", "duration_ms": "83"}
+{"timestamp": "2026-10-09T04:38:05.655224Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "13048", "wal_files": "9", "duration_ms": "88"}
+{"timestamp": "2026-10-09T04:38:05.822270Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "39144", "wal_files": "9", "duration_ms": "166"}
+{"timestamp": "2026-10-09T04:38:06.541320Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "13048", "wal_files": "9", "duration_ms": "718"}
+{"timestamp": "2026-10-09T04:38:07.153987Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "13048", "wal_files": "9", "duration_ms": "611"}
+{"timestamp": "2026-10-09T04:38:07.278445Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "32620", "wal_files": "9", "duration_ms": "123"}
+{"timestamp": "2026-10-09T04:38:07.348229Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "6524", "wal_files": "9", "duration_ms": "68"}
+{"timestamp": "2026-10-09T04:38:07.434860Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "13048", "wal_files": "9", "duration_ms": "85"}
+{"timestamp": "2026-10-09T04:38:07.503031Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "6524", "wal_files": "9", "duration_ms": "67"}
+{"timestamp": "2026-10-09T04:38:07.973942Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "6524", "wal_files": "9", "duration_ms": "469"}
+{"timestamp": "2026-10-09T04:38:08.047818Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "6524", "wal_files": "9", "duration_ms": "72"}
+{"timestamp": "2026-10-09T04:38:08.143728Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "13048", "wal_files": "9", "duration_ms": "95"}
+{"timestamp": "2026-10-09T04:38:08.209585Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "6524", "wal_files": "9", "duration_ms": "64"}
+{"timestamp": "2026-10-09T04:38:08.299831Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "13048", "wal_files": "9", "duration_ms": "89"}
+{"timestamp": "2026-10-09T04:38:08.387578Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "13048", "wal_files": "9", "duration_ms": "86"}
+{"timestamp": "2026-10-09T04:38:08.452095Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "6524", "wal_files": "9", "duration_ms": "63"}
+{"timestamp": "2026-10-09T04:38:08.521362Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "6524", "wal_files": "9", "duration_ms": "68"}
+{"timestamp": "2026-10-09T04:38:08.583682Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "6524", "wal_files": "9", "duration_ms": "61"}
+{"timestamp": "2026-10-09T04:38:08.666791Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "13048", "wal_files": "9", "duration_ms": "82"}
+{"timestamp": "2026-10-09T04:38:18.773071Z", "event_type": "compaction_complete", "compact_service": "fail2ban", "rows": "6652", "wal_files": "7", "duration_ms": "102"}
+{"timestamp": "2026-10-09T04:38:18.849375Z", "event_type": "compaction_complete", "compact_service": "apt", "rows": "6652", "wal_files": "7", "duration_ms": "75"}
+{"timestamp": "2026-10-09T04:38:18.917841Z", "event_type": "compaction_complete", "compact_service": "web", "rows": "6652", "wal_files": "7", "duration_ms": "67"}
+{"timestamp": "2026-10-09T04:38:18.995351Z", "event_type": "compaction_complete", "compact_service": "mysql", "rows": "6652", "wal_files": "7", "duration_ms": "76"}
+{"timestamp": "2026-10-09T04:38:19.108807Z", "event_type": "compaction_complete", "compact_service": "redis", "rows": "26608", "wal_files": "7", "duration_ms": "112"}
+{"timestamp": "2026-10-09T04:38:19.523124Z", "event_type": "compaction_complete", "compact_service": "docker-unidentified", "rows": "13304", "wal_files": "7", "duration_ms": "413"}
+{"timestamp": "2026-10-09T04:38:19.603099Z", "event_type": "compaction_complete", "compact_service": "syslog-unidentified", "rows": "13304", "wal_files": "7", "duration_ms": "79"}
+{"timestamp": "2026-10-09T04:38:19.724793Z", "event_type": "compaction_complete", "compact_service": "apache", "rows": "33260", "wal_files": "7", "duration_ms": "120"}
+{"timestamp": "2026-10-09T04:38:19.803828Z", "event_type": "compaction_complete", "compact_service": "serial-getty", "rows": "13304", "wal_files": "7", "duration_ms": "77"}
+{"timestamp": "2026-10-09T04:38:19.893090Z", "event_type": "compaction_complete", "compact_service": "ufw", "rows": "13304", "wal_files": "7", "duration_ms": "88"}
+{"timestamp": "2026-10-09T04:38:19.963354Z", "event_type": "compaction_complete", "compact_service": "getty", "rows": "6652", "wal_files": "7", "duration_ms": "69"}
+{"timestamp": "2026-10-09T04:38:20.030694Z", "event_type": "compaction_complete", "compact_service": "steam", "rows": "6652", "wal_files": "7", "duration_ms": "66"}
+{"timestamp": "2026-10-09T04:38:20.121281Z", "event_type": "compaction_complete", "compact_service": "trawl-check-00000000-0000-4000-8000-000000000198", "rows": "13304", "wal_files": "7", "duration_ms": "89"}
+{"timestamp": "2026-10-09T04:38:20.198243Z", "event_type": "compaction_complete", "compact_service": "long-unit", "rows": "6652", "wal_files": "7", "duration_ms": "75"}
+{"timestamp": "2026-10-09T04:38:20.270480Z", "event_type": "compaction_complete", "compact_service": "sd-pam", "rows": "13304", "wal_files": "7", "duration_ms": "71"}
+{"timestamp": "2026-10-09T04:38:20.436681Z", "event_type": "compaction_complete", "compact_service": "nginx", "rows": "39912", "wal_files": "7", "duration_ms": "164"}
+{"timestamp": "2026-10-09T04:38:20.951034Z", "event_type": "compaction_complete", "compact_service": "dpkg", "rows": "6652", "wal_files": "7", "duration_ms": "513"}
+{"timestamp": "2026-10-09T04:38:21.036172Z", "event_type": "compaction_complete", "compact_service": "unifi-u6-lite", "rows": "13304", "wal_files": "7", "duration_ms": "84"}
+{"timestamp": "2026-10-09T04:38:21.146870Z", "event_type": "compaction_complete", "compact_service": "postgresql", "rows": "26608", "wal_files": "7", "duration_ms": "109"}
+{"timestamp": "2026-10-09T04:38:21.213410Z", "event_type": "compaction_complete", "compact_service": "worker", "rows": "6652", "wal_files": "7", "duration_ms": "65"}
+{"timestamp": "2026-10-09T04:38:21.278796Z", "event_type": "compaction_complete", "compact_service": "systemd-fsck", "rows": "6652", "wal_files": "7", "duration_ms": "64"}
+{"timestamp": "2026-10-09T04:38:21.374756Z", "event_type": "compaction_complete", "compact_service": "trawld", "rows": "1185", "wal_files": "14", "duration_ms": "94"}
+{"timestamp": "2026-10-09T04:38:21.452504Z", "event_type": "compaction_complete", "compact_service": "systemd-networkd", "rows": "13304", "wal_files": "7", "duration_ms": "75"}
+{"timestamp": "2026-10-09T04:38:21.544708Z", "event_type": "compaction_complete", "compact_service": "user", "rows": "13304", "wal_files": "7", "duration_ms": "91"}
+{"timestamp": "2026-10-09T04:38:21.666492Z", "event_type": "compaction_complete", "compact_service": "sshd", "rows": "26608", "wal_files": "7", "duration_ms": "120"}
+{"timestamp": "2026-10-09T04:38:21.732579Z", "event_type": "compaction_complete", "compact_service": "cron", "rows": "6652", "wal_files": "7", "duration_ms": "65"}
+{"timestamp": "2026-10-09T04:38:21.816723Z", "event_type": "compaction_complete", "compact_service": "mount", "rows": "13304", "wal_files": "7", "duration_ms": "83"}
+{"timestamp": "2026-10-09T04:38:21.898543Z", "event_type": "compaction_complete", "compact_service": "NetworkManager", "rows": "13304", "wal_files": "7", "duration_ms": "80"}
+{"timestamp": "2026-10-09T04:38:22.049499Z", "event_type": "compaction_complete", "compact_service": "varlog-unidentified", "rows": "6652", "wal_files": "7", "duration_ms": "150"}
+{"timestamp": "2026-10-09T04:38:22.123792Z", "event_type": "compaction_complete", "compact_service": "uuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuuu", "rows": "6652", "wal_files": "7", "duration_ms": "73"}
+{"timestamp": "2026-10-09T04:38:22.199604Z", "event_type": "compaction_complete", "compact_service": "pipewire", "rows": "6652", "wal_files": "7", "duration_ms": "74"}
+{"timestamp": "2026-10-09T04:38:22.275872Z", "event_type": "compaction_complete", "compact_service": "journal-unidentified", "rows": "13304", "wal_files": "7", "duration_ms": "75"}
+{"timestamp": "2026-10-09T04:38:22.365757Z", "event_type": "compaction_complete", "compact_service": "stack-web", "rows": "13304", "wal_files": "7", "duration_ms": "88"}
+{"timestamp": "2026-10-09T04:38:22.455349Z", "event_type": "compaction_complete", "compact_service": "init", "rows": "13304", "wal_files": "7", "duration_ms": "88"}
+{"timestamp": "2026-10-09T04:38:22.536102Z", "event_type": "compaction_complete", "compact_service": "networkd-dispatcher", "rows": "13304", "wal_files": "7", "duration_ms": "79"}

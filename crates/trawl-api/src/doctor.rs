@@ -275,6 +275,10 @@ impl Verdict {
 pub mod reason {
     /// The target refused the probe for exceeding its rate limit.
     pub const RATE_LIMITED: &str = "rate_limited";
+    /// trawld refused the probe because it was at its request limit: its
+    /// count of requests in progress, or its control allowance, was full
+    /// (ADR-0054). Retry with backoff.
+    pub const REQUEST_LIMIT_REACHED: &str = "request_limit_reached";
     /// The probe got no answer within its deadline.
     pub const TIMED_OUT: &str = "timed_out";
     /// The doctor's user lacks access to what the check reads.

@@ -9,7 +9,9 @@
 //! unbounded size and unpredictable duration. These handlers stream the
 //! upstream response bytes straight to the browser without parsing. The
 //! browser's `EventSource` handles framing on its end; reconnection
-//! after a drop is automatic and rides the same session cookie.
+//! after a drop is automatic and rides the same session cookie. A non-2xx
+//! upstream answer is no stream, and is relayed as the generic forwarder
+//! relays it.
 
 use std::time::Duration;
 
@@ -23,7 +25,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Auth;
-use crate::routes::proxy::{clear_cookie_for_proxied_response, refuse_redirect};
+use crate::routes::proxy::{clear_cookie_for_proxied_response, refuse_redirect, relay_response};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -93,13 +95,15 @@ fn forward_sse_response(
     // and 429 (stream-concurrency limit) behind a vague "upstream error".
     // A 3xx is the exception, for the same reason as there.
     refuse_redirect(upstream_resp.status())?;
+    // A non-2xx answer is no stream: it goes out through the generic
+    // forwarder's copy, with its own Content-Type, Cache-Control and
+    // request id, so a 503 `request_limit_reached` reaches the browser
+    // unchanged (ADR-0054). Only a stream gets the SSE treatment below.
+    if !upstream_resp.status().is_success() {
+        return relay_response(upstream_resp, auth);
+    }
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let upstream_ct = upstream_resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
     let byte_stream = upstream_resp.bytes_stream();
 
     // Cap the stream: a cookie session ends at its `exp`, a bearer client
@@ -116,18 +120,9 @@ fn forward_sse_response(
     let deadline = Instant::now() + ttl;
     let capped_stream = byte_stream.take_until(sleep_until(deadline));
 
-    // For non-2xx, preserve the upstream Content-Type (typically
-    // application/json for structured error bodies) so the browser
-    // sees a real error response rather than a truncated SSE stream.
-    let content_type = if status.is_success() {
-        "text/event-stream".to_string()
-    } else {
-        upstream_ct.unwrap_or_else(|| "application/json".to_string())
-    };
-
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         // Disable proxy buffering (e.g. nginx) upstream of us. Trawld sets
         // this too but we re-set it to be resilient to misconfigured
@@ -444,6 +439,92 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// trawld's request-limit refusal on a stream route (ADR-0054).
+    const REFUSAL: &str = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
+
+    /// The request id trawld put on [`REFUSAL`].
+    const REQUEST_ID: &str = "0b5f3c1e-request-limit-id";
+
+    /// Open `uri` through the proxy against an upstream that answers
+    /// `upstream_path` with trawld's 503 `request_limit_reached`, and check
+    /// the browser gets it as trawld sent it: status, body bytes,
+    /// `Content-Type`, `Cache-Control: no-store` and the request id, with no
+    /// SSE header added. The upstream sees exactly one request: no retry.
+    async fn assert_stream_relays_request_limit_refusal(uri: &str, upstream_path: &str) {
+        let upstream = TlsUpstream::start().await;
+        let state = state_pointing_at(&upstream);
+        let app = routes::build(state);
+        let cookie = login_cookie(app.clone(), &upstream).await;
+
+        Mock::given(method("GET"))
+            .and(path(upstream_path))
+            .and(bearer_token("flt_token"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("cache-control", "no-store")
+                    .insert_header("x-request-id", REQUEST_ID)
+                    .set_body_raw(REFUSAL, "application/json"),
+            )
+            .expect(1)
+            .mount(upstream.mock())
+            .await;
+
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["no-store"],
+            "{uri}"
+        );
+        assert_eq!(headers.get("x-request-id").unwrap(), REQUEST_ID, "{uri}");
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json",
+            "{uri}"
+        );
+        assert!(headers.get("x-accel-buffering").is_none(), "{uri}");
+        assert!(headers.get(header::RETRY_AFTER).is_none(), "{uri}");
+        assert!(!headers.contains_key(header::SET_COOKIE), "{uri}");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.as_ref(), REFUSAL.as_bytes(), "{uri}");
+
+        let relayed = upstream
+            .mock()
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == upstream_path)
+            .count();
+        assert_eq!(relayed, 1, "{uri}: one upstream request, no retry");
+    }
+
+    #[tokio::test]
+    async fn stream_forwards_request_limit_refusal() {
+        assert_stream_relays_request_limit_refusal("/api/v1/stream?query=*", "/api/v1/stream")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn dashboard_stream_forwards_request_limit_refusal() {
+        assert_stream_relays_request_limit_refusal(
+            "/api/v1/dashboard/stream",
+            "/api/v1/dashboard/stream",
+        )
+        .await;
     }
 
     #[test]
