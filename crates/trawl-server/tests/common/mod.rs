@@ -1249,6 +1249,74 @@ impl TestServer {
         })
     }
 
+    /// The production router over this fixture's state, with the fixture's
+    /// HTTP config as `f` leaves it.
+    ///
+    /// For in-process requests through `oneshot`. Such a request must carry
+    /// a `SocketAddr` extension where a route reads the peer (ingest does),
+    /// as the accept loop inserts one for every real connection.
+    pub fn router_with(
+        &self,
+        f: impl FnOnce(&mut trawl_server::state::HttpConfig),
+    ) -> axum::Router {
+        let mut http_config = self.http_config.clone();
+        f(&mut http_config);
+        http::router(self.state.clone(), &http_config)
+    }
+
+    /// Boot a SECOND server over this fixture's state and TLS material, on
+    /// an ephemeral port of its own, with the fixture's HTTP config as `f`
+    /// leaves it, and wait until it answers. Answers its base URL and the
+    /// serve task.
+    ///
+    /// `faults` are errors its first `accept()` calls answer, in order,
+    /// before any real accept (`serve_with_listener_failing_accepts`).
+    /// Empty, it serves through `serve_with_listener`, as the fixture does.
+    pub async fn spawn_server_with(
+        &self,
+        f: impl FnOnce(&mut trawl_server::state::HttpConfig),
+        faults: Vec<std::io::Error>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for a second server");
+        let addr = listener
+            .local_addr()
+            .expect("listener local_addr")
+            .to_string();
+        let state = self.state.clone();
+        let mut http_config = self.http_config.clone();
+        f(&mut http_config);
+        let server_config = self.server_config.clone();
+        let state_dir = self.state_dir.clone();
+        let task = tokio::spawn(async move {
+            let served = if faults.is_empty() {
+                http::serve_with_listener(
+                    listener,
+                    state,
+                    &http_config,
+                    &server_config,
+                    &state_dir,
+                    None,
+                )
+                .await
+            } else {
+                http::serve_with_listener_failing_accepts(
+                    listener,
+                    faults,
+                    state,
+                    &http_config,
+                    &server_config,
+                    &state_dir,
+                    None,
+                )
+                .await
+            };
+            served.unwrap();
+        });
+        wait_for_ready(&addr, &task).await;
+        (format!("https://{addr}"), task)
+    }
+
     /// Force-drop the fleet keystore database under the running server.
     pub async fn kill_fleet_database(&self) {
         kill_database(&self.fleet_db_url).await;

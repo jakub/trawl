@@ -12,8 +12,9 @@
 #![allow(dead_code)] // each test module uses a subset of these items
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -38,6 +39,81 @@ pub const REGULAR_MESSAGE: &str = "trawld is at its HTTP request limit \
 /// The control refusal's message, word for word.
 pub const CONTROL_MESSAGE: &str = "trawld is at its HTTP control allowance; the request was not processed; retry later with \
      backoff";
+
+// -- the production subscriber, captured ------------------------------------
+
+/// Everything the global subscriber writes to stdout.
+#[derive(Clone, Default)]
+struct Stdout(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Stdout {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install trawld's production subscriber under the default directives,
+/// once for the whole binary, with its stdout captured. Every test that
+/// reads [`stdout_lines`] calls this first.
+pub fn capture_logs() {
+    captured();
+}
+
+fn captured() -> &'static Stdout {
+    static STDOUT: OnceLock<Stdout> = OnceLock::new();
+    STDOUT.get_or_init(install_capture)
+}
+
+fn install_capture() -> Stdout {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let stdout = Stdout::default();
+    let (subscriber, _) = trawl_server::telemetry::build_subscriber(
+        trawl_server::telemetry::DEFAULT_LOG_FILTER,
+        trawl_server::telemetry::LogSinks {
+            stdout_ansi: false,
+            stdout: Some(stdout.clone()),
+            wal: None,
+            file_log: false,
+        },
+    );
+    subscriber.init();
+    stdout
+}
+
+/// Every stdout line the subscriber has written so far.
+pub fn stdout_lines() -> Vec<String> {
+    let bytes = captured().0.lock().unwrap().clone();
+    String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A field's value on a formatted stdout line: `name="quoted"` or
+/// `name=bare`.
+pub fn field(line: &str, name: &str) -> Option<String> {
+    let at = line.find(&format!(" {name}="))? + name.len() + 2;
+    let rest = &line[at..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.find('"').map(|end| quoted[..end].to_owned())
+    } else {
+        Some(rest.split_whitespace().next().unwrap_or("").to_owned())
+    }
+}
 
 /// The edge config with `max_concurrent_requests` at `limit` and no CORS.
 pub fn http_config(limit: usize) -> HttpConfig {

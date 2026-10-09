@@ -11,6 +11,8 @@
 //! waiting out the drain timeout.
 
 use std::any::Any;
+#[cfg(any(test, feature = "test-support"))]
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -21,9 +23,8 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{delete, get, post, put};
-use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
@@ -478,7 +479,7 @@ pub async fn serve(
     tracing::info!(event_type = "lifecycle", addr = %local_addr, "HTTPS server listening");
 
     accept_loop(
-        listener,
+        Incoming::new(listener),
         tls_acceptor,
         state,
         http,
@@ -509,7 +510,53 @@ pub async fn serve_with_listener(
     external_shutdown: Option<ShutdownRx>,
 ) -> Result<(), crate::error::ServerError> {
     let tls_acceptor = build_tls_acceptor(config, state_dir)?;
+    let incoming = Incoming::new(adopt_listener(listener)?);
+    accept_loop(
+        incoming,
+        tls_acceptor,
+        state,
+        http,
+        config,
+        external_shutdown,
+    )
+    .await
+}
 
+/// [`serve_with_listener`], with the first `accept()` calls answering
+/// `faults`, one each, in order, before any real accept.
+///
+/// The seam behind the accept loop's error handling: an error such as
+/// EMFILE cannot be provoked on demand from a real listener. The faults
+/// belong to this one server; nothing about them is process-wide.
+#[cfg(feature = "test-support")]
+pub async fn serve_with_listener_failing_accepts(
+    listener: std::net::TcpListener,
+    faults: Vec<std::io::Error>,
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    state_dir: &Path,
+    external_shutdown: Option<ShutdownRx>,
+) -> Result<(), crate::error::ServerError> {
+    let tls_acceptor = build_tls_acceptor(config, state_dir)?;
+    let mut incoming = Incoming::new(adopt_listener(listener)?);
+    incoming.faults.extend(faults);
+    accept_loop(
+        incoming,
+        tls_acceptor,
+        state,
+        http,
+        config,
+        external_shutdown,
+    )
+    .await
+}
+
+/// Register a listener the caller bound with the runtime, and log the
+/// address it listens on.
+fn adopt_listener(
+    listener: std::net::TcpListener,
+) -> Result<TcpListener, crate::error::ServerError> {
     let local_addr = listener
         .local_addr()
         .map_err(|e| crate::error::ServerError::Internal(format!("listener local_addr: {e}")))?;
@@ -526,23 +573,48 @@ pub async fn serve_with_listener(
     })?;
 
     tracing::info!(event_type = "lifecycle", addr = %local_addr, "HTTPS server listening");
+    Ok(listener)
+}
 
-    accept_loop(
-        listener,
-        tls_acceptor,
-        state,
-        http,
-        config,
-        external_shutdown,
-    )
-    .await
+/// How long the accept loop waits after a failed `accept()` before it
+/// accepts again. Long enough that a process out of file descriptors does
+/// not spin on the error; short enough that it serves again soon after
+/// descriptors free up.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The listener the accept loop reads.
+///
+/// With `test-support`, a queue of errors the next `accept()` calls answer
+/// before the listener is asked: see [`serve_with_listener_failing_accepts`].
+struct Incoming {
+    listener: TcpListener,
+    #[cfg(any(test, feature = "test-support"))]
+    faults: VecDeque<std::io::Error>,
+}
+
+impl Incoming {
+    fn new(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            #[cfg(any(test, feature = "test-support"))]
+            faults: VecDeque::new(),
+        }
+    }
+
+    async fn accept(&mut self) -> std::io::Result<(TcpStream, SocketAddr)> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(fault) = self.faults.pop_front() {
+            return Err(fault);
+        }
+        self.listener.accept().await
+    }
 }
 
 /// The shared tail of both serve paths: cert hot-reload, the TLS accept loop,
 /// and the graceful shutdown drain.
 #[allow(clippy::too_many_lines)] // accept loop + shutdown drain are cohesive
 async fn accept_loop(
-    listener: TcpListener,
+    mut incoming: Incoming,
     tls_acceptor: TlsAcceptor,
     state: AppState,
     http: &HttpConfig,
@@ -592,14 +664,31 @@ async fn accept_loop(
     // because the accept arm below borrows `accept_rx` mutably for the whole
     // `select!`, and a clone taken after the flag was set still observes it.
     let conn_rx = accept_rx.clone();
+    // The same reason: the accept arm waits out its backoff on this one.
+    let mut backoff_rx = accept_rx.clone();
 
     // Accept loop — runs until shutdown signal.
     loop {
         tokio::select! {
-            result = listener.accept() => {
-                let (tcp_stream, peer_addr) = result.map_err(|e| {
-                    crate::error::ServerError::Internal(format!("accept error: {e}"))
-                })?;
+            result = incoming.accept() => {
+                // A failed accept, such as EMFILE when the process is out
+                // of file descriptors, ends nothing: log it, wait out the
+                // backoff, and accept again. Under the pre-auth target, like
+                // every accept-loop diagnostic, because a connection flood
+                // can provoke it.
+                let (tcp_stream, peer_addr) = match result {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        tracing::warn!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "accept_failed", error = %e, "accept failed; accepting again after a backoff");
+                        tokio::select! {
+                            () = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => continue,
+                            () = shutdown_observed(&mut backoff_rx) => {
+                                tracing::info!(event_type = "lifecycle", "shutdown: stopping accept loop");
+                                break;
+                            }
+                        }
+                    }
+                };
 
                 let tls_acceptor = tls_rx.borrow().clone();
                 let tower_service = app.clone();
@@ -623,7 +712,7 @@ async fn accept_loop(
                     let io = TokioIo::new(tls_stream);
 
                     let hyper_service =
-                        hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                        hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
                             req.extensions_mut().insert(peer_addr);
                             let mut svc = tower_service.clone();
                             async move { svc.call(req).await }
