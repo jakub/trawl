@@ -22,8 +22,12 @@ Each sender first writes a backlog of whole fixture cycles to its Vector as
 fast as Vector reads them, as on a first start, then follows at a steady
 rate.
 
-A scraper reads /metrics at a fixed cadence. The run passes when
-trawl_http_requests_refused_total is 0 for both allowances.
+A scraper reads /metrics at a fixed cadence. After delivery the script
+stops the query loop and the senders, then takes one more /metrics snapshot
+before it stops trawld. The run passes when trawl_http_requests_refused_total
+is present and 0 for both allowances in every sample and in that snapshot,
+trawld recorded no request_limit_reached failure, every event was stored,
+and evidence collection and cleanup succeeded (see verdict).
 
 Usage, from the repository root:
 
@@ -32,8 +36,13 @@ Usage, from the repository root:
 
 --work is private: it holds the database password, the API keys, the data
 directory and the raw logs, and is deleted at the end unless --keep-work is
-given. Only summaries reach --out. The script owns one Postgres container,
-one trawld and three Vector processes, and removes all of them on exit.
+given. The script deletes only a --work directory it created itself (see
+check_work_path and Run.remove_work). Only summaries reach --out. The script
+owns one Postgres container, one trawld and three Vector processes, and
+removes all of them on exit.
+
+test_run.py, beside this file, checks the pass predicate and the --work
+rules without a full run.
 """
 
 import argparse
@@ -43,6 +52,7 @@ import gzip
 import hashlib
 import http.client
 import json
+import math
 import os
 import platform
 import re
@@ -50,6 +60,7 @@ import secrets
 import shutil
 import signal
 import ssl
+import stat
 import statistics
 import subprocess
 import sys
@@ -62,7 +73,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = Path(
     subprocess.run(["git", "-C", str(HERE), "rev-parse", "--show-toplevel"],
-                   check=True, capture_output=True, text=True).stdout.strip())
+                   check=True, capture_output=True, text=True).stdout.strip()).resolve()
 FIXTURE = ROOT / "crates/trawl-server/tests/fixtures/vector-capture/debian.ndjson"
 VECTOR_BASE = ROOT / "config/vector/debian/base.toml"
 TARGET = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")
@@ -111,7 +122,14 @@ def parse_metrics(text):
         m = METRIC_LINE.match(line)
         if not m:
             continue
-        name, labels, value = m.group(1), (m.group(2) or "")[1:-1], float(m.group(3))
+        name, labels = m.group(1), (m.group(2) or "")[1:-1]
+        try:
+            value = float(m.group(3))
+        except ValueError:
+            # Kept as None: an unparseable reading is an invalid observation,
+            # and a refusal counter that reads None fails the run.
+            series[(name, labels)] = None
+            continue
         series[(name, labels)] = value
         totals[name] = totals.get(name, 0.0) + value
     return series, totals
@@ -126,10 +144,103 @@ def pick(series, totals, name, label):
     return None
 
 
+def sample_row(text):
+    """The sampled series of one /metrics body, by SAMPLED key."""
+    series, totals = parse_metrics(text)
+    row = {key: pick(series, totals, name, label) for key, name, label in SAMPLED}
+    row["parquet_files"] = totals.get("trawl_parquet_files_total")
+    return row
+
+
+def counter_reading(value):
+    """A refusal counter reading as an int, or None when it is missing,
+    unparseable, not finite, negative or not a whole number."""
+    if value is None or not math.isfinite(value) or value < 0 or value != int(value):
+        return None
+    return int(value)
+
+
+def refuse_dangerous(work):
+    """SystemExit if work, an absolute path, is a symlink, passes through
+    one, or is a directory the script must never create or delete."""
+    if os.path.islink(work):
+        raise SystemExit(f"--work {work} is a symlink; refusing")
+    if Path(os.path.realpath(work)) != work:
+        raise SystemExit(f"--work {work} passes through a symlink; refusing")
+    tmp = Path("/tmp")
+    for name, path in (("the filesystem root", Path("/")), ("$HOME", Path.home().resolve()),
+                       ("/tmp", tmp)):
+        if work == path:
+            raise SystemExit(f"--work must not be {name}")
+    if work == ROOT or work in ROOT.parents:
+        raise SystemExit(f"--work must not be the repository root {ROOT} or an ancestor of it")
+    for forbidden in (tmp, HERE):
+        if work == forbidden or forbidden in work.parents:
+            raise SystemExit(f"--work must not be under {forbidden}")
+
+
+def check_work_path(raw):
+    """The --work argument as an absolute path that does not exist yet.
+
+    The path is made absolute lexically, so a symlink is never followed.
+    Anything refused here is never created or deleted by the script."""
+    work = Path(os.path.abspath(raw))
+    refuse_dangerous(work)
+    if os.path.lexists(work):
+        raise SystemExit(f"--work {work} already exists; remove it or pick another")
+    return work
+
+
+def verdict(summary):
+    """Every reason the summary is not AC23 evidence. The run passes when
+    the list is empty. A missing or unreadable observation is a reason."""
+    reasons = []
+    if "collectError" in summary:
+        reasons.append(f"collecting the evidence failed: {summary['collectError']}")
+    m = summary.get("metrics") or {}
+    if not m.get("samples"):
+        reasons.append("no /metrics samples")
+    if m.get("failedScrapes") != 0:
+        reasons.append(f"failed /metrics scrapes: {m.get('failedScrapes')}")
+    if (m.get("terminalSnapshot") or {}).get("status") != 200:
+        reasons.append("no terminal /metrics snapshot after the producers stopped")
+    for allowance in ("regular", "control"):
+        invalid = (m.get("invalidRefusalObservations") or {}).get(allowance)
+        if invalid != 0:
+            reasons.append(f"samples without a valid {allowance} refusal counter: {invalid}")
+        seen = (m.get("refusedTotalMaxSeen") or {}).get(allowance)
+        if seen != 0:
+            reasons.append(f"highest sampled {allowance} refusal counter: {seen}")
+        end = (m.get("refusedTotalAtEnd") or {}).get(allowance)
+        if end != 0:
+            reasons.append(f"{allowance} refusal counter in the terminal snapshot: {end}")
+    if summary.get("requestLimitRefusalEvents") != 0:
+        reasons.append("trawld recorded request_limit_reached failures: "
+                       f"{summary.get('requestLimitRefusalEvents')}")
+    vector_refusals = sum(v.get("request_limit_reached", 0)
+                          for v in (summary.get("vectorLogs") or {}).values())
+    if vector_refusals:
+        reasons.append(f"Vector logged request_limit_reached: {vector_refusals}")
+    if not (summary.get("delivery") or {}).get("complete"):
+        reasons.append("delivery incomplete")
+    stopped = summary.get("producersStopped") or {}
+    if stopped.get("threadsStillRunning") != []:
+        reasons.append(f"producer threads still running: {stopped.get('threadsStillRunning')}")
+    cleanup = summary.get("cleanup") or {}
+    if not (cleanup.get("processes") and cleanup.get("container")):
+        reasons.append(f"cleanup failed: {cleanup}")
+    if cleanup.get("workDir") not in ("removed", "kept"):
+        reasons.append(f"work directory: {cleanup.get('workDir')}")
+    return reasons
+
+
 class Run:
     def __init__(self, args):
         self.args = args
-        self.work = Path(args.work).resolve()
+        self.work = Path(os.path.abspath(args.work))
+        # (st_dev, st_ino) of the --work directory once claim_work has
+        # created it; None until then. Only an owned directory is deleted.
+        self.work_owned = None
         self.out = Path(args.out).resolve()
         self.run_id = f"ac23-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}"
         self.container = f"trawl-ac23-{secrets.token_hex(8)}"
@@ -183,12 +294,52 @@ class Run:
 
     # -- setup -------------------------------------------------------------
 
-    def preflight(self):
-        for forbidden in (Path("/tmp"), HERE):
-            if self.work == forbidden or forbidden in self.work.parents:
-                raise SystemExit(f"--work must not be under {forbidden}")
-        if self.work.exists():
+    def claim_work(self):
+        """Create --work, or SystemExit with nothing created.
+
+        mkdir is the claim: it fails if the path appeared after the check,
+        so the script never takes over a directory it did not make."""
+        self.work = check_work_path(self.args.work)
+        if self.out == self.work or self.work in self.out.parents:
+            raise SystemExit(f"--out must not be inside --work {self.work}")
+        self.work.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.mkdir(self.work, 0o700)
+        except FileExistsError:
             raise SystemExit(f"--work {self.work} already exists; remove it or pick another")
+        st = os.lstat(self.work)
+        self.work_owned = (st.st_dev, st.st_ino)
+        (self.work / "private").mkdir(mode=0o700)
+
+    def remove_work(self):
+        """Delete --work if this invocation created it. Returns what happened.
+
+        The path must still be the directory claim_work made (same device
+        and inode, not a symlink), and rmtree must be the variant that does
+        not follow symlinks."""
+        if self.args.keep_work:
+            return "kept"
+        if self.work_owned is None:
+            return "not created by this run; left in place"
+        try:
+            refuse_dangerous(self.work)
+        except SystemExit as refusal:
+            return f"refused: {refusal.code}"
+        try:
+            st = os.lstat(self.work)
+        except FileNotFoundError:
+            return "refused: already gone"
+        if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != self.work_owned:
+            return "refused: no longer the directory this run created"
+        if not shutil.rmtree.avoids_symlink_attacks:
+            return "refused: this platform's rmtree can follow symlinks"
+        try:
+            shutil.rmtree(self.work)
+        except OSError as error:
+            return f"failed: {error.__class__.__name__}"
+        return "removed"
+
+    def preflight(self):
         dirty = self.cmd(["git", "-C", str(ROOT), "status", "--porcelain", "--", "crates",
                           "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "bin/trawld-dev"])
         if dirty:
@@ -220,8 +371,6 @@ class Run:
             "memTotalKiB": int(next(l.split()[1] for l in open("/proc/meminfo")
                                     if l.startswith("MemTotal:"))),
         }
-        self.work.mkdir(parents=True, mode=0o700)
-        (self.work / "private").mkdir(mode=0o700)
 
     def start_postgres(self):
         password = secrets.token_hex(24)
@@ -511,16 +660,45 @@ class Run:
             took = time.monotonic() - at
             row = {"t": round(at - self.t0, 3), "scrape_ms": round(took * 1000, 1), "status": status}
             if status == 200:
-                series, totals = parse_metrics(text)
-                for key, name, label in SAMPLED:
-                    row[key] = pick(series, totals, name, label)
-                row["parquet_files"] = totals.get("trawl_parquet_files_total")
-                self.last_metrics = text
+                row.update(sample_row(text))
             self.samples.append(row)
             tick = max(tick + 1, int((time.monotonic() - start) / interval) + 1)
             delay = start + tick * interval - time.monotonic()
             if delay > 0:
                 self.stop.wait(delay)
+
+    def stop_vectors(self):
+        """Close each Vector's stdin and wait for it to exit. The stdin
+        source ends, and Vector flushes its sink before it stops."""
+        for s in self.vectors:
+            try:
+                s["child"].stdin.close()
+            except OSError:
+                pass
+        exits = {}
+        for s in self.vectors:
+            try:
+                s["child"].wait(60)
+            except subprocess.TimeoutExpired:
+                self.terminate(s["child"])
+            exits[s["name"]] = s["child"].returncode
+        return exits
+
+    def final_scrape(self):
+        """The terminal /metrics snapshot: after the producers stop, before
+        trawld stops. Counters only grow, so a retry reads the same truth."""
+        status, text = 0, None
+        for attempt in range(3):
+            at = time.monotonic()
+            try:
+                status, text = self.http("GET", "/metrics", timeout=30)
+            except Exception:  # recorded as status 0, which fails the run
+                status, text = 0, None
+            if status == 200:
+                break
+            time.sleep(1 + attempt)
+        self.final_metrics = {"t": round(at - self.t0, 3), "status": status,
+                              "attempts": attempt + 1, "text": text if status == 200 else None}
 
     def query_loop(self):
         # A search for one systemd line, one page of 50 rows. It matches
@@ -573,8 +751,8 @@ class Run:
         self.t0 = time.monotonic()
         self.wall0 = datetime.now(timezone.utc)
         self.summary["measuredSessionStart"] = self.wall0.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-        threads = [threading.Thread(target=self.scrape, daemon=True),
-                   threading.Thread(target=self.query_loop, daemon=True)]
+        threads = [threading.Thread(target=self.scrape, name="scraper", daemon=True),
+                   threading.Thread(target=self.query_loop, name="query-loop", daemon=True)]
         for t in threads:
             t.start()
         self.start_vectors()
@@ -616,9 +794,16 @@ class Run:
         self.delivered_at = round(time.monotonic() - self.t0, 3)
         # One more interval so the last batches meet a normal compaction pass.
         time.sleep(12)
+        # Stop every producer, then take the terminal snapshot while trawld
+        # still runs: a refusal after the last sample is in that snapshot.
+        # A query in flight finishes within its 120 s client timeout.
         self.stop.set()
         for t in threads:
-            t.join(60)
+            t.join(150)
+        self.summary["producersStopped"] = {
+            "threadsStillRunning": [t.name for t in threads if t.is_alive()],
+            "vectorExitCodes": self.stop_vectors()}
+        self.final_scrape()
         self.summary["delivery"] = {"expectedDistinct": expected, "counted": counts,
                                     "complete": complete(counts),
                                     "duplicates": counts and {
@@ -645,31 +830,41 @@ class Run:
             w.writeheader()
             for row in self.queries:
                 w.writerow(row)
-        if getattr(self, "last_metrics", None):
+        terminal = getattr(self, "final_metrics", None) or {}
+        final_text = terminal.get("text")
+        if final_text:
             keep = re.compile(r"^(# (HELP|TYPE) )?trawl_(http_|hot_buffer_|ingest_events|"
                               r"compaction_|files_quarantined|parquet_files|wal_files|queries_total)")
             (self.out / "metrics-final.prom").write_text(
-                "\n".join(l for l in self.last_metrics.splitlines() if keep.match(l)) + "\n")
+                "\n".join(l for l in final_text.splitlines() if keep.match(l)) + "\n")
+        final = sample_row(final_text) if final_text else {}
 
         ok = [r for r in self.samples if r.get("status") == 200]
         gaps = [b["t"] - a["t"] for a, b in zip(ok, ok[1:])]
         peak = max((r["in_progress_regular"] for r in ok if r.get("in_progress_regular") is not None),
                    default=None)
         peak_row = next((r for r in ok if r.get("in_progress_regular") == peak), None)
-        final = ok[-1] if ok else {}
+        refused = {a: [counter_reading(r.get(f"refused_{a}")) for r in ok]
+                   for a in ("regular", "control")}
         self.summary["metrics"] = {
             "samples": len(self.samples),
             "failedScrapes": len(self.samples) - len(ok),
             "intervalSeconds": {"target": self.args.scrape_interval,
                                 "median": round(statistics.median(gaps), 3) if gaps else None,
                                 "max": round(max(gaps), 3) if gaps else None},
+            "terminalSnapshot": {k: terminal.get(k) for k in ("t", "status", "attempts")},
             "allowance": {"regular": final.get("allowance_regular"),
                           "control": final.get("allowance_control")},
-            "refusedTotalAtEnd": {"regular": final.get("refused_regular"),
-                                  "control": final.get("refused_control")},
-            "refusedTotalMaxSeen": {
-                "regular": max((r.get("refused_regular") or 0 for r in ok), default=None),
-                "control": max((r.get("refused_control") or 0 for r in ok), default=None)},
+            # From the terminal snapshot. None: the series was missing or
+            # unreadable there, which fails the run.
+            "refusedTotalAtEnd": {a: counter_reading(final.get(f"refused_{a}"))
+                                  for a in ("regular", "control")},
+            # Over the samples' valid readings; a missing or unreadable
+            # reading is counted as invalid, never as zero.
+            "refusedTotalMaxSeen": {a: max((v for v in refused[a] if v is not None), default=None)
+                                    for a in ("regular", "control")},
+            "invalidRefusalObservations": {a: sum(v is None for v in refused[a])
+                                           for a in ("regular", "control")},
             "sampledPeakInProgress": {
                 "regular": peak, "atSeconds": peak_row and peak_row["t"],
                 "control": max((r.get("in_progress_control") or 0 for r in ok), default=None)},
@@ -683,8 +878,8 @@ class Run:
                 str(v): sum(1 for r in ok if (r.get("hot_buffer_admission_state") or 0) == v)
                 for v in (0, 1, 2)},
         }
-        if getattr(self, "last_metrics", None):
-            series, totals = parse_metrics(self.last_metrics)
+        if final_text:
+            series, totals = parse_metrics(final_text)
             self.summary["metrics"]["final"] = {
                 f"{n}{{{l}}}" if l else n: v for (n, l), v in series.items()
                 if n in ("trawl_ingest_events_total", "trawl_ingest_events_rejected_total",
@@ -751,10 +946,12 @@ class Run:
                 "durationMs": {"p50": int(statistics.median(took)), "max": took[-1]},
             }
         self.summary["httpFailuresFromTrawld"] = {}
+        self.summary["requestLimitRefusalEvents"] = 0
         for f in self.events(self.trawld_log):
             if f.get("event_type") == "http_failure":
                 key = f'{f.get("route")} {f.get("status")} {f.get("cause_kind")}'
                 self.summary["httpFailuresFromTrawld"][key] = self.summary["httpFailuresFromTrawld"].get(key, 0) + 1
+                self.summary["requestLimitRefusalEvents"] += f.get("cause_kind") == "request_limit_reached"
 
         # What the senders saw: Vector's retry warnings, by the body code.
         vectors = {}
@@ -803,6 +1000,9 @@ def main():
     p.add_argument("--drain-seconds", type=int, default=900)
     p.add_argument("--keep-work", action="store_true")
     run = Run(p.parse_args())
+    # A refused --work exits here, before anything exists to clean up, and
+    # nothing is written to --out.
+    run.claim_work()
     def interrupt(*_):
         raise KeyboardInterrupt
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -814,32 +1014,39 @@ def main():
     except KeyboardInterrupt:
         run.summary["status"] = "interrupted"
         log("interrupted")
+    except SystemExit as refusal:  # a preflight refusal after the claim
+        run.summary["status"] = "refused"
+        run.summary["error"] = run.redact(str(refusal.code))
+        log(f"refused: {run.summary['error']}")
     except Exception as error:
         run.summary["status"] = "error"
         run.summary["error"] = run.redact(str(error))
         log(f"error: {run.summary['error']}")
     finally:
         run.cleanup()
-        try:
-            run.collect()
-        except Exception as error:
-            run.summary["collectError"] = run.redact(repr(error))
-        m = run.summary.get("metrics", {})
-        refused = m.get("refusedTotalMaxSeen", {})
-        delivery = run.summary.get("delivery", {})
-        if code == 0:
-            passed = (refused.get("regular") == 0 and refused.get("control") == 0
-                      and delivery.get("complete") and m.get("failedScrapes") == 0
-                      and run.summary.get("cleanup", {}).get("processes")
-                      and run.summary.get("cleanup", {}).get("container"))
-            run.summary["status"] = "passed" if passed else "failed"
-            code = 0 if passed else 1
-        run.out.mkdir(parents=True, exist_ok=True)
-        (run.out / "summary.json").write_text(run.redact(json.dumps(run.summary, indent=2)) + "\n")
-        log(f"status {run.summary['status']}; summary in {run.out / 'summary.json'}")
-        if not run.args.keep_work and run.work.exists() and run.work != HERE:
-            shutil.rmtree(run.work, ignore_errors=True)
+        code = conclude(run, code)
     sys.exit(code)
+
+
+def conclude(run, code):
+    """Collect the summaries, remove --work if this run owns it, judge the
+    run and write summary.json. Returns the exit code."""
+    try:
+        run.collect()
+    except Exception as error:
+        run.summary["collectError"] = run.redact(repr(error))
+    run.summary.setdefault("cleanup", {})["workDir"] = run.remove_work()
+    if code == 0:
+        reasons = verdict(run.summary)
+        run.summary["status"] = "failed" if reasons else "passed"
+        run.summary["failureReasons"] = reasons
+        code = 1 if reasons else 0
+    run.out.mkdir(parents=True, exist_ok=True)
+    (run.out / "summary.json").write_text(run.redact(json.dumps(run.summary, indent=2)) + "\n")
+    log(f"status {run.summary['status']}; summary in {run.out / 'summary.json'}")
+    for reason in run.summary.get("failureReasons", []):
+        log(f"  {reason}")
+    return code
 
 
 if __name__ == "__main__":
