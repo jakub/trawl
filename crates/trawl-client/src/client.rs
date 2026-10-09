@@ -1427,10 +1427,14 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
 }
 
 /// What a send failure of a request that carries a body says when the
-/// server reset or closed the connection under it. It claims no 413 it did
-/// not read, and names no URL or transport internals.
+/// server reset or closed the connection under it. A reset proves nothing
+/// about why: trawld hangs up on an oversized body (413) and on a request
+/// refused at its request limit (503) without draining the upload. The text
+/// names both possibilities, claims neither a 413 nor a 503 it did not read,
+/// and names no URL or transport internals.
 const UPLOAD_CUT_OFF: &str = "the server closed the connection before the upload finished; \
-                              the request may exceed the server's request size limit";
+                              the request may exceed the server's request size limit, \
+                              or the server may be at its request limit";
 
 /// Categorize a send failure of a request that carries a body.
 ///

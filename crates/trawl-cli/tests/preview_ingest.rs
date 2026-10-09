@@ -792,7 +792,8 @@ async fn a_body_far_over_the_limit_prints_the_413_or_a_cut_off_upload() {
          max_request_body_bytes ({DEFAULT_BODY_LIMIT} bytes)\n"
     );
     let cut_off = "trawl: network error: the server closed the connection before the \
-                   upload finished; the request may exceed the server's request size limit\n";
+                   upload finished; the request may exceed the server's request size limit, \
+                   or the server may be at its request limit\n";
     assert!(stderr == refused || stderr == cut_off, "{stderr}");
     eprintln!("far-over-limit outcome: {}", stderr.trim_end());
     server.stop().await;
