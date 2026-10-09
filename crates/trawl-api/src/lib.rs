@@ -150,6 +150,12 @@ pub enum ErrorCode {
     /// The request body carries a `Content-Encoding` this route does not
     /// decode (415).
     UnsupportedEncoding,
+    /// trawld is at its count of requests in progress, or a control route
+    /// is at its control allowance (503, no `Retry-After`, ADR-0054). The
+    /// request was refused before any handler ran, so nothing from it was
+    /// processed or ingested. The message never carries the configured
+    /// value.
+    RequestLimitReached,
 }
 
 /// Source location within a query string.
@@ -2557,6 +2563,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::UnsupportedEncoding).unwrap(),
             "\"unsupported_encoding\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::RequestLimitReached).unwrap(),
+            "\"request_limit_reached\""
         );
     }
 

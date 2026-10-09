@@ -12,6 +12,7 @@ use crate::hot_buffer::Charge;
 use crate::publication::CorpusUnsettled;
 use crate::report_window::{MaterializeError, PlanError, WindowPolicyError};
 use crate::store::StoreError;
+use crate::transport::request_limit::Allowance;
 
 /// The one reason a unit of pool work refused before it ever started
 /// (ADR-0024): the request's budget was gone, or its cancellation was
@@ -34,6 +35,27 @@ const fn corpus_recovering_message(reason: CorpusUnsettled) -> &'static str {
         CorpusUnsettled::RollupPending => {
             "Search is unavailable while the server finishes an interrupted storage rollup."
         }
+    }
+}
+
+/// The refusal when `[server] max_concurrent_requests` requests are already
+/// in progress (ADR-0054). It names the setting and never its value: the
+/// refusal reaches callers who have not authenticated, and the value would
+/// tell one how many slow uploads fill the server.
+pub const REQUEST_LIMIT_REACHED: &str = "trawld is at its HTTP request limit \
+     ([server] max_concurrent_requests); the request was not processed; retry later with backoff";
+
+/// The refusal when the control allowance is in use (ADR-0054). It names the
+/// allowance, not `max_concurrent_requests`, which the control routes never
+/// use.
+pub const CONTROL_ALLOWANCE_REACHED: &str = "trawld is at its HTTP control allowance; \
+     the request was not processed; retry later with backoff";
+
+/// The fixed sentence for a refusal charged to `allowance`.
+const fn request_limit_message(allowance: Allowance) -> &'static str {
+    match allowance {
+        Allowance::Regular => REQUEST_LIMIT_REACHED,
+        Allowance::Control => CONTROL_ALLOWANCE_REACHED,
     }
 }
 
@@ -220,6 +242,14 @@ pub enum ServerError {
     #[error("hot buffer snapshot failed")]
     HotSnapshot(#[source] std::io::Error),
 
+    /// The request was refused at the edge because its allowance had no
+    /// request in progress free (503, no `Retry-After`, `Cache-Control:
+    /// no-store`, ADR-0054). No handler ran and the body was never read.
+    /// The message is fixed per allowance and never carries the configured
+    /// value.
+    #[error("{}", request_limit_message(*.0))]
+    RequestLimitReached(Allowance),
+
     /// Internal server error (unexpected failures).
     #[error("internal error: {0}")]
     Internal(String),
@@ -317,11 +347,14 @@ pub enum CauseKind {
     /// A read was refused because a rollup is unresolved or the rollup
     /// scan failed (ADR-0026, ADR-0041).
     RollupPending,
+    /// A request was refused at the edge because trawld was at its count of
+    /// requests in progress or at its control allowance (ADR-0054).
+    RequestLimitReached,
 }
 
 impl CauseKind {
     /// Every kind, for closed-set checks and for consumers that enumerate.
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::None,
         Self::Unknown,
         Self::IoNotFound,
@@ -353,6 +386,7 @@ impl CauseKind {
         Self::HotBufferFull,
         Self::RestartBacklog,
         Self::RollupPending,
+        Self::RequestLimitReached,
     ];
 
     /// The fixed `snake_case` literal this kind is recorded as.
@@ -390,6 +424,7 @@ impl CauseKind {
             Self::HotBufferFull => "hot_buffer_full",
             Self::RestartBacklog => "restart_backlog",
             Self::RollupPending => "rollup_pending",
+            Self::RequestLimitReached => "request_limit_reached",
         }
     }
 
@@ -507,8 +542,8 @@ impl ServerError {
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
             // `IngestBodyTooLarge`, `RequestTooLarge`, `HotBufferFull`,
             // `IngestBatchTooLarge`, `PreviewTooLarge`, `UnsupportedEncoding`,
-            // `CorpusRecovering` and `HotSnapshot` render fixed text and
-            // counts, with nothing to redact.
+            // `CorpusRecovering`, `HotSnapshot` and `RequestLimitReached`
+            // render fixed text and counts, with nothing to redact.
             other => other.to_string(),
         }
     }
@@ -551,12 +586,14 @@ impl ServerError {
             // A full hot buffer is a 503 like any other refusal to serve;
             // `cause_kind` names it, as it does an auth backend outage.
             // An unsettled corpus and a failed hot snapshot are too: the
-            // reason and the I/O kind are cause kinds, not classes.
+            // reason and the I/O kind are cause kinds, not classes. So is a
+            // request refused at the request limit (ADR-0054).
             Self::ServiceUnavailable(_)
             | Self::AuthBackend(_)
             | Self::HotBufferFull { .. }
             | Self::CorpusRecovering(_)
-            | Self::HotSnapshot(_) => "service_unavailable",
+            | Self::HotSnapshot(_)
+            | Self::RequestLimitReached(_) => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::PreviewTooLarge { .. } => "preview_too_large",
             Self::RequestTooLarge { .. } => "request_too_large",
@@ -581,6 +618,9 @@ impl ServerError {
             Self::HotBufferFull { .. } => CauseKind::HotBufferFull,
             Self::CorpusRecovering(CorpusUnsettled::RestartBacklog) => CauseKind::RestartBacklog,
             Self::CorpusRecovering(CorpusUnsettled::RollupPending) => CauseKind::RollupPending,
+            // One kind for both allowances: the metric label, not the
+            // failure record, tells them apart.
+            Self::RequestLimitReached(_) => CauseKind::RequestLimitReached,
             // A pre-start capacity refusal is a pressure outcome the class
             // names in full. Every other 503 was built from a string and
             // kept no typed source.
@@ -969,6 +1009,16 @@ impl IntoResponse for ServerError {
                     "recent events could not be read for this query",
                 ),
             ),
+            // No `Retry-After`: nothing predicts when a request in progress
+            // ends, and a fixed hint would make senders retry together
+            // (ADR-0054). `Cache-Control: no-store` is added below.
+            Self::RequestLimitReached(allowance) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(
+                    ErrorCode::RequestLimitReached,
+                    request_limit_message(*allowance),
+                ),
+            ),
             // A client error with no `Retry-After`: the same request can
             // never fit.
             Self::IngestBatchTooLarge { .. } => (
@@ -1007,11 +1057,23 @@ impl IntoResponse for ServerError {
 
         let body = trawl_api::ErrorResponse { error: envelope };
         let mut response = (status, axum::Json(body)).into_response();
-        if let Self::HotBufferFull { retry_after_secs } = self {
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from(retry_after_secs),
-            );
+        match self {
+            Self::HotBufferFull { retry_after_secs } => {
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(retry_after_secs),
+                );
+            }
+            // The refusal is the edge's answer for every route, the ingest
+            // preview included, whose own no-store layer sits inside the
+            // count and never sees it.
+            Self::RequestLimitReached(_) => {
+                response.headers_mut().insert(
+                    axum::http::header::CACHE_CONTROL,
+                    axum::http::HeaderValue::from_static("no-store"),
+                );
+            }
+            _ => {}
         }
         response
     }
@@ -1211,10 +1273,11 @@ mod tests {
                 | CauseKind::AuthWorker
                 | CauseKind::HotBufferFull
                 | CauseKind::RestartBacklog
-                | CauseKind::RollupPending => true,
+                | CauseKind::RollupPending
+                | CauseKind::RequestLimitReached => true,
             })
             .count();
-        assert_eq!(variants, 31, "ALL lists every variant");
+        assert_eq!(variants, 32, "ALL lists every variant");
 
         let mut seen = std::collections::HashSet::new();
         for kind in CauseKind::ALL {
@@ -1605,6 +1668,64 @@ mod tests {
             body["error"]["message"],
             "request body exceeds [server] max_request_body_bytes (131072 bytes)"
         );
+    }
+
+    /// A request-limit refusal (ADR-0054): 503 with its own code and the
+    /// fixed sentence for its allowance, classed like every refusal to
+    /// serve, `Cache-Control: no-store` and no `Retry-After`.
+    #[tokio::test]
+    async fn a_request_limit_refusal_is_a_no_store_503_without_retry_after() {
+        for (allowance, message) in [
+            (Allowance::Regular, REQUEST_LIMIT_REACHED),
+            (Allowance::Control, CONTROL_ALLOWANCE_REACHED),
+        ] {
+            let err = ServerError::RequestLimitReached(allowance);
+            assert_eq!(err.error_class(), "service_unavailable");
+            assert_eq!(err.cause_kind(), CauseKind::RequestLimitReached);
+            assert_eq!(err.cause_kind().as_str(), "request_limit_reached");
+            assert_eq!(err.to_string(), message);
+            assert_eq!(err.safe_message(), message);
+            let response = err.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let headers = response.headers();
+            assert!(
+                headers.get(axum::http::header::RETRY_AFTER).is_none(),
+                "{allowance:?} must not send Retry-After"
+            );
+            assert_eq!(
+                headers.get(axum::http::header::CACHE_CONTROL),
+                Some(&axum::http::HeaderValue::from_static("no-store"))
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(&body_string(response).await).unwrap();
+            assert_eq!(body["error"]["code"], "request_limit_reached");
+            assert_eq!(body["error"]["message"], message);
+            assert!(body["error"].get("details").is_none());
+        }
+    }
+
+    /// The two sentences, word for word. The regular one names the setting
+    /// and carries no digits at all, so no configured value can be in it;
+    /// the control one names the allowance and not the setting.
+    #[test]
+    fn the_request_limit_messages_are_fixed_and_carry_no_value() {
+        assert_eq!(
+            REQUEST_LIMIT_REACHED,
+            "trawld is at its HTTP request limit ([server] max_concurrent_requests); the \
+             request was not processed; retry later with backoff"
+        );
+        assert_eq!(
+            CONTROL_ALLOWANCE_REACHED,
+            "trawld is at its HTTP control allowance; the request was not processed; retry \
+             later with backoff"
+        );
+        for message in [REQUEST_LIMIT_REACHED, CONTROL_ALLOWANCE_REACHED] {
+            assert!(
+                !message.bytes().any(|b| b.is_ascii_digit()),
+                "a digit in {message:?}"
+            );
+        }
+        assert!(!CONTROL_ALLOWANCE_REACHED.contains("max_concurrent_requests"));
     }
 
     /// An engine refusal is the caller's mistake, not the server's: 400,
