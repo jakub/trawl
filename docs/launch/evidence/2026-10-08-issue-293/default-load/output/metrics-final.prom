@@ -1,60 +1,76 @@
+# HELP trawl_hot_buffer_duplicate_batches_total Hot-buffer batches dropped because their batch id was already resident; the resident batch is kept. Nonzero means a WAL writer bug
+# TYPE trawl_hot_buffer_duplicate_batches_total counter
+trawl_hot_buffer_duplicate_batches_total 0
+# HELP trawl_ingest_events_rejected_total Total number of rejected ingest events
+# TYPE trawl_ingest_events_rejected_total counter
+trawl_ingest_events_rejected_total{reason="missing_service"} 0
+trawl_ingest_events_rejected_total{reason="empty_service"} 0
+trawl_ingest_events_rejected_total{reason="env_not_allowed"} 0
+trawl_ingest_events_rejected_total{reason="invalid_json"} 0
+trawl_ingest_events_rejected_total{reason="service_too_long"} 0
+trawl_ingest_events_rejected_total{reason="invalid_env"} 0
+trawl_ingest_events_rejected_total{reason="service_not_string"} 0
+trawl_ingest_events_rejected_total{reason="ingest_batch_too_large"} 0
+trawl_ingest_events_rejected_total{reason="host_missing_from_relay"} 0
+trawl_ingest_events_rejected_total{reason="wal_failure"} 0
+trawl_ingest_events_rejected_total{reason="hot_buffer_full"} 535418
+trawl_ingest_events_rejected_total{reason="not_object"} 0
+trawl_ingest_events_rejected_total{reason="invalid_chars"} 0
+# HELP trawl_http_requests_refused_total HTTP requests refused with 503 request_limit_reached because their allowance had no request in progress free, by allowance
+# TYPE trawl_http_requests_refused_total counter
+trawl_http_requests_refused_total{allowance="control"} 0
+trawl_http_requests_refused_total{allowance="regular"} 0
+# HELP trawl_compaction_operation_failures_total Failed compaction operation attempts, labelled by operation; excludes successful quarantines, idle work and intentional suppression
+# TYPE trawl_compaction_operation_failures_total counter
+trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0
+trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0
+trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0
+trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0
+trawl_compaction_operation_failures_total{operation="chunk"} 0
+trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0
+trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0
+trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0
+# HELP trawl_queries_total Total number of queries executed
+# TYPE trawl_queries_total counter
+trawl_queries_total{status="success"} 85
 # HELP trawl_files_quarantined_total Files successfully renamed out of normal processing with bytes retained, labelled by kind; temporary rollup sources may remain intact, not an event-loss count
 # TYPE trawl_files_quarantined_total counter
 trawl_files_quarantined_total{kind="rollup_temporary"} 0
 trawl_files_quarantined_total{kind="wal"} 0
 trawl_files_quarantined_total{kind="parquet"} 0
-# HELP trawl_queries_total Total number of queries executed
-# TYPE trawl_queries_total counter
-trawl_queries_total{status="success"} 85
-# HELP trawl_compaction_operation_failures_total Failed compaction operation attempts, labelled by operation; excludes successful quarantines, idle work and intentional suppression
-# TYPE trawl_compaction_operation_failures_total counter
-trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0
-trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0
-trawl_compaction_operation_failures_total{operation="chunk"} 0
-trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0
-trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0
-trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0
-trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0
-trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0
-# HELP trawl_ingest_events_rejected_total Total number of rejected ingest events
-# TYPE trawl_ingest_events_rejected_total counter
-trawl_ingest_events_rejected_total{reason="hot_buffer_full"} 394653
-trawl_ingest_events_rejected_total{reason="invalid_env"} 0
-trawl_ingest_events_rejected_total{reason="invalid_json"} 0
-trawl_ingest_events_rejected_total{reason="not_object"} 0
-trawl_ingest_events_rejected_total{reason="host_missing_from_relay"} 0
-trawl_ingest_events_rejected_total{reason="invalid_chars"} 0
-trawl_ingest_events_rejected_total{reason="service_not_string"} 0
-trawl_ingest_events_rejected_total{reason="empty_service"} 0
-trawl_ingest_events_rejected_total{reason="service_too_long"} 0
-trawl_ingest_events_rejected_total{reason="ingest_batch_too_large"} 0
-trawl_ingest_events_rejected_total{reason="env_not_allowed"} 0
-trawl_ingest_events_rejected_total{reason="wal_failure"} 0
-trawl_ingest_events_rejected_total{reason="missing_service"} 0
+# HELP trawl_ingest_events_total Total number of ingested events
+# TYPE trawl_ingest_events_total counter
+trawl_ingest_events_total 446220
 # HELP trawl_hot_buffer_admission_refusals_total Hot-buffer reservations refused, labelled by producer (http, syslog, trawld) and kind (full = no free space, retry after compaction drains; oversized = larger than the producer's ceiling, can never fit)
 # TYPE trawl_hot_buffer_admission_refusals_total counter
 trawl_hot_buffer_admission_refusals_total{producer="syslog",kind="full"} 0
 trawl_hot_buffer_admission_refusals_total{producer="syslog",kind="oversized"} 0
 trawl_hot_buffer_admission_refusals_total{producer="trawld",kind="full"} 0
 trawl_hot_buffer_admission_refusals_total{producer="http",kind="oversized"} 0
+trawl_hot_buffer_admission_refusals_total{producer="http",kind="full"} 198
 trawl_hot_buffer_admission_refusals_total{producer="trawld",kind="oversized"} 0
-trawl_hot_buffer_admission_refusals_total{producer="http",kind="full"} 153
-# HELP trawl_hot_buffer_duplicate_batches_total Hot-buffer batches dropped because their batch id was already resident; the resident batch is kept. Nonzero means a WAL writer bug
-# TYPE trawl_hot_buffer_duplicate_batches_total counter
-trawl_hot_buffer_duplicate_batches_total 0
-# HELP trawl_http_requests_refused_total HTTP requests refused with 503 request_limit_reached because their allowance had no request in progress free, by allowance
-# TYPE trawl_http_requests_refused_total counter
-trawl_http_requests_refused_total{allowance="control"} 0
-trawl_http_requests_refused_total{allowance="regular"} 0
-# HELP trawl_ingest_events_total Total number of ingested events
-# TYPE trawl_ingest_events_total counter
-trawl_ingest_events_total 446220
-# HELP trawl_hot_buffer_oldest_batch_age_seconds Age in seconds of the oldest resident hot-buffer batch (a batch reloaded from the WAL at boot counts from its file's timestamp), 0 when the buffer is empty; rising past a few compaction intervals means compaction is not draining
-# TYPE trawl_hot_buffer_oldest_batch_age_seconds gauge
-trawl_hot_buffer_oldest_batch_age_seconds 23.098419405
 # HELP trawl_hot_buffer_admission_state Hot-buffer admission state: 0 = open, 1 = pressure (at or above half of either cap, compaction drains early), 2 = refusing (a reservation was refused for lack of space; clears below a quarter of both caps)
 # TYPE trawl_hot_buffer_admission_state gauge
 trawl_hot_buffer_admission_state 0
+# HELP trawl_parquet_files_total Ingested Parquet file count from the last complete measurement, excluding saved reports. Retained after collection failure.
+# TYPE trawl_parquet_files_total gauge
+trawl_parquet_files_total 70
+# HELP trawl_hot_buffer_bytes Current byte size of the hot buffer
+# TYPE trawl_hot_buffer_bytes gauge
+trawl_hot_buffer_bytes 597186
+# HELP trawl_hot_buffer_max_events Hot-buffer event cap (ingest.hot_buffer_max_events); external producers may fill 15/16 of it, self-telemetry all of it
+# TYPE trawl_hot_buffer_max_events gauge
+trawl_hot_buffer_max_events 100000
+# HELP trawl_http_requests_in_progress HTTP requests in progress, by allowance (regular: server.max_concurrent_requests; control: health, metrics and query listing and cancellation). Ingest and preview work that holds a request's body keeps it counted after the client leaves
+# TYPE trawl_http_requests_in_progress gauge
+trawl_http_requests_in_progress{allowance="control"} 1
+trawl_http_requests_in_progress{allowance="regular"} 0
+# HELP trawl_hot_buffer_events Current number of events in the hot buffer
+# TYPE trawl_hot_buffer_events gauge
+trawl_hot_buffer_events 618
+# HELP trawl_compaction_interval_seconds Configured compaction interval (ingest.compaction_interval_secs)
+# TYPE trawl_compaction_interval_seconds gauge
+trawl_compaction_interval_seconds 10
 # HELP trawl_http_request_allowance Size of each request allowance: server.max_concurrent_requests for regular, the fixed control allowance for control
 # TYPE trawl_http_request_allowance gauge
 trawl_http_request_allowance{allowance="regular"} 32
@@ -62,25 +78,9 @@ trawl_http_request_allowance{allowance="control"} 4
 # HELP trawl_hot_buffer_max_bytes Hot-buffer serialized-byte cap (ingest.hot_buffer_max_bytes); external producers may fill 15/16 of it, self-telemetry all of it
 # TYPE trawl_hot_buffer_max_bytes gauge
 trawl_hot_buffer_max_bytes 104857600
-# HELP trawl_hot_buffer_max_events Hot-buffer event cap (ingest.hot_buffer_max_events); external producers may fill 15/16 of it, self-telemetry all of it
-# TYPE trawl_hot_buffer_max_events gauge
-trawl_hot_buffer_max_events 100000
-# HELP trawl_http_requests_in_progress HTTP requests in progress, by allowance (regular: server.max_concurrent_requests; control: health, metrics and query listing and cancellation). Ingest and preview work that holds a request's body keeps it counted after the client leaves
-# TYPE trawl_http_requests_in_progress gauge
-trawl_http_requests_in_progress{allowance="regular"} 0
-trawl_http_requests_in_progress{allowance="control"} 1
-# HELP trawl_hot_buffer_bytes Current byte size of the hot buffer
-# TYPE trawl_hot_buffer_bytes gauge
-trawl_hot_buffer_bytes 6669279
-# HELP trawl_parquet_files_total Ingested Parquet file count from the last complete measurement, excluding saved reports. Retained after collection failure.
-# TYPE trawl_parquet_files_total gauge
-trawl_parquet_files_total 70
-# HELP trawl_hot_buffer_events Current number of events in the hot buffer
-# TYPE trawl_hot_buffer_events gauge
-trawl_hot_buffer_events 7077
-# HELP trawl_compaction_interval_seconds Configured compaction interval (ingest.compaction_interval_secs)
-# TYPE trawl_compaction_interval_seconds gauge
-trawl_compaction_interval_seconds 10
 # HELP trawl_wal_files WAL ndjson file count from the last complete measurement, including active files. Retained after collection failure.
 # TYPE trawl_wal_files gauge
-trawl_wal_files 395
+trawl_wal_files 465
+# HELP trawl_hot_buffer_oldest_batch_age_seconds Age in seconds of the oldest resident hot-buffer batch (a batch reloaded from the WAL at boot counts from its file's timestamp), 0 when the buffer is empty; rising past a few compaction intervals means compaction is not draining
+# TYPE trawl_hot_buffer_oldest_batch_age_seconds gauge
+trawl_hot_buffer_oldest_batch_age_seconds 15.242791606

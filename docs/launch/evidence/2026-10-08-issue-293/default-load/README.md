@@ -6,8 +6,8 @@ nothing in normal use" (ADR-0054, "Range and default").
 ## Result
 
 **Pass.** At the default `max_concurrent_requests` of 32, trawld refused no
-request on either allowance. The run was on 2026-10-09 from 03:03 to 03:08
-UTC (2026-10-08 local time).
+request on either allowance. The run was on 2026-10-09 from 04:33 to 04:38
+UTC (2026-10-08 local time), on the final script.
 
 | Measurement | Value |
 | --- | --- |
@@ -17,32 +17,32 @@ UTC (2026-10-08 local time).
 | Samples with a refusal series missing or unreadable, both allowances | 0 |
 | `http_failure` events with `cause_kind=request_limit_reached` | 0 |
 | `trawl_http_request_allowance`, regular / control | 32 / 4 |
-| Sampled peak of `trawl_http_requests_in_progress{allowance="regular"}` | 7, at t = 8.0 s |
+| Sampled peak of `trawl_http_requests_in_progress{allowance="regular"}` | 9, at t = 12.5 s |
 | Sampled peak of `trawl_http_requests_in_progress{allowance="control"}` | 1 |
 | Events written to the senders / stored, distinct per sender | 148,740 / 148,740 for each of 3 |
 | Duplicate events stored | 0 |
-| `compaction_complete` events while the senders delivered | 282 (316 in the session) |
-| `rollup_complete` events while the senders delivered | 35, from 03:05:43.18 to 03:05:52.91 UTC (t = 62.4 to 72.1 s) |
-| Search queries / answered 200 | 83 / 83 |
+| `compaction_complete` events while the senders delivered | 280 (316 in the session) |
+| `rollup_complete` events while the senders delivered | 35, from 04:36:07.52 to 04:36:10.58 UTC (t = 67.9 to 71.0 s) |
+| Search queries / answered 200 | 82 / 82 |
 | Failed `/metrics` scrapes | 0 |
 | Cleanup: processes / Postgres container | removed / removed |
 
-The terminal snapshot is one more `/metrics` scrape at t = 199.2 s. The
+The terminal snapshot is one more `/metrics` scrape at t = 204.8 s. The
 script takes it after the query loop and the three Vector processes have
 stopped, and before it stops trawld. A refusal after the last sample is
 therefore still counted.
 
 The peak is a sampled peak, not an exact high-water mark. The scraper read
 `/metrics` every 0.25 s. The median gap between samples was 0.25 s and the
-largest gap was 2.0 s, so a peak shorter than a gap can be missed. The
+largest gap was 2.25 s, so a peak shorter than a gap can be missed. The
 refusal counters are counters, so the pass condition does not depend on
 sampling.
 
-In-progress samples for the regular allowance (631 samples):
+In-progress samples for the regular allowance (613 samples):
 
-| In progress | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Samples | 154 | 169 | 131 | 95 | 46 | 19 | 12 | 5 |
+| In progress | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Samples | 142 | 172 | 126 | 85 | 56 | 8 | 10 | 12 | 1 | 1 |
 
 ## Hypothesis and threshold
 
@@ -90,10 +90,12 @@ summary.
 ## What ran
 
 - **Build:** debug profile, `cargo build --locked --no-default-features -p
-  trawl-server -p fleet-admin`, at `e451464ade6624004b0a838451f21deb48da7716`.
-  `crates/` and the Cargo files at that commit are the same as at
-  `02b6343a`, the head of the earlier runs. `run.py` refuses to start if
-  `crates/`, the Cargo files or `bin/trawld-dev` differ from HEAD. The trawld binary's SHA-256 is in `output/summary.json`.
+  trawl-server -p fleet-admin`, at `b38305242b361ec022252e5372869b018d2d2801`,
+  the commit that holds the final `run.py`. Its `crates/` differs from
+  `e451464a`, the head of run 5, only in the test file
+  `crates/trawl-server/tests/request_limit/transport.rs`. `run.py` refuses
+  to start if `crates/`, the Cargo files or `bin/trawld-dev` differ from
+  HEAD. The trawld binary's SHA-256 is in `output/summary.json`.
   A debug build parses and serializes more slowly than a release build, so
   each request stays in progress longer.
 - **Host:** Linux, 16 logical CPUs, 32 GB RAM. Everything ran on loopback.
@@ -109,10 +111,10 @@ summary.
   with `trawl:query`, `trawl:schema_read` and `trawl:validate` for the query
   loop. Both roles have `--rate-rpm 100000`, so the per-key rate limiter never
   answers 429 and hides load from the request limit.
-- **Duration:** the measured session ran 199 s. The senders received their
-  last event at t = 181.0 s, every event was stored at t = 187.0 s, and the
-  terminal snapshot was at t = 199.2 s. With the build check, the database
-  and the seed sessions, the script took 4 minutes 24 seconds.
+- **Duration:** the measured session ran 205 s. The senders received their
+  last event at t = 181.1 s, every event was stored at t = 192.7 s, and the
+  terminal snapshot was at t = 204.8 s. With the build check, the database
+  and the seed sessions, the script took 4 minutes 26 seconds.
 
 ## Workload
 
@@ -150,9 +152,9 @@ table in `docs/src/content/docs/getting-started/vector-integration.md`
 | Concurrency | `adaptive` | 399 |
 
 trawld's `ingest_complete` events show the batches the senders sent. trawld
-accepted 186 requests from them. The decoded body had a median of
-1,052,192 bytes and a maximum of 1,052,399 bytes, and 132 requests were at
-least 900 KB. The gzip body had a median of 24,259 bytes. The replayed
+accepted 188 requests from them. The decoded body had a median of
+1,052,220 bytes and a maximum of 1,052,399 bytes, and 134 requests were at
+least 900 KB. The gzip body had a median of 24,227 bytes. The replayed
 fixture repeats 67 events, so it compresses far better than real logs do.
 
 ### Events and pacing
@@ -184,14 +186,14 @@ trawld and waits 1 s between queries. The loop alternates two queries:
 - An aggregation: `load_run="<run>" | stats count() by load_sender` in the
   same window.
 
-It sent 83 queries. All answered 200, with a median of 866 ms and a maximum
-of 3,310 ms.
+It sent 82 queries. All answered 200, with a median of 1,370 ms and a
+maximum of 3,279 ms.
 
 ### Compaction and rollup
 
 No endpoint or CLI command starts a compaction or a rollup. Both run in the
 compaction task, at the default interval of 10 s and on hot-buffer pressure.
-That is all the run needs for compaction: trawld logged 282
+That is all the run needs for compaction: trawld logged 280
 `compaction_complete` events while the senders delivered.
 
 A rollup needs more. trawld rolls up only date directories before today, and
@@ -205,7 +207,7 @@ it files events under the UTC date and hour they arrive, not under `_time`.
    daily files. Its own hour directory then moves to `prod/2026-10-08/23`.
 3. The measured session starts with the senders. Its first normal pass
    with a rollup merged hour 23 into the 35 daily files: 35
-   `rollup_complete` events, each with `hourly_files=1`, at t = 62.4 to 72.1 s.
+   `rollup_complete` events, each with `hourly_files=1`, at t = 67.9 to 71.0 s.
 
 Files move only while trawld is stopped. `output/summary.json` lists them
 under `seededHistory`.
@@ -213,16 +215,17 @@ under `seededHistory`.
 ## What else the run showed
 
 - **The hot buffer, not the request count, limited the backlog.** From
-  t = 9.75 s to t = 135.5 s the hot buffer was mostly in the refusing state
-  (347 of 631 samples in state 2). trawld answered 153 ingest requests with
+  t = 12.75 s to t = 147.5 s the hot buffer was mostly in the refusing state
+  (341 of 613 samples in state 2). trawld answered 198 ingest requests with
   503 `hot_buffer_full`. Vector retried each one with backoff, and every
   event was stored once. Vector's adaptive concurrency reduces its
   concurrency after a 503, so a hot-buffer refusal also lowers the request
   count.
-- **The sampled peak came while the hot buffer filled.** In-progress reached
-  6 to 7 from t = 8.0 s to t = 9.75 s, while the hot buffer went from 49,715
-  to 78,756 events. It reached 6 again at t = 81 to 89 s. During the rollup
-  window it was 0 to 4.
+- **The sampled peak came while the hot buffer filled.** In-progress held
+  at 6 to 7 from t = 8.25 s to t = 12.25 s, while the hot buffer went from
+  49,715 to 74,894 events. It read 9 at t = 12.5 s, with 87,222 events in
+  the hot buffer, one sample before the buffer started refusing. It read 8
+  once more at t = 22.25 s. During the rollup window it was 0 to 3.
 - Vector's own logs show no request timeouts and no errors. Vector logs a
   retry as `Service Unavailable` without the response body, and it
   suppresses repeats of that warning. The 503 count therefore comes from
@@ -232,7 +235,8 @@ under `seededHistory`.
 
 Review found two defects in the script of the earlier runs. Run 5 was the
 first run on the corrected pass check. Later reviews found more, fixed
-after run 5.
+after run 5. Run 6 is the first run on the final script, and `output/`
+comes from it.
 
 - **The script could delete a directory it did not create.** The old
   script refused an existing `--work`, but its cleanup still ran and
@@ -303,7 +307,7 @@ The script changed between runs. The earlier summaries are in
 [`earlier-runs/`](earlier-runs/). Runs 1 to 4 used the old pass check from
 [What changed in the script](#what-changed-in-the-script). Their end
 counters were present and 0, but the old check would also have passed
-with a refusal series missing. All five runs refused nothing.
+with a refusal series missing. All six runs refused nothing.
 
 | Run | Head | Sampled peak (regular) | Refused | What differed |
 | --- | --- | --- | --- | --- |
@@ -311,7 +315,8 @@ with a refusal series missing. All five runs refused nothing.
 | 2 | `02b6343a` | 14, at t = 202.5 s | 0 | Interrupted during the delivery wait, see below. |
 | 3 | `02b6343a` | 10, at t = 11.25 s | 0 | Without the batch-size and failure tallies. |
 | 4 | `02b6343a` | 8, at t = 12.0 s | 0 | The old pass check. Its `output/` was replaced by run 5. |
-| 5 | `e451464a` | 7, at t = 8.0 s | 0 | The corrected script. `output/` |
+| 5 | `e451464a` | 7, at t = 8.0 s | 0 | The corrected pass check, before the fixes listed after run 5. |
+| 6 | `b3830524` | 9, at t = 12.5 s | 0 | The final script. `output/` |
 
 In run 2, one compaction pass took 33,969 ms
 (`compact_service=trawl-check-…`, 32 WAL files, 11,528 rows), from about
@@ -355,7 +360,8 @@ The script prints its run directory, `.flow-scratch/<run id>/`, at the end.
 API credential. `output/` holds the summaries. The script never deletes the
 run directory, so remove it when you are done. In a clone without a local
 exclude for `.flow-scratch/`, git shows it as untracked. `--help` lists the
-workload options.
+workload options. Run 6 used `--vector
+~/.cache/trawl-vector-0.57.0/vector-x86_64-unknown-linux-gnu/bin/vector`.
 
 To compare your run with the committed one, apply the pass check to it and
 read the same fields from both summaries:
@@ -395,4 +401,4 @@ python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/test_run.py
 | [`output/metrics-final.prom`](output/metrics-final.prom) | The terminal snapshot, request, hot-buffer, ingest, compaction and query series only |
 | [`output/compaction-rollup-events.ndjson`](output/compaction-rollup-events.ndjson) | trawld's `compaction_complete` and `rollup_complete` events, with timestamps |
 | [`output/queries.csv`](output/queries.csv) | Each search query: time, kind, status, latency |
-| [`earlier-runs/`](earlier-runs/) | Summaries of runs 1 to 3, and run 2's samples |
+| [`earlier-runs/`](earlier-runs/) | Summaries of runs 1, 2, 3 and 5, and run 2's samples |

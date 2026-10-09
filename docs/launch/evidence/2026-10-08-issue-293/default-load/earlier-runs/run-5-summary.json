@@ -1,10 +1,10 @@
 {
-  "runId": "ac23-20261009T043358Z-05e876",
+  "runId": "ac23-20261009T030336Z-8675c6",
   "status": "passed",
   "build": {
-    "head": "b38305242b361ec022252e5372869b018d2d2801",
+    "head": "e451464ade6624004b0a838451f21deb48da7716",
     "profile": "debug (cargo build --locked --no-default-features)",
-    "trawldSha256": "e98e3754606e4b05169f12f3bb7924f918b735b19c83d0c9c56eed775802b18d",
+    "trawldSha256": "a7d01f53e1e25d896baeba65a6e154959d54e19476bf9a5fb3d28f3a0760930e",
     "vector": "vector 0.57.0 (x86_64-unknown-linux-gnu 8832452 2026-07-14 20:58:30.491174540)",
     "vectorSha256": "79be503feab9ec57b010cbff2b0d9f4002ed442d16a6a5588e46f26ffba355c0"
   },
@@ -25,17 +25,17 @@
     {
       "day": "2026-10-08",
       "hour": "22",
-      "movedFrom": "2026-10-09/04",
+      "movedFrom": "2026-10-09/03",
       "parquetFiles": 35
     },
     {
       "day": "2026-10-08",
       "hour": "23",
-      "movedFrom": "2026-10-09/04",
+      "movedFrom": "2026-10-09/03",
       "parquetFiles": 35
     }
   ],
-  "measuredSessionStart": "2026-10-09T04:34:59.575976Z",
+  "measuredSessionStart": "2026-10-09T03:04:40.763925Z",
   "vectorSink": {
     "source": "config/vector/debian/base.toml [sinks.trawld], read at run time",
     "shipped": {
@@ -112,15 +112,11 @@
       "vector-3": 148740
     },
     "counted": {
-      "vector-2": {
-        "stored": 148740,
-        "distinct": 148740
-      },
-      "seed-2": {
+      "seed-1": {
         "stored": 2010,
         "distinct": 2010
       },
-      "vector-1": {
+      "vector-3": {
         "stored": 148740,
         "distinct": 148740
       },
@@ -128,11 +124,15 @@
         "stored": 67,
         "distinct": 67
       },
-      "seed-1": {
+      "vector-1": {
+        "stored": 148740,
+        "distinct": 148740
+      },
+      "seed-2": {
         "stored": 2010,
         "distinct": 2010
       },
-      "vector-3": {
+      "vector-2": {
         "stored": 148740,
         "distinct": 148740
       }
@@ -148,24 +148,24 @@
       "vector-2": 148740,
       "vector-3": 148740
     },
-    "feedDoneSeconds": 181.06,
-    "deliveredSeconds": 192.735
+    "feedDoneSeconds": 181.001,
+    "deliveredSeconds": 187.018
   },
   "cleanup": {
     "processes": true,
     "container": true,
-    "containerState": "removed"
+    "workDir": "removed"
   },
   "metrics": {
-    "samples": 613,
+    "samples": 631,
     "failedScrapes": 0,
     "intervalSeconds": {
       "target": 0.25,
       "median": 0.25,
-      "max": 2.25
+      "max": 2.0
     },
     "terminalSnapshot": {
-      "t": 204.843,
+      "t": 199.224,
       "status": 200,
       "attempts": 1
     },
@@ -186,123 +186,121 @@
       "control": 0
     },
     "sampledPeakInProgress": {
-      "regular": 9.0,
-      "atSeconds": 12.5,
+      "regular": 7.0,
+      "atSeconds": 8.001,
       "control": 1.0
     },
     "inProgressRegularHistogram": {
-      "0": 142,
-      "1": 172,
-      "2": 126,
-      "3": 85,
-      "4": 56,
-      "5": 8,
-      "6": 10,
-      "7": 12,
-      "8": 1,
-      "9": 1
+      "0": 154,
+      "1": 169,
+      "2": 131,
+      "3": 95,
+      "4": 46,
+      "5": 19,
+      "6": 12,
+      "7": 5
     },
-    "peakHotBufferEvents": 93605.0,
+    "peakHotBufferEvents": 93723.0,
     "hotBufferAdmissionStateSamples": {
-      "0": 255,
-      "1": 17,
-      "2": 341
+      "0": 278,
+      "1": 6,
+      "2": 347
     },
     "final": {
-      "trawl_ingest_events_rejected_total{reason=\"missing_service\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"empty_service\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"env_not_allowed\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"invalid_json\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"service_too_long\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"invalid_env\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"service_not_string\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"ingest_batch_too_large\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"host_missing_from_relay\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"hot_buffer_full\"}": 535418.0,
-      "trawl_ingest_events_rejected_total{reason=\"not_object\"}": 0.0,
-      "trawl_ingest_events_rejected_total{reason=\"invalid_chars\"}": 0.0,
-      "trawl_compaction_operation_failures_total{operation=\"pending_rollup_recovery\"}": 0.0,
-      "trawl_compaction_operation_failures_total{operation=\"daily_rollup_scan\"}": 0.0,
-      "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}": 0.0,
-      "trawl_compaction_operation_failures_total{operation=\"daily_rollup_unit\"}": 0.0,
-      "trawl_compaction_operation_failures_total{operation=\"chunk\"}": 0.0,
-      "trawl_compaction_operation_failures_total{operation=\"consumed_wal_removal\"}": 0.0,
-      "trawl_compaction_operation_failures_total{operation=\"wal_environment_scan\"}": 0.0,
-      "trawl_compaction_operation_failures_total{operation=\"pending_rollup_scan\"}": 0.0,
-      "trawl_queries_total{status=\"success\"}": 85.0,
       "trawl_files_quarantined_total{kind=\"rollup_temporary\"}": 0.0,
       "trawl_files_quarantined_total{kind=\"wal\"}": 0.0,
       "trawl_files_quarantined_total{kind=\"parquet\"}": 0.0,
-      "trawl_ingest_events_total": 446220.0,
+      "trawl_queries_total{status=\"success\"}": 85.0,
+      "trawl_compaction_operation_failures_total{operation=\"consumed_wal_removal\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"pending_rollup_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"chunk\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"wal_environment_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"wal_root_scan\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"pending_rollup_recovery\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"daily_rollup_unit\"}": 0.0,
+      "trawl_compaction_operation_failures_total{operation=\"daily_rollup_scan\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"hot_buffer_full\"}": 394653.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_env\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_json\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"not_object\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"host_missing_from_relay\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"invalid_chars\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"service_not_string\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"empty_service\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"service_too_long\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"ingest_batch_too_large\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"env_not_allowed\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"wal_failure\"}": 0.0,
+      "trawl_ingest_events_rejected_total{reason=\"missing_service\"}": 0.0,
       "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"full\"}": 0.0,
       "trawl_hot_buffer_admission_refusals_total{producer=\"syslog\",kind=\"oversized\"}": 0.0,
       "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"full\"}": 0.0,
       "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"oversized\"}": 0.0,
-      "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"full\"}": 198.0,
-      "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"oversized\"}": 0.0
+      "trawl_hot_buffer_admission_refusals_total{producer=\"trawld\",kind=\"oversized\"}": 0.0,
+      "trawl_hot_buffer_admission_refusals_total{producer=\"http\",kind=\"full\"}": 153.0,
+      "trawl_ingest_events_total": 446220.0
     }
   },
   "queries": {
-    "count": 82,
+    "count": 83,
     "byStatus": {
-      "200": 82
+      "200": 83
     },
-    "msP50": 1370.4,
-    "msMax": 3278.7
+    "msP50": 866.1,
+    "msMax": 3310.1
   },
   "compactionAndRollup": {
     "compaction_complete": {
       "total": 316,
-      "duringIngest": 280
+      "duringIngest": 282
     },
     "rollup_complete": {
       "total": 35,
       "duringIngest": 35
     },
     "rollupWindow": [
-      "2026-10-09T04:36:07.519874Z",
-      "2026-10-09T04:36:10.581127Z"
+      "2026-10-09T03:05:43.176113Z",
+      "2026-10-09T03:05:52.913100Z"
     ]
   },
   "ingestRequests": {
-    "accepted": 188,
+    "accepted": 186,
     "events": 446220,
     "decodedBytes": {
-      "p50": 1052220,
+      "p50": 1052192,
       "max": 1052399,
-      "atLeast900KB": 134
+      "atLeast900KB": 132
     },
     "wireBytes": {
-      "p50": 24227,
-      "max": 24751
+      "p50": 24259,
+      "max": 24944
     },
     "durationMs": {
-      "p50": 709,
-      "max": 1881
+      "p50": 685,
+      "max": 1212
     }
   },
   "httpFailuresFromTrawld": {
-    "/api/v1/ingest 503 hot_buffer_full": 198
+    "/api/v1/ingest 503 hot_buffer_full": 153
   },
   "requestLimitRefusalEvents": 0,
   "vectorLogs": {
     "vector-1": {
-      "retryLines": 17,
+      "retryLines": 11,
       "request_limit_reached": 0,
       "hot_buffer_full": 0,
       "requestTimeouts": 0,
       "errorLines": 0
     },
     "vector-2": {
-      "retryLines": 24,
+      "retryLines": 17,
       "request_limit_reached": 0,
       "hot_buffer_full": 0,
       "requestTimeouts": 0,
       "errorLines": 0
     },
     "vector-3": {
-      "retryLines": 23,
+      "retryLines": 19,
       "request_limit_reached": 0,
       "hot_buffer_full": 0,
       "requestTimeouts": 0,
