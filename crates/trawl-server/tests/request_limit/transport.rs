@@ -78,7 +78,7 @@ async fn request_count_spans_connections_and_h2_streams() {
         h2_send(&connection, &url, &Post::preview(&server, "stream two")).await;
     let report_probe = report.entered().await;
     let (refused, _refused_stream) =
-        h2_send(&connection, &url, &Post::ingest(&server, "stream three")).await;
+        h2_send_may_be_refused(&connection, &url, &Post::ingest(&server, "stream three")).await;
     let (status, body) = h2_answer(refused).await;
     assert_h2_refused(status, &body);
 
@@ -120,6 +120,73 @@ async fn request_count_spans_connections_and_h2_streams() {
         let (status, body) = h2_answer(answer).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     }
+    task.abort();
+}
+
+/// Hold the only request the limit admits, then open a stream whose
+/// headers the server refuses, and wait until the server has closed that
+/// stream (its `RST_STREAM`, which follows the 503 head) before the body
+/// is sent. The order is forced by the stream's reset event, not by timing.
+async fn refused_stream_closed_before_body(server: &TestServer, url: &str) -> RefusedStream {
+    let mut parse = Held::next(server, BodyWork::IngestParse);
+    let held = h1_send(url, &Post::ingest(server, "held")).await;
+    parse.entered().await;
+
+    let sender = h2_connect(url).await;
+    let refused = Post::ingest(server, "refused");
+    let (response, mut stream) = h2_open(&sender, url, &refused).await;
+    let reason = tokio::time::timeout(DEADLINE, std::future::poll_fn(|cx| stream.poll_reset(cx)))
+        .await
+        .expect("the server closed the refused stream before the deadline")
+        .expect("the refused stream was reset");
+    assert_eq!(reason, h2::Reason::NO_ERROR, "a refusal closes cleanly");
+    RefusedStream {
+        response,
+        stream,
+        post: refused,
+        parse,
+        _held: held,
+    }
+}
+
+/// A refused HTTP/2 stream the server has closed, and the held request
+/// that made it refuse.
+struct RefusedStream {
+    response: h2::client::ResponseFuture,
+    stream: h2::SendStream<Bytes>,
+    post: Post,
+    parse: Held,
+    _held: TlsStream<TcpStream>,
+}
+
+/// The refused stream's body goes out after the server closed the stream:
+/// the helper for refused streams lets it through, and the refusal is still
+/// the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_h2_stream_closed_before_its_body_still_answers() {
+    let server = common::setup().await;
+    let (url, task) = server
+        .spawn_server_with(|http| http.max_concurrent_requests = 1, vec![])
+        .await;
+    let mut refused = refused_stream_closed_before_body(&server, &url).await;
+    send_body(&mut refused.stream, &refused.post, true);
+    let (status, body) = h2_answer(refused.response).await;
+    assert_h2_refused(status, &body);
+    refused.parse.release();
+    task.abort();
+}
+
+/// The strict helper, used for streams the server admits, still fails on
+/// the same closed stream: tolerance is only for the refused one.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "send the request body")]
+async fn admitted_h2_stream_closed_before_its_body_fails() {
+    let server = common::setup().await;
+    let (url, task) = server
+        .spawn_server_with(|http| http.max_concurrent_requests = 1, vec![])
+        .await;
+    let mut refused = refused_stream_closed_before_body(&server, &url).await;
+    send_body(&mut refused.stream, &refused.post, false);
     task.abort();
 }
 
@@ -255,7 +322,37 @@ pub async fn h2_connect(url: &str) -> h2::client::SendRequest<Bytes> {
 
 /// Open a stream on `sender`'s connection carrying `post` whole. The stream
 /// stays open for a reset until its answer is read.
+///
+/// For a stream the server is expected to admit: it is an error if the
+/// server closes the stream before the body is sent.
 pub async fn h2_send(
+    sender: &h2::client::SendRequest<Bytes>,
+    url: &str,
+    post: &Post,
+) -> (h2::client::ResponseFuture, h2::SendStream<Bytes>) {
+    let (response, mut stream) = h2_open(sender, url, post).await;
+    send_body(&mut stream, post, false);
+    (response, stream)
+}
+
+/// Like [`h2_send`], for a stream the server is expected to refuse.
+///
+/// A refusal is answered at once and does not drain the body (ADR-0054),
+/// so the server may close the stream before the client's DATA frame goes
+/// out. That is not an error here: the caller reads the answer and asserts
+/// the refusal, which a stream that was in fact admitted cannot give.
+pub async fn h2_send_may_be_refused(
+    sender: &h2::client::SendRequest<Bytes>,
+    url: &str,
+    post: &Post,
+) -> (h2::client::ResponseFuture, h2::SendStream<Bytes>) {
+    let (response, mut stream) = h2_open(sender, url, post).await;
+    send_body(&mut stream, post, true);
+    (response, stream)
+}
+
+/// Open a stream on `sender`'s connection for `post`, headers only.
+async fn h2_open(
     sender: &h2::client::SendRequest<Bytes>,
     url: &str,
     post: &Post,
@@ -273,13 +370,28 @@ pub async fn h2_send(
         .ready()
         .await
         .expect("the connection takes another stream");
-    let (response, mut stream) = ready
+    ready
         .send_request(request.body(()).unwrap(), false)
-        .expect("open a stream");
-    stream
-        .send_data(Bytes::from(post.body.clone()), true)
-        .expect("send the request body");
-    (response, stream)
+        .expect("open a stream")
+}
+
+/// Send `post`'s body and end `stream`. With `may_be_refused`, an error
+/// that says the server already closed the stream is let through; any
+/// other error fails.
+fn send_body(stream: &mut h2::SendStream<Bytes>, post: &Post, may_be_refused: bool) {
+    match stream.send_data(Bytes::from(post.body.clone()), true) {
+        Ok(()) => {}
+        Err(error) if may_be_refused && closed_by_peer(&error) => {}
+        Err(error) => panic!("send the request body: {error:?}"),
+    }
+}
+
+/// Whether `error` says the stream is already closed: the peer reset it,
+/// or `h2` found it no longer open for sending (`InactiveStreamId`). h2
+/// exposes no predicate for the latter, so it is matched by the text of its
+/// `UserError`; the refused-stream tests below pin that text.
+fn closed_by_peer(error: &h2::Error) -> bool {
+    error.is_reset() || error.to_string().contains("inactive stream")
 }
 
 /// Open a stream on `sender`'s connection carrying a GET of `path`.
