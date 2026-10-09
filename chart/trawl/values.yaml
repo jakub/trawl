@@ -140,7 +140,7 @@ config:
     # and no Retry-After. Two fixed allowances sit beside it: 3 for health
     # and metrics (probe) and 4 for query list/cancel (control). Each is its
     # own count and none borrows from another. Read refusals from
-    # trawl_http_requests_refused_total{allowance="regular|probe|control"};
+    # trawl_http_requests_refused_total{allowance=~"regular|probe|control"};
     # the failure log is capped at 60 events a minute. Anyone who can reach
     # the listener can fill the probe allowance, and junk tokens can fill the
     # control allowance; block such a source at the network. At 32, ingest

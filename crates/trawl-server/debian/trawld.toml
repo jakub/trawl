@@ -29,7 +29,7 @@ http_addr = "0.0.0.0:5514"
 # `request_limit_reached` and no Retry-After. Two fixed allowances sit
 # beside the count: 3 requests for health and metrics (`probe`) and 4 for
 # query listing and cancellation (`control`). Read refusals from
-# trawl_http_requests_refused_total{allowance="regular|probe|control"};
+# trawl_http_requests_refused_total{allowance=~"regular|probe|control"};
 # the failure log is capped at 60 events a minute.
 # max_concurrent_requests = 32
 
