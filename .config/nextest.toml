@@ -61,8 +61,9 @@ filter = '''
     | binary(scheduler_windows) | binary(span_context) | binary(http_failure) | binary(timestamp_repair) | binary(unavailable_run_result)
     | binary(admission_stall) | binary(ingest_admission) | binary(restart_overhang) | binary(query_timing_roundtrip)
     | binary(doctor_pg) | binary(trawld_doctor) | binary(ingest_preview)
-    | binary(ingest_preview_stores_nothing)))
+    | binary(ingest_preview_stores_nothing) | binary(request_limit)))
   | (package(fleet-auth) & kind(test))
+  | (package(fleet-auth) & kind(lib) & test(/^store::pg_tests::/))
   | (package(fleet-admin) & kind(test))
   | (package(trawl-cli) & binary(preview_ingest))
 '''

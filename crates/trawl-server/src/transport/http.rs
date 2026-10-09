@@ -27,7 +27,6 @@ use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
-use tower::limit::ConcurrencyLimitLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -40,6 +39,7 @@ use ulid::Ulid;
 pub struct RequestId(pub(crate) String);
 
 use super::failure;
+use super::request_limit::{self, RequestLimit};
 use crate::config::{DEFAULT_INGEST_MAX_BODY_BYTES, ServerConfig};
 use crate::error::ServerError;
 use crate::handlers;
@@ -282,9 +282,19 @@ async fn no_store_on_preview(request: Request, next: middleware::Next) -> Respon
 
 /// Wrap `app` in trawld's edge layers, the ones every route shares.
 ///
-/// Onion, innermost first: panic catcher → concurrency limit → `nosniff`
-/// and HSTS headers → CORS (only with configured origins) → request span
+/// Onion, innermost first: panic catcher → request count → `nosniff` and
+/// HSTS headers → CORS (only with configured origins) → request span
 /// (`TraceLayer`) → failure observer → request id → connection gauge.
+///
+/// The request count ([`request_limit::count_request`], ADR-0054) sits
+/// outside the panic catcher and every layer of the nested routers, so it
+/// also bounds how many authentication checks and body reads run at once,
+/// and a caught panic still ends its count. Every layer outside it wraps
+/// its refusal: the refusal carries a request id, `nosniff`, HSTS and CORS
+/// headers, and gets its one `http_failure`. A CORS preflight the CORS
+/// layer answers never reaches it. The count is built once, here, before
+/// any layer: axum clones each layer per route and per method, and every
+/// clone shares this one.
 ///
 /// The failure observer sits directly inside `request_id_middleware`: the
 /// request id exists when it starts, and every other layer runs inside the
@@ -300,10 +310,14 @@ where
     S: Clone + Send + Sync + 'static,
 {
     let cors_origins = &http.cors_allowed_origins;
+    let limit = RequestLimit::new(http.max_concurrent_requests);
     let mut app = app
         // -- security hardening layers (first .layer() = innermost) --
         .layer(CatchPanicLayer::custom(panic_response))
-        .layer(ConcurrencyLimitLayer::new(http.max_concurrent_requests))
+        .layer(middleware::from_fn_with_state(
+            limit,
+            request_limit::count_request,
+        ))
         .layer(SetResponseHeaderLayer::overriding(
             header::X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
