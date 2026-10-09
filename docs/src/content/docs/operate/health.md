@@ -458,14 +458,14 @@ generated SQL, event values, and the caller's DSL.
 | `stage` | How far the request got. See the next table. |
 | `reached` | On `stage=unrecorded` only: `pre_admission`, `admitted`, or `handler`, the last point the request passed. |
 | `error_class` | The server's closed error class. `panic` for a caught panic, `unknown` when nothing was recorded. |
-| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, `auth_worker`, `hot_buffer_full` for an ingest request that the hot buffer had no room for, or `restart_backlog` or `rollup_pending` for a read refused as `corpus_recovering`. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
+| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure`, a Postgres kind such as `pg_pool_timed_out`, `auth_worker`, `hot_buffer_full` for an ingest request that the hot buffer had no room for, `request_limit_reached` for a request that trawld refused because its [request limit](/reference/configuration/#the-request-limit) was full, or `restart_backlog` or `rollup_pending` for a read refused as `corpus_recovering`. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
 | `query_id` | Present when the request allocated a query ID. |
 | `key_id` | Present when a rate limiter metered the request. Names the key it metered. |
 | `peer_addr` | Present when no rate limiter metered the request. The client address, the only lead when no key is known. |
 
 | `stage` | Meaning |
 | --- | --- |
-| `pre_admission` | The request failed before any rate limiter admitted it, for example with the auth backend down. |
+| `pre_admission` | The request failed before any rate limiter admitted it, for example with the auth backend down or with trawld at its request limit. |
 | `admitted` | The request failed after the rate limiter admitted it, before the handler. |
 | `handler_error` | The handler returned a typed error. |
 | `panicked` | trawld caught a panic while it served the request. |
@@ -474,6 +474,15 @@ generated SQL, event values, and the caller's DSL.
 A 503 or 504 logs at WARN, because both are expected pressure outcomes. See
 [Diagnose a 503 or 504 from a query](#diagnose-a-503-or-504-from-a-query).
 Every other 5xx logs at ERROR.
+
+A request that trawld refuses at its [request limit](/reference/configuration/#the-request-limit)
+leaves one failure event with `error_class=service_unavailable`,
+`cause_kind=request_limit_reached`, and `stage=pre_admission`. It logs at WARN
+and is unmetered, so it shares the cap of 60 events per minute below. Count the
+refusals and watch the load with `trawl_http_requests_refused_total{allowance}`
+and `trawl_http_requests_in_progress{allowance}` on `/metrics`. The label
+`allowance` is `regular` or `control`. `trawl_http_request_allowance{allowance}`
+reports the size of each count.
 
 To trace one failure:
 

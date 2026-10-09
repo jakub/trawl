@@ -80,7 +80,7 @@ A check runs only when its prerequisite completed. Otherwise the check is
 | `server.recovery.publication` | The publication and rollup markers are readable and well-formed. | `server.data.epoch` |
 | `server.tls.material` | The certificate and key parse, match, and are in date, or boot generates them. A directory at `tls/key.pem`, where an older trawld kept its key, fails the check, because boot cannot remove it. When boot would generate the pair, the check also fails if the running user cannot create `tls/` or `tls-key/` in the directory above it, or if either directory is on a read-only filesystem. | `server.config` |
 | `server.listener.identity` | The listener presents exactly the certificate on disk. | `server.tls.material` |
-| `server.listener.health` | The health endpoint answers, and trawld does not report itself `unavailable`. An `unavailable` answer fails this row, whatever the reported checks say. One row per reported check follows as `server.listener.health.<key>`. Only the checks trawld reports get a row. Any other check names share one `failed` `server.listener.health._invalid` row, which does not show them. | `server.listener.identity` |
+| `server.listener.health` | The health endpoint answers, and trawld does not report itself `unavailable`. An `unavailable` answer fails this row, whatever the reported checks say. One row per reported check follows as `server.listener.health.<key>`. Only the checks trawld reports get a row. Any other check names share one `failed` `server.listener.health._invalid` row, which does not show them. A 503 `request_limit_reached` answer is `not_sampled` with the reason `request_limit_reached` and no per-check rows: trawld was at its request limit. Run the doctor again later, with backoff. | `server.listener.identity` |
 
 The listener checks connect to trawld's own listener without sending an API
 key. They accept only the certificate that the configuration names or that
@@ -98,7 +98,8 @@ proves host names from a client.
 
 A `not_sampled` row is neither a pass nor a failure. Its reason is one of the
 stable codes, among them `blocked`, `permission_denied`, `timed_out`,
-`not_listening`, `migration_in_progress`, `unproven`, and `ran_as_root`. Only
+`not_listening`, `migration_in_progress`, `unproven`, `request_limit_reached`, and
+`ran_as_root`. Only
 `trawld --doctor` reports these codes:
 
 | Reason | Meaning |
@@ -296,6 +297,9 @@ request can fail:
   `timed_out`.
 - trawld's corpus is still recovering after a restart: `not_sampled` with the
   reason `recovering`.
+- trawld is at its request limit: `not_sampled` with the reason
+  `request_limit_reached`, and no per-check rows. Run the doctor again later,
+  with backoff.
 
 #### Outcomes
 
@@ -308,8 +312,8 @@ request can fail:
 
 A `not_sampled` row is neither a pass nor a failure. Its reason is one of the
 stable codes, among them `blocked`, `permission_denied`, `timed_out`,
-`too_large`, `interrupted`, `unreadable`, `recovering`, `ca_not_present`, and
-`ran_as_root`.
+`too_large`, `interrupted`, `unreadable`, `recovering`,
+`request_limit_reached`, `ca_not_present`, and `ran_as_root`.
 Only `trawl-web --doctor` reports these codes:
 
 | Reason | Meaning |
@@ -422,7 +426,7 @@ The HTTPS listener, query limits, TLS, and logging.
 | `max_result_rows` | integer | `100000` | Rows a query may return before trawld rejects it |
 | `max_export_rows` | integer | `1000000` | Rows an export may return. Exports do not use `max_result_rows` |
 | `max_request_body_bytes` | byte size | `"128K"` | Request body limit on every route except `/api/v1/ingest`, which has `[ingest] max_body_bytes`. `/api/v1/health` and `/metrics` read no body, so no body limit applies to them. A route that reads a body reads it before it checks the route's own permission, so any key with a trawl permission can make one request hold up to this many bytes |
-| `max_concurrent_requests` | integer | `256` | Concurrent HTTP requests. Past it trawld answers 503 |
+| `max_concurrent_requests` | integer | `32` | Requests in progress across trawld's HTTPS listener, 1 to 65,536. A request over the count is refused at once with 503 `request_limit_reached`. See [the request limit](#the-request-limit) |
 | `shutdown_drain_secs` | integer | `30` | Graceful shutdown budget for in-flight requests |
 | `log_file` | path | *(none)* | JSON log file. Opened when `[ingest] enabled` or `internal_telemetry` is false. When both are true, server events use the ingest pipeline and this path is not opened. File logging starts after database and storage admission; earlier JSON events go to stderr. Must not name or alias the data root's `EPOCH`, `CATALOG`, or `REPIN` marker. Owner-only: trawld creates it 0600 and tightens an existing looser file when it opens it. A symlink at the path, or a file that trawld does not own or cannot make owner-only, refuses the start |
 | `tls_cert_path` | path | *(generated)* | PEM certificate |
@@ -441,6 +445,28 @@ Notes:
 - `tls_cert_path` and `tls_key_path` must both be set or both omitted. With both omitted, trawld generates a self-signed ECDSA P-256 certificate at startup, with SANs for `localhost`, `127.0.0.1`, and `::1`. The certificate is `{state_dir}/tls/cert.pem`, mode 0644, in a 0755 directory, and the key is `{state_dir}/tls-key/key.pem`, in a 0700 directory. `state_dir` is the parent of `[data] path`.
 - `timeout_secs` covers queue waits, execution, and best-effort history writes, but not request-body reading or response delivery. Expiry before work starts is 503, and after work starts it is 504. A timed-out worker can hold its permit until it finishes. See [the query deadline](/operate/health/#diagnose-a-503-or-504-from-a-query).
 - `0` disables a limit only where the row says so.
+
+#### The request limit
+
+`max_concurrent_requests` counts requests in progress on trawld's HTTPS listener. It spans every route and every method, and one HTTP/2 stream is one request. Unmatched paths and `405` method fallbacks count. Syslog and `trawl-web` are separate services with their own limits. The value must be 1 to 65,536, and trawld refuses to start outside that range with a message that names `server.max_concurrent_requests`.
+
+A request over the count is refused at once. trawld does not queue it. The answer is 503 with the code `request_limit_reached` and the message `trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff`. It carries `Cache-Control: no-store` and no `Retry-After`, because nothing predicts when a request in progress ends. The handler never ran, so nothing was ingested or changed. trawld does not read the request body. A client that is still uploading can see a connection reset instead of the 503. While the count is full, the refusal comes before `401`, `403`, `404`, `405`, `413`, and `429`.
+
+Four more requests are the control allowance. It serves only `GET` and `HEAD` on `/api/v1/health`, `/metrics`, and `/api/v1/queries`, and `DELETE` on `/api/v1/queries/{id}`, so a probe, a scrape, and an operator can still reach trawld when the count is full. The allowance is fixed at 4. It does not borrow from the regular count and the regular count does not borrow from it. Authentication, rate limits, and ownership checks still apply to these routes. trawld decides membership from the route it matched and the method, never from the raw path, the query string, or a header. A control request over the allowance gets the same 503 and code, with the message `trawld is at its HTTP control allowance; the request was not processed; retry later with backoff`.
+
+A request counts from its arrival until trawld produces its response head, or until the client hangs up. Response bodies and established SSE streams do not count. Three kinds of work keep the count until they end, even after the client hangs up: decoding and parsing an ingest body, writing and finalizing the ingest WAL, and building the [ingest preview](/reference/api/#preview-ingest) report. They hold the request's body, so they stay counted. Query and export work does not keep the count.
+
+The count bounds the body memory of those components, not the process. At the defaults, each counted ingest request can hold `[ingest] max_body_bytes` as sent plus its decoded body, so `32 × (16 MiB + 16 MiB)` is 1 GiB. Token checks add a separate ceiling: at most 4 Argon2id checks run at once, each at 128 MiB, which is 512 MiB. Parse structures, the hot buffer, DuckDB, and response buffers come on top of both figures. Size `max_concurrent_requests` from `[ingest] max_body_bytes` and the memory you can give the ingest path.
+
+`/metrics` reports the count with a label `allowance` of `regular` or `control`:
+
+| Metric | Meaning |
+|--------|---------|
+| `trawl_http_requests_in_progress{allowance}` | Requests in progress now |
+| `trawl_http_requests_refused_total{allowance}` | Requests refused with `request_limit_reached` |
+| `trawl_http_request_allowance{allowance}` | The size of the allowance: `[server] max_concurrent_requests`, and 4 for `control` |
+
+Each refusal also logs one `http_failure` event with the `cause_kind` `request_limit_reached`. See [Trace a server failure](/operate/health/#trace-a-server-failure).
 
 #### `[server.rate_limit]`
 
