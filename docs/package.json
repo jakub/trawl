@@ -14,7 +14,7 @@
     "@astrojs/markdown-satteri": "0.3.8",
     "astro": "^7.1.0",
     "@astrojs/starlight": "^0.41.0",
-    "sharp": "^0.35.0"
+    "sharp": "^0.35.5"
   },
   "allowScripts": {
     "esbuild@0.28.1": true
