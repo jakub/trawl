@@ -114,7 +114,25 @@ async fn do_forward(
 
     let upstream_resp = upstream_req.send().await.map_err(ProxyError::Network)?;
     refuse_redirect(upstream_resp.status())?;
+    relay_response(upstream_resp, &auth)
+}
 
+/// Copy an upstream answer to the browser as it came: its status, its
+/// end-to-end headers through [`copy_response_headers`], and its body
+/// bytes, under the proxy-wide cookie rule. Nothing is retried or
+/// rewritten, so a refusal such as trawld's 503 `request_limit_reached`
+/// keeps its `Cache-Control` and request id (ADR-0054).
+///
+/// The generic forwarder relays every answer this way, and the SSE
+/// handlers every non-2xx one. A caller refuses a redirect first
+/// ([`refuse_redirect`]).
+///
+/// # Errors
+/// [`ProxyError::Internal`] when the response cannot be built.
+pub(crate) fn relay_response(
+    upstream_resp: reqwest::Response,
+    auth: &Auth,
+) -> Result<Response, ProxyError> {
     let status =
         StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let upstream_headers = upstream_resp.headers().clone();
@@ -124,7 +142,7 @@ async fn do_forward(
     let out_headers = out.headers_mut().expect("fresh response has headers map");
     copy_response_headers(&upstream_headers, out_headers);
 
-    if let Some(clear) = clear_cookie_for_proxied_response(status, &auth) {
+    if let Some(clear) = clear_cookie_for_proxied_response(status, auth) {
         out_headers.insert(header::SET_COOKIE, clear);
     }
 
@@ -471,6 +489,74 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn proxy_forwards_request_limit_refusal() {
+        // trawld's 503 `request_limit_reached` (ADR-0054) reaches the
+        // browser as trawld sent it: status, body bytes, `Cache-Control`
+        // and request id. The proxy never retries it: trawld refused the
+        // request before any handler ran, and a retry is the caller's
+        // call, with backoff.
+        let upstream = TlsUpstream::start().await;
+        let app = build_app(state_pointing_at(&upstream));
+        let cookie = login_and_get_cookie(app.clone(), &upstream).await;
+
+        let refusal: &[u8] = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
+        let request_id = "0b5f3c1e-request-limit-id";
+        Mock::given(method("POST"))
+            .and(path("/api/v1/query"))
+            .and(bearer_token("flt_token"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("cache-control", "no-store")
+                    .insert_header("x-request-id", request_id)
+                    .set_body_raw(refusal, "application/json"),
+            )
+            .expect(1)
+            .mount(upstream.mock())
+            .await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/query")
+            .header("cookie", &cookie)
+            .header("origin", TEST_ORIGIN)
+            .header("host", "trawl.fleet.test")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"query":"*"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let headers = resp.headers();
+        assert_eq!(
+            headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["no-store"]
+        );
+        assert_eq!(headers.get("x-request-id").unwrap(), request_id);
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert!(headers.get(header::RETRY_AFTER).is_none());
+        let relayed = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&relayed[..], refusal);
+
+        let sent = upstream
+            .mock()
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/api/v1/query")
+            .count();
+        assert_eq!(sent, 1, "one upstream request, no retry");
     }
 
     #[tokio::test]
