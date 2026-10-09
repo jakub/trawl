@@ -38,16 +38,15 @@ Usage, from the repository root:
         --work .flow-scratch/default-load --vector /path/to/vector
 
 --work is private: it holds the data directory, the trawld and Vector
-configs and the raw logs, and is deleted at the end unless --keep-work is
-given. The script writes no credential into it: the database password goes
-to docker through docker's own environment, the DSNs to trawld through its
-environment, and the API keys to Vector through its environment. The
-configs it does write are created owner-only (see write_private). Its
-parent must be owned by the invoking user and not writable by group or
-other. The script deletes only a --work directory it created itself (see
-check_work_path and Run.remove_work). Only summaries reach --out. The
-script owns one Postgres container, one trawld and three Vector processes,
-and removes all of them on exit.
+configs and the raw logs. The script creates it (mode 0700, it must not
+exist) and never deletes it; it prints the path at the end and the operator
+removes it. The script writes no credential into it: the database password
+goes to docker through docker's own environment, the DSNs to trawld through
+its environment, and the API keys to Vector through its environment. The
+configs it does write are created owner-only (see write_private). trawld
+itself puts its throwaway self-signed loopback TLS key under state/. Only
+summaries reach --out. The script owns one Postgres container, one trawld
+and three Vector processes, and removes all of them on exit.
 
 --check-summary output/summary.json applies the pass check to an existing
 summary and runs nothing.
@@ -69,10 +68,8 @@ import platform
 import re
 import secrets
 import shlex
-import shutil
 import signal
 import ssl
-import stat
 import statistics
 import subprocess
 import sys
@@ -207,7 +204,7 @@ def counter_reading(value):
 
 def refuse_dangerous(work):
     """SystemExit if work, an absolute path, is a symlink, passes through
-    one, or is a directory the script must never create or delete."""
+    one, or is a directory the script must never create."""
     if os.path.islink(work):
         raise SystemExit(f"--work {work} is a symlink; refusing")
     if Path(os.path.realpath(work)) != work:
@@ -224,38 +221,13 @@ def refuse_dangerous(work):
             raise SystemExit(f"--work must not be under {forbidden}")
 
 
-def refuse_shared_parent(work):
-    """SystemExit unless the parent of work is a directory owned by the
-    effective uid and not writable by group or other.
-
-    Only a process with the invoking user's uid can then rename or replace
-    entries in it, and the script trusts those (see "Threat model" in
-    README.md)."""
-    parent = work.parent
-    try:
-        st = os.lstat(parent)
-    except OSError as error:
-        raise SystemExit(f"--work parent {parent}: {error.strerror}; refusing")
-    if not stat.S_ISDIR(st.st_mode):
-        raise SystemExit(f"--work parent {parent} is not a directory; refusing")
-    if st.st_uid != os.geteuid():
-        raise SystemExit(f"--work parent {parent} is owned by uid {st.st_uid}, "
-                         f"not {os.geteuid()}; refusing")
-    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        raise SystemExit(f"--work parent {parent} is writable by group or other "
-                         f"(mode {stat.S_IMODE(st.st_mode):04o}); refusing")
-
-
 def check_work_path(raw):
     """The --work argument as an absolute path that does not exist yet.
 
     The path is made absolute lexically, so a symlink is never followed.
-    Anything refused here is never created or deleted by the script. A
-    parent that does not exist yet is checked after claim_work creates it."""
+    Anything refused here is never created by the script."""
     work = Path(os.path.abspath(raw))
     refuse_dangerous(work)
-    if os.path.lexists(work.parent):
-        refuse_shared_parent(work)
     if os.path.lexists(work):
         raise SystemExit(f"--work {work} already exists; remove it or pick another")
     return work
@@ -341,8 +313,6 @@ def verdict(summary):
     cleanup = summary.get("cleanup") or {}
     if not (cleanup.get("processes") is True and cleanup.get("container") is True):
         reasons.append(f"cleanup failed: {cleanup}")
-    if cleanup.get("workDir") not in ("removed", "kept"):
-        reasons.append(f"work directory: {cleanup.get('workDir')}")
     return reasons
 
 
@@ -350,9 +320,6 @@ class Run:
     def __init__(self, args):
         self.args = args
         self.work = Path(os.path.abspath(args.work))
-        # (st_dev, st_ino) of the --work directory once claim_work has
-        # created it; None until then. Only an owned directory is deleted.
-        self.work_owned = None
         self.out = Path(args.out).resolve()
         self.run_id = f"ac23-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}"
         self.container = f"trawl-ac23-{secrets.token_hex(8)}"
@@ -417,45 +384,11 @@ class Run:
         # A missing parent is created owner-only; missing ancestors above it
         # get the default mode, as with mkdir -p.
         self.work.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        refuse_shared_parent(self.work)
         try:
             os.mkdir(self.work, 0o700)
         except FileExistsError:
             raise SystemExit(f"--work {self.work} already exists; remove it or pick another")
-        st = os.lstat(self.work)
-        self.work_owned = (st.st_dev, st.st_ino)
         (self.work / "private").mkdir(mode=0o700)
-
-    def remove_work(self):
-        """Delete --work if this invocation created it. Returns what happened.
-
-        The parent must still be owner-only, the path must still be the
-        directory claim_work made (same device and inode, not a symlink),
-        and rmtree must be the variant that does not follow symlinks. A
-        same-uid process could still swap the directory between the check
-        and rmtree; README.md's "Threat model" puts that out of scope."""
-        if self.args.keep_work:
-            return "kept"
-        if self.work_owned is None:
-            return "not created by this run; left in place"
-        try:
-            refuse_dangerous(self.work)
-            refuse_shared_parent(self.work)
-        except SystemExit as refusal:
-            return f"refused: {refusal.code}"
-        try:
-            st = os.lstat(self.work)
-        except FileNotFoundError:
-            return "refused: already gone"
-        if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != self.work_owned:
-            return "refused: no longer the directory this run created"
-        if not shutil.rmtree.avoids_symlink_attacks:
-            return "refused: this platform's rmtree can follow symlinks"
-        try:
-            shutil.rmtree(self.work)
-        except OSError as error:
-            return f"failed: {error.__class__.__name__}"
-        return "removed"
 
     def preflight(self):
         dirty = self.cmd(["git", "-C", str(ROOT), "status", "--porcelain", "--", "crates",
@@ -1165,7 +1098,6 @@ def main():
     p.add_argument("--scrape-interval", type=float, default=0.25)
     p.add_argument("--query-think", type=float, default=1.0)
     p.add_argument("--drain-seconds", type=int, default=900)
-    p.add_argument("--keep-work", action="store_true")
     args = p.parse_args()
     if args.check_summary:
         sys.exit(check_summary(args.check_summary))
@@ -1201,13 +1133,12 @@ def main():
 
 
 def conclude(run, code):
-    """Collect the summaries, remove --work if this run owns it, judge the
-    run and write summary.json. Returns the exit code."""
+    """Collect the summaries, judge the run, write summary.json and tell the
+    operator where --work is. Returns the exit code."""
     try:
         run.collect()
     except Exception as error:
         run.summary["collectError"] = run.redact(repr(error))
-    run.summary.setdefault("cleanup", {})["workDir"] = run.remove_work()
     if code == 0:
         reasons = verdict(run.summary)
         run.summary["status"] = "failed" if reasons else "passed"
@@ -1218,6 +1149,9 @@ def conclude(run, code):
     log(f"status {run.summary['status']}; summary in {run.out / 'summary.json'}")
     for reason in run.summary.get("failureReasons", []):
         log(f"  {reason}")
+    log(f"work directory: {run.work}")
+    log("this script never deletes it; remove it when done. It holds synthetic "
+        "data and trawld's throwaway loopback TLS key, no database or API credential.")
     return code
 
 

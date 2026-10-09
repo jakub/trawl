@@ -4,9 +4,8 @@
 * The pass predicate: the real Run.collect() and verdict() over in-memory
   /metrics bodies and a written trawld log, and the --check-summary mode.
 * Container cleanup: Run.cleanup() over a stubbed docker command.
-* The --work rules: a refused path is never created or deleted,
-  Run.remove_work deletes only the directory its own claim created, and
-  a parent that another uid can write to is refused.
+* The --work rules: a refused path is never created, and main never
+  deletes --work, after a clean exit or a failure.
 
 Usage, from the repository root:
 
@@ -93,7 +92,7 @@ class Scratch(unittest.TestCase):
         values = dict(work=str(self.scratch / "work"), out=str(self.scratch / "out"),
                       vector="/nonexistent/vector", senders=3, seed_cycles=30, steady_rate=268,
                       steady_seconds=180, backlog_cycles=1500, scrape_interval=0.25,
-                      query_think=1.0, drain_seconds=900, keep_work=False)
+                      query_think=1.0, drain_seconds=900)
         values.update(overrides)
         return argparse.Namespace(**values)
 
@@ -336,7 +335,7 @@ class ContainerCleanup(Scratch):
 
 
 class WorkDirectory(Scratch):
-    """No refused --work is created or deleted."""
+    """No refused --work is created, and no --work is ever deleted."""
 
     def sentinel(self, directory):
         directory.mkdir(parents=True, exist_ok=True)
@@ -390,91 +389,105 @@ class WorkDirectory(Scratch):
         self.assertTrue(keep.exists())
         self.assertFalse((target / "work").exists())
 
-    def test_claim_refuses_an_existing_directory_and_remove_leaves_it(self):
-        existing = self.scratch / "existing"
-        keep = self.sentinel(existing)
-        r = run.Run(self.args(work=str(existing)))
-        with self.assertRaises(SystemExit):
-            r.claim_work()
-        self.assertIsNone(r.work_owned)
-        self.assertEqual(r.remove_work(), "not created by this run; left in place")
-        self.assertTrue(keep.exists())
-
-    def test_remove_deletes_the_directory_it_created(self):
-        r = run.Run(self.args())
-        r.claim_work()
-        (r.work / "private/secret").write_text("x")
-        self.assertEqual(r.remove_work(), "removed")
-        self.assertFalse(r.work.exists())
-
-    def test_remove_refuses_a_symlink_swapped_in(self):
-        r = run.Run(self.args())
-        r.claim_work()
-        elsewhere = self.scratch / "elsewhere"
-        keep = self.sentinel(elsewhere)
-        os.rename(r.work, self.scratch / "moved")
-        r.work.symlink_to(elsewhere)
-        self.assertTrue(r.remove_work().startswith("refused"))
-        self.assertTrue(keep.exists())
-        self.assertTrue((self.scratch / "moved/private").exists())
-
-    def test_remove_refuses_a_directory_swapped_in(self):
-        r = run.Run(self.args())
-        r.claim_work()
-        os.rename(r.work, self.scratch / "moved")
-        keep = self.sentinel(r.work)
-        self.assertEqual(r.remove_work(), "refused: no longer the directory this run created")
-        self.assertTrue(keep.exists())
-
-    def test_group_or_other_writable_parent_is_refused(self):
-        shared = self.scratch / "shared"
-        shared.mkdir()
-        try:
-            for mode in (0o770, 0o707, 0o1777):
-                with self.subTest(mode=oct(mode)):
-                    shared.chmod(mode)
-                    with self.assertRaises(SystemExit) as raised:
-                        run.check_work_path(str(shared / "work"))
-                    self.assertIn("writable by group or other", str(raised.exception.code))
-                    r = run.Run(self.args(work=str(shared / "work")))
-                    with self.assertRaises(SystemExit):
-                        r.claim_work()
-                    self.assertFalse((shared / "work").exists())
-                    self.assertEqual(r.remove_work(), "not created by this run; left in place")
-        finally:
-            shared.chmod(0o700)
-
-    def test_parent_owned_by_another_uid_is_refused(self):
-        with mock.patch.object(run.os, "geteuid", return_value=os.geteuid() + 1):
-            with self.assertRaises(SystemExit) as raised:
-                run.check_work_path(str(self.scratch / "work"))
-            self.assertIn("is owned by uid", str(raised.exception.code))
-            r = run.Run(self.args())
-            with self.assertRaises(SystemExit):
-                r.claim_work()
-        self.assertFalse((self.scratch / "work").exists())
-
     def test_missing_parent_is_created_owner_only(self):
         r = run.Run(self.args(work=str(self.scratch / "new/work")))
         r.claim_work()
         self.assertEqual(os.stat(self.scratch / "new").st_mode & 0o777, 0o700)
-        self.assertEqual(r.remove_work(), "removed")
-
-    def test_remove_refuses_once_the_parent_is_shared(self):
-        r = run.Run(self.args())
-        r.claim_work()
-        self.scratch.chmod(0o777)
-        try:
-            self.assertTrue(r.remove_work().startswith("refused: --work parent"))
-            self.assertTrue((r.work / "private").exists())
-        finally:
-            self.scratch.chmod(0o700)
+        self.assertEqual(os.stat(r.work).st_mode & 0o777, 0o700)
 
     def test_out_inside_work_is_refused(self):
         r = run.Run(self.args(out=str(self.scratch / "work/out")))
         with self.assertRaises(SystemExit):
             r.claim_work()
         self.assertFalse((self.scratch / "work").exists())
+
+
+    def test_symlink_work_is_refused_before_anything_is_written(self):
+        target = self.scratch / "target"
+        keep = self.sentinel(target)
+        link = self.scratch / "work-link"
+        link.symlink_to(target)
+        before = sorted(p.name for p in self.scratch.iterdir())
+        r = run.Run(self.args(work=str(link)))
+        with self.assertRaises(SystemExit) as raised:
+            r.claim_work()
+        self.assertIn("symlink", str(raised.exception.code))
+        self.assertTrue(keep.exists())
+        self.assertEqual(sorted(p.name for p in self.scratch.iterdir()), before)
+        self.assertEqual(list(target.iterdir()), [keep])
+
+    def test_existing_dangerous_and_symlink_work_are_refused_by_claim(self):
+        existing = self.scratch / "existing"
+        keep = self.sentinel(existing)
+        for raw in (str(existing), "/", str(Path.home()), str(run.ROOT), "/tmp"):
+            with self.subTest(raw=raw):
+                r = run.Run(self.args(work=raw))
+                with self.assertRaises(SystemExit):
+                    r.claim_work()
+        self.assertEqual(list(existing.iterdir()), [keep])
+        self.assertFalse((self.scratch / "out").exists())
+
+    def conclude(self, r, code):
+        # collect() needs a real run; the work directory is what is under test.
+        with mock.patch.object(r, "collect"), contextlib.redirect_stdout(io.StringIO()) as printed:
+            return run.conclude(r, code), printed.getvalue()
+
+    def test_conclude_never_removes_work_after_a_clean_exit(self):
+        r = run.Run(self.args())
+        r.claim_work()
+        (r.work / "vector-1.log").write_text("x")
+        _, printed = self.conclude(r, 0)
+        self.assertTrue((r.work / "vector-1.log").exists())
+        self.assertIn(str(r.work), printed)
+        self.assertIn("remove it when done", printed)
+        self.assertNotIn("workDir", r.summary.get("cleanup", {}))
+
+    def test_conclude_never_removes_work_after_a_failure(self):
+        r = run.Run(self.args())
+        r.claim_work()
+        (r.work / "vector-1.log").write_text("x")
+        r.summary["status"] = "error"
+        code, printed = self.conclude(r, 1)
+        self.assertEqual(code, 1)
+        self.assertTrue((r.work / "vector-1.log").exists())
+        self.assertIn(str(r.work), printed)
+
+    def test_main_never_removes_work_after_a_clean_exit_or_a_failure(self):
+        for outcome in ("clean", "failure"):
+            with self.subTest(outcome=outcome):
+                work = self.scratch / f"work-{outcome}"
+                out = self.scratch / f"out-{outcome}"
+                created = []
+
+                def fake_run(self_, outcome=outcome):
+                    (self_.work / "state").mkdir()
+                    created.append(self_.work)
+                    if outcome == "failure":
+                        raise RuntimeError("boom")
+
+                saved = sys.argv
+                sys.argv = ["run.py", "--work", str(work), "--vector", "/nonexistent/vector",
+                            "--out", str(out)]
+                try:
+                    with mock.patch.object(run.Run, "run", fake_run), \
+                            mock.patch.object(run.Run, "cleanup"), \
+                            mock.patch.object(run.Run, "collect"), \
+                            mock.patch.object(run, "verdict", return_value=[]), \
+                            contextlib.redirect_stdout(io.StringIO()), \
+                            self.assertRaises(SystemExit) as raised:
+                        run.main()
+                finally:
+                    sys.argv = saved
+                self.assertEqual(raised.exception.code, 0 if outcome == "clean" else 1)
+                self.assertEqual(created, [work])
+                self.assertTrue((work / "state").is_dir())
+                self.assertTrue((work / "private").is_dir())
+                self.assertTrue((out / "summary.json").exists())
+
+    def test_nothing_in_run_py_deletes_a_tree(self):
+        text = (run.HERE / "run.py").read_text()
+        for needle in ("rmtree", "remove_work", "work_owned", "keep_work", "--keep-work"):
+            self.assertNotIn(needle, text)
 
 
 class Credentials(Scratch):
@@ -507,7 +520,6 @@ class Credentials(Scratch):
         self.assertFalse(any(password in arg for arg in argv), argv)
         self.assertEqual(env["POSTGRES_PASSWORD"], password)
         self.assertEqual(list((r.work / "private").iterdir()), [])
-        r.remove_work()
 
     def test_private_file_is_owner_only_from_the_moment_it_exists(self):
         path = self.scratch / "secret"
@@ -571,7 +583,6 @@ class Credentials(Scratch):
         self.assertEqual(written, ["trawld.toml", "vector-1.json", "vector-2.json", "vector-3.json"])
         for name in written:
             self.assertEqual(os.stat(r.work / "private" / name).st_mode & 0o777, 0o600)
-        r.remove_work()
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ UTC (2026-10-08 local time).
 | `rollup_complete` events while the senders delivered | 35, from 03:05:43.18 to 03:05:52.91 UTC (t = 62.4 to 72.1 s) |
 | Search queries / answered 200 | 83 / 83 |
 | Failed `/metrics` scrapes | 0 |
-| Cleanup: processes / Postgres container / `--work` | removed / removed / removed |
+| Cleanup: processes / Postgres container | removed / removed |
 
 The terminal snapshot is one more `/metrics` scrape at t = 199.2 s. The
 script takes it after the query loop and the three Vector processes have
@@ -71,7 +71,7 @@ never counted as 0. The run also fails if:
 - a scrape failed, or the terminal snapshot is missing;
 - the run stopped with an error, or collecting the evidence raised one;
 - the query loop or the scraper was still running at the terminal snapshot;
-- cleanup of the processes, the container or `--work` failed. The container
+- cleanup of the processes or the container failed. The container
   counts as removed only after `docker rm` succeeds, or when `docker
   inspect` reports no such container. Any other Docker error, such as an
   unreachable daemon, fails the run.
@@ -237,11 +237,11 @@ found three more, fixed after run 5 without a new run (see below).
 - **The script could delete a directory it did not create.** The old
   script refused an existing `--work`, but its cleanup still ran and
   deleted that path. `--work .` could delete the checkout. The script now
-  creates `--work` with one `mkdir` and records the directory's device and
-  inode. It deletes only that directory, with the `rmtree` that does not
-  follow symlinks. It refuses a symlink, the filesystem root, `$HOME`,
-  `/tmp`, the repository root and its ancestors before it creates anything,
-  and a refused path is never created or deleted.
+  creates `--work` with one `mkdir`. It refuses an existing path, a
+  symlink, the filesystem root, `$HOME`, `/tmp`, the repository root and
+  its ancestors before it creates anything, and a refused path is never
+  created. See "The script no longer deletes `--work`" below for what
+  became of the deletion itself.
 - **The pass check could pass without refusal evidence.** The old check
   read a missing refusal series as 0. It ignored collection errors and
   `request_limit_reached` failure events. It stopped sampling while the
@@ -260,9 +260,23 @@ After run 5:
   daemon passed cleanup. Only a successful `docker rm`, or Docker reporting
   no such container, now counts.
 - **A swapped work directory.** Between the inode check and `rmtree`,
-  another process could replace `--work` with a different directory. The
-  script now refuses a `--work` whose parent another uid can write to. The
-  remaining window is covered in [Threat model](#threat-model).
+  another process could replace `--work` with a different directory. A
+  first fix refused a `--work` whose immediate parent another uid can
+  write to. A later review showed that an ancestor higher up could still
+  be swapped for a symlink, and that `rmtree` then deletes elsewhere. The
+  next item removes the deletion.
+
+- **The script no longer deletes `--work`.** Every fix to the deletion
+  left a check-then-delete window, so the script now has no recursive
+  delete at all. `Run.remove_work`, the device and inode bookkeeping, the
+  parent-ownership rule, the `--keep-work` option and the `workDir`
+  cleanup field are gone. The pass check no longer reads `workDir`, so
+  an older `summary.json` that carries it still passes. The script
+  creates `--work` fresh (mode 0700) and prints its path at the end.
+  The operator removes it. It holds synthetic fixture data, the raw logs
+  and trawld's throwaway self-signed loopback TLS key. It holds no
+  database or API credential. The script still removes the Postgres
+  container and its processes, and `--out` must not sit inside `--work`.
 
 After PR #297's CodeQL scan:
 
@@ -290,27 +304,29 @@ Docker host.
 [`test_run.py`](test_run.py) runs the real `collect()` and `verdict()` on
 in-memory scrapes and a written trawld log, with one case for each pass
 condition. It runs `cleanup()` against stubbed Docker answers. It also
-checks that the `--work` rules create and delete nothing they refuse,
-including under a parent that is group- or other-writable or owned by
-another uid. It checks that the `docker run` command line never carries the
+checks that the `--work` rules create nothing they refuse (an existing
+path, a symlink, a dangerous path) and that `main` leaves `--work` in
+place after a clean exit and after a failure. It checks that the `docker run` command line never carries the
 password and that the private files are created 0600. It needs no build,
 database or Vector.
 
 ## Threat model
 
-`run.py` runs as the invoking user. It creates `--work` itself, inside a
-parent that the invoking user owns and that group and other cannot write
-to. The script checks the parent before it creates `--work` and again
-before it deletes it.
+`run.py` runs as the invoking user. It creates `--work` itself, and it
+never deletes it. There is no check-then-delete window, and so no rule
+about who owns or can write to the parent of `--work`. The script
+deletes nothing recursively; it only removes its own Postgres container
+and stops its own processes.
 
-- **Other users** cannot rename or replace anything in that parent, so
-  they cannot swap `--work` for another directory.
+- **Writing.** `--work` must not exist, must not be a symlink or pass
+  through one, and must not be the filesystem root, `$HOME`, `/tmp`, the
+  repository root or an ancestor of it. `mkdir` is the claim, so a path
+  that appears after the check is refused too. The configs are created
+  with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode 0600.
 - **Processes running as the same user** are trusted. They can already
-  delete anything the user can, so the script does not defend against
-  them. One window remains: a same-user process could replace `--work`
-  between the inode check and `rmtree`. This is out of scope.
-- **Symlinks** are refused in `--work` and its path. `rmtree` is the
-  variant that does not follow symlinks inside the tree.
+  read and delete anything the user can.
+- **Cleanup** is the operator's: delete `--work` when done. It holds
+  synthetic data and no credential the script wrote.
 
 ## Earlier runs
 
@@ -367,11 +383,17 @@ python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
 ```
 
 `--work` must not exist, must not be a symlink and must not be under
-`/tmp`. Its parent must be owned by you and not writable by group or
-other. A missing parent is created with mode 0700. `--work` holds the
-data, the configs and the raw logs, and no credential. The script deletes
-it at the end unless `--keep-work` is given, and it deletes only a `--work` it created. Only summaries reach `--out`, which
-defaults to `output/`. `--help` lists the workload options.
+`/tmp`. A missing parent is created with mode 0700. `--work` holds the
+data, the configs and the raw logs, and no database or API credential.
+The script never deletes it. It prints the path at the end, and you
+remove it when you are done:
+
+```bash
+rm -rf .flow-scratch/default-load
+```
+
+Only summaries reach `--out`, which defaults to `output/`. `--help` lists
+the workload options.
 
 This run used:
 
