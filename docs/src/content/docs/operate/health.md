@@ -478,11 +478,29 @@ Every other 5xx logs at ERROR.
 A request that trawld refuses at its [request limit](/reference/configuration/#the-request-limit)
 leaves one failure event with `error_class=service_unavailable`,
 `cause_kind=request_limit_reached`, and `stage=pre_admission`. It logs at WARN
-and is unmetered, so it shares the cap of 60 events per minute below. Count the
-refusals and watch the load with `trawl_http_requests_refused_total{allowance}`
-and `trawl_http_requests_in_progress{allowance}` on `/metrics`. The label
-`allowance` is `regular` or `control`. `trawl_http_request_allowance{allowance}`
-reports the size of each count.
+and is unmetered, so it shares the cap of 60 events per minute below. The cap
+covers all three allowances, so a flood hides most refusals from the failure
+log. Count them with the counter instead:
+`trawl_http_requests_refused_total{allowance="regular"}`,
+`trawl_http_requests_refused_total{allowance="probe"}`, and
+`trawl_http_requests_refused_total{allowance="control"}` on `/metrics`.
+`trawl_http_requests_in_progress{allowance}` shows the load now.
+The label `allowance` is `regular`, `probe`, or `control`.
+`trawl_http_request_allowance{allowance}` reports the size of each count: the
+configured value for `regular`, and 3 and 4 for the fixed `probe` and
+`control` allowances.
+
+The probe allowance serves `GET` and `HEAD` on `/api/v1/health` and
+`/metrics`. The chart's probes, a scrape, a doctor
+run and a browser health read all use it. The control allowance serves query
+list and cancel. A rising `probe` counter means health or `/metrics` requests
+arrived faster than they ended. A rising `control` counter with `401` answers
+in the same window points at junk tokens. trawld cannot tell them from valid
+ones before the key check, so the control allowance holds them for that whole
+check. List and cancel are not promised during such a flood. Block the source
+at the network. Any caller who can reach the listener can also fill the probe
+allowance, and no network policy can fence health alone, because health shares
+the API port.
 
 To trace one failure:
 

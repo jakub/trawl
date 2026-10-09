@@ -32,8 +32,13 @@
 # One count covers every route and method. When it is full, trawld refuses
 # the next request at once with 503 `request_limit_reached` and no
 # Retry-After; it never queues a request. Senders retry with backoff.
-# Four more requests are reserved for health, metrics, query listing and
-# query cancellation, so probes and scrapes still get through.
+# Two fixed allowances sit beside the count, and none borrows from another:
+# 3 requests for health and metrics (`probe`), so probes and scrapes still
+# get through, and 4 for query listing and cancellation (`control`). The
+# failure log is capped at 60 events a minute, so read refusals from
+# trawl_http_requests_refused_total{allowance="regular|probe|control"}.
+# Anyone who can reach the listener can fill the probe allowance, and junk
+# tokens can fill the control allowance; block such a source at the network.
 # Ingest requests dominate memory: count x (wire body + decoded body),
 # 32 x 32 MiB = 1 GiB at the defaults. Lower it before raising it.
 # max_concurrent_requests = 32

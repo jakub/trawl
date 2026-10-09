@@ -233,7 +233,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.server.maxResultRows` | int | `100000` | `[server] max_result_rows` |
 | `config.server.maxExportRows` | int | `1000000` | `[server] max_export_rows` |
 | `config.server.maxRequestBodyBytes` | string | `128K` | `[server] max_request_body_bytes` |
-| `config.server.maxConcurrentRequests` | int | `32` | `[server] max_concurrent_requests`: HTTP requests in progress across the listener, 1 to 65536. When full, trawld refuses the next request at once with 503 `request_limit_reached` and no `Retry-After`. Four more are reserved for health, metrics and query list/cancel |
+| `config.server.maxConcurrentRequests` | int | `32` | `[server] max_concurrent_requests`: HTTP requests in progress across the listener, 1 to 65536. When full, trawld refuses the next request at once with 503 `request_limit_reached` and no `Retry-After`. Two fixed allowances sit beside it: 3 for health and metrics (`probe`) and 4 for query list/cancel (`control`). The `allowance` label on `trawl_http_requests_refused_total` is `regular`, `probe` or `control` |
 | `config.server.shutdownDrainSecs` | int | `30` | `[server] shutdown_drain_secs`, also the pod's `terminationGracePeriodSeconds` |
 | `config.server.maxSseConnections` | int | `32` | `[server] max_sse_connections` |
 | `config.server.tlsReloadIntervalSecs` | int | `300` | `[server] tls_reload_interval_secs`, rendered for `tls.mode` `secret` and `certManager` |
