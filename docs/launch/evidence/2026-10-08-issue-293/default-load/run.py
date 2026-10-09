@@ -35,24 +35,26 @@ and evidence collection and cleanup succeeded (see verdict).
 Usage, from the repository root:
 
     python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \\
-        --work .flow-scratch/default-load --vector /path/to/vector
+        --vector /path/to/vector
 
---work is private: it holds the data directory, the trawld and Vector
-configs and the raw logs. The script creates it (mode 0700, it must not
-exist) and never deletes it; it prints the path at the end and the operator
-removes it. The script writes no credential into it: the database password
-goes to docker through docker's own environment, the DSNs to trawld through
-its environment, and the API keys to Vector through its environment. The
-configs it does write are created owner-only (see write_private). trawld
-itself puts its throwaway self-signed loopback TLS key under state/. Only
-summaries reach --out. The script owns one Postgres container, one trawld
-and three Vector processes, and removes all of them on exit.
+Each run writes only inside .flow-scratch/<run id>/ in the checkout, a
+directory it creates with mode 0700 and never deletes. work/ holds the data
+directory, the trawld and Vector configs and the raw logs, and output/ the
+summaries. The script prints the run directory at the end; copy output/
+into the evidence by hand to promote a run. The script writes no credential
+into it: the database password goes to docker through docker's own
+environment, the DSNs to trawld through its environment, and the API keys
+to Vector through its environment. The configs it does write are created
+owner-only (see write_private). trawld itself puts its throwaway
+self-signed loopback TLS key under work/state/. The script owns one
+Postgres container, one trawld and three Vector processes, and removes all
+of them on exit.
 
 --check-summary output/summary.json applies the pass check to an existing
 summary and runs nothing.
 
 test_run.py, beside this file, checks the pass predicate, the container
-cleanup and the --work rules without a full run.
+cleanup and the run directory without a full run.
 """
 
 import argparse
@@ -88,6 +90,9 @@ VECTOR_BASE = ROOT / "config/vector/debian/base.toml"
 TARGET = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")
 if not TARGET.is_absolute():
     TARGET = ROOT / TARGET
+# Every run's directory. Anyone who can write the checkout can already
+# change the code this script builds and runs.
+RUNS = ROOT / ".flow-scratch"
 POSTGRES_IMAGE = "postgres:18"
 DOCKER = ["docker", "--host", "unix:///var/run/docker.sock"]
 # Wide enough for every fixture timestamp (2024-01-15 to 2026-09-28).
@@ -202,37 +207,6 @@ def counter_reading(value):
     return int(value)
 
 
-def refuse_dangerous(work):
-    """SystemExit if work, an absolute path, is a symlink, passes through
-    one, or is a directory the script must never create."""
-    if os.path.islink(work):
-        raise SystemExit(f"--work {work} is a symlink; refusing")
-    if Path(os.path.realpath(work)) != work:
-        raise SystemExit(f"--work {work} passes through a symlink; refusing")
-    tmp = Path("/tmp")
-    for name, path in (("the filesystem root", Path("/")), ("$HOME", Path.home().resolve()),
-                       ("/tmp", tmp)):
-        if work == path:
-            raise SystemExit(f"--work must not be {name}")
-    if work == ROOT or work in ROOT.parents:
-        raise SystemExit(f"--work must not be the repository root {ROOT} or an ancestor of it")
-    for forbidden in (tmp, HERE):
-        if work == forbidden or forbidden in work.parents:
-            raise SystemExit(f"--work must not be under {forbidden}")
-
-
-def check_work_path(raw):
-    """The --work argument as an absolute path that does not exist yet.
-
-    The path is made absolute lexically, so a symlink is never followed.
-    Anything refused here is never created by the script."""
-    work = Path(os.path.abspath(raw))
-    refuse_dangerous(work)
-    if os.path.lexists(work):
-        raise SystemExit(f"--work {work} already exists; remove it or pick another")
-    return work
-
-
 def number(value):
     """value as a float when it is a finite JSON number, else None."""
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -319,9 +293,10 @@ def verdict(summary):
 class Run:
     def __init__(self, args):
         self.args = args
-        self.work = Path(os.path.abspath(args.work))
-        self.out = Path(args.out).resolve()
         self.run_id = f"ac23-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{secrets.token_hex(3)}"
+        self.run_dir = RUNS / self.run_id
+        self.work = self.run_dir / "work"
+        self.out = self.run_dir / "output"
         self.container = f"trawl-ac23-{secrets.token_hex(8)}"
         self.secrets = []
         self.children = []
@@ -373,22 +348,19 @@ class Run:
 
     # -- setup -------------------------------------------------------------
 
-    def claim_work(self):
-        """Create --work, or SystemExit with nothing created.
+    def claim(self):
+        """Create the run directory, or SystemExit with nothing created.
 
-        mkdir is the claim: it fails if the path appeared after the check,
-        so the script never takes over a directory it did not make."""
-        self.work = check_work_path(self.args.work)
-        if self.out == self.work or self.work in self.out.parents:
-            raise SystemExit(f"--out must not be inside --work {self.work}")
-        # A missing parent is created owner-only; missing ancestors above it
-        # get the default mode, as with mkdir -p.
-        self.work.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        mkdir is the claim: it fails if the path exists, so the script never
+        takes over a directory it did not make."""
+        os.makedirs(RUNS, exist_ok=True)
         try:
-            os.mkdir(self.work, 0o700)
+            os.mkdir(self.run_dir, 0o700)
         except FileExistsError:
-            raise SystemExit(f"--work {self.work} already exists; remove it or pick another")
-        (self.work / "private").mkdir(mode=0o700)
+            raise SystemExit(f"run directory {self.run_dir} already exists")
+        self.work.mkdir()
+        (self.work / "private").mkdir()
+        self.out.mkdir()
 
     def preflight(self):
         dirty = self.cmd(["git", "-C", str(ROOT), "status", "--porcelain", "--", "crates",
@@ -467,12 +439,14 @@ class Run:
             self.secrets.append(key)
             self.ingest_keys.append(key)
 
+    def write_trawld_config(self):
+        """Write trawld's config once; every trawld session reads it."""
+        self.data = self.work / "state/data"
+        self.trawld_config = self.work / "private/trawld.toml"
+        write_private(self.trawld_config,
+                      (HERE / "trawld.toml").read_text().replace("@DATA_DIR@", str(self.data)))
+
     def start_trawld(self, log_name):
-        state = self.work / "state"
-        self.data = state / "data"
-        config = (HERE / "trawld.toml").read_text().replace("@DATA_DIR@", str(self.data))
-        config_path = self.work / "private/trawld.toml"
-        write_private(config_path, config)
         self.trawld_log = self.work / log_name
         env = {"FLEET_DATABASE_URL": self.fleet_dsn, "TRAWL_DATABASE_URL": self.app_dsn,
                "RUST_LOG": "trawl_server=info,fleet_auth=info", "NO_COLOR": "1"}
@@ -480,13 +454,13 @@ class Run:
             if k in os.environ:
                 env[k] = os.environ[k]
         log(f"starting trawld ({log_name})")
-        self.trawld = self.spawn([str(ROOT / "bin/trawld-dev"), "--config", str(config_path)],
+        self.trawld = self.spawn([str(ROOT / "bin/trawld-dev"), "--config", str(self.trawld_config)],
                                  env, self.trawld_log)
         deadline = time.monotonic() + 180
         addr = None
         while addr is None:
             if self.trawld.poll() is not None:
-                raise RuntimeError("trawld exited during startup; see its log in --work")
+                raise RuntimeError("trawld exited during startup; see its log in the run directory")
             if time.monotonic() > deadline:
                 raise RuntimeError("trawld readiness deadline")
             text = self.trawld_log.read_text(errors="replace")
@@ -497,7 +471,7 @@ class Run:
             else:
                 time.sleep(0.2)
         self.host, self.port = addr.split(":")[0], int(addr.split(":")[1])
-        self.cert = state / "tls/cert.pem"
+        self.cert = self.work / "state/tls/cert.pem"
         self.tls = ssl.create_default_context(cafile=str(self.cert))
         status, body = self.http("GET", "/api/v1/health")
         if status != 200:
@@ -791,6 +765,7 @@ class Run:
         self.load_fixture()
         self.start_postgres()
         self.provision_keys()
+        self.write_trawld_config()
         self.seed_history()
         self.start_trawld("trawld.log")
         self.t0 = time.monotonic()
@@ -862,8 +837,7 @@ class Run:
                 self.summary["delivery"].setdefault("feedErrors", {})[s["name"]] = s["error"]
 
     def collect(self):
-        """Summaries only. Raw logs stay in --work."""
-        self.out.mkdir(parents=True, exist_ok=True)
+        """Summaries only. Raw logs stay in work/."""
         columns = ["t", "scrape_ms", "status"] + [k for k, _, _ in SAMPLED] + ["parquet_files"]
         with open(self.out / "metrics-samples.csv", "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
@@ -1087,8 +1061,6 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--check-summary", metavar="SUMMARY",
                    help="apply the pass check to an existing summary.json and exit; runs nothing")
-    p.add_argument("--work", help="private scratch directory (created; must not exist)")
-    p.add_argument("--out", default=str(HERE / "output"), help="summary directory")
     p.add_argument("--vector", help="Vector 0.57.0 binary")
     p.add_argument("--senders", type=int, default=3)
     p.add_argument("--seed-cycles", type=int, default=30, help="fixture cycles per seed session")
@@ -1101,12 +1073,11 @@ def main():
     args = p.parse_args()
     if args.check_summary:
         sys.exit(check_summary(args.check_summary))
-    if not (args.work and args.vector):
-        p.error("--work and --vector are required unless --check-summary is given")
+    if not args.vector:
+        p.error("--vector is required unless --check-summary is given")
     run = Run(args)
-    # A refused --work exits here, before anything exists to clean up, and
-    # nothing is written to --out.
-    run.claim_work()
+    # A refused claim exits here, before anything exists to clean up.
+    run.claim()
     def interrupt(*_):
         raise KeyboardInterrupt
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1134,7 +1105,7 @@ def main():
 
 def conclude(run, code):
     """Collect the summaries, judge the run, write summary.json and tell the
-    operator where --work is. Returns the exit code."""
+    operator where the run directory is. Returns the exit code."""
     try:
         run.collect()
     except Exception as error:
@@ -1144,12 +1115,11 @@ def conclude(run, code):
         run.summary["status"] = "failed" if reasons else "passed"
         run.summary["failureReasons"] = reasons
         code = 1 if reasons else 0
-    run.out.mkdir(parents=True, exist_ok=True)
     (run.out / "summary.json").write_text(run.redact(json.dumps(run.summary, indent=2)) + "\n")
     log(f"status {run.summary['status']}; summary in {run.out / 'summary.json'}")
     for reason in run.summary.get("failureReasons", []):
         log(f"  {reason}")
-    log(f"work directory: {run.work}")
+    log(f"run directory: {run.run_dir}")
     log("this script never deletes it; remove it when done. It holds synthetic "
         "data and trawld's throwaway loopback TLS key, no database or API credential.")
     return code

@@ -4,15 +4,17 @@
 * The pass predicate: the real Run.collect() and verdict() over in-memory
   /metrics bodies and a written trawld log, and the --check-summary mode.
 * Container cleanup: Run.cleanup() over a stubbed docker command.
-* The --work rules: a refused path is never created, and main never
-  deletes --work, after a clean exit or a failure.
+* The run directory: the claim makes a fresh one and refuses an existing
+  one, a run writes only inside it, and main never deletes it, after a
+  clean exit or a failure.
+* trawld restarts: the config is written once, and every session reuses it.
 
 Usage, from the repository root:
 
     python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/test_run.py
 
 Scratch directories go under .flow-scratch/ in the repository root and are
-removed afterwards.
+removed afterwards. Each test points run.RUNS at its own scratch directory.
 """
 
 import argparse
@@ -84,13 +86,15 @@ class Scratch(unittest.TestCase):
     def setUp(self):
         SCRATCH_ROOT.mkdir(exist_ok=True)
         self.scratch = Path(tempfile.mkdtemp(prefix="test-run-", dir=SCRATCH_ROOT))
+        runs = mock.patch.object(run, "RUNS", self.scratch)
+        runs.start()
+        self.addCleanup(runs.stop)
 
     def tearDown(self):
         shutil.rmtree(self.scratch)
 
     def args(self, **overrides):
-        values = dict(work=str(self.scratch / "work"), out=str(self.scratch / "out"),
-                      vector="/nonexistent/vector", senders=3, seed_cycles=30, steady_rate=268,
+        values = dict(vector="/nonexistent/vector", senders=3, seed_cycles=30, steady_rate=268,
                       steady_seconds=180, backlog_cycles=1500, scrape_interval=0.25,
                       query_think=1.0, drain_seconds=900)
         values.update(overrides)
@@ -102,7 +106,9 @@ class Predicate(Scratch):
 
     def judge(self, samples, final, log_lines=(), collect_error=False, work_events=WORK_EVENTS,
               queries=(query(), query()), deliveries=None):
-        r = run.Run(self.args(keep_work=True))
+        r = run.Run(self.args())
+        r.claim()
+        self.run = r
         r.t0 = 0.0
         r.wall0 = datetime(2026, 10, 8, 12, 0, 0, tzinfo=timezone.utc)
         r.delivered_at = 60.0
@@ -114,7 +120,7 @@ class Predicate(Scratch):
         r.final_metrics = {"t": 70.0, "status": 200 if final is not None else 0, "attempts": 1,
                            "text": final}
         r.queries = list(queries)
-        r.trawld_log = self.scratch / "trawld.log"
+        r.trawld_log = r.work / "trawld.log"
         if not collect_error:
             r.trawld_log.write_text("".join(line + "\n" for line in (*work_events, *log_lines)))
         r.summary.update({
@@ -124,7 +130,7 @@ class Predicate(Scratch):
         })
         with contextlib.redirect_stdout(io.StringIO()):
             code = run.conclude(r, 0)
-        written = json.loads((self.scratch / "out/summary.json").read_text())
+        written = json.loads((r.out / "summary.json").read_text())
         self.assertEqual(written["status"], r.summary["status"])
         return code, r.summary
 
@@ -240,7 +246,7 @@ class Predicate(Scratch):
     def test_check_summary_applies_the_same_check(self):
         code, summary = self.judge([metrics()], metrics())
         self.assertEqual(code, 0)
-        path = self.scratch / "out/summary.json"
+        path = self.run.out / "summary.json"
         with contextlib.redirect_stdout(io.StringIO()) as printed:
             self.assertEqual(run.check_summary(path), 0)
         self.assertIn("pass check: passed", printed.getvalue())
@@ -253,6 +259,18 @@ class Predicate(Scratch):
             self.assertEqual(run.check_summary(path), 1)
         self.assertIn("pass check: failed", printed.getvalue())
         self.assertIn("rollup_complete events while the senders delivered", printed.getvalue())
+
+    def test_conclude_writes_only_under_the_run_dir(self):
+        def tree(root):
+            return {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        evidence = tree(run.HERE)
+        code, _ = self.judge([metrics()], metrics())
+        self.assertEqual(code, 0)
+        self.assertEqual(tree(run.HERE), evidence)
+        self.assertEqual([p.name for p in self.scratch.iterdir()], [self.run.run_id])
+        self.assertEqual(sorted(p.name for p in self.run.out.iterdir()),
+                         ["compaction-rollup-events.ndjson", "metrics-final.prom",
+                          "metrics-samples.csv", "queries.csv", "summary.json"])
 
 
 def docker_stub(*answers):
@@ -334,98 +352,26 @@ class ContainerCleanup(Scratch):
                 self.assertFalse(r.summary["cleanup"]["container"])
 
 
-class WorkDirectory(Scratch):
-    """No refused --work is created, and no --work is ever deleted."""
+class RunDirectory(Scratch):
+    """A run claims a fresh directory, and no run directory is ever deleted."""
 
-    def sentinel(self, directory):
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "keep-me"
-        path.write_text("x")
-        return path
+    def test_claim_makes_a_fresh_owner_only_run_dir(self):
+        r = run.Run(self.args())
+        r.claim()
+        self.assertEqual(r.run_dir.parent, self.scratch)
+        self.assertEqual(os.stat(r.run_dir).st_mode & 0o777, 0o700)
+        self.assertEqual(sorted(str(p.relative_to(r.run_dir)) for p in r.run_dir.rglob("*")),
+                         ["output", "work", "work/private"])
 
-    def main(self, *argv):
-        out = self.scratch / "main-out"
-        saved = sys.argv
-        sys.argv = ["run.py", *argv, "--vector", "/nonexistent/vector", "--out", str(out)]
-        try:
-            with self.assertRaises(SystemExit) as raised:
-                run.main()
-        finally:
-            sys.argv = saved
-        self.assertIn("already exists", str(raised.exception.code))
-        self.assertFalse(out.exists(), "a refused --work wrote to --out")
-
-    def test_main_leaves_an_existing_work_directory(self):
-        existing = self.scratch / "previous-run"
-        keep = self.sentinel(existing)
-        self.main("--work", str(existing))
-        self.assertTrue(keep.exists())
-
-    def test_main_leaves_the_current_directory(self):
-        here = self.scratch / "checkout"
-        keep = self.sentinel(here)
-        saved = os.getcwd()
-        os.chdir(here)
-        try:
-            self.main("--work", ".")
-        finally:
-            os.chdir(saved)
-        self.assertTrue(keep.exists())
-
-    def test_dangerous_paths_are_refused(self):
-        target = self.scratch / "target"
-        keep = self.sentinel(target)
-        live = self.scratch / "live-link"
-        live.symlink_to(target)
-        dangling = self.scratch / "dangling-link"
-        dangling.symlink_to(self.scratch / "nowhere")
-        through = self.scratch / "dir-link"
-        through.symlink_to(target)
-        for raw in ("/", str(Path.home()), str(run.ROOT), str(run.ROOT.parent), "/tmp",
-                    "/tmp/ac23-work", str(run.HERE), str(run.HERE / "work"),
-                    str(live), str(dangling), str(through / "work")):
-            with self.subTest(raw=raw), self.assertRaises(SystemExit):
-                run.check_work_path(raw)
-        self.assertTrue(keep.exists())
-        self.assertFalse((target / "work").exists())
-
-    def test_missing_parent_is_created_owner_only(self):
-        r = run.Run(self.args(work=str(self.scratch / "new/work")))
-        r.claim_work()
-        self.assertEqual(os.stat(self.scratch / "new").st_mode & 0o777, 0o700)
-        self.assertEqual(os.stat(r.work).st_mode & 0o777, 0o700)
-
-    def test_out_inside_work_is_refused(self):
-        r = run.Run(self.args(out=str(self.scratch / "work/out")))
-        with self.assertRaises(SystemExit):
-            r.claim_work()
-        self.assertFalse((self.scratch / "work").exists())
-
-
-    def test_symlink_work_is_refused_before_anything_is_written(self):
-        target = self.scratch / "target"
-        keep = self.sentinel(target)
-        link = self.scratch / "work-link"
-        link.symlink_to(target)
-        before = sorted(p.name for p in self.scratch.iterdir())
-        r = run.Run(self.args(work=str(link)))
+    def test_claim_refuses_an_existing_run_dir(self):
+        r = run.Run(self.args())
+        r.run_dir.mkdir()
+        keep = r.run_dir / "keep-me"
+        keep.write_text("x")
         with self.assertRaises(SystemExit) as raised:
-            r.claim_work()
-        self.assertIn("symlink", str(raised.exception.code))
-        self.assertTrue(keep.exists())
-        self.assertEqual(sorted(p.name for p in self.scratch.iterdir()), before)
-        self.assertEqual(list(target.iterdir()), [keep])
-
-    def test_existing_dangerous_and_symlink_work_are_refused_by_claim(self):
-        existing = self.scratch / "existing"
-        keep = self.sentinel(existing)
-        for raw in (str(existing), "/", str(Path.home()), str(run.ROOT), "/tmp"):
-            with self.subTest(raw=raw):
-                r = run.Run(self.args(work=raw))
-                with self.assertRaises(SystemExit):
-                    r.claim_work()
-        self.assertEqual(list(existing.iterdir()), [keep])
-        self.assertFalse((self.scratch / "out").exists())
+            r.claim()
+        self.assertIn("already exists", str(raised.exception.code))
+        self.assertEqual(list(r.run_dir.iterdir()), [keep])
 
     def conclude(self, r, code):
         # collect() needs a real run; the work directory is what is under test.
@@ -434,29 +380,27 @@ class WorkDirectory(Scratch):
 
     def test_conclude_never_removes_work_after_a_clean_exit(self):
         r = run.Run(self.args())
-        r.claim_work()
+        r.claim()
         (r.work / "vector-1.log").write_text("x")
         _, printed = self.conclude(r, 0)
         self.assertTrue((r.work / "vector-1.log").exists())
-        self.assertIn(str(r.work), printed)
+        self.assertIn(str(r.run_dir), printed)
         self.assertIn("remove it when done", printed)
         self.assertNotIn("workDir", r.summary.get("cleanup", {}))
 
     def test_conclude_never_removes_work_after_a_failure(self):
         r = run.Run(self.args())
-        r.claim_work()
+        r.claim()
         (r.work / "vector-1.log").write_text("x")
         r.summary["status"] = "error"
         code, printed = self.conclude(r, 1)
         self.assertEqual(code, 1)
         self.assertTrue((r.work / "vector-1.log").exists())
-        self.assertIn(str(r.work), printed)
+        self.assertIn(str(r.run_dir), printed)
 
     def test_main_never_removes_work_after_a_clean_exit_or_a_failure(self):
         for outcome in ("clean", "failure"):
             with self.subTest(outcome=outcome):
-                work = self.scratch / f"work-{outcome}"
-                out = self.scratch / f"out-{outcome}"
                 created = []
 
                 def fake_run(self_, outcome=outcome):
@@ -466,8 +410,7 @@ class WorkDirectory(Scratch):
                         raise RuntimeError("boom")
 
                 saved = sys.argv
-                sys.argv = ["run.py", "--work", str(work), "--vector", "/nonexistent/vector",
-                            "--out", str(out)]
+                sys.argv = ["run.py", "--vector", "/nonexistent/vector"]
                 try:
                     with mock.patch.object(run.Run, "run", fake_run), \
                             mock.patch.object(run.Run, "cleanup"), \
@@ -479,10 +422,11 @@ class WorkDirectory(Scratch):
                 finally:
                     sys.argv = saved
                 self.assertEqual(raised.exception.code, 0 if outcome == "clean" else 1)
-                self.assertEqual(created, [work])
+                [work] = created
+                self.assertEqual(work.parent.parent, self.scratch)
                 self.assertTrue((work / "state").is_dir())
                 self.assertTrue((work / "private").is_dir())
-                self.assertTrue((out / "summary.json").exists())
+                self.assertTrue((work.parent / "output/summary.json").exists())
 
     def test_nothing_in_run_py_deletes_a_tree(self):
         text = (run.HERE / "run.py").read_text()
@@ -506,7 +450,7 @@ class Credentials(Scratch):
 
     def test_start_postgres_hands_docker_the_password_through_its_environment(self):
         r = run.Run(self.args())
-        r.claim_work()
+        r.claim()
         seen = []
 
         def fake(argv, **kwargs):
@@ -564,7 +508,7 @@ class Credentials(Scratch):
 
     def test_trawld_and_vector_configs_are_written_through_write_private(self):
         r = run.Run(self.args())
-        r.claim_work()
+        r.claim()
         written = []
         real = run.write_private
 
@@ -574,15 +518,37 @@ class Credentials(Scratch):
         r.fleet_dsn = r.app_dsn = "postgres://x"
         r.ingest_keys = ["k1", "k2", "k3"]
         r.port, r.cert = 1, Path("/cert.pem")
-        # trawld "exits" at once, so start_trawld stops after the config write.
+        # trawld "exits" at once, so start_trawld stops before readiness.
         with mock.patch.object(run, "write_private", spy), \
                 mock.patch.object(r, "spawn", return_value=mock.Mock(poll=lambda: 1)):
+            r.write_trawld_config()
             with self.assertRaises(RuntimeError):
                 r.start_trawld("trawld.log")
             r.start_vectors()
         self.assertEqual(written, ["trawld.toml", "vector-1.json", "vector-2.json", "vector-3.json"])
         for name in written:
             self.assertEqual(os.stat(r.work / "private" / name).st_mode & 0o777, 0o600)
+
+
+class TrawldRestarts(Scratch):
+    """Two seed sessions and the measured session start trawld three times."""
+
+    def test_start_trawld_survives_the_three_session_sequence(self):
+        r = run.Run(self.args())
+        r.claim()
+        r.fleet_dsn = r.app_dsn = "postgres://x"
+        r.write_trawld_config()
+        # A dead trawld: each start fails at startup, after its config and
+        # log are in place. A FileExistsError would escape assertRaises.
+        with mock.patch.object(r, "spawn", return_value=mock.Mock(poll=lambda: 1)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for log_name in ("trawld-seed-1.log", "trawld-seed-2.log", "trawld.log"):
+                with self.subTest(log_name=log_name):
+                    with self.assertRaises(RuntimeError) as raised:
+                        r.start_trawld(log_name)
+                    self.assertIn("exited during startup", str(raised.exception))
+        self.assertEqual(r.trawld_config, r.work / "private/trawld.toml")
+        self.assertIn(str(r.data), r.trawld_config.read_text())
 
 
 if __name__ == "__main__":

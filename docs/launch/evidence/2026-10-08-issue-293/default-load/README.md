@@ -231,17 +231,12 @@ under `seededHistory`.
 ## What changed in the script
 
 Review found two defects in the script of the earlier runs. Run 5 was the
-first on the corrected script, and `output/` comes from it. A later review
-found three more, fixed after run 5 without a new run (see below).
+first run on the corrected pass check. Later reviews found more, fixed
+after run 5.
 
 - **The script could delete a directory it did not create.** The old
   script refused an existing `--work`, but its cleanup still ran and
-  deleted that path. `--work .` could delete the checkout. The script now
-  creates `--work` with one `mkdir`. It refuses an existing path, a
-  symlink, the filesystem root, `$HOME`, `/tmp`, the repository root and
-  its ancestors before it creates anything, and a refused path is never
-  created. See "The script no longer deletes `--work`" below for what
-  became of the deletion itself.
+  deleted that path. `--work .` could delete the checkout.
 - **The pass check could pass without refusal evidence.** The old check
   read a missing refusal series as 0. It ignored collection errors and
   `request_limit_reached` failure events. It stopped sampling while the
@@ -259,74 +254,48 @@ After run 5:
   inspect` counted as proof that the container was gone, so an unreachable
   daemon passed cleanup. Only a successful `docker rm`, or Docker reporting
   no such container, now counts.
-- **A swapped work directory.** Between the inode check and `rmtree`,
-  another process could replace `--work` with a different directory. A
-  first fix refused a `--work` whose immediate parent another uid can
-  write to. A later review showed that an ancestor higher up could still
-  be swapped for a symlink, and that `rmtree` then deletes elsewhere. The
-  next item removes the deletion.
-
-- **The script no longer deletes `--work`.** Every fix to the deletion
-  left a check-then-delete window, so the script now has no recursive
-  delete at all. `Run.remove_work`, the device and inode bookkeeping, the
-  parent-ownership rule, the `--keep-work` option and the `workDir`
-  cleanup field are gone. The pass check no longer reads `workDir`, so
-  an older `summary.json` that carries it still passes. The script
-  creates `--work` fresh (mode 0700) and prints its path at the end.
-  The operator removes it. It holds synthetic fixture data, the raw logs
-  and trawld's throwaway self-signed loopback TLS key. It holds no
-  database or API credential. The script still removes the Postgres
-  container and its processes, and `--out` must not sit inside `--work`.
-
-After PR #297's CodeQL scan:
-
-- **The database password was written to disk.** The script put it in
-  `private/postgres.env` for `docker run --env-file` and set the file to
-  mode 0600 afterwards, so the file existed for a moment at the umask's
-  permissions (CodeQL `py/clear-text-storage-sensitive-data`). The script
-  now writes no credential to a file. `docker run` gets `--env
-  POSTGRES_PASSWORD` with no value, and the value is set only in the
-  environment of that one `docker` process, not on the command line, which
-  any local user can read through `/proc`. The DSNs already reached
-  trawld, and the keys Vector, through their environments, and the
-  configs the script writes hold no secret. Those configs are still
-  created with `os.open(O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)`, so they
-  are owner-only from the moment they exist and the script refuses an
-  existing path or a symlink. This does not change what the script
-  measures, so `output/` was not re-run.
-
-Run 5's summary has every field the new check reads.
-`output/predicate-check.txt` shows that it passes, so `output/` was not
-re-run. Run 5 judged container cleanup by the old rule. After the fix, no
-container with the script's `trawl.experiment` label existed on the
-Docker host.
+- **The script no longer deletes its work directory.** Every fix to the
+  deletion left a check-then-delete window, so the script has no recursive
+  delete at all. It removes only its own Postgres container and stops its
+  own processes. The pass check no longer reads the `workDir` cleanup
+  field.
+- **The database password was written to disk** (CodeQL
+  `py/clear-text-storage-sensitive-data` on PR #297). The script put it in
+  a file for `docker run --env-file`. It now writes no credential to a
+  file. `docker run` gets `--env POSTGRES_PASSWORD` with no value, and the
+  value is set only in the environment of that one `docker` process, not
+  on the command line, which any local user can read through `/proc`. The
+  configs the script writes hold no secret, and they are created with
+  `O_CREAT | O_EXCL | O_NOFOLLOW` and mode 0600.
+- **The script could not finish a run.** The CodeQL fix created
+  `private/trawld.toml` with `O_EXCL` every time trawld started, so the
+  second seed session failed with `FileExistsError`. `test_run.py` started
+  trawld only once and stayed green. The script now writes the config once,
+  before the seed sessions, and `test_run.py` starts trawld for all three
+  sessions.
+- **A run could overwrite the committed evidence.** `--out` defaulted to
+  `output/`, so a failed reproduction truncated the committed summaries.
+  `--work` took any path, and each review found another way to misuse one.
+  Both options are gone. Each run writes only inside a fresh
+  `.flow-scratch/<run id>/` in the checkout, and promoting a run into
+  `output/` is a manual copy (see [Reproduce](#reproduce)).
 
 [`test_run.py`](test_run.py) runs the real `collect()` and `verdict()` on
 in-memory scrapes and a written trawld log, with one case for each pass
-condition. It runs `cleanup()` against stubbed Docker answers. It also
-checks that the `--work` rules create nothing they refuse (an existing
-path, a symlink, a dangerous path) and that `main` leaves `--work` in
-place after a clean exit and after a failure. It checks that the `docker run` command line never carries the
+condition. It runs `cleanup()` against stubbed Docker answers. It checks
+that a run claims a fresh 0700 directory, refuses an existing one, writes
+only inside it and never deletes it, and that trawld starts three times on
+one config. It checks that the `docker run` command line never carries the
 password and that the private files are created 0600. It needs no build,
 database or Vector.
 
 ## Threat model
 
-`run.py` runs as the invoking user. It creates `--work` itself, and it
-never deletes it. There is no check-then-delete window, and so no rule
-about who owns or can write to the parent of `--work`. The script
-deletes nothing recursively; it only removes its own Postgres container
-and stops its own processes.
-
-- **Writing.** `--work` must not exist, must not be a symlink or pass
-  through one, and must not be the filesystem root, `$HOME`, `/tmp`, the
-  repository root or an ancestor of it. `mkdir` is the claim, so a path
-  that appears after the check is refused too. The configs are created
-  with `O_CREAT | O_EXCL | O_NOFOLLOW` and mode 0600.
-- **Processes running as the same user** are trusted. They can already
-  read and delete anything the user can.
-- **Cleanup** is the operator's: delete `--work` when done. It holds
-  synthetic data and no credential the script wrote.
+`run.py` writes only inside `.flow-scratch/<run id>/` in your checkout, a
+directory it creates with mode 0700 and never deletes. Anyone who can write
+the checkout or its ancestors, and any process running as the same user,
+can already change the code the script builds and runs, so findings that
+need either are out of scope.
 
 ## Earlier runs
 
@@ -378,43 +347,39 @@ From the repository root, with Docker and the Vector 0.57.0 binary from CI:
 
 ```bash
 python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
-    --work .flow-scratch/default-load \
     --vector /path/to/vector-x86_64-unknown-linux-gnu/bin/vector
 ```
 
-`--work` must not exist, must not be a symlink and must not be under
-`/tmp`. A missing parent is created with mode 0700. `--work` holds the
-data, the configs and the raw logs, and no database or API credential.
-The script never deletes it. It prints the path at the end, and you
-remove it when you are done:
+The script prints its run directory, `.flow-scratch/<run id>/`, at the end.
+`work/` holds the data, the configs and the raw logs, and no database or
+API credential. `output/` holds the summaries. The script never deletes the
+run directory, so remove it when you are done. In a clone without a local
+exclude for `.flow-scratch/`, git shows it as untracked. `--help` lists the
+workload options.
+
+To compare your run with the committed one, apply the pass check to it and
+read the same fields from both summaries:
 
 ```bash
-rm -rf .flow-scratch/default-load
+E=docs/launch/evidence/2026-10-08-issue-293/default-load
+python3 -I $E/run.py --check-summary <run dir>/output/summary.json
+jq '{status, refused: .metrics.refusedTotalAtEnd, peak: .metrics.sampledPeakInProgress,
+     delivered: .delivery.complete}' <run dir>/output/summary.json $E/output/summary.json
 ```
 
-Only summaries reach `--out`, which defaults to `output/`. `--help` lists
-the workload options.
-
-This run used:
+To promote a run into the evidence, copy its summaries over the committed
+ones and record the pass check against them:
 
 ```bash
-python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
-    --work .flow-scratch/w10-default-load \
-    --vector ~/.cache/trawl-vector-0.57.0/vector-x86_64-unknown-linux-gnu/bin/vector
+cp <run dir>/output/* $E/output/
+python3 -I $E/run.py --check-summary $E/output/summary.json > $E/output/predicate-check.txt
 ```
 
-To check the pass predicate, the container cleanup and the `--work` rules
+To check the pass predicate, the container cleanup and the run directory
 without a full run:
 
 ```bash
 python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/test_run.py
-```
-
-To apply the pass check to the committed summary:
-
-```bash
-python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
-    --check-summary docs/launch/evidence/2026-10-08-issue-293/default-load/output/summary.json
 ```
 
 ## Files
@@ -422,7 +387,7 @@ python3 -I docs/launch/evidence/2026-10-08-issue-293/default-load/run.py \
 | File | Contents |
 | --- | --- |
 | [`run.py`](run.py) | The run: build check, Postgres, keys, seed sessions, trawld, senders, query loop, scraper, terminal snapshot, summary, cleanup |
-| [`test_run.py`](test_run.py) | Checks of the pass predicate, the container cleanup and the `--work` rules, without a full run |
+| [`test_run.py`](test_run.py) | Checks of the pass predicate, the container cleanup, the run directory and trawld restarts, without a full run |
 | [`trawld.toml`](trawld.toml) | trawld's configuration, with the data path filled in at run time |
 | [`output/summary.json`](output/summary.json) | Every number above |
 | [`output/predicate-check.txt`](output/predicate-check.txt) | The current pass check applied to `output/summary.json`, with the command and the `run.py` blob SHA |
