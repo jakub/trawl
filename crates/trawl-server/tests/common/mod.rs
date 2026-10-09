@@ -1259,9 +1259,20 @@ impl TestServer {
         &self,
         f: impl FnOnce(&mut trawl_server::state::HttpConfig),
     ) -> axum::Router {
+        self.router_over(self.state.clone(), f)
+    }
+
+    /// [`Self::router_with`] over `state` instead of the fixture's own: a
+    /// clone of [`Self::state`] with a field replaced, for a setting that
+    /// lives in the state rather than the HTTP config (the stream caps).
+    pub fn router_over(
+        &self,
+        state: AppState,
+        f: impl FnOnce(&mut trawl_server::state::HttpConfig),
+    ) -> axum::Router {
         let mut http_config = self.http_config.clone();
         f(&mut http_config);
-        http::router(self.state.clone(), &http_config)
+        http::router(state, &http_config)
     }
 
     /// Boot a SECOND server over this fixture's state and TLS material, on
