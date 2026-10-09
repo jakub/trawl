@@ -23,6 +23,109 @@ use trawl_server::transport::request_limit::body_work::{BodyWork, HoldProbe};
 use crate::common::{self, TestServer};
 use crate::support::{DEADLINE, REGULAR_MESSAGE};
 
+/// AC14: through the production TLS listener, separate connections share
+/// one count, and N+1 concurrent HTTP/2 streams on one connection at
+/// limit N meet exactly one refusal. The count recovers on the same
+/// connection afterwards.
+///
+/// Each held request is ingest or preview work held at the state's seam,
+/// which reports its entry, so a request is known to hold the count
+/// before the next one is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_count_spans_connections_and_h2_streams() {
+    const N: u8 = 2;
+    let server = common::setup().await;
+    let (url, task) = server
+        .spawn_server_with(|http| http.max_concurrent_requests = usize::from(N), vec![])
+        .await;
+
+    // Separate connections: one HTTP/1.1 and one HTTP/2 connection each
+    // hold one request, and a third connection is refused.
+    let mut parse = Held::next(&server, BodyWork::IngestParse);
+    let mut report = Held::next(&server, BodyWork::Preview);
+    let first = h1_send(&url, &Post::ingest(&server, "connection one")).await;
+    let parse_probe = parse.entered().await;
+    let second = h2_connect(&url).await;
+    let (preview, _preview_stream) =
+        h2_send(&second, &url, &Post::preview(&server, "connection two")).await;
+    let report_probe = report.entered().await;
+    assert_fresh_refused(&url, &Post::ingest(&server, "connection three")).await;
+
+    parse.release();
+    report.release();
+    let (status, body) = h2_answer(preview).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    until_holders(&parse_probe, 0, "the HTTP/1.1 connection's request").await;
+    until_holders(&report_probe, 0, "the HTTP/2 connection's request").await;
+    drop(first);
+
+    // One connection: N streams held, the N+1th refused.
+    let connection = h2_connect(&url).await;
+    let mut parse = Held::next(&server, BodyWork::IngestParse);
+    let mut report = Held::next(&server, BodyWork::Preview);
+    let (ingest, _ingest_stream) =
+        h2_send(&connection, &url, &Post::ingest(&server, "stream one")).await;
+    let parse_probe = parse.entered().await;
+    let (preview, _preview_stream) =
+        h2_send(&connection, &url, &Post::preview(&server, "stream two")).await;
+    let report_probe = report.entered().await;
+    let (refused, _refused_stream) =
+        h2_send(&connection, &url, &Post::ingest(&server, "stream three")).await;
+    let (status, body) = h2_answer(refused).await;
+    assert_h2_refused(status, &body);
+
+    // `/metrics` is a control request, so a scrape on the same connection
+    // passes the full regular count and reads it.
+    let (status, scrape) = h2_answer(h2_get(&connection, &url, "/metrics").await).await;
+    assert_eq!(status, StatusCode::OK);
+    let regular = regular_in_progress(&String::from_utf8_lossy(&scrape));
+    // The recorder is process-wide: other tests' requests only add to it.
+    assert!(
+        regular >= f64::from(N),
+        "regular in progress {regular}, held {N}"
+    );
+
+    parse.release();
+    report.release();
+    for (name, answer) in [("stream one", ingest), ("stream two", preview)] {
+        let (status, body) = h2_answer(answer).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{name}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    until_holders(&parse_probe, 0, "stream one").await;
+    until_holders(&report_probe, 0, "stream two").await;
+
+    // The count recovers on the same connection: N streams at once are
+    // all admitted.
+    let mut answers = Vec::new();
+    for n in 0..N {
+        let label = format!("recovered {n}");
+        answers.push(h2_send(&connection, &url, &Post::ingest(&server, &label)).await);
+    }
+    for (answer, _stream) in answers {
+        let (status, body) = h2_answer(answer).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+    task.abort();
+}
+
+/// `trawl_http_requests_in_progress{allowance="regular"}` in a scrape.
+fn regular_in_progress(scrape: &str) -> f64 {
+    scrape
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("trawl_http_requests_in_progress{allowance=\"regular\"} ")
+        })
+        .unwrap_or_else(|| panic!("no regular in-progress gauge in:\n{scrape}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 /// One POST, sent the same way over any of the clients here.
 #[derive(Clone)]
 pub struct Post {
@@ -167,6 +270,45 @@ pub async fn h2_send(
         .send_data(Bytes::from(post.body.clone()), true)
         .expect("send the request body");
     (response, stream)
+}
+
+/// Open a stream on `sender`'s connection carrying a GET of `path`.
+pub async fn h2_get(
+    sender: &h2::client::SendRequest<Bytes>,
+    url: &str,
+    path: &str,
+) -> h2::client::ResponseFuture {
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(format!("{url}{path}"))
+        .body(())
+        .unwrap();
+    let mut ready = sender
+        .clone()
+        .ready()
+        .await
+        .expect("the connection takes another stream");
+    ready.send_request(request, true).expect("open a stream").0
+}
+
+/// A stream's status and whole body, within the deadline.
+pub async fn h2_answer(response: h2::client::ResponseFuture) -> (StatusCode, Bytes) {
+    tokio::time::timeout(DEADLINE, async {
+        let response = response.await.expect("the stream answered");
+        let status = response.status();
+        let mut body = response.into_body();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("the answer's body");
+            body.flow_control()
+                .release_capacity(chunk.len())
+                .expect("release flow-control capacity");
+            bytes.extend_from_slice(&chunk);
+        }
+        (status, Bytes::from(bytes))
+    })
+    .await
+    .expect("the stream answered before the deadline")
 }
 
 /// Assert an HTTP/2 answer is the regular refusal.
