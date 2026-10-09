@@ -31,7 +31,9 @@ use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::seam::Seam;
 
 use crate::common::{self, TestServer};
-use crate::support::{DEADLINE, REGULAR_MESSAGE, assert_refused, body_bytes, body_json, call};
+use crate::support::{
+    CONTROL_MESSAGE, DEADLINE, REGULAR_MESSAGE, assert_refused, body_bytes, body_json, call,
+};
 use crate::transport::SCRAPE;
 
 /// The peer every in-process request carries, as the accept loop inserts
@@ -671,6 +673,156 @@ async fn control_allowance_is_keyed_by_matched_route() {
     );
 
     fill.release().await;
+}
+
+// -- junk tokens in control (#298) ---------------------------------------------------
+
+/// Ungranted waits on this database's `api_keys`, one per backend. The
+/// database filter matters: every fixture's fleet database has an
+/// `api_keys` table, and `pg_locks` spans the whole cluster.
+async fn api_keys_waiters(lock: &mut sqlx::PgConnection) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(DISTINCT pid) FROM pg_locks \
+         WHERE NOT granted \
+           AND relation = 'api_keys'::regclass \
+           AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(lock)
+    .await
+    .expect("read pg_locks")
+}
+
+/// The in-process `control` in-progress gauge. Read from the recorder, not
+/// over `/metrics`, so the read takes no request place of its own.
+fn control_in_progress() -> u64 {
+    crate::support::sample(
+        &common::test_metrics_handle().render(),
+        "trawl_http_requests_in_progress",
+        "control",
+    )
+}
+
+/// Junk bearer tokens on the query-control routes cannot starve health or
+/// `/metrics` (#298).
+///
+/// Four `HEAD /api/v1/queries` requests carry a well-shaped token with an
+/// unknown prefix. Each is admitted to the control allowance at the edge,
+/// before authentication, and then parks in `verify_key`'s prefix lookup
+/// behind a lock on `api_keys`. While they are parked, health (GET and
+/// HEAD) and `/metrics` answer 200, and a fifth junk list request and a
+/// valid key's cancellation are refused with the control message. After
+/// the lock goes, the parked requests end with 401 and the control gauge
+/// is back at 0.
+///
+/// The fleet pool has five connections: four for the parked lookups and
+/// one for health's keystore ping. The router runs over a fresh
+/// `AuthState` on the same keystore, so the readiness probe's cached ping
+/// is not reused and health really pings while the lookups are parked.
+/// Health answers 200 even when its keystore ping fails (`auth_db` is not
+/// critical), so the test also requires `status` and `checks.auth_db` to
+/// read `ok`.
+///
+/// Everything here is string literals and fixture APIs, so the test also
+/// builds against the single control allowance it replaced, where health
+/// is refused.
+#[tokio::test(flavor = "multi_thread")]
+#[allow(clippy::too_many_lines)] // one parked window, every probe and refusal read in it
+async fn junk_tokens_in_control_do_not_starve_probes() {
+    use sqlx::{Connection as _, Executor as _};
+
+    let server = common::setup_with_fleet_pool(common::FleetPoolSize::PARKED_AUTH).await;
+    let mut state = server.state.clone();
+    state.auth = trawl_server::state::AuthState::from_key_store(state.auth.key_store.clone());
+    let app = server.router_over(state, |http| http.max_concurrent_requests = 32);
+
+    // The lock comes first, on a raw connection outside every pool, so no
+    // lookup can pass before it.
+    let mut lock = sqlx::PgConnection::connect(&server.fleet_db_url)
+        .await
+        .expect("connect to the fleet database");
+    lock.execute("BEGIN; LOCK TABLE api_keys IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock api_keys");
+
+    let parked: Vec<_> = (0..4)
+        .map(|_| crate::support::send(&app, empty("HEAD", "/api/v1/queries", Some(BAD_TOKEN))))
+        .collect();
+    let mut waiters = 0;
+    let mut gauge = 0;
+    let ready = tokio::time::timeout(DEADLINE, async {
+        loop {
+            waiters = api_keys_waiters(&mut lock).await;
+            gauge = control_in_progress();
+            if waiters == 4 && gauge == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "four lookups park on api_keys and fill the control allowance before \
+         the deadline: {waiters} waiters, control gauge {gauge}"
+    );
+    assert!(
+        parked.iter().all(|handle| !handle.is_finished()),
+        "a parked request ended early"
+    );
+
+    // Health, GET: 200, and healthy, so its keystore ping answered.
+    let health = call(&app, empty("GET", "/api/v1/health", None)).await;
+    let status = health.status();
+    let body = body_json(health).await;
+    assert_eq!(status, StatusCode::OK, "GET /api/v1/health: {body}");
+    assert_eq!(body["status"], "ok", "{body}");
+    assert_eq!(body["checks"]["auth_db"], "ok", "{body}");
+
+    // Health, HEAD.
+    let head = call(&app, empty("HEAD", "/api/v1/health", None)).await;
+    let status = head.status();
+    let bytes = body_bytes(head).await;
+    assert_eq!(status, StatusCode::OK, "HEAD /api/v1/health: {bytes:?}");
+
+    // `/metrics`: 200, and the scrape shows the control allowance full.
+    let metrics = call(&app, empty("GET", "/metrics", None)).await;
+    let status = metrics.status();
+    let text = String::from_utf8(body_bytes(metrics).await.to_vec()).unwrap();
+    assert_eq!(status, StatusCode::OK, "GET /metrics: {text}");
+    assert_eq!(
+        crate::support::sample(&text, "trawl_http_requests_in_progress", "control"),
+        4
+    );
+
+    // A fifth junk list request and a valid key's cancellation: refused.
+    assert_refused(
+        call(&app, empty("GET", "/api/v1/queries", Some(BAD_TOKEN))).await,
+        CONTROL_MESSAGE,
+    )
+    .await;
+    assert_refused(
+        call(
+            &app,
+            empty("DELETE", "/api/v1/queries/7", Some(&server.analyst_token)),
+        )
+        .await,
+        CONTROL_MESSAGE,
+    )
+    .await;
+
+    // Still exactly the four parked lookups.
+    assert_eq!(api_keys_waiters(&mut lock).await, 4);
+    assert!(
+        parked.iter().all(|handle| !handle.is_finished()),
+        "a parked request ended early"
+    );
+
+    lock.execute("ROLLBACK").await.expect("release the lock");
+    for handle in parked {
+        let response = crate::support::finish(handle).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{response:?}");
+    }
+    assert_eq!(control_in_progress(), 0);
 }
 
 // -- AC10, stream routes ------------------------------------------------------------------

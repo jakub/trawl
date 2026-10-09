@@ -19,13 +19,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::body::{Body, HttpBody};
+use axum::extract::Path;
 use axum::http::{Request, StatusCode, header};
 use axum::routing::{delete, get};
 use trawl_server::transport::http::with_edge_layers;
 
 use crate::support::{
-    CONTROL_MESSAGE, Holds, PollRecorder, REGULAR_MESSAGE, assert_refused, body_bytes, call,
-    finish, http_config, request, send,
+    CONTROL_MESSAGE, Holds, PROBE_MESSAGE, PollRecorder, REGULAR_MESSAGE, assert_refused,
+    body_bytes, call, finish, http_config, request, sample, send,
 };
 
 /// A handler that panics.
@@ -219,26 +220,6 @@ async fn request_limit_refusal_contract() {
 
 // -- AC6 ----------------------------------------------------------------------
 
-/// One sample of `name` with `allowance`, as the recorder renders it.
-///
-/// Every series here is a whole count, so it is read as one: a gauge
-/// renders as a float, and `Display` writes a whole float without a
-/// fraction.
-fn sample(rendered: &str, name: &str, allowance: &str) -> u64 {
-    let series = format!("{name}{{allowance=\"{allowance}\"}} ");
-    let value: f64 = rendered
-        .lines()
-        .find_map(|line| line.strip_prefix(&series))
-        .unwrap_or_else(|| panic!("no {series:?} in:\n{rendered}"))
-        .trim()
-        .parse()
-        .unwrap();
-    value
-        .to_string()
-        .parse()
-        .unwrap_or_else(|_| panic!("{series:?} is not a whole count: {value}"))
-}
-
 /// The three series for `allowance`: in progress, refused, size.
 fn series(
     handle: &metrics_exporter_prometheus::PrometheusHandle,
@@ -252,15 +233,16 @@ fn series(
     )
 }
 
-/// The gauges and the counter follow the count: the sizes are N and 4, a
-/// held request raises its allowance's gauge, a refusal raises its
-/// counter, and the gauge is back at its baseline after every way a
-/// request ends.
+/// The gauges and the counter follow the count: the sizes are N, 3 and 4,
+/// a held request raises its allowance's gauge, a refusal raises only its
+/// own allowance's counter, and the gauge is back at its baseline after
+/// every way a request ends.
 ///
 /// The recorder is this test's own, installed for this thread only: the
 /// test runs on a current-thread runtime, so every request it sends records
 /// here, and no other test in the process can move these series.
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one saturated window per allowance, then every way a request ends
 async fn request_count_metrics_follow_ownership() {
     const N: usize = 2;
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -272,7 +254,16 @@ async fn request_count_metrics_follow_ownership() {
         Router::new()
             .route("/a", get(holds.handler("get /a")))
             .route("/b", get(holds.handler("get /b")))
-            .route("/api/v1/health", get(holds.handler("health")))
+            .route(
+                "/api/v1/health",
+                get(holds.handler("get health")).head(holds.handler("head health")),
+            )
+            .route("/metrics", get(holds.handler("get metrics")))
+            .route(
+                "/api/v1/queries",
+                get(holds.handler("get queries")).head(holds.handler("head queries")),
+            )
+            .route("/api/v1/queries/{id}", delete(holds.handler("cancel")))
             .route("/panic", get(panicking))
             .route(
                 "/error",
@@ -281,30 +272,69 @@ async fn request_count_metrics_follow_ownership() {
         &http_config(N),
     );
 
-    // Published at build: both sizes, nothing in progress, nothing refused.
+    // Published at build: every size, nothing in progress, nothing refused.
     assert_eq!(series(&handle, "regular"), (0, 0, 2));
+    assert_eq!(series(&handle, "probe"), (0, 0, 3));
     assert_eq!(series(&handle, "control"), (0, 0, 4));
 
-    let a = send(&app, request("GET", "/a"));
-    let b = send(&app, request("GET", "/b"));
-    let health = send(&app, request("GET", "/api/v1/health"));
-    holds.entered_n(3).await;
+    // Fill all three allowances.
+    let held = [
+        ("GET", "/a"),
+        ("GET", "/b"),
+        ("GET", "/api/v1/health"),
+        ("HEAD", "/api/v1/health"),
+        ("GET", "/metrics"),
+        ("GET", "/api/v1/queries"),
+        ("HEAD", "/api/v1/queries"),
+        ("DELETE", "/api/v1/queries/7"),
+        ("DELETE", "/api/v1/queries/8"),
+    ]
+    .map(|(method, uri)| send(&app, request(method, uri)));
+    holds.entered_n(held.len()).await;
     assert_eq!(series(&handle, "regular"), (2, 0, 2));
-    assert_eq!(series(&handle, "control"), (1, 0, 4));
+    assert_eq!(series(&handle, "probe"), (3, 0, 3));
+    assert_eq!(series(&handle, "control"), (4, 0, 4));
 
+    // One refusal in each allowance moves that allowance's counter only.
     assert_refused(call(&app, request("GET", "/a")).await, REGULAR_MESSAGE).await;
     assert_eq!(series(&handle, "regular"), (2, 1, 2));
+    assert_eq!(series(&handle, "probe").1, 0);
     assert_eq!(series(&handle, "control").1, 0);
 
-    holds.release("get /a");
-    holds.release("health");
-    finish(a).await;
-    finish(health).await;
-    assert_eq!(series(&handle, "regular").0, 1);
-    assert_eq!(series(&handle, "control").0, 0);
-    holds.release("get /b");
-    finish(b).await;
-    assert_eq!(series(&handle, "regular").0, 0);
+    assert_refused(call(&app, request("HEAD", "/metrics")).await, PROBE_MESSAGE).await;
+    assert_eq!(series(&handle, "probe"), (3, 1, 3));
+    assert_eq!(series(&handle, "regular").1, 1);
+    assert_eq!(series(&handle, "control").1, 0);
+
+    assert_refused(
+        call(&app, request("DELETE", "/api/v1/queries/9")).await,
+        CONTROL_MESSAGE,
+    )
+    .await;
+    assert_eq!(series(&handle, "control"), (4, 1, 4));
+    assert_eq!(series(&handle, "regular").1, 1);
+    assert_eq!(series(&handle, "probe").1, 1);
+    assert!(holds.nothing_entered());
+
+    for label in [
+        "get /a",
+        "get /b",
+        "get health",
+        "head health",
+        "get metrics",
+        "get queries",
+        "head queries",
+        "cancel",
+        "cancel",
+    ] {
+        holds.release(label);
+    }
+    for handle in held {
+        assert_eq!(finish(handle).await.status(), StatusCode::OK);
+    }
+    for allowance in ["regular", "probe", "control"] {
+        assert_eq!(series(&handle, allowance).0, 0, "{allowance}");
+    }
 
     // A caught panic, an error answer and a dropped request each end at
     // the baseline.
@@ -320,7 +350,8 @@ async fn request_count_metrics_follow_ownership() {
     dropped.abort();
     assert!(dropped.await.unwrap_err().is_cancelled());
     assert_eq!(series(&handle, "regular"), (0, 1, 2));
-    assert_eq!(series(&handle, "control"), (0, 0, 4));
+    assert_eq!(series(&handle, "probe"), (0, 1, 3));
+    assert_eq!(series(&handle, "control"), (0, 1, 4));
 }
 
 // -- AC9 ----------------------------------------------------------------------
@@ -411,53 +442,143 @@ async fn response_bodies_and_streams_do_not_hold_the_count() {
     drop(body);
 }
 
-// -- control allowance -----------------------------------------------------------
+// -- probe allowance ---------------------------------------------------------------
 
-/// The control allowance saturates at four, and neither allowance borrows
-/// from the other. Test routes are mounted at the control templates, so
-/// membership is read off their matched routes as in production.
+/// The probe allowance saturates at three and borrows from nothing. Test
+/// routes are mounted at the probe templates, so membership is read off
+/// their matched routes as in production.
+///
+/// The refused probe request is `HEAD /metrics`, whose handler answers at
+/// once. A larger probe allowance, or a probe request charged to the free
+/// regular count, would admit it and answer 200 instead of the refusal.
 #[tokio::test]
-async fn control_allowance_saturates_at_four() {
+async fn probe_allowance_saturates_at_three() {
     let mut holds = Holds::new();
     let app = with_edge_layers(
         Router::new()
-            .route("/api/v1/health", get(holds.handler("health")))
-            .route("/metrics", get(holds.handler("metrics")))
-            .route("/api/v1/queries", get(holds.handler("queries")))
-            .route("/api/v1/queries/{id}", delete(holds.handler("cancel")))
+            .route(
+                "/api/v1/health",
+                get(holds.handler("get health")).head(holds.handler("head health")),
+            )
+            .route(
+                "/metrics",
+                get(holds.handler("get metrics")).head(holds.free("head metrics")),
+            )
+            .route("/api/v1/queries", get(holds.free("queries")))
+            .route("/b", get(holds.free("get /b"))),
+        &http_config(1),
+    );
+
+    // Three probe requests on both routes and both methods.
+    let get_health = send(&app, request("GET", "/api/v1/health"));
+    let head_health = send(&app, request("HEAD", "/api/v1/health"));
+    let get_metrics = send(&app, request("GET", "/metrics"));
+    assert_eq!(
+        holds.entered_n(3).await,
+        ["get health", "get metrics", "head health"]
+    );
+
+    // A fourth probe request gets the probe message, although the regular
+    // count is free: probe never borrows regular.
+    assert_refused(call(&app, request("HEAD", "/metrics")).await, PROBE_MESSAGE).await;
+    assert!(holds.nothing_entered());
+
+    // A control request and a regular request are still admitted.
+    let queries = call(&app, request("GET", "/api/v1/queries")).await;
+    assert_eq!(queries.status(), StatusCode::OK);
+    assert_eq!(holds.entered().await, "queries");
+    let regular = call(&app, request("GET", "/b")).await;
+    assert_eq!(regular.status(), StatusCode::OK);
+    assert_eq!(holds.entered().await, "get /b");
+
+    // Releasing one probe request admits exactly one more.
+    holds.release("get health");
+    assert_eq!(finish(get_health).await.status(), StatusCode::OK);
+    let admitted = send(&app, request("GET", "/api/v1/health"));
+    assert_eq!(holds.entered().await, "get health");
+    assert_refused(call(&app, request("HEAD", "/metrics")).await, PROBE_MESSAGE).await;
+    assert!(holds.nothing_entered());
+
+    holds.release_all();
+    for handle in [head_health, get_metrics, admitted] {
+        assert_eq!(finish(handle).await.status(), StatusCode::OK);
+    }
+}
+
+// -- control allowance -----------------------------------------------------------
+
+/// The control allowance saturates at four, takes nothing from the probe
+/// allowance, and neither it nor the regular count borrows from the other.
+/// Test routes are mounted at the control and probe templates, so
+/// membership is read off their matched routes as in production.
+///
+/// The refused control request is `DELETE /api/v1/queries/9`, whose handler
+/// answers at once, so a larger control allowance would answer 200 instead
+/// of the refusal.
+#[tokio::test]
+async fn control_allowance_saturates_at_four() {
+    let mut holds = Holds::new();
+    let held_cancel = holds.handler("cancel");
+    let free_cancel = holds.free("cancel 9");
+    let app = with_edge_layers(
+        Router::new()
+            .route(
+                "/api/v1/queries",
+                get(holds.handler("get queries")).head(holds.handler("head queries")),
+            )
+            .route(
+                "/api/v1/queries/{id}",
+                delete(move |Path(id): Path<u32>| {
+                    if id == 9 {
+                        free_cancel()
+                    } else {
+                        held_cancel()
+                    }
+                }),
+            )
+            .route("/api/v1/health", get(holds.free("health")))
+            .route("/metrics", get(holds.free("metrics")))
             .route("/a", get(holds.handler("get /a")))
             .route("/b", get(holds.free("get /b"))),
         &http_config(1),
     );
 
-    // Four control requests: every control route, GET and HEAD.
-    let health = send(&app, request("GET", "/api/v1/health"));
-    let metrics = send(&app, request("HEAD", "/metrics"));
-    let queries = send(&app, request("GET", "/api/v1/queries"));
-    let cancel = send(&app, request("DELETE", "/api/v1/queries/7"));
+    // Four control requests: list by GET and HEAD, and two cancellations.
+    let get_queries = send(&app, request("GET", "/api/v1/queries"));
+    let head_queries = send(&app, request("HEAD", "/api/v1/queries"));
+    let cancel_7 = send(&app, request("DELETE", "/api/v1/queries/7"));
+    let cancel_8 = send(&app, request("DELETE", "/api/v1/queries/8"));
     assert_eq!(
         holds.entered_n(4).await,
-        ["cancel", "health", "metrics", "queries"]
+        ["cancel", "cancel", "get queries", "head queries"]
     );
 
     // A fifth control request gets the control message, although the
     // regular count is free: control never borrows regular.
     assert_refused(
-        call(&app, request("GET", "/metrics?x=1")).await,
+        call(&app, request("DELETE", "/api/v1/queries/9")).await,
         CONTROL_MESSAGE,
     )
     .await;
     assert!(holds.nothing_entered());
+
+    // Probes are untouched by four control requests.
+    let health = call(&app, request("GET", "/api/v1/health")).await;
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(holds.entered().await, "health");
+    let metrics = call(&app, request("HEAD", "/metrics")).await;
+    assert_eq!(metrics.status(), StatusCode::OK);
+    assert_eq!(holds.entered().await, "metrics");
 
     // The regular count is untouched by four control requests.
     let a = send(&app, request("GET", "/a"));
     assert_eq!(holds.entered().await, "get /a");
 
     // Free one control request. Regular is full and control has one free:
-    // a regular request, and a POST to a control path, are refused with
-    // the regular message. Regular never borrows control.
-    holds.release("health");
-    assert_eq!(finish(health).await.status(), StatusCode::OK);
+    // a regular request, and a POST to a probe path, are refused with the
+    // regular message. Regular never borrows control.
+    holds.release("get queries");
+    assert_eq!(finish(get_queries).await.status(), StatusCode::OK);
     assert_refused(call(&app, request("GET", "/b")).await, REGULAR_MESSAGE).await;
     assert_refused(
         call(&app, request("POST", "/api/v1/health")).await,
@@ -466,17 +587,18 @@ async fn control_allowance_saturates_at_four() {
     .await;
     assert!(holds.nothing_entered());
 
-    // The free control request is still there for a control route.
-    let health = send(&app, request("HEAD", "/api/v1/health"));
-    assert_eq!(holds.entered().await, "health");
+    // The free control place is still there for a control route.
+    let get_queries = send(&app, request("GET", "/api/v1/queries"));
+    assert_eq!(holds.entered().await, "get queries");
     assert_refused(
-        call(&app, request("DELETE", "/api/v1/queries/8")).await,
+        call(&app, request("DELETE", "/api/v1/queries/9")).await,
         CONTROL_MESSAGE,
     )
     .await;
+    assert!(holds.nothing_entered());
 
     holds.release_all();
-    for handle in [health, metrics, queries, cancel, a] {
+    for handle in [get_queries, head_queries, cancel_7, cancel_8, a] {
         assert_eq!(finish(handle).await.status(), StatusCode::OK);
     }
 }
