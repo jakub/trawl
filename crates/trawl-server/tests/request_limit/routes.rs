@@ -32,6 +32,7 @@ use trawl_server::pool::seam::Seam;
 
 use crate::common::{self, TestServer};
 use crate::support::{DEADLINE, REGULAR_MESSAGE, assert_refused, body_bytes, body_json, call};
+use crate::transport::SCRAPE;
 
 /// The peer every in-process request carries, as the accept loop inserts
 /// one for every real connection (ingest reads it).
@@ -415,12 +416,6 @@ async fn request_limit_precedes_auth_body_rate_and_routing() {
 
 // -- AC7 ------------------------------------------------------------------------------
 
-/// Serializes the `/metrics` scrapes in this file. The recorder is global
-/// under the plain `cargo test` harness, and a scrape sets
-/// `trawl_query_permits_retained` from its own server's pool just before
-/// it renders, so two scrapes from different fixtures must not interleave.
-static SCRAPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// With the regular count full, every control route and method reaches
 /// its handler. Each handler is recognised by what only it produces:
 /// health's `DuckDB` probe arrives at the pool, `/metrics` answers
@@ -658,10 +653,12 @@ async fn control_allowance_is_keyed_by_matched_route() {
     let health = call(&app, empty("GET", "/api/v1/health?zz=/api/v1/query", None)).await;
     let body = body_json(health).await;
     assert!(body["checks"].is_object(), "{body}");
+    let scrape = SCRAPE.lock().await;
     let metrics = call(&app, empty("GET", "/metrics?zz=1", None)).await;
     assert_eq!(metrics.status(), StatusCode::OK);
     let text = String::from_utf8(body_bytes(metrics).await.to_vec()).unwrap();
     assert!(text.contains("# TYPE "), "{text}");
+    drop(scrape);
     let cancel = call(
         &app,
         empty("DELETE", "/api/v1/queries/987654?zz=1", Some(admin)),
@@ -815,6 +812,8 @@ async fn executor_retained_work_does_not_hold_the_count() {
     assert_eq!(pool.retained(), 1, "the timed-out query keeps its permit");
     // The count is back while the permit is still retained.
     assert_regular_free(&app, analyst).await;
+    // `SCRAPE` is held from the top of the test, so no other fixture's
+    // scrape can overwrite the sample between publish and render.
     assert_eq!(scraped_retained(&app).await, 1);
     assert_eq!(pool.retained(), 1);
 

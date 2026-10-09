@@ -23,6 +23,14 @@ use trawl_server::transport::request_limit::body_work::{BodyWork, HoldProbe};
 use crate::common::{self, TestServer};
 use crate::support::{DEADLINE, REGULAR_MESSAGE};
 
+/// Serializes every `/metrics` scrape in this test binary. The recorder is
+/// global under the plain `cargo test` harness, and a scrape sets
+/// `trawl_query_permits_retained` from its own server's pool just before it
+/// renders, so a scrape from any fixture can overwrite the sample another
+/// fixture is about to read. A test holds this across its scrape and every
+/// assertion on what the scrape rendered.
+pub static SCRAPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// AC14: through the production TLS listener, separate connections share
 /// one count, and N+1 concurrent HTTP/2 streams on one connection at
 /// limit N meet exactly one refusal. The count recovers on the same
@@ -76,9 +84,11 @@ async fn request_count_spans_connections_and_h2_streams() {
 
     // `/metrics` is a control request, so a scrape on the same connection
     // passes the full regular count and reads it.
-    let (status, scrape) = h2_answer(h2_get(&connection, &url, "/metrics").await).await;
+    let scrape = SCRAPE.lock().await;
+    let (status, scrape_body) = h2_answer(h2_get(&connection, &url, "/metrics").await).await;
     assert_eq!(status, StatusCode::OK);
-    let regular = regular_in_progress(&String::from_utf8_lossy(&scrape));
+    let regular = regular_in_progress(&String::from_utf8_lossy(&scrape_body));
+    drop(scrape);
     // The recorder is process-wide: other tests' requests only add to it.
     assert!(
         regular >= f64::from(N),
