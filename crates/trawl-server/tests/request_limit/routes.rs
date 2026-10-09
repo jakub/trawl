@@ -696,6 +696,11 @@ async fn api_keys_waiters(lock: &mut sqlx::PgConnection) -> i64 {
 
 /// The in-process `control` in-progress gauge. Read from the recorder, not
 /// over `/metrics`, so the read takes no request place of its own.
+///
+/// The recorder is process-global, so the exact values this test asserts
+/// hold only with one test per process, which is how nextest runs this
+/// binary. Under plain `cargo test` a sibling test's control request can
+/// move the gauge.
 fn control_in_progress() -> u64 {
     crate::support::sample(
         &common::test_metrics_handle().render(),
