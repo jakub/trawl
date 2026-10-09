@@ -80,6 +80,10 @@ fn every_outcome_is_documented() {
         &format!("| `{}` |", trawl_api::doctor::reason::NOT_POSTGRES),
         "the reason code",
     );
+    assert_documented(
+        &format!("`{}`", trawl_api::doctor::reason::REQUEST_LIMIT_REACHED),
+        "the reason code",
+    );
 }
 
 #[test]
