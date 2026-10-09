@@ -1,0 +1,24 @@
+diff --git i/crates/trawl-server/src/transport/request_limit.rs w/crates/trawl-server/src/transport/request_limit.rs
+index 21073eae..cdda7455 100644
+--- i/crates/trawl-server/src/transport/request_limit.rs
++++ w/crates/trawl-server/src/transport/request_limit.rs
+@@ -76,15 +76,14 @@ pub const CONTROL_ALLOWANCE: usize = 4;
+ /// path, the query string or a header, so no spelling of a request can
+ /// claim an allowance. A route added later is regular unless it is added
+ /// to this table or to [`CONTROL_ROUTES`].
+-static PROBE_ROUTES: [(Method, &str); 4] = [
++static PROBE_ROUTES: [(Method, &str); 0] = [];
++
++/// The control routes, matched as [`PROBE_ROUTES`] are.
++static CONTROL_ROUTES: [(Method, &str); 7] = [
+     (Method::GET, "/api/v1/health"),
+     (Method::HEAD, "/api/v1/health"),
+     (Method::GET, "/metrics"),
+     (Method::HEAD, "/metrics"),
+-];
+-
+-/// The control routes, matched as [`PROBE_ROUTES`] are.
+-static CONTROL_ROUTES: [(Method, &str); 3] = [
+     (Method::GET, "/api/v1/queries"),
+     (Method::HEAD, "/api/v1/queries"),
+     (Method::DELETE, "/api/v1/queries/{id}"),

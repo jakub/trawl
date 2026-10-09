@@ -1,0 +1,80 @@
+# AC3: the junk-token regression against the parent commit's single control allowance
+
+parent commit:   c86753757b294f67cbd9e7de031bee0339c19a6b
+                 (health, /metrics, query list and cancel share one control allowance of four)
+test commits:    aa0c0b2d08e3c6787ebcbbea9df18cf9678338f2 test(server): give parked-auth fixtures a five-connection fleet pool
+                 0edb4554e09e4fb257523373fd5f7501b828e486 test(server): pin the probe allowance and junk tokens in control
+tree under test: c8675375 with the five files those two commits touch taken from 0edb4554e09e4fb257523373fd5f7501b828e486,
+                 the same tree `git cherry-pick -n` of both commits gives (they touch only
+                 these files, and nothing else changed them since c8675375). Built as a plain
+                 copy under .flow-scratch/, every other tracked file checked blob-for-blob
+                 against `git ls-tree -r c8675375`, because this seat may not add worktrees.
+                 sha256 93021fe17bb6adb19b3d62fe7e1c4956ddf34db8afebf6954102ab0935a3b91d crates/trawl-server/tests/common/mod.rs
+                 sha256 885161bd4d07f653bf479ca633d449d745f142d35dc87e8d97cfb3383a9d4776 crates/trawl-server/tests/connection_budget.rs
+                 sha256 2ae2647f8ca23e2540e07405fde5ed5faece2a9b15d843e761ab8941542b6269 crates/trawl-server/tests/request_limit/edge.rs
+                 sha256 12c4ec2f9d6351128257db22e4a02ea9f9614518fbc7b41fe945d250dfcdeb2e crates/trawl-server/tests/request_limit/routes.rs
+                 sha256 7393d4a9550c0a472a6eb692e2bc62ce82d570ed04b61274ee41ca1f8e46e46c crates/trawl-server/tests/request_limit/support.rs
+toolchain:       rustc 1.98.0 (88d9e12ae 2026-08-18)
+command:         cargo nextest run -p trawl-server --test request_limit -E 'test(=routes::junk_tokens_in_control_do_not_starve_probes)'
+                 (DATABASE_URL on a disposable test cluster, CARGO_TARGET_DIR under .flow-scratch/)
+
+## Reading
+
+The test parks four junk-token HEAD /api/v1/queries requests in verify_key behind
+LOCK TABLE api_keys. At the parent those four fill the one control allowance, so the
+first probe, GET /api/v1/health, is refused before its handler with 503
+request_limit_reached and the control message. That is the starvation #298 describes:
+a caller with no valid key fills the reserve that liveness and readiness depend on.
+The readiness wait reads Postgres and the in-process gauge, not /metrics, so the first
+failing assertion is health's, not a scrape's.
+
+## Parent run (nextest output; database names and bound address dropped)
+
+────────────
+    Starting 1 test across 1 binary (22 tests skipped)
+        FAIL [   0.557s] (1/1) trawl-server::request_limit routes::junk_tokens_in_control_do_not_starve_probes
+  stdout ───
+    running 1 test
+    test routes::junk_tokens_in_control_do_not_starve_probes ... FAILED
+    failures:
+    failures:
+        routes::junk_tokens_in_control_do_not_starve_probes
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.55s
+  stderr ───
+    thread 'routes::junk_tokens_in_control_do_not_starve_probes' (2536930) panicked at crates/trawl-server/tests/request_limit/routes.rs:777:5:
+    assertion `left == right` failed: GET /api/v1/health: {"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff"}}
+      left: 503
+     right: 200
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+    --- fixture facts ---
+      pool ceilings:  fleet=5 app=3 worst-shape=10
+    --- pg_stat_activity ---
+  Cancelling due to test failure:
+────────────
+     Summary [   0.558s] 1 test run: 0 passed, 1 failed, 22 skipped
+        FAIL [   0.557s] (1/1) trawl-server::request_limit routes::junk_tokens_in_control_do_not_starve_probes
+error: test run failed
+exit=100
+
+## Fixed-tree run
+
+tree:            the commit that adds this section, fix(server): give probes and query control separate allowances (its parent is 0e2ce00892f25e007a87b71080a91434780adae7)
+test files in that tree:
+                 sha256 93021fe17bb6adb19b3d62fe7e1c4956ddf34db8afebf6954102ab0935a3b91d crates/trawl-server/tests/common/mod.rs
+                 sha256 885161bd4d07f653bf479ca633d449d745f142d35dc87e8d97cfb3383a9d4776 crates/trawl-server/tests/connection_budget.rs
+                 sha256 b7ebd6f10871fc556f9b9a343b9a4c3a6f696e27da9e42513f0f973ed710c846 crates/trawl-server/tests/request_limit/edge.rs
+                 sha256 cb8285240a8766d2cf007c3bbca2838deb1e305a752420c97d3520b8c651c91f crates/trawl-server/tests/request_limit/routes.rs
+                 sha256 7393d4a9550c0a472a6eb692e2bc62ce82d570ed04b61274ee41ca1f8e46e46c crates/trawl-server/tests/request_limit/support.rs
+junk-token section of routes.rs (from its "// -- junk tokens" banner to the next banner):
+                 sha256 7c31625ca22ae418f74ebc9fbe3a3561a0be7647d76c9ba6278e44b542e8db27 parent run
+                 sha256 7c31625ca22ae418f74ebc9fbe3a3561a0be7647d76c9ba6278e44b542e8db27 fixed-tree run
+                 (routes.rs differs elsewhere only in comments that now say probe for
+                 health and /metrics)
+command:         cargo nextest run -p trawl-server --test request_limit -E 'test(=routes::junk_tokens_in_control_do_not_starve_probes)'
+
+────────────
+    Starting 1 test across 1 binary (22 tests skipped)
+        PASS [   0.683s] (1/1) trawl-server::request_limit routes::junk_tokens_in_control_do_not_starve_probes
+────────────
+     Summary [   0.683s] 1 test run: 1 passed, 22 skipped
+exit=0

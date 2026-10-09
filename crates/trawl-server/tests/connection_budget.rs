@@ -82,15 +82,16 @@ fn postgres_group_width_fits_the_connection_budget() {
         "postgres group is oversubscribed: WORST_TEST_CONNECTION_CEILING ({}) \
          * max-threads ({max_threads}) + headroom ({headroom}) = {worst_case} \
          > CI_MAX_CONNECTIONS ({}). Shape ceilings: full server {}, \
-         full server + direct store pool {}, sqlx store test {}, boot {}. \
-         Lower max-threads in .config/nextest.toml, or shrink whichever \
-         shape is widest.",
+         full server + direct store pool {}, sqlx store test {}, boot {}, \
+         parked auth {}. Lower max-threads in .config/nextest.toml, or \
+         shrink whichever shape is widest.",
         common::WORST_TEST_CONNECTION_CEILING,
         common::CI_MAX_CONNECTIONS,
         common::FULL_SERVER_CONNECTION_CEILING,
         common::DIRECT_STORE_CONNECTION_CEILING,
         common::SQLX_STORE_CONNECTION_CEILING,
         common::BOOT_CONNECTION_CEILING,
+        common::PARKED_AUTH_CONNECTION_CEILING,
     );
 }
 
@@ -104,6 +105,7 @@ fn the_worst_shape_is_the_widest_shape() {
         ("direct store", common::DIRECT_STORE_CONNECTION_CEILING),
         ("sqlx store test", common::SQLX_STORE_CONNECTION_CEILING),
         ("boot", common::BOOT_CONNECTION_CEILING),
+        ("parked auth", common::PARKED_AUTH_CONNECTION_CEILING),
     ] {
         assert!(
             ceiling <= common::WORST_TEST_CONNECTION_CEILING,

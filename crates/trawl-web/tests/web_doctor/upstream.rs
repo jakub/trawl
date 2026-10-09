@@ -366,17 +366,17 @@ async fn web_doctor_redirect_refused() {
     assert_anonymous_probes(elsewhere.mock(), 0).await;
 }
 
-/// trawld's request-limit refusal, under either allowance's message, is a
-/// capacity refusal and not a foreign answer: `proxy.upstream.health` is
-/// `not_sampled`/`request_limit_reached` with the shared text and a retry
-/// with backoff, no per-check row is invented, no row says another service
-/// answers, and the run is incomplete. One probe, no retry. The same code
-/// under a 200, and an unrelated 503 envelope, still fail as answers that
-/// are not trawld's (ADR-0054).
+/// trawld's request-limit refusal, under the regular or the probe message,
+/// is a capacity refusal and not a foreign answer: `proxy.upstream.health`
+/// is `not_sampled`/`request_limit_reached` with the shared text and a
+/// retry with backoff, no per-check row is invented, no row says another
+/// service answers, and the run is incomplete. One probe, no retry. The
+/// same code under a 200, and an unrelated 503 envelope, still fail as
+/// answers that are not trawld's (ADR-0054).
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_request_limit_refusal_is_not_sampled() {
     let regular = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
-    let control = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff","details":[]}}"#;
+    let probe = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP probe allowance; the request was not processed; retry later with backoff","details":[]}}"#;
     let ca = TestCa::named(CA_SUBJECT);
     let answer = |status: u16, body: &str| {
         ResponseTemplate::new(status)
@@ -384,7 +384,7 @@ async fn web_doctor_request_limit_refusal_is_not_sampled() {
             .set_body_raw(body.to_owned(), "application/json")
     };
 
-    for body in [regular, control] {
+    for body in [regular, probe] {
         let upstream = TlsUpstream::issued_by(&ca).await;
         serve_health(upstream.mock(), answer(503, body)).await;
         let setup = Setup::pinned(upstream.url(), &ca);

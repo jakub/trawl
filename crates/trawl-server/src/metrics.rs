@@ -65,14 +65,16 @@ pub const HOT_BUFFER_DUPLICATE_BATCHES_TOTAL: &str = "trawl_hot_buffer_duplicate
 pub const COMPACTION_INTERVAL_SECONDS: &str = "trawl_compaction_interval_seconds";
 pub const ACTIVE_CONNECTIONS: &str = "trawl_active_connections";
 /// Requests in progress on the HTTPS listener, labelled by `allowance`
-/// (`regular` or `control`, ADR-0054). Follows ownership: blocking ingest
-/// and preview work that holds a request's body keeps its request counted.
+/// (`regular`, `probe` or `control`, ADR-0054). Follows ownership: blocking
+/// ingest and preview work that holds a request's body keeps its request
+/// counted.
 pub const REQUESTS_IN_PROGRESS: &str = "trawl_http_requests_in_progress";
 /// Requests refused at once because their allowance was full, labelled by
 /// `allowance` (ADR-0054).
 pub const REQUESTS_REFUSED_TOTAL: &str = "trawl_http_requests_refused_total";
 /// The size of each allowance: `[server] max_concurrent_requests` for
-/// `regular`, the fixed control allowance for `control` (ADR-0054).
+/// `regular`, the fixed 3 for `probe` and the fixed 4 for `control`
+/// (ADR-0054).
 pub const REQUEST_ALLOWANCE: &str = "trawl_http_request_allowance";
 /// Pool permits held by work whose request already answered (ADR-0024).
 ///
@@ -506,9 +508,9 @@ pub fn describe_metrics() {
     describe_gauge!(
         REQUESTS_IN_PROGRESS,
         "HTTP requests in progress, by allowance (regular: \
-         server.max_concurrent_requests; control: health, metrics and query \
-         listing and cancellation). Ingest and preview work that holds a \
-         request's body keeps it counted after the client leaves"
+         server.max_concurrent_requests; probe: health and metrics; control: \
+         query listing and cancellation). Ingest and preview work that holds \
+         a request's body keeps it counted after the client leaves"
     );
     describe_counter!(
         REQUESTS_REFUSED_TOTAL,
@@ -518,7 +520,7 @@ pub fn describe_metrics() {
     describe_gauge!(
         REQUEST_ALLOWANCE,
         "Size of each request allowance: server.max_concurrent_requests for \
-         regular, the fixed control allowance for control"
+         regular, 3 for probe, 4 for control"
     );
     describe_gauge!(
         QUERY_PERMITS_RETAINED,

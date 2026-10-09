@@ -88,7 +88,7 @@ Every error that trawld itself produces has this body:
 | `timeout` | 504 | The query started but did not finish within `timeout_secs` |
 | `service_unavailable` | 503 | A dependency is down, the server is at capacity, or the node cannot serve the route |
 | `hot_buffer_full` | 503 | The hot buffer has no room for an ingest request. Sent with `Retry-After` |
-| `request_limit_reached` | 503 | trawld is at its `[server] max_concurrent_requests` limit, or at its control allowance of 4. The handler did not run and nothing was ingested. No `Retry-After`. Retry with backoff. See [the request limit](/reference/configuration/#the-request-limit) |
+| `request_limit_reached` | 503 | trawld is at its `[server] max_concurrent_requests` limit, or a health or `/metrics` request is at the probe allowance (fixed at 3), or a query list or cancel request is at the control allowance (fixed at 4). The handler did not run and nothing was ingested. No `Retry-After`. Retry with backoff. See [the request limit](/reference/configuration/#the-request-limit) |
 | `corpus_recovering` | 503 | The server cannot yet count every stored event exactly once, so it refuses the read. No `Retry-After`. See [corpus recovering](#corpus-recovering) |
 
 #### Corpus recovering

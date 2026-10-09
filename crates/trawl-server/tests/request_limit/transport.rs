@@ -82,7 +82,7 @@ async fn request_count_spans_connections_and_h2_streams() {
     let (status, body) = h2_answer(refused).await;
     assert_h2_refused(status, &body);
 
-    // `/metrics` is a control request, so a scrape on the same connection
+    // `/metrics` is a probe request, so a scrape on the same connection
     // passes the full regular count and reads it.
     let scrape = SCRAPE.lock().await;
     let (status, scrape_body) = h2_answer(h2_get(&connection, &url, "/metrics").await).await;

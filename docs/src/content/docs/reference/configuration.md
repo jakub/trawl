@@ -298,8 +298,9 @@ request can fail:
 - trawld's corpus is still recovering after a restart: `not_sampled` with the
   reason `recovering`.
 - trawld is at its request limit: `not_sampled` with the reason
-  `request_limit_reached`, and no per-check rows. Run the doctor again later,
-  with backoff.
+  `request_limit_reached`, and no per-check rows. The health read uses the
+  [probe allowance](#the-request-limit). Run the doctor again later, with
+  backoff.
 
 #### Outcomes
 
@@ -452,21 +453,31 @@ Notes:
 
 A request over the count is refused at once. trawld does not queue it. The answer is 503 with the code `request_limit_reached` and the message `trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff`. It carries `Cache-Control: no-store` and no `Retry-After`, because nothing predicts when a request in progress ends. The handler never ran, so nothing was ingested or changed. trawld does not read the request body. A client that is still uploading can see a connection reset instead of the 503. While the count is full, the refusal comes before `401`, `403`, `404`, `405`, `413`, and `429`.
 
-Four more requests are the control allowance. It serves only `GET` and `HEAD` on `/api/v1/health`, `/metrics`, and `/api/v1/queries`, and `DELETE` on `/api/v1/queries/{id}`, so a probe, a scrape, and an operator can still reach trawld when the count is full. The allowance is fixed at 4. It does not borrow from the regular count and the regular count does not borrow from it. Authentication, rate limits, and ownership checks still apply to these routes. trawld decides membership from the route it matched and the method, never from the raw path, the query string, or a header. A control request over the allowance gets the same 503 and code, with the message `trawld is at its HTTP control allowance; the request was not processed; retry later with backoff`.
+Two more allowances sit beside the count. Each is its own count of requests in progress. They are fixed, so no setting changes them. No allowance borrows from another, and the regular count does not borrow from them.
+
+- The probe allowance is fixed at 3. It serves only `GET` and `HEAD` on `/api/v1/health` and `/metrics`, so a probe and a scrape can still reach trawld when the count is full. Three covers the chart's liveness probe, its readiness probe, and one scrape. A doctor run and a browser health read use the probe allowance too.
+- The control allowance is fixed at 4. It serves only `GET` and `HEAD` on `/api/v1/queries` and `DELETE` on `/api/v1/queries/{id}`, so an operator can still list and cancel queries when the count is full.
+
+Authentication, rate limits, and ownership checks still apply to these routes. trawld decides membership from the route it matched and the method, never from the raw path, the query string, or a header. A route that is in neither list uses the regular count. A request over the probe allowance gets the same 503 and code, with the message `trawld is at its HTTP probe allowance; the request was not processed; retry later with backoff`. A request over the control allowance gets them too, with the message `trawld is at its HTTP control allowance; the request was not processed; retry later with backoff`.
+
+Both allowances are taken before authentication. trawld cannot tell a junk token from a valid one until the key check ends, and that check is what the count must cover. Two limits follow:
+
+- Any caller who can reach the listener can fill the probe allowance with requests to health or `/metrics`. Health shares the API port, so no network policy can fence it without also fencing ingest and queries.
+- The control allowance keeps list and cancel reachable while admitted work fills the regular count. It does not keep them reachable while callers with junk tokens fill the control allowance. During such a flood, list and cancel are not promised. Block the source at the network.
 
 A request counts from its arrival until trawld produces its response head, or until the client hangs up. Response bodies and established SSE streams do not count. Three kinds of work keep the count until they end, even after the client hangs up: decoding and parsing an ingest body, writing and finalizing the ingest WAL, and building the [ingest preview](/reference/api/#preview-ingest) report. They hold the request's body, so they stay counted. Query and export work does not keep the count.
 
 The count bounds the body memory of those components, not the process. At the defaults, each counted ingest request can hold `[ingest] max_body_bytes` as sent plus its decoded body, so `32 × (16 MiB + 16 MiB)` is 1 GiB. Token checks add a separate ceiling: at most 4 Argon2id checks run at once, each at 128 MiB, which is 512 MiB. Parse structures, the hot buffer, DuckDB, and response buffers come on top of both figures. Size `max_concurrent_requests` from `[ingest] max_body_bytes` and the memory you can give the ingest path.
 
-`/metrics` reports the count with a label `allowance` of `regular` or `control`:
+`/metrics` reports each count with a label `allowance` of `regular`, `probe`, or `control`:
 
 | Metric | Meaning |
 |--------|---------|
 | `trawl_http_requests_in_progress{allowance}` | Requests in progress now |
 | `trawl_http_requests_refused_total{allowance}` | Requests refused with `request_limit_reached` |
-| `trawl_http_request_allowance{allowance}` | The size of the allowance: `[server] max_concurrent_requests`, and 4 for `control` |
+| `trawl_http_request_allowance{allowance}` | The size of the allowance: `[server] max_concurrent_requests` for `regular`, 3 for `probe`, and 4 for `control` |
 
-Each refusal also logs one `http_failure` event with the `cause_kind` `request_limit_reached`. See [Trace a server failure](/operate/health/#trace-a-server-failure).
+Each refusal also logs one `http_failure` event with the `cause_kind` `request_limit_reached`. The failure log is capped at 60 events a minute across all three allowances, so during a flood it undercounts. Read the rate from `trawl_http_requests_refused_total{allowance="regular"}`, `{allowance="probe"}`, and `{allowance="control"}`. See [Trace a server failure](/operate/health/#trace-a-server-failure).
 
 #### `[server.rate_limit]`
 

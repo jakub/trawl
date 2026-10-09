@@ -2058,9 +2058,9 @@ fn doctor_identity_requires_exactly_200() {
     }
 }
 
-/// trawld's request-limit refusal (ADR-0054), under either allowance's
-/// message, is a capacity refusal: `api.health` is `not_sampled` with the
-/// reason `request_limit_reached`, the shared text, and a retry with
+/// trawld's request-limit refusal (ADR-0054), under the regular or the
+/// probe message, is a capacity refusal: `api.health` is `not_sampled` with
+/// the reason `request_limit_reached`, the shared text, and a retry with
 /// backoff, never wrong-service advice. The health proof stays incomplete:
 /// no witness, no per-check rows, `api.identity` blocked, and the stub sees
 /// only the unkeyed probe. The run is incomplete, exit 3. On `whoami` the
@@ -2070,7 +2070,7 @@ fn doctor_identity_requires_exactly_200() {
 #[test]
 fn doctor_request_limit_refusal_is_not_sampled() {
     let regular = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
-    let control = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff","details":[]}}"#;
+    let probe = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP probe allowance; the request was not processed; retry later with backoff","details":[]}}"#;
     let assert_refused = |check: &serde_json::Value, case: &str| {
         assert_eq!(check["outcome"], "not_sampled", "{case}: {check}");
         assert_eq!(check["reason"], "request_limit_reached", "{case}: {check}");
@@ -2086,7 +2086,7 @@ fn doctor_request_limit_refusal_is_not_sampled() {
         );
     };
 
-    for (case, body) in [("regular", regular), ("control", control)] {
+    for (case, body) in [("regular", regular), ("probe", probe)] {
         let (output, stub) = doctor_against(vec![
             (HEALTH_PATH, 503, body.to_owned()),
             whoami(r#""query""#),

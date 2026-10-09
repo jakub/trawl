@@ -36,6 +36,10 @@ pub const DEADLINE: Duration = Duration::from_secs(20);
 pub const REGULAR_MESSAGE: &str = "trawld is at its HTTP request limit \
      ([server] max_concurrent_requests); the request was not processed; retry later with backoff";
 
+/// The probe refusal's message, word for word.
+pub const PROBE_MESSAGE: &str = "trawld is at its HTTP probe allowance; the request was not processed; retry later with \
+     backoff";
+
 /// The control refusal's message, word for word.
 pub const CONTROL_MESSAGE: &str = "trawld is at its HTTP control allowance; the request was not processed; retry later with \
      backoff";
@@ -299,6 +303,27 @@ pub async fn assert_refused(response: Response<Body>, message: &str) -> serde_js
     assert_eq!(body["error"]["code"], "request_limit_reached", "{body}");
     assert_eq!(body["error"]["message"], message, "{body}");
     body
+}
+
+/// One sample of `name` with `allowance`, as a Prometheus render shows
+/// it.
+///
+/// Every request-count series is a whole count, so it is read as one: a
+/// gauge renders as a float, and `Display` writes a whole float without a
+/// fraction.
+pub fn sample(rendered: &str, name: &str, allowance: &str) -> u64 {
+    let series = format!("{name}{{allowance=\"{allowance}\"}} ");
+    let value: f64 = rendered
+        .lines()
+        .find_map(|line| line.strip_prefix(&series))
+        .unwrap_or_else(|| panic!("no {series:?} in:\n{rendered}"))
+        .trim()
+        .parse()
+        .unwrap();
+    value
+        .to_string()
+        .parse()
+        .unwrap_or_else(|_| panic!("{series:?} is not a whole count: {value}"))
 }
 
 /// A request body that records whether anything ever polled it.

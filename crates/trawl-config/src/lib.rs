@@ -81,8 +81,9 @@ pub struct ServerConfig {
     ///
     /// One count covers every route and method. When it is full, trawld
     /// refuses the next request at once with 503 `request_limit_reached`
-    /// and no `Retry-After`; it never queues. Four further requests are
-    /// reserved for health, metrics and query list and cancel.
+    /// and no `Retry-After`; it never queues. Two fixed allowances sit
+    /// beside the count and none borrows from another: 3 requests for health
+    /// and metrics (`probe`) and 4 for query list and cancel (`control`).
     #[serde(default = "default_max_concurrent_requests")]
     pub max_concurrent_requests: usize,
 

@@ -302,6 +302,24 @@ const SWEPT_PREFIXES: [&str; 2] = [APP_DB_PREFIX, FLEET_DB_PREFIX];
 /// Fleet-keystore pool size for one fixture server.
 pub const FLEET_POOL_MAX: u32 = 3;
 
+/// Fleet-keystore pool size for a fixture whose test parks bearer
+/// verifications in Postgres (`request_limit`'s junk-token case).
+///
+/// Four requests wait inside `verify_key`'s prefix lookup behind a table
+/// lock, each holding a connection, and one more is free for health's
+/// keystore ping. Every other fixture keeps [`FLEET_POOL_MAX`].
+pub const PARKED_AUTH_FLEET_POOL_MAX: u32 = 5;
+
+/// How long that pool waits for a free connection: longer than the
+/// request-limit tests' 20-second failure deadline, so a parked window
+/// never ends in a pool timeout before the test's own deadline names the
+/// hang.
+pub const PARKED_AUTH_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The raw connection a parked-auth test keeps open to hold its table
+/// lock. It is not taken from any pool.
+pub const TABLE_LOCK_CONNECTIONS: u32 = 1;
+
 /// App-store pool size for one fixture server.
 pub const APP_POOL_MAX: u32 = 3;
 
@@ -357,14 +375,22 @@ pub const SQLX_STORE_CONNECTION_CEILING: u32 = SQLX_TEST_POOL_MAX + APP_POOL_MAX
 /// harness pool at all.
 pub const BOOT_CONNECTION_CEILING: u32 = 2 * (APP_POOL_MAX + LOCK_CONNECTIONS);
 
+/// A full-server fixture on a [`PARKED_AUTH_FLEET_POOL_MAX`] fleet pool,
+/// plus the raw connection its test holds a table lock on.
+pub const PARKED_AUTH_CONNECTION_CEILING: u32 =
+    PARKED_AUTH_FLEET_POOL_MAX + APP_POOL_MAX + LOCK_CONNECTIONS + TABLE_LOCK_CONNECTIONS;
+
 /// The widest shape in the postgres admission group. `connection_budget`
 /// multiplies THIS by the group width.
 pub const WORST_TEST_CONNECTION_CEILING: u32 = max_u32(
     max_u32(
-        FULL_SERVER_CONNECTION_CEILING,
-        DIRECT_STORE_CONNECTION_CEILING,
+        max_u32(
+            FULL_SERVER_CONNECTION_CEILING,
+            DIRECT_STORE_CONNECTION_CEILING,
+        ),
+        max_u32(SQLX_STORE_CONNECTION_CEILING, BOOT_CONNECTION_CEILING),
     ),
-    max_u32(SQLX_STORE_CONNECTION_CEILING, BOOT_CONNECTION_CEILING),
+    PARKED_AUTH_CONNECTION_CEILING,
 );
 
 /// `u32::max` is not const-callable in this MSRV path; this is.
@@ -384,12 +410,22 @@ pub const CI_MAX_CONNECTIONS: u32 = 100;
 /// clippy's `disallowed_methods` for test code, this is the only site
 /// that opts out.
 pub async fn fixture_pool(dsn: &str, max_connections: u32) -> PgPool {
+    fixture_pool_with_acquire_timeout(dsn, max_connections, None).await
+}
+
+/// [`fixture_pool`] with an explicit acquire timeout, for a test whose
+/// pool has to outwait a hold of its own. `None` keeps sqlx's default.
+pub async fn fixture_pool_with_acquire_timeout(
+    dsn: &str,
+    max_connections: u32,
+    acquire_timeout: Option<std::time::Duration>,
+) -> PgPool {
+    let mut options = sqlx::postgres::PgPoolOptions::new().max_connections(max_connections);
+    if let Some(timeout) = acquire_timeout {
+        options = options.acquire_timeout(timeout);
+    }
     #[allow(clippy::disallowed_methods)]
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(max_connections)
-        .connect(dsn)
-        .await
-        .expect("fixture pool connect");
+    let pool = options.connect(dsn).await.expect("fixture pool connect");
     pool
 }
 
@@ -1071,12 +1107,12 @@ struct FixtureFacts {
 }
 
 impl FixtureFacts {
-    fn new(app_db_url: &str, fleet_db_url: &str, bound_addr: &str) -> Self {
+    fn new(app_db_url: &str, fleet_db_url: &str, bound_addr: &str, fleet_pool_max: u32) -> Self {
         Self {
             app_db: database_name(app_db_url).to_owned(),
             fleet_db: database_name(fleet_db_url).to_owned(),
             bound_addr: bound_addr.to_owned(),
-            fleet_pool_max: FLEET_POOL_MAX,
+            fleet_pool_max,
             app_pool_max: APP_POOL_MAX,
             worst_connection_ceiling: WORST_TEST_CONNECTION_CEILING,
         }
@@ -1530,8 +1566,34 @@ pub async fn setup_in_dir_with_data_and_timeout(
         None,
         None,
         &[],
+        FleetPoolSize::DEFAULT,
     )
     .await
+}
+
+/// How a fixture's fleet-keystore pool is built.
+#[derive(Debug, Clone, Copy)]
+pub struct FleetPoolSize {
+    pub max_connections: u32,
+    /// `None` keeps sqlx's default acquire timeout.
+    pub acquire_timeout: Option<std::time::Duration>,
+}
+
+impl FleetPoolSize {
+    /// The pool every fixture uses unless a test parks bearer
+    /// verifications in Postgres.
+    pub const DEFAULT: Self = Self {
+        max_connections: FLEET_POOL_MAX,
+        acquire_timeout: None,
+    };
+
+    /// The pool for a test that parks bearer verifications in Postgres:
+    /// [`PARKED_AUTH_FLEET_POOL_MAX`] connections and
+    /// [`PARKED_AUTH_ACQUIRE_TIMEOUT`].
+    pub const PARKED_AUTH: Self = Self {
+        max_connections: PARKED_AUTH_FLEET_POOL_MAX,
+        acquire_timeout: Some(PARKED_AUTH_ACQUIRE_TIMEOUT),
+    };
 }
 
 /// The `[server]` row caps a fixture boots with.
@@ -1565,6 +1627,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         None,
         None,
         &[],
+        FleetPoolSize::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1607,6 +1670,7 @@ pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
         None,
         None,
         &[],
+        FleetPoolSize::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1629,6 +1693,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         None,
         None,
         &[],
+        FleetPoolSize::DEFAULT,
     )
     .await
 }
@@ -1650,6 +1715,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         None,
         None,
         &[],
+        FleetPoolSize::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1674,6 +1740,7 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         None,
         None,
         cidrs,
+        FleetPoolSize::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1719,6 +1786,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         Some(knobs),
         None,
         &[],
+        FleetPoolSize::DEFAULT,
     )
     .await
 }
@@ -1746,6 +1814,7 @@ pub async fn setup_observing_boot(
         knobs,
         Some(before_boot),
         &[],
+        FleetPoolSize::DEFAULT,
     )
     .await
 }
@@ -1764,6 +1833,7 @@ async fn setup_with_ingest_config(
     hot_buffer: Option<HotBufferKnobs>,
     before_boot: Option<&mut dyn FnMut(&AppState)>,
     trusted_relays: &[&str],
+    fleet_pool_size: FleetPoolSize,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1777,7 +1847,12 @@ async fn setup_with_ingest_config(
     let fleet_db_url = create_fleet_database().await;
     let app_db_url = create_app_database().await;
 
-    let fleet = fleet_pool(&fleet_db_url).await;
+    let fleet = fixture_pool_with_acquire_timeout(
+        &fleet_db_url,
+        fleet_pool_size.max_connections,
+        fleet_pool_size.acquire_timeout,
+    )
+    .await;
     let store = fleet_keystore(&fleet).await;
 
     let (analyst_token, admin_token, reader_token, ingest_token) = mint_role_keys(&store).await;
@@ -1901,7 +1976,12 @@ async fn setup_with_ingest_config(
     let serve_task = serve_and_wait(listener, &state, &config, http_config.clone(), &addr).await;
 
     TestServer {
-        facts: FixtureFacts::new(&app_db_url, &fleet_db_url, &addr),
+        facts: FixtureFacts::new(
+            &app_db_url,
+            &fleet_db_url,
+            &addr,
+            fleet_pool_size.max_connections,
+        ),
         server_config: config.server.clone(),
         http_config,
         state_dir: config.state_dir(),
@@ -1971,6 +2051,34 @@ pub async fn setup_with_query_timeout(
         seed_data_root(tmp.path()),
         rate_limit,
         timeout_secs,
+    )
+    .await;
+    // Leak the tempdir so it survives the test (cleaned up by OS).
+    std::mem::forget(tmp);
+    server
+}
+
+/// A fixture whose fleet-keystore pool is built as `size`, for a test that
+/// parks bearer verifications in Postgres and still needs a free
+/// connection beside them. With [`FleetPoolSize::PARKED_AUTH`] and the
+/// test's table-lock connection, the shape is
+/// [`PARKED_AUTH_CONNECTION_CEILING`]. The tempdir is leaked so it
+/// outlives the server.
+pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
+    let tmp = tempfile::tempdir().expect("failed to create temp dir");
+    let server = setup_with_ingest_config(
+        tmp.path(),
+        seed_data_root(tmp.path()),
+        RateLimitConfig::default(),
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
+        SchedulerConfig::default(),
+        None,
+        None,
+        &[],
+        size,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).

@@ -1,0 +1,20 @@
+diff --git i/crates/trawl-server/src/transport/request_limit.rs w/crates/trawl-server/src/transport/request_limit.rs
+index 21073eae..8196cd27 100644
+--- i/crates/trawl-server/src/transport/request_limit.rs
++++ w/crates/trawl-server/src/transport/request_limit.rs
+@@ -155,7 +155,14 @@ impl RequestLimit {
+             Allowance::Probe => &self.probe,
+             Allowance::Control => &self.control,
+         };
+-        let permit = Arc::clone(semaphore).try_acquire_owned().ok()?;
++        let permit = Arc::clone(semaphore)
++            .try_acquire_owned()
++            .ok()
++            .or_else(|| {
++                (allowance == Allowance::Probe)
++                    .then(|| Arc::clone(&self.regular).try_acquire_owned().ok())
++                    .flatten()
++            })?;
+         Some(RequestInProgress {
+             _counted: Arc::new(Counted::new(permit, allowance)),
+         })

@@ -276,7 +276,7 @@ pub mod reason {
     /// The target refused the probe for exceeding its rate limit.
     pub const RATE_LIMITED: &str = "rate_limited";
     /// trawld refused the probe because it was at its request limit: its
-    /// count of requests in progress, or its control allowance, was full
+    /// count of requests in progress, or its probe allowance, was full
     /// (ADR-0054). Retry with backoff.
     pub const REQUEST_LIMIT_REACHED: &str = "request_limit_reached";
     /// The probe got no answer within its deadline.

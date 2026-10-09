@@ -871,6 +871,9 @@ async fn sentinels_never_reach_http_failure() {
 const REQUEST_LIMIT_MESSAGE: &str = "trawld is at its HTTP request limit \
      ([server] max_concurrent_requests); the request was not processed; retry later with backoff";
 
+/// The probe refusal's message, word for word.
+const PROBE_MESSAGE: &str = "trawld is at its HTTP probe allowance; the request was not processed; retry later with backoff";
+
 /// A request through the production router, carrying the peer the accept
 /// loop would insert.
 fn production_request(uri: &str, token: &str, body: Body) -> Request<Body> {
@@ -1023,4 +1026,84 @@ async fn request_limit_refusal_is_one_unmetered_warn() {
         .unwrap()
         .unwrap();
     assert_eq!(held.status(), StatusCode::OK);
+}
+
+/// A probe refusal is one `http_failure` like every request-limit refusal:
+/// three held `GET /api/v1/health` requests fill the probe allowance under
+/// the production edge layers, and the fourth is refused before its
+/// handler with the probe message, at WARN on the unmetered target, stage
+/// `pre_admission`, the route named, and persisted under the unmetered
+/// cap.
+///
+/// Health is a test handler at the production route template: the
+/// production handler cannot be held without a seam, because its `DuckDB`
+/// ping gives up after its own budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_refusal_is_one_unmetered_warn() {
+    sinks();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let handler_gate = Arc::clone(&gate);
+    let app = with_edge_layers(
+        Router::new()
+            .route(
+                "/api/v1/health",
+                get(move || {
+                    let entered = entered_tx.clone();
+                    let gate = Arc::clone(&handler_gate);
+                    async move {
+                        let _ = entered.send(());
+                        // A closed gate releases every held request.
+                        let _ = gate.acquire().await;
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .route_layer(axum::middleware::from_fn(mark_handler)),
+        &http_config(),
+    );
+    let health = || Request::get("/api/v1/health").body(Body::empty()).unwrap();
+
+    let held: Vec<_> = (0..3)
+        .map(|_| tokio::spawn(app.clone().oneshot(health())))
+        .collect();
+    for _ in 0..3 {
+        tokio::time::timeout(std::time::Duration::from_secs(20), entered_rx.recv())
+            .await
+            .expect("a held probe entered its handler before the deadline")
+            .expect("the entry channel is open");
+    }
+
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        app.clone().oneshot(health()),
+    )
+    .await
+    .expect("the fourth probe was answered without waiting on a held one")
+    .unwrap();
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let request_id = edge_request_id(&refused);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(refused.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["error"]["code"], "request_limit_reached", "{body}");
+    assert_eq!(body["error"]["message"], PROBE_MESSAGE, "{body}");
+    assert!(
+        entered_rx.try_recv().is_err(),
+        "the refused probe entered its handler"
+    );
+    assert_one_request_limit_failure(&request_id, Some("/api/v1/health"));
+
+    gate.close();
+    for handle in held {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .expect("the held probe finished")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

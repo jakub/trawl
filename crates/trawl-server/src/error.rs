@@ -45,9 +45,15 @@ const fn corpus_recovering_message(reason: CorpusUnsettled) -> &'static str {
 pub const REQUEST_LIMIT_REACHED: &str = "trawld is at its HTTP request limit \
      ([server] max_concurrent_requests); the request was not processed; retry later with backoff";
 
+/// The refusal when the probe allowance is in use (ADR-0054). It names the
+/// allowance, not `max_concurrent_requests`, which health and `/metrics`
+/// never use.
+pub const PROBE_ALLOWANCE_REACHED: &str = "trawld is at its HTTP probe allowance; \
+     the request was not processed; retry later with backoff";
+
 /// The refusal when the control allowance is in use (ADR-0054). It names the
-/// allowance, not `max_concurrent_requests`, which the control routes never
-/// use.
+/// allowance, not `max_concurrent_requests`, which the query list and
+/// cancellation never use.
 pub const CONTROL_ALLOWANCE_REACHED: &str = "trawld is at its HTTP control allowance; \
      the request was not processed; retry later with backoff";
 
@@ -55,6 +61,7 @@ pub const CONTROL_ALLOWANCE_REACHED: &str = "trawld is at its HTTP control allow
 const fn request_limit_message(allowance: Allowance) -> &'static str {
     match allowance {
         Allowance::Regular => REQUEST_LIMIT_REACHED,
+        Allowance::Probe => PROBE_ALLOWANCE_REACHED,
         Allowance::Control => CONTROL_ALLOWANCE_REACHED,
     }
 }
@@ -348,7 +355,8 @@ pub enum CauseKind {
     /// scan failed (ADR-0026, ADR-0041).
     RollupPending,
     /// A request was refused at the edge because trawld was at its count of
-    /// requests in progress or at its control allowance (ADR-0054).
+    /// requests in progress, its probe allowance or its control allowance
+    /// (ADR-0054).
     RequestLimitReached,
 }
 
@@ -618,7 +626,7 @@ impl ServerError {
             Self::HotBufferFull { .. } => CauseKind::HotBufferFull,
             Self::CorpusRecovering(CorpusUnsettled::RestartBacklog) => CauseKind::RestartBacklog,
             Self::CorpusRecovering(CorpusUnsettled::RollupPending) => CauseKind::RollupPending,
-            // One kind for both allowances: the metric label, not the
+            // One kind for every allowance: the metric label, not the
             // failure record, tells them apart.
             Self::RequestLimitReached(_) => CauseKind::RequestLimitReached,
             // A pre-start capacity refusal is a pressure outcome the class
@@ -1672,13 +1680,21 @@ mod tests {
 
     /// A request-limit refusal (ADR-0054): 503 with its own code and the
     /// fixed sentence for its allowance, classed like every refusal to
-    /// serve, `Cache-Control: no-store` and no `Retry-After`.
+    /// serve, `Cache-Control: no-store` and no `Retry-After`. Every
+    /// allowance is covered: the match below is exhaustive, and `ALL` is
+    /// pinned to the three of them.
     #[tokio::test]
     async fn a_request_limit_refusal_is_a_no_store_503_without_retry_after() {
-        for (allowance, message) in [
-            (Allowance::Regular, REQUEST_LIMIT_REACHED),
-            (Allowance::Control, CONTROL_ALLOWANCE_REACHED),
-        ] {
+        assert_eq!(
+            Allowance::ALL,
+            [Allowance::Regular, Allowance::Probe, Allowance::Control]
+        );
+        for allowance in Allowance::ALL {
+            let message = match allowance {
+                Allowance::Regular => REQUEST_LIMIT_REACHED,
+                Allowance::Probe => PROBE_ALLOWANCE_REACHED,
+                Allowance::Control => CONTROL_ALLOWANCE_REACHED,
+            };
             let err = ServerError::RequestLimitReached(allowance);
             assert_eq!(err.error_class(), "service_unavailable");
             assert_eq!(err.cause_kind(), CauseKind::RequestLimitReached);
@@ -1704,27 +1720,50 @@ mod tests {
         }
     }
 
-    /// The two sentences, word for word. The regular one names the setting
-    /// and carries no digits at all, so no configured value can be in it;
-    /// the control one names the allowance and not the setting.
+    /// The three sentences, word for word. None carries a digit, so no
+    /// configured value can be in one. The regular one names the setting;
+    /// the probe and control ones name their allowance and not the setting.
     #[test]
     fn the_request_limit_messages_are_fixed_and_carry_no_value() {
         assert_eq!(
-            REQUEST_LIMIT_REACHED,
-            "trawld is at its HTTP request limit ([server] max_concurrent_requests); the \
-             request was not processed; retry later with backoff"
+            Allowance::ALL,
+            [Allowance::Regular, Allowance::Probe, Allowance::Control]
         );
-        assert_eq!(
-            CONTROL_ALLOWANCE_REACHED,
-            "trawld is at its HTTP control allowance; the request was not processed; retry \
-             later with backoff"
-        );
-        for message in [REQUEST_LIMIT_REACHED, CONTROL_ALLOWANCE_REACHED] {
+        for allowance in Allowance::ALL {
+            let expected = match allowance {
+                Allowance::Regular => {
+                    "trawld is at its HTTP request limit ([server] max_concurrent_requests); the \
+                     request was not processed; retry later with backoff"
+                }
+                Allowance::Probe => {
+                    "trawld is at its HTTP probe allowance; the request was not processed; retry \
+                     later with backoff"
+                }
+                Allowance::Control => {
+                    "trawld is at its HTTP control allowance; the request was not processed; retry \
+                     later with backoff"
+                }
+            };
+            let message = request_limit_message(allowance);
+            assert_eq!(message, expected, "{allowance:?}");
             assert!(
                 !message.bytes().any(|b| b.is_ascii_digit()),
                 "a digit in {message:?}"
             );
         }
+        assert_eq!(
+            request_limit_message(Allowance::Regular),
+            REQUEST_LIMIT_REACHED
+        );
+        assert_eq!(
+            request_limit_message(Allowance::Probe),
+            PROBE_ALLOWANCE_REACHED
+        );
+        assert_eq!(
+            request_limit_message(Allowance::Control),
+            CONTROL_ALLOWANCE_REACHED
+        );
+        assert!(!PROBE_ALLOWANCE_REACHED.contains("max_concurrent_requests"));
         assert!(!CONTROL_ALLOWANCE_REACHED.contains("max_concurrent_requests"));
     }
 

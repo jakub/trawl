@@ -177,7 +177,7 @@ pub enum Answer {
     /// recovering after a restart and it cannot answer for it yet.
     Recovering,
     /// A 503 `request_limit_reached` refusal: trawld was at its count of
-    /// requests in progress, or at its control allowance, and refused the
+    /// requests in progress, or at its probe allowance, and refused the
     /// probe before any handler ran (ADR-0054). It says nothing about the
     /// checks, and it is not another service's answer: retry with backoff.
     RequestLimit,
@@ -625,16 +625,16 @@ mod tests {
         assert!(!degraded.has_version());
     }
 
-    /// trawld's request-limit refusal, under either allowance's message,
-    /// is a capacity refusal: not sampled, with no checks, and not a
-    /// foreign answer. Only the 503 with the typed code is; the same code
-    /// under another status, another code, and an unrelated body stay
-    /// what they were (ADR-0054).
+    /// trawld's request-limit refusal, under the regular or the probe
+    /// message, is a capacity refusal: not sampled, with no checks, and
+    /// not a foreign answer. Only the 503 with the typed code is; the
+    /// same code under another status, another code, and an unrelated
+    /// body stay what they were (ADR-0054).
     #[test]
     fn health_request_limit_refusal_is_not_sampled_and_not_foreign() {
         let regular = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
-        let control = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP control allowance; the request was not processed; retry later with backoff","details":[]}}"#;
-        for body in [regular.as_slice(), control.as_slice()] {
+        let probe = br#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP probe allowance; the request was not processed; retry later with backoff","details":[]}}"#;
+        for body in [regular.as_slice(), probe.as_slice()] {
             let judged = judge(503, body);
             assert_eq!(judged, Answer::RequestLimit);
             assert_eq!(judged.outcome(), Outcome::NotSampled);
