@@ -250,9 +250,9 @@ if contains(msg, "[UFW ") {
 }
 
 # --- drop internal journal metadata ---
-# The journal's trusted fields start with an underscore (_PID, _BOOT_ID,
-# _SYSTEMD_OWNER_UID, __CURSOR, ...), and trawld reserves that prefix for
-# its own fields. The identity fields already moved to their kept names
+# The journal's trusted fields (_PID, _BOOT_ID, _SYSTEMD_OWNER_UID, ...)
+# and address fields (__CURSOR, __SEQNUM, ...) start with an underscore,
+# and trawld reserves that prefix for its own fields. The identity fields already moved to their kept names
 # above; every other underscore field is dropped as a class, so a field the
 # journal adds on some events (user sessions, audit) never reaches trawld.
 . = filter(.) -> |key, _value| { !starts_with(key, "_") }
