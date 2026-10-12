@@ -22,9 +22,12 @@
 //! spells a write to evade it. The scanner lexes each remap and finds writes
 //! to `.service`. It accepts only an assignment to exactly `.service` of a
 //! literal name trawld takes or of the gated `service` variable, and one
-//! whole-event form, `. = filter(.) -> |k, v| { ... }`: filtering the event
-//! itself keeps or drops fields it already has and never writes a new
-//! value, so it can no more set `service` than `del` can. It refuses what
+//! whole-event form, `. = filter(.) -> |k, v| { ... }`, only after such a
+//! write at the transform's top level and only with no assignment in the
+//! closure: filtering the event itself keeps or drops fields it already
+//! has, so it can no more set `service` than `del` can, and a closure that
+//! assigns nothing cannot change the gated variable (VRL closures can
+//! assign to the variables around them). It refuses what
 //! it cannot classify instead of guessing: operator, destructuring and other
 //! whole-event assignments, `set` and `merge` calls, paths below `.service`,
 //! and any quoted path segment with a backslash (it does not decode
@@ -256,8 +259,9 @@ fn path_end(tokens: &[Token], mut j: usize) -> usize {
 
 /// From token `k`, exactly `filter(.) -> |a, b| { ... }` ending its
 /// statement: a filter over the event itself, never over a path below it,
-/// whose result is the whole right-hand side. The closure's tokens are still
-/// scanned for writes of their own.
+/// whose result is the whole right-hand side, and whose closure assigns
+/// nothing, not even a local. The closure's tokens are still scanned for
+/// writes of their own.
 fn filters_the_event(tokens: &[Token], k: usize) -> bool {
     let head = matches!(tokens.get(k).map(|t| &t.tok), Some(Tok::Ident(f)) if f == "filter")
         && is_punct(tokens, k + 1, "(")
@@ -281,6 +285,7 @@ fn filters_the_event(tokens: &[Token], k: usize) -> bool {
         match &token.tok {
             Tok::Punct(p) if p == "{" => depth += 1,
             Tok::Punct(p) if p == "}" => depth -= 1,
+            Tok::Punct(p) if ASSIGN.contains(&p.as_str()) => return false,
             _ => {}
         }
         if depth == 0 {
@@ -353,6 +358,10 @@ fn classify_rhs(tokens: &[Token], k: usize) -> Write {
 fn service_writes(source: &str) -> Vec<ServiceWrite> {
     let tokens = lex(source);
     let mut writes = Vec::new();
+    // Brace depth at the current token, and whether a classified `.service`
+    // write has already run unconditionally, at depth 0.
+    let mut depth = 0_i32;
+    let mut service_set = false;
     for (i, token) in tokens.iter().enumerate() {
         let line = token.line;
         let write = match &token.tok {
@@ -400,7 +409,10 @@ fn service_writes(source: &str) -> Vec<ServiceWrite> {
                     Some(Tok::Punct(op))
                         if op == "=" && whole_event && filters_the_event(&tokens, end + 1) =>
                     {
-                        None
+                        (!service_set).then_some(Write::Refused(
+                            "filters the whole event before an unconditional `.service` write, \
+                             so a `service` the source sent would pass through ungated",
+                        ))
                     }
                     Some(Tok::Punct(op)) if ASSIGN.contains(&op.as_str()) => {
                         Some(Write::Refused(if whole_event {
@@ -421,6 +433,14 @@ fn service_writes(source: &str) -> Vec<ServiceWrite> {
             }
             _ => None,
         };
+        if depth == 0 && matches!(write, Some(Write::Literal(_) | Write::Derived)) {
+            service_set = true;
+        }
+        match &token.tok {
+            Tok::Punct(p) if p == "{" => depth += 1,
+            Tok::Punct(p) if p == "}" => depth -= 1,
+            _ => {}
+        }
         if let Some(write) = write {
             writes.push(ServiceWrite { line, write });
         }
@@ -570,6 +590,12 @@ fn the_scanner_refuses_every_write_it_cannot_classify() {
         ". = filter(.) -> |k, v| { true } ?? .x",
         ". = filter(.) -> |k, v| { true } ?? {\"service\": .x}",
         ". = filter(.) -> |k, v| {\n  .service = .x\n  true\n}",
+        ". = filter(.) -> |k, v| { true }",
+        ". = filter(.) -> |k, v| { true }\n.service = service",
+        "if .a { .service = \"x\" }\n. = filter(.) -> |k, v| { true }",
+        ".service = service\n. = filter(.) -> |k, v| { if k == \"message\" { service = string!(v) }; true }\n.service = service",
+        ".service = service\n. = filter(.) -> |k, v| { n = 1; true }",
+        ".service = service\n. = filter(.) -> |k, v| { x, err = parse_json(v); true }",
     ] {
         assert!(refused(source), "the scanner let this through: {source}");
     }
@@ -588,6 +614,18 @@ fn the_scanner_accepts_the_shipped_shapes() {
              .service = service\n.host = \"x\""
         ),
         vec![Write::Derived]
+    );
+    // The shipped underscore drop: a filter over the event, after the gated
+    // write, whose closure assigns nothing.
+    assert_eq!(
+        writes(".service = service\n. = filter(.) -> |key, _value| { !starts_with(key, \"_\") }"),
+        vec![Write::Derived]
+    );
+    assert_eq!(
+        writes(
+            ".service = \"ufw\"\nif .a { .b = 1 }\n. = filter(.) -> |k, _v| {\n  !starts_with(k, \"_\")\n}\n.x = 1"
+        ),
+        literal("ufw")
     );
     assert_eq!(
         service_writes("a = 1\n\n.service = service")[0].line,
@@ -620,8 +658,6 @@ fn the_scanner_ignores_reads_comparisons_and_other_fields() {
         "unit = replace(unit, r'\\.(?:service|scope)$', \"\")",
         "settings = 1\nmerged = 2",
         "x = 1.5",
-        ". = filter(.) -> |key, _value| { !starts_with(key, \"_\") }",
-        ". = filter(.) -> |k, _v| {\n  !starts_with(k, \"_\")\n}\n.x = 1",
     ] {
         assert_eq!(writes(source), vec![], "the scanner flagged this: {source}");
     }
