@@ -76,6 +76,9 @@ MAX_PREVIEW_BODY_BYTES = 128 * 1024
 POSTGRES_ZONE = "America/New_York"
 # The read time every stdin fixture carries.
 FIXTURE_TIME = "2026-09-28T10:30:45.123456Z"
+# The reserved fields trawld accepts from a producer as sent
+# (trawl-server ingest::envelope::is_proposable).
+PROPOSABLE = ("_time", "_raw")
 # A kept-field expectation: the delivered event has no such key.
 MISSING = object()
 # The journal identity fields and the names journal_enriched keeps them
@@ -200,6 +203,17 @@ def fixtures(suppress):
         kept={"UNIT": "foo.service", "systemd_unit": "init.scope", "unit": MISSING},
         _SYSTEMD_UNIT="init.scope", UNIT="foo.service", SYSLOG_IDENTIFIER="systemd",
         _COMM="systemd")
+    # A user-session entry carries trusted fields beyond the common set.
+    # base.toml drops every underscore field, so none reaches trawld's
+    # reserved prefix, under either spelling.
+    session_fields = dict(_SYSTEMD_OWNER_UID="1000", _SYSTEMD_SESSION="4",
+                          _SYSTEMD_USER_SLICE="app.slice", _AUDIT_LOGINUID="1000",
+                          _AUDIT_SESSION="4", _SOURCE_MONOTONIC_TIMESTAMP="3898601328256",
+                          _SOURCE_BOOTTIME_TIMESTAMP="3898601328256", __SEQNUM="42")
+    add("journald", "journal-session-fields", "pipewire",
+        kept={key.lstrip("_").lower(): MISSING for key in session_fields},
+        _SYSTEMD_UNIT="user@1000.service", _SYSTEMD_USER_UNIT="pipewire.service",
+        **session_fields)
     for service in ("networkd-dispatcher", "NetworkManager", "systemd-networkd"):
         add("journald", f"veth churn {service}", None if suppress else service, SYSLOG_IDENTIFIER=service)
         add("journald", f"normal {service}", service, SYSLOG_IDENTIFIER=service)
@@ -427,9 +441,12 @@ def run(tcp, suppress, tls="http"):
                             assert key not in event, (key, event)
                         else:
                             assert event.get(key, MISSING) == value, (key, event)
-                    # No journal original leaves under its journald name.
+                    # No field reaches trawld's reserved prefix beyond the two
+                    # a producer may propose (_time, _raw), and no journal
+                    # identity field leaves under its journald name.
                     leaked = [k for k in event
-                              if k.startswith("_SYSTEMD_") or k in ("SYSLOG_IDENTIFIER", "_COMM")]
+                              if (k.startswith("_") and k not in PROPOSABLE)
+                              or k == "SYSLOG_IDENTIFIER"]
                     assert not leaked, (leaked, event)
                     if name in sent and sent[name]["fixture_source"] == "journald":
                         for source, kept_as in JOURNAL_KEPT:

@@ -1139,7 +1139,8 @@ const VECTOR_CAPTURE: &str = include_str!("fixtures/vector-capture/debian.ndjson
 
 /// What the shipped configs send is what trawld accepts: every captured
 /// event is accepted under the service Vector sent, with no profile
-/// fallback and no folded field-name collision.
+/// fallback, no folded field-name collision, and no field that trawld
+/// must move off its reserved prefix.
 #[tokio::test(flavor = "multi_thread")]
 async fn shipped_vector_capture_is_accepted_under_the_services_it_sent() {
     let sent: Vec<Value> = VECTOR_CAPTURE
@@ -1177,6 +1178,8 @@ async fn shipped_vector_capture_is_accepted_under_the_services_it_sent() {
         for code in [
             RepairCode::ServiceFromProfile,
             RepairCode::FieldNameCaseCollision,
+            RepairCode::ReservedPrefix,
+            RepairCode::ReservedPrefixCollision,
         ] {
             assert!(
                 !repairs.iter().any(|repair| repair == code.as_str()),

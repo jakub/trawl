@@ -250,29 +250,12 @@ if contains(msg, "[UFW ") {
 }
 
 # --- drop internal journal metadata ---
-# systemd-prefixed fields are internal identifiers, not useful downstream.
-# listed explicitly because VRL closures can't mutate the event. The identity
-# fields already moved to their kept names above.
-del(.__CURSOR)
-del(.__MONOTONIC_TIMESTAMP)
-del(.__REALTIME_TIMESTAMP)
-del(._BOOT_ID)
-del(._CAP_EFFECTIVE)
-del(._CMDLINE)
-del(._EXE)
-del(._GID)
-del(._HOSTNAME)
-del(._MACHINE_ID)
-del(._PID)
-del(._RUNTIME_SCOPE)
-del(._SELINUX_CONTEXT)
-del(._SOURCE_REALTIME_TIMESTAMP)
-del(._STREAM_ID)
-del(._SYSTEMD_CGROUP)
-del(._SYSTEMD_INVOCATION_ID)
-del(._SYSTEMD_SLICE)
-del(._TRANSPORT)
-del(._UID)
+# The journal's trusted fields start with an underscore (_PID, _BOOT_ID,
+# _SYSTEMD_OWNER_UID, __CURSOR, ...), and trawld reserves that prefix for
+# its own fields. The identity fields already moved to their kept names
+# above; every other underscore field is dropped as a class, so a field the
+# journal adds on some events (user sessions, audit) never reaches trawld.
+. = filter(.) -> |key, _value| { !starts_with(key, "_") }
 del(.PRIORITY)
 .env = "${TRAWL_ENV:-prod}"
 del(.source_type)
