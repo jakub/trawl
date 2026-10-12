@@ -67,15 +67,15 @@ jobs:
           targets: x86_64-unknown-linux-gnu, wasm32-unknown-unknown
 
       # Own cache entry, so this job neither evicts nor is evicted by
-      # release-<target> and dev-aarch64-linux. The official DuckDB runtime
+      # release-<target>. The official DuckDB runtime
       # is downloaded separately from the Rust compilation cache.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: crashdump-amd64-linux
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      # amd64 is the runner's own architecture, so unlike dev-image.yml and
-      # release.yml's cross leg there is no foreign libc to install. zig is
+      # amd64 is the runner's own architecture, so unlike release.yml's cross
+      # leg there is no foreign libc to install. zig is
       # still here because the glibc floor (.2.31) is what the shipped image
       # is built against, and cargo-zigbuild is how the workspace sets it.
       - name: Install zig
@@ -117,7 +117,7 @@ jobs:
 
       # --load, not --push: nothing publishes from here. The image has to land
       # in the local docker store because the proof below runs containers from
-      # it. No QEMU either, unlike dev-image.yml: linux/amd64 is native.
+      # it. No QEMU either: linux/amd64 is native.
       - name: Build the image
         run: docker build --platform linux/amd64 --load -t trawl-crashdump-ci:${{ github.sha }} .
 

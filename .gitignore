@@ -1,7 +1,7 @@
 # rust build artifacts
 /target/
 
-# binaries staged for `docker build` (dev-image.yml, release.yml, ci/crashdump-image.sh)
+# binaries staged for `docker build` (release.yml, linux-distribution.yml, crashdump-image.yml)
 docker-ctx/
 
 # editor / IDE
