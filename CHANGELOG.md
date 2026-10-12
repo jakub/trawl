@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.3
+
+See the [0.9.3 release notes](docs/releases/v0.9.3.md) for the server-wide
+request limit, the Vector service-name fix, and what existing installations
+should check before upgrading.
+
 ## 0.9.2
 
 See the [0.9.2 release notes](docs/releases/v0.9.2.md) for the fixes from the
