@@ -21,8 +21,11 @@
 //! It is not a VRL verifier, and it does not try to resist an author who
 //! spells a write to evade it. The scanner lexes each remap and finds writes
 //! to `.service`. It accepts only an assignment to exactly `.service` of a
-//! literal name trawld takes or of the gated `service` variable. It refuses
-//! what it cannot classify instead of guessing: operator, destructuring and
+//! literal name trawld takes or of the gated `service` variable, and one
+//! whole-event form, `. = filter(.) -> |k, v| { ... }`: filtering the event
+//! itself keeps or drops fields it already has and never writes a new
+//! value, so it can no more set `service` than `del` can. It refuses what
+//! it cannot classify instead of guessing: operator, destructuring and other
 //! whole-event assignments, `set` and `merge` calls, paths below `.service`,
 //! and any quoted path segment with a backslash (it does not decode
 //! escapes). The shipped configs use none of these.
@@ -251,6 +254,46 @@ fn path_end(tokens: &[Token], mut j: usize) -> usize {
     }
 }
 
+/// From token `k`, exactly `filter(.) -> |a, b| { ... }` ending its
+/// statement: a filter over the event itself, never over a path below it,
+/// whose result is the whole right-hand side. The closure's tokens are still
+/// scanned for writes of their own.
+fn filters_the_event(tokens: &[Token], k: usize) -> bool {
+    let head = matches!(tokens.get(k).map(|t| &t.tok), Some(Tok::Ident(f)) if f == "filter")
+        && is_punct(tokens, k + 1, "(")
+        && is_punct(tokens, k + 2, ".")
+        && is_punct(tokens, k + 3, ")")
+        && is_punct(tokens, k + 4, "-")
+        && is_punct(tokens, k + 5, ">")
+        && adjacent(tokens, k + 5)
+        && is_punct(tokens, k + 6, "|")
+        && matches!(tokens.get(k + 7).map(|t| &t.tok), Some(Tok::Ident(_)))
+        && is_punct(tokens, k + 8, ",")
+        && matches!(tokens.get(k + 9).map(|t| &t.tok), Some(Tok::Ident(_)))
+        && is_punct(tokens, k + 10, "|")
+        && is_punct(tokens, k + 11, "{");
+    if !head {
+        return false;
+    }
+    let mut depth = 0;
+    let mut j = k + 11;
+    while let Some(token) = tokens.get(j) {
+        match &token.tok {
+            Tok::Punct(p) if p == "{" => depth += 1,
+            Tok::Punct(p) if p == "}" => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            let close = token.line;
+            return tokens.get(j + 1).is_none_or(|next| {
+                next.line > close || matches!(&next.tok, Tok::Punct(p) if p == "}" || p == ";")
+            });
+        }
+        j += 1;
+    }
+    false
+}
+
 /// `, target = ...` after a path: the second target of `.service, err = f()`.
 /// `foo(.service, err == 1)` and `[.service, a]` are not.
 fn destructures(tokens: &[Token], comma: usize) -> bool {
@@ -353,6 +396,11 @@ fn service_writes(source: &str) -> Vec<ServiceWrite> {
                 match tokens.get(end).map(|t| &t.tok) {
                     Some(Tok::Punct(op)) if op == "=" && !whole_event && !descends => {
                         Some(classify_rhs(&tokens, end + 1))
+                    }
+                    Some(Tok::Punct(op))
+                        if op == "=" && whole_event && filters_the_event(&tokens, end + 1) =>
+                    {
+                        None
                     }
                     Some(Tok::Punct(op)) if ASSIGN.contains(&op.as_str()) => {
                         Some(Write::Refused(if whole_event {
@@ -515,6 +563,13 @@ fn the_scanner_refuses_every_write_it_cannot_classify() {
         "merge!(., {\"service\": .x})",
         "ok, .service = f()",
         "for_each(.m) -> |k, v| { .service = v }",
+        ". = filter(.m) -> |k, v| { true }",
+        ". = filter(parse_json!(.message)) -> |k, v| { true }",
+        ". = filter(.)",
+        ". |= filter(.) -> |k, v| { true }",
+        ". = filter(.) -> |k, v| { true } ?? .x",
+        ". = filter(.) -> |k, v| { true } ?? {\"service\": .x}",
+        ". = filter(.) -> |k, v| {\n  .service = .x\n  true\n}",
     ] {
         assert!(refused(source), "the scanner let this through: {source}");
     }
@@ -565,6 +620,8 @@ fn the_scanner_ignores_reads_comparisons_and_other_fields() {
         "unit = replace(unit, r'\\.(?:service|scope)$', \"\")",
         "settings = 1\nmerged = 2",
         "x = 1.5",
+        ". = filter(.) -> |key, _value| { !starts_with(key, \"_\") }",
+        ". = filter(.) -> |k, _v| {\n  !starts_with(k, \"_\")\n}\n.x = 1",
     ] {
         assert_eq!(writes(source), vec![], "the scanner flagged this: {source}");
     }
