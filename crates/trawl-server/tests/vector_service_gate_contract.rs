@@ -19,16 +19,21 @@
 //! from the pinned literal, and a literal service name trawld refuses.
 //!
 //! It is not a VRL verifier, and it does not try to resist an author who
-//! spells a write to evade it. The scanner lexes each remap and finds writes
-//! to `.service`. It accepts only an assignment to exactly `.service` of a
-//! literal name trawld takes or of the gated `service` variable, and one
-//! whole-event form, `. = filter(.) -> |k, v| { ... }`, only after such a
-//! write at the transform's top level and only with no assignment in the
-//! closure: filtering the event itself keeps or drops fields it already
-//! has, so it can no more set `service` than `del` can, and a closure that
-//! assigns nothing cannot change the gated variable (VRL closures can
-//! assign to the variables around them). It refuses what
-//! it cannot classify instead of guessing: operator, destructuring and other
+//! spells a write to evade it (Unicode whitespace inside a path, say). It
+//! does not follow control flow either: a top-level write counts as
+//! unconditional even when an earlier `return` can skip it and send the
+//! source event on as it came. No shipped remap returns early.
+//!
+//! The scanner lexes each remap and finds writes to `.service`. It accepts
+//! only an assignment to exactly `.service` of a literal name trawld takes
+//! or of the gated `service` variable, and one whole-event form,
+//! `. = filter(.) -> |k, v| { ... }`, only after such a write at the
+//! transform's top level and only with no assignment in the closure:
+//! filtering the event itself keeps or drops fields it already has, so it
+//! can no more set `service` than `del` can, and a closure that assigns
+//! nothing cannot change the gated variable (VRL closures can assign to the
+//! variables around them). It refuses what it cannot classify instead of
+//! guessing: operator, destructuring and other
 //! whole-event assignments, `set` and `merge` calls, paths below `.service`,
 //! and any quoted path segment with a backslash (it does not decode
 //! escapes). The shipped configs use none of these.
