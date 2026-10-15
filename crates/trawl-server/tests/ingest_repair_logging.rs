@@ -743,9 +743,13 @@ async fn actionable_detail_is_bounded_and_totals_stay_exact() {
 
 /// Two keys with one display name and a third flooding actionable repairs,
 /// sending at once: every line names the key that sent it, and each
-/// actionable request has its own WARN.
+/// actionable request has its own WARN. The flood first spends more
+/// actionable requests than any shared warning budget would allow
+/// (ADR-0055 rejects one), so a budget would starve the twins' warnings.
 #[tokio::test(flavor = "multi_thread")]
 async fn keys_are_attributed_per_request() {
+    // Beyond the 60 a minute an ADR-0040-style shared cap would allow.
+    const FLOOD_REQUESTS: usize = 64;
     sinks();
     let server = Arc::new(common::setup().await);
     let (first_twin, first_id) = mint(&server, "twin-sender").await;
@@ -758,6 +762,14 @@ async fn keys_are_attributed_per_request() {
         event["_time"] = json!(ANCIENT);
         event
     };
+    let mut sent = Vec::new();
+    for _ in 0..FLOOD_REQUESTS {
+        let events = vec![actionable("rl-keys-flood")];
+        let (status, request_id) = post(&server, &flooder, &events).await;
+        assert_eq!(status, 200);
+        sent.push((request_id, flooder_id, "flooder", true, events.len()));
+    }
+
     // (token, key id, name, events, actionable?)
     let mut plan: Vec<(String, i64, &str, Vec<Value>, bool)> = Vec::new();
     for round in 0..4 {
@@ -801,8 +813,8 @@ async fn keys_are_attributed_per_request() {
             (request_id, key_id, name, actionable, events.len())
         });
     }
-    let sent = sends.join_all().await;
-    assert_eq!(sent.len(), 12);
+    sent.extend(sends.join_all().await);
+    assert_eq!(sent.len(), FLOOD_REQUESTS + 12);
 
     for (request_id, key_id, name, actionable, events) in sent {
         let key_id = key_id.to_string();
