@@ -67,8 +67,12 @@ wire_enum! {
         HostFromPeer => "host.from_peer",
         /// `env` was missing; filled from `default_env`.
         EnvDefaulted => "env.defaulted",
-        /// `_time` was missing or unparseable; used arrival time.
+        /// no configured `_time` source was present; used arrival time.
         TimeFromIngest => "time.from_ingest",
+        /// the first present `_time` source failed to parse (a JSON `null`
+        /// counts as present); used arrival time. The value the sender sent
+        /// stays under its own field and in `_raw`.
+        TimeUnparseable => "time.unparseable",
         /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
         TimeOutOfRange => "time.out_of_range",
         /// a value exceeded the length cap (`_raw`).
@@ -76,10 +80,18 @@ wire_enum! {
         /// a field name arrived in trawl's `_` namespace and is not a slot the
         /// sender may propose (ADR-0013 §5). The leading underscore run was
         /// stripped and the value stored under the bare remainder
-        /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`); a name with no
-        /// remainder at all (`_`, `___`) was dropped. Nothing is lost either
-        /// way — `_raw` carries the original name and value.
+        /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`). Nothing is
+        /// lost — `_raw` carries the original name and value.
         ReservedPrefix => "field.reserved_prefix",
+        /// a field name was made only of underscores (`_`, `___`), so the
+        /// reserved-prefix strip left no name to store under and the field
+        /// was dropped. Its value stays findable in `_raw`.
+        FieldNameEmpty => "field.name_empty",
+        /// a field arrived under one of trawl's stamp names
+        /// ([`trawl_core::schema::STAMP_NAMES`]: `_ingested`, `_repairs`,
+        /// `_producer`, `_trawl_wal_file`). It took the reserved-prefix strip
+        /// to its bare name, and the server's stamp still won.
+        FieldStampClaimed => "field.stamp_claimed",
         /// stripping a reserved prefix produced a name the same event already
         /// carries bare, so the prefixed loser was dropped (the case-collision
         /// precedent). Its value stays findable in `_raw`.
@@ -135,8 +147,8 @@ wire_enum! {
         /// adapted without loss.
         Routine => "routine",
         /// someone should inspect the sender: a value was dropped, cut,
-        /// replaced or flagged as implausible, or a field conflicted with an
-        /// asserted value.
+        /// replaced or flagged as implausible, a field conflicted with an
+        /// asserted value, or a sender claimed one of trawl's stamps.
         Actionable => "actionable",
     }
 }
@@ -152,8 +164,11 @@ impl RepairCode {
             | Self::TimeFromIngest
             | Self::ReservedPrefix
             | Self::FieldNameCaseFolded => RepairClass::Routine,
-            Self::TimeOutOfRange
+            Self::TimeUnparseable
+            | Self::TimeOutOfRange
             | Self::FieldTruncated
+            | Self::FieldNameEmpty
+            | Self::FieldStampClaimed
             | Self::ReservedPrefixCollision
             | Self::FieldNameTooLong
             | Self::FieldNameCaseCollision
@@ -233,9 +248,10 @@ pub struct Rejection {
 pub enum TimeSource {
     /// The first present source parsed; `_time` is its canonical spelling.
     Field(usize),
-    /// Arrival time filled `_time` (`time.from_ingest`). `unparseable` is
-    /// the first present source when one claimed the derivation and failed
-    /// to parse (a JSON `null` included); `None` means no source was present.
+    /// Arrival time filled `_time`. `unparseable` is the first present
+    /// source when one claimed the derivation and failed to parse (a JSON
+    /// `null` included), which earns `time.unparseable`; `None` means no
+    /// source was present, which earns `time.from_ingest`.
     Arrival { unparseable: Option<usize> },
 }
 
@@ -723,12 +739,18 @@ fn stringify_nested_values(out: &mut Map<String, Value>, changes: &mut Vec<Field
     }
 }
 
-/// What the reserved-prefix strip did to one event.
+/// What the reserved-prefix strip did to one event. Each flag is set only
+/// by the key that earned it, so one event can carry any combination.
 #[derive(Default)]
+#[allow(clippy::struct_excessive_bools)] // four independent repair outcomes
 struct PrefixStrip {
-    /// At least one `_x` key was stripped or dropped
-    /// (`field.reserved_prefix`).
-    stripped: bool,
+    /// At least one ordinary `_x` key (not a stamp name, not all
+    /// underscores) was stripped or collided out (`field.reserved_prefix`).
+    reserved_prefix: bool,
+    /// At least one all-underscore key was dropped (`field.name_empty`).
+    name_empty: bool,
+    /// At least one stamp name was claimed (`field.stamp_claimed`).
+    stamp_claimed: bool,
     /// A stripped name collided with a bare name the same event carries,
     /// so the prefixed loser was dropped
     /// (`field.reserved_prefix_collision`).
@@ -781,19 +803,26 @@ fn is_proposable(key: &str, value: &Value, raw_proposable: bool) -> bool {
 /// `__name__` → `name__`), and it keeps the promise that every accepted
 /// field stays structurally queryable.
 ///
+/// The key's code is settled on its folded full name, before trimming
+/// (ADR-0013, 2026-10-14 amendment): an exact stamp name
+/// ([`trawl_core::schema::STAMP_NAMES`], so `_INGESTED` once folded, but
+/// not `__ingested`) earns `field.stamp_claimed` instead of
+/// `field.reserved_prefix`; every other key earns `field.reserved_prefix`.
+///
 /// Three sub-cases, all deterministic:
 ///
 /// - the bare remainder is empty (`_`, `___`): there is no name to store
-///   under, so the field is dropped — its value is still in `_raw`;
+///   under, so the field is dropped with `field.name_empty` alone — its
+///   value is still in `_raw`;
 /// - the bare name already exists in this event: the prefixed loser is
 ///   dropped (`field.reserved_prefix_collision`), the same tiebreak the
-///   case-fold uses;
+///   case-fold uses, and the key still earns its own code;
 /// - two prefixed claimants for one bare name: the first in map order
 ///   wins (`serde_json::Map` iterates sorted, so that is the
 ///   ASCII-lexicographically first spelling), the rest collide out.
 ///
-/// Each key is recorded in `changes`: renamed to its bare remainder, or
-/// dropped as `field.reserved_prefix` (no remainder) or
+/// Each key is recorded in `changes`: renamed to its bare remainder under
+/// its own code, or dropped as `field.name_empty` (no remainder) or
 /// `field.reserved_prefix_collision` (the bare name was taken).
 fn strip_reserved_prefixes(
     out: &mut Map<String, Value>,
@@ -808,22 +837,34 @@ fn strip_reserved_prefixes(
         .collect();
     let mut strip = PrefixStrip::default();
     for key in reserved {
-        strip.stripped = true;
         let value = out.remove(&key).expect("key came from this map");
         let bare = key.trim_start_matches('_');
-        if bare.is_empty() || out.contains_key(bare) {
-            // No name to store under, or the bare name is already taken:
-            // drop the prefixed value. `_raw` still carries it.
-            let code = if bare.is_empty() {
-                RepairCode::ReservedPrefix
-            } else {
-                strip.collided = true;
-                RepairCode::ReservedPrefixCollision
-            };
+        if bare.is_empty() {
+            // No name to store under: drop the value. `_raw` still
+            // carries it.
+            strip.name_empty = true;
             changes.push(FieldChange {
                 field: key,
                 kind: FieldChangeKind::Dropped,
-                code: Some(code),
+                code: Some(RepairCode::FieldNameEmpty),
+            });
+            continue;
+        }
+        let code = if trawl_core::schema::STAMP_NAMES.contains(&key.as_str()) {
+            strip.stamp_claimed = true;
+            RepairCode::FieldStampClaimed
+        } else {
+            strip.reserved_prefix = true;
+            RepairCode::ReservedPrefix
+        };
+        if out.contains_key(bare) {
+            // The bare name is already taken: drop the prefixed value.
+            // `_raw` still carries it.
+            strip.collided = true;
+            changes.push(FieldChange {
+                field: key,
+                kind: FieldChangeKind::Dropped,
+                code: Some(RepairCode::ReservedPrefixCollision),
             });
             continue;
         }
@@ -832,7 +873,7 @@ fn strip_reserved_prefixes(
         changes.push(FieldChange {
             field: key,
             kind: FieldChangeKind::Renamed { to: bare },
-            code: Some(RepairCode::ReservedPrefix),
+            code: Some(code),
         });
     }
     strip
@@ -1003,7 +1044,10 @@ fn host_absent(out: &Map<String, Value>) -> bool {
 
 /// Derive `_time` from the first present source in this profile's
 /// `time_from` list, returning the canonical RFC 3339 UTC-microsecond
-/// text and the repair it earned, if any (ADR-0013 §2, ADR-0008 grammar).
+/// text and the repair it earned, if any (ADR-0013 §2, ADR-0008 grammar):
+/// `time.from_ingest` when no source is present, `time.unparseable` when
+/// the first present one fails to parse, `time.out_of_range` when it parses
+/// to an implausible instant.
 ///
 /// Derivation observes, it never consumes. Only `_time` itself is removed,
 /// being the proposal slot the canonical value replaces;
@@ -1048,7 +1092,7 @@ fn derive_time(
         }
         None => (
             ctx.arrival.to_owned(),
-            Some(RepairCode::TimeFromIngest),
+            Some(RepairCode::TimeUnparseable),
             TimeSource::Arrival {
                 unparseable: Some(index),
             },
@@ -1100,7 +1144,8 @@ fn capture_raw(
 ///    per-profile ([`raw_is_proposable`]): trawld's own door never lets a
 ///    field claim the lifeline.
 /// 2. Reserved-prefix strip ([`strip_reserved_prefixes`],
-///    `field.reserved_prefix` / `field.reserved_prefix_collision`).
+///    `field.reserved_prefix` / `field.name_empty` / `field.stamp_claimed` /
+///    `field.reserved_prefix_collision`).
 ///    2.5. Producer assertions ([`apply_assertions`],
 ///    `field.producer_asserted`), after the strip, so a stripped
 ///    `_service` has already landed on its bare slot and the profile
@@ -1115,8 +1160,8 @@ fn capture_raw(
 ///    `env.defaulted`/`host.from_peer` about a sender that did assert one.
 ///    Over-long field-name drop (`field.name_too_long`) follows.
 /// 4. `_time` derived from the first present source in this profile's
-///    `time_from` list, ADR-0008 grammar,
-///    `time.from_ingest`/`time.out_of_range`. Only `_time` is consumed.
+///    `time_from` list, ADR-0008 grammar, `time.from_ingest` /
+///    `time.unparseable` / `time.out_of_range`. Only `_time` is consumed.
 /// 5. `_ingested` stamp.
 /// 6. `env` default-or-reject, `host` peer-fill / relay-reject / omit.
 /// 7. `_severity` derived from the first mappable source in this profile's
@@ -1190,8 +1235,14 @@ pub fn canonicalize(
     if fold.collided {
         push_repair(&mut repairs, RepairCode::FieldNameCaseCollision);
     }
-    if strip.stripped {
+    if strip.reserved_prefix {
         push_repair(&mut repairs, RepairCode::ReservedPrefix);
+    }
+    if strip.name_empty {
+        push_repair(&mut repairs, RepairCode::FieldNameEmpty);
+    }
+    if strip.stamp_claimed {
+        push_repair(&mut repairs, RepairCode::FieldStampClaimed);
     }
     if strip.collided {
         push_repair(&mut repairs, RepairCode::ReservedPrefixCollision);
@@ -1849,6 +1900,7 @@ mod tests {
         assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
         assert_eq!(c.obj["repairs"], "forged");
         assert!(codes(&c).contains(&"field.reserved_prefix"));
+        assert!(codes(&c).contains(&"field.stamp_claimed"));
     }
 
     /// The strip runs before identity resolution, so a stripped
@@ -1895,19 +1947,56 @@ mod tests {
     }
 
     /// A key with no bare remainder has nowhere to land, so it is
-    /// dropped — its value is still in `_raw`.
+    /// dropped with `field.name_empty` alone — its value is still in
+    /// `_raw`.
     #[test]
-    fn an_all_underscore_name_is_dropped_not_stored() {
-        let c = canon(r#"{"service":"s","_":"a","___":"b","keep":"me"}"#);
-        assert!(!c.obj.contains_key("_"));
-        assert!(!c.obj.contains_key("___"));
-        assert!(!c.obj.contains_key(""));
-        assert_eq!(c.obj["keep"], "me");
-        assert!(codes(&c).contains(&"field.reserved_prefix"));
-        match &c.obj["_raw"] {
-            Value::String(raw) => assert!(raw.contains("\"___\":\"b\""), "{raw}"),
-            other => panic!("_raw must be a string: {other:?}"),
+    fn an_all_underscore_name_is_dropped_as_name_empty() {
+        for (json, key) in [
+            (
+                r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_":"a","keep":"me"}"#,
+                "_",
+            ),
+            (
+                r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","___":"b","keep":"me"}"#,
+                "___",
+            ),
+        ] {
+            let c = canon(json);
+            assert!(!c.obj.contains_key(key), "{key} must not be stored");
+            assert!(!c.obj.contains_key(""));
+            assert_eq!(c.obj["keep"], "me");
+            assert_eq!(codes(&c), vec!["field.name_empty"], "{key}");
+            assert_eq!(
+                c.lineage.fields,
+                vec![change(
+                    key,
+                    FieldChangeKind::Dropped,
+                    Some(RepairCode::FieldNameEmpty)
+                )]
+            );
+            match &c.obj["_raw"] {
+                Value::String(raw) => assert!(raw.contains(&format!("\"{key}\":")), "{raw}"),
+                other => panic!("_raw must be a string: {other:?}"),
+            }
         }
+
+        // Both in one event earn the code once, beside an ordinary strip.
+        let c = canon(r#"{"service":"s","_":"a","___":"b","_x":1}"#);
+        assert!(codes(&c).contains(&"field.name_empty"));
+        assert!(
+            codes(&c).contains(&"field.reserved_prefix"),
+            "from _x alone"
+        );
+        assert_eq!(
+            codes(&c)
+                .iter()
+                .filter(|code| **code == "field.name_empty")
+                .count(),
+            1
+        );
+        let raw = c.obj["_raw"].as_str().unwrap();
+        assert!(raw.contains("\"_\":\"a\""), "{raw}");
+        assert!(raw.contains("\"___\":\"b\""), "{raw}");
     }
 
     /// The bare name already present in the same event wins; the
@@ -1985,8 +2074,15 @@ mod tests {
     fn an_unparseable_time_proposal_does_not_fall_through_to_a_lower_source() {
         let c = canon(r#"{"service":"s","_time":"not a time","timestamp":"2025-06-01T12:00:00Z"}"#);
         assert_eq!(c.obj["_time"], ARRIVAL);
-        assert!(codes(&c).contains(&"time.from_ingest"));
+        assert!(codes(&c).contains(&"time.unparseable"));
+        assert!(!codes(&c).contains(&"time.from_ingest"));
         assert_eq!(c.obj["timestamp"], "2025-06-01T12:00:00Z", "still stored");
+
+        // An explicit null is present too: it hides the valid source below.
+        let c = canon(r#"{"service":"s","_time":null,"timestamp":"2025-06-01T12:00:00Z"}"#);
+        assert_eq!(c.obj["_time"], ARRIVAL);
+        assert!(codes(&c).contains(&"time.unparseable"));
+        assert!(!codes(&c).contains(&"time.from_ingest"));
     }
 
     // --- _raw: pre-defaults capture, client honour ---
@@ -2022,18 +2118,99 @@ mod tests {
         assert!(codes(&c).contains(&"field.reserved_prefix"));
     }
 
+    /// Each stamp name earns `field.stamp_claimed` and not
+    /// `field.reserved_prefix` (ADR-0013, 2026-10-14 amendment): the value
+    /// lands under the bare name and the server's own stamp is untouched.
     #[test]
-    fn client_ingested_and_repairs_strip_to_bare_names() {
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","_ingested":"1999-01-01T00:00:00Z","_repairs":"forged"}"#,
-        );
-        assert_eq!(c.obj["_ingested"], ARRIVAL, "server stamp wins");
-        assert_eq!(
-            c.obj["_repairs"], "field.reserved_prefix",
-            "forged _repairs replaced by the strip record"
-        );
-        assert_eq!(c.obj["repairs"], "forged", "the client value lands bare");
-        assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
+    fn each_stamp_name_is_stamp_claimed_not_reserved_prefix() {
+        for stamp in trawl_core::schema::STAMP_NAMES {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","{stamp}":"forged"}}"#
+            ));
+            let bare = stamp.trim_start_matches('_');
+            assert_eq!(
+                c.obj[bare], "forged",
+                "{stamp}: the client value lands bare"
+            );
+            assert_eq!(codes(&c), vec!["field.stamp_claimed"], "{stamp}");
+            assert_eq!(
+                c.lineage.fields,
+                vec![change(
+                    stamp,
+                    renamed(bare),
+                    Some(RepairCode::FieldStampClaimed)
+                )]
+            );
+            // The server's stamps, never the client's values.
+            assert_eq!(c.obj["_ingested"], ARRIVAL, "{stamp}");
+            assert_eq!(c.obj["_repairs"], "field.stamp_claimed", "{stamp}");
+            assert_eq!(c.obj["_producer"], "http", "{stamp}");
+            assert!(
+                !c.obj.contains_key(trawl_core::schema::WAL_FILE),
+                "{stamp}: the provenance column is compaction's, never stored"
+            );
+        }
+    }
+
+    /// A stamp claim over a bare name the event already carries also
+    /// collides out, and still earns no `field.reserved_prefix`.
+    #[test]
+    fn a_stamp_claimed_over_a_present_bare_name_also_collides() {
+        for stamp in trawl_core::schema::STAMP_NAMES {
+            let bare = stamp.trim_start_matches('_');
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","{stamp}":"forged","{bare}":"mine"}}"#
+            ));
+            assert_eq!(c.obj[bare], "mine", "{stamp}: the bare spelling wins");
+            assert_eq!(
+                codes(&c),
+                vec!["field.stamp_claimed", "field.reserved_prefix_collision"],
+                "{stamp}"
+            );
+            assert_eq!(
+                c.lineage.fields,
+                vec![change(
+                    stamp,
+                    FieldChangeKind::Dropped,
+                    Some(RepairCode::ReservedPrefixCollision)
+                )]
+            );
+            assert!(
+                c.obj["_raw"].as_str().unwrap().contains("forged"),
+                "{stamp}: the dropped value stays in _raw"
+            );
+        }
+    }
+
+    /// The stamp rule is exact on the folded full name: an extra
+    /// underscore, a journald name, the derivation-only `_severity` and a
+    /// non-string `_raw` all keep the ordinary strip.
+    #[test]
+    fn only_an_exact_stamp_name_is_stamp_claimed() {
+        for (json, bare) in [
+            (r#""__ingested":"1999-01-01T00:00:00Z""#, "ingested"),
+            (r#""_HOSTNAME":"box""#, "hostname"),
+            (r#""_severity":"warn""#, "severity"),
+            (r#""_raw":{"a":1}"#, "raw"),
+        ] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z",{json}}}"#
+            ));
+            assert!(c.obj.contains_key(bare), "{json} lands on {bare}");
+            assert!(
+                codes(&c).contains(&"field.reserved_prefix"),
+                "{json}: {:?}",
+                c.repairs
+            );
+            assert!(
+                !codes(&c).contains(&"field.stamp_claimed"),
+                "{json}: {:?}",
+                c.repairs
+            );
+        }
+        // The server's own `_ingested` is untouched by `__ingested`.
+        let c = canon(r#"{"service":"s","__ingested":"1999-01-01T00:00:00Z"}"#);
+        assert_eq!(c.obj["_ingested"], ARRIVAL);
     }
 
     #[test]
@@ -2170,15 +2347,20 @@ mod tests {
     }
 
     #[test]
-    fn case_variant_ingested_folds_then_takes_the_reserved_prefix_strip() {
-        let c = canon(
-            r#"{"service":"s","env":"prod","host":"h",
-                "_time":"2025-12-31T23:00:00Z","_Ingested":"1999-01-01T00:00:00Z"}"#,
-        );
-        assert_eq!(c.obj["_ingested"], ARRIVAL, "server stamp wins");
-        assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
-        assert!(codes(&c).contains(&"field.reserved_prefix"));
-        assert!(codes(&c).contains(&"field.name_case_folded"));
+    fn case_variant_ingested_folds_then_is_stamp_claimed() {
+        for key in ["_Ingested", "_INGESTED"] {
+            let c = canon(&format!(
+                r#"{{"service":"s","env":"prod","host":"h",
+                    "_time":"2025-12-31T23:00:00Z","{key}":"1999-01-01T00:00:00Z"}}"#
+            ));
+            assert_eq!(c.obj["_ingested"], ARRIVAL, "server stamp wins");
+            assert_eq!(c.obj["ingested"], "1999-01-01T00:00:00Z");
+            assert_eq!(
+                codes(&c),
+                vec!["field.name_case_folded", "field.stamp_claimed"],
+                "{key}"
+            );
+        }
     }
 
     #[test]
@@ -2351,8 +2533,12 @@ mod tests {
                 "malformed input {input} must be substituted with arrival"
             );
             assert!(
-                codes(&c).contains(&"time.from_ingest"),
+                codes(&c).contains(&"time.unparseable"),
                 "malformed input {input} must be flagged"
+            );
+            assert!(
+                !codes(&c).contains(&"time.from_ingest"),
+                "a present source is not an absent one: {input}"
             );
         }
     }
@@ -2494,7 +2680,8 @@ mod tests {
             c.obj["producer"], "syslog",
             "the sender's value stays queryable"
         );
-        assert!(codes(&c).contains(&"field.reserved_prefix"));
+        assert!(codes(&c).contains(&"field.stamp_claimed"));
+        assert!(!codes(&c).contains(&"field.reserved_prefix"));
 
         // Same rule on a profile door, and the assertion order holds:
         // the strip runs before the stamp, so the two never race.
@@ -2502,6 +2689,8 @@ mod tests {
         let c = canon_profile(r#"{"_PRODUCER":"http","msg":"x"}"#, Producer::Syslog(a));
         assert_eq!(c.obj["_producer"], "syslog");
         assert_eq!(c.obj["producer"], "http");
+        assert!(codes(&c).contains(&"field.stamp_claimed"));
+        assert!(!codes(&c).contains(&"field.reserved_prefix"));
     }
 
     #[test]
@@ -2905,7 +3094,7 @@ mod tests {
             }
         );
         assert_eq!(c.obj["_time"], ARRIVAL);
-        assert!(codes(&c).contains(&"time.from_ingest"));
+        assert!(codes(&c).contains(&"time.unparseable"));
 
         // A present JSON null claims precedence the same way.
         let c = canon(r#"{"service":"s","_time":null,"timestamp":"2025-12-31T23:00:00Z"}"#);
@@ -3029,7 +3218,7 @@ mod tests {
                 change(
                     "_",
                     FieldChangeKind::Dropped,
-                    Some(RepairCode::ReservedPrefix)
+                    Some(RepairCode::FieldNameEmpty)
                 ),
                 change(
                     "_foo",
@@ -3174,6 +3363,8 @@ mod tests {
         match code {
             RepairCode::FieldTruncated
             | RepairCode::ReservedPrefix
+            | RepairCode::FieldNameEmpty
+            | RepairCode::FieldStampClaimed
             | RepairCode::ReservedPrefixCollision
             | RepairCode::FieldNameTooLong
             | RepairCode::FieldNameCaseFolded
@@ -3182,6 +3373,7 @@ mod tests {
             RepairCode::HostFromPeer
             | RepairCode::EnvDefaulted
             | RepairCode::TimeFromIngest
+            | RepairCode::TimeUnparseable
             | RepairCode::TimeOutOfRange
             | RepairCode::HostOmitted
             | RepairCode::ServiceFromProfile => false,
@@ -3193,8 +3385,6 @@ mod tests {
     /// oracle that does not call it.
     #[test]
     fn repair_class_matches_adr_0055() {
-        // The next checkpoint adds time.unparseable (actionable),
-        // field.name_empty (actionable) and field.stamp_claimed (actionable).
         const ROUTINE: &[&str] = &[
             "env.defaulted",
             "host.from_peer",
@@ -3204,14 +3394,19 @@ mod tests {
             "field.reserved_prefix",
         ];
         const ACTIONABLE: &[&str] = &[
+            "time.unparseable",
             "time.out_of_range",
             "field.truncated",
             "field.name_too_long",
+            "field.name_empty",
             "field.name_case_collision",
             "field.reserved_prefix_collision",
+            "field.stamp_claimed",
             "field.producer_asserted",
             "service.from_profile",
         ];
+        assert_eq!(ROUTINE.len() + ACTIONABLE.len(), 16);
+        assert_eq!(RepairCode::ALL.len(), 16);
 
         for code in RepairCode::ALL {
             let wire = code.as_str();
@@ -3236,6 +3431,67 @@ mod tests {
         }
     }
 
+    /// Every trawl-owned `_` name declares exactly one class (ADR-0013,
+    /// 2026-10-14 amendment): a slot the sender may propose, a
+    /// derivation-only slot, or a stamp name. The inventory is the stored
+    /// envelope plus compaction's provenance column, so a new `_` slot in
+    /// either fails here until it is declared.
+    #[test]
+    fn every_reserved_slot_declares_its_class() {
+        use trawl_core::schema::{DERIVATION_ONLY_NAMES, ENVELOPE_TYPES, STAMP_NAMES, WAL_FILE};
+
+        let inventory: Vec<&str> = ENVELOPE_TYPES
+            .iter()
+            .map(|(name, _)| *name)
+            .chain([WAL_FILE])
+            .filter(|name| trawl_core::schema::is_reserved_name(name))
+            .collect();
+        assert!(
+            inventory.len() >= 7,
+            "the inventory must not be vacuous: {inventory:?}"
+        );
+
+        for name in &inventory {
+            let declared = [
+                is_proposable(name, &Value::String(String::new()), true),
+                DERIVATION_ONLY_NAMES.contains(name),
+                STAMP_NAMES.contains(name),
+            ];
+            assert_eq!(
+                declared.iter().filter(|d| **d).count(),
+                1,
+                "{name} must be exactly one of proposable, derivation-only or a stamp name"
+            );
+        }
+        for name in DERIVATION_ONLY_NAMES.iter().chain(STAMP_NAMES) {
+            assert!(
+                inventory.contains(name),
+                "{name} is declared but is not a trawl-owned `_` slot"
+            );
+        }
+        let mut declared: Vec<&str> = DERIVATION_ONLY_NAMES
+            .iter()
+            .chain(STAMP_NAMES)
+            .copied()
+            .collect();
+        let listed = declared.len();
+        declared.sort_unstable();
+        declared.dedup();
+        assert_eq!(declared.len(), listed, "the lists are disjoint and unique");
+    }
+
+    /// Whether a field change accounts for an event-level field code. A
+    /// collision is a strip that lost, so a collision drop also accounts
+    /// for the strip code its key earned: `field.stamp_claimed` for a
+    /// stamp name, `field.reserved_prefix` for any other.
+    fn change_covers(change: &FieldChange, code: RepairCode) -> bool {
+        let stamp = trawl_core::schema::STAMP_NAMES.contains(&change.field.as_str());
+        change.code == Some(code)
+            || (change.code == Some(RepairCode::ReservedPrefixCollision)
+                && ((code == RepairCode::ReservedPrefix && !stamp)
+                    || (code == RepairCode::FieldStampClaimed && stamp)))
+    }
+
     #[test]
     fn lineage_and_repairs_agree() {
         let long_name = "a".repeat(trawl_core::schema::MAX_FIELD_NAME_BYTES + 1);
@@ -3249,6 +3505,9 @@ mod tests {
             r#"{"service":"s","_foo":1,"foo":2}"#.to_owned(),
             r#"{"service":"s","___":1}"#.to_owned(),
             r#"{"service":"s","_Foo":1,"_foo":2,"foo":3}"#.to_owned(),
+            r#"{"service":"s","_ingested":1,"_repairs":"x","repairs":"y"}"#.to_owned(),
+            r#"{"service":"s","_PRODUCER":"me","_trawl_wal_file":"f","_x":1}"#.to_owned(),
+            r#"{"service":"s","_time":null,"timestamp":"2025-12-31T23:00:00Z"}"#.to_owned(),
             r#"{"service":"s","_raw":{"nested":true}}"#.to_owned(),
             r#"{"service":"s","k8s":{"pod":"p"},"tags":[1]}"#.to_owned(),
             r#"{"service":"s","_time":"garbage"}"#.to_owned(),
@@ -3300,22 +3559,28 @@ mod tests {
                 }
             }
             for code in c.repairs.iter().copied().filter(|c| is_field_level(*c)) {
-                // A collision is a strip that lost, so a collision drop
-                // also accounts for `field.reserved_prefix`.
-                let covers = |change: &FieldChange| {
-                    change.code == Some(code)
-                        || (code == RepairCode::ReservedPrefix
-                            && change.code == Some(RepairCode::ReservedPrefixCollision))
-                };
                 assert!(
-                    c.lineage.fields.iter().any(covers),
+                    c.lineage
+                        .fields
+                        .iter()
+                        .any(|change| change_covers(change, code)),
                     "{label}: repair {code} has no field change in {:?}",
                     c.lineage.fields
                 );
             }
             assert_eq!(
                 c.repairs.contains(&RepairCode::TimeFromIngest),
-                matches!(c.lineage.time, TimeSource::Arrival { .. }),
+                matches!(c.lineage.time, TimeSource::Arrival { unparseable: None }),
+                "{label}: time lineage disagrees with repairs"
+            );
+            assert_eq!(
+                c.repairs.contains(&RepairCode::TimeUnparseable),
+                matches!(
+                    c.lineage.time,
+                    TimeSource::Arrival {
+                        unparseable: Some(_)
+                    }
+                ),
                 "{label}: time lineage disagrees with repairs"
             );
             if c.repairs.contains(&RepairCode::TimeOutOfRange) {

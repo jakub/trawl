@@ -2830,7 +2830,7 @@ fn read_wal_to_table(
 /// (`envelope::canonicalize`) stops a client planting it, and a WAL file
 /// that carries it anyway drains losslessly through a renamed provenance
 /// column (see [`build_wal_batch`]) instead of wedging forever.
-pub(super) const WAL_FILE_COL: &str = "_trawl_wal_file";
+pub(super) const WAL_FILE_COL: &str = trawl_core::schema::WAL_FILE;
 
 /// SQL expression producing a never-NULL TIMESTAMP `column` for a WAL row
 /// (ADR-0008: the partition key is never hard-CAST).
