@@ -75,8 +75,8 @@ wire_enum! {
         /// no configured `_time` source was present; used arrival time.
         TimeFromIngest => "time.from_ingest",
         /// the first present `_time` source failed to parse (a JSON `null`
-        /// counts as present); used arrival time. A bare source keeps the value
-        /// under its own field. A `_time` proposal is consumed, and trawld
+        /// counts as present); used arrival time. Derivation leaves a bare
+        /// source in place. A `_time` proposal is consumed, and trawld
         /// keeps no copy of it outside `_raw`.
         TimeUnparseable => "time.unparseable",
         /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
@@ -86,8 +86,8 @@ wire_enum! {
         /// a field name arrived in trawl's `_` namespace and is not a slot the
         /// sender may propose (ADR-0013 §5). The leading underscore run was
         /// stripped and the value stored under the bare remainder
-        /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`). Nothing is
-        /// lost — `_raw` carries the original name and value.
+        /// (`_HOSTNAME` → `hostname`, `__name__` → `name__`). The original
+        /// name and value stay findable in `_raw`.
         ReservedPrefix => "field.reserved_prefix",
         /// a field name was made only of underscores (`_`, `___`), so the
         /// reserved-prefix strip left no name to store under and the field
@@ -96,7 +96,9 @@ wire_enum! {
         /// a field arrived under one of trawl's stamp names
         /// ([`trawl_core::schema::STAMP_NAMES`]: `_ingested`, `_repairs`,
         /// `_producer`, `_trawl_wal_file`). It took the reserved-prefix strip
-        /// to its bare name, and the server's stamp still won.
+        /// to its bare name, or was dropped with
+        /// `field.reserved_prefix_collision` when that name was taken, and the
+        /// server's stamp still won.
         FieldStampClaimed => "field.stamp_claimed",
         /// stripping a reserved prefix produced a name the same event already
         /// carries bare, so the prefixed loser was dropped (the case-collision
@@ -813,7 +815,8 @@ fn is_proposable(key: &str, value: &Value, raw_proposable: bool) -> bool {
 /// (ADR-0013, 2026-10-14 amendment): an exact stamp name
 /// ([`trawl_core::schema::STAMP_NAMES`], so `_INGESTED` once folded, but
 /// not `__ingested`) earns `field.stamp_claimed` instead of
-/// `field.reserved_prefix`; every other key earns `field.reserved_prefix`.
+/// `field.reserved_prefix`; every other key with a nonempty remainder earns
+/// `field.reserved_prefix`.
 ///
 /// Three sub-cases, all deterministic:
 ///
@@ -864,8 +867,8 @@ fn strip_reserved_prefixes(
             RepairCode::ReservedPrefix
         };
         if out.contains_key(bare) {
-            // The bare name is already taken: drop the prefixed value.
-            // `_raw` still carries it.
+            // The bare name is already taken: drop the prefixed value. Only a
+            // captured `_raw` still carries it (see the caveat on `RepairCode`).
             strip.collided = true;
             changes.push(FieldChange {
                 field: key,

@@ -412,8 +412,8 @@ nothing.
    the `_time` and `_severity` sources of the accepted rows. For example, a
    `_time` of `arrival (bad timestamp)`, with the `time.unparseable` repair,
    means that `timestamp` did not parse, so trawld would use the arrival time.
-   A `_time` of `arrival` with `time.from_ingest` means the event sent no
-   timestamp at all.
+   A `_time` of `arrival` with `time.from_ingest` means the event carried none
+   of the `[ingest] time_from` sources.
    Fix the configuration and capture again until the
    preview shows what you expect. The shipped configuration sets `host` on
    every event, so the preview needs no `--peer-ip`.

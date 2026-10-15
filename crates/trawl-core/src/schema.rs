@@ -57,14 +57,16 @@ pub const WAL_FILE: &str = "_trawl_wal_file";
 
 /// The names trawl stamps itself and a sender can only claim (ADR-0013,
 /// 2026-10-14 amendment). An incoming field with one of these names is
-/// stripped like any other reserved name, the server's stamp still wins,
+/// stripped like any other reserved name (so it lands on its bare name, or
+/// is dropped when that name is taken), the server's stamp still wins,
 /// and the field earns `field.stamp_claimed` rather than
 /// `field.reserved_prefix`.
 pub const STAMP_NAMES: &[&str] = &[INGESTED, REPAIRS, PRODUCER, WAL_FILE];
 
 /// The names trawl derives and a sender may not propose (ADR-0013 §3). An
 /// incoming one takes the ordinary reserved-prefix strip and lands on its
-/// bare name, which the derivation then reads.
+/// bare name unless the event already carries that name. The derivation
+/// reads the bare name when it is a configured source, as it is by default.
 pub const DERIVATION_ONLY_NAMES: &[&str] = &[SEVERITY];
 
 /// Envelope columns stored as TIMESTAMP on disk. Every seam that casts the

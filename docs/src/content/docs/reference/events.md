@@ -61,8 +61,11 @@ A proposed string `_raw` is kept verbatim to the cap. Otherwise trawld
 serializes the original object before repair and case folding, which is what
 telemetry always gets. A sender cannot forge any other slot. An input
 `_severity` lands as a bare `severity` with `field.reserved_prefix`, and
-derivation reads it. An input stamp name such as `_producer` lands as a bare
-`producer` with `field.stamp_claimed`, and trawld writes the real one.
+derivation reads it when `severity` is in `[ingest] severity_from`, as it is by
+default. An input stamp name such as `_producer` lands as a bare `producer`
+with `field.stamp_claimed`, and trawld writes the real one. Either input is
+dropped instead, with `field.reserved_prefix_collision`, when the event already
+carries the bare name.
 
 | Name | Charset | Bounds |
 |------|---------|--------|
@@ -100,7 +103,7 @@ replace a fixed source.
 |------|----------|
 | Selection | The first source present wins, not the first parseable one |
 | No source present | Arrival time, recorded as `time.from_ingest` |
-| Unparseable first value | Arrival time, recorded as `time.unparseable`. An explicit `null` counts as present. The value does not fall through to a later source. A bare source field keeps the value under its own name. A `_time` proposal is consumed, and trawld keeps no copy of it outside `_raw`. A sender-supplied `_raw` replaces the one trawld would capture, so it may not contain the value |
+| Unparseable first value | Arrival time, recorded as `time.unparseable`. An explicit `null` counts as present. The value does not fall through to a later source. Derivation leaves a bare source field in place. A `_time` proposal is consumed, and trawld keeps no copy of it outside `_raw`. A sender-supplied `_raw` replaces the one trawld would capture, so it may not contain the value |
 | Consumption | Only the `_time` proposal is consumed. Every bare source field stays in the event |
 | Normalization | RFC 3339 UTC at microsecond precision |
 | Plausibility | A parseable time more than ten years before arrival, or more than one day after it, is kept and flagged `time.out_of_range` |
@@ -206,7 +209,7 @@ action. An actionable repair means someone should inspect the sender.
 | `field.truncated` | actionable | `_raw` exceeded its character cap |
 | `field.reserved_prefix` | routine | A reserved prefix was stripped |
 | `field.name_empty` | actionable | A name made only of underscores was dropped |
-| `field.stamp_claimed` | actionable | A sender sent one of trawl's stamp names, which was stripped to the bare name |
+| `field.stamp_claimed` | actionable | A sender sent one of trawl's stamp names. It was stripped to the bare name, or dropped when that name was taken |
 | `field.reserved_prefix_collision` | actionable | A stripped name collided with an existing bare name |
 | `field.name_too_long` | actionable | A field name exceeded 255 bytes and its column was dropped |
 | `field.name_case_folded` | routine | A field name changed to ASCII lowercase |

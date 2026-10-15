@@ -62,7 +62,7 @@ trawld fills or refuses the envelope fields as follows:
 | `service` | Rejects the event when it is missing, empty, or outside the service charset. |
 | `env` | Fills `[ingest] default_env` and records `env.defaulted` when missing. Rejects a value that is not in `envs`. |
 | `host` | Fills the peer address and records `host.from_peer` when missing. Rejects a missing host when the peer is in `[ingest] trusted_relays`. |
-| `_time` | Reads `_time`, `timestamp`, and `@timestamp`, first present. Uses arrival time when none is present, and records `time.from_ingest`. Uses arrival time when the first present value does not parse, and records `time.unparseable`. |
+| `_time` | Reads the `[ingest] time_from` sources, first present: `_time`, `timestamp`, and `@timestamp` by default. Uses arrival time when none is present, and records `time.from_ingest`. Uses arrival time when the first present value does not parse, and records `time.unparseable`. |
 | `_severity` | Reads `severity`, `severity_text`, and `level`, first mappable. Leaves `_severity` absent when none maps. |
 
 The body limit is `[ingest] max_body_bytes`, 16M by default, and
