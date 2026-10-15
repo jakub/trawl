@@ -24,7 +24,7 @@ use indexmap::IndexMap;
 use crate::error::ServerError;
 use crate::hot_buffer::{Charge, Refusal, Reservation};
 use crate::ingest::body::{EventOutcome, EventReport, HttpRequestContext, visit_events};
-use crate::ingest::envelope::{EnvelopeContext, RejectReason};
+use crate::ingest::envelope::{EnvelopeContext, RejectReason, RepairClass, RepairCode};
 use crate::ingest::pipeline::{BatchKey, PipelineWriter, ServiceBatch};
 use crate::ingest::producer::ProducerKind;
 use crate::policy::{Permission, TrawlAuthz as _};
@@ -82,6 +82,159 @@ impl RejectCounts {
     }
 }
 
+/// How many `(code, service)` pairs a repair log line lists (ADR-0055).
+/// Per-code totals are always complete; this only bounds the detail.
+const REPAIR_DETAIL_PAIRS: usize = 8;
+
+/// One `(env, service)` group's repair and unmapped-severity tallies, held
+/// until that group's WAL write returns (ADR-0055).
+#[derive(Debug, Default)]
+struct GroupTally {
+    /// Per-code repair counts: occurrences of one code on one event.
+    repairs: IndexMap<RepairCode, u64>,
+    /// Accepted events whose severity source maps to nothing on the `OTel`
+    /// ladder (ADR-0013 §2).
+    severity_unmapped: u64,
+}
+
+/// The repairs and unmapped severities of a request's acknowledged groups,
+/// the only source of their metrics and log lines (ADR-0055). A group whose
+/// WAL write failed never enters it.
+#[derive(Debug, Default)]
+struct RepairLedger {
+    /// Per-`(code, service)` repair counts, feeding
+    /// `trawl_ingest_repairs_total{code,service}`. The same service written
+    /// under two envs shares one entry.
+    repairs: IndexMap<(RepairCode, String), u64>,
+    /// Per-service unmapped-severity counts, feeding
+    /// `trawl_severity_unmapped_total{service}`.
+    severity_unmapped: IndexMap<String, u64>,
+}
+
+/// A bounded per-service detail: the listed pairs and what was left out.
+#[derive(Debug, PartialEq, Eq)]
+struct RepairDetail {
+    /// `service/code:n` for at most [`REPAIR_DETAIL_PAIRS`] pairs, joined
+    /// with `", "`. Empty when nothing matched.
+    text: String,
+    /// Pairs past the bound.
+    omitted_pairs: u64,
+    /// Occurrences those omitted pairs held.
+    omitted_occurrences: u64,
+}
+
+impl RepairLedger {
+    /// Fold the acknowledged groups' tallies. `wal_paths` is the list of
+    /// groups whose write succeeded, the same list publication walks, so
+    /// what is counted and what is published cannot diverge.
+    fn acknowledged(
+        tallies: &IndexMap<BatchKey, GroupTally>,
+        wal_paths: &[(BatchKey, PathBuf)],
+    ) -> Self {
+        let mut ledger = Self::default();
+        for (key, _) in wal_paths {
+            if let Some(tally) = tallies.get(key) {
+                ledger.add(&key.1, tally);
+            }
+        }
+        ledger
+    }
+
+    fn add(&mut self, service: &str, tally: &GroupTally) {
+        for (code, count) in &tally.repairs {
+            *self.repairs.entry((*code, service.to_owned())).or_default() += count;
+        }
+        if tally.severity_unmapped > 0 {
+            *self
+                .severity_unmapped
+                .entry(service.to_owned())
+                .or_default() += tally.severity_unmapped;
+        }
+    }
+
+    /// The repairs of `class`, or of both classes for `None`, as
+    /// `(code, service, count)`.
+    fn pairs(&self, class: Option<RepairClass>) -> impl Iterator<Item = (RepairCode, &str, u64)> {
+        self.repairs
+            .iter()
+            .filter(move |((code, _), _)| class.is_none_or(|class| code.class() == class))
+            .map(|((code, service), count)| (*code, service.as_str(), *count))
+    }
+
+    /// Total repair occurrences of `class`, or of both classes for `None`.
+    fn total(&self, class: Option<RepairClass>) -> u64 {
+        self.pairs(class).map(|(_, _, count)| count).sum()
+    }
+
+    /// Exact non-zero per-code totals as `code:n, code:n`, in
+    /// [`RepairCode::ALL`] order, the same shape as [`RejectCounts::summary`].
+    fn codes(&self, class: Option<RepairClass>) -> String {
+        let mut totals: IndexMap<RepairCode, u64> = IndexMap::new();
+        for (code, _, count) in self.pairs(class) {
+            *totals.entry(code).or_default() += count;
+        }
+        RepairCode::ALL
+            .iter()
+            .filter_map(|code| totals.get(code).map(|count| format!("{code}:{count}")))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// At most [`REPAIR_DETAIL_PAIRS`] pairs, by count, highest first, then
+    /// by code, then by service, with exact counts of what was left out.
+    fn detail(&self, class: Option<RepairClass>) -> RepairDetail {
+        let mut pairs: Vec<_> = self.pairs(class).collect();
+        pairs.sort_by(
+            |(a_code, a_service, a_count), (b_code, b_service, b_count)| {
+                b_count
+                    .cmp(a_count)
+                    .then_with(|| a_code.as_str().cmp(b_code.as_str()))
+                    .then_with(|| a_service.cmp(b_service))
+            },
+        );
+        let tail = pairs.split_off(pairs.len().min(REPAIR_DETAIL_PAIRS));
+        RepairDetail {
+            text: pairs
+                .iter()
+                .map(|(code, service, count)| format!("{service}/{code}:{count}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            omitted_pairs: tail.len() as u64,
+            omitted_occurrences: tail.iter().map(|(_, _, count)| count).sum(),
+        }
+    }
+
+    /// Emit the repair and unmapped-severity counters.
+    fn emit_metrics(&self) {
+        for (service, count) in &self.severity_unmapped {
+            // Same label discipline as the repair counter: `service` is a
+            // client-chosen data dimension trawl publishes deliberately, run
+            // through the same bounded label helper.
+            metrics::counter!(
+                crate::metrics::SEVERITY_UNMAPPED_TOTAL,
+                "service" => crate::metrics::repair_service_label(service)
+            )
+            .increment(*count);
+        }
+        for ((code, service), count) in &self.repairs {
+            // SECURITY: `service` is client-supplied and `/metrics` is
+            // unauthenticated. It is a data dimension ADR-0009 publishes
+            // deliberately (alerting per repair code and sender), unlike the
+            // principal-derived labels `handlers.rs` forbids — but the
+            // recorder never evicts a series, so the distinct label values are
+            // capped and per-key attribution stays in the authenticated log.
+            // Only acknowledged groups get here, so a failed write never
+            // spends one of those capped label slots.
+            metrics::counter!(
+                crate::metrics::INGEST_REPAIRS_TOTAL,
+                "code" => code.as_str(),
+                "service" => crate::metrics::repair_service_label(service)
+            )
+            .increment(*count);
+        }
+    }
+}
+
 /// Parsed ingest payload, grouped by `(env, service)`.
 #[derive(Debug)]
 struct ParsedEvents {
@@ -91,14 +244,10 @@ struct ParsedEvents {
     errors: Vec<IngestEventError>,
     /// Per-reason rejection counts for prometheus labels.
     reject_counts: RejectCounts,
-    /// Per-`(code, service)` repair counts (ADR-0009): accepted events the
-    /// server modified, feeding `trawl_ingest_repairs_total{code,service}`.
-    repairs: IndexMap<(&'static str, String), u64>,
-    /// Per-service count of accepted events that carried a severity source
-    /// mapping to nothing on the `OTel` ladder (ADR-0013 §2). Not a
-    /// repair — nothing sender-visible was touched — so it rides its own
-    /// counter, `trawl_severity_unmapped_total{service}`.
-    severity_unmapped: IndexMap<String, u64>,
+    /// Repair and unmapped-severity tallies of the groups that have any,
+    /// keyed like `batches`. Only the groups whose WAL write succeeds are
+    /// counted ([`RepairLedger::acknowledged`]).
+    tallies: IndexMap<BatchKey, GroupTally>,
 }
 
 impl ParsedEvents {
@@ -107,8 +256,7 @@ impl ParsedEvents {
             batches: IndexMap::new(),
             errors: Vec::new(),
             reject_counts: RejectCounts::default(),
-            repairs: IndexMap::new(),
-            severity_unmapped: IndexMap::new(),
+            tallies: IndexMap::new(),
         }
     }
 
@@ -117,19 +265,15 @@ impl ParsedEvents {
     fn record(&mut self, report: EventReport<'_>) -> ControlFlow<()> {
         match report.outcome {
             EventOutcome::Accepted(canonical) => {
-                for code in &canonical.repairs {
-                    *self
-                        .repairs
-                        .entry((code.as_str(), canonical.service.clone()))
-                        .or_default() += 1;
-                }
-                if canonical.severity_unmapped() {
-                    *self
-                        .severity_unmapped
-                        .entry(canonical.service.clone())
-                        .or_default() += 1;
-                }
+                let severity_unmapped = canonical.severity_unmapped();
                 let key = (canonical.env, canonical.service);
+                if !canonical.repairs.is_empty() || severity_unmapped {
+                    let tally = self.tallies.entry(key.clone()).or_default();
+                    for code in &canonical.repairs {
+                        *tally.repairs.entry(*code).or_default() += 1;
+                    }
+                    tally.severity_unmapped += u64::from(severity_unmapped);
+                }
                 self.batches.entry(key).or_default().push(canonical.obj);
             }
             EventOutcome::Rejected {
@@ -155,12 +299,6 @@ impl ParsedEvents {
                     bytes: usize::MAX,
                 })
             })
-    }
-
-    /// Total repair codes applied, for the log line. One event may carry
-    /// several codes, so this is not an event count.
-    fn total_repairs(&self) -> u64 {
-        self.repairs.values().sum()
     }
 }
 
@@ -567,44 +705,27 @@ fn finalize_ingest(
         );
     }
 
-    for (service, count) in &parsed.severity_unmapped {
-        // Same label discipline as the repair counter: `service` is a
-        // client-chosen data dimension trawl publishes deliberately, run
-        // through the same bounded label helper.
-        metrics::counter!(
-            crate::metrics::SEVERITY_UNMAPPED_TOTAL,
-            "service" => crate::metrics::repair_service_label(service)
-        )
-        .increment(*count);
-    }
-
-    if !parsed.repairs.is_empty() {
-        for ((code, service), count) in &parsed.repairs {
-            // SECURITY: `service` is client-supplied and `/metrics` is
-            // unauthenticated. It is a data dimension ADR-0009 publishes
-            // deliberately (alerting per repair code and sender), unlike the
-            // principal-derived labels `handlers.rs` forbids — but the
-            // recorder never evicts a series, so the distinct label values are
-            // capped and per-key attribution stays in the authenticated log.
-            metrics::counter!(
-                crate::metrics::INGEST_REPAIRS_TOTAL,
-                "code" => *code,
-                "service" => crate::metrics::repair_service_label(service)
-            )
-            .increment(*count);
-        }
-        let summary = parsed
-            .repairs
-            .iter()
-            .map(|((code, service), count)| format!("{service}/{code}:{count}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+    // Only the groups whose WAL write succeeded count. Fold them before
+    // publication drains the batches.
+    let ledger = RepairLedger::acknowledged(&parsed.tallies, wal_paths);
+    ledger.emit_metrics();
+    let repairs = ledger.total(None);
+    let repairs_routine = ledger.total(Some(RepairClass::Routine));
+    let repairs_actionable = ledger.total(Some(RepairClass::Actionable));
+    if repairs_actionable > 0 {
+        let actionable = ledger.detail(Some(RepairClass::Actionable));
+        // Not "lost": `time.out_of_range` keeps the value it flags.
         tracing::warn!(
             event_type = "ingest_repairs",
             user = %verified.name,
-            repairs = parsed.total_repairs(),
-            summary,
-            "accepted events were repaired (codes recorded in _repairs)"
+            key_id = verified.id,
+            repairs_actionable,
+            repairs_routine,
+            actionable_codes = ledger.codes(Some(RepairClass::Actionable)),
+            actionable_detail = actionable.text,
+            actionable_detail_omitted_pairs = actionable.omitted_pairs,
+            actionable_detail_omitted_occurrences = actionable.omitted_occurrences,
+            "accepted events have repairs that need inspection (codes in _repairs)"
         );
     }
 
@@ -620,9 +741,12 @@ fn finalize_ingest(
 
     let duration_ms = decompress_ms + parse_ms + wal_ms;
     let services = wal_paths.len();
+    let detail = ledger.detail(None);
+    // The per-key record of every repair, routine ones included (ADR-0055).
     tracing::info!(
         event_type = "ingest_complete",
         user = %verified.name,
+        key_id = verified.id,
         services,
         accepted,
         rejected,
@@ -633,6 +757,13 @@ fn finalize_ingest(
         decompress_ms,
         parse_ms,
         wal_ms,
+        repairs,
+        repairs_routine,
+        repairs_actionable,
+        repair_codes = ledger.codes(None),
+        repair_detail = detail.text,
+        repair_detail_omitted_pairs = detail.omitted_pairs,
+        repair_detail_omitted_occurrences = detail.omitted_occurrences,
         "ingested events to WAL"
     );
 
@@ -761,6 +892,24 @@ mod tests {
             .contains_key(&(env.to_string(), svc.to_string()))
     }
 
+    /// The `(env, service)` group's tally, panicking if it has none.
+    fn tally<'a>(parsed: &'a ParsedEvents, env: &str, svc: &str) -> &'a GroupTally {
+        parsed
+            .tallies
+            .get(&(env.to_string(), svc.to_string()))
+            .unwrap_or_else(|| panic!("no tally for ({env}, {svc})"))
+    }
+
+    /// One code's count in the `(env, service)` group's tally.
+    fn repairs_of(parsed: &ParsedEvents, env: &str, svc: &str, code: RepairCode) -> u64 {
+        parsed
+            .tallies
+            .get(&(env.to_string(), svc.to_string()))
+            .and_then(|tally| tally.repairs.get(&code))
+            .copied()
+            .unwrap_or(0)
+    }
+
     // --- happy path tests ---
 
     #[test]
@@ -860,19 +1009,33 @@ mod tests {
     fn unmappable_severity_sources_are_counted_per_service() {
         let data = br#"[{"service":"game","level":"gold"},{"service":"game","level":"silver"},{"service":"nginx","level":"error"}]"#;
         let parsed = parse(data).unwrap();
-        assert_eq!(parsed.severity_unmapped.get("game"), Some(&2));
-        assert_eq!(parsed.severity_unmapped.get("nginx"), None);
+        assert_eq!(tally(&parsed, "prod", "game").severity_unmapped, 2);
+        assert_eq!(tally(&parsed, "prod", "nginx").severity_unmapped, 0);
+        // Counted, never repaired: no code on any event says so.
+        let codes: Vec<&str> = parsed
+            .tallies
+            .values()
+            .flat_map(|tally| tally.repairs.keys().map(|code| code.as_str()))
+            .collect();
         assert!(
-            !parsed
-                .repairs
-                .keys()
-                .any(|(code, _)| *code == "severity.unmapped"),
-            "the deleted repair code must not come back: {:?}",
-            parsed.repairs
+            !codes.iter().any(|code| code.starts_with("severity.")),
+            "the deleted repair code must not come back: {codes:?}"
+        );
+        let ledger = RepairLedger::acknowledged(
+            &parsed.tallies,
+            &[
+                (("prod".to_owned(), "game".to_owned()), PathBuf::new()),
+                (("prod".to_owned(), "nginx".to_owned()), PathBuf::new()),
+            ],
+        );
+        assert_eq!(
+            ledger.severity_unmapped,
+            IndexMap::from([("game".to_owned(), 2)])
         );
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // one scenario, stated in order
     fn http_wal_failure_rejects_only_failed_group_and_preserves_successes() {
         use crate::metrics::test_support::sample;
         let recorder = crate::metrics::prometheus_builder().build_recorder();
@@ -884,10 +1047,11 @@ mod tests {
             writer.ensure_dir().unwrap();
             std::fs::write(writer.dir().join("blocked"), b"keep").unwrap();
             let mut parsed = ParsedEvents::new();
+            // `shared` sits in both a written env and the failed one.
             for (env, service, count) in [
                 ("prod", "before", 1),
-                ("blocked", "failed", 3),
-                ("prod", "after", 2),
+                ("blocked", "shared", 3),
+                ("prod", "shared", 2),
             ] {
                 let mut batch = ServiceBatch::default();
                 for id in 0..count {
@@ -898,9 +1062,20 @@ mod tests {
                             .clone(),
                     );
                 }
-                parsed
-                    .batches
-                    .insert((env.to_owned(), service.to_owned()), batch);
+                let key = (env.to_owned(), service.to_owned());
+                parsed.batches.insert(key.clone(), batch);
+                let code = if env == "blocked" {
+                    RepairCode::FieldNameTooLong
+                } else {
+                    RepairCode::EnvDefaulted
+                };
+                parsed.tallies.insert(
+                    key,
+                    GroupTally {
+                        repairs: IndexMap::from([(code, count)]),
+                        severity_unmapped: count,
+                    },
+                );
             }
             let (written, failed) = write_wal_batches(&writer, &mut parsed);
             assert!(failed, "a failed group fails the request");
@@ -910,8 +1085,42 @@ mod tests {
             assert!(
                 !parsed
                     .batches
-                    .contains_key(&("blocked".to_owned(), "failed".to_owned()))
+                    .contains_key(&("blocked".to_owned(), "shared".to_owned()))
             );
+
+            // Only the written groups reach the ledger: the failed group's
+            // repairs and unmapped severities are unacknowledged.
+            let ledger = RepairLedger::acknowledged(&parsed.tallies, &written);
+            assert_eq!(
+                ledger.repairs,
+                IndexMap::from([
+                    ((RepairCode::EnvDefaulted, "before".to_owned()), 1),
+                    ((RepairCode::EnvDefaulted, "shared".to_owned()), 2),
+                ])
+            );
+            assert_eq!(
+                ledger.severity_unmapped,
+                IndexMap::from([("before".to_owned(), 1), ("shared".to_owned(), 2)])
+            );
+            assert_eq!(ledger.total(Some(RepairClass::Actionable)), 0);
+            ledger.emit_metrics();
+            assert_eq!(
+                sample(
+                    &handle,
+                    "trawl_ingest_repairs_total{code=\"env.defaulted\",service=\"shared\"}"
+                ),
+                2
+            );
+            assert_eq!(
+                sample(&handle, "trawl_severity_unmapped_total{service=\"shared\"}"),
+                2
+            );
+            assert!(
+                !handle.render().contains("field.name_too_long"),
+                "{}",
+                handle.render()
+            );
+
             // finalize_ingest emits this same per-reason accounting once.
             parsed.reject_counts.emit_metrics();
             assert_eq!(
@@ -939,6 +1148,132 @@ mod tests {
                 b"keep"
             );
         });
+    }
+
+    /// Every group failed: nothing reaches the ledger.
+    #[test]
+    fn a_ledger_over_no_written_group_counts_nothing() {
+        let mut tallies = IndexMap::new();
+        tallies.insert(
+            ("prod".to_owned(), "svc".to_owned()),
+            GroupTally {
+                repairs: IndexMap::from([(RepairCode::TimeOutOfRange, 4)]),
+                severity_unmapped: 4,
+            },
+        );
+        let ledger = RepairLedger::acknowledged(&tallies, &[]);
+        assert!(ledger.repairs.is_empty());
+        assert!(ledger.severity_unmapped.is_empty());
+        assert_eq!(ledger.total(None), 0);
+    }
+
+    // --- the repair ledger's log text (ADR-0055) ---
+
+    fn ledger(pairs: &[(RepairCode, &str, u64)]) -> RepairLedger {
+        RepairLedger {
+            repairs: pairs
+                .iter()
+                .map(|(code, service, count)| ((*code, (*service).to_owned()), *count))
+                .collect(),
+            severity_unmapped: IndexMap::new(),
+        }
+    }
+
+    /// A clean request: zero totals and empty strings, never a missing field.
+    #[test]
+    fn a_clean_ledger_reports_zeroes_and_empty_detail() {
+        let ledger = RepairLedger::default();
+        for class in [
+            None,
+            Some(RepairClass::Routine),
+            Some(RepairClass::Actionable),
+        ] {
+            assert_eq!(ledger.total(class), 0);
+            assert_eq!(ledger.codes(class), "");
+            assert_eq!(
+                ledger.detail(class),
+                RepairDetail {
+                    text: String::new(),
+                    omitted_pairs: 0,
+                    omitted_occurrences: 0,
+                }
+            );
+        }
+    }
+
+    /// Ties on count break by code, then by service, both ascending.
+    #[test]
+    fn repair_detail_orders_by_count_then_code_then_service() {
+        let ledger = ledger(&[
+            (RepairCode::HostFromPeer, "b", 5),
+            (RepairCode::EnvDefaulted, "b", 5),
+            (RepairCode::EnvDefaulted, "a", 5),
+            (RepairCode::FieldNameCaseFolded, "z", 9),
+            (RepairCode::TimeOutOfRange, "c", 1),
+        ]);
+        assert_eq!(
+            ledger.detail(None).text,
+            "z/field.name_case_folded:9, a/env.defaulted:5, b/env.defaulted:5, \
+             b/host.from_peer:5, c/time.out_of_range:1"
+        );
+    }
+
+    /// At most eight pairs; the rest are counted, never listed.
+    #[test]
+    fn repair_detail_lists_eight_pairs_and_counts_the_rest() {
+        let services: Vec<String> = (0..11).map(|i| format!("s{i:02}")).collect();
+        let pairs: Vec<(RepairCode, &str, u64)> = services
+            .iter()
+            .enumerate()
+            .map(|(i, service)| (RepairCode::EnvDefaulted, service.as_str(), 20 - i as u64))
+            .collect();
+        let detail = ledger(&pairs).detail(None);
+        let listed: Vec<&str> = detail.text.split(", ").collect();
+        assert_eq!(listed.len(), REPAIR_DETAIL_PAIRS);
+        assert_eq!(listed[0], "s00/env.defaulted:20");
+        assert_eq!(listed[7], "s07/env.defaulted:13");
+        // s08..s10 hold 12 + 11 + 10.
+        assert_eq!(detail.omitted_pairs, 3);
+        assert_eq!(detail.omitted_occurrences, 33);
+    }
+
+    /// Per-code totals are exact over the whole ledger, in declaration
+    /// order, and the class filter keeps each line to its own codes.
+    #[test]
+    fn repair_codes_are_exact_and_filtered_by_class() {
+        let ledger = ledger(&[
+            (RepairCode::FieldNameTooLong, "a", 1),
+            (RepairCode::EnvDefaulted, "a", 50),
+            (RepairCode::EnvDefaulted, "b", 7),
+            (RepairCode::TimeOutOfRange, "b", 2),
+            (RepairCode::FieldNameCaseFolded, "c", 3),
+        ]);
+        assert_eq!(
+            ledger.codes(None),
+            "env.defaulted:57, time.out_of_range:2, field.name_too_long:1, \
+             field.name_case_folded:3"
+        );
+        assert_eq!(
+            ledger.codes(Some(RepairClass::Routine)),
+            "env.defaulted:57, field.name_case_folded:3"
+        );
+        assert_eq!(
+            ledger.codes(Some(RepairClass::Actionable)),
+            "time.out_of_range:2, field.name_too_long:1"
+        );
+        assert_eq!(ledger.total(None), 63);
+        assert_eq!(ledger.total(Some(RepairClass::Routine)), 60);
+        assert_eq!(ledger.total(Some(RepairClass::Actionable)), 3);
+        assert_eq!(
+            ledger.detail(Some(RepairClass::Actionable)).text,
+            "b/time.out_of_range:2, a/field.name_too_long:1"
+        );
+        assert!(
+            !ledger
+                .detail(Some(RepairClass::Routine))
+                .text
+                .contains("time.out_of_range")
+        );
     }
 
     // --- batch-level errors ---
@@ -1067,8 +1402,8 @@ mod tests {
         let event = &batch_maps(&parsed, "prod", "svc")[0];
         assert_eq!(event["env"], "prod");
         assert_eq!(
-            parsed.repairs.get(&("env.defaulted", "svc".to_string())),
-            Some(&1)
+            repairs_of(&parsed, "prod", "svc", RepairCode::EnvDefaulted),
+            1
         );
     }
 
@@ -1098,8 +1433,8 @@ mod tests {
         let parsed = parse_with(data, &["prod"], false).unwrap();
         assert_eq!(total_accepted(&parsed), 1);
         assert_eq!(
-            parsed.repairs.get(&("host.from_peer", "svc".to_string())),
-            Some(&1)
+            repairs_of(&parsed, "prod", "svc", RepairCode::HostFromPeer),
+            1
         );
     }
 
@@ -1253,20 +1588,40 @@ mod tests {
         assert_eq!(event["message"], "hello");
     }
 
-    /// The repair ledger counts per (code, service) across the batch.
+    /// Repairs are tallied per code within each `(env, service)` group, one
+    /// per event that earned the code.
     #[test]
     fn repairs_counted_per_code_and_service() {
-        let data = br#"{"service":"a","timestamp":"bad"}
-{"service":"a","timestamp":"also-bad"}
-{"service":"b","timestamp":"bad"}"#;
-        let parsed = parse(data).unwrap();
+        let data = br#"{"service":"a"}
+{"service":"a","Mixed":1}
+{"service":"b","env":"lab","host":"h","_time":"2026-01-01T00:00:00Z"}
+{"service":"b"}"#;
+        let parsed = parse_with(data, &["prod", "lab"], false).unwrap();
         assert_eq!(
-            parsed.repairs.get(&("time.from_ingest", "a".to_string())),
-            Some(&2)
+            repairs_of(&parsed, "prod", "a", RepairCode::TimeFromIngest),
+            2
         );
         assert_eq!(
-            parsed.repairs.get(&("time.from_ingest", "b".to_string())),
-            Some(&1)
+            repairs_of(&parsed, "prod", "a", RepairCode::EnvDefaulted),
+            2
+        );
+        assert_eq!(
+            repairs_of(&parsed, "prod", "a", RepairCode::HostFromPeer),
+            2
+        );
+        assert_eq!(
+            repairs_of(&parsed, "prod", "a", RepairCode::FieldNameCaseFolded),
+            1
+        );
+        assert_eq!(
+            repairs_of(&parsed, "prod", "b", RepairCode::TimeFromIngest),
+            1
+        );
+        assert!(
+            !parsed
+                .tallies
+                .contains_key(&("lab".to_owned(), "b".to_owned())),
+            "a clean group holds no tally"
         );
         assert_eq!(parsed.errors.len(), 0, "repair is not a rejection");
     }
@@ -1284,7 +1639,7 @@ mod tests {
             wal_event["_repairs"]
                 .as_str()
                 .unwrap()
-                .contains("time.from_ingest")
+                .contains("time.unparseable")
         );
         assert!(
             wal_event["_raw"].as_str().unwrap().contains("not-a-date"),

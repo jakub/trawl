@@ -45,20 +45,27 @@ are query aliases.
 | Name length | A name longer than 255 bytes drops its column (`field.name_too_long`) |
 | Nested values | An object or array becomes JSON text |
 | Reserved input name | The leading underscore run is stripped and the value lands under the bare remainder: `_HOSTNAME` becomes `hostname`, `__name__` becomes `name__` (`field.reserved_prefix`) |
-| All-underscore name | Dropped (`field.reserved_prefix`) |
+| All-underscore name | `_` or `___` has no remainder, so the field is dropped (`field.name_empty`) |
+| Stamp name | `_ingested`, `_repairs`, `_producer`, or `_trawl_wal_file`, matched after case folding. The value lands under the bare name unless the event already carries it, trawld's own stamp is unchanged, and the field records `field.stamp_claimed` instead of `field.reserved_prefix` |
 | Stripped name already present | The stripped loser is dropped (`field.reserved_prefix_collision`) |
 | `_raw` cap | 65536 Unicode characters. Truncation records `field.truncated` |
 
-A dropped field's name and value stay findable in `_raw`, up to the cap. Past
-that boundary they are not recoverable.
+A dropped field's name and value stay findable in the `_raw` that trawld
+captures, up to the cap. Past that boundary they are not recoverable. A
+sender-supplied string `_raw` replaces that capture, so it may not contain a
+dropped value.
 
 The reserved-name rule has two exceptions: the `_time` proposal that time
 derivation reads, and the `_raw` proposal the HTTP and syslog profiles may make.
 A proposed string `_raw` is kept verbatim to the cap. Otherwise trawld
 serializes the original object before repair and case folding, which is what
-telemetry always gets. A sender cannot forge any other slot: an input
-`_producer` or `_severity` lands as a bare `producer` or `severity`, and trawld
-writes the real one.
+telemetry always gets. A sender cannot forge any other slot. An input
+`_severity` lands as a bare `severity` with `field.reserved_prefix`, and
+derivation reads it when `severity` is in `[ingest] severity_from`, as it is by
+default. An input stamp name such as `_producer` lands as a bare `producer`
+with `field.stamp_claimed`, and trawld writes the real one. Either input is
+dropped instead, with `field.reserved_prefix_collision`, when the event already
+carries the bare name.
 
 | Name | Charset | Bounds |
 |------|---------|--------|
@@ -95,7 +102,8 @@ replace a fixed source.
 | Rule | Behavior |
 |------|----------|
 | Selection | The first source present wins, not the first parseable one |
-| No usable value | Arrival time, recorded as `time.from_ingest`. An invalid first value does not fall through to a later source |
+| No source present | Arrival time, recorded as `time.from_ingest` |
+| Unparseable first value | Arrival time, recorded as `time.unparseable`. An explicit `null` counts as present. The value does not fall through to a later source. Derivation leaves a bare source field in place. A `_time` proposal is consumed, and trawld keeps no copy of it outside `_raw`. A sender-supplied `_raw` replaces the one trawld would capture, so it may not contain the value |
 | Consumption | Only the `_time` proposal is consumed. Every bare source field stays in the event |
 | Normalization | RFC 3339 UTC at microsecond precision |
 | Plausibility | A parseable time more than ten years before arrival, or more than one day after it, is kept and flagged `time.out_of_range` |
@@ -186,21 +194,27 @@ code. See [catalog conformance](/architecture/catalog/).
 `_repairs` carries each applicable code once, separated by commas. Deriving a
 value is not a repair. Repair metrics use the same vocabulary.
 
-| Code | What happened |
-|------|---------------|
-| `host.from_peer` | A missing host was filled from an honest peer address |
-| `host.omitted` | A profile kept the event with no honest host value |
-| `env.defaulted` | A missing environment used `[ingest] default_env` |
-| `service.from_profile` | A profile used its service default after an unusable frame service |
-| `time.from_ingest` | Event time was missing or invalid, so arrival time was used |
-| `time.out_of_range` | A parseable event time was kept outside the plausibility window |
-| `field.truncated` | `_raw` exceeded its character cap |
-| `field.reserved_prefix` | A reserved prefix was stripped, or an all-underscore name was dropped |
-| `field.reserved_prefix_collision` | A stripped name collided with an existing bare name |
-| `field.name_too_long` | A field name exceeded 255 bytes and its column was dropped |
-| `field.name_case_folded` | A field name changed to ASCII lowercase |
-| `field.name_case_collision` | Two names differed only in ASCII case, and the losing one was dropped |
-| `field.producer_asserted` | A profile's asserted identity displaced a conflicting payload value |
+A routine repair fills an absence or adapts a name without loss and needs no
+action. An actionable repair means someone should inspect the sender.
+
+| Code | Class | What happened |
+|------|-------|---------------|
+| `host.from_peer` | routine | A missing host was filled from an honest peer address |
+| `host.omitted` | routine | A profile kept the event with no honest host value |
+| `env.defaulted` | routine | A missing environment used `[ingest] default_env` |
+| `service.from_profile` | actionable | A profile used its service default after an unusable frame service |
+| `time.from_ingest` | routine | No configured time source was present, so arrival time was used |
+| `time.unparseable` | actionable | The first present time source did not parse, so arrival time was used |
+| `time.out_of_range` | actionable | A parseable event time was kept outside the plausibility window |
+| `field.truncated` | actionable | `_raw` exceeded its character cap |
+| `field.reserved_prefix` | routine | A reserved prefix was stripped |
+| `field.name_empty` | actionable | A name made only of underscores was dropped |
+| `field.stamp_claimed` | actionable | A sender sent one of trawl's stamp names. It was stripped to the bare name, or dropped when that name was taken |
+| `field.reserved_prefix_collision` | actionable | A stripped name collided with an existing bare name |
+| `field.name_too_long` | actionable | A field name exceeded 255 bytes and its column was dropped |
+| `field.name_case_folded` | routine | A field name changed to ASCII lowercase |
+| `field.name_case_collision` | actionable | Two names differed only in ASCII case, and the losing one was dropped |
+| `field.producer_asserted` | actionable | A profile's asserted identity displaced a conflicting payload value |
 
 ## Rejection reasons
 

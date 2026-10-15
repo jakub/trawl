@@ -62,7 +62,7 @@ trawld fills or refuses the envelope fields as follows:
 | `service` | Rejects the event when it is missing, empty, or outside the service charset. |
 | `env` | Fills `[ingest] default_env` and records `env.defaulted` when missing. Rejects a value that is not in `envs`. |
 | `host` | Fills the peer address and records `host.from_peer` when missing. Rejects a missing host when the peer is in `[ingest] trusted_relays`. |
-| `_time` | Reads `_time`, `timestamp`, and `@timestamp`, first present. Uses arrival time and records `time.from_ingest` when none parses. |
+| `_time` | Reads the `[ingest] time_from` sources, first present: `_time`, `timestamp`, and `@timestamp` by default. Uses arrival time when none is present, and records `time.from_ingest`. Uses arrival time when the first present value does not parse, and records `time.unparseable`. |
 | `_severity` | Reads `severity`, `severity_text`, and `level`, first mappable. Leaves `_severity` absent when none maps. |
 
 The body limit is `[ingest] max_body_bytes`, 16M by default, and
@@ -71,6 +71,31 @@ once decoded, or trawld answers 413. Each key gets
 `[server.rate_limit] ingest_rpm` requests per minute on this route, 1000 by
 default. For journald and file logs, follow
 [Ship logs with Vector](/getting-started/vector-integration/).
+
+### Find senders that repair events
+
+Every repair code has a class. A routine repair fills an absence or adapts a
+name without loss, such as `env.defaulted` or `time.from_ingest`, and needs no
+action. An actionable repair means you should inspect the sender, such as
+`time.unparseable` or `field.truncated`. It does not mean the sender is at
+fault. The [repair codes table](/reference/events/#repair-codes) gives the
+class of each code.
+
+trawld writes one `ingest_complete` line for each finalized ingest request. It
+carries the key's `key_id` and `user`, and counts the repairs by class and by
+code. To total them for each key over the last hour, run:
+
+```bash
+trawl -p prod query 'service=trawld _producer=trawld event_type=ingest_complete repairs>0 last=1h | stats sum(repairs_routine), sum(repairs_actionable) by key_id, user'
+```
+
+A request with at least one actionable repair also writes an `ingest_repairs`
+warning. Routine repairs write no warning. To act on the warning, see
+[Ingest repairs needing inspection](/operate/operational-alerts/#ingest-repairs-needing-inspection).
+
+The warning is not rate limited. The per-key `[server.rate_limit] ingest_rpm`
+limit bounds it, one warning per request, and only while that limit is on.
+`ingest_rpm = 0`, or a role override, turns the limit off or raises it.
 
 ### Keep each batch under the admission ceiling
 

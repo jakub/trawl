@@ -65,3 +65,38 @@ fn repair_table_matches_every_repair_code() {
     let code: Vec<&'static str> = RepairCode::ALL.iter().map(|r| r.as_str()).collect();
     assert_same("## Repair codes", &table_codes("## Repair codes"), &code);
 }
+
+/// The class cell of each repair row, keyed by code: the second cell of every
+/// row whose first cell is one backticked code.
+fn repair_classes() -> Vec<(&'static str, &'static str)> {
+    let start = EVENTS
+        .find("\n## Repair codes\n")
+        .expect("the events reference has a repair codes section");
+    let section = &EVENTS[start + "## Repair codes".len() + 2..];
+    let section = &section[..section.find("\n## ").unwrap_or(section.len())];
+    section
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|rest| rest.split_once("` |"))
+        .map(|(code, rest)| {
+            let class = rest.split('|').next().unwrap_or("").trim();
+            (code, class)
+        })
+        .collect()
+}
+
+#[test]
+fn repair_table_class_column_matches_every_code_class() {
+    let documented = repair_classes();
+    for code in RepairCode::ALL {
+        let row = documented
+            .iter()
+            .find(|(wire, _)| *wire == code.as_str())
+            .unwrap_or_else(|| panic!("no repair row for {code}"));
+        assert_eq!(
+            row.1,
+            code.class().as_str(),
+            "the Class cell of {code} drifted from RepairCode::class"
+        );
+    }
+}

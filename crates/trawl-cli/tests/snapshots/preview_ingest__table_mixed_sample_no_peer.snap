@@ -9,7 +9,7 @@ peer 192.0.2.1 (placeholder, no --peer-ip given; an event without a host depends
 │ 0     ┆ accepted ┆ prod ┆ api     ┆ web-1              ┆ 2026-01-01T10:00:00.000000Z (_time) ┆ warn (level)        ┆ -                      ┆ -                                                             │
 ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ 1     ┆ accepted ┆ prod ┆ worker  ┆ 192.0.2.1 (sender) ┆ arrival (bad timestamp)             ┆ error (level)       ┆ field.name_case_folded ┆ Level → level                                                 │
-│       ┆          ┆      ┆         ┆                    ┆                                     ┆                     ┆ time.from_ingest       ┆ ctx stringified                                               │
+│       ┆          ┆      ┆         ┆                    ┆                                     ┆                     ┆ time.unparseable       ┆ ctx stringified                                               │
 │       ┆          ┆      ┆         ┆                    ┆                                     ┆                     ┆ env.defaulted          ┆                                                               │
 │       ┆          ┆      ┆         ┆                    ┆                                     ┆                     ┆ host.from_peer         ┆                                                               │
 ├╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤

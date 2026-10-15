@@ -5,9 +5,12 @@
 //! End-to-end tests for malformed-time handling (ADR-0008): every bad-time
 //! variant ingests through the real handler, is queryable from the hot
 //! buffer, compacts to parquet without wedging, and stays queryable, with
-//! `_time` set to the arrival time, the `time.from_ingest` code in
-//! `_repairs`, and the original value findable in `_raw`. Canonicalization
-//! of a valid timestamp is covered at the API level too.
+//! `_time` set to the arrival time, the original value findable in `_raw`,
+//! and `_repairs` naming why (ADR-0013, 2026-10-14 amendment):
+//! `time.unparseable` when the first present source failed to parse, a
+//! JSON `null` included, and `time.from_ingest` when no source was
+//! present. Canonicalization of a valid timestamp is covered at the API
+//! level too.
 
 mod common;
 
@@ -28,9 +31,11 @@ fn first_row_string(result: &trawl_api::value::QueryResult, column: &str) -> Opt
     }
 }
 
-/// All four trigger variants from the issue: ingested via the handler,
-/// visible in the hot buffer, compacted without errors, and returned by a
-/// `last=1h` query afterwards — original preserved, timestamp at arrival.
+/// The four unparseable trigger variants, a `_time: null` that hides a
+/// valid `timestamp`, and an event with no time source at all: ingested
+/// via the handler, visible in the hot buffer, compacted without errors,
+/// and returned by a `last=1h` query afterwards — original preserved,
+/// timestamp at arrival, and the code telling the two causes apart.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
 async fn trigger_variants_survive_ingest_compact_query() {
@@ -48,23 +53,48 @@ async fn trigger_variants_survive_ingest_compact_query() {
     let ingest_client = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query_client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // (payload, substring of the original that must be findable in _raw)
-    let variants: Vec<(serde_json::Value, &str)> = vec![
-        (json!("not-a-date"), "not-a-date"),
-        (json!("2026-13-45T99:99:99Z"), "2026-13-45T99:99:99Z"),
-        (json!({"nested": 1}), r#"{"nested":1}"#),
-        (json!(12345), "12345"),
+    // (time fields, the repair code, a substring of the original that
+    // must be findable in _raw)
+    let variants: Vec<(serde_json::Value, &str, &str)> = vec![
+        (
+            json!({"timestamp": "not-a-date"}),
+            "time.unparseable",
+            "not-a-date",
+        ),
+        (
+            json!({"timestamp": "2026-13-45T99:99:99Z"}),
+            "time.unparseable",
+            "2026-13-45T99:99:99Z",
+        ),
+        (
+            json!({"timestamp": {"nested": 1}}),
+            "time.unparseable",
+            r#"{"nested":1}"#,
+        ),
+        (json!({"timestamp": 12345}), "time.unparseable", "12345"),
+        // A present null claims the derivation and hides the valid
+        // lower-precedence source, which stays an ordinary column.
+        (
+            json!({"_time": null, "timestamp": "2026-01-01T00:00:00Z"}),
+            "time.unparseable",
+            r#""_time":null"#,
+        ),
+        // No source at all.
+        (json!({}), "time.from_ingest", "variant 5"),
     ];
 
     let before_ingest = chrono::Utc::now() - chrono::Duration::minutes(1);
-    for (i, (bad, _)) in variants.iter().enumerate() {
-        let record = json!({
+    for (i, (time_fields, _, _)) in variants.iter().enumerate() {
+        let mut record = json!({
             "service": format!("svc{i}"),
             "env": "prod",
             "host": "web01",
-            "timestamp": bad,
             "message": format!("variant {i}"),
         });
+        let fields = record.as_object_mut().unwrap();
+        for (k, v) in time_fields.as_object().unwrap() {
+            fields.insert(k.clone(), v.clone());
+        }
         let resp = ingest_client.ingest(&[record]).await.expect("ingest ok");
         assert_eq!(resp.accepted, 1, "variant {i} must be accepted");
         assert_eq!(resp.rejected, 0, "variant {i} must not be rejected");
@@ -72,7 +102,7 @@ async fn trigger_variants_survive_ingest_compact_query() {
     let after_ingest = chrono::Utc::now() + chrono::Duration::minutes(1);
 
     // Phase 1: hot buffer, visible to a last=1h query before compaction.
-    for (i, (bad, preserved)) in variants.iter().enumerate() {
+    for (i, (bad, code, preserved)) in variants.iter().enumerate() {
         let result = query_client
             .query_paginated(&format!("service=svc{i} last=1h"), None, None)
             .await
@@ -84,7 +114,7 @@ async fn trigger_variants_survive_ingest_compact_query() {
         );
         assert_eq!(
             first_row_string(&result.result, "_repairs").as_deref(),
-            Some("time.from_ingest"),
+            Some(*code),
             "variant {bad}: the repair must be recorded (hot)"
         );
         let raw = first_row_string(&result.result, "_raw")
@@ -126,7 +156,7 @@ async fn trigger_variants_survive_ingest_compact_query() {
 
     // Phase 3: parquet — still returned by a last=1h query, original still
     // preserved, timestamp at arrival time.
-    for (i, (bad, preserved)) in variants.iter().enumerate() {
+    for (i, (bad, code, preserved)) in variants.iter().enumerate() {
         let result = query_client
             .query_paginated(&format!("service=svc{i} last=1h"), None, None)
             .await
@@ -138,7 +168,7 @@ async fn trigger_variants_survive_ingest_compact_query() {
         );
         assert_eq!(
             first_row_string(&result.result, "_repairs").as_deref(),
-            Some("time.from_ingest"),
+            Some(*code),
             "variant {bad}: the repair must be recorded (parquet)"
         );
         let raw = first_row_string(&result.result, "_raw")
