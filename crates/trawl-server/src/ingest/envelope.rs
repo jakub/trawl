@@ -61,6 +61,11 @@ wire_enum! {
     /// What the server changed about an accepted event — a closed enum, same
     /// principle as ADR-0006's "roles are data, permissions are code": codes
     /// are code, so `_repairs` cannot become a junk drawer.
+    ///
+    /// "Findable in `_raw`" below means the `_raw` trawld captures, up to its
+    /// cap. On a door that admits the proposal, a sender-supplied string
+    /// `_raw` replaces that capture (see `capture_raw`), so a dropped value
+    /// may survive nowhere.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum RepairCode {
         /// `host` was missing; filled from the sender IP.
@@ -814,7 +819,7 @@ fn is_proposable(key: &str, value: &Value, raw_proposable: bool) -> bool {
 ///
 /// - the bare remainder is empty (`_`, `___`): there is no name to store
 ///   under, so the field is dropped with `field.name_empty` alone — its
-///   value is still in `_raw`;
+///   value survives only in `_raw`, under the caveat on [`RepairCode`];
 /// - the bare name already exists in this event: the prefixed loser is
 ///   dropped (`field.reserved_prefix_collision`), the same tiebreak the
 ///   case-fold uses, and the key still earns its own code;
@@ -841,8 +846,8 @@ fn strip_reserved_prefixes(
         let value = out.remove(&key).expect("key came from this map");
         let bare = key.trim_start_matches('_');
         if bare.is_empty() {
-            // No name to store under: drop the value. `_raw` still
-            // carries it.
+            // No name to store under: drop the value. Only a captured
+            // `_raw` still carries it (see the caveat on `RepairCode`).
             strip.name_empty = true;
             changes.push(FieldChange {
                 field: key,

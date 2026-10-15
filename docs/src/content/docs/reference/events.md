@@ -46,12 +46,14 @@ are query aliases.
 | Nested values | An object or array becomes JSON text |
 | Reserved input name | The leading underscore run is stripped and the value lands under the bare remainder: `_HOSTNAME` becomes `hostname`, `__name__` becomes `name__` (`field.reserved_prefix`) |
 | All-underscore name | `_` or `___` has no remainder, so the field is dropped (`field.name_empty`) |
-| Stamp name | `_ingested`, `_repairs`, `_producer`, or `_trawl_wal_file`, matched after case folding. The value lands under the bare name, trawld's own stamp is unchanged, and the field records `field.stamp_claimed` instead of `field.reserved_prefix` |
+| Stamp name | `_ingested`, `_repairs`, `_producer`, or `_trawl_wal_file`, matched after case folding. The value lands under the bare name unless the event already carries it, trawld's own stamp is unchanged, and the field records `field.stamp_claimed` instead of `field.reserved_prefix` |
 | Stripped name already present | The stripped loser is dropped (`field.reserved_prefix_collision`) |
 | `_raw` cap | 65536 Unicode characters. Truncation records `field.truncated` |
 
-A dropped field's name and value stay findable in `_raw`, up to the cap. Past
-that boundary they are not recoverable.
+A dropped field's name and value stay findable in the `_raw` that trawld
+captures, up to the cap. Past that boundary they are not recoverable. A
+sender-supplied string `_raw` replaces that capture, so it may not contain a
+dropped value.
 
 The reserved-name rule has two exceptions: the `_time` proposal that time
 derivation reads, and the `_raw` proposal the HTTP and syslog profiles may make.
