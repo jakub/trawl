@@ -1639,7 +1639,7 @@ mod tests {
             wal_event["_repairs"]
                 .as_str()
                 .unwrap()
-                .contains("time.from_ingest")
+                .contains("time.unparseable")
         );
         assert!(
             wal_event["_raw"].as_str().unwrap().contains("not-a-date"),
