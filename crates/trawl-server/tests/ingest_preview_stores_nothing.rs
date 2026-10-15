@@ -430,7 +430,7 @@ async fn send_canary_previews(server: &TestServer) -> Vec<String> {
         })
         .expect("a repaired event");
     for code in [
-        "time.from_ingest",
+        "time.unparseable",
         "host.from_peer",
         "field.reserved_prefix",
     ] {

@@ -1851,7 +1851,7 @@ async fn ingest_repairs_exposed_on_metrics() {
         .lines()
         .find(|l| {
             l.starts_with("trawl_ingest_repairs_total")
-                && l.contains("code=\"time.from_ingest\"")
+                && l.contains("code=\"time.unparseable\"")
                 && l.contains("service=\"repair-svc\"")
         })
         .unwrap_or_else(|| {

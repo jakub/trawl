@@ -352,6 +352,8 @@ fn the_http_profile_survives_a_hostile_corpus() {
         &seen,
         &[
             "field.reserved_prefix",
+            "field.name_empty",
+            "field.stamp_claimed",
             "field.name_case_folded",
             "field.name_too_long",
             "field.truncated",
@@ -454,6 +456,8 @@ fn the_syslog_profile_survives_hostile_frames_and_payloads() {
         &seen,
         &[
             "field.reserved_prefix",
+            "field.name_empty",
+            "field.stamp_claimed",
             "field.name_too_long",
             "field.truncated",
             "host.omitted",
@@ -562,6 +566,8 @@ fn the_trawld_profile_never_rejects_a_hostile_payload() {
         &[
             "field.producer_asserted",
             "field.reserved_prefix",
+            "field.name_empty",
+            "field.stamp_claimed",
             // A tracing field name past the catalog's key bound: it has to
             // be dropped at the door, never carried into compaction.
             "field.name_too_long",

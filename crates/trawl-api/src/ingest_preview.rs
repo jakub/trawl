@@ -147,7 +147,8 @@ pub enum TimeLineage {
         /// The source field.
         field: String,
     },
-    /// The arrival time filled `_time` (`time.from_ingest`).
+    /// The arrival time filled `_time`: `time.from_ingest` when no source
+    /// was present, `time.unparseable` when `unparseable` names one.
     Arrival {
         /// The first present source when it failed to parse; absent when no
         /// source was present.

@@ -319,7 +319,7 @@ async fn accepted_event_carries_canonical_event_repairs_and_lineage() {
     assert_eq!(event["level"], "warn");
     assert_eq!(event["_severity"], 13, "warn maps to OTel WARN");
     assert_eq!(event["_ingested"], report.arrival.as_str());
-    assert_eq!(event["_time"], report.arrival.as_str(), "time.from_ingest");
+    assert_eq!(event["_time"], report.arrival.as_str(), "time.unparseable");
     assert_eq!(event["ctx"], r#"{"a":1}"#, "nested value stringified");
     assert!(event.contains_key("_raw"));
     assert!(!event.contains_key("Ctx"));
@@ -335,7 +335,7 @@ async fn accepted_event_carries_canonical_event_repairs_and_lineage() {
     );
     for code in [
         "env.defaulted",
-        "time.from_ingest",
+        "time.unparseable",
         "field.name_case_folded",
     ] {
         assert!(repairs.iter().any(|r| r == code), "{code} in {repairs:?}");
@@ -885,6 +885,8 @@ fn plain_differential_body() -> String {
         json!({"id": "raw", "service": "diff", "host": "h1", "_raw": "r".repeat(70_000)}),
         json!({"id": "prefix", "service": "diff", "host": "h1", "_custom": "v", "_": "gone"}),
         json!({"id": "prefix-collision", "service": "diff", "host": "h1", "_dup": "a", "dup": "b"}),
+        json!({"id": "stamp", "service": "diff", "host": "h1", "_ingested": "forged",
+               "_repairs": "forged", "repairs": "mine"}),
         json!({"id": "too-long", "service": "diff", "host": "h1", long_name: 1}),
         json!({"id": "folded", "service": "diff", "host": "h1", "Ctx": {"a": [1, 2]},
                "Level": "warn"}),
@@ -1179,6 +1181,8 @@ async fn shipped_vector_capture_is_accepted_under_the_services_it_sent() {
             RepairCode::ServiceFromProfile,
             RepairCode::FieldNameCaseCollision,
             RepairCode::ReservedPrefix,
+            RepairCode::FieldNameEmpty,
+            RepairCode::FieldStampClaimed,
             RepairCode::ReservedPrefixCollision,
         ] {
             assert!(
