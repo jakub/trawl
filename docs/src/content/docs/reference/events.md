@@ -98,7 +98,7 @@ replace a fixed source.
 |------|----------|
 | Selection | The first source present wins, not the first parseable one |
 | No source present | Arrival time, recorded as `time.from_ingest` |
-| Unparseable first value | Arrival time, recorded as `time.unparseable`. An explicit `null` counts as present. The value does not fall through to a later source. A bare source field keeps the value under its own name. A `_time` proposal is consumed, so its original value is findable only in `_raw` |
+| Unparseable first value | Arrival time, recorded as `time.unparseable`. An explicit `null` counts as present. The value does not fall through to a later source. A bare source field keeps the value under its own name. A `_time` proposal is consumed, and trawld keeps no copy of it outside `_raw`. A sender-supplied `_raw` replaces the one trawld would capture, so it may not contain the value |
 | Consumption | Only the `_time` proposal is consumed. Every bare source field stays in the event |
 | Normalization | RFC 3339 UTC at microsecond precision |
 | Plausibility | A parseable time more than ten years before arrival, or more than one day after it, is kept and flagged `time.out_of_range` |

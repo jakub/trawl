@@ -71,8 +71,8 @@ wire_enum! {
         TimeFromIngest => "time.from_ingest",
         /// the first present `_time` source failed to parse (a JSON `null`
         /// counts as present); used arrival time. A bare source keeps the value
-        /// under its own field; a `_time` proposal is consumed, so its value
-        /// survives only in `_raw`.
+        /// under its own field. A `_time` proposal is consumed, and trawld
+        /// keeps no copy of it outside `_raw`.
         TimeUnparseable => "time.unparseable",
         /// `_time` was implausible (>10y past / >1d future); kept, but flagged.
         TimeOutOfRange => "time.out_of_range",
