@@ -464,8 +464,8 @@ WAL write failed is unacknowledged and adds nothing to it.
    and the field that caused them. It stores nothing and logs nothing.
 4. Fix the sender, then preview again until the codes are gone. A
    `field.stamp_claimed` repair means the sender sent one of `_ingested`,
-   `_repairs`, `_producer`, or `_trawl_wal_file`. trawld discards that value
-   and keeps its own stamp.
+   `_repairs`, `_producer`, or `_trawl_wal_file`. trawld keeps its own stamp
+   and stores the sender's value under the bare name, such as `ingested`.
 
 The warning is not rate limited. Each key's `[server.rate_limit] ingest_rpm`
 limit bounds it, one warning per request, only while that limit is on.
