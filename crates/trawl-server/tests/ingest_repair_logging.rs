@@ -677,6 +677,70 @@ async fn detail_is_bounded_and_totals_stay_exact() {
     );
 }
 
+/// More than eight actionable pairs: the WARN's own detail is bounded, its
+/// omitted counts are exact and nonzero, and a one-off actionable code past
+/// the bound stays in its per-code totals.
+#[tokio::test(flavor = "multi_thread")]
+async fn actionable_detail_is_bounded_and_totals_stay_exact() {
+    sinks();
+    let server = common::setup().await;
+    let (token, _) = mint(&server, "actionable-bounded-sender").await;
+    // Service s{i} sends 10 - i ancient events, each earning only
+    // `time.out_of_range`; s09's one event also carries a name too long.
+    let mut events = Vec::new();
+    for index in 0..10_u64 {
+        let service = format!("rl-abound-s{index:02}");
+        for _ in 0..10 - index {
+            let mut event = addressed(&service);
+            event["_time"] = json!(ANCIENT);
+            events.push(event);
+        }
+    }
+    events.last_mut().unwrap()[long_name()] = json!(1);
+    let (status, request_id) = post(&server, &token, &events).await;
+    assert_eq!(status, 200);
+
+    // 55 time.out_of_range + 1 field.name_too_long, over 11 pairs. The eight
+    // listed hold 52 occurrences; s08's 2 and s09's two 1s are omitted.
+    let detail = "rl-abound-s00/time.out_of_range:10, rl-abound-s01/time.out_of_range:9, \
+                  rl-abound-s02/time.out_of_range:8, rl-abound-s03/time.out_of_range:7, \
+                  rl-abound-s04/time.out_of_range:6, rl-abound-s05/time.out_of_range:5, \
+                  rl-abound-s06/time.out_of_range:4, rl-abound-s07/time.out_of_range:3";
+    let (line, record) = one_line(&request_id, REPAIRS, "WARN");
+    assert_fields(
+        &line,
+        &record,
+        &[
+            ("repairs_actionable", "56"),
+            ("repairs_routine", "0"),
+            (
+                "actionable_codes",
+                "time.out_of_range:55, field.name_too_long:1",
+            ),
+            ("actionable_detail", detail),
+            ("actionable_detail_omitted_pairs", "3"),
+            ("actionable_detail_omitted_occurrences", "4"),
+        ],
+    );
+
+    let (line, record) = one_line(&request_id, COMPLETE, "INFO");
+    assert_fields(
+        &line,
+        &record,
+        &[
+            ("accepted", "55"),
+            ("repairs", "56"),
+            (
+                "repair_codes",
+                "time.out_of_range:55, field.name_too_long:1",
+            ),
+            ("repair_detail", detail),
+            ("repair_detail_omitted_pairs", "3"),
+            ("repair_detail_omitted_occurrences", "4"),
+        ],
+    );
+}
+
 /// Two keys with one display name and a third flooding actionable repairs,
 /// sending at once: every line names the key that sent it, and each
 /// actionable request has its own WARN.
