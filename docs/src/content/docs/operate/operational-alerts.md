@@ -426,6 +426,52 @@ Resolution means no new refusals were observed in the window. It does not
 recover refused events. Resend them from the sender's own copy, if it keeps
 one.
 
+## Ingest repairs needing inspection
+
+No alert rule covers this case. trawld writes an `ingest_repairs` warning for
+each HTTP ingest request that stored at least one event with an actionable
+repair. An actionable repair means you should inspect the sender. It does not
+mean the sender is at fault or hostile, and it does not mean data was lost.
+For example, `time.unparseable` stored the event at its arrival time, and
+`time.out_of_range` kept the value it flagged. Routine repairs, such as
+`env.defaulted` and `host.from_peer`, write no warning. The
+[repair codes table](/reference/events/#repair-codes) gives the class of each
+code. The warning counts only events that trawld acknowledged. A group whose
+WAL write failed is unacknowledged and adds nothing to it.
+
+1. Read the codes. `actionable_codes` counts the actionable repairs by code,
+   such as `time.unparseable:3`. `repairs_actionable` is their total, and
+   `repairs_routine` counts the routine repairs in the same request. Each
+   count is an occurrence of a code on an event, not a count of events.
+2. Find the sender. `user` is the display name of the key that sent the
+   request, and `key_id` is its stable id. Two keys can share a display name,
+   so group by `key_id`. `actionable_detail` lists up to eight
+   `service/code:count` pairs, highest count first.
+   `actionable_detail_omitted_pairs` and
+   `actionable_detail_omitted_occurrences` count what the list left out.
+   When `[ingest] internal_telemetry` is on, the default, trawld stores the
+   warning as its own telemetry. Set `TRAWL_PROFILE` to a CLI profile whose
+   key has `trawl:query`, then search for it:
+
+   ```bash
+   trawl -p "$TRAWL_PROFILE" query 'service=trawld _producer=trawld event_type=ingest_repairs last=1h | table _time, user, key_id, repairs_actionable, actionable_codes, actionable_detail'
+   ```
+
+   With internal telemetry off, read the warning in the daemon output, as in
+   [Inspect the affected target](#inspect-the-affected-target).
+3. Run an [ingest preview](/operate/ingestion/#ingest-preview) on a sample of
+   what the sender sends. The preview shows the repair codes for each event
+   and the field that caused them. It stores nothing and logs nothing.
+4. Fix the sender, then preview again until the codes are gone. A
+   `field.stamp_claimed` repair means the sender sent one of `_ingested`,
+   `_repairs`, `_producer`, or `_trawl_wal_file`. trawld discards that value
+   and keeps its own stamp.
+
+The warning is not rate limited. Each key's `[server.rate_limit] ingest_rpm`
+limit bounds it, one warning per request, only while that limit is on.
+Resolution means no new warnings in the window. The repaired events stay
+stored, with their codes in `_repairs`.
+
 ## Telemetry WAL write failure
 
 `TrawlTelemetryWalWriteFailure` observes

@@ -410,8 +410,10 @@ nothing.
    is rejected. It exits `2` when it gets no report, for example when the key
    lacks the permission. Look at each rejected row's reason, and at the repairs and
    the `_time` and `_severity` sources of the accepted rows. For example, a
-   `_time` of `arrival (bad timestamp)`, with the `time.from_ingest` repair,
+   `_time` of `arrival (bad timestamp)`, with the `time.unparseable` repair,
    means that `timestamp` did not parse, so trawld would use the arrival time.
+   A `_time` of `arrival` with `time.from_ingest` means the event sent no
+   timestamp at all.
    Fix the configuration and capture again until the
    preview shows what you expect. The shipped configuration sets `host` on
    every event, so the preview needs no `--peer-ip`.
@@ -915,7 +917,7 @@ reason and message, without waiting for the counter.
 | Vector logs `503` with the error code `request_limit_reached`, and `trawl_http_requests_refused_total` rises | trawld is at its `[server] max_concurrent_requests` limit and refused the request before it ran. Nothing was ingested. Vector retries with backoff, as it does for any `503`, including `hot_buffer_full`. If it persists, see [the request limit](/reference/configuration/#the-request-limit) before you raise the setting. |
 | Vector logs `413` | One request is too large, and Vector drops that batch. Lower the sink's `batch.max_bytes`. If `trawl_hot_buffer_admission_refusals_total{producer="http",kind="oversized"}` or the rejection counter with `reason="ingest_batch_too_large"` rises, the request holds more than the hot buffer admits at once. If neither rises, the body exceeds trawld's `[ingest] max_body_bytes`, as sent (code `request_too_large`) or once gzip is decoded. A decoded body over the limit logs `ingest_body_too_large` on trawld. |
 | Vector logs `500`, and `reason="wal_failure"` rises | trawld could not write its WAL. Vector retries. Check trawld's journal and the data directory's disk. |
-| The event arrives with `env.defaulted` in `_repairs` | The event arrived with no `env`, so trawld used `[ingest] default_env`. The shipped configuration always sends `env`, and an unset `TRAWL_ENV` sends `prod`. A custom transform dropped `.env`. Set `.env = "${TRAWL_ENV:-prod}"` in it. |
+| The event arrives with `env.defaulted` in `_repairs` | The event arrived with no `env`, so trawld used `[ingest] default_env`. This is valid server behavior, a routine repair that needs no action. From an unchanged shipped transform it is unexpected, because the shipped configuration always sends `env`, and an unset `TRAWL_ENV` sends `prod`. If you see it from an unchanged copy, compare the file against the shipped one. If a custom transform dropped `.env`, set `.env = "${TRAWL_ENV:-prod}"` in it. |
 | Vector logs a certificate verification or hostname error | trawld's generated certificate is valid only for `localhost`, `127.0.0.1`, and `::1`, so no other host can verify it. Give trawld a certificate for the `TRAWL_URL` hostname, as in [Configure TLS](/operate/access/#configure-tls). Get a private CA certificate over a channel you trust. A CA certificate fetched from the endpoint you are configuring proves nothing, because an attacker in the path serves their own. |
 | Vector logs a connection refused or timeout error | The host or port in `TRAWL_URL` is wrong, trawld is not running, or a firewall blocks the port. |
 

@@ -639,6 +639,10 @@ line that stored telemetry also keeps arrives twice: once with
 `service=trawld _producer=trawld` for stored telemetry, and
 `service=trawld _producer=http` for the stdout-only events above.
 
+The copy with `_producer=http` duplicates stored telemetry, including one
+`ingest_complete` line for each ingest request. Do not drop all of trawld's
+stdout to remove the duplicates, because some diagnostics reach stdout only.
+
 ## Enable the query debug log
 
 Use this log when you need the raw DSL, the generated SQL with its parameter
