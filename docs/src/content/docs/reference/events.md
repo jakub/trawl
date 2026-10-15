@@ -98,7 +98,7 @@ replace a fixed source.
 |------|----------|
 | Selection | The first source present wins, not the first parseable one |
 | No source present | Arrival time, recorded as `time.from_ingest` |
-| Unparseable first value | Arrival time, recorded as `time.unparseable`. An explicit `null` counts as present. The value does not fall through to a later source, and it stays in the event under its own name |
+| Unparseable first value | Arrival time, recorded as `time.unparseable`. An explicit `null` counts as present. The value does not fall through to a later source. A bare source field keeps the value under its own name. A `_time` proposal is consumed, so its original value is findable only in `_raw` |
 | Consumption | Only the `_time` proposal is consumed. Every bare source field stays in the event |
 | Normalization | RFC 3339 UTC at microsecond precision |
 | Plausibility | A parseable time more than ten years before arrival, or more than one day after it, is kept and flagged `time.out_of_range` |
