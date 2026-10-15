@@ -2119,12 +2119,28 @@ mod tests {
         assert!(codes(&c).contains(&"field.reserved_prefix"));
     }
 
+    /// The four stamp names the ADR-0013 amendment of 2026-10-14 lists,
+    /// spelled out here so the stamp tests do not take their cases from
+    /// [`trawl_core::schema::STAMP_NAMES`], the list under test.
+    const SPEC_STAMP_NAMES: [&str; 4] = ["_ingested", "_repairs", "_producer", "_trawl_wal_file"];
+
+    /// [`trawl_core::schema::STAMP_NAMES`] holds exactly the four names the
+    /// amendment lists, no more and no fewer.
+    #[test]
+    fn stamp_claimed_names_are_exactly_the_amendment_list() {
+        let mut listed: Vec<&str> = trawl_core::schema::STAMP_NAMES.to_vec();
+        listed.sort_unstable();
+        let mut spec = SPEC_STAMP_NAMES.to_vec();
+        spec.sort_unstable();
+        assert_eq!(listed, spec);
+    }
+
     /// Each stamp name earns `field.stamp_claimed` and not
     /// `field.reserved_prefix` (ADR-0013, 2026-10-14 amendment): the value
     /// lands under the bare name and the server's own stamp is untouched.
     #[test]
     fn each_stamp_name_is_stamp_claimed_not_reserved_prefix() {
-        for stamp in trawl_core::schema::STAMP_NAMES {
+        for stamp in SPEC_STAMP_NAMES {
             let c = canon(&format!(
                 r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","{stamp}":"forged"}}"#
             ));
@@ -2157,7 +2173,7 @@ mod tests {
     /// collides out, and still earns no `field.reserved_prefix`.
     #[test]
     fn a_stamp_claimed_over_a_present_bare_name_also_collides() {
-        for stamp in trawl_core::schema::STAMP_NAMES {
+        for stamp in SPEC_STAMP_NAMES {
             let bare = stamp.trim_start_matches('_');
             let c = canon(&format!(
                 r#"{{"service":"s","env":"prod","host":"h","_time":"2025-12-31T23:00:00Z","{stamp}":"forged","{bare}":"mine"}}"#
