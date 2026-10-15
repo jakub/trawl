@@ -1,6 +1,6 @@
 # A declared event schema, and a catalog that makes column types authoritative at write time
 
-status: accepted (2026-07-29), amended (2026-07-29) after adversarial review, amended (2026-08-03) after the slice-2 implementation review — see Amendments
+status: accepted (2026-07-29), amended (2026-07-29) after adversarial review, amended (2026-08-03) after the slice-2 implementation review — see Amendments; amended (2026-10-14): repair classes and request logging, prep record for #302
 
 trawl has no data model. `validate_event` requires exactly one field — `service` —
 and every other top-level JSON key becomes a physical parquet column whose type
@@ -416,3 +416,16 @@ the bundled DuckDB 1.5.5 and are pinned in
   both in place the read-side case-variant defences (the pin cache's
   VARCHAR degrade, the emitter's runtime fold) are deleted rather than
   kept as dead code.
+
+## Amendment (2026-10-14): repair classes and request logging
+
+The "complete ingest-time set" in the `_repairs` decision is out of date.
+`severity.unmapped` left `_repairs` under ADR-0013 §8. The current closed set
+is `RepairCode::ALL` in `crates/trawl-server/src/ingest/envelope.rs`, and the
+Repair codes table in `docs/src/content/docs/reference/events.md` lists it,
+with a test that keeps the two equal. ADR-0055 gives each code a class,
+routine or actionable, and adds `time.unparseable`, `field.name_empty` and
+`field.stamp_claimed`. `env.defaulted` stays the intended zero-config path
+and is routine. ADR-0055 also decides how trawld logs repairs per ingest
+request and how the repair metric counts a request whose WAL write partly
+failed. `trawl_ingest_repairs_total{code, service}` keeps its labels.

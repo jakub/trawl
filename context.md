@@ -299,8 +299,16 @@ Refuse a whole event at ingest, with a typed reason. Nothing lands.
 _Avoid_: drop, discard
 
 **Repair**:
-Alter an event at ingest where the server has an honest answer, recording a code in `_repairs`. The event lands, with a scar.
+Alter an event at ingest where the server has an honest answer. The event lands, and `_repairs` records what changed. A repair is never a finding of sender fault or intent.
 _Avoid_: fix up, coerce
+
+**Routine repair**:
+A repair that fills an absence or adapts a name without loss, as the contract intends. It needs no action.
+_Avoid_: expected repair, harmless repair
+
+**Actionable repair**:
+A repair that means someone should inspect the sender: a sent value was dropped, cut, replaced or flagged as implausible, a field conflicted with an asserted value, or the sender claimed one of trawl's stamps.
+_Avoid_: bad repair, data-loss repair, tampering
 
 **Drop**:
 Discard one field at ingest; the rest of the event lands, and the field's name and value stay findable in `_raw`.

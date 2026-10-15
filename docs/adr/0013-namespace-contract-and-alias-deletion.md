@@ -1,7 +1,8 @@
 # The namespace contract: two namespaces, observe-don't-consume, zero aliases
 
 status: accepted (2026-08-14) — prep ruling record for #60; slice 1 is #60,
-slice 2 is the producer-profile/operator-surface issue filed beside it
+slice 2 is the producer-profile/operator-surface issue filed beside it; amended (2026-10-08): status-only collectors; amended (2026-10-14):
+repair classes and three split codes, prep record for #302, see the Amendment
 
 ADR-0009 declared the event envelope and made ingest canonicalize into it, but
 it inherited a rule trawl never wrote down and then broke: a name that ingest
@@ -449,3 +450,42 @@ per-event rejection and its 200 response. For the configs trawl ships, trawl
 owns validity at the sender instead: ADR-0053 makes every shipped
 transform that derives `service` send only names trawld accepts, and the
 per-event rejection alert of ADR-0034 reports the senders it does not cover.
+
+## Amendment: repair classes and three split codes, 2026-10-14
+
+ADR-0055 gives every repair code a class, routine or actionable, read from the
+code alone. Three codes in §3, §5 and §8 each covered a routine case and an
+actionable case, so each one splits.
+
+**`_time`.** `time.from_ingest` now means that no configured time source was
+present. When the first present source fails to parse, the event earns
+`time.unparseable` instead. An explicit `null` counts as present, so a
+`_time: null` that hides a valid lower-precedence source also earns
+`time.unparseable`. First-present precedence and the arrival-time substitution
+do not change. The §3 row for `_time` reads: absent → arrival +
+`time.from_ingest`; unparseable → arrival + `time.unparseable`; implausible →
+kept + `time.out_of_range`.
+
+**Empty names.** A reserved name with no remainder (`_`, `___`) is still
+dropped, and its value stays findable in `_raw`. It now earns
+`field.name_empty` instead of `field.reserved_prefix`.
+
+**Stamp claims.** The stamp names are `_ingested`, `_repairs`, `_producer` and
+`_trawl_wal_file`. An incoming field with one of these names is still stripped
+under §5, and the server's stamp still wins. That field earns
+`field.stamp_claimed` instead of `field.reserved_prefix`. If the bare name
+already exists in the event, it also earns `field.reserved_prefix_collision`.
+The rule is the same on every door. `_severity` is not a stamp name. Its strip
+to bare `severity` is the documented OTel adaptation and stays
+`field.reserved_prefix`, as do a non-string `_raw` and any other `_x`. One
+list beside the schema constants holds the stamp names. A contract test makes
+every trawl-owned `_` name declare itself proposable, derivation-only or a
+stamp name, so a new slot cannot skip the decision.
+
+**§8 taxonomy.** The three families stay as they are, and the class is a
+second, independent axis. Routine: `env.defaulted`, `host.from_peer`,
+`host.omitted`, `time.from_ingest`, `field.name_case_folded`,
+`field.reserved_prefix`. Actionable: `time.unparseable`, `time.out_of_range`,
+`field.truncated`, `field.name_too_long`, `field.name_empty`,
+`field.name_case_collision`, `field.reserved_prefix_collision`,
+`field.stamp_claimed`, `field.producer_asserted`, `service.from_profile`.
