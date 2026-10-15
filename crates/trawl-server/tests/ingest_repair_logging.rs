@@ -209,11 +209,36 @@ fn assert_no_repair_warning(request_id: &str) {
     assert!(persisted.is_empty(), "{persisted:#?}");
 }
 
+/// The repair fields logged as integers. Persisted telemetry pins a field's
+/// type, so each must reach stdout unquoted and the record as a number.
+const NUMERIC_FIELDS: &[&str] = &[
+    "key_id",
+    "repairs",
+    "repairs_routine",
+    "repairs_actionable",
+    "repair_detail_omitted_pairs",
+    "repair_detail_omitted_occurrences",
+    "actionable_detail_omitted_pairs",
+    "actionable_detail_omitted_occurrences",
+];
+
 /// Each `(field, value)` holds on the stdout line and on the persisted
-/// record alike.
+/// record alike, and each of [`NUMERIC_FIELDS`] keeps its integer type.
 fn assert_fields(line: &str, record: &Value, expected: &[(&str, &str)]) {
     for (name, want) in expected {
         assert_eq!(field(line, name).as_deref(), Some(*want), "{name}: {line}");
+        if NUMERIC_FIELDS.contains(name) {
+            assert!(
+                !line.contains(&format!("{name}=\"")),
+                "{name} is quoted on stdout: {line}"
+            );
+            let integer = if *name == "key_id" {
+                record[*name].is_i64()
+            } else {
+                record[*name].is_u64()
+            };
+            assert!(integer, "{name} is not persisted as an integer: {record}");
+        }
         let stored = match &record[*name] {
             Value::String(text) => text.clone(),
             Value::Null => panic!("{name} is not persisted: {record}"),
@@ -327,6 +352,18 @@ const ANCIENT: &str = "2001-02-03T04:05:06Z";
 /// A field name past `MAX_FIELD_NAME_BYTES`: earns `field.name_too_long`.
 fn long_name() -> String {
     "n".repeat(300)
+}
+
+/// A counter stored as a string fails [`assert_fields`], so the integer
+/// fields cannot regress to text while the value assertions stay green.
+#[test]
+#[should_panic(expected = "not persisted as an integer")]
+fn assert_fields_rejects_a_counter_stored_as_text() {
+    assert_fields(
+        "x{repairs_actionable=3}",
+        &json!({ "repairs_actionable": "3" }),
+        &[("repairs_actionable", "3")],
+    );
 }
 
 /// No `env`, `host` or time field: `env.defaulted`, `host.from_peer` and
