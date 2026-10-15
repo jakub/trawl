@@ -61,7 +61,7 @@ wire_enum! {
     /// What the server changed about an accepted event — a closed enum, same
     /// principle as ADR-0006's "roles are data, permissions are code": codes
     /// are code, so `_repairs` cannot become a junk drawer.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum RepairCode {
         /// `host` was missing; filled from the sender IP.
         HostFromPeer => "host.from_peer",
@@ -124,6 +124,42 @@ wire_enum! {
 impl fmt::Display for RepairCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+wire_enum! {
+    /// Whether a repair needs anyone to look at the sender (ADR-0055).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum RepairClass {
+        /// the contract working as designed: an absence was filled or a name
+        /// adapted without loss.
+        Routine => "routine",
+        /// someone should inspect the sender: a value was dropped, cut,
+        /// replaced or flagged as implausible, or a field conflicted with an
+        /// asserted value.
+        Actionable => "actionable",
+    }
+}
+
+impl RepairCode {
+    /// The code's class (ADR-0055). One exhaustive match with no wildcard
+    /// arm, so a new code cannot compile without choosing a class.
+    pub const fn class(self) -> RepairClass {
+        match self {
+            Self::HostFromPeer
+            | Self::EnvDefaulted
+            | Self::HostOmitted
+            | Self::TimeFromIngest
+            | Self::ReservedPrefix
+            | Self::FieldNameCaseFolded => RepairClass::Routine,
+            Self::TimeOutOfRange
+            | Self::FieldTruncated
+            | Self::ReservedPrefixCollision
+            | Self::FieldNameTooLong
+            | Self::FieldNameCaseCollision
+            | Self::ProducerAsserted
+            | Self::ServiceFromProfile => RepairClass::Actionable,
+        }
     }
 }
 
@@ -3149,6 +3185,54 @@ mod tests {
             | RepairCode::TimeOutOfRange
             | RepairCode::HostOmitted
             | RepairCode::ServiceFromProfile => false,
+        }
+    }
+
+    /// The class table is restated here as wire strings copied from the
+    /// ADR-0055 table, so a wrong arm in `RepairCode::class` fails against an
+    /// oracle that does not call it.
+    #[test]
+    fn repair_class_matches_adr_0055() {
+        // The next checkpoint adds time.unparseable (actionable),
+        // field.name_empty (actionable) and field.stamp_claimed (actionable).
+        const ROUTINE: &[&str] = &[
+            "env.defaulted",
+            "host.from_peer",
+            "host.omitted",
+            "time.from_ingest",
+            "field.name_case_folded",
+            "field.reserved_prefix",
+        ];
+        const ACTIONABLE: &[&str] = &[
+            "time.out_of_range",
+            "field.truncated",
+            "field.name_too_long",
+            "field.name_case_collision",
+            "field.reserved_prefix_collision",
+            "field.producer_asserted",
+            "service.from_profile",
+        ];
+
+        for code in RepairCode::ALL {
+            let wire = code.as_str();
+            let routine = ROUTINE.contains(&wire);
+            let actionable = ACTIONABLE.contains(&wire);
+            assert!(
+                routine != actionable,
+                "{wire} must appear in exactly one ADR-0055 list"
+            );
+            let want = if routine {
+                RepairClass::Routine
+            } else {
+                RepairClass::Actionable
+            };
+            assert_eq!(code.class(), want, "{wire}");
+        }
+        for wire in ROUTINE.iter().chain(ACTIONABLE) {
+            assert!(
+                RepairCode::ALL.iter().any(|c| c.as_str() == *wire),
+                "{wire} is not a RepairCode"
+            );
         }
     }
 

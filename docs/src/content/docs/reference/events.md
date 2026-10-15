@@ -186,21 +186,24 @@ code. See [catalog conformance](/architecture/catalog/).
 `_repairs` carries each applicable code once, separated by commas. Deriving a
 value is not a repair. Repair metrics use the same vocabulary.
 
-| Code | What happened |
-|------|---------------|
-| `host.from_peer` | A missing host was filled from an honest peer address |
-| `host.omitted` | A profile kept the event with no honest host value |
-| `env.defaulted` | A missing environment used `[ingest] default_env` |
-| `service.from_profile` | A profile used its service default after an unusable frame service |
-| `time.from_ingest` | Event time was missing or invalid, so arrival time was used |
-| `time.out_of_range` | A parseable event time was kept outside the plausibility window |
-| `field.truncated` | `_raw` exceeded its character cap |
-| `field.reserved_prefix` | A reserved prefix was stripped, or an all-underscore name was dropped |
-| `field.reserved_prefix_collision` | A stripped name collided with an existing bare name |
-| `field.name_too_long` | A field name exceeded 255 bytes and its column was dropped |
-| `field.name_case_folded` | A field name changed to ASCII lowercase |
-| `field.name_case_collision` | Two names differed only in ASCII case, and the losing one was dropped |
-| `field.producer_asserted` | A profile's asserted identity displaced a conflicting payload value |
+A routine repair fills an absence or adapts a name without loss and needs no
+action. An actionable repair means someone should inspect the sender.
+
+| Code | Class | What happened |
+|------|-------|---------------|
+| `host.from_peer` | routine | A missing host was filled from an honest peer address |
+| `host.omitted` | routine | A profile kept the event with no honest host value |
+| `env.defaulted` | routine | A missing environment used `[ingest] default_env` |
+| `service.from_profile` | actionable | A profile used its service default after an unusable frame service |
+| `time.from_ingest` | routine | Event time was missing or invalid, so arrival time was used |
+| `time.out_of_range` | actionable | A parseable event time was kept outside the plausibility window |
+| `field.truncated` | actionable | `_raw` exceeded its character cap |
+| `field.reserved_prefix` | routine | A reserved prefix was stripped, or an all-underscore name was dropped |
+| `field.reserved_prefix_collision` | actionable | A stripped name collided with an existing bare name |
+| `field.name_too_long` | actionable | A field name exceeded 255 bytes and its column was dropped |
+| `field.name_case_folded` | routine | A field name changed to ASCII lowercase |
+| `field.name_case_collision` | actionable | Two names differed only in ASCII case, and the losing one was dropped |
+| `field.producer_asserted` | actionable | A profile's asserted identity displaced a conflicting payload value |
 
 ## Rejection reasons
 
