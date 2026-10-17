@@ -87,7 +87,7 @@ shape is in [the API reference](/reference/api/#health).
 
 ### The engine sample
 
-The `duckdb` check reads the **engine sample**, not a live probe. Every 10 seconds, a dedicated thread runs `SELECT 1` on a connection of its own to the query database. The connection takes no executor permit and never appears in the query list. Each sample has a 250 ms budget. When the budget runs out, trawld interrupts the probe and starts no new one until it returns. A health request reads the latest result and never waits.
+The `duckdb` check reads the **engine sample**, not a live probe. Every 10 seconds, a dedicated thread runs `SELECT 1` on a connection of its own to the query database. The connection takes no executor permit and never appears in the query list. Each sample has a 250 ms budget. When the budget runs out, trawld interrupts the probe and starts no new one until it returns. A health request reads the latest result and never waits. trawld takes the first sample before it serves anything, so health never answers `error` for want of a sample. That wait ends at the 250 ms budget at the latest.
 
 | Latest sample | Recent success | `duckdb` | HTTP |
 | --- | --- | --- | --- |
@@ -95,9 +95,8 @@ The `duckdb` check reads the **engine sample**, not a live probe. Every 10 secon
 | Ran past 250 ms | A sample succeeded in the last 60 seconds | `slow` | 200 |
 | Ran past 250 ms | None in the last 60 seconds | `error` | 503 |
 | Returned a DuckDB error | | `error` | 503 |
-| None yet | None since boot | `error` | 503 |
 
-Saturation never fails health. A full executor pool, permits held after a timeout, live streams, and queries that went over their budgets leave `duckdb` at `ok`, because the sample does not use the pool. The pool is visible elsewhere: read `trawl_query_permits_in_use` against `trawl_query_pool_size`, and `trawl_engine_sample_age_seconds`, on `/metrics`. A sample age that keeps growing past a few multiples of 10 seconds means a probe is wedged.
+Saturation never fails health. A full executor pool, permits held after a timeout, live streams, and queries that went over their budgets leave `duckdb` at `ok`, because the sample does not use the pool. The pool is visible elsewhere: read `trawl_query_permits_in_use` against `trawl_query_pool_size`, and `trawl_engine_sample_age_seconds`, on `/metrics`. `trawl_engine_sample_age_seconds` counts the seconds since the latest probe started, or since the sampler started before the first probe. It resets every 10 seconds while probes finish, and it keeps growing while one is wedged. An age past a few multiples of 10 seconds means a probe is wedged. A sample that reads `error` answers 503 and records an `http_failure` event with `error_class=service_unavailable` and `cause_kind=engine_sample_failed`. The gauge `trawl_health_check{subsystem="duckdb"}` reads `1` for `ok` and `slow`, and `0` only for `error`.
 
 The sample exists so that a busy node does not look dead to its probes. Kubernetes readiness, liveness, and startup probes keep calling `/api/v1/health`. A node that is only busy stays ready. A node whose engine is broken goes 503, fails readiness, and, after the liveness threshold, restarts. Acknowledged ingest survives that restart in the WAL.
 
@@ -123,9 +122,9 @@ The sample exists so that a busy node does not look dead to its probes. Kubernet
 
    The response has three lists: `active`, `recent`, and `retained`. Each
    `retained` entry carries `id`, `kind`, `started`, and `retained_ms`. `kind`
-   is one of `query`, `from_saved`, `export`, `scheduled`, `ping`, or `sample`.
+   is one of `query`, `from_saved`, `export`, `scheduled`, or `sample`.
    An entry for key-owned work also carries `user` and `query`. An entry for
-   `ping` or `scheduled` work carries them only for a reader with `server_manage`.
+   `scheduled` work carries them only for a reader with `server_manage`.
 
 3. Watch `trawl_query_permits_retained` on `/metrics`. A value that stays above
    zero means capacity is held by work that no request waits for. Alarm on that
@@ -346,7 +345,7 @@ Symptom: a query is slow or timed out, and you need to know where its time went.
 trawld writes one `query_timing` event for each DSL query that reaches its DSL
 check. That covers interactive queries, `from saved` queries, exports, and
 scheduled and manual report runs, including the ones refused at the DSL check
-or for capacity. Live tail, the pool ping, and field sampling write none. The
+or for capacity. Live tail and field sampling write none. The
 event splits the query's time into phases. Each phase is an integer number of
 microseconds in a field named `query_<phase>_us`, such as `query_bind_us`.
 [Query timing](/architecture/reports-telemetry/#query-timing) lists the phases
@@ -477,7 +476,7 @@ generated SQL, event values, and the caller's DSL.
 | `stage` | How far the request got. See the next table. |
 | `reached` | On `stage=unrecorded` only: `pre_admission`, `admitted`, or `handler`, the last point the request passed. |
 | `error_class` | The server's closed error class. `panic` for a caught panic, `unknown` when nothing was recorded. |
-| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure` or `duckdb_resource_exhausted` (a query over its spill or memory budget), a Postgres kind such as `pg_pool_timed_out`, `auth_worker`, `hot_buffer_full` for an ingest request that the hot buffer had no room for, `request_limit_reached` for a request that trawld refused because its [request limit](/reference/configuration/#the-request-limit) was full, or `restart_backlog` or `rollup_pending` for a read refused as `corpus_recovering`. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
+| `cause_kind` | A closed kind taken from the typed error beneath the class: an I/O error kind such as `io_storage_full`, a DuckDB kind such as `duckdb_failure` or `duckdb_resource_exhausted` (a query over its spill or memory budget), `engine_sample_failed` (a health request that answered 503 because the engine sample read `error`), a Postgres kind such as `pg_pool_timed_out`, `auth_worker`, `hot_buffer_full` for an ingest request that the hot buffer had no room for, `request_limit_reached` for a request that trawld refused because its [request limit](/reference/configuration/#the-request-limit) was full, or `restart_backlog` or `rollup_pending` for a read refused as `corpus_recovering`. `unknown` when a server fault kept no typed source: an `internal` error or a `service_unavailable` other than a capacity refusal, including the 500 and 503 that the authentication layer answers, such as the auth backend being down. `none` when the class is the whole cause, as for `timeout`, `panic`, or a capacity refusal, and when nothing was recorded. |
 | `query_id` | Present when the request allocated a query ID. |
 | `key_id` | Present when a rate limiter metered the request. Names the key it metered. |
 | `peer_addr` | Present when no rate limiter metered the request. The client address, the only lead when no key is known. |

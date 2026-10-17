@@ -1278,7 +1278,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/queries"
 | `active[].role` | string | The key's role names, sorted and comma-joined. `none` when the key holds no roles. |
 | `recent` | array | Most recent first. At most `[server] max_query_history` (`1000`) entries are kept. |
 | `retained` | array | Work that still holds a pool permit after its request answered. Disjoint from `active`. |
-| `retained[].kind` | string | `query`, `from_saved`, `export`, `scheduled`, `ping`, or `sample` |
+| `retained[].kind` | string | `query`, `from_saved`, `export`, `scheduled`, or `sample` |
 | `retained[].started` | boolean | Whether the work passed its start transition |
 | `retained[].user`, `retained[].query` | string | Present for key-submitted work. For system work, present only for a reader with `server_manage`. |
 
@@ -2254,9 +2254,9 @@ These series show the executor pool and the engine sample behind the `duckdb` he
 | `trawl_query_permits_in_use` | gauge | Executor permits held now, by running queries, exports, field samples, and retained work |
 | `trawl_query_pool_size` | gauge | The executor pool size, `[server] max_concurrent_queries` |
 | `trawl_query_permits_retained` | gauge | Permits held by physical work whose request has already ended. A subset of `trawl_query_permits_in_use` |
-| `trawl_engine_sample_age_seconds` | gauge | Seconds since the latest engine sample finished. It resets every 10 seconds while sampling runs, and it keeps growing while a probe is wedged |
+| `trawl_engine_sample_age_seconds` | gauge | Seconds since the latest probe started, or since the sampler started before the first probe. It resets every 10 seconds while probes finish, and it keeps growing while one is wedged |
 
-`trawl_query_permits_in_use` at `trawl_query_pool_size` means searches queue, not that the engine is down. Alarm on the sample age instead, or on `checks.duckdb` reading `error`. See [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query).
+`trawl_query_permits_in_use` at `trawl_query_pool_size` means searches queue, not that the engine is down. Alarm on the sample age instead, or on `checks.duckdb` reading `error`. `trawl_health_check{subsystem="duckdb"}` is set each time `/api/v1/health` answers. It reads `1` for `ok` and `slow`, and `0` for `error`. See [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query).
 
 #### Restart visibility metrics
 
