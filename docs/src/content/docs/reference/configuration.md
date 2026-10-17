@@ -453,7 +453,7 @@ Notes:
 
 #### The request limit
 
-`max_concurrent_requests` counts requests in progress on trawld's HTTPS listener. It spans every route and every method, and one HTTP/2 stream is one request. Unmatched paths and `405` method fallbacks count. Syslog and `trawl-web` are separate services with their own limits. The value must be 1 to 65,536, and trawld refuses to start outside that range with a message that names `server.max_concurrent_requests`.
+`max_concurrent_requests` counts requests in progress on trawld's HTTPS listener. It spans every route and every method. trawld speaks HTTP/1.1 only, so each request on a connection counts once. Unmatched paths and `405` method fallbacks count. Syslog and `trawl-web` are separate services with their own limits. The value must be 1 to 65,536, and trawld refuses to start outside that range with a message that names `server.max_concurrent_requests`.
 
 A request over the count is refused at once. trawld does not queue it. The answer is 503 with the code `request_limit_reached` and the message `trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff`. It carries `Cache-Control: no-store` and no `Retry-After`, because nothing predicts when a request in progress ends. The handler never ran, so nothing was ingested or changed. trawld does not read the request body. A client that is still uploading can see a connection reset instead of the 503. While the count is full, the refusal comes before `401`, `403`, `404`, `405`, `413`, and `429`.
 
