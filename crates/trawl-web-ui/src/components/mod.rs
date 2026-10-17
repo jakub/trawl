@@ -28,6 +28,7 @@ pub mod facet_sidebar;
 pub mod field_case_drawer;
 pub mod histogram;
 pub mod job_refresh;
+pub mod live_cap_notice;
 pub mod malformed_notice;
 pub mod meta_strip;
 pub mod net_drawer;

@@ -55,6 +55,7 @@ use crate::components::exact_table::ExactTable;
 use crate::components::export_modal::ExportModal;
 use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
+use crate::components::live_cap_notice::LiveCapNotice;
 use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::query_error_notice::QueryErrorNotice;
@@ -545,6 +546,10 @@ pub fn Search() -> impl IntoView {
     let stream_query = RwSignal::new(String::new());
     let lagged = RwSignal::new(None::<u64>);
     let stream_failure = RwSignal::new(None::<&'static str>);
+    // The caps the open stream's latest snapshot reported (ADR-0001).
+    // Its own signal, apart from the failure and the lag: a disconnect
+    // or a lag notice says nothing about what the aggregation dropped.
+    let live_capped = RwSignal::new(Vec::<trawl_api::stream::SnapshotCap>::new());
     // Aggregation frames this session accepted — the footer's `Updates`
     // count. The ring's own `epoch` is the raw twin (`Received`).
     let frames = RwSignal::new(0_u64);
@@ -575,6 +580,7 @@ pub fn Search() -> impl IntoView {
         live_snapshot.set(None);
         lagged.set(None);
         stream_failure.set(None);
+        live_capped.set(Vec::new());
         // A new session counts from zero. An automatic EventSource
         // reconnect does not re-run this effect, so a blip keeps the
         // rows and both counts.
@@ -597,6 +603,7 @@ pub fn Search() -> impl IntoView {
                 latest: stream_opened_at,
                 session,
             }),
+            capped: Some(live_capped),
         };
         if let Some(handle) = start_stream(&q, signals) {
             stream_handle.update_value(|slot| *slot = Some(handle));
@@ -1203,6 +1210,12 @@ pub fn Search() -> impl IntoView {
                 // worth reading, and the Visualization tab is drawn from
                 // the same incomplete rows.
                 <DegradedNotice query=effective_q fields=degraded_fields/>
+                // The live twin, for a stream whose aggregation dropped
+                // input past a cap. Above the results for the same
+                // reason: the rows under it are the partial ones, on
+                // either tab. Only a live stream sets it, and starting
+                // any stream, or leaving Live, clears it.
+                <LiveCapNotice capped=live_capped/>
                 <Show when=move || !unreadable.get()
                     && mode.get() == Mode::Live
                     && (active_tab.get() == ResultsTab::Events || !is_chart_query.get())

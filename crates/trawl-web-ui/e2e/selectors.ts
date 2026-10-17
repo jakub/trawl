@@ -143,6 +143,14 @@ export const SEL = {
   resourceNotice: '#search-results .resource-notice[role="alert"]',
   resourceNoticeTitle: '.resource-notice-title',
   resourceNoticeText: '.resource-notice-text',
+  /// crates/trawl-web-ui/src/components/live_cap_notice.rs — the live cap
+  /// notice, which search.rs mounts above the results when the open
+  /// stream's latest snapshot reports `capped`. The `role="status"`
+  /// wrapper stays mounted; the notice inside it comes and goes. Its
+  /// parts are chained off the notice.
+  liveCapNotice: '.live-cap-live[role="status"] .live-cap-notice',
+  liveCapNoticeTitle: '.live-cap-notice-title',
+  liveCapNoticeText: '.live-cap-notice-text',
   /// crates/trawl-web-ui/src/components/results_table.rs — the one cell
   /// an empty snapshot page renders.
   resultsEmptyCell: '.results-empty-cell',
@@ -621,6 +629,10 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/resource_notice.rs — the
   /// resource notice's title.
   resourceTitle: 'Query ran out of resources',
+  /// crates/trawl-web-ui/src/live_cap_copy.rs — the live cap notice's
+  /// title and the sentence that closes its text.
+  liveCapTitle: 'Live aggregate is partial',
+  liveCapAdvice: 'Narrow the query, or switch to Snapshot.',
   /// crates/trawl-web-ui/src/state/stream_session.rs STREAM_UNAVAILABLE.
   streamUnavailable: 'Live stream unavailable. Retry or switch to Snapshot.',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible

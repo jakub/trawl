@@ -72,6 +72,8 @@ const QUERY_ERROR_NOTICE_RS: &str = include_str!("../src/components/query_error_
 const SEARCH_RS: &str = include_str!("../src/pages/search.rs");
 const RECOVERING_NOTICE_RS: &str = include_str!("../src/components/recovering_notice.rs");
 const RESOURCE_NOTICE_RS: &str = include_str!("../src/components/resource_notice.rs");
+const LIVE_CAP_NOTICE_RS: &str = include_str!("../src/components/live_cap_notice.rs");
+const LIVE_CAP_COPY_RS: &str = include_str!("../src/live_cap_copy.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -2251,6 +2253,48 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/resource_notice.rs",
         source: RESOURCE_NOTICE_RS,
         hook: "\"Query ran out of resources\"",
+    },
+    Contract {
+        assignment: "liveCapNotice: '.live-cap-live[role=\"status\"] .live-cap-notice',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<LiveCapNotice capped=live_capped/>",
+    },
+    Contract {
+        assignment: "liveCapNotice: '.live-cap-live[role=\"status\"] .live-cap-notice',",
+        source_path: "src/components/live_cap_notice.rs",
+        source: LIVE_CAP_NOTICE_RS,
+        hook: "<div class=\"live-cap-live\" role=\"status\">",
+    },
+    Contract {
+        assignment: "liveCapNotice: '.live-cap-live[role=\"status\"] .live-cap-notice',",
+        source_path: "src/components/live_cap_notice.rs",
+        source: LIVE_CAP_NOTICE_RS,
+        hook: "<div class=\"live-cap-notice\">",
+    },
+    Contract {
+        assignment: "liveCapNoticeTitle: '.live-cap-notice-title',",
+        source_path: "src/components/live_cap_notice.rs",
+        source: LIVE_CAP_NOTICE_RS,
+        hook: "class=\"live-cap-notice-title\"",
+    },
+    Contract {
+        assignment: "liveCapNoticeText: '.live-cap-notice-text',",
+        source_path: "src/components/live_cap_notice.rs",
+        source: LIVE_CAP_NOTICE_RS,
+        hook: "class=\"live-cap-notice-text\"",
+    },
+    Contract {
+        assignment: "liveCapTitle: 'Live aggregate is partial',",
+        source_path: "src/live_cap_copy.rs",
+        source: LIVE_CAP_COPY_RS,
+        hook: "pub const LIVE_CAP_TITLE: &str = \"Live aggregate is partial\";",
+    },
+    Contract {
+        assignment: "liveCapAdvice: 'Narrow the query, or switch to Snapshot.',",
+        source_path: "src/live_cap_copy.rs",
+        source: LIVE_CAP_COPY_RS,
+        hook: "pub const LIVE_CAP_ADVICE: &str = \"Narrow the query, or switch to Snapshot.\";",
     },
     Contract {
         assignment: "resultsEmptyCell: '.results-empty-cell',",

@@ -970,6 +970,31 @@
 }
 .deg-x:hover { color: var(--ink); background: var(--panel-2); }
 
+/* Live cap notice (ADR-0001): a live aggregate dropped input past a
+ * cap, so the rows under it are partial. Same band as the incomplete-
+ * results notice above, title then the per-cap sentences. The
+ * .live-cap-live wrapper is the persistent status region and collapses
+ * to nothing while no cap is reported. */
+.live-cap-live { flex-shrink: 0; }
+.live-cap-notice {
+  padding: 7px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--font-ui);
+  font-size: var(--fs-dense);
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+.live-cap-notice-title {
+  margin: 0;
+  color: var(--ink);
+  font-weight: 600;
+}
+.live-cap-notice-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 /* ─────────────────────────────────────────────────────────────────
  *  Malformed-link notice (ADR-0027) — a search URL whose structured
  *  state could not be read. Red rather than the degraded notice's
