@@ -2110,6 +2110,7 @@ fn rollup_day_inner(
     // Every conform in this connection reads the session zone.
     conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
         .map_err(|e| format!("SET TimeZone failed: {e}"))?;
+    structured_errors(&conn)?;
 
     // Build the merge input list: all hourly files, plus the existing
     // day-level file (late-arriving data merges into it after a prior
@@ -2189,19 +2190,24 @@ fn rollup_day_inner(
         tmp_path.to_string_lossy(),
     ));
     if let Err(e) = fast {
-        // A file that passed `is_valid_parquet`'s magic-byte sniff but
-        // fails `read_parquet` — corrupt middle, or a schema the catalog
-        // invariant says trawl cannot have written. No amount of retrying
-        // repairs either — surface it distinctly at error level so the rare
-        // forever-retry is visible on the dashboard rather than buried in
-        // the count.
-        tracing::error!(
-            event_type = "rollup_unreadable",
-            compact_service = %service,
-            error = %e,
-            "rollup inputs unreadable or nonconformant (foreign parquet?); will retry indefinitely"
-        );
-        return Err(format!("rollup COPY failed: {e}"));
+        let failure = StatementFailure::duckdb("rollup COPY failed", &e);
+        // Running out of memory says nothing about the inputs; the failure
+        // is already reported as a resource failure.
+        if !failure.is_out_of_memory() {
+            // A file that passed `is_valid_parquet`'s magic-byte sniff but
+            // fails `read_parquet` — corrupt middle, or a schema the catalog
+            // invariant says trawl cannot have written. No amount of retrying
+            // repairs either — surface it distinctly at error level so the rare
+            // forever-retry is visible on the dashboard rather than buried in
+            // the count.
+            tracing::error!(
+                event_type = "rollup_unreadable",
+                compact_service = %service,
+                error = %failure,
+                "rollup inputs unreadable or nonconformant (foreign parquet?); will retry indefinitely"
+            );
+        }
+        return Err(failure.into());
     }
 
     // Keep marker publication, daily publication, and hourly retirement
@@ -2753,7 +2759,7 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
         |row| row.get::<_, i64>(0),
     )
     .map(|n| u64::try_from(n).unwrap_or(0))
-    .map_err(|e| format!("count_rows failed: {e}"))
+    .map_err(|e| statement_failed("count_rows failed", &e))
 }
 
 /// Read WAL ndjson files into a `DuckDB` temp table called `wal_batch`,
@@ -2766,7 +2772,9 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
 /// the ones that throw, and rebuild from the survivors. This makes a single
 /// poison-pill file unable to wedge the whole batch (the residual the byte
 /// sniff alone could not close). Each file set aside is pushed onto
-/// `quarantined`. Returns the files that contributed rows, empty when every
+/// `quarantined`. A read or probe that runs out of memory isolates nothing:
+/// the batch fails as a resource failure ([`StatementFailure`]) and stays in
+/// the WAL, because a file too large for the limit is not a corrupt one. Returns the files that contributed rows, empty when every
 /// file turned out corrupt (the caller treats that as data-loss, not error).
 ///
 /// Complex-typed columns cannot arise here: ingest canonicalization
@@ -2782,6 +2790,10 @@ fn read_wal_to_table(
     // Fast path: read the whole batch in one scan. The common case.
     match build_wal_batch(conn, wal_files, service) {
         Ok(()) => return Ok(wal_files.to_vec()),
+        // Out of memory is not a malformed file: isolating would probe each
+        // file under the same limit, and a file whose probe runs out of
+        // memory too would be quarantined whole. The batch stays in the WAL.
+        Err(e) if e.is_out_of_memory() => return Err(e.into()),
         Err(e) => {
             // A non-"Duplicate name" read error means at least one file is
             // malformed-but-textual. Without isolation that one file fails
@@ -2800,11 +2812,15 @@ fn read_wal_to_table(
 
     let mut survivors: Vec<PathBuf> = Vec::with_capacity(wal_files.len());
     for f in wal_files {
-        if probe_ndjson(conn, f).is_ok() {
-            survivors.push(f.clone());
-        } else {
-            quarantine_file(f, service, "compaction_quarantine", QuarantineKind::Wal)?;
-            quarantined.push(f.clone());
+        match probe_ndjson(conn, f) {
+            Ok(()) => survivors.push(f.clone()),
+            // The probe needs memory too; a file it could not hold is not
+            // corrupt, and the files quarantined so far were.
+            Err(e) if e.is_out_of_memory() => return Err(e.into()),
+            Err(_) => {
+                quarantine_file(f, service, "compaction_quarantine", QuarantineKind::Wal)?;
+                quarantined.push(f.clone());
+            }
         }
     }
 
@@ -2916,7 +2932,7 @@ fn is_ingest_instant(text: &str) -> bool {
 /// on hand-written WAL, and the depth-1 retry ([`build_wal_batch`]) drains
 /// it losslessly.
 fn is_duplicate_name(e: &duckdb::Error) -> bool {
-    e.to_string().contains("Duplicate name")
+    trawl_engine::error::render_duckdb_error(e).contains("Duplicate name")
 }
 
 /// The collision shape specific to the `filename=` option: the data itself
@@ -2925,7 +2941,7 @@ fn is_duplicate_name(e: &duckdb::Error) -> bool {
 /// file reaches this — and it would fail the read on every tick forever,
 /// which is why the retry under a renamed provenance column exists.
 fn is_filename_collision(e: &duckdb::Error) -> bool {
-    e.to_string().contains("adds column")
+    trawl_engine::error::render_duckdb_error(e).contains("adds column")
 }
 
 /// Build the `wal_batch` table from a multi-file `read_json`.
@@ -2948,7 +2964,7 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 ///    column is ever dropped.
 ///
 /// Any other read error is returned so the caller can isolate the offending
-/// file. A malformed `timestamp` is never fatal here: see
+/// file, unless it is out of memory ([`StatementFailure::is_out_of_memory`]). A malformed `timestamp` is never fatal here: see
 /// [`repair_expr`].
 ///
 /// `sample_size=-1` (schema detection over every row, not `DuckDB`'s default
@@ -2961,7 +2977,7 @@ fn build_wal_batch(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
     service: &str,
-) -> Result<(), String> {
+) -> Result<(), StatementFailure> {
     let file_list_sql = wal_files
         .iter()
         .map(|p| format!("'{}'", p.to_string_lossy()))
@@ -2987,7 +3003,7 @@ fn build_wal_batch(
             tracing::warn!(
                 event_type = "compaction_depth_fallback",
                 compact_service = %service,
-                error = %e,
+                error = %trawl_engine::error::render_duckdb_error(&e),
                 "nested keys collide at depth 2 (legacy pre-stringification \
                  WAL); retrying at maximum_depth=1 — no columns dropped"
             );
@@ -3005,27 +3021,30 @@ fn build_wal_batch(
             tracing::warn!(
                 event_type = "compaction_provenance_rename",
                 compact_service = %service,
-                error = %e,
+                error = %trawl_engine::error::render_duckdb_error(&e),
                 "WAL data carries the provenance column name; retrying under a renamed column"
             );
             let _ = conn.execute_batch("DROP TABLE IF EXISTS wal_batch");
-            read_with_depth_ladder(&alt)
-                .map_err(|e2| format!("read_json (renamed provenance) failed: {e2}"))
+            read_with_depth_ladder(&alt).map_err(|e2| {
+                StatementFailure::duckdb("read_json (renamed provenance) failed", &e2)
+            })
         }
-        Err(e) => Err(format!("read_json failed: {e}")),
+        Err(e) => Err(StatementFailure::duckdb("read_json failed", &e)),
     }
 }
 
 /// Probe a single WAL file by fully scanning it through `read_json`.
 ///
-/// Returns `Err` only if the file is genuinely unparseable — the
-/// malformed-but-textual corruption the byte sniff can't catch. A full
+/// Returns `Err` if the file is genuinely unparseable — the
+/// malformed-but-textual corruption the byte sniff can't catch — or the
+/// probe ran out of memory, which the caller tells apart
+/// ([`StatementFailure::is_out_of_memory`]). A full
 /// `count(*)` scan forces every record to parse, so a malformed line anywhere
 /// in the file surfaces. A "Duplicate name" collision is not corruption —
 /// [`build_wal_batch`]'s depth-1 rung drains it — so a colliding file is
 /// re-probed at `maximum_depth=1` and only quarantined when both depths
 /// fail.
-fn probe_ndjson(conn: &duckdb::Connection, file: &Path) -> Result<(), String> {
+fn probe_ndjson(conn: &duckdb::Connection, file: &Path) -> Result<(), StatementFailure> {
     let path = file.to_string_lossy();
     let probe_at = |depth: i32| {
         conn.query_row(
@@ -3040,11 +3059,106 @@ fn probe_ndjson(conn: &duckdb::Connection, file: &Path) -> Result<(), String> {
     };
     match probe_at(2) {
         Ok(()) => Ok(()),
-        Err(e) if is_duplicate_name(&e) => {
-            probe_at(1).map_err(|e| format!("probe read_json (depth 1) failed: {e}"))
-        }
-        Err(e) => Err(format!("probe read_json failed: {e}")),
+        Err(e) if is_duplicate_name(&e) => probe_at(1)
+            .map_err(|e| StatementFailure::duckdb("probe read_json (depth 1) failed", &e)),
+        Err(e) => Err(StatementFailure::duckdb("probe read_json failed", &e)),
     }
+}
+
+/// Turn on `DuckDB`'s structured error diagnostics on a maintenance
+/// connection (compaction, rollup, conform and repin), so a failure carries
+/// the `exception_type` [`StatementFailure`] reads. Set last when a
+/// connection opens, so a failure to open still reads as text.
+pub(crate) fn structured_errors(conn: &duckdb::Connection) -> Result<(), String> {
+    conn.execute_batch("SET errors_as_json = true")
+        .map_err(|e| format!("SET errors_as_json failed: {e}"))
+}
+
+/// A failed maintenance statement: compaction, rollup, conform or repin
+/// (ADR-0056).
+///
+/// A maintenance connection reports failures as structured diagnostics
+/// ([`structured_errors`]), and [`Self::duckdb`] classifies one by its
+/// `exception_type`, through the same test the query lanes use
+/// ([`trawl_engine::error::is_out_of_memory`]). The message text is never
+/// searched. `Out of Memory` means the statement did not fit in `[ingest]
+/// compaction_memory_limit`. That is a resource failure, not bad data, so
+/// [`Self::duckdb`] logs it as `maintenance_resource_exhausted` and counts
+/// it on [`crate::metrics::MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL`], once, at
+/// the failed statement. A caller that would otherwise read the failure as
+/// bad input (a corrupt WAL file to quarantine, a nonconformant parquet
+/// file, a file the boot pass skips) asks [`Self::is_out_of_memory`] first
+/// and leaves its inputs alone for the next pass.
+///
+/// The text is `DuckDB`'s own wording behind the caller's context, as the
+/// connection would word it without `errors_as_json`. Every other failure,
+/// from `DuckDB` or not, is carried as text.
+#[derive(Debug)]
+pub(crate) struct StatementFailure {
+    text: String,
+    out_of_memory: bool,
+}
+
+impl StatementFailure {
+    /// The failure of a maintenance statement `DuckDB` refused, behind
+    /// `context` ("COPY TO parquet failed"). Logs and counts it when
+    /// `DuckDB` ran out of memory.
+    pub(crate) fn duckdb(context: &str, error: &duckdb::Error) -> Self {
+        let text = format!(
+            "{context}: {}",
+            trawl_engine::error::render_duckdb_error(error)
+        );
+        let out_of_memory = trawl_engine::error::is_out_of_memory(error);
+        if out_of_memory {
+            metrics::counter!(crate::metrics::MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL).increment(1);
+            tracing::error!(
+                event_type = "maintenance_resource_exhausted",
+                error = %text,
+                "maintenance work ran out of ingest.compaction_memory_limit; its \
+                 inputs are kept and retried, and it fails the same way until \
+                 the limit is raised or the input shrinks"
+            );
+        }
+        Self {
+            text,
+            out_of_memory,
+        }
+    }
+
+    /// Whether `DuckDB` ran out of memory: the inputs are sound, and the
+    /// statement needs more memory than the limit allows.
+    pub(crate) fn is_out_of_memory(&self) -> bool {
+        self.out_of_memory
+    }
+}
+
+impl std::fmt::Display for StatementFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl From<String> for StatementFailure {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            out_of_memory: false,
+        }
+    }
+}
+
+impl From<StatementFailure> for String {
+    fn from(failure: StatementFailure) -> Self {
+        failure.text
+    }
+}
+
+/// A maintenance statement's `DuckDB` failure as text behind `context`,
+/// logged and counted as a resource failure when it is one
+/// ([`StatementFailure::duckdb`]). For callers with no decision to make on
+/// the failure's kind.
+pub(crate) fn statement_failed(context: &str, error: &duckdb::Error) -> String {
+    StatementFailure::duckdb(context, error).into()
 }
 
 /// Column name and type from `DuckDB` `DESCRIBE`. Shared with the boot
@@ -3058,10 +3172,10 @@ pub(crate) struct ColInfo {
 pub(crate) fn describe_source(
     conn: &duckdb::Connection,
     query: &str,
-) -> Result<Vec<ColInfo>, String> {
+) -> Result<Vec<ColInfo>, StatementFailure> {
     let mut stmt = conn
         .prepare(&format!("DESCRIBE {query}"))
-        .map_err(|e| format!("DESCRIBE failed: {e}"))?;
+        .map_err(|e| StatementFailure::duckdb("DESCRIBE failed", &e))?;
 
     let rows = stmt
         .query_map([], |row| {
@@ -3070,10 +3184,10 @@ pub(crate) fn describe_source(
                 dtype: row.get::<_, String>(1)?,
             })
         })
-        .map_err(|e| format!("DESCRIBE query failed: {e}"))?;
+        .map_err(|e| StatementFailure::duckdb("DESCRIBE query failed", &e))?;
 
     rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("DESCRIBE row read failed: {e}"))
+        .map_err(|e| StatementFailure::duckdb("DESCRIBE row read failed", &e))
 }
 
 /// Escape a `DuckDB` identifier: wrap in double-quotes, doubling any
@@ -3092,7 +3206,9 @@ pub(crate) fn quote_ident(name: &str) -> String {
 /// therefore means the existing file violates the invariant — foreign
 /// parquet dropped into the tree, or a restore against a stale catalog —
 /// and is surfaced as `catalog_invariant_violation`: the batch errors, the
-/// WAL files are retained, and the tick retries. Do not add a cast-and-retry
+/// WAL files are retained, and the tick retries. A merge that runs out of
+/// memory fails the batch the same way, as a resource failure
+/// ([`StatementFailure`]), with no violation reported. Do not add a cast-and-retry
 /// fallback: rewriting both sides silently hides exactly the nonconformant
 /// corpus this error exists to report.
 fn merge_with_existing(
@@ -3109,16 +3225,21 @@ fn merge_with_existing(
          SELECT * FROM wal_batch",
     ))
     .map_err(|e| {
-        tracing::error!(
-            event_type = "catalog_invariant_violation",
-            compact_service = %service,
-            path = %canonical_path.display(),
-            error = %e,
-            "merge with existing parquet failed — write-time conformance makes this \
-             impossible for trawl-written files (foreign parquet at this path?); \
-             WAL retained, batch retried next tick"
-        );
-        format!("merge read_parquet failed: {e}")
+        let failure = StatementFailure::duckdb("merge read_parquet failed", &e);
+        // Running out of memory is not a nonconformant file, and the
+        // failure is already reported as a resource failure.
+        if !failure.is_out_of_memory() {
+            tracing::error!(
+                event_type = "catalog_invariant_violation",
+                compact_service = %service,
+                path = %canonical_path.display(),
+                error = %failure,
+                "merge with existing parquet failed — write-time conformance makes this \
+                 impossible for trawl-written files (foreign parquet at this path?); \
+                 WAL retained, batch retried next tick"
+            );
+        }
+        failure.into()
     })
 }
 
@@ -3274,6 +3395,7 @@ fn prepare_service_batch(
     // ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]).
     conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
         .map_err(|e| format!("SET TimeZone failed: {e}"))?;
+    structured_errors(&conn)?;
 
     let survivors = read_wal_to_table(&conn, &valid_files, service, quarantined)?;
     if survivors.is_empty() {
@@ -3450,7 +3572,7 @@ fn run_pin_ladders(
                 }
                 Ok(counts)
             })
-            .map_err(|e| format!("pin ladder query failed: {e}"))?;
+            .map_err(|e| statement_failed("pin ladder query failed", &e))?;
 
         for slot in counts.chunks(stride) {
             let non_null = slot[0];
@@ -3959,7 +4081,7 @@ impl ConformPlan {
         conn: &duckdb::Connection,
         source: &str,
         service: &str,
-    ) -> Result<Vec<FieldConflict>, String> {
+    ) -> Result<Vec<FieldConflict>, StatementFailure> {
         if self.casts.is_empty() {
             return Ok(Vec::new());
         }
@@ -3984,7 +4106,7 @@ impl ConformPlan {
                     }
                     Ok(out)
                 })
-                .map_err(|e| format!("conform stats query failed: {e}"))?;
+                .map_err(|e| StatementFailure::duckdb("conform stats query failed", &e))?;
             stats.extend(chunk_stats);
         }
 
@@ -4087,7 +4209,14 @@ impl ConformPlan {
                 }
                 Ok(out)
             })
-            .map_err(|e| format!("conform sample query failed: {e}"))?;
+            .map_err(|e| {
+                // Best effort, so never a maintenance failure: the caller
+                // records the capture's own failure.
+                format!(
+                    "conform sample query failed: {}",
+                    trawl_engine::error::render_duckdb_error(&e)
+                )
+            })?;
 
         let mut out = HashMap::with_capacity(sampled.len());
         for (i, json) in sampled.into_iter().zip(rendered) {
@@ -4355,11 +4484,11 @@ fn write_output(
               BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
             tmp_path.display(),
         ))
-        .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
+        .map_err(|e| statement_failed("COPY TO parquet failed", &e))?;
 
         let count = count_rows(&conn, "merged")?;
         conn.execute_batch("DROP TABLE IF EXISTS merged")
-            .map_err(|e| format!("DROP TABLE failed: {e}"))?;
+            .map_err(|e| statement_failed("DROP TABLE failed", &e))?;
         count
     } else {
         // Fresh write: no existing file to merge with.
@@ -4369,13 +4498,13 @@ fn write_output(
               BLOOM_FILTER_FALSE_POSITIVE_RATIO 0.01)",
             tmp_path.display(),
         ))
-        .map_err(|e| format!("COPY TO parquet failed: {e}"))?;
+        .map_err(|e| statement_failed("COPY TO parquet failed", &e))?;
 
         batch_rows
     };
 
     conn.execute_batch("DROP TABLE IF EXISTS wal_batch")
-        .map_err(|e| format!("DROP TABLE failed: {e}"))?;
+        .map_err(|e| statement_failed("DROP TABLE failed", &e))?;
 
     Ok(StagedOutput {
         output_dir,
@@ -4631,7 +4760,7 @@ fn conform_wal_batch(
              ALTER TABLE wal_conformed RENAME TO wal_batch",
             plan.select_list.join(", ")
         ))
-        .map_err(|e| format!("catalog conform failed: {e}"))?;
+        .map_err(|e| statement_failed("catalog conform failed", &e))?;
     }
 
     Ok((conflicts, plan.retained))
@@ -4855,6 +4984,101 @@ pub(crate) fn extract_service_from_filename(filename: &str) -> String {
         parts[2].to_owned()
     } else {
         filename.to_owned()
+    }
+}
+
+/// Fixtures for the maintenance out-of-memory tests (ADR-0056), shared by
+/// compaction, rollup, conform and repin.
+#[cfg(test)]
+pub(crate) mod oom_support {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    /// A maintenance memory limit far below what reading a
+    /// [`big_parquet`] or [`big_wal`] file takes.
+    pub(crate) const STARVED: &str = "8MB";
+
+    /// Rows in a [`big_parquet`] file. Each `message` is 128 hex
+    /// characters, so the one row group's `message` column chunk is 16 MiB,
+    /// which `DuckDB` reads whole and cannot spill.
+    const BIG_ROWS: u64 = 131_072;
+
+    /// Write a parquet file with `_time`, `_raw` and `message` columns in
+    /// one row group, too large to read under [`STARVED`].
+    pub(crate) fn big_parquet(path: &Path) {
+        parquet_of(path, BIG_ROWS);
+    }
+
+    /// A [`big_parquet`] file with `rows` rows in its one row group.
+    pub(crate) fn parquet_of(path: &Path, rows: u64) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT TIMESTAMPTZ '2026-01-14 00:00:00+00' + to_microseconds(i) AS _time, \
+                        '{{}}' AS _raw, \
+                        md5(i::VARCHAR) || md5((i * 7)::VARCHAR) || md5((i * 13)::VARCHAR) \
+                        || md5((i * 31)::VARCHAR) AS message \
+                 FROM range({rows}) t(i)) TO '{}' (FORMAT PARQUET, ROW_GROUP_SIZE {rows})",
+                path.display()
+            ))
+            .unwrap();
+    }
+
+    /// Write a well-formed WAL file of about 26 MiB for `service`, too
+    /// large to read under [`STARVED`].
+    pub(crate) fn big_wal(dir: &Path, service: &str) -> std::path::PathBuf {
+        use std::io::Write as _;
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{service}_1730000000000_big.ndjson"));
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        for i in 0..BIG_ROWS {
+            writeln!(
+                out,
+                r#"{{"_time":"2026-01-15T00:00:00Z","_ingested":"2026-01-15T00:00:00Z","service":"{service}","message":"{:0128x}"}}"#,
+                u128::from(i).wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834)
+            )
+            .unwrap();
+        }
+        out.flush().unwrap();
+        path
+    }
+
+    /// Run `f` on this thread with its logs and metrics captured. Returns
+    /// `f`'s value, everything logged, and the maintenance resource
+    /// failures counted. The maintenance paths under test run where they
+    /// are called, so a thread-local subscriber and recorder see them.
+    pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, String, u64) {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let sink = Sink(Arc::clone(&logs));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || sink.clone())
+            .finish();
+        let recorder = crate::metrics::prometheus_builder().build_recorder();
+        let handle = recorder.handle();
+        let value = metrics::with_local_recorder(&recorder, || {
+            crate::metrics::init_operational_alert_metrics();
+            tracing::subscriber::with_default(subscriber, f)
+        });
+        let exhausted = crate::metrics::test_support::sample(
+            &handle,
+            crate::metrics::MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL,
+        );
+        let logged = String::from_utf8_lossy(&logs.lock().unwrap()).into_owned();
+        (value, logged, exhausted)
     }
 }
 
@@ -7601,6 +7825,113 @@ mod tests {
         // No .tmp files left behind.
         let tmp_files = find_files_by_ext(&data_dir, "tmp");
         assert!(tmp_files.is_empty(), "stale .tmp files found");
+    }
+
+    /// A WAL batch too large for the compaction memory limit is a resource
+    /// failure, not a corrupt file (ADR-0056). The single-file probe that
+    /// isolates corrupt WAL runs out of memory on the same file, so reading
+    /// that as corruption would quarantine sound data. The WAL is kept as
+    /// it was, nothing is quarantined and no parquet is written.
+    #[test]
+    fn maintenance_out_of_memory_is_a_resource_failure_in_compaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        let wal = oom_support::big_wal(&wal_dir, "svc");
+        let before = std::fs::read(&wal).unwrap();
+
+        let (result, logs, exhausted) = oom_support::capture(|| {
+            compact_service_blocking(
+                std::slice::from_ref(&wal),
+                &data_dir,
+                "svc",
+                oom_support::STARVED,
+            )
+        });
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("read_json failed: Out of Memory Error: "),
+            "{err}"
+        );
+        assert_eq!(exhausted, 1, "{logs}");
+        assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
+        for wrong in ["compaction_quarantine", "compaction_isolation"] {
+            assert!(!logs.contains(wrong), "{wrong}: {logs}");
+        }
+        assert_eq!(std::fs::read(&wal).unwrap(), before, "the WAL is kept");
+        assert!(find_files_by_ext(&wal_dir, "corrupt").is_empty());
+        assert!(find_files_by_ext(&data_dir, "parquet").is_empty());
+    }
+
+    /// A merge with the hour's existing file that runs out of memory is a
+    /// resource failure, not a catalog invariant violation (ADR-0056): the
+    /// existing file is trawl's own and conformant. Both inputs are kept.
+    #[test]
+    fn maintenance_out_of_memory_is_a_resource_failure_in_compaction_merge() {
+        use chrono::Timelike as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let now = chrono::Utc::now();
+        let existing = data_dir
+            .join(now.format("%Y-%m-%d").to_string())
+            .join(format!("{:02}", now.hour()))
+            .join("svc.parquet");
+        // A 64 MiB column chunk: the merge allocates 128 MiB to read it,
+        // past a limit that still holds the WAL read's two 32 MiB buffers.
+        oom_support::parquet_of(&existing, 524_288);
+        let existing_before = std::fs::read(&existing).unwrap();
+        let wal = write_wal_file(&wal_dir, "svc", &[OPERATIONAL_ROW]);
+
+        let (result, logs, exhausted) = oom_support::capture(|| {
+            compact_service_blocking(std::slice::from_ref(&wal), &data_dir, "svc", "96MB")
+        });
+
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("merge read_parquet failed: Out of Memory Error: "),
+            "{err}"
+        );
+        assert_eq!(exhausted, 1, "{logs}");
+        assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
+        assert!(!logs.contains("catalog_invariant_violation"), "{logs}");
+        assert!(wal.is_file(), "the WAL is kept");
+        assert_eq!(std::fs::read(&existing).unwrap(), existing_before);
+    }
+
+    /// A rollup that runs out of memory is a resource failure, not
+    /// unreadable input (ADR-0056). Every hourly input is kept for the next
+    /// pass and no daily file is published.
+    #[test]
+    fn maintenance_out_of_memory_is_a_resource_failure_in_rollup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let day_dir = data_dir.join("2026-01-14");
+        let big = day_dir.join("00").join("svc.parquet");
+        oom_support::big_parquet(&big);
+        let small = write_hourly_parquet(&data_dir, "2026-01-14", "01", "svc", &[OPERATIONAL_ROW]);
+        let inputs = [big.clone(), small.clone()];
+
+        let (outcome, logs, exhausted) = oom_support::capture(|| {
+            rollup_day_blocking(&day_dir, "svc", &inputs, oom_support::STARVED)
+        });
+
+        let err = outcome.result.unwrap_err();
+        assert!(
+            err.contains("rollup COPY failed: Out of Memory Error: "),
+            "{err}"
+        );
+        assert_eq!(outcome.quarantined, 0);
+        assert_eq!(exhausted, 1, "{logs}");
+        assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
+        assert!(!logs.contains("rollup_unreadable"), "{logs}");
+        assert!(
+            big.is_file() && small.is_file(),
+            "every hourly input is kept"
+        );
+        assert!(!day_dir.join("svc.parquet").exists(), "no daily file");
     }
 
     #[test]

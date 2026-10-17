@@ -17,6 +17,7 @@ use crate::catalog::conform::layout_path;
 use crate::ingest::compaction::{
     ColInfo, ConformPlan, ConformPolicy, RepinReading, bounded_misfit_samples_sql,
     decode_misfit_samples, describe_source, is_valid_parquet, quote_ident, repin_count_exprs,
+    statement_failed,
 };
 
 /// Identity of one source file, for the additive catch-up diff. A
@@ -274,7 +275,7 @@ fn rewrite_affected(
         plan.select_list.join(", "),
         tmp.to_string_lossy().replace('\'', "''"),
     ))
-    .map_err(|e| format!("repin rewrite failed for {}: {e}", src.display()))?;
+    .map_err(|e| statement_failed(&format!("repin rewrite failed for {}", src.display()), &e))?;
     std::fs::File::open(&tmp)
         .and_then(|f| f.sync_all())
         .map_err(|e| format!("repin fsync failed for {}: {e}", tmp.display()))?;
@@ -423,7 +424,7 @@ fn measure(
                 if sampled { row.get(5)? } else { None },
             ))
         })
-        .map_err(|e| format!("repin count failed: {e}"))?;
+        .map_err(|e| statement_failed("repin count failed", &e))?;
     Ok((
         RepinEffect {
             rows: u64::try_from(rows).unwrap_or(0),
@@ -439,6 +440,56 @@ fn measure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repin rewrite that runs out of memory is a resource failure
+    /// (ADR-0056). The source is kept and nothing lands in the shadow.
+    #[test]
+    fn maintenance_out_of_memory_is_a_resource_failure_in_repin() {
+        use crate::ingest::compaction::oom_support;
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let shadow = tmp.path().join("data.repin-next");
+        let rel = Path::new("prod/2026-01-14/00/svc.parquet");
+        let src = data_dir.join(rel);
+        oom_support::big_parquet(&src);
+        let before = std::fs::read(&src).unwrap();
+        let conn =
+            crate::catalog::conform::open_bounded_connection(&data_dir, oom_support::STARVED)
+                .unwrap();
+        let reading = RepinReading::new(
+            CanonicalType::Varchar,
+            CanonicalType::BigInt,
+            trawl_core::severity::Dialect::Otel,
+        );
+        let flipped = HashMap::from([("message".to_owned(), CanonicalType::BigInt)]);
+        let counted = RepinEffect {
+            rows: 131_072,
+            carrying: 131_072,
+            nulled: 0,
+            resurrected: 0,
+            ambiguous: 0,
+        };
+
+        let (result, logs, exhausted) = oom_support::capture(|| {
+            process_file(
+                &conn,
+                &data_dir,
+                &shadow,
+                rel,
+                "message",
+                reading,
+                &flipped,
+                Some(counted),
+            )
+        });
+
+        let err = result.unwrap_err();
+        assert!(err.contains("Out of Memory Error: "), "{err}");
+        assert_eq!(exhausted, 1, "{logs}");
+        assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
+        assert_eq!(std::fs::read(&src).unwrap(), before, "the source is kept");
+        assert!(!shadow.join(rel).exists(), "nothing reaches the shadow");
+    }
 
     /// A live staging file must never enter the shadow: hardlinking one
     /// gives the shadow a second name for an inode compaction is about to

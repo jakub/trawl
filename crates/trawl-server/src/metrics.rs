@@ -169,6 +169,12 @@ pub const SYSLOG_WAL_EVENTS_DISCARDED_TOTAL: &str = "trawl_syslog_wal_events_dis
 pub const SYSLOG_WRITE_TASKS_FAILED_TOTAL: &str = "trawl_syslog_write_tasks_failed_total";
 pub const WAL_DURABILITY_FAILURES_TOTAL: &str = "trawl_wal_durability_failures_total";
 pub const COMPACTION_OPERATION_FAILURES_TOTAL: &str = "trawl_compaction_operation_failures_total";
+/// Maintenance statements (compaction, rollup, conform and repin) that ran
+/// out of `[ingest] compaction_memory_limit`: `DuckDB` raised `Out of
+/// Memory` (ADR-0056). Counted once per failed statement, where it fails
+/// ([`crate::ingest::compaction::StatementFailure`]). The inputs stay where
+/// they are for the next pass.
+pub const MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL: &str = "trawl_maintenance_resource_exhausted_total";
 pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
 /// Publication markers recovery looked at, by `outcome`
 /// ([`crate::ingest::publication_marker::RecoveryOutcomeKind`]). A
@@ -362,6 +368,7 @@ pub fn init_operational_alert_metrics() {
         metrics::counter!(COMPACTION_OPERATION_FAILURES_TOTAL, "operation" => operation.label())
             .increment(0);
     }
+    metrics::counter!(MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL).increment(0);
     for kind in QuarantineKind::ALL {
         metrics::counter!(FILES_QUARANTINED_TOTAL, "kind" => kind.label()).increment(0);
     }
@@ -602,6 +609,10 @@ pub fn describe_metrics() {
     describe_counter!(
         COMPACTION_OPERATION_FAILURES_TOTAL,
         "Failed compaction operation attempts, labelled by operation; excludes successful quarantines, idle work and intentional suppression"
+    );
+    describe_counter!(
+        MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL,
+        "Compaction, rollup, conform and repin statements that ran out of ingest.compaction_memory_limit; the inputs are kept and retried"
     );
     describe_counter!(
         PUBLICATION_RECOVERY_TOTAL,
@@ -2711,6 +2722,7 @@ mod tests {
                 "trawl_compaction_operation_failures_total{operation=\"pending_rollup_scan\"}",
                 "trawl_compaction_operation_failures_total{operation=\"pending_rollup_recovery\"}",
                 "trawl_compaction_operation_failures_total{operation=\"consumed_wal_removal\"}",
+                "trawl_maintenance_resource_exhausted_total",
                 "trawl_files_quarantined_total{kind=\"wal\"}",
                 "trawl_files_quarantined_total{kind=\"parquet\"}",
                 "trawl_files_quarantined_total{kind=\"rollup_temporary\"}",

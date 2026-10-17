@@ -155,13 +155,23 @@ impl From<duckdb::Error> for EngineError {
     /// searched, so a message that says "Out of Memory" under another type
     /// stays a database error.
     fn from(error: duckdb::Error) -> Self {
-        match DuckDbDiagnostic::of(&error) {
-            Some(diagnostic) if diagnostic.exception_type == OUT_OF_MEMORY => {
-                Self::ResourceExhausted
-            }
-            _ => Self::Database(error),
+        if is_out_of_memory(&error) {
+            Self::ResourceExhausted
+        } else {
+            Self::Database(error)
         }
     }
+}
+
+/// Whether `error` is `DuckDB` running out of memory or spill space: its
+/// structured diagnostic names the `Out of Memory` exception type. The one
+/// test [`EngineError::from`] classifies [`EngineError::ResourceExhausted`]
+/// by, for callers that keep the `duckdb::Error`. The maintenance databases
+/// (compaction, rollup, conform and repin) read it too: they turn on
+/// `errors_as_json` for the same reason the query database does.
+#[must_use]
+pub fn is_out_of_memory(error: &duckdb::Error) -> bool {
+    DuckDbDiagnostic::of(error).is_some_and(|d| d.exception_type == OUT_OF_MEMORY)
 }
 
 /// The structured diagnostic `DuckDB` reports in place of its message
@@ -373,7 +383,8 @@ fn is_operator(c: u8) -> bool {
 }
 
 /// A `DuckDB` error as `DuckDB` would word it without `errors_as_json`.
-fn render_duckdb_error(error: &duckdb::Error) -> String {
+#[must_use]
+pub fn render_duckdb_error(error: &duckdb::Error) -> String {
     DuckDbDiagnostic::of(error).map_or_else(|| error.to_string(), |d| d.text())
 }
 
