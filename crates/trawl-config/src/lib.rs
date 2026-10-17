@@ -754,10 +754,6 @@ pub struct SchedulerConfig {
     #[serde(default = "default_scheduler_poll_interval_secs")]
     pub poll_interval_secs: u64,
 
-    /// Maximum rows stored in a report run result.
-    #[serde(default = "default_scheduler_report_max_rows")]
-    pub report_max_rows: usize,
-
     /// Maximum runs to keep per schedule (retention).
     #[serde(default = "default_scheduler_max_runs_per_schedule")]
     pub max_runs_per_schedule: u64,
@@ -781,7 +777,6 @@ pub struct SchedulerConfig {
 
 const DEFAULT_SCHEDULER_ENABLED: bool = true;
 const DEFAULT_SCHEDULER_POLL_INTERVAL_SECS: u64 = 10;
-const DEFAULT_SCHEDULER_REPORT_MAX_ROWS: usize = 10_000;
 const DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE: u64 = 100;
 const DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS: u64 = 30;
 /// A day of missed coverage at the common hourly cadence.
@@ -820,9 +815,6 @@ fn default_scheduler_enabled() -> bool {
 fn default_scheduler_poll_interval_secs() -> u64 {
     DEFAULT_SCHEDULER_POLL_INTERVAL_SECS
 }
-fn default_scheduler_report_max_rows() -> usize {
-    DEFAULT_SCHEDULER_REPORT_MAX_ROWS
-}
 fn default_scheduler_max_runs_per_schedule() -> u64 {
     DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE
 }
@@ -838,7 +830,6 @@ impl Default for SchedulerConfig {
         Self {
             enabled: DEFAULT_SCHEDULER_ENABLED,
             poll_interval_secs: DEFAULT_SCHEDULER_POLL_INTERVAL_SECS,
-            report_max_rows: DEFAULT_SCHEDULER_REPORT_MAX_ROWS,
             max_runs_per_schedule: DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE,
             report_retention_days: DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS,
             max_catchup_intervals: DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS,
@@ -2815,6 +2806,29 @@ path = "/data"
         assert_eq!(
             SchedulerConfig::default().max_catchup_intervals,
             DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS
+        );
+    }
+
+    /// The report row cap was never applied, so it is gone rather than
+    /// documented as inert: a config that still sets it refuses to load
+    /// instead of reading as a limit. Runs stop at `max_result_rows`.
+    #[test]
+    fn scheduler_report_max_rows_is_an_unknown_key() {
+        let err = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[scheduler]
+report_max_rows = 10000
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown setting at scheduler.report_max_rows"),
+            "{err}"
         );
     }
 

@@ -272,7 +272,6 @@ config:
   scheduler:
     enabled: true
     pollIntervalSecs: 10
-    reportMaxRows: 10000
     maxRunsPerSchedule: 100
     reportRetentionDays: 30
     # Intervals of missed coverage one since_last catch-up run may cover

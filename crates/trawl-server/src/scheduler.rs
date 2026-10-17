@@ -83,7 +83,6 @@ async fn scheduler_loop(
     tracing::info!(
         event_type = "scheduler_started",
         poll_interval_secs = config.poll_interval_secs,
-        report_max_rows = config.report_max_rows,
         "scheduler started"
     );
 
@@ -284,7 +283,6 @@ pub async fn poll_and_execute(
         } = claimed;
         let store = schedule_store.clone();
         let pool = pool.clone();
-        let max_rows = config.report_max_rows;
 
         spawned.push(tokio::spawn(async move {
             execute_scheduled_query(
@@ -293,7 +291,6 @@ pub async fn poll_and_execute(
                 run_id,
                 &resolved_query,
                 &query_name,
-                max_rows,
                 timeout_secs,
             )
             .await;
@@ -371,7 +368,6 @@ pub(crate) async fn execute_scheduled_query(
     run_id: i64,
     query: &str,
     _query_name: &str,
-    _max_rows: usize,
     timeout_secs: u64,
 ) {
     let start = std::time::Instant::now();
@@ -1051,7 +1047,6 @@ mod tests {
             succeeded,
             "* | head 1",
             "timed_ok",
-            0,
             30,
         )
         .await;
@@ -1061,7 +1056,6 @@ mod tests {
             failed,
             "* | stats zz_sched_needle()",
             "timed_failure",
-            0,
             30,
         )
         .await;

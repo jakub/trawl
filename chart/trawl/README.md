@@ -283,7 +283,6 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.syslog.channelCapacity` | int | `10000` | `[syslog] channel_capacity` |
 | `config.scheduler.enabled` | bool | `true` | `[scheduler] enabled` |
 | `config.scheduler.pollIntervalSecs` | int | `10` | `[scheduler] poll_interval_secs` |
-| `config.scheduler.reportMaxRows` | int | `10000` | `[scheduler] report_max_rows` |
 | `config.scheduler.maxRunsPerSchedule` | int | `100` | `[scheduler] max_runs_per_schedule` |
 | `config.scheduler.reportRetentionDays` | int | `30` | `[scheduler] report_retention_days` |
 | `config.scheduler.maxCatchupIntervals` | int | `24` | `[scheduler] max_catchup_intervals` |

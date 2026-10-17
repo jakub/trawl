@@ -774,7 +774,6 @@ Notes:
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable scheduled query execution |
 | `poll_interval_secs` | integer | `10` | How often the scheduler looks for due schedules |
-| `report_max_rows` | integer | `10000` | Rows stored per report run |
 | `max_runs_per_schedule` | integer | `100` | Completed runs kept per schedule |
 | `report_retention_days` | integer | `30` | Delete report runs older than this many days |
 | `max_catchup_intervals` | integer | `24` | Whole schedule intervals one `since_last` catch-up run may cover. Must be between 1 and 1000000 |

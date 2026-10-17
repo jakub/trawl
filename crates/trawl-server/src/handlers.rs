@@ -3002,7 +3002,6 @@ pub async fn trigger_run(
             run_id,
             &query,
             &query_name,
-            0,
             timeout_secs,
         )
         .await;
