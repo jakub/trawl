@@ -1952,12 +1952,14 @@ async fn setup_with_ingest_config(
     let storage = trawl_server::store::StorageState::from_pool(app_pool(&app_db_url).await)
         .await
         .expect("boot the app-state database");
+    let scratch = trawl_server::state::open_query_scratch(&config).expect("lock the query scratch");
     let (state, http_config) = AppState::from_parts(
         &config,
         test_metrics_handle(),
         resolve_derivation(&config),
         auth,
         storage,
+        scratch,
     )
     .await
     .expect("failed to create app state");

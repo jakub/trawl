@@ -356,6 +356,13 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         config.ingest.enabled,
     )?;
 
+    // Lock and clear the query scratch directory before anything waits on
+    // PostgreSQL either (ADR-0056). Its own lock authorizes the clearing, so
+    // a second trawld on the same directory refuses here, before it touches
+    // the database, and boot never removes spill a live process still uses.
+    // The state holds the lock for the life of the process.
+    let scratch = trawl_server::state::open_query_scratch(&config).map_err(|e| e.to_string())?;
+
     // Admit both databases before the epoch gate can initialize a fresh
     // root or repin recovery can rename/sweep an existing corpus. This exact
     // storage owner holds the sole-writer lock through recovery and serving.
@@ -414,7 +421,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     .await?;
 
     let (mut state, http_config) =
-        AppState::from_parts(&config, metrics_handle, derivation, auth, storage).await?;
+        AppState::from_parts(&config, metrics_handle, derivation, auth, storage, scratch).await?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());

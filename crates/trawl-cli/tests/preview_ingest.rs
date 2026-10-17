@@ -187,10 +187,17 @@ impl Server {
             trawl_server::ingest::producer::Derivation::resolve(&config.ingest)
                 .expect("the default derivation lists resolve"),
         );
-        let (state, http_config) =
-            AppState::from_parts(&config, metrics_handle(), derivation, auth, storage)
-                .await
-                .expect("build the app state");
+        let scratch = trawl_server::state::open_query_scratch(&config).expect("lock the scratch");
+        let (state, http_config) = AppState::from_parts(
+            &config,
+            metrics_handle(),
+            derivation,
+            auth,
+            storage,
+            scratch,
+        )
+        .await
+        .expect("build the app state");
         trawl_server::boot::prepare_corpus(&state, &config)
             .await
             .expect("prepare the corpus");

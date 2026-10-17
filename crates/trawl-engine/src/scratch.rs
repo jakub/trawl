@@ -15,6 +15,17 @@
 //! with no group or other bit. `DuckDB` opens its spill files by predictable
 //! names without `O_EXCL`, so a directory another user could enter would let
 //! them plant or read one.
+//!
+//! [`ScratchLock::open`] makes the scratch directory itself trawld's for the
+//! life of the process. It makes the directory 0700 if it is missing, holds
+//! its final component no-follow as ADR-0052 holds a storage root, takes an
+//! exclusive `flock` on that handle, and only then clears what an earlier
+//! trawld left behind, such as after a SIGKILL or an eviction. The clearing
+//! reads the whole tree before it removes anything: one entry it does not
+//! recognize refuses the start with nothing deleted. It never follows a
+//! link and never crosses a mount. The `PostgreSQL` sole-writer lock does
+//! not authorize it: that lock guards one app-state database, not this
+//! directory, and a lost lock can go unseen for seconds.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -22,9 +33,26 @@ use std::path::{Path, PathBuf};
 /// Prefix of a query database's private spill directory.
 pub const SPILL_DIR_PREFIX: &str = "trawl-spill-";
 
-/// Length of the random suffix after [`SPILL_DIR_PREFIX`], pinned so the
-/// recognizer can demand exactly what the creator makes.
-const SPILL_DIR_RANDOM_LEN: usize = 6;
+/// Prefix and suffix of a hot-buffer query snapshot file.
+pub const SNAPSHOT_FILE_PREFIX: &str = "trawl-snapshot-";
+/// See [`SNAPSHOT_FILE_PREFIX`].
+pub const SNAPSHOT_FILE_SUFFIX: &str = ".ndjson";
+
+/// Prefix and suffix of a Parquet export staging file.
+pub const EXPORT_FILE_PREFIX: &str = "trawl-export-";
+/// See [`EXPORT_FILE_PREFIX`].
+pub const EXPORT_FILE_SUFFIX: &str = ".parquet";
+
+/// The prefix `DuckDB` 1.5.5's `COPY ... TO` gives the file it writes before
+/// renaming it onto the target (`use_tmp_file`, on by default for a local
+/// file; `plan_copy_to_file.cpp`). An export killed mid-copy leaves one
+/// beside its staging file.
+const COPY_TMP_PREFIX: &str = "tmp_";
+
+/// Length of the random part of every name trawld makes in the scratch
+/// directory, pinned so the recognizers can demand exactly what the
+/// creators make.
+const RANDOM_LEN: usize = 6;
 
 /// The setting an operator changes to move query spill, named in refusals
 /// of a spill directory made in the scratch directory.
@@ -36,8 +64,9 @@ pub(crate) const TMPDIR_SETTING: &str = "TMPDIR";
 
 /// The query scratch directory, by path.
 ///
-/// It names the directory and makes the spill directories inside it. It
-/// does not create, lock or clear the directory itself.
+/// It names the directory and makes the entries trawld keeps inside it. It
+/// does not create, lock or clear the directory itself: [`ScratchLock`]
+/// does, and hands out this name once it holds the lock.
 #[derive(Debug, Clone)]
 pub struct QueryScratch {
     path: PathBuf,
@@ -60,18 +89,67 @@ impl QueryScratch {
     pub(crate) fn private_spill_dir(&self) -> std::io::Result<tempfile::TempDir> {
         private_dir_in(&self.path, SCRATCH_SETTING, |_| Ok(()))
     }
+
+    /// Create a hot-buffer query snapshot file, 0600, named so
+    /// [`is_snapshot_file_name`] recognizes it.
+    pub fn snapshot_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
+        named_file_in(&self.path, SNAPSHOT_FILE_PREFIX, SNAPSHOT_FILE_SUFFIX)
+    }
+
+    /// Create a Parquet export staging file, 0600, named so
+    /// [`is_export_file_name`] recognizes it.
+    pub fn export_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
+        named_file_in(&self.path, EXPORT_FILE_PREFIX, EXPORT_FILE_SUFFIX)
+    }
+}
+
+/// Create a 0600 file in `dir` named `prefix`, [`RANDOM_LEN`] ASCII letters
+/// or digits, then `suffix`.
+fn named_file_in(
+    dir: &Path,
+    prefix: &str,
+    suffix: &str,
+) -> std::io::Result<tempfile::NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .suffix(suffix)
+        .rand_bytes(RANDOM_LEN)
+        .tempfile_in(dir)
+}
+
+/// Whether `name` is `prefix`, exactly [`RANDOM_LEN`] ASCII letters or
+/// digits, then `suffix`.
+fn is_made_name(name: &OsStr, prefix: &str, suffix: &str) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(prefix))
+        .and_then(|rest| rest.strip_suffix(suffix))
+        .is_some_and(|random| {
+            random.len() == RANDOM_LEN && random.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
 }
 
 /// Whether `name` is one trawld gives a query database's spill directory:
 /// [`SPILL_DIR_PREFIX`] and exactly six ASCII letters or digits.
 #[must_use]
 pub fn is_spill_dir_name(name: &OsStr) -> bool {
-    name.to_str()
-        .and_then(|name| name.strip_prefix(SPILL_DIR_PREFIX))
-        .is_some_and(|suffix| {
-            suffix.len() == SPILL_DIR_RANDOM_LEN
-                && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
-        })
+    is_made_name(name, SPILL_DIR_PREFIX, "")
+}
+
+/// Whether `name` is one [`QueryScratch::snapshot_file`] makes.
+#[must_use]
+pub fn is_snapshot_file_name(name: &OsStr) -> bool {
+    is_made_name(name, SNAPSHOT_FILE_PREFIX, SNAPSHOT_FILE_SUFFIX)
+}
+
+/// Whether `name` is one [`QueryScratch::export_file`] makes, or the
+/// `tmp_`-prefixed file `DuckDB`'s `COPY ... TO` writes before it renames
+/// it onto that name.
+#[must_use]
+pub fn is_export_file_name(name: &OsStr) -> bool {
+    let name = name
+        .to_str()
+        .map(|name| name.strip_prefix(COPY_TMP_PREFIX).unwrap_or(name));
+    name.is_some_and(|name| is_made_name(OsStr::new(name), EXPORT_FILE_PREFIX, EXPORT_FILE_SUFFIX))
 }
 
 /// Whether `name` is one `DuckDB` 1.5.5 gives a file in a spill directory.
@@ -121,7 +199,7 @@ pub(crate) fn private_dir_in(
 ) -> std::io::Result<tempfile::TempDir> {
     let mut builder = tempfile::Builder::new();
     builder.prefix(SPILL_DIR_PREFIX);
-    builder.rand_bytes(SPILL_DIR_RANDOM_LEN);
+    builder.rand_bytes(RANDOM_LEN);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -163,6 +241,602 @@ pub(crate) fn check_private(path: &Path, euid: u32, setting: &str) -> std::io::R
             owner,
         ),
     ))
+}
+
+/// Why [`ScratchLock::open`] refused the scratch directory. Every message
+/// names `[server] query_scratch_dir`, the setting the operator changes.
+#[derive(Debug, thiserror::Error)]
+pub enum ScratchError {
+    /// The path does not end in a directory name: it is empty, `/`, or ends
+    /// in `..`.
+    #[error(
+        "the query scratch directory {} does not end in a directory name; point {SCRATCH_SETTING} \
+         at a directory of its own",
+        .path.display()
+    )]
+    BadPath {
+        /// The configured path.
+        path: PathBuf,
+    },
+    /// A filesystem call failed.
+    #[error(
+        "cannot {action} the query scratch directory {}: {source}; check {SCRATCH_SETTING}",
+        .path.display()
+    )]
+    Io {
+        /// What trawld was doing, as a verb phrase.
+        action: &'static str,
+        /// The path it was doing it to.
+        path: PathBuf,
+        /// The failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The directory cannot be written: a query-only node whose data root is
+    /// mounted read-only keeps the default scratch directory beside it.
+    #[error(
+        "the query scratch directory {} is on a read-only filesystem; point {SCRATCH_SETTING} at \
+         a writable directory",
+        .path.display()
+    )]
+    ReadOnly {
+        /// The configured path.
+        path: PathBuf,
+    },
+    /// The final component is a symbolic link, which trawld does not follow.
+    #[error(
+        "the query scratch directory {} is a symbolic link, which trawld does not follow; point \
+         {SCRATCH_SETTING} at the directory itself",
+        .path.display()
+    )]
+    Symlink {
+        /// The configured path.
+        path: PathBuf,
+    },
+    /// Something other than a directory is at the path.
+    #[error(
+        "the query scratch directory {} is not a directory; move it aside or point \
+         {SCRATCH_SETTING} at a directory",
+        .path.display()
+    )]
+    NotDirectory {
+        /// The configured path.
+        path: PathBuf,
+    },
+    /// Another user owns the directory. trawld does not take over a
+    /// directory it was not given, even when it runs as root.
+    #[error(
+        "the query scratch directory {} is owned by uid {owner}, not uid {euid}, the user trawld \
+         runs as; point {SCRATCH_SETTING} at a directory uid {euid} owns",
+        .path.display()
+    )]
+    ForeignOwner {
+        /// The configured path.
+        path: PathBuf,
+        /// The directory's owner.
+        owner: u32,
+        /// The uid trawld runs as.
+        euid: u32,
+    },
+    /// A group or other bit survived the change that removes them, as on a
+    /// filesystem with fixed modes.
+    #[error(
+        "the query scratch directory {} keeps mode {mode:04o} after trawld removed its group and \
+         other bits, so other users could read query data; point {SCRATCH_SETTING} at a \
+         directory on a filesystem that keeps Unix modes",
+        .path.display()
+    )]
+    NotPrivate {
+        /// The configured path.
+        path: PathBuf,
+        /// The mode read back after the change.
+        mode: u32,
+    },
+    /// Another process holds the lock.
+    #[error(
+        "the query scratch directory {} is locked by another trawld; stop that trawld, or point \
+         this one's {SCRATCH_SETTING} at a directory of its own",
+        .path.display()
+    )]
+    Locked {
+        /// The configured path.
+        path: PathBuf,
+    },
+    /// An entry trawld does not make, or one it cannot remove safely. The
+    /// whole tree is read before anything is removed, so nothing was.
+    #[error(
+        "the query scratch directory {} holds {}, which {reason}; trawld removes only the entries \
+         it makes and has removed nothing. Move the entry out, or point {SCRATCH_SETTING} at a \
+         directory of its own",
+        .path.display(),
+        .entry.display()
+    )]
+    ForeignEntry {
+        /// The configured path.
+        path: PathBuf,
+        /// The entry.
+        entry: PathBuf,
+        /// Why it refuses the start, as a predicate.
+        reason: String,
+    },
+}
+
+/// What [`ScratchLock::open`] removed: the entries an earlier trawld left
+/// behind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reclaimed {
+    /// Query database spill directories, each with its spill files.
+    pub spill_dirs: usize,
+    /// Hot-buffer query snapshot files.
+    pub snapshots: usize,
+    /// Parquet export staging files, `DuckDB`'s `tmp_` copies included.
+    pub exports: usize,
+}
+
+/// The query scratch directory, locked for this process and cleared of
+/// what an earlier trawld left behind.
+///
+/// The lock is an exclusive `flock` on the directory's own no-follow
+/// handle, so it lives exactly as long as this value: dropping it closes
+/// the handle and frees the lock, and so does the end of the process,
+/// however it ends. `flock` belongs to the open file description, so a
+/// second open in the same process is refused like one in another process.
+#[derive(Debug)]
+pub struct ScratchLock {
+    scratch: QueryScratch,
+    /// The handle the lock is held on.
+    _handle: std::fs::File,
+    reclaimed: Reclaimed,
+}
+
+impl ScratchLock {
+    /// Make, check, lock and clear the scratch directory at `path`.
+    ///
+    /// A missing directory is made 0700, below parents made as needed, as
+    /// the epoch gate makes the data root. Its final component is then
+    /// opened no-follow, and everything after is judged and done through
+    /// that handle. It refuses a symlink, a non-directory, a directory
+    /// another user owns, and one on a read-only filesystem. A group or
+    /// other bit is removed through the handle, as ADR-0052 closes a root,
+    /// and refused if it survives. Then it takes the lock, refusing if
+    /// another process holds it, and clears the directory (see the module
+    /// documentation).
+    pub fn open(path: &Path) -> Result<Self, ScratchError> {
+        #[cfg(unix)]
+        return Self::open_as(path, rustix::process::geteuid().as_raw());
+        #[cfg(not(unix))]
+        return Err(ScratchError::Io {
+            action: "lock",
+            path: path.to_owned(),
+            source: std::io::ErrorKind::Unsupported.into(),
+        });
+    }
+
+    /// [`Self::open`] for a trawld running as `euid`.
+    #[cfg(unix)]
+    fn open_as(path: &Path, euid: u32) -> Result<Self, ScratchError> {
+        use std::fs::TryLockError;
+        use std::os::fd::AsFd as _;
+
+        use rustix::fs::{Mode, StatVfsMountFlags};
+
+        let path = lock::final_name(path).ok_or_else(|| ScratchError::BadPath {
+            path: path.to_owned(),
+        })?;
+        lock::make(&path)?;
+        let handle = lock::hold(&path)?;
+        let io = |action| {
+            let path = path.clone();
+            move |source: std::io::Error| ScratchError::Io {
+                action,
+                path,
+                source,
+            }
+        };
+
+        let stat = lock::stat_handle(handle.as_fd()).map_err(io("inspect"))?;
+        if stat.owner != euid {
+            return Err(ScratchError::ForeignOwner {
+                path,
+                owner: stat.owner,
+                euid,
+            });
+        }
+        let read_only = rustix::fs::fstatvfs(&handle)
+            .map_err(|e| io("inspect")(e.into()))?
+            .f_flag
+            .contains(StatVfsMountFlags::RDONLY);
+        if read_only {
+            return Err(ScratchError::ReadOnly { path });
+        }
+        if stat.mode & lock::GROUP_OTHER != 0 {
+            rustix::fs::fchmod(&handle, Mode::from_raw_mode(stat.mode & !lock::GROUP_OTHER))
+                .map_err(|e| io("remove the group and other bits of")(e.into()))?;
+            let mode = lock::stat_handle(handle.as_fd())
+                .map_err(io("inspect"))?
+                .mode;
+            if mode & lock::GROUP_OTHER != 0 {
+                return Err(ScratchError::NotPrivate { path, mode });
+            }
+        }
+
+        match handle.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(ScratchError::Locked { path }),
+            Err(TryLockError::Error(e)) => return Err(io("lock")(e)),
+        }
+        let stale = lock::preflight(&path, &handle, euid)?;
+        let reclaimed = lock::remove(&path, &handle, stale)?;
+        Ok(Self {
+            scratch: QueryScratch::new(path),
+            _handle: handle,
+            reclaimed,
+        })
+    }
+
+    /// The scratch directory this lock holds.
+    #[must_use]
+    pub fn scratch(&self) -> &QueryScratch {
+        &self.scratch
+    }
+
+    /// What the open removed.
+    #[must_use]
+    pub fn reclaimed(&self) -> Reclaimed {
+        self.reclaimed
+    }
+}
+
+/// The filesystem work behind [`ScratchLock::open`]. Everything below the
+/// scratch directory is reached by descriptor, one `openat` or `unlinkat`
+/// at a time, never by a path a link could redirect.
+#[cfg(unix)]
+mod lock {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsFd as _, BorrowedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::{Component, Path, PathBuf};
+
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+    use rustix::io::Errno;
+
+    use super::{
+        Reclaimed, ScratchError, is_export_file_name, is_snapshot_file_name, is_spill_dir_name,
+        is_spill_file_name,
+    };
+
+    /// The group and other permission bits.
+    pub(super) const GROUP_OTHER: u32 = 0o077;
+
+    /// Flags for a no-follow directory open.
+    const DIR_FLAGS: OFlags = OFlags::RDONLY
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+
+    /// `path` rebuilt from its components, or `None` when it does not end
+    /// in a directory name. Rebuilding drops a trailing `/` or `.`, which
+    /// would turn a final symlink into an intermediate component that the
+    /// no-follow open follows.
+    pub(super) fn final_name(path: &Path) -> Option<PathBuf> {
+        let components: Vec<Component<'_>> = path.components().collect();
+        matches!(components.last(), Some(Component::Normal(_))).then(|| components.iter().collect())
+    }
+
+    /// Make the directory at `path` 0700 if nothing is there, and its
+    /// parents as needed. Something already there is left for [`hold`] to
+    /// judge.
+    pub(super) fn make(path: &Path) -> Result<(), ScratchError> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let refuse = |action, source: io::Error| match source.kind() {
+            io::ErrorKind::ReadOnlyFilesystem => ScratchError::ReadOnly {
+                path: path.to_owned(),
+            },
+            _ => ScratchError::Io {
+                action,
+                path: path.to_owned(),
+                source,
+            },
+        };
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| refuse("make the parent of", e))?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(refuse("make", e)),
+        }
+    }
+
+    /// Open the directory at `path` without following a final symlink.
+    pub(super) fn hold(path: &Path) -> Result<File, ScratchError> {
+        match rustix::fs::open(path, DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => Ok(File::from(fd)),
+            // Linux answers a symlink with ENOTDIR here, not ELOOP: the open
+            // has already refused it, and the lstat only names why.
+            Err(Errno::LOOP | Errno::NOTDIR) => Err(
+                if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
+                    ScratchError::Symlink {
+                        path: path.to_owned(),
+                    }
+                } else {
+                    ScratchError::NotDirectory {
+                        path: path.to_owned(),
+                    }
+                },
+            ),
+            Err(e) => Err(ScratchError::Io {
+                action: "open",
+                path: path.to_owned(),
+                source: e.into(),
+            }),
+        }
+    }
+
+    /// Where an inode lives: its filesystem and, where the kernel says,
+    /// its mount. A bind mount keeps the device, so the device alone
+    /// cannot see one; Linux 5.8 and later name the mount.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Placement {
+        device: u64,
+        mount: Option<u64>,
+    }
+
+    /// What one `stat` of an entry says, without following a symlink.
+    #[derive(Debug, Clone, Copy)]
+    pub(super) struct EntryStat {
+        kind: FileType,
+        pub(super) owner: u32,
+        pub(super) mode: u32,
+        inode: u64,
+        placement: Placement,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn statx(dir: BorrowedFd<'_>, name: &CStr, flags: AtFlags) -> io::Result<EntryStat> {
+        use rustix::fs::StatxFlags;
+        let stat = rustix::fs::statx(
+            dir,
+            name,
+            flags | AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+            StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+        )?;
+        let mode = u32::from(stat.stx_mode);
+        Ok(EntryStat {
+            kind: FileType::from_raw_mode(mode),
+            owner: stat.stx_uid,
+            mode: mode & 0o7777,
+            inode: stat.stx_ino,
+            placement: Placement {
+                device: rustix::fs::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+                mount: (stat.stx_mask & StatxFlags::MNT_ID.bits() != 0).then_some(stat.stx_mnt_id),
+            },
+        })
+    }
+
+    /// The entry `name` in `dir`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn stat_entry(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<EntryStat> {
+        statx(dir, name, AtFlags::empty())
+    }
+
+    /// The inode `fd` holds.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn stat_handle(fd: BorrowedFd<'_>) -> io::Result<EntryStat> {
+        statx(fd, c"", AtFlags::EMPTY_PATH)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn from_stat(stat: &rustix::fs::Stat) -> EntryStat {
+        #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+        EntryStat {
+            kind: FileType::from_raw_mode(stat.st_mode as _),
+            owner: stat.st_uid,
+            mode: (stat.st_mode as u32) & 0o7777,
+            inode: stat.st_ino as u64,
+            placement: Placement {
+                device: stat.st_dev as u64,
+                mount: None,
+            },
+        }
+    }
+
+    /// The entry `name` in `dir`. This platform names no mount, so the
+    /// device is all there is.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn stat_entry(dir: BorrowedFd<'_>, name: &CStr) -> io::Result<EntryStat> {
+        Ok(from_stat(&rustix::fs::statat(
+            dir,
+            name,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?))
+    }
+
+    /// The inode `fd` holds.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(super) fn stat_handle(fd: BorrowedFd<'_>) -> io::Result<EntryStat> {
+        Ok(from_stat(&rustix::fs::fstat(fd)?))
+    }
+
+    /// The entries of the directory `dir` holds, `.` and `..` left out,
+    /// each with its `stat`. `path` names `dir` in errors.
+    fn entries(dir: &File, path: &Path) -> Result<Vec<(CString, EntryStat)>, ScratchError> {
+        let io = |source: io::Error| ScratchError::Io {
+            action: "read",
+            path: path.to_owned(),
+            source,
+        };
+        let mut out = Vec::new();
+        for entry in rustix::fs::Dir::read_from(dir).map_err(|e| io(e.into()))? {
+            let entry = entry.map_err(|e| io(e.into()))?;
+            let name = entry.file_name();
+            if name == c"." || name == c".." {
+                continue;
+            }
+            let stat = stat_entry(dir.as_fd(), name).map_err(io)?;
+            out.push((name.to_owned(), stat));
+        }
+        Ok(out)
+    }
+
+    /// An entry an earlier trawld left behind, checked and due for removal.
+    pub(super) enum Stale {
+        /// A spill directory, held open, and the spill files in it.
+        SpillDir {
+            name: CString,
+            dir: File,
+            files: Vec<CString>,
+        },
+        /// A snapshot file.
+        Snapshot(CString),
+        /// An export staging file.
+        Export(CString),
+    }
+
+    /// Why `stat` refuses whatever its name: a symlink, another mount, or
+    /// another owner.
+    fn refusal(stat: &EntryStat, home: Placement, euid: u32) -> Option<String> {
+        if stat.kind == FileType::Symlink {
+            Some("is a symbolic link, which trawld does not follow".to_owned())
+        } else if stat.placement != home {
+            Some("is on another mount, which trawld does not cross".to_owned())
+        } else if stat.owner != euid {
+            Some(format!(
+                "is owned by uid {}, not uid {euid}, the user trawld runs as",
+                stat.owner
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Read the whole tree under the locked directory `root` and return
+    /// what to remove, or refuse at the first entry trawld did not make.
+    /// Nothing is removed here, so a refusal leaves the tree as it was.
+    ///
+    /// trawld makes three kinds of entry. A spill directory is a directory
+    /// named by [`is_spill_dir_name`] holding only regular files named by
+    /// [`is_spill_file_name`]. A snapshot or an export is a regular file
+    /// named by [`is_snapshot_file_name`] or [`is_export_file_name`]. Each
+    /// is owned by `euid` and sits in the root's mount. Anything else
+    /// refuses: another name, a symlink, a special file, a directory
+    /// inside a spill directory, another owner, another mount.
+    pub(super) fn preflight(
+        path: &Path,
+        root: &File,
+        euid: u32,
+    ) -> Result<Vec<Stale>, ScratchError> {
+        let home = stat_handle(root.as_fd())
+            .map_err(|source| ScratchError::Io {
+                action: "inspect",
+                path: path.to_owned(),
+                source,
+            })?
+            .placement;
+        let mut stale = Vec::new();
+        for (name, stat) in entries(root, path)? {
+            let os_name = OsStr::from_bytes(name.to_bytes());
+            let entry = path.join(os_name);
+            let foreign = |entry: &Path, reason: String| ScratchError::ForeignEntry {
+                path: path.to_owned(),
+                entry: entry.to_owned(),
+                reason,
+            };
+            if let Some(reason) = refusal(&stat, home, euid) {
+                return Err(foreign(&entry, reason));
+            }
+            let regular = stat.kind == FileType::RegularFile;
+            if is_spill_dir_name(os_name) && stat.kind == FileType::Directory {
+                let dir = match rustix::fs::openat(root, &name, DIR_FLAGS, Mode::empty()) {
+                    Ok(fd) => File::from(fd),
+                    Err(e) => {
+                        return Err(ScratchError::Io {
+                            action: "open",
+                            path: entry,
+                            source: e.into(),
+                        });
+                    }
+                };
+                let opened = stat_handle(dir.as_fd()).map_err(|source| ScratchError::Io {
+                    action: "inspect",
+                    path: entry.clone(),
+                    source,
+                })?;
+                if opened.inode != stat.inode || opened.placement != stat.placement {
+                    return Err(foreign(&entry, "changed while trawld read it".to_owned()));
+                }
+                let mut files = Vec::new();
+                for (child, child_stat) in entries(&dir, &entry)? {
+                    let child_name = OsStr::from_bytes(child.to_bytes());
+                    let child_path = entry.join(child_name);
+                    if let Some(reason) = refusal(&child_stat, home, euid) {
+                        return Err(foreign(&child_path, reason));
+                    }
+                    if child_stat.kind != FileType::RegularFile || !is_spill_file_name(child_name) {
+                        return Err(foreign(
+                            &child_path,
+                            "is not a spill file DuckDB makes".to_owned(),
+                        ));
+                    }
+                    files.push(child);
+                }
+                stale.push(Stale::SpillDir { name, dir, files });
+            } else if regular && is_snapshot_file_name(os_name) {
+                stale.push(Stale::Snapshot(name));
+            } else if regular && is_export_file_name(os_name) {
+                stale.push(Stale::Export(name));
+            } else {
+                return Err(foreign(&entry, "is not an entry trawld makes".to_owned()));
+            }
+        }
+        Ok(stale)
+    }
+
+    /// Remove what [`preflight`] found, by name relative to the open
+    /// directories, so no link is followed. An entry already gone counts
+    /// as removed.
+    pub(super) fn remove(
+        path: &Path,
+        root: &File,
+        stale: Vec<Stale>,
+    ) -> Result<Reclaimed, ScratchError> {
+        let unlink =
+            |dir: &File, dir_path: &Path, name: &CStr, flags: AtFlags| match rustix::fs::unlinkat(
+                dir, name, flags,
+            ) {
+                Ok(()) | Err(Errno::NOENT) => Ok(()),
+                Err(e) => Err(ScratchError::Io {
+                    action: "remove an entry of",
+                    path: dir_path.join(OsStr::from_bytes(name.to_bytes())),
+                    source: e.into(),
+                }),
+            };
+        let mut reclaimed = Reclaimed::default();
+        for entry in stale {
+            match entry {
+                Stale::SpillDir { name, dir, files } => {
+                    let dir_path = path.join(OsStr::from_bytes(name.to_bytes()));
+                    for file in &files {
+                        unlink(&dir, &dir_path, file, AtFlags::empty())?;
+                    }
+                    drop(dir);
+                    unlink(root, path, &name, AtFlags::REMOVEDIR)?;
+                    reclaimed.spill_dirs += 1;
+                }
+                Stale::Snapshot(name) => {
+                    unlink(root, path, &name, AtFlags::empty())?;
+                    reclaimed.snapshots += 1;
+                }
+                Stale::Export(name) => {
+                    unlink(root, path, &name, AtFlags::empty())?;
+                    reclaimed.exports += 1;
+                }
+            }
+        }
+        Ok(reclaimed)
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +929,394 @@ mod tests {
         assert!(!names.is_empty(), "the sort spilled nothing");
         for name in &names {
             assert!(is_spill_file_name(name), "{}", name.to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn snapshot_and_export_names_are_recognized_exactly() {
+        let parent = tempfile::tempdir().expect("parent");
+        let scratch = QueryScratch::new(parent.path());
+        let snapshot = scratch.snapshot_file().expect("snapshot");
+        let export = scratch.export_file().expect("export");
+        let snapshot_name = snapshot.path().file_name().expect("a final component");
+        let export_name = export.path().file_name().expect("a final component");
+        assert!(is_snapshot_file_name(snapshot_name), "{snapshot_name:?}");
+        assert!(is_export_file_name(export_name), "{export_name:?}");
+        let copy_tmp = format!("tmp_{}", export_name.to_str().expect("utf-8"));
+        assert!(is_export_file_name(OsStr::new(&copy_tmp)), "{copy_tmp}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for file in [&snapshot, &export] {
+                let mode = file
+                    .as_file()
+                    .metadata()
+                    .expect("stat")
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600, "{}", file.path().display());
+            }
+        }
+
+        for name in [
+            "trawl-snapshot-.ndjson",
+            "trawl-snapshot-abc12.ndjson",
+            "trawl-snapshot-abc1234.ndjson",
+            "trawl-snapshot-abc-12.ndjson",
+            "trawl-snapshot-abc123.ndjson.tmp",
+            "tmp_trawl-snapshot-abc123.ndjson",
+            "trawl-export-abc123.parquet",
+            "trawl-snapshot-abc123",
+        ] {
+            assert!(!is_snapshot_file_name(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "trawl-export-abc12.parquet",
+            "trawl-export-abc123.parquet.tmp",
+            "tmp_tmp_trawl-export-abc123.parquet",
+            "tmptrawl-export-abc123.parquet",
+            "trawl-export-abc123",
+            "trawl-snapshot-abc123.ndjson",
+        ] {
+            assert!(!is_export_file_name(OsStr::new(name)), "{name}");
+        }
+    }
+
+    /// Every entry under `root`, `root` included, with what it is: a
+    /// directory, a file and its bytes, or a link and its target. A refused
+    /// open must leave this unchanged.
+    #[cfg(unix)]
+    fn tree(root: &Path) -> Vec<(PathBuf, String)> {
+        let meta = std::fs::symlink_metadata(root).expect("stat");
+        let what = if meta.is_symlink() {
+            format!(
+                "link {}",
+                std::fs::read_link(root).expect("readlink").display()
+            )
+        } else if meta.is_dir() {
+            "dir".to_owned()
+        } else {
+            format!("file {:?}", std::fs::read(root).expect("read"))
+        };
+        let mut out = vec![(root.to_owned(), what)];
+        if meta.is_dir() {
+            let mut children: Vec<PathBuf> = std::fs::read_dir(root)
+                .expect("list")
+                .map(|entry| entry.expect("entry").path())
+                .collect();
+            children.sort();
+            for child in children {
+                out.extend(tree(&child));
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(path).expect("stat").mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// Leave in `scratch` what a trawld killed mid-query leaves: a spill
+    /// directory holding both kinds of `DuckDB` spill file, a snapshot, an
+    /// export staging file and `DuckDB`'s `tmp_` copy of it. Returns the
+    /// spill directory.
+    #[cfg(unix)]
+    fn plant_stale(scratch: &Path) -> PathBuf {
+        let made = QueryScratch::new(scratch);
+        let spill = made.private_spill_dir().expect("spill dir").keep();
+        for name in [
+            "duckdb_temp_storage_DEFAULT-0.tmp",
+            "duckdb_temp_block-4611686018427388160.block",
+        ] {
+            std::fs::write(spill.join(name), b"spilled").expect("spill file");
+        }
+        made.snapshot_file()
+            .expect("snapshot")
+            .keep()
+            .expect("keep");
+        let (_, export) = made.export_file().expect("export").keep().expect("keep");
+        let name = export.file_name().expect("name").to_str().expect("utf-8");
+        std::fs::write(scratch.join(format!("tmp_{name}")), b"half a copy").expect("copy");
+        spill
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_open_makes_a_missing_directory_private() {
+        let parent = tempfile::tempdir().expect("parent");
+        let path = parent.path().join("absent/parents/data.query-scratch");
+        let lock = ScratchLock::open(&path).expect("open");
+        assert_eq!(lock.scratch().path(), path);
+        assert_eq!(mode_of(&path), 0o700);
+        assert_eq!(lock.reclaimed(), Reclaimed::default());
+        // A trailing `/` names the same directory.
+        drop(lock);
+        let again = ScratchLock::open(&parent.path().join("absent/parents/data.query-scratch/"))
+            .expect("reopen");
+        assert_eq!(again.scratch().path(), path);
+    }
+
+    /// ADR-0052's close: a directory trawld owns loses its group and other
+    /// bits through the held handle, and keeps its setgid bit.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_open_closes_an_open_directory() {
+        let parent = tempfile::tempdir().expect("parent");
+        let path = parent.path().join("scratch");
+        std::fs::create_dir(&path).expect("mkdir");
+        set_mode(&path, 0o2755);
+        let _lock = ScratchLock::open(&path).expect("open");
+        assert_eq!(mode_of(&path), 0o2700);
+    }
+
+    /// `flock` belongs to the open file description, so a second open in
+    /// this process is refused as one in another trawld is, and touches
+    /// nothing; dropping the first frees the lock.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_lock_refuses_a_second_open_until_dropped() {
+        let parent = tempfile::tempdir().expect("parent");
+        let path = parent.path().join("scratch");
+        let first = ScratchLock::open(&path).expect("first");
+        plant_stale(&path);
+        let before = tree(&path);
+        let error = ScratchLock::open(&path).expect_err("held");
+        assert!(matches!(error, ScratchError::Locked { .. }), "{error}");
+        let message = error.to_string();
+        assert!(message.contains("locked by another trawld"), "{message}");
+        assert!(message.contains("[server] query_scratch_dir"), "{message}");
+        assert_eq!(
+            tree(&path),
+            before,
+            "the refused open changed the directory"
+        );
+        drop(first);
+        let second = ScratchLock::open(&path).expect("free once dropped");
+        assert_eq!(second.reclaimed().spill_dirs, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_open_reclaims_what_a_killed_trawld_left() {
+        let parent = tempfile::tempdir().expect("parent");
+        let path = parent.path().join("scratch");
+        std::fs::create_dir(&path).expect("mkdir");
+        let spill = plant_stale(&path);
+        plant_stale(&path);
+        assert!(spill.is_dir());
+
+        let lock = ScratchLock::open(&path).expect("open");
+        assert_eq!(
+            lock.reclaimed(),
+            Reclaimed {
+                spill_dirs: 2,
+                snapshots: 2,
+                exports: 4,
+            }
+        );
+        assert_eq!(tree(&path), vec![(path.clone(), "dir".to_owned())]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_open_refuses_a_symlink_or_a_non_directory() {
+        let parent = tempfile::tempdir().expect("parent");
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).expect("mkdir");
+        plant_stale(&target);
+        set_mode(&target, 0o755);
+        let before = tree(&target);
+        let link = parent.path().join("scratch");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        for path in [link.clone(), link.join("")] {
+            let error = ScratchLock::open(&path).expect_err("a symlink");
+            assert!(matches!(error, ScratchError::Symlink { .. }), "{error}");
+        }
+        assert_eq!(tree(&target), before, "the link was followed");
+        assert_eq!(mode_of(&target), 0o755);
+
+        let file = parent.path().join("file");
+        std::fs::write(&file, b"not a directory").expect("file");
+        let error = ScratchLock::open(&file).expect_err("a file");
+        assert!(
+            matches!(error, ScratchError::NotDirectory { .. }),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&file).expect("read"), b"not a directory");
+
+        for path in ["", "/", "scratch/.."] {
+            let error = ScratchLock::open(Path::new(path)).expect_err("no final name");
+            assert!(
+                matches!(error, ScratchError::BadPath { .. }),
+                "{path:?}: {error}"
+            );
+        }
+    }
+
+    /// A directory another user owns refuses the start before anything
+    /// changes, even one trawld could tighten; so does an entry inside
+    /// another user owns. An unprivileged test cannot own either as
+    /// another user, so the open runs as a uid that does not own them.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_open_refuses_another_owner() {
+        let euid = rustix::process::geteuid().as_raw();
+        let other = euid.wrapping_add(1);
+        let parent = tempfile::tempdir().expect("parent");
+        let path = parent.path().join("scratch");
+        std::fs::create_dir(&path).expect("mkdir");
+        plant_stale(&path);
+        set_mode(&path, 0o755);
+        let before = tree(&path);
+
+        let error = ScratchLock::open_as(&path, other).expect_err("foreign");
+        assert!(
+            matches!(error, ScratchError::ForeignOwner { owner, euid: e, .. } if owner == euid && e == other),
+            "{error}"
+        );
+        assert_eq!(mode_of(&path), 0o755, "a foreign directory was changed");
+        assert_eq!(tree(&path), before);
+
+        let handle = lock::hold(&path).expect("hold");
+        let Err(error) = lock::preflight(&path, &handle, other) else {
+            panic!("an entry another uid owns passed the preflight");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("is owned by uid {euid}, not uid {other}")),
+            "{message}"
+        );
+        assert_eq!(tree(&path), before);
+    }
+
+    /// Plants one entry trawld does not make, given the scratch directory,
+    /// a stale spill directory in it and a file outside it, and returns
+    /// the entry.
+    #[cfg(unix)]
+    type Plant = fn(&Path, &Path, &Path) -> PathBuf;
+
+    /// Each entry the preflight refuses: what it is, how to plant it, and
+    /// the reason the refusal gives.
+    #[cfg(unix)]
+    fn foreign_entries() -> [(&'static str, Plant, &'static str); 7] {
+        [
+            (
+                "an unknown file",
+                |scratch, _, _| {
+                    let entry = scratch.join("notes.txt");
+                    std::fs::write(&entry, b"mine").expect("write");
+                    entry
+                },
+                "is not an entry trawld makes",
+            ),
+            (
+                "a symlink with a snapshot's name",
+                |scratch, _, victim| {
+                    let entry = scratch.join("trawl-snapshot-abc123.ndjson");
+                    std::os::unix::fs::symlink(victim, &entry).expect("symlink");
+                    entry
+                },
+                "is a symbolic link",
+            ),
+            (
+                "a symlink with a spill directory's name",
+                |scratch, _, victim| {
+                    let entry = scratch.join("trawl-spill-abc123");
+                    std::os::unix::fs::symlink(victim.parent().expect("dir"), &entry)
+                        .expect("symlink");
+                    entry
+                },
+                "is a symbolic link",
+            ),
+            (
+                "a symlink inside a spill directory",
+                |_, spill, victim| {
+                    let entry = spill.join("duckdb_temp_block-7.block");
+                    std::os::unix::fs::symlink(victim, &entry).expect("symlink");
+                    entry
+                },
+                "is a symbolic link",
+            ),
+            (
+                "a directory inside a spill directory",
+                |_, spill, _| {
+                    let entry = spill.join("duckdb_temp_storage_DEFAULT-9.tmp");
+                    std::fs::create_dir(&entry).expect("mkdir");
+                    entry
+                },
+                "is not a spill file DuckDB makes",
+            ),
+            (
+                "an unknown file inside a spill directory",
+                |_, spill, _| {
+                    let entry = spill.join("core");
+                    std::fs::write(&entry, b"dump").expect("write");
+                    entry
+                },
+                "is not a spill file DuckDB makes",
+            ),
+            (
+                "a directory with an export's name",
+                |scratch, _, _| {
+                    let entry = scratch.join("trawl-export-abc123.parquet");
+                    std::fs::create_dir(&entry).expect("mkdir");
+                    entry
+                },
+                "is not an entry trawld makes",
+            ),
+        ]
+    }
+
+    /// The preflight reads the whole tree before anything is removed: each
+    /// entry trawld does not make refuses the start by name, the stale
+    /// entries it does make beside it stay, and no link is followed.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_preflight_refuses_and_removes_nothing() {
+        let outside = tempfile::tempdir().expect("outside");
+        let victim = outside.path().join("victim");
+        std::fs::write(&victim, b"not trawld's").expect("victim");
+        for (case, plant, reason) in foreign_entries() {
+            let parent = tempfile::tempdir().expect("parent");
+            let path = parent.path().join("scratch");
+            std::fs::create_dir(&path).expect("mkdir");
+            let spill = plant_stale(&path);
+            let entry = plant(&path, &spill, &victim);
+            let before = tree(&path);
+
+            let error = ScratchLock::open(&path).expect_err(case);
+            assert!(
+                matches!(&error, ScratchError::ForeignEntry { entry: named, .. } if *named == entry),
+                "{case}: {error}"
+            );
+            let message = error.to_string();
+            for needle in [reason, "has removed nothing", "[server] query_scratch_dir"] {
+                assert!(
+                    message.contains(needle),
+                    "{case}: {needle:?} missing from {message}"
+                );
+            }
+            assert_eq!(
+                tree(&path),
+                before,
+                "{case}: the refused open changed the tree"
+            );
+            assert_eq!(
+                std::fs::read(&victim).expect("victim"),
+                b"not trawld's",
+                "{case}"
+            );
+            // The refusal released the lock with the handle.
+            std::fs::remove_dir_all(&path).expect("clear");
+            ScratchLock::open(&path).expect("free after a refusal");
         }
     }
 }
