@@ -28,8 +28,9 @@
 //! cross-site request would sign the user out of every fleet app.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use fleet_auth::{SessionExpiry, SessionPayload, session};
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,39 @@ use zeroize::Zeroizing;
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Session;
 use crate::state::AppState;
+
+/// The most a body under `/api/auth/*` may hold. An API key is about 50
+/// bytes; without this bound an unauthenticated caller could make the
+/// proxy buffer axum's default 2 MiB per login (ADR-0054, amended
+/// 2026-10-17).
+pub const LOGIN_BODY_LIMIT: usize = 16 * 1024;
+
+/// The name the login limit's 413 carries, where trawld's names a setting.
+pub const LOGIN_BODY_LIMIT_NAME: &str = "the login body limit";
+
+/// Answer the login body limit's refusal with the error envelope.
+///
+/// The `Json` extractor refuses a body over `DefaultBodyLimit` with a
+/// plain-text 413; this turns it into 413 `request_too_large` with the
+/// limit's name and value, the shape trawld's own 413 has. A 413 that is
+/// already JSON is a handler's own and passes untouched.
+pub async fn envelope_login_body_limit(request: Request, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() != StatusCode::PAYLOAD_TOO_LARGE
+        || response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"))
+    {
+        return response;
+    }
+    ProxyError::RequestTooLarge {
+        setting: LOGIN_BODY_LIMIT_NAME,
+        limit: LOGIN_BODY_LIMIT,
+    }
+    .into_response()
+}
 
 /// Request body for `POST /api/auth/login`.
 #[derive(Debug, Deserialize)]

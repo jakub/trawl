@@ -11,7 +11,7 @@ pub mod stream;
 use std::path::PathBuf;
 
 use axum::Router;
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::routing::{any, get, post};
 
@@ -42,14 +42,21 @@ pub fn build(state: AppState) -> Router {
 pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
     let (csp, hsts, xcto, refp, xfo) = security_headers::layers();
 
-    let router = Router::new()
-        // Auth endpoints live under /api/auth/ so the SPA owns the
-        // top-level /login, /logout paths as client-side routes without
-        // colliding with POST-only HTTP handlers (which would 405 on GET
-        // navigation and break deep-links to the login page).
+    // Auth endpoints live under /api/auth/ so the SPA owns the
+    // top-level /login, /logout paths as client-side routes without
+    // colliding with POST-only HTTP handlers (which would 405 on GET
+    // navigation and break deep-links to the login page). Their bodies
+    // are held to the login limit, innermost, and its refusal gets the
+    // envelope outside it.
+    let auth_routes = Router::new()
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
+        .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT))
+        .layer(axum::middleware::from_fn(auth::envelope_login_body_limit));
+
+    let router = Router::new()
+        .merge(auth_routes)
         // SSE first — must outrank the generic forwarder (both are under /api/v1).
         // Like the forwarder below, these are cookie-authenticated: the
         // ADR-0016 origin guard reaches them through the `Auth` extractor

@@ -19,14 +19,20 @@
 //! - An upstream 3xx becomes the proxy's own 502, and `Location` never
 //!   reaches the browser; see `refuse_redirect`.
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use futures::StreamExt as _;
 
+use crate::config::ProxyLimits;
 use crate::error::ProxyError;
 use crate::middleware::session_extractor::Auth;
 use crate::state::AppState;
+
+/// The setting the proxy's body limit comes from, as trawld's 413 names
+/// it.
+pub const BODY_LIMIT_SETTING: &str = "[server] max_request_body_bytes";
 
 /// Headers that are hop-by-hop per RFC 7230 §6.1 and MUST NOT be forwarded
 /// end-to-end. Plus `host` which we always rewrite.
@@ -83,9 +89,7 @@ async fn do_forward(
     // rule hold for every cookie route, including the next one.
     let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
 
-    let body_bytes = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
-        .await
-        .map_err(|e| ProxyError::BadRequest(format!("request body: {e}")))?;
+    let body_bytes = collect_body(&parts.headers, body, state.limits()).await?;
 
     // After every local check, so a request refused here never waits on
     // the pin file. This one client carries the request and its streamed
@@ -109,7 +113,8 @@ async fn do_forward(
     }
 
     if !body_bytes.is_empty() {
-        upstream_req = upstream_req.body(body_bytes.to_vec());
+        // `Bytes` into reqwest as it is: no copy of the buffered body.
+        upstream_req = upstream_req.body(body_bytes);
     }
 
     let upstream_resp = upstream_req.send().await.map_err(ProxyError::Network)?;
@@ -193,7 +198,59 @@ pub(crate) fn refuse_redirect(status: reqwest::StatusCode) -> Result<(), ProxyEr
     Ok(())
 }
 
-const MAX_PROXY_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// Buffer a request body whole, within the proxy's limits.
+///
+/// A `Content-Length` past the limit is refused before a byte is read,
+/// and a body found over the limit while it streams in is refused at the
+/// byte that crosses it: 413 `request_too_large`, with trawld's sentence.
+/// A body that is not whole within the deadline is 408 `timeout`. Neither
+/// refusal contacts trawld. The count the request holds is released with
+/// the refusal, as with any response head.
+///
+/// # Errors
+/// [`ProxyError::RequestTooLarge`], [`ProxyError::BodyTimeout`], or
+/// [`ProxyError::BadRequest`] when the body cannot be read.
+async fn collect_body(
+    headers: &HeaderMap,
+    body: Body,
+    limits: &ProxyLimits,
+) -> Result<Bytes, ProxyError> {
+    let limit = limits.request_body_bytes;
+    let too_large = || ProxyError::RequestTooLarge {
+        setting: BODY_LIMIT_SETTING,
+        limit,
+    };
+    let announced: Option<usize> = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse().ok());
+    if announced.is_some_and(|length| length > limit) {
+        return Err(too_large());
+    }
+    let read = async {
+        let mut stream = body.into_data_stream();
+        let mut chunks: Vec<Bytes> = Vec::new();
+        let mut total = 0_usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| ProxyError::BadRequest(format!("request body: {e}")))?;
+            total = total.saturating_add(chunk.len());
+            if total > limit {
+                return Err(too_large());
+            }
+            chunks.push(chunk);
+        }
+        // One chunk, the common case, goes on as it arrived; several are
+        // joined once.
+        Ok(match chunks.len() {
+            0 => Bytes::new(),
+            1 => chunks.remove(0),
+            _ => Bytes::from(chunks.concat()),
+        })
+    };
+    tokio::time::timeout(limits.body_read_timeout, read)
+        .await
+        .map_err(|_elapsed| ProxyError::BodyTimeout)?
+}
 
 /// Compose the upstream URL: the configured base followed by the
 /// browser's own path and query, verbatim.
@@ -287,6 +344,64 @@ mod tests {
             AppState::from_config(cfg).unwrap(),
             RequestCount::new(count),
         )
+    }
+
+    /// [`counted_app`] with `adjust` applied to the resolved config
+    /// first, so a test can shrink a limit or a deadline.
+    fn limited_app(
+        upstream: &HandUpstream,
+        count: usize,
+        adjust: impl FnOnce(&mut ResolvedConfig),
+    ) -> Router {
+        let web = WebConfig {
+            allow_insecure_cookies: true,
+            public_origins: vec![TEST_ORIGIN.to_owned()],
+            ..upstream.web_config()
+        };
+        let mut cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
+        adjust(&mut cfg);
+        routes::build_with_count(
+            AppState::from_config(cfg).unwrap(),
+            RequestCount::new(count),
+        )
+    }
+
+    /// A bearer POST of `body` to `path`.
+    fn bearer_post(path: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", "Bearer flt_direct")
+            .header("content-type", "application/json")
+            .body(body)
+            .unwrap()
+    }
+
+    /// Assert `resp` is one of the proxy's envelope refusals: `status`,
+    /// the `trawl_api` envelope with `code` and exactly `message`,
+    /// `Cache-Control: no-store` and no cookie change. Returns nothing a
+    /// caller needs; the body is consumed.
+    async fn assert_envelope_refusal(
+        resp: Response,
+        status: StatusCode,
+        code: trawl_api::ErrorCode,
+        message: &str,
+    ) {
+        assert_eq!(resp.status(), status);
+        let headers = resp.headers().clone();
+        assert_eq!(
+            headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["no-store"]
+        );
+        assert!(headers.get(header::SET_COOKIE).is_none());
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let envelope: trawl_api::ErrorResponse = serde_json::from_slice(&body)
+            .unwrap_or_else(|e| panic!("not an envelope ({e}): {body:?}"));
+        assert_eq!(envelope.error.code, code);
+        assert_eq!(envelope.error.message, message);
     }
 
     /// A bearer GET of `path`, the simplest counted request.
@@ -470,6 +585,149 @@ mod tests {
                 .unwrap();
         assert!(later.starts_with(b"data: "), "{later:?}");
         drop(body);
+    }
+
+    /// A body over `[server] max_request_body_bytes` is answered 413
+    /// `request_too_large` with trawld's own sentence, whether its length
+    /// was announced or found while it streamed in, and trawld is never
+    /// called. A body exactly at the limit goes through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_body_over_server_limit_gets_413_without_upstream_call() {
+        let upstream = HandUpstream::start().await;
+        let app = limited_app(&upstream, 4, |cfg| cfg.limits.request_body_bytes = 64);
+        let sentence = "request body exceeds [server] max_request_body_bytes (64 bytes)";
+
+        // Announced: refused on the header alone.
+        let announced = Request::builder()
+            .method("POST")
+            .uri("/api/v1/search")
+            .header("authorization", "Bearer flt_direct")
+            .header("content-type", "application/json")
+            .header("content-length", "65")
+            .body(Body::from(vec![b'x'; 65]))
+            .unwrap();
+        let resp = app.clone().oneshot(announced).await.unwrap();
+        assert_envelope_refusal(
+            resp,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            trawl_api::ErrorCode::RequestTooLarge,
+            sentence,
+        )
+        .await;
+
+        // Unannounced: refused at the byte that crosses the limit.
+        let chunks = futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 60])),
+            Ok(Bytes::from(vec![b'x'; 5])),
+        ]);
+        let resp = app
+            .clone()
+            .oneshot(bearer_post("/api/v1/search", Body::from_stream(chunks)))
+            .await
+            .unwrap();
+        assert_envelope_refusal(
+            resp,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            trawl_api::ErrorCode::RequestTooLarge,
+            sentence,
+        )
+        .await;
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+
+        // At the limit: forwarded.
+        let resp = app
+            .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; 64])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        upstream.wait_for_requests(1).await;
+        assert_eq!(upstream.seen(), ["POST /api/v1/search"]);
+    }
+
+    /// The default limit is trawld's default, so a proxy resolved without
+    /// a `[server]` section refuses what a default trawld would.
+    #[test]
+    fn proxy_body_limit_defaults_to_trawld_default() {
+        let limits = crate::config::ProxyLimits::from_server(None);
+        assert_eq!(
+            limits.request_body_bytes,
+            trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+        assert_eq!(limits.body_read_timeout, Duration::from_secs(30));
+    }
+
+    /// A login body over 16 KiB is answered 413 `request_too_large` with
+    /// the login limit named, and trawld is never asked about the key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_login_body_over_limit_is_refused() {
+        let upstream = HandUpstream::start().await;
+        let app = counted_app(&upstream, 4);
+
+        let padding = "x".repeat(16 * 1024);
+        let body = format!(r#"{{"api_key":"flt_direct","padding":"{padding}"}}"#);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("origin", TEST_ORIGIN)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_envelope_refusal(
+            resp,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            trawl_api::ErrorCode::RequestTooLarge,
+            "request body exceeds the login body limit (16384 bytes)",
+        )
+        .await;
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+    }
+
+    /// A body that stops arriving is answered 408 `timeout` at the body
+    /// deadline, trawld is never called, and the request's count is free
+    /// again for the next request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_body_collection_deadline_releases_slot() {
+        let upstream = HandUpstream::start().await;
+        let app = limited_app(&upstream, 1, |cfg| {
+            cfg.limits.body_read_timeout = Duration::from_millis(200);
+        });
+
+        // One chunk, then nothing, forever.
+        let stalled = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from("{")) })
+            .chain(futures::stream::pending());
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone()
+                .oneshot(bearer_post("/api/v1/search", Body::from_stream(stalled))),
+        )
+        .await
+        .expect("the deadline answered the request")
+        .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(160),
+            "answered before the deadline: {:?}",
+            started.elapsed()
+        );
+        assert_envelope_refusal(
+            resp,
+            StatusCode::REQUEST_TIMEOUT,
+            trawl_api::ErrorCode::Timeout,
+            "request body was not received within trawl-web's deadline",
+        )
+        .await;
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+
+        // The only count is free again.
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(bearer_get("/api/v1/schema")),
+        )
+        .await
+        .expect("the next request was answered")
+        .unwrap();
+        assert_eq!(next.status(), StatusCode::OK, "the count was not released");
     }
 
     #[tokio::test]

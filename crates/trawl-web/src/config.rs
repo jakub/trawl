@@ -37,6 +37,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fleet_auth::{
     ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN, ENV_SESSION_COOKIE_PATH,
@@ -106,6 +107,45 @@ pub struct ResolvedConfig {
     /// knows the operator stated an origin and the guard is a plain
     /// membership test with no "unset means allow" branch to forget.
     pub public_origins: PublicOrigins,
+    /// The bounds the proxy holds each request to.
+    pub limits: ProxyLimits,
+}
+
+/// The bounds the proxy holds each request to (ADR-0054, amended
+/// 2026-10-17).
+///
+/// The body limit comes from trawld's own `[server]
+/// max_request_body_bytes` in the file both daemons read, so the proxy
+/// refuses what trawld would refuse without sending it. A trawl-web
+/// pointed at a trawld with a different file enforces its own file's
+/// value. The deadline is a constant; a test shortens it through this
+/// struct, and no key sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyLimits {
+    /// The most the proxy buffers of one request body before it calls
+    /// trawld: `[server] max_request_body_bytes`.
+    pub request_body_bytes: usize,
+    /// How long the proxy waits for a request body to arrive whole. Past
+    /// it the request is answered 408 `timeout` and its count released.
+    pub body_read_timeout: Duration,
+}
+
+impl ProxyLimits {
+    /// How long a request body may take to arrive.
+    pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// The limits for `server`, or for trawld's defaults when the proxy
+    /// resolves without a `[server]` section.
+    #[must_use]
+    pub fn from_server(server: Option<&ServerConfig>) -> Self {
+        Self {
+            request_body_bytes: server
+                .map_or(trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES, |server| {
+                    server.max_request_body_bytes
+                }),
+            body_read_timeout: Self::BODY_READ_TIMEOUT,
+        }
+    }
 }
 
 /// How the proxy's upstream client decides whether to trust trawld's
@@ -434,6 +474,7 @@ impl ResolvedConfig {
             cookie_settings,
             upstream,
             bind_addr,
+            limits,
             configured,
         } = sources;
         let public_origins = public_origins?.origins;
@@ -465,6 +506,7 @@ impl ResolvedConfig {
             cookie_key,
             shared_domain: cookie_settings.shared_domain,
             public_origins,
+            limits,
         })
     }
 }
@@ -753,6 +795,9 @@ pub struct Sources {
     pub upstream: Result<UpstreamPlan, ConfigError>,
     /// The proxy's listen address.
     pub bind_addr: Result<BindAddr, ConfigError>,
+    /// The bounds the proxy holds each request to. Derived from trawld's
+    /// own settings and constants; nothing here can fail.
+    pub limits: ProxyLimits,
     /// The configured values the startup warnings compare with the
     /// environment. Private, so only [`ResolvedConfig::from_sources`]
     /// reaches them.
@@ -786,6 +831,7 @@ impl Sources {
             upstream: resolve_upstream(web, server, &host),
             bind_addr: select_bind_addr(host.bind_addr.as_deref(), web.bind_addr.as_deref())
                 .map(|(addr, from)| BindAddr { addr, from }),
+            limits: ProxyLimits::from_server(server),
             configured: Configured {
                 cookie_secret_env: web.cookie_secret_env.clone(),
                 cookie_secret_path: web.cookie_secret_path.clone(),

@@ -99,6 +99,26 @@ pub enum ProxyError {
     /// the same way; no cookie mutation, since the session is fine.
     #[error("request limit reached")]
     RequestLimitReached,
+
+    /// A request body over the limit the proxy buffers to. The message is
+    /// trawld's own sentence for its 413, naming the setting and the exact
+    /// value, so a caller resizes the request the same way whichever hop
+    /// refused it. Nothing was sent to trawld.
+    #[error("request body exceeds {setting} ({limit} bytes)")]
+    RequestTooLarge {
+        /// The setting's name as an operator writes it, or the fixed
+        /// login limit's name.
+        setting: &'static str,
+        /// The limit in bytes.
+        limit: usize,
+    },
+
+    /// A request body that did not arrive whole within
+    /// [`crate::config::ProxyLimits::BODY_READ_TIMEOUT`]. Answered 408
+    /// with the envelope code `timeout`; the request's count is released
+    /// with it. Nothing was sent to trawld.
+    #[error("request body not received in time")]
+    BodyTimeout,
 }
 
 /// The envelope answers: trawld's error shape, `Cache-Control:
@@ -120,13 +140,32 @@ fn envelope(status: StatusCode, code: ErrorCode, message: &str) -> Response {
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
-        if let Self::RequestLimitReached = self {
-            tracing::warn!(error = %self, "proxy request limit reached");
-            return envelope(
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::RequestLimitReached,
-                REQUEST_LIMIT_MESSAGE,
-            );
+        match &self {
+            Self::RequestLimitReached => {
+                tracing::warn!(error = %self, "proxy request limit reached");
+                return envelope(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::RequestLimitReached,
+                    REQUEST_LIMIT_MESSAGE,
+                );
+            }
+            Self::RequestTooLarge { .. } => {
+                tracing::debug!(error = %self, "proxy refused an oversized body");
+                return envelope(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    ErrorCode::RequestTooLarge,
+                    &self.to_string(),
+                );
+            }
+            Self::BodyTimeout => {
+                tracing::debug!(error = %self, "proxy body deadline passed");
+                return envelope(
+                    StatusCode::REQUEST_TIMEOUT,
+                    ErrorCode::Timeout,
+                    "request body was not received within trawl-web's deadline",
+                );
+            }
+            _ => {}
         }
         let (status, message) = match &self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
@@ -144,7 +183,9 @@ impl IntoResponse for ProxyError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream certificate not available",
             ),
-            Self::RequestLimitReached => unreachable!("answered above"),
+            Self::RequestLimitReached | Self::RequestTooLarge { .. } | Self::BodyTimeout => {
+                unreachable!("answered above")
+            }
         };
 
         // Severity per variant: network and upstream failures are outage
@@ -169,7 +210,9 @@ impl IntoResponse for ProxyError {
             Self::ServiceUnavailable(_) => {
                 tracing::warn!(error = %self, "proxy service unavailable");
             }
-            Self::RequestLimitReached => unreachable!("answered above"),
+            Self::RequestLimitReached | Self::RequestTooLarge { .. } | Self::BodyTimeout => {
+                unreachable!("answered above")
+            }
         }
 
         // Only the expired-session path clears the cookie; see the

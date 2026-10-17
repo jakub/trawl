@@ -27,7 +27,7 @@ use fleet_auth::{
 use reqwest::Client;
 use tokio::task::JoinHandle;
 
-use crate::config::ResolvedConfig;
+use crate::config::{ProxyLimits, ResolvedConfig};
 use crate::error::ProxyError;
 use crate::upstream::Upstream;
 
@@ -45,6 +45,7 @@ struct Inner {
     allow_insecure_cookies: bool,
     shared_domain: Option<String>,
     public_origins: PublicOrigins,
+    limits: ProxyLimits,
 }
 
 impl AppState {
@@ -75,8 +76,16 @@ impl AppState {
                 allow_insecure_cookies: cfg.allow_insecure_cookies,
                 shared_domain: cfg.shared_domain,
                 public_origins: cfg.public_origins,
+                limits: cfg.limits,
             }),
         })
+    }
+
+    /// The bounds every request is held to: the body limit and the body
+    /// deadline.
+    #[must_use]
+    pub fn limits(&self) -> &ProxyLimits {
+        &self.inner.limits
     }
 
     #[must_use]
@@ -268,6 +277,7 @@ mod tests {
             shared_domain: None,
             public_origins: PublicOrigins::parse(["http://127.0.0.1:8090"])
                 .expect("fixture origin parses"),
+            limits: ProxyLimits::from_server(None),
         }
     }
 
