@@ -71,6 +71,7 @@ const CODEMIRROR_TS: &str = include_str!("../vendor/src/codemirror.ts");
 const QUERY_ERROR_NOTICE_RS: &str = include_str!("../src/components/query_error_notice.rs");
 const SEARCH_RS: &str = include_str!("../src/pages/search.rs");
 const RECOVERING_NOTICE_RS: &str = include_str!("../src/components/recovering_notice.rs");
+const RESOURCE_NOTICE_RS: &str = include_str!("../src/components/resource_notice.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -2208,6 +2209,42 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/recovering_notice.rs",
         source: RECOVERING_NOTICE_RS,
         hook: "\"Search is recovering\"",
+    },
+    Contract {
+        assignment: "resourceNotice: '#search-results .resource-notice[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<ResourceNotice message=message/>",
+    },
+    Contract {
+        assignment: "resourceNotice: '#search-results .resource-notice[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<div id=\"search-results\" class=\"results\"",
+    },
+    Contract {
+        assignment: "resourceNotice: '#search-results .resource-notice[role=\"alert\"]',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "<div class=\"resource-notice\" role=\"alert\">",
+    },
+    Contract {
+        assignment: "resourceNoticeTitle: '.resource-notice-title',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "class=\"resource-notice-title\"",
+    },
+    Contract {
+        assignment: "resourceNoticeText: '.resource-notice-text',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "class=\"resource-notice-text\"",
+    },
+    Contract {
+        assignment: "resourceTitle: 'Query ran out of resources',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "\"Query ran out of resources\"",
     },
     Contract {
         assignment: "resultsEmptyCell: '.results-empty-cell',",

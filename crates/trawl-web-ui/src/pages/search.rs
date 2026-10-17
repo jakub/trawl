@@ -59,6 +59,7 @@ use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::query_error_notice::QueryErrorNotice;
 use crate::components::recovering_notice::RecoveringNotice;
+use crate::components::resource_notice::ResourceNotice;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
@@ -736,15 +737,38 @@ pub fn Search() -> impl IntoView {
             _ => None,
         })
     });
-    // A named refusal (a query error, or the corpus recovering) the
-    // resource still holds after a newer request superseded it: the same
-    // text re-sent, or new text not yet answered. The tables would render
-    // it as "Couldn't load results" with a Retry, which a query error
-    // never offers and which would misname a recovering server, so the
-    // region waits for the new answer instead.
+    // The resource notice, when the failure on screen is the CURRENT
+    // request answered with `query_resource_exhausted` (ADR-0056): the
+    // query used up the memory or scratch space trawld gives queries.
+    // The text is fine and nothing ran to completion, so this is neither
+    // a query error nor an empty result. Identity decides, as for the
+    // notices above. Live reads the stream, which never answers with
+    // this code, so live shows no such notice.
+    let resource_notice = Memo::new(move |_| -> Option<String> {
+        if unreadable.get() || live.get() || snapshot_q.get().trim().is_empty() || loading.get() {
+            return None;
+        }
+        rows.with(|result| match result {
+            Some(Err(failure))
+                if failure.intent == request_intent.get()
+                    && failure.generation == request_generation.get() =>
+            {
+                failure.error.resource_exhausted().map(str::to_owned)
+            }
+            _ => None,
+        })
+    });
+    // A named refusal (a query error, the corpus recovering, or the
+    // query's resources exhausted) the resource still holds after a newer
+    // request superseded it: the same text re-sent, or new text not yet
+    // answered. The tables would render it as "Couldn't load results"
+    // with a Retry, which a query error and an exhausted query never
+    // offer and which would misname a recovering server, so the region
+    // waits for the new answer instead.
     let refusal_superseded = Signal::derive(move || {
         query_notice.get().is_none()
             && recovering_notice.get().is_none()
+            && resource_notice.get().is_none()
             && !unreadable.get()
             && !live.get()
             && !snapshot_q.get().trim().is_empty()
@@ -754,6 +778,7 @@ pub fn Search() -> impl IntoView {
                     Some(Err(failure))
                         if failure.error.query_error().is_some()
                             || failure.error.recovering().is_some()
+                            || failure.error.resource_exhausted().is_some()
                 )
             })
     });
@@ -1232,6 +1257,16 @@ pub fn Search() -> impl IntoView {
                     view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
                             <RecoveringNotice message=message on_retry=Callback::new(move |()| rerun_request())/>
+                        </div>
+                    }.into_any()
+                } else if let Some(message) = resource_notice.get() {
+                    // The query used up its resources, on either tab:
+                    // no underline, no empty table, and no Retry, since
+                    // the same request spends the same budget again. The
+                    // server's sentence says what helps.
+                    view! {
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <ResourceNotice message=message/>
                         </div>
                     }.into_any()
                 } else if refusal_superseded.get() {

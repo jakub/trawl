@@ -137,6 +137,16 @@ impl ApiError {
             _ => None,
         }
     }
+
+    /// The server's sentence when this failure is a
+    /// `query_resource_exhausted` refusal, else `None`.
+    #[must_use]
+    pub fn resource_exhausted(&self) -> Option<&str> {
+        match self {
+            Self::ResourceExhausted { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// How [`decode_error_body`] keeps an envelope with a given code.
@@ -281,7 +291,23 @@ mod tests {
         assert_eq!(err.http_status(), Some(503));
         assert!(err.query_error().is_none());
         assert!(err.recovering().is_none());
+        assert_eq!(err.resource_exhausted(), Some(message));
         assert_eq!(err.to_string(), message);
+    }
+
+    /// Only the `query_resource_exhausted` refusal answers with its
+    /// sentence: a recovering refusal, a generic 503 and a query error do
+    /// not, so the search page's notice never mounts for them.
+    #[test]
+    fn only_the_resource_exhausted_refusal_reads_as_one() {
+        for body in [
+            r#"{"error":{"code":"corpus_recovering","message":"recovering"}}"#,
+            r#"{"error":{"code":"service_unavailable","message":"service unavailable"}}"#,
+            r#"{"error":{"code":"parse_error","message":"bad","details":[]}}"#,
+        ] {
+            let err = decode_error_body(503, body);
+            assert_eq!(err.resource_exhausted(), None, "{body}");
+        }
     }
 
     /// Both of the server's fixed `corpus_recovering` sentences, as it

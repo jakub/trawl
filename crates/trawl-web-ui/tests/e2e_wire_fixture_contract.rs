@@ -1729,6 +1729,8 @@ const QUERY_VALIDATION_NO_HINT: &str =
 const QUERY_EXECUTION_ERROR: &str = include_str!("../e2e/harness/wire/query-execution-error.json");
 const QUERY_CORPUS_RECOVERING: &str =
     include_str!("../e2e/harness/wire/query-corpus-recovering.json");
+const QUERY_RESOURCE_EXHAUSTED: &str =
+    include_str!("../e2e/harness/wire/query-resource-exhausted.json");
 
 /// `ErrorDetail` has no `PartialEq`; compare the wire form instead.
 fn json(details: &[trawl_api::ErrorDetail]) -> serde_json::Value {
@@ -1835,6 +1837,27 @@ fn the_corpus_recovering_fixture_is_the_restart_backlog_refusal() {
     assert_eq!(
         body.error.message,
         "Search is unavailable while the server finishes loading data from before its restart."
+    );
+    assert!(body.error.details.is_empty());
+}
+
+/// The resource notice spec's body: the code, and the server's fixed
+/// sentence for an exhausted query budget (trawl-engine's
+/// `EngineError::ResourceExhausted`), with no details. The browser shows
+/// that sentence verbatim, so a fixture carrying other text would test
+/// copy the server never writes.
+#[test]
+fn the_query_resource_exhausted_fixture_is_the_budget_refusal() {
+    let body: trawl_api::ErrorResponse =
+        decode("query-resource-exhausted.json", QUERY_RESOURCE_EXHAUSTED);
+    assert_eq!(
+        body.error.code,
+        trawl_api::ErrorCode::QueryResourceExhausted
+    );
+    assert_eq!(
+        body.error.message,
+        "query could not complete with the available query resources; narrow the time range or \
+         simplify the query"
     );
     assert!(body.error.details.is_empty());
 }

@@ -34,6 +34,7 @@ pub mod net_drawer;
 pub mod query_error_notice;
 pub mod recovering_notice;
 pub mod repin_modal;
+pub mod resource_notice;
 pub mod results_table;
 pub mod save_as_net_modal;
 pub mod search_quick_start;

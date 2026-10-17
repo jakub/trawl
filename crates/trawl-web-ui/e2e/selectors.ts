@@ -136,6 +136,13 @@ export const SEL = {
   recoveringNotice: '#search-results .recovering-notice[role="alert"]',
   recoveringNoticeTitle: '.recovering-notice-title',
   recoveringNoticeText: '.recovering-notice-text',
+  /// crates/trawl-web-ui/src/components/resource_notice.rs — the
+  /// resource notice, which search.rs mounts in the results region in
+  /// place of the table or chart when a snapshot is answered with
+  /// `query_resource_exhausted`. Its parts are chained off the notice.
+  resourceNotice: '#search-results .resource-notice[role="alert"]',
+  resourceNoticeTitle: '.resource-notice-title',
+  resourceNoticeText: '.resource-notice-text',
   /// crates/trawl-web-ui/src/components/results_table.rs — the one cell
   /// an empty snapshot page renders.
   resultsEmptyCell: '.results-empty-cell',
@@ -607,6 +614,9 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/recovering_notice.rs — the
   /// recovering notice's title.
   recoveringTitle: 'Search is recovering',
+  /// crates/trawl-web-ui/src/components/resource_notice.rs — the
+  /// resource notice's title.
+  resourceTitle: 'Query ran out of resources',
   /// crates/trawl-web-ui/src/state/stream_session.rs STREAM_UNAVAILABLE.
   streamUnavailable: 'Live stream unavailable. Retry or switch to Snapshot.',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible
