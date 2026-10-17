@@ -9,7 +9,9 @@
 //! omits the field when nothing was dropped. These run the real SSE loop on
 //! a live server with real ingest, because the property lives in the wiring:
 //! the dropped event has to count toward the next snapshot, and the report
-//! has to ride every snapshot after it.
+//! has to ride every snapshot after it. The batch lane's Rust tail runs the
+//! same accumulators and has no snapshot to carry a report, so it refuses
+//! instead; the last test pins that answer over HTTP.
 
 mod common;
 
@@ -210,4 +212,41 @@ async fn sse_scheduled_snapshot_discloses_a_cap_with_no_later_input() {
         .snapshot_where(|payload| count_of(payload, "h0") == Some(2))
         .await;
     assert_eq!(later["capped"], groups_cap(), "{}", summary(&later));
+}
+
+/// The batch lane has no snapshot to carry a report, so a Rust-tail
+/// aggregation that would drop input refuses with the row cap's contract:
+/// 400 `result_too_large`, naming the cap and its limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn kv_tail_over_group_cap_refuses_over_http() {
+    let server = setup().await;
+    let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
+    let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
+
+    let records: Vec<Value> = (0..=MAX_GROUPS)
+        .map(|i| json!({"service": "kvcap-svc", "host": "web01", "message": format!("k=v{i}")}))
+        .collect();
+    assert_eq!(
+        ingest.ingest(&records).await.unwrap().accepted,
+        MAX_GROUPS + 1
+    );
+
+    let refused = analyst
+        .query_paginated(
+            "service=kvcap-svc | extract kv | stats count() by k",
+            None,
+            None,
+        )
+        .await;
+    match refused.expect_err("a tail past the group cap must not answer") {
+        trawl_client::ClientError::Server { status, error } => {
+            assert_eq!(status, 400);
+            assert_eq!(error.code, trawl_api::ErrorCode::ResultTooLarge);
+            assert_eq!(
+                error.message,
+                "result too large: the aggregation has more than 10000 groups; narrow the query"
+            );
+        }
+        other => panic!("expected a 400 result_too_large, got {other:?}"),
+    }
 }

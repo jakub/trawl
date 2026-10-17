@@ -606,7 +606,9 @@ impl ServerError {
             Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
                 "database"
             }
-            Self::Engine(EngineError::ResultTooLarge(_)) => "result_too_large",
+            Self::Engine(EngineError::ResultTooLarge(_) | EngineError::AggregationCapped(_)) => {
+                "result_too_large"
+            }
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
             Self::Engine(EngineError::Cancelled) => "cancelled",
             Self::Engine(EngineError::Io(_)) => "io",
@@ -860,6 +862,13 @@ impl IntoResponse for ServerError {
                     ErrorCode::ResultTooLarge,
                     format!("result exceeded {n} row limit"),
                 ),
+            ),
+            // The same contract as a row cap: the whole answer would not
+            // fit, here inside one aggregation (ADR-0001). The sentence is
+            // trawl-authored and names only the cap and its limit.
+            Self::Engine(err @ EngineError::AggregationCapped(_)) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::ResultTooLarge, err.to_string()),
             ),
             // Database/IO errors are server-side — don't leak details.
             //
@@ -1163,6 +1172,28 @@ mod tests {
             assert_eq!(body["error"]["message"], "authentication failed");
             assert!(!String::from_utf8_lossy(&bytes).contains("private-"));
         }
+    }
+
+    /// A batch aggregation past a cap answers like a row cap: 400
+    /// `result_too_large`, with a message that names the cap and its limit.
+    #[tokio::test]
+    async fn aggregation_cap_answers_result_too_large() {
+        let err = ServerError::Engine(EngineError::AggregationCapped(
+            trawl_core::stream::AggregationCap::Groups,
+        ));
+        assert_eq!(err.error_class(), "result_too_large");
+        assert_eq!(err.cause_kind(), CauseKind::None);
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["code"], "result_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "result too large: the aggregation has more than 10000 groups; narrow the query"
+        );
     }
 
     /// Parse and emit a query the emitter refuses, and read the envelope

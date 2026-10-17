@@ -45,6 +45,15 @@ pub enum EngineError {
     #[error("result too large: query returned more than {0} rows")]
     ResultTooLarge(usize),
 
+    /// The Rust tail's aggregation would have dropped input at one of its
+    /// caps (ADR-0001), so its answer would leave groups or values out.
+    /// The batch answer has no channel to say it is partial, so the query
+    /// is refused instead. The server answers it as `result_too_large`.
+    ///
+    /// The message is trawl-authored and names only the cap and its limit.
+    #[error("result too large: {}; narrow the query", describe_cap(*.0))]
+    AggregationCapped(trawl_core::stream::AggregationCap),
+
     /// A read matched no files even though its source still reaches files on
     /// disk — the empty answer would silently drop the cold data, which
     /// ADR-0008 forbids. Raised by every lane (query and export, with a hot
@@ -99,6 +108,21 @@ pub enum EngineError {
     /// the caller's own record.
     #[error("query cancelled")]
     Cancelled,
+}
+
+/// What passed an aggregation cap, with the cap's limit.
+fn describe_cap(cap: trawl_core::stream::AggregationCap) -> String {
+    use trawl_core::stream::AggregationCap;
+    let limit = cap.limit();
+    match cap {
+        AggregationCap::Groups => format!("the aggregation has more than {limit} groups"),
+        AggregationCap::DistinctValues => {
+            format!("a dc() or values() has more than {limit} distinct values in one group")
+        }
+        AggregationCap::ExactValues => {
+            format!("a median or percentile has more than {limit} values in one group")
+        }
+    }
 }
 
 /// `DuckDB`'s exception type for running out of memory or spill space.

@@ -88,7 +88,7 @@ pub fn apply_rust_stages(
             &mut post_stages,
             events,
             &anchor,
-        ),
+        )?,
     };
 
     // Apply deferred sort stages.
@@ -228,13 +228,17 @@ fn apply_pass_through(
 }
 
 /// Run an aggregation plan: pre-stages → accumulate → snapshot → post-stages.
+///
+/// Refuses with [`EngineError::AggregationCapped`] when the accumulators
+/// dropped input at a cap: the live lane can report a partial answer on
+/// its snapshot, but a batch answer cannot, so it gives none (ADR-0001).
 fn apply_aggregate(
     pre_stages: &mut [CompiledStage],
     aggregation: &mut stream::CompiledAggregation,
     post_stages: &mut [CompiledStage],
     events: Vec<Row>,
     anchor: &EvalContext,
-) -> Vec<Row> {
+) -> Result<Vec<Row>, EngineError> {
     // Feed events through pre-stages into the aggregation.
     'event: for mut event in events {
         for stage in pre_stages.iter_mut() {
@@ -256,6 +260,9 @@ fn apply_aggregate(
         // accumulator feed alike (ADR-0017 §3).
         aggregation.feed_event(&event, anchor);
     }
+    if let Some(&cap) = aggregation.capped().first() {
+        return Err(EngineError::AggregationCapped(cap));
+    }
 
     // Snapshot the aggregation results.
     let (_columns, snapshot_rows) = aggregation.snapshot();
@@ -267,12 +274,12 @@ fn apply_aggregate(
             match stream::apply_stage(stage, &mut row, anchor) {
                 StageResult::Pass => {}
                 StageResult::Filtered => continue 'row,
-                StageResult::Done => return output,
+                StageResult::Done => return Ok(output),
             }
         }
         output.push(row);
     }
-    output
+    Ok(output)
 }
 
 /// Apply deferred sort stages to the event list.
@@ -955,5 +962,99 @@ mod tests {
         )
         .unwrap();
         assert!(out.is_empty());
+    }
+
+    /// `n` messages `k=v{i}` for the kv tail to split, one per row.
+    fn kv_messages(n: usize) -> QueryResult {
+        make_result(
+            &["message"],
+            (0..n)
+                .map(|i| vec![crate::value::Value::String(format!("k=v{i} n={i}"))])
+                .collect(),
+        )
+    }
+
+    fn run_tail(dsl: &str, result: QueryResult) -> Result<QueryResult, EngineError> {
+        let tail = trawl_core::parser::parse(dsl).expect("dsl parses").pipeline;
+        apply_rust_stages(
+            result,
+            &tail,
+            &PinScope::unpinned(),
+            EvalContext::capture(),
+            None,
+        )
+    }
+
+    /// The batch tail feeds the live lane's accumulators, which stop
+    /// taking input at their caps. A batch answer has no channel to say
+    /// it is partial, so a tail that would drop input refuses as
+    /// `result_too_large` and names the cap, instead of answering with
+    /// counts that leave groups out (ADR-0001).
+    #[test]
+    fn kv_tail_over_group_cap_refuses() {
+        let limit = trawl_core::stream::AggregationCap::Groups.limit();
+        let err = run_tail(
+            "* | extract kv | stats count() by k",
+            kv_messages(limit + 1),
+        )
+        .expect_err("a tail past the group cap must not answer");
+        assert!(
+            matches!(
+                err,
+                EngineError::AggregationCapped(trawl_core::stream::AggregationCap::Groups)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "result too large: the aggregation has more than 10000 groups; narrow the query"
+        );
+    }
+
+    /// Exactly at a cap nothing is dropped, so the tail answers whole.
+    #[test]
+    fn kv_tail_at_group_cap_answers() {
+        let limit = trawl_core::stream::AggregationCap::Groups.limit();
+        let out = run_tail("* | extract kv | stats count() by k", kv_messages(limit))
+            .expect("exactly at the cap drops nothing");
+        assert_eq!(out.rows.len(), limit);
+    }
+
+    /// The per-group value caps refuse the same way, each naming itself.
+    #[test]
+    fn kv_tail_over_value_caps_refuses() {
+        use trawl_core::stream::AggregationCap;
+
+        let distinct = AggregationCap::DistinctValues.limit();
+        let err = run_tail("* | extract kv | stats dc(k)", kv_messages(distinct + 1))
+            .expect_err("a dc() past its cap must not answer");
+        assert!(
+            matches!(
+                err,
+                EngineError::AggregationCapped(AggregationCap::DistinctValues)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "result too large: a dc() or values() has more than 10000 distinct values \
+             in one group; narrow the query"
+        );
+
+        let exact = AggregationCap::ExactValues.limit();
+        let err = run_tail("* | extract kv | stats median(n)", kv_messages(exact + 1))
+            .expect_err("a median past its cap must not answer");
+        assert!(
+            matches!(
+                err,
+                EngineError::AggregationCapped(AggregationCap::ExactValues)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "result too large: a median or percentile has more than 100000 values \
+             in one group; narrow the query"
+        );
     }
 }

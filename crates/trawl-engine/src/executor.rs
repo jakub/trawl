@@ -2100,7 +2100,7 @@ fn classify_query_outcome(
         // with the empty-result UX would hide it behind a 200.
         Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-        // Refused, ResultTooLarge, ResourceExhausted, parse, IO —
+        // Refused, ResultTooLarge, AggregationCapped, ResourceExhausted, parse, IO —
         // propagate. An exhausted budget is shared by every query on the
         // database, so a hot-only retry would only spend it again.
         Err(_) => HotColdOutcome::Fatal,
