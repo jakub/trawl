@@ -1567,6 +1567,53 @@ pub async fn setup_in_dir_with_data_and_timeout(
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
+    )
+    .await
+}
+
+/// The query pool and the query database's budgets a fixture runs with
+/// (ADR-0056).
+#[derive(Debug, Clone, Copy)]
+pub struct QueryKnobs {
+    pub max_concurrent_queries: usize,
+    pub spill_max_bytes: std::num::NonZeroU64,
+    pub memory_limit: std::num::NonZeroU64,
+    pub threads: std::num::NonZeroU32,
+}
+
+impl QueryKnobs {
+    /// Two permits under the shipped budgets.
+    pub const DEFAULT: Self = Self {
+        max_concurrent_queries: 2,
+        spill_max_bytes: trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
+        memory_limit: trawl_server::config::DEFAULT_QUERY_MEMORY_LIMIT,
+        threads: trawl_server::config::DEFAULT_QUERY_THREADS,
+    };
+}
+
+/// A fixture over a caller-owned `dir` and data root whose query pool and
+/// budgets are `query` and whose queries time out after `timeout_secs`.
+pub async fn setup_with_query_knobs(
+    dir: &std::path::Path,
+    data_path: String,
+    timeout_secs: u64,
+    query: QueryKnobs,
+) -> TestServer {
+    setup_with_ingest_config(
+        dir,
+        data_path,
+        RateLimitConfig::default(),
+        timeout_secs,
+        true,
+        RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
+        SchedulerConfig::default(),
+        None,
+        None,
+        &[],
+        FleetPoolSize::DEFAULT,
+        query,
     )
     .await
 }
@@ -1628,6 +1675,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1671,6 +1719,7 @@ pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1694,6 +1743,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await
 }
@@ -1716,6 +1766,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1741,6 +1792,7 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         None,
         cidrs,
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1787,6 +1839,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await
 }
@@ -1815,6 +1868,7 @@ pub async fn setup_observing_boot(
         Some(before_boot),
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await
 }
@@ -1834,6 +1888,7 @@ async fn setup_with_ingest_config(
     before_boot: Option<&mut dyn FnMut(&AppState)>,
     trusted_relays: &[&str],
     fleet_pool_size: FleetPoolSize,
+    query: QueryKnobs,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1891,7 +1946,7 @@ async fn setup_with_ingest_config(
         server: ServerConfig {
             http_addr: addr.clone(),
             timeout_secs,
-            max_concurrent_queries: 2,
+            max_concurrent_queries: query.max_concurrent_queries,
             max_result_rows: row_caps.max_result_rows,
             max_export_rows: row_caps.max_export_rows,
             max_request_body_bytes: body_limits.max_request_body_bytes,
@@ -1910,9 +1965,9 @@ async fn setup_with_ingest_config(
             rate_limit,
             monitor_refresh_ms: 1000,
             query_scratch_dir: None,
-            query_spill_max_bytes: trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
-            query_memory_limit: trawl_server::config::DEFAULT_QUERY_MEMORY_LIMIT,
-            query_threads: trawl_server::config::DEFAULT_QUERY_THREADS,
+            query_spill_max_bytes: query.spill_max_bytes,
+            query_memory_limit: query.memory_limit,
+            query_threads: query.threads,
         },
         data: DataConfig { path: data_path },
         auth: AuthConfig {
@@ -2085,6 +2140,7 @@ pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
         None,
         &[],
         size,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).

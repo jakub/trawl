@@ -429,6 +429,13 @@ impl Executor {
         Ok(self.raw_count_rows_for_test(sql)?)
     }
 
+    /// Run `sql`, which answers one `BIGINT`, on this connection, as a
+    /// test reads a system table (`duckdb_temporary_files()`) beside the
+    /// queries it drives.
+    pub fn query_i64_for_test(&self, sql: &str) -> Result<i64, EngineError> {
+        Ok(self.conn.query_row(sql, [], |row| row.get(0))?)
+    }
+
     /// [`Self::count_rows_for_test`] with the failure as `DuckDB` raised
     /// it, before classification.
     pub fn raw_count_rows_for_test(&self, sql: &str) -> Result<u64, duckdb::Error> {

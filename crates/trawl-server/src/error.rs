@@ -24,6 +24,14 @@ use crate::transport::request_limit::Allowance;
 /// here is 503, never the 504 an execution timeout earns — nothing ran.
 pub const CAPACITY_NOT_STARTED: &str = "server at capacity: the query was not started";
 
+/// The whole answer to a query that exhausted the query database's spill
+/// cap or memory limit (ADR-0056). Fixed text: the server is healthy, and
+/// narrowing or simplifying the query is what helps. It names no path,
+/// size or `DuckDB` text, so the wire, the query tracker and a run row can
+/// all carry it unredacted.
+pub const QUERY_RESOURCE_EXHAUSTED: &str = "query could not complete with the available query \
+     resources; narrow the time range or simplify the query";
+
 /// The whole answer to a read refused while the corpus is not settled
 /// (ADR-0041). Fixed per reason: no counts, paths or marker names, so the
 /// wire, the query tracker and a run row can all carry it unredacted.
@@ -321,6 +329,9 @@ pub enum CauseKind {
     DuckdbConversion,
     /// Any other `duckdb::Error` variant: a misuse of the driver's API.
     DuckdbOther,
+    /// `DuckDB` ran out of the query database's spill cap or memory limit
+    /// (its `Out of Memory` exception type, ADR-0056).
+    DuckdbResourceExhausted,
     /// The postgres pool had no connection to give within its timeout.
     PostgresPoolTimedOut,
     /// The postgres pool was closed.
@@ -362,7 +373,7 @@ pub enum CauseKind {
 
 impl CauseKind {
     /// Every kind, for closed-set checks and for consumers that enumerate.
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 33] = [
         Self::None,
         Self::Unknown,
         Self::IoNotFound,
@@ -379,6 +390,7 @@ impl CauseKind {
         Self::DuckdbFailure,
         Self::DuckdbConversion,
         Self::DuckdbOther,
+        Self::DuckdbResourceExhausted,
         Self::PostgresPoolTimedOut,
         Self::PostgresPoolClosed,
         Self::PgServer,
@@ -417,6 +429,7 @@ impl CauseKind {
             Self::DuckdbFailure => "duckdb_failure",
             Self::DuckdbConversion => "duckdb_conversion",
             Self::DuckdbOther => "duckdb_other",
+            Self::DuckdbResourceExhausted => "duckdb_resource_exhausted",
             Self::PostgresPoolTimedOut => "pg_pool_timed_out",
             Self::PostgresPoolClosed => "pg_pool_closed",
             Self::PgServer => "pg_server",
@@ -524,13 +537,10 @@ impl ServerError {
     /// unable to say what was refused.
     pub fn safe_message(&self) -> String {
         match self {
-            // An exhausted query budget answers as a database failure until
-            // its own 503 contract lands (ADR-0056).
-            Self::Engine(
-                EngineError::Database(_)
-                | EngineError::ResourceExhausted
-                | EngineError::BudgetNotApplied { .. },
-            ) => "query execution failed".to_owned(),
+            Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
+                "query execution failed".to_owned()
+            }
+            Self::Engine(EngineError::ResourceExhausted) => QUERY_RESOURCE_EXHAUSTED.to_owned(),
             Self::Store(StoreError::Unavailable(_) | StoreError::Migration(_)) => {
                 "app-state store unavailable".to_owned()
             }
@@ -579,13 +589,9 @@ impl ServerError {
             Self::Engine(EngineError::Refused { .. }) => "refused",
             // A budget refusal ends the query database's open at startup,
             // so no request carries it; it reads as the engine it came from.
-            // An exhausted budget reads the same until its own 503 contract
-            // lands (ADR-0056).
-            Self::Engine(
-                EngineError::Database(_)
-                | EngineError::ResourceExhausted
-                | EngineError::BudgetNotApplied { .. },
-            ) => "database",
+            Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
+                "database"
+            }
             Self::Engine(EngineError::ResultTooLarge(_)) => "result_too_large",
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
             Self::Engine(EngineError::Cancelled) => "cancelled",
@@ -609,8 +615,10 @@ impl ServerError {
             // `cause_kind` names it, as it does an auth backend outage.
             // An unsettled corpus and a failed hot snapshot are too: the
             // reason and the I/O kind are cause kinds, not classes. So is a
-            // request refused at the request limit (ADR-0054).
-            Self::ServiceUnavailable(_)
+            // request refused at the request limit (ADR-0054), and a query
+            // that exhausted the query database's budgets (ADR-0056).
+            Self::Engine(EngineError::ResourceExhausted)
+            | Self::ServiceUnavailable(_)
             | Self::AuthBackend(_)
             | Self::HotBufferFull { .. }
             | Self::CorpusRecovering(_)
@@ -633,9 +641,7 @@ impl ServerError {
     pub fn cause_kind(&self) -> CauseKind {
         match self {
             Self::Engine(EngineError::Database(e)) => CauseKind::of_duckdb(e),
-            // `DuckDB` raised it, as a `DuckDBFailure`; its own kind lands
-            // with its 503 contract (ADR-0056).
-            Self::Engine(EngineError::ResourceExhausted) => CauseKind::DuckdbFailure,
+            Self::Engine(EngineError::ResourceExhausted) => CauseKind::DuckdbResourceExhausted,
             Self::Engine(EngineError::Io(e)) | Self::HotSnapshot(e) => CauseKind::of_io(e),
             Self::Store(StoreError::Unavailable(e)) => CauseKind::of_sqlx(e),
             Self::Store(StoreError::Migration(e)) => CauseKind::of_store_schema(e),
@@ -848,18 +854,23 @@ impl IntoResponse for ServerError {
             // the latch does not earn the caller a different status than the
             // interrupt it backs up. `error_class` still tells the two apart
             // for telemetry.
-            //
-            // An exhausted query budget answers here too until its own 503
-            // contract lands (ADR-0056).
             Self::Engine(
                 EngineError::Database(_)
-                | EngineError::ResourceExhausted
                 | EngineError::BudgetNotApplied { .. }
                 | EngineError::Io(_)
                 | EngineError::Cancelled,
             ) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),
+            ),
+            // The query ran out of the query database's spill cap or memory
+            // limit (ADR-0056). The server is fine and the same query would
+            // fail the same way, so there is no `Retry-After`; the fixed
+            // sentence tells the caller what helps and names no path, size
+            // or `DuckDB` text.
+            Self::Engine(EngineError::ResourceExhausted) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(ErrorCode::QueryResourceExhausted, QUERY_RESOURCE_EXHAUSTED),
             ),
             // The read raced a file move while cold data exists — transient
             // and retryable, never a silent empty 200 (ADR-0008).
@@ -1291,6 +1302,7 @@ mod tests {
                 | CauseKind::DuckdbFailure
                 | CauseKind::DuckdbConversion
                 | CauseKind::DuckdbOther
+                | CauseKind::DuckdbResourceExhausted
                 | CauseKind::PostgresPoolTimedOut
                 | CauseKind::PostgresPoolClosed
                 | CauseKind::PgServer
@@ -1309,7 +1321,7 @@ mod tests {
                 | CauseKind::RequestLimitReached => true,
             })
             .count();
-        assert_eq!(variants, 32, "ALL lists every variant");
+        assert_eq!(variants, 33, "ALL lists every variant");
 
         let mut seen = std::collections::HashSet::new();
         for kind in CauseKind::ALL {
@@ -1355,6 +1367,10 @@ mod tests {
                     Some("zz_secret_sql".into()),
                 ))),
                 CauseKind::DuckdbFailure,
+            ),
+            (
+                ServerError::Engine(EngineError::ResourceExhausted),
+                CauseKind::DuckdbResourceExhausted,
             ),
             (
                 ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut)),
@@ -1618,6 +1634,39 @@ mod tests {
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["error"]["code"], "service_unavailable");
         }
+    }
+
+    /// A query that exhausted the query database's budgets is a 503
+    /// `query_resource_exhausted` with the fixed sentence and no
+    /// `Retry-After`, everywhere it is told (ADR-0056).
+    #[tokio::test]
+    async fn an_exhausted_query_budget_is_a_fixed_503() {
+        let err = ServerError::Engine(EngineError::ResourceExhausted);
+        assert_eq!(err.error_class(), "service_unavailable");
+        assert_eq!(err.cause_kind(), CauseKind::DuckdbResourceExhausted);
+        assert_eq!(err.cause_kind().as_str(), "duckdb_resource_exhausted");
+        assert_eq!(err.safe_message(), QUERY_RESOURCE_EXHAUSTED);
+        assert_eq!(
+            EngineError::ResourceExhausted.to_string(),
+            QUERY_RESOURCE_EXHAUSTED,
+            "the engine's own rendering says the same"
+        );
+        assert_eq!(
+            QUERY_RESOURCE_EXHAUSTED,
+            "query could not complete with the available query resources; narrow the time \
+             range or simplify the query"
+        );
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "query_resource_exhausted");
+        assert_eq!(body["error"]["message"], QUERY_RESOURCE_EXHAUSTED);
     }
 
     /// An oversized ingest request is a 413 with no `Retry-After`, and its

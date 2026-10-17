@@ -4,25 +4,47 @@
 
 //! What trawld's queries may use, against the bundled `DuckDB` (ADR-0056):
 //! the query database spills, snapshots and stages exports only inside
-//! the query scratch directory.
+//! the query scratch directory, and a query that runs out of its spill cap
+//! or memory limit answers 503 `query_resource_exhausted` with a fixed
+//! sentence and nothing of `DuckDB`'s.
 //!
-//! A scenario that needs its own process environment runs in a CHILD
-//! PROCESS: this test binary re-executes itself with the ignored
+//! A scenario that needs its own process runs in a CHILD PROCESS: this
+//! test binary re-executes itself with the ignored
 //! [`query_resources_child`] test selected, the scenario named in
 //! [`CHILD_SCENARIO`] and a work directory the parent owns in
 //! [`CHILD_WORK`]. The child boots a server under that directory, drives
 //! it, and panics on a failed assertion; the parent asserts it exited
-//! cleanly.
+//! cleanly. Two reasons need one: a private `TMPDIR`, and sampling the
+//! spill directory with the server's whole process stopped, so a sample is
+//! one state of the files rather than a sum over files `DuckDB` grows and
+//! truncates while the directory is read.
+//!
+//! Every server here installs the production subscriber
+//! ([`telemetry::build_subscriber`]) with a stdout capture and a WAL
+//! layer, as `http_failure` does, so a test can read what trawld logged
+//! and stored about a request.
 
 mod common;
 
+use std::collections::HashSet;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
+use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use trawl_engine::error::EngineError;
 use trawl_server::bus::IngestBatch;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::error::QUERY_RESOURCE_EXHAUSTED;
+use trawl_server::ingest::producer::Derivation;
+use trawl_server::ingest::wal::WalWriter;
 use trawl_server::pool::seam::Seam;
+use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
+use trawl_server::transport::failure::FAILURE_TARGET;
 
 /// Set only in the child: which scenario to run.
 const CHILD_SCENARIO: &str = "TRAWL_QUERY_RESOURCES_SCENARIO";
@@ -46,14 +68,22 @@ fn query_resources_child() {
         .expect("a runtime");
     match scenario.to_str().expect("a UTF-8 scenario") {
         "tmpdir" => runtime.block_on(tmpdir_child(&work)),
+        "spill_budget" => runtime.block_on(spill_budget_child(&work)),
+        "shared_budget" => runtime.block_on(shared_budget_child(&work)),
         other => panic!("unknown scenario {other}"),
     }
 }
 
-/// Run `scenario` in a child process over a fresh work directory, with
-/// `env` added to this process's environment, and fail with the child's
-/// output if it did not pass.
+/// Run `scenario` in a child process over `work`, with `env` added to this
+/// process's environment, and fail with the child's output if it did not
+/// pass.
 fn run_child(scenario: &str, work: &Path, env: &[(&str, &Path)]) {
+    finish_child(scenario, spawn_child(scenario, work, env));
+}
+
+/// Start `scenario` in a child process over `work`, with `env` added to
+/// this process's environment.
+fn spawn_child(scenario: &str, work: &Path, env: &[(&str, &Path)]) -> Child {
     let mut command = Command::new(std::env::current_exe().expect("locate this test binary"));
     command
         .args([
@@ -68,7 +98,17 @@ fn run_child(scenario: &str, work: &Path, env: &[(&str, &Path)]) {
     for (name, value) in env {
         command.env(name, value);
     }
-    let output = command.output().expect("run the child");
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start the child")
+}
+
+/// Wait for a child [`spawn_child`] started, and fail with its output if
+/// it did not pass.
+fn finish_child(scenario: &str, child: Child) {
+    let output = child.wait_with_output().expect("wait for the child");
     assert!(
         output.status.success(),
         "the {scenario} child failed: {}\nstdout:\n{}\nstderr:\n{}",
@@ -226,6 +266,746 @@ async fn tmpdir_child(work: &Path) {
             .iter()
             .any(|name| name.starts_with("trawl-export-")),
         "the staging file is gone once the export answered"
+    );
+}
+
+// -- the production subscriber, captured ------------------------------------
+
+const ENV: &str = "default";
+
+/// Everything the global subscriber writes to stdout.
+#[derive(Clone, Default)]
+struct Stdout(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Stdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for Stdout {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+struct Sinks {
+    stdout: Stdout,
+    wal: WalLayer,
+    wal_dir: tempfile::TempDir,
+}
+
+/// The production subscriber under the default directives, installed once
+/// for the process. Its WAL lives in the child's work directory when there
+/// is one, so the subscriber writes nothing to `TMPDIR` either.
+fn sinks() -> &'static Sinks {
+    static SINKS: OnceLock<Sinks> = OnceLock::new();
+    SINKS.get_or_init(|| {
+        let wal_dir = match std::env::var_os(CHILD_WORK) {
+            Some(work) => tempfile::tempdir_in(work),
+            None => tempfile::tempdir(),
+        }
+        .unwrap();
+        let handle = WalHandle::new();
+        handle.set(Arc::new(WalWriter::new(wal_dir.path().to_path_buf())), ENV);
+        let wal = WalLayer::new_with_buffer_cap(
+            handle,
+            &[ENV.to_owned()],
+            ENV,
+            Arc::new(Derivation::defaults()),
+            trawl_config::DEFAULT_TELEMETRY_BUFFER_MAX_BYTES,
+        );
+        let stdout = Stdout::default();
+        let (subscriber, _) = telemetry::build_subscriber(
+            telemetry::DEFAULT_LOG_FILTER,
+            LogSinks {
+                stdout_ansi: false,
+                stdout: Some(stdout.clone()),
+                wal: Some(wal.clone()),
+                file_log: false,
+            },
+        );
+        subscriber.init();
+        Sinks {
+            stdout,
+            wal,
+            wal_dir,
+        }
+    })
+}
+
+/// Every stdout line so far.
+fn stdout_lines() -> Vec<String> {
+    let bytes = sinks().stdout.0.lock().unwrap().clone();
+    String::from_utf8(bytes)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every record the telemetry WAL holds so far.
+fn wal_records() -> Vec<serde_json::Value> {
+    sinks().wal.flush();
+    let Ok(entries) = std::fs::read_dir(sinks().wal_dir.path().join(ENV)) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "ndjson"))
+        .flat_map(|path| {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The persisted `event_type` records for one request.
+fn records_for(event_type: &str, request_id: &str) -> Vec<serde_json::Value> {
+    wal_records()
+        .into_iter()
+        .filter(|record| record["event_type"] == event_type && record["request_id"] == request_id)
+        .collect()
+}
+
+/// A field's value on a formatted stdout line: `name="quoted"` or
+/// `name=bare`.
+fn field(line: &str, name: &str) -> Option<String> {
+    let at = line.find(&format!(" {name}="))? + name.len() + 2;
+    let rest = &line[at..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        quoted.find('"').map(|end| quoted[..end].to_owned())
+    } else {
+        Some(rest.split_whitespace().next().unwrap_or("").to_owned())
+    }
+}
+
+// -- a corpus that spills -----------------------------------------------------
+
+const MIB: u64 = 1024 * 1024;
+
+/// What the spill directory may hold past the cap on `DuckDB` 1.5.5: one
+/// block of each temp-file size class, 32 KiB to 256 KiB in 32 KiB steps
+/// (ADR-0056; `CLASS_SLACK` in trawl-engine's `query_budgets` tests).
+const CLASS_SLACK: u64 = 1_179_648;
+
+/// Rows in [`spill_corpus`]. With 128 MiB of memory and two threads,
+/// [`SPILLING`] spills about 70 MiB of them, in well under a second.
+const CORPUS_ROWS: usize = 1_000_000;
+
+/// A query whose answer is one row but whose window sorts every distinct
+/// message: it must hold or spill the whole input.
+const SPILLING: &str = "service=blob | dedup message | stats count()";
+
+/// A query over the same corpus that needs next to nothing.
+const SMALL: &str = "service=blob | stats count()";
+
+/// `DuckDB` text that must never reach a response, a log line or a
+/// stored record: its exception type, the settings its messages name, and
+/// the units its sizes are written in.
+const DUCKDB_TEXT: [&str; 8] = [
+    "Out of Memory",
+    "out of memory",
+    "max_temp_directory_size",
+    "memory_limit",
+    "failed to",
+    "MiB",
+    "KiB",
+    "duckdb_temp",
+];
+
+/// Write [`CORPUS_ROWS`] events of 128-character hex messages, all
+/// distinct, as one Parquet file in `data`'s on-disk layout. Row groups
+/// stay small: the scan reads a column chunk whole, outside the memory
+/// `DuckDB` can spill, and a default group of these strings would be the
+/// allocation that fails.
+fn spill_corpus(data: &Path) {
+    let hour = data.join("prod").join("2026-01-02").join("10");
+    std::fs::create_dir_all(&hour).unwrap();
+    let conn = duckdb::Connection::open_in_memory().unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT TIMESTAMP '2026-01-02 10:00:00' + to_microseconds(i) AS _time, \
+                TIMESTAMP '2026-01-02 10:00:01' + to_microseconds(i) AS _ingested, \
+                NULL::VARCHAR AS _raw, NULL::VARCHAR AS _repairs, 'prod' AS env, \
+                'blob' AS service, 'h' AS host, 9::BIGINT AS severity, \
+                'info' AS severity_text, \
+                md5(i::VARCHAR) || md5((i * 7)::VARCHAR) || md5((i * 13)::VARCHAR) \
+                    || md5((i * 31)::VARCHAR) AS message \
+         FROM range({CORPUS_ROWS}) t(i)) TO '{}' (FORMAT PARQUET, ROW_GROUP_SIZE 8192)",
+        hour.join("blob.parquet").display()
+    ))
+    .unwrap();
+}
+
+/// The budgets a server under test runs with.
+fn knobs(permits: usize, spill: u64, memory: u64) -> common::QueryKnobs {
+    common::QueryKnobs {
+        max_concurrent_queries: permits,
+        spill_max_bytes: NonZeroU64::new(spill).unwrap(),
+        memory_limit: NonZeroU64::new(memory).unwrap(),
+        threads: NonZeroU32::new(2).unwrap(),
+    }
+}
+
+/// A server over [`spill_corpus`] in `work`, with the production
+/// subscriber installed.
+async fn spill_server(
+    work: &Path,
+    timeout_secs: u64,
+    query: common::QueryKnobs,
+) -> common::TestServer {
+    sinks();
+    let data = work.join("data");
+    spill_corpus(&data);
+    common::setup_with_query_knobs(work, data.to_str().unwrap().to_owned(), timeout_secs, query)
+        .await
+}
+
+/// One answer to a query: its status, request id and body.
+struct Answer {
+    status: u16,
+    request_id: String,
+    body: String,
+}
+
+async fn post_query(server: &common::TestServer, dsl: &str) -> Answer {
+    post(server, QUERY_ROUTE, dsl).await
+}
+
+/// A Parquet export, which stages its file in scratch before a byte goes
+/// out, so a budget failure still answers with a status.
+async fn post_export(server: &common::TestServer, dsl: &str) -> Answer {
+    post(server, &format!("{EXPORT_ROUTE}?format=parquet"), dsl).await
+}
+
+const QUERY_ROUTE: &str = "/api/v1/query";
+const EXPORT_ROUTE: &str = "/api/v1/export";
+
+async fn post(server: &common::TestServer, path: &str, dsl: &str) -> Answer {
+    let response = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .post(format!("{}{path}", server.url))
+        .bearer_auth(&server.analyst_token)
+        .json(&serde_json::json!({ "query": dsl }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .expect("every response carries X-Request-Id")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = response.text().await.unwrap();
+    Answer {
+        status,
+        request_id,
+        body,
+    }
+}
+
+/// `answer` is the 503 contract (ADR-0056): the code and the fixed
+/// sentence, nothing else.
+fn assert_exhausted(answer: &Answer) {
+    assert_eq!(answer.status, 503, "{}", answer.body);
+    let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "error": {
+                "code": "query_resource_exhausted",
+                "message": QUERY_RESOURCE_EXHAUSTED,
+            }
+        }),
+        "the body is the code and the fixed sentence alone"
+    );
+}
+
+/// The `http_failure` trawld logged and stored for an exhausted request on
+/// `route`: one record on each sink, a 503 `service_unavailable` with
+/// cause `duckdb_resource_exhausted`.
+fn assert_exhausted_failure(route: &str, request_id: &str) {
+    let stored = records_for("http_failure", request_id);
+    assert_eq!(stored.len(), 1, "one persisted failure: {stored:?}");
+    let failure = &stored[0];
+    assert_eq!(failure["target"], FAILURE_TARGET);
+    assert_eq!(failure["status"], 503);
+    assert_eq!(failure["route"], route);
+    assert_eq!(failure["error_class"], "service_unavailable");
+    assert_eq!(failure["cause_kind"], "duckdb_resource_exhausted");
+
+    let lines: Vec<String> = stdout_lines()
+        .into_iter()
+        .filter(|line| field(line, "event_type").as_deref() == Some("http_failure"))
+        .filter(|line| field(line, "request_id").as_deref() == Some(request_id))
+        .collect();
+    assert_eq!(lines.len(), 1, "one stdout failure: {lines:?}");
+    assert_eq!(
+        field(&lines[0], "cause_kind").as_deref(),
+        Some("duckdb_resource_exhausted")
+    );
+}
+
+/// Where both sinks stood before a test's requests: stdout is a stream,
+/// so a line count marks it; the WAL is read file by file, in no promised
+/// order, so the set of records already there marks it.
+struct Mark {
+    stdout: usize,
+    stored: HashSet<String>,
+}
+
+fn mark() -> Mark {
+    Mark {
+        stdout: stdout_lines().len(),
+        stored: wal_records().iter().map(ToString::to_string).collect(),
+    }
+}
+
+/// Nothing trawld logged to stdout or stored since `mark` carries
+/// `DuckDB` text or a size, or names the query scratch, and nothing about
+/// the requests `request_ids` names any path under `work`. Boot records
+/// that land late may name the data directory; they are not about a
+/// query.
+fn assert_nothing_leaked(work: &Path, mark: &Mark, request_ids: &[&str]) {
+    let scratch = work.join("data.query-scratch");
+    let scratch = scratch.to_str().unwrap();
+    let work = work.to_str().unwrap();
+    let lines = stdout_lines();
+    let lines = &lines[mark.stdout..];
+    let records: Vec<serde_json::Value> = wal_records()
+        .into_iter()
+        .filter(|record| !mark.stored.contains(&record.to_string()))
+        .collect();
+    for id in request_ids {
+        assert!(
+            lines
+                .iter()
+                .any(|line| field(line, "request_id").as_deref() == Some(id)),
+            "request {id} logged nothing to stdout"
+        );
+        assert!(
+            records.iter().any(|record| record["request_id"] == *id),
+            "request {id} stored nothing"
+        );
+    }
+    let stdout = lines.iter().map(|line| {
+        let ours = field(line, "request_id").is_some_and(|id| request_ids.contains(&id.as_str()));
+        ("stdout", line.clone(), ours)
+    });
+    let stored = records.iter().map(|record| {
+        let ours = record["request_id"]
+            .as_str()
+            .is_some_and(|id| request_ids.contains(&id));
+        ("stored", record.to_string(), ours)
+    });
+    for (sink, text, ours) in stdout.chain(stored) {
+        for sentinel in DUCKDB_TEXT.iter().chain(&[scratch, "trawl-spill"]) {
+            assert!(
+                !text.contains(sentinel),
+                "{sentinel:?} reached {sink}: {text}"
+            );
+        }
+        assert!(
+            !ours || !text.contains(work),
+            "a path reached {sink}: {text}"
+        );
+    }
+}
+
+// -- the spill directory, sampled with the server stopped --------------------
+
+/// The largest byte totals the spill directory reached across samples:
+/// the sum of the files' lengths and of their allocated blocks.
+#[derive(Debug, Default, Clone, Copy)]
+struct Peak {
+    length: u64,
+    allocated: u64,
+    samples: u64,
+}
+
+impl Peak {
+    fn held(self) -> u64 {
+        self.length.max(self.allocated)
+    }
+}
+
+/// The spill directory's totals right now.
+fn totals(dir: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let (mut length, mut allocated) = (0, 0);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                length += meta.len();
+                allocated += meta.blocks() * 512;
+            }
+        }
+    }
+    (length, allocated)
+}
+
+/// Whether every thread of `pid` has stopped, or the process has exited
+/// (a zombie never reads as stopped).
+fn stopped_or_gone(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return true;
+    };
+    tasks.flatten().all(|task| {
+        std::fs::read_to_string(task.path().join("stat")).map_or(true, |stat| {
+            // The state follows the parenthesised command name.
+            stat.rsplit_once(") ")
+                .is_none_or(|(_, rest)| rest.starts_with(['T', 't', 'Z', 'X']))
+        })
+    })
+}
+
+/// Run `scenario` in a child process over `work` and sample the spill
+/// directory its server makes in `<work>/data.query-scratch` until it
+/// exits, then fail with the child's output if it did not pass.
+///
+/// Each sample sends `SIGSTOP`, waits until every thread is stopped, reads
+/// the directory, then sends `SIGCONT`. No thread moves a block while the
+/// directory is read, so a sample is one consistent state of the files.
+/// Sampling can still miss a peak between two samples, which weakens the
+/// check but never makes it fail falsely.
+fn spill_peak_of_child(scenario: &str, work: &Path) -> Peak {
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let scratch = work.join("data.query-scratch");
+    let mut child = spawn_child(scenario, work, &[]);
+    let pid = Pid::from_child(&child);
+    let mut peak = Peak::default();
+    let mut spill = None;
+    while child.try_wait().expect("child state").is_none() {
+        if spill.is_none() {
+            spill = std::fs::read_dir(&scratch).ok().and_then(|entries| {
+                entries.flatten().map(|entry| entry.path()).find(|path| {
+                    path.file_name()
+                        .is_some_and(trawl_engine::scratch::is_spill_dir_name)
+                })
+            });
+        }
+        let Some(dir) = &spill else {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        };
+        if kill_process(pid, Signal::STOP).is_err() {
+            break;
+        }
+        while !stopped_or_gone(child.id()) {
+            std::hint::spin_loop();
+        }
+        let (length, allocated) = totals(dir);
+        let _ = kill_process(pid, Signal::CONT);
+        peak.length = peak.length.max(length);
+        peak.allocated = peak.allocated.max(allocated);
+        peak.samples += 1;
+        std::thread::sleep(Duration::from_micros(50));
+    }
+    finish_child(scenario, child);
+    peak
+}
+
+/// The most spill `DuckDB` accounts for in its temp files while `run`
+/// runs, read from `duckdb_temporary_files()` on a clone of the query
+/// database that takes no permit.
+async fn accounted_while<F: std::future::Future>(
+    server: &common::TestServer,
+    run: F,
+) -> (F::Output, i64) {
+    let executor = server
+        .state
+        .query
+        .pool
+        .detached_executor()
+        .expect("a clone of the query database");
+    let stop = Arc::new(AtomicBool::new(false));
+    let most = Arc::new(AtomicI64::new(0));
+    let sampler = std::thread::spawn({
+        let (stop, most) = (Arc::clone(&stop), Arc::clone(&most));
+        move || {
+            while !stop.load(Ordering::SeqCst) {
+                // The sampler draws on the same budget as the query it
+                // watches, so a full budget refuses some samples.
+                match executor.query_i64_for_test(
+                    "SELECT coalesce(sum(size), 0)::BIGINT FROM duckdb_temporary_files()",
+                ) {
+                    Ok(used) => {
+                        most.fetch_max(used, Ordering::SeqCst);
+                    }
+                    Err(EngineError::ResourceExhausted) => {}
+                    Err(err) => panic!("read the temp files: {err}"),
+                }
+            }
+        }
+    });
+    let output = run.await;
+    stop.store(true, Ordering::SeqCst);
+    sampler.join().unwrap();
+    (output, most.load(Ordering::SeqCst))
+}
+
+// -- AC4: the spill cap -------------------------------------------------------
+
+/// The spill cap of [`spill_budget`]: well under what [`SPILLING`] spills.
+const SPILL_CAP: u64 = 24 * MIB;
+
+/// A query that spills past `[server] query_spill_max_bytes` answers 503
+/// `query_resource_exhausted` with cause `duckdb_resource_exhausted` and
+/// the fixed sentence (ADR-0056). The spill directory never holds more
+/// than the cap plus one block of each temp-file size class, the usage
+/// `DuckDB` accounts never passes the cap, and a small query on the same
+/// server then succeeds.
+#[test]
+fn spill_budget() {
+    let work = tempfile::tempdir().expect("work dir");
+    let peak = spill_peak_of_child("spill_budget", work.path());
+    assert!(peak.samples > 0, "the spill directory was never sampled");
+    assert!(
+        peak.held() <= SPILL_CAP + CLASS_SLACK,
+        "the spill directory held {} bytes, {} past the cap ({peak:?})",
+        peak.held(),
+        peak.held().saturating_sub(SPILL_CAP)
+    );
+    assert!(
+        peak.held() >= SPILL_CAP / 2,
+        "the query never spilled near the cap, so the cap is not what stopped it ({peak:?})"
+    );
+}
+
+/// The child half of [`spill_budget`].
+async fn spill_budget_child(work: &Path) {
+    let server = spill_server(work, 60, knobs(2, SPILL_CAP, 128 * MIB)).await;
+    let before = mark();
+
+    let (answer, accounted) = accounted_while(&server, post_query(&server, SPILLING)).await;
+    assert_exhausted(&answer);
+    assert_exhausted_failure(QUERY_ROUTE, &answer.request_id);
+    assert!(accounted > 0, "DuckDB accounted no spill at all");
+    assert!(
+        u64::try_from(accounted).unwrap() <= SPILL_CAP,
+        "DuckDB accounted {accounted} bytes of spill past the cap {SPILL_CAP}"
+    );
+
+    let small = post_query(&server, SMALL).await;
+    assert_eq!(small.status, 200, "{}", small.body);
+    let body: serde_json::Value = serde_json::from_str(&small.body).unwrap();
+    assert_eq!(body["rows"], serde_json::json!([[CORPUS_ROWS]]));
+    assert_nothing_leaked(work, &before, &[&answer.request_id, &small.request_id]);
+}
+
+// -- AC5: the memory limit ----------------------------------------------------
+
+/// A query that runs out of `[server] query_memory_limit` answers the same
+/// 503 contract, on the query lane and the export lane alike, and the
+/// body, stdout and the stored `http_failure` carry no path, size or
+/// `DuckDB` text (ADR-0056).
+///
+/// The spill cap is the shipped default, far past what the query needs,
+/// and the spill directory stays empty: the memory limit stopped it.
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_limit() {
+    let work = tempfile::tempdir().expect("work dir");
+    let server = spill_server(
+        work.path(),
+        60,
+        knobs(
+            2,
+            trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES.get(),
+            8 * MIB,
+        ),
+    )
+    .await;
+    let before = mark();
+
+    let answer = post_query(&server, SPILLING).await;
+    assert_exhausted(&answer);
+    assert_exhausted_failure(QUERY_ROUTE, &answer.request_id);
+
+    let export = post_export(&server, SPILLING).await;
+    assert_exhausted(&export);
+    assert_exhausted_failure(EXPORT_ROUTE, &export.request_id);
+
+    let small = post_query(&server, SMALL).await;
+    assert_eq!(small.status, 200, "{}", small.body);
+    assert_nothing_leaked(
+        work.path(),
+        &before,
+        &[&answer.request_id, &export.request_id, &small.request_id],
+    );
+}
+
+// -- AC6: one budget, shared --------------------------------------------------
+
+/// The spill cap of [`clones_share_one_spill_budget`]. [`SPILLING`] alone
+/// accounts 66 to 80 MB of spill on `DuckDB` 1.5.5, and under a 128 MiB cap
+/// it still failed about one run in ten under load, so one query gets well
+/// over twice what a sampler sees it use. Four at once ask for about
+/// 300 MB.
+const SHARED_CAP: u64 = 192 * MIB;
+
+/// Concurrent queries, one per permit, in [`clones_share_one_spill_budget`].
+const SHARERS: usize = 4;
+
+/// Concurrent queries on clones of the query database share its one
+/// spill cap (ADR-0056). One query fits the cap alone; four started
+/// together cannot all fit, so at least one answers 503
+/// `query_resource_exhausted`, where a cap per clone would let all four
+/// complete. The spill directory never holds more than the one cap.
+#[test]
+fn clones_share_one_spill_budget() {
+    let work = tempfile::tempdir().expect("work dir");
+    let peak = spill_peak_of_child("shared_budget", work.path());
+    assert!(peak.samples > 0, "the spill directory was never sampled");
+    assert!(
+        peak.held() <= SHARED_CAP + CLASS_SLACK,
+        "the spill directory held {} bytes, {} past the shared cap ({peak:?})",
+        peak.held(),
+        peak.held().saturating_sub(SHARED_CAP)
+    );
+}
+
+/// The child half of [`clones_share_one_spill_budget`].
+async fn shared_budget_child(work: &Path) {
+    let server = Arc::new(spill_server(work, 60, knobs(SHARERS, SHARED_CAP, 128 * MIB)).await);
+
+    let alone = post_query(&server, SPILLING).await;
+    assert_eq!(alone.status, 200, "one query fits the cap: {}", alone.body);
+
+    // All start before any runs: each parks at the work-start seam until
+    // the others have arrived. The session releases its gates when
+    // dropped, so it lives as long as the hold.
+    let seams = server.state.query.pool.seams();
+    let started = seams.hold(Seam::Started);
+    let all = tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            let queries: Vec<_> = (0..SHARERS)
+                .map(|_| {
+                    let server = Arc::clone(&server);
+                    tokio::spawn(async move { post_query(&server, SPILLING).await })
+                })
+                .collect();
+            accounted_while(&server, async {
+                let mut answers = Vec::with_capacity(SHARERS);
+                for query in queries {
+                    answers.push(query.await.unwrap());
+                }
+                answers
+            })
+            .await
+        }
+    });
+    let start = Instant::now();
+    while started.arrivals() < SHARERS {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the queries never all started"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    started.release();
+    let (answers, accounted) = all.await.unwrap();
+    assert!(
+        u64::try_from(accounted).unwrap() <= SHARED_CAP,
+        "DuckDB accounted {accounted} bytes of spill past the shared cap"
+    );
+    let exhausted: Vec<&Answer> = answers
+        .iter()
+        .filter(|answer| answer.status != 200)
+        .collect();
+    assert!(
+        !exhausted.is_empty(),
+        "{SHARERS} queries that together spill past the cap all completed"
+    );
+    for answer in exhausted {
+        assert_exhausted(answer);
+        assert_exhausted_failure(QUERY_ROUTE, &answer.request_id);
+    }
+}
+
+// -- AC8: the timeout verdict -------------------------------------------------
+
+/// A query whose work fails with `Out of Memory` while its request times
+/// out keeps its 504 (ADR-0056): the work's failure is parked until the
+/// request has its answer, and does not replace it. `query_timing` records
+/// the timeout and `query_permit_reclaimed` the work's failure, as for any
+/// retained permit.
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_verdict_survives_resource_failure() {
+    let work = tempfile::tempdir().expect("work dir");
+    let server = spill_server(work.path(), 1, knobs(2, SPILL_CAP, 128 * MIB)).await;
+
+    // The work runs into the spill cap within a few hundred milliseconds,
+    // then parks with its failure in hand past the one-second deadline,
+    // so the request answers 504 for work that has already failed. The
+    // session releases its gates when dropped, so it lives as long as the
+    // hold.
+    let seams = server.state.query.pool.seams();
+    let finished = seams.hold(Seam::Finished);
+    let released = seams.watch(Seam::Released);
+    let answer = post_query(&server, SPILLING).await;
+    assert_eq!(
+        finished.arrivals(),
+        1,
+        "the work failed before the deadline"
+    );
+    assert_eq!(answer.status, 504, "{}", answer.body);
+    let body: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+    assert_eq!(body["error"]["code"], "timeout");
+
+    finished.release();
+    let start = Instant::now();
+    while released.arrivals() == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the work never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // The reclaim is logged as the worker hands back its permit.
+    let start = Instant::now();
+    let reclaimed = loop {
+        let reclaimed = records_for("query_permit_reclaimed", &answer.request_id);
+        if !reclaimed.is_empty() || start.elapsed() > Duration::from_secs(10) {
+            break reclaimed;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(reclaimed.len(), 1, "{reclaimed:?}");
+    assert_eq!(
+        reclaimed[0]["physical_outcome"], "failed",
+        "the retained work failed on its budget: {}",
+        reclaimed[0]
+    );
+
+    let timing = records_for("query_timing", &answer.request_id);
+    assert_eq!(timing.len(), 1, "{timing:?}");
+    assert_eq!(timing[0]["outcome"], "timeout", "{}", timing[0]);
+    assert_eq!(timing[0]["work_started"], true, "{}", timing[0]);
+
+    let failures = records_for("http_failure", &answer.request_id);
+    assert_eq!(failures.len(), 1, "one failure, the timeout: {failures:?}");
+    assert_eq!(failures[0]["status"], 504);
+    assert_eq!(failures[0]["error_class"], "timeout");
+    assert!(
+        wal_records()
+            .iter()
+            .all(|record| record["cause_kind"] != "duckdb_resource_exhausted"),
+        "nothing recorded the late failure as the request's answer"
     );
 }
 
