@@ -491,7 +491,7 @@ Searches, exports, and field samples all run on one query database. A big query 
 
 | Key | DuckDB setting | Default | Refused at startup |
 |-----|----------------|---------|--------------------|
-| `query_scratch_dir` | none | `<data.path>.query-scratch` | An empty path. A path equal to, inside, or above the data root, the WAL directory, or a repin staging root (`<data.path>.repin-next`, `<data.path>.repin-aside`) |
+| `query_scratch_dir` | none | `<data.path>.query-scratch` | An empty path. An explicit path that is relative or has a `..` component. A path with a glob metacharacter (`*`, `?`, `[`, `]`, `{`, `}`). A path equal to, inside, or above the data root, the WAL directory, or a repin staging root (`<data.path>.repin-next`, `<data.path>.repin-aside`) |
 | `query_spill_max_bytes` | `max_temp_directory_size` | `"512M"` | Zero. A value that overflows 64 bits. A value DuckDB rejects |
 | `query_memory_limit` | `memory_limit` | `"256M"` | Zero. A value that overflows 64 bits. A value DuckDB rejects |
 | `query_threads` | `threads` | `2` | Zero. A value that overflows 32 bits |
@@ -513,7 +513,7 @@ The spill cap counts the bytes DuckDB accounts. On disk, DuckDB can hold a littl
 
 A query-only node with a read-only data root must set `query_scratch_dir` to a writable directory. With the default on a read-only mount, startup refuses, and the message names `[server] query_scratch_dir`.
 
-**The lock and boot cleanup.** trawld makes the directory 0700, opens its final component without following a symlink, and takes an exclusive `flock` on it for the life of the process. A second trawld that finds the lock held refuses to start with `the query scratch directory ... is locked by another trawld`. Give each trawld on one host its own directory. Distinct `[data] path` values already give distinct defaults.
+**The lock and boot cleanup.** trawld makes the directory 0700, opens its final component without following a symlink, and takes an exclusive `flock` on it for the life of the process. Before it takes the lock, it compares the opened directory, and each directory above it, with the data root, the WAL directory, and the repin staging roots by device and inode. An overlap refuses the start however the path spells it, through a symlink or a bind mount included. A second trawld that finds the lock held refuses to start with `the query scratch directory ... is locked by another trawld`. Give each trawld on one host its own directory. Distinct `[data] path` values already give distinct defaults.
 
 Under the lock, boot reads the whole directory and then removes what an earlier trawld left behind, such as after a SIGKILL or an eviction:
 
@@ -522,7 +522,7 @@ Under the lock, boot reads the whole directory and then removes what an earlier 
 - export staging files named `trawl-export-*.parquet`, and the `tmp_`-prefixed copy that DuckDB writes beside one;
 - nothing else.
 
-Any other entry refuses the start: a different name, a symlink, a special file, a file owned by another user, a directory on another mount, or anything inside a spill directory that DuckDB does not name. The message names the entry and `[server] query_scratch_dir`, and trawld has removed nothing. Move the entry out, or point the key at a directory of its own. A directory owned by another user, or one that keeps group or other bits after trawld clears them, also refuses the start. The Postgres sole-writer lock does not authorize this cleanup, because it guards a database, not a directory.
+Any other entry refuses the start: a different name, a symlink, a special file, a file owned by another user, a directory on another mount, or anything inside a spill directory that DuckDB does not name. The message names the entry and `[server] query_scratch_dir`, and trawld has removed nothing. Move the entry out, or point the key at a directory of its own. A Linux kernel before 5.8 cannot report which mount an entry is on, so there any entry refuses the start, and only an empty directory opens. A directory owned by another user, or one that keeps group or other bits after trawld clears them, also refuses the start. The Postgres sole-writer lock does not authorize this cleanup, because it guards a database, not a directory.
 
 **When a query goes over budget.** The query fails with 503 `query_resource_exhausted`, and the server keeps serving. DuckDB reports the spill cap and the memory limit with the same error type, so one response covers both. The response is not a 4xx, because the budgets are shared and the same query can finish on an idle server. See [query resource exhausted](/reference/api/#query-resource-exhausted) for the contract. To let queries use more, raise `query_memory_limit` first, then `query_spill_max_bytes`, and check the [memory arithmetic](#the-memory-arithmetic).
 

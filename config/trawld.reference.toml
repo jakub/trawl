@@ -20,11 +20,17 @@
 # root's sibling, <data.path>.query-scratch, so it sits on the data volume.
 # It must not be the data root, the WAL directory or a repin staging root
 # (<data.path>.repin-next, <data.path>.repin-aside), nor inside or above
-# any of them. A query-only node with a read-only data root sets it to a
-# writable directory. trawld makes the directory 0700 and holds an exclusive
-# lock on it, so a second trawld on the same directory refuses to start. At
-# boot it removes the spill directories, snapshots and export files an
-# earlier trawld left behind; any other entry refuses the start.
+# any of them. An explicit path must be absolute, with no '..' component
+# and none of the glob metacharacters * ? [ ] { }. Startup compares the
+# opened directory with those roots by device and inode, so an overlap
+# refuses however the path spells it. A query-only node with a read-only
+# data root sets it to a writable directory. trawld makes the directory
+# 0700 and holds an exclusive lock on it, so a second trawld on the same
+# directory refuses to start. At boot it removes the spill directories,
+# snapshots and export files an earlier trawld left behind; any other entry
+# refuses the start. A Linux kernel before 5.8 cannot report mount ids, so
+# there a directory with any entry refuses the start and only an empty one
+# opens.
 # query_scratch_dir = "/var/lib/trawl/data.query-scratch"
 
 # Budgets of the query database, shared by every query, export and field
