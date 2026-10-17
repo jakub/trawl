@@ -45,8 +45,7 @@ struct Fixture {
     query_log: Option<PathBuf>,
     /// `[ingest] wal_dir`, when not `wal` beside the data root.
     wal_dir: Option<PathBuf>,
-    /// The daemon's `TMPDIR`, where the query engine makes its spill
-    /// directory; unset leaves the system default.
+    /// The daemon's `TMPDIR`; unset leaves the system default.
     tmpdir: Option<PathBuf>,
     /// `[server] query_scratch_dir`; unset leaves the default beside the
     /// data root ([`Fixture::scratch`]).
@@ -2493,20 +2492,39 @@ async fn a_repin_sibling_that_is_not_a_directory_refuses_the_start() {
 /// rather than a panic whose message the panic hook drops. A spill
 /// directory refused as not private takes the same path, but an
 /// unprivileged test cannot produce one: the engine asks for mode 0700,
-/// and only a mount that ignores modes answers otherwise. A `TMPDIR` that
-/// does not exist stands in for it.
+/// and only a mount that ignores modes answers otherwise.
+///
+/// The spill directory lives in the query scratch directory (ADR-0056),
+/// so a scratch path a few bytes short of `PATH_MAX` stands in: trawld can
+/// make, lock and clear the scratch directory itself, but the spill
+/// directory's longer path inside it is `ENAMETOOLONG`.
 #[tokio::test]
 async fn a_spill_directory_that_cannot_be_made_refuses_the_start() {
+    /// Linux's `PATH_MAX`, the terminating NUL included.
+    const PATH_MAX: usize = 4096;
     let mut fixture = Fixture::new().await;
     fixture.current_fleet().await;
-    let tmpdir = fixture.root.path().join("no-such-tmp");
-    fixture.tmpdir = Some(tmpdir.clone());
+    // Room for the scratch path, and too little for `/trawl-spill-XXXXXX`
+    // after it.
+    let target = PATH_MAX - 1 - 8;
+    let mut scratch = fixture.root.path().join("deep");
+    while scratch.as_os_str().len() + 1 + 200 <= target {
+        scratch.push("d".repeat(200));
+    }
+    let rest = target - scratch.as_os_str().len() - 1;
+    if rest > 0 {
+        scratch.push("s".repeat(rest));
+    }
+    assert!(scratch.as_os_str().len() < PATH_MAX);
+    assert!(scratch.as_os_str().len() + "/trawl-spill-XXXXXX".len() >= PATH_MAX);
+    std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+    fixture.query_scratch_dir = Some(scratch.clone());
 
     let mut daemon = fixture.spawn();
     daemon.refused("failed to start the query engine").await;
     let log = daemon.log();
     assert!(
-        log.contains(&tmpdir.display().to_string()),
+        log.contains(&scratch.display().to_string()),
         "the error names the spill directory's parent: {log}"
     );
     assert!(
@@ -2514,6 +2532,19 @@ async fn a_spill_directory_that_cannot_be_made_refuses_the_start() {
         "the start failed by panicking: {log}"
     );
     fixture.assert_lock_free().await;
+}
+
+/// #304: the query engine makes nothing in `TMPDIR` (ADR-0056), so a
+/// `TMPDIR` that does not exist no longer stops trawld from starting.
+#[tokio::test]
+async fn a_missing_tmpdir_does_not_stop_the_query_engine() {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.tmpdir = Some(fixture.root.path().join("no-such-tmp"));
+
+    let mut daemon = fixture.spawn();
+    daemon.ready().await;
+    daemon.stop().await;
 }
 
 /// Every entry under `root`, `root` included, with what it is, read without
@@ -2679,11 +2710,34 @@ async fn query_scratch_boot_reclaims_stale_spill_snapshot_export() {
         .lines()
         .find(|line| line.contains("query scratch directory locked"))
         .unwrap_or_else(|| panic!("no reclaim line: {log}"));
-    for field in ["spill_dirs=1", "snapshots=1", "exports=2"] {
+    // Two spill directories: the planted one and the killed daemon's own,
+    // which its query database made in scratch.
+    for field in ["spill_dirs=2", "snapshots=1", "exports=2"] {
         assert!(line.contains(field), "{field} missing from {line}");
     }
+    // What remains is the 0700 directory and the serving daemon's own
+    // empty spill directory, which no planted path names.
+    let mut tree = scratch_tree(&scratch);
+    let own: Vec<PathBuf> = tree
+        .keys()
+        .filter(|path| {
+            path.parent() == Some(scratch.as_path())
+                && trawl_engine::scratch::is_spill_dir_name(path.file_name().unwrap())
+        })
+        .cloned()
+        .collect();
     assert_eq!(
-        scratch_tree(&scratch),
+        own.len(),
+        1,
+        "one spill directory, the daemon's own: {tree:?}"
+    );
+    assert!(
+        !planted.contains(&own[0]),
+        "a stale spill directory survived"
+    );
+    assert_eq!(tree.remove(&own[0]).as_deref(), Some("dir 0700"));
+    assert_eq!(
+        tree,
         BTreeMap::from([(scratch.clone(), "dir 0700".to_owned())]),
         "boot left something behind, or left the directory open"
     );

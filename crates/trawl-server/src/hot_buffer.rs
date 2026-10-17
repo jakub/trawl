@@ -56,6 +56,7 @@ use indexmap::IndexMap;
 use indexmap::map::Entry;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::watch;
+use trawl_engine::scratch::QueryScratch;
 
 use crate::bus::IngestBatch;
 use crate::ingest::producer::ProducerKind;
@@ -1033,8 +1034,9 @@ impl HotBuffer {
         self.ledger.pressure.subscribe()
     }
 
-    /// Get a snapshot of all buffered events as a temporary ndjson file,
-    /// paired with the catalog pins that apply to it.
+    /// Get a snapshot of all buffered events as a temporary ndjson file in
+    /// the query scratch directory, paired with the catalog pins that apply
+    /// to it.
     ///
     /// Returns `Ok(None)` if the buffer holds no event, and an error if the
     /// file cannot be built: creating it, writing or serializing any one
@@ -1045,6 +1047,9 @@ impl HotBuffer {
     /// Uses a generation-based cache: concurrent queries against an unchanged
     /// buffer share a single snapshot file (1 disk write instead of N).
     /// The `Arc` ensures the temp file stays alive until all queries using it finish.
+    /// Every caller holds an executor permit while it holds a snapshot, so
+    /// at most one file per permit plus the cached one exists at a time,
+    /// each no larger than the serialized buffer (ADR-0056).
     ///
     /// The file is cached per generation; the pin intersection is not — see
     /// [`HotSnapshot`] for why a generation-cached pin set would be stale in
@@ -1060,7 +1065,7 @@ impl HotBuffer {
     ///
     /// The I/O error that stopped the build. Its text can quote a path;
     /// callers report its kind, not its text.
-    pub fn snapshot(&self) -> std::io::Result<Option<HotSnapshot>> {
+    pub fn snapshot(&self, scratch: &QueryScratch) -> std::io::Result<Option<HotSnapshot>> {
         // Fast path: no events at all → skip locking entirely.
         if self.total_events.load(Ordering::Relaxed) == 0 {
             return Ok(None);
@@ -1080,7 +1085,7 @@ impl HotBuffer {
         }
 
         // Cache miss — build under lock so concurrent queries wait.
-        let Some((file, keys)) = self.build_snapshot()? else {
+        let Some((file, keys)) = self.build_snapshot(scratch)? else {
             return Ok(None);
         };
         let file = Arc::new(file);
@@ -1103,6 +1108,31 @@ impl HotBuffer {
         let mut cache = self.snapshot_cache.lock();
         *cache = None;
         self.fail_next_snapshot.store(true, Ordering::Relaxed);
+    }
+
+    /// The bytes a snapshot of the whole buffer holds right now: every
+    /// resident event serialized as [`Self::snapshot`] writes it.
+    #[cfg(test)]
+    pub(crate) fn serialized_len_for_test(&self) -> u64 {
+        struct Count(u64);
+        impl std::io::Write for Count {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len() as u64;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let map = self.batches.read();
+        let mut count = Count(0);
+        write_events(
+            &mut count,
+            map.values()
+                .flat_map(|resident| resident.batch.events.iter()),
+        )
+        .expect("counting cannot fail");
+        count.0
     }
 
     /// The pins that apply to one snapshot: the catalog intersected with
@@ -1132,7 +1162,10 @@ impl HotBuffer {
     /// `Ok(None)` when no batch holds an event. Any failure fails the whole
     /// build and is returned, not logged: the reader that asked refuses,
     /// and its failure record names the kind.
-    fn build_snapshot(&self) -> std::io::Result<Option<(tempfile::NamedTempFile, Vec<String>)>> {
+    fn build_snapshot(
+        &self,
+        scratch: &QueryScratch,
+    ) -> std::io::Result<Option<(tempfile::NamedTempFile, Vec<String>)>> {
         let map = self.batches.read();
         let events: Vec<&Event> = map
             .values()
@@ -1147,7 +1180,7 @@ impl HotBuffer {
             .chain((0..events.len()).filter(|&i| !pioneer[i]))
             .map(|i| events[i]);
 
-        let mut tmpfile = tempfile::Builder::new().suffix(".ndjson").tempfile()?;
+        let mut tmpfile = scratch.snapshot_file()?;
         // serde_json emits many small writes per event. Buffer them before
         // crossing into the filesystem, then flush before publishing the file.
         let writer = BufWriter::new(&mut tmpfile);
@@ -1247,6 +1280,48 @@ fn write_events<'a, W: std::io::Write>(
     Ok(())
 }
 
+/// A query scratch directory in a fresh temp directory, for tests that
+/// take hot-buffer snapshots without a pool. It dereferences to the
+/// [`QueryScratch`] [`HotBuffer::snapshot`] takes, and is removed on drop.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct TestScratch {
+    scratch: QueryScratch,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TestScratch {
+    /// Make one.
+    ///
+    /// # Panics
+    /// The temp directory could not be made.
+    #[must_use]
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().expect("make a scratch temp dir");
+        Self {
+            scratch: QueryScratch::new(dir.path()),
+            _dir: dir,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Default for TestScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl std::ops::Deref for TestScratch {
+    type Target = QueryScratch;
+
+    fn deref(&self) -> &QueryScratch {
+        &self.scratch
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 mod test_seam {
     //! The fault behind [`HotBuffer::fail_next_snapshot_for_test`].
@@ -1318,6 +1393,7 @@ mod tests {
 
     #[test]
     fn insert_and_snapshot() {
+        let scratch = TestScratch::new();
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
@@ -1326,7 +1402,7 @@ mod tests {
         assert_eq!(buf.event_count(), 3);
         assert_eq!(buf.batch_count(), 1);
 
-        let tmpfile = buf.snapshot().unwrap().expect("should have events");
+        let tmpfile = buf.snapshot(&scratch).unwrap().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         assert_eq!(content.lines().count(), 3);
         assert!(content.contains("event_0"));
@@ -1377,6 +1453,7 @@ mod tests {
 
     #[test]
     fn snapshot_hoists_schema_pioneers_to_the_front() {
+        let scratch = TestScratch::new();
         // DuckDB infers the snapshot's schema from a bounded prefix and then
         // hard-errors on a later record with a key outside it. `_repairs`
         // is sparse by construction (ADR-0008), so the writer moves the events
@@ -1394,7 +1471,7 @@ mod tests {
             events,
         }));
 
-        let tmpfile = buf.snapshot().unwrap().expect("should have events");
+        let tmpfile = buf.snapshot(&scratch).unwrap().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         let lines: Vec<&str> = content.lines().collect();
 
@@ -1431,6 +1508,7 @@ mod tests {
         // call sites are exercised — the hot-only reader (no parquet yet) and
         // the hot+cold union.
         use trawl_engine::executor::Executor;
+        let scratch = TestScratch::new();
 
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 100_000,
@@ -1442,7 +1520,7 @@ mod tests {
             byte_size: 1000,
             events: events_with_trailing_sparse_key(30_000),
         }));
-        let snapshot = buf.snapshot().unwrap().expect("should have events");
+        let snapshot = buf.snapshot(&scratch).unwrap().expect("should have events");
         let hot = snapshot.path().to_str().unwrap();
 
         for with_cold in [false, true] {
@@ -1488,6 +1566,7 @@ mod tests {
         // must not reach the emitter (REPLACE on an absent column throws),
         // and an observed key without a pin contributes nothing.
         use trawl_core::schema::CanonicalType;
+        let scratch = TestScratch::new();
 
         let catalog = Arc::new(crate::catalog::FieldCatalog::new());
         catalog.replace([
@@ -1510,7 +1589,7 @@ mod tests {
             events: vec![ev],
         }));
 
-        let snap = buf.snapshot().unwrap().expect("should have events");
+        let snap = buf.snapshot(&scratch).unwrap().expect("should have events");
         assert_eq!(
             snap.field_types.get("duration"),
             Some(CanonicalType::BigInt),
@@ -1533,6 +1612,7 @@ mod tests {
         // union, so a stale set is a hard error. Pins are therefore
         // intersected on every snapshot() call, cache hit included.
         use trawl_core::schema::CanonicalType;
+        let scratch = TestScratch::new();
 
         let catalog = Arc::new(crate::catalog::FieldCatalog::new());
         let buf = HotBuffer::new(HotBufferConfig {
@@ -1551,7 +1631,7 @@ mod tests {
             events: vec![ev],
         }));
 
-        let first = buf.snapshot().unwrap().expect("should have events");
+        let first = buf.snapshot(&scratch).unwrap().expect("should have events");
         assert!(
             first.field_types.is_empty(),
             "no pins yet — nothing to conform"
@@ -1560,7 +1640,7 @@ mod tests {
         // Pin lands mid-window: no buffer mutation, same generation.
         catalog.replace([("duration".to_string(), CanonicalType::BigInt)]);
 
-        let second = buf.snapshot().unwrap().expect("should have events");
+        let second = buf.snapshot(&scratch).unwrap().expect("should have events");
         assert!(
             Arc::ptr_eq(&first.file, &second.file),
             "same generation must reuse the cached snapshot file"
@@ -1575,6 +1655,7 @@ mod tests {
 
     #[test]
     fn drain_removes_batches() {
+        let scratch = TestScratch::new();
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
@@ -1589,7 +1670,7 @@ mod tests {
 
         buf.drain(&["batch_002"]);
         assert_eq!(buf.event_count(), 0);
-        assert!(buf.snapshot().unwrap().is_none());
+        assert!(buf.snapshot(&scratch).unwrap().is_none());
     }
 
     #[test]
@@ -1608,6 +1689,7 @@ mod tests {
 
     #[test]
     fn snapshot_includes_all_batches() {
+        let scratch = TestScratch::new();
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
@@ -1615,7 +1697,7 @@ mod tests {
         buf.insert_for_test(make_batch("batch_001", 2));
         buf.insert_for_test(make_batch("batch_002", 3));
 
-        let tmpfile = buf.snapshot().unwrap().expect("should have events");
+        let tmpfile = buf.snapshot(&scratch).unwrap().expect("should have events");
         let content = std::fs::read_to_string(tmpfile.path()).unwrap();
         // All 5 events from both batches should be in the snapshot.
         assert_eq!(content.lines().count(), 5);
@@ -1623,6 +1705,7 @@ mod tests {
 
     #[test]
     fn drain_after_snapshot_leaves_snapshot_valid() {
+        let scratch = TestScratch::new();
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
@@ -1631,7 +1714,7 @@ mod tests {
         buf.insert_for_test(make_batch("batch_002", 3));
 
         // Take a snapshot (Arc-wrapped temp file).
-        let snapshot = buf.snapshot().unwrap().expect("should have events");
+        let snapshot = buf.snapshot(&scratch).unwrap().expect("should have events");
         let content_before = std::fs::read_to_string(snapshot.path()).unwrap();
         assert_eq!(content_before.lines().count(), 5);
 
@@ -1645,11 +1728,12 @@ mod tests {
 
     #[test]
     fn empty_buffer_returns_none() {
+        let scratch = TestScratch::new();
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 100,
             max_bytes: 10_000_000,
         });
-        assert!(buf.snapshot().unwrap().is_none());
+        assert!(buf.snapshot(&scratch).unwrap().is_none());
     }
 
     /// Refuses the first write of line `refuse_line` (0-based) once, and
@@ -1715,23 +1799,27 @@ mod tests {
     /// whole.
     #[test]
     fn snapshot_failure_is_an_error_never_an_empty_buffer() {
+        let scratch = TestScratch::new();
         let buf = HotBuffer::new(HotBufferConfig {
             max_events: 1000,
             max_bytes: 10_000_000,
         });
-        assert!(buf.snapshot().unwrap().is_none(), "empty is Ok(None)");
+        assert!(
+            buf.snapshot(&scratch).unwrap().is_none(),
+            "empty is Ok(None)"
+        );
         buf.insert_for_test(make_batch("batch_001", 3));
         // Built and cached first: the fault must not be answered from the
         // cache.
-        buf.snapshot().unwrap().expect("should have events");
+        buf.snapshot(&scratch).unwrap().expect("should have events");
 
         buf.fail_next_snapshot_for_test();
         let err = buf
-            .snapshot()
+            .snapshot(&scratch)
             .expect_err("an event that cannot be written fails the snapshot");
         assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
 
-        let snapshot = buf.snapshot().unwrap().expect("should have events");
+        let snapshot = buf.snapshot(&scratch).unwrap().expect("should have events");
         let content = std::fs::read_to_string(snapshot.path()).unwrap();
         assert_eq!(content.lines().count(), 3);
     }
@@ -2641,6 +2729,7 @@ mod hydrate {
 
     #[test]
     fn over_cap_plan_is_exceeds_caps_and_leaves_the_ledger_untouched() {
+        let scratch = TestScratch::new();
         for (plan, why) in [
             (
                 vec![
@@ -2686,7 +2775,7 @@ mod hydrate {
                 "{why}"
             );
             assert!(!buf.is_resident("prod/a"), "{why}");
-            assert!(buf.snapshot().unwrap().is_none(), "{why}");
+            assert!(buf.snapshot(&scratch).unwrap().is_none(), "{why}");
             assert!(!pressure.has_changed().unwrap(), "{why}");
             assert!(!released.has_changed().unwrap(), "{why}");
         }
@@ -2694,6 +2783,7 @@ mod hydrate {
 
     #[test]
     fn hydrated_batches_are_resident_readable_and_drain_like_any_other() {
+        let scratch = TestScratch::new();
         let buf = ledger_buffer(100, 1_000);
         let mut events = vec![serde_json::Map::new(); 2];
         events[0].insert("message".into(), "first".into());
@@ -2715,7 +2805,10 @@ mod hydrate {
         assert!(buf.is_resident("dev/svc_2_abcd"));
         assert!(!buf.is_resident("prod/svc_3_abcd"));
 
-        let snapshot = buf.snapshot().unwrap().expect("hydrated rows are readable");
+        let snapshot = buf
+            .snapshot(&scratch)
+            .unwrap()
+            .expect("hydrated rows are readable");
         let content = std::fs::read_to_string(snapshot.path()).unwrap();
         assert_eq!(content.lines().count(), 3);
         assert!(content.contains("first") && content.contains("second"));
@@ -2729,7 +2822,7 @@ mod hydrate {
         assert!(!buf.is_resident("prod/svc_1_abcd"));
         assert_eq!(buf.charged(), Charge::ZERO);
         assert_eq!(buf.drained_batches(), 3);
-        assert!(buf.snapshot().unwrap().is_none());
+        assert!(buf.snapshot(&scratch).unwrap().is_none());
     }
 
     #[test]
@@ -2852,6 +2945,7 @@ mod duplicate_identity {
 
     #[test]
     fn a_duplicate_insert_keeps_the_resident_and_is_counted_and_logged() {
+        let scratch = TestScratch::new();
         let recorder = crate::metrics::prometheus_builder().build_recorder();
         let handle = recorder.handle();
         let capture = Capture::default();
@@ -2886,7 +2980,7 @@ mod duplicate_identity {
                 );
                 assert!(released.has_changed().unwrap());
                 assert_eq!(buf.inserted_batches(), 1, "a duplicate is not an insert");
-                let snapshot = buf.snapshot().unwrap().unwrap();
+                let snapshot = buf.snapshot(&scratch).unwrap().unwrap();
                 let content = std::fs::read_to_string(snapshot.path()).unwrap();
                 assert!(content.contains("kept_one") && content.contains("kept_two"));
                 assert!(!content.contains("lost_"), "{content}");
@@ -2913,6 +3007,7 @@ mod duplicate_identity {
 
     #[test]
     fn a_duplicate_id_within_a_hydration_plan_keeps_the_first() {
+        let scratch = TestScratch::new();
         let recorder = crate::metrics::prometheus_builder().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
@@ -2937,7 +3032,8 @@ mod duplicate_identity {
             assert_eq!(total, charge(2, 11), "the duplicate is not charged");
             assert_eq!(buf.charged(), total);
             assert_eq!(buf.batch_count(), 2);
-            let content = std::fs::read_to_string(buf.snapshot().unwrap().unwrap().path()).unwrap();
+            let content =
+                std::fs::read_to_string(buf.snapshot(&scratch).unwrap().unwrap().path()).unwrap();
             assert!(content.contains("kept") && !content.contains("lost_"));
             assert_eq!(duplicates(&handle), 1);
         });

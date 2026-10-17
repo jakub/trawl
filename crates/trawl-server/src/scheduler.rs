@@ -709,7 +709,9 @@ fn write_result_parquet(
         return zstd_fallback(result);
     }
 
-    let executor = match trawl_engine::executor::Executor::new() {
+    // A clone of the query database, so the write spills into the query
+    // scratch directory under the query budgets (ADR-0056).
+    let executor = match pool.detached_executor() {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
@@ -1026,9 +1028,13 @@ mod tests {
         }
 
         let data = tempfile::tempdir().unwrap();
-        let executors =
-            crate::pool::ExecutorPool::new(data.path().to_str().unwrap().into(), 1, 100_000, None)
-                .unwrap();
+        let executors = crate::pool::ExecutorPool::for_test(
+            data.path().to_str().unwrap().into(),
+            1,
+            100_000,
+            None,
+        )
+        .unwrap();
         let (store, _, succeeded) = super::pg_tests::seed_run(&pool, "timed_ok").await;
         let (_, _, failed) = super::pg_tests::seed_run(&pool, "timed_failure").await;
 

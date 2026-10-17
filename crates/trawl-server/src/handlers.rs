@@ -3057,8 +3057,11 @@ pub async fn get_report_run(
         }
 
         let path = file.absolute_path.clone();
+        // A clone of the query database, so the read spills into the query
+        // scratch directory under the query budgets (ADR-0056).
+        let pool = state.query.pool.clone();
         match tokio::task::spawn_blocking(move || {
-            let executor = trawl_engine::executor::Executor::new()?;
+            let executor = pool.detached_executor()?;
             executor.read_parquet_to_result(&path, max_rows)
         })
         .await

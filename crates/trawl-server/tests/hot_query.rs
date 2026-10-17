@@ -53,7 +53,7 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         max_bytes: 10_000_000,
     }));
 
-    let pool = ExecutorPool::new(
+    let pool = ExecutorPool::for_test(
         data_dir.to_str().unwrap().to_owned(),
         1,    // single executor for test
         1000, // max result rows
@@ -172,7 +172,7 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         max_bytes: 10_000_000,
     }));
 
-    let pool = ExecutorPool::new(
+    let pool = ExecutorPool::for_test(
         data_dir.to_str().unwrap().to_owned(),
         1,
         1000,
@@ -278,7 +278,7 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
         })
         .with_field_catalog(Arc::clone(&catalog)),
     );
-    let exec_pool = ExecutorPool::new(
+    let exec_pool = ExecutorPool::for_test(
         data_dir.to_str().unwrap().to_owned(),
         1,
         1000,
@@ -444,8 +444,9 @@ async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgP
     );
 
     // The hot snapshot carries the folded key and no unfolded spelling.
+    let scratch = trawl_server::hot_buffer::TestScratch::new();
     let snap = hot_buffer
-        .snapshot()
+        .snapshot(&scratch)
         .unwrap()
         .expect("event must be in the hot buffer");
     let content = std::fs::read_to_string(snap.path()).unwrap();
@@ -495,7 +496,8 @@ async fn query_works_without_hot_buffer() {
     std::fs::create_dir_all(&data_dir).unwrap();
 
     // Pool without hot buffer.
-    let pool = ExecutorPool::new(data_dir.to_str().unwrap().to_owned(), 1, 1000, None).unwrap();
+    let pool =
+        ExecutorPool::for_test(data_dir.to_str().unwrap().to_owned(), 1, 1000, None).unwrap();
 
     // Write WAL and compact directly (no bus, no hot buffer).
     let events = vec![make_event("nginx", "standalone event")];
@@ -553,7 +555,8 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    let pool = ExecutorPool::new(data_dir.to_str().unwrap().to_owned(), 1, 1000, None).unwrap();
+    let pool =
+        ExecutorPool::for_test(data_dir.to_str().unwrap().to_owned(), 1, 1000, None).unwrap();
 
     // One nginx event, timestamped now so it lands in the current hour
     // partition and inside a `last=6h` window.
@@ -652,7 +655,7 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         })
         .with_field_catalog(Arc::clone(&catalog)),
     );
-    let pool = ExecutorPool::new(
+    let pool = ExecutorPool::for_test(
         data_dir.to_str().unwrap().to_owned(),
         1,
         1000,
@@ -810,7 +813,7 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         })
         .with_field_catalog(Arc::clone(&catalog)),
     );
-    let pool = ExecutorPool::new(
+    let pool = ExecutorPool::for_test(
         data_dir.to_str().unwrap().to_owned(),
         1,
         1000,

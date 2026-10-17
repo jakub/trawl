@@ -281,7 +281,7 @@ async fn scheduler_harness() -> SchedulerHarness {
     std::fs::create_dir_all(&data_dir).expect("create the data root");
 
     SchedulerHarness {
-        pool: ExecutorPool::new(
+        pool: ExecutorPool::for_test(
             data_dir.to_str().expect("utf-8 data dir").to_owned(),
             2,
             100_000,

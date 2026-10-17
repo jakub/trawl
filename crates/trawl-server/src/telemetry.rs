@@ -4194,9 +4194,15 @@ mod tests {
         );
     }
 
-    /// Events of `event_type` in the hot buffer's current snapshot.
-    fn hot_events_of(hot: &crate::hot_buffer::HotBuffer, event_type: &str) -> usize {
-        let Some(snapshot) = hot.snapshot().unwrap() else {
+    /// Events of `event_type` in the hot buffer's current snapshot, made
+    /// in `scratch`. The buffer caches its snapshot, so one test passes the
+    /// same scratch to every call.
+    fn hot_events_of(
+        hot: &crate::hot_buffer::HotBuffer,
+        scratch: &trawl_engine::scratch::QueryScratch,
+        event_type: &str,
+    ) -> usize {
+        let Some(snapshot) = hot.snapshot(scratch).unwrap() else {
             return 0;
         };
         std::fs::read_to_string(snapshot.path())
@@ -4247,6 +4253,7 @@ mod tests {
         let handle = WalHandle::new();
         handle.set(Arc::clone(&writer), "prod");
         let hot = admission_hot(10_000, 10 * 1024 * 1024);
+        let scratch = crate::hot_buffer::TestScratch::new();
         let layer = WalLayer::new(handle, "prod");
         layer.set_hot_buffer(Arc::clone(&hot));
         let layer_ref = layer.clone();
@@ -4299,8 +4306,8 @@ mod tests {
             (1, 1),
             "the unit lands in exactly one WAL file, once"
         );
-        assert_eq!(hot_events_of(&hot, "refused_unit"), 1);
-        assert_eq!(hot_events_of(&hot, "refusal_burst"), 500);
+        assert_eq!(hot_events_of(&hot, &scratch, "refused_unit"), 1);
+        assert_eq!(hot_events_of(&hot, &scratch, "refusal_burst"), 500);
         let events = read_wal_events(&env_dir);
         assert_eq!(
             events[0]["event_type"], "refused_unit",
@@ -4332,6 +4339,7 @@ mod tests {
         let handle = WalHandle::new();
         handle.set(Arc::clone(&writer), "prod");
         let hot = admission_hot(1600, 1_600_000);
+        let scratch = crate::hot_buffer::TestScratch::new();
         let layer = WalLayer::new(handle, "prod");
         layer.set_hot_buffer(Arc::clone(&hot));
         let layer_ref = layer.clone();
@@ -4359,7 +4367,7 @@ mod tests {
         layer_ref.flush_cycle().await;
 
         assert!(layer_ref.inner.pending.lock().is_empty());
-        assert_eq!(hot_events_of(&hot, "reserve_floor"), 1);
+        assert_eq!(hot_events_of(&hot, &scratch, "reserve_floor"), 1);
         assert_eq!(
             wal_files_holding(&writer.dir().join("prod"), "reserve_floor"),
             (1, 1)
@@ -4444,6 +4452,7 @@ mod tests {
         let handle = WalHandle::new();
         handle.set(Arc::clone(&writer), "prod");
         let hot = admission_hot(1000, 6000);
+        let scratch = crate::hot_buffer::TestScratch::new();
         let layer = WalLayer::new(handle, "prod");
         layer.set_hot_buffer(Arc::clone(&hot));
         let layer_ref = layer.clone();
@@ -4471,8 +4480,8 @@ mod tests {
             layer_ref.inner.pending.lock().is_empty(),
             "the queue is not wedged"
         );
-        assert_eq!(hot_events_of(&hot, "around"), 2);
-        assert_eq!(hot_events_of(&hot, "oversized"), 0);
+        assert_eq!(hot_events_of(&hot, &scratch, "around"), 2);
+        assert_eq!(hot_events_of(&hot, &scratch, "oversized"), 0);
         // The dropped event left the staged accounting with its unit.
         assert_eq!(layer_ref.inner.staged.events.load(Ordering::Relaxed), 0);
         assert_eq!(layer_ref.inner.staged.bytes.load(Ordering::Relaxed), 0);

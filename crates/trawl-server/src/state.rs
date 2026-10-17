@@ -589,6 +589,16 @@ pub fn open_query_scratch(
     Ok(scratch)
 }
 
+/// The query database's budgets from `[server]` (ADR-0056).
+#[must_use]
+pub fn query_budgets(server: &crate::config::ServerConfig) -> trawl_engine::executor::QueryBudgets {
+    trawl_engine::executor::QueryBudgets {
+        spill_max_bytes: server.query_spill_max_bytes,
+        memory_limit: server.query_memory_limit,
+        threads: server.query_threads,
+    }
+}
+
 /// Build [`AuthState`]: connect the fleet keystore (eagerly) and wrap it as
 /// a bearer-only [`fleet_auth::BearerState`].
 async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::ServerError> {
@@ -744,12 +754,16 @@ impl AppState {
         crate::metrics::init_retention_metrics(config.retention.min_free_disk_bytes);
 
         // A query engine that cannot start, as when its spill directory is
-        // refused (ADR-0052), fails the start with the engine's own message.
+        // refused (ADR-0052) or a budget does not apply (ADR-0056), fails
+        // the start with the engine's own message.
+        let scratch = Arc::new(scratch);
         let pool = ExecutorPool::new(
             config.data.base_dir().to_string_lossy().into_owned(),
             config.server.max_concurrent_queries,
             config.server.max_result_rows,
             hot_buffer.clone(),
+            Arc::clone(&scratch),
+            &query_budgets(&config.server),
         )
         .map_err(|e| {
             crate::error::ServerError::ServiceUnavailable(format!(
@@ -779,7 +793,7 @@ impl AppState {
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
                 dashboard_sse_semaphore: Arc::new(Semaphore::new(MAX_DASHBOARD_STREAMS)),
                 query_log: None,
-                scratch: Arc::new(scratch),
+                scratch,
             },
             auth,
             storage,
