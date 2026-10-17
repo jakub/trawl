@@ -35,6 +35,8 @@ A no-files read, after source evidence established that cold data exists, return
 
 The pool bounds concurrent physical DuckDB work. Request lifetime and worker lifetime differ, because DuckDB binding can continue after an interrupt or a timeout. A timed-out request therefore keeps its permit and its publication guard while the work runs. The running-query listing exposes it, and a repin cutover waits for real exclusion rather than for HTTP responses to finish.
 
+Every query, export, and field sample runs on one query database with a spill cap, a memory limit, and a thread count, and spills into the query scratch directory. A query that goes over a budget fails with 503 `query_resource_exhausted`, and nothing else is affected. The health check does not take a permit: it reads the latest engine sample, which a separate thread takes every 10 seconds, so a full pool never fails health. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets) and [the engine sample](/operate/health/#the-engine-sample).
+
 ## Rust tail and display
 
 `extract kv` splits execution into SQL plus a Rust tail. The tail evaluates the later stages and receives the pin scope at the split, so it does more than formatting. Display offsets apply after it, which keeps evaluation on UTC instants. Severity columns render as tokens in human-readable views and as numbers in machine formats. See [severity syntax](/reference/dsl/#severity-_severity).

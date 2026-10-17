@@ -166,6 +166,13 @@ restart, or finishing an interrupted storage rollup, so an empty table would be
 wrong. Live mode reads only the event stream, which this refusal does not
 touch. See [reads while the corpus is unsettled](/architecture/data-flow/#reads-while-the-corpus-is-unsettled).
 
+When the server answers 503 `query_resource_exhausted`, the page shows the
+server's sentence as a notice with no syntax underline, because the text is
+fine. It does not retry on its own and offers no **Retry**, because the same
+request spends the same budget again, and it does not claim the result is
+empty. Narrow the time range or simplify the query. See
+[query resource exhausted](/reference/api/#query-resource-exhausted).
+
 For every other failure, **Events** shows `Couldn't load results:` with the
 server's message or status, and a **Retry** button. **Visualization** shows
 **Snapshot query failed. Open Events for the error.** with **Retry
@@ -370,7 +377,7 @@ stream; those buttons do not trigger a storage scan or open another stream.
 
 | Section | Permission | Contents |
 |---------|------------|----------|
-| Server health | any signed-in key | Overall state, version, and each named check |
+| Server health | any signed-in key | Overall state, version, and each named check. A `duckdb` check that reads `slow` shows as a warning, not a failure |
 | Capacity | `server_manage` | Uptime, queries since startup, active queries, executors available, and retained work |
 | Live operations | `server_manage` | Host, HTTP ingest rate, query rate, hot buffer events and memory, and executors occupied |
 | Ingestion | `server_manage` | HTTP rejected events, syslog configuration, transport receive counts, syslog rate, parse errors, backpressure drops, and active TCP connections |

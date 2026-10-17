@@ -83,13 +83,14 @@ Every error that trawld itself produces has this body:
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
 | `rate_limited` | 429 | The key's per-minute bucket is empty |
 | `too_many_streams` | 429 | `max_sse_connections` reached |
-| `execution_error` | 500 | DuckDB failed or the query was cancelled. Details are logged, never returned. |
+| `execution_error` | 500 | DuckDB failed for a reason other than its resource budgets, or the query was cancelled. Details are logged, never returned. |
 | `internal_error` | 500 | Anything else |
 | `timeout` | 504 | The query started but did not finish within `timeout_secs` |
 | `service_unavailable` | 503 | A dependency is down, the server is at capacity, or the node cannot serve the route |
 | `hot_buffer_full` | 503 | The hot buffer has no room for an ingest request. Sent with `Retry-After` |
 | `request_limit_reached` | 503 | trawld is at its `[server] max_concurrent_requests` limit, or a health or `/metrics` request is at the probe allowance (fixed at 3), or a query list or cancel request is at the control allowance (fixed at 4). The handler did not run and nothing was ingested. No `Retry-After`. Retry with backoff. See [the request limit](/reference/configuration/#the-request-limit) |
 | `corpus_recovering` | 503 | The server cannot yet count every stored event exactly once, so it refuses the read. No `Retry-After`. See [corpus recovering](#corpus-recovering) |
+| `query_resource_exhausted` | 503 | The query needed more spill or memory than the query database may use. No `Retry-After`. See [query resource exhausted](#query-resource-exhausted) |
 
 #### Corpus recovering
 
@@ -105,6 +106,23 @@ When both reasons hold, the response names `rollup_pending`. The reason is the `
 A body over the size limit is refused before a handler runs, with 413 and the envelope, code `request_too_large`. Three other refusals come from the HTTP framework before a handler runs, with an empty or plain-text body instead of the envelope: 415 when a JSON route receives no `Content-Type: application/json`, 400 when the body is not valid JSON, and 422 when the JSON does not match the request shape.
 
 Every response carries an `X-Request-Id` header holding a ULID. Quote it when reporting a problem.
+
+#### Query resource exhausted
+
+A query, export, or field sample answers 503 `query_resource_exhausted` when it needs more spill or memory than the query database may use: more than `[server] query_spill_max_bytes` of spill, or more than `[server] query_memory_limit` of memory. DuckDB reports both limits with one error type, so the response does not say which one ran out. The body is fixed:
+
+```json
+{
+  "error": {
+    "code": "query_resource_exhausted",
+    "message": "query could not complete with the available query resources; narrow the time range or simplify the query"
+  }
+}
+```
+
+The message names no path, size, or DuckDB text. The response carries no `Retry-After`. The status is 503, not 500, because nothing is broken, and not a 4xx, because every query shares the budgets: the same query can finish on an idle server and fail beside a heavy one. Narrow the time range, add a filter, or drop a wide `stats ... by` before you retry. The server keeps serving, and a small query on the same server succeeds.
+
+The `http_failure` event records `error_class=service_unavailable` and `cause_kind=duckdb_resource_exhausted`. A query that timed out first keeps its 504 `timeout`, even when DuckDB then fails with the same error. The rule covers planning, execution, row fetch, and export. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets) for the settings and [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query) for the operator steps.
 
 ### Rate limiting
 
@@ -150,7 +168,7 @@ trawld sends CORS headers only when `[server] cors_allowed_origins` is not empty
 
 Permission: none. The route is unauthenticated.
 
-Probes DuckDB, the Fleet keystore, the app-state store, and the data directory.
+Reports the query engine's latest sample, and probes the Fleet keystore, the app-state store, and the data directory. The `duckdb` check reads a sample that trawld takes on its own schedule, so a health request never waits for the engine and never takes an executor permit.
 
 **Request**
 
@@ -170,11 +188,21 @@ curl --fail-with-body "$TRAWL_URL/api/v1/health"
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | `ok` when every check passes. `degraded` when `auth_db`, `storage_db`, or `data_path` reads `error`, `ingest_capacity` reads `refusing`, or `corpus` reads anything but `ok`. `unavailable` when `duckdb` fails. |
-| `checks` | object | Exactly six keys. `duckdb`, `auth_db`, `storage_db`, and `data_path` are each `ok` or `error`. `ingest_capacity` is `ok` or `refusing`. `corpus` is `ok`, `rollup_pending`, or `restart_backlog`. No diagnostics or paths. |
+| `status` | string | `ok` when every check passes. `degraded` when `duckdb` reads `slow`, `auth_db`, `storage_db`, or `data_path` reads `error`, `ingest_capacity` reads `refusing`, or `corpus` reads anything but `ok`. `unavailable` when `duckdb` reads `error`. |
+| `checks` | object | Exactly six keys. `duckdb` is `ok`, `slow`, or `error`. `auth_db`, `storage_db`, and `data_path` are each `ok` or `error`. `ingest_capacity` is `ok` or `refusing`. `corpus` is `ok`, `rollup_pending`, or `restart_backlog`. No diagnostics or paths. |
 | `version` | string | The trawld package version |
 
 `degraded` does not prove that authenticated requests can run. An `auth_db` failure turns every authenticated route into a 503.
+
+`duckdb` reads the latest engine sample. Every 10 seconds, a dedicated thread runs `SELECT 1` on a connection of its own to the query database, with a 250 ms budget. A sample that runs past the budget is interrupted, and no new sample starts until it returns.
+
+| `duckdb` | Meaning | `status` | HTTP |
+|----------|---------|----------|------|
+| `ok` | The latest sample succeeded within its budget | `ok` unless another check differs | 200 |
+| `slow` | The latest sample ran past its budget, and a sample succeeded in the last 60 seconds | `degraded` | 200 |
+| `error` | The latest sample returned a DuckDB error, no sample has succeeded in the last 60 seconds, or none has succeeded since boot | `unavailable` | 503 |
+
+A busy engine never turns the check to `error`. A full executor pool, permits held after a timeout, live streams, and exhausted query budgets do not change `duckdb` or `status`, because the sample uses no permit. Read saturation from `trawl_query_permits_in_use` and `trawl_query_pool_size` on [`/metrics`](#prometheus-metrics). The response adds no sample age or diagnostics; `trawl_engine_sample_age_seconds` reports the age.
 
 `ingest_capacity` reads `refusing` while the hot buffer refuses ingest for lack of space, and `ok` otherwise, including on a node with ingest disabled. Reads keep working while it refuses, so the response stays 200 and probes do not restart the server. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission).
 
@@ -251,6 +279,7 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 | 404 | `not_found` | A `from saved` stage names a saved query the key does not own, or one with no successful run |
 | 409 | `bad_request` | A `from saved` stage selects a run that has rows but no Parquet file. The message names the run route. |
 | 500 | `execution_error` | DuckDB failed or the query was cancelled |
+| 503 | `query_resource_exhausted` | The query went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the query started, or a cold file moved during the read. Retry. |
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
@@ -345,6 +374,7 @@ The body is the file. The headers name its type:
 | 400 | `result_too_large` | An `extract kv` pipeline read more than `max_export_rows` input rows |
 | 400 | none | `format` is not `csv`, `json`, or `parquet`. Plain-text body from the framework. |
 | 500 | `execution_error` | DuckDB failed |
+| 503 | `query_resource_exhausted` | The export went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the export started |
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
@@ -947,6 +977,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" \
 |--------|------|------|
 | 400 | `bad_request` | `service` contains a character outside the allowed set |
 | 500 | `execution_error` | DuckDB failed |
+| 503 | `query_resource_exhausted` | The sample went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the sample started |
 | 503 | `corpus_recovering` | The corpus is unsettled and the values are not cached. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the sample started |
@@ -2178,7 +2209,7 @@ read them.
 
 | Series | Type | Measurement |
 | --- | --- | --- |
-| `trawl_disk_total_bytes{role}` | gauge | Total bytes of each filesystem trawld writes to. `role` is `data`, `wal`, or `spill` |
+| `trawl_disk_total_bytes{role}` | gauge | Total bytes of each filesystem trawld writes to. `role` is `data`, `wal`, or `spill`. `spill` is the filesystem of `[server] query_scratch_dir` |
 | `trawl_disk_available_bytes{role}` | gauge | Bytes available to trawld on each filesystem it writes to. `role` is `data`, `wal`, or `spill` |
 | `trawl_retention_min_free_disk_bytes` | gauge | The deletion floor, `min_free_disk_bytes`, set at startup. `0` means pressure deletion is off |
 | `trawl_retention_deletions_total{trigger}` | counter | Date directories that retention removed with a successful delete. `trigger` is `age` or `disk_pressure`. Both series start at zero |
@@ -2213,6 +2244,19 @@ interval but none of the hot-buffer gauges.
 | `trawl_compaction_interval_seconds` | gauge | `[ingest] compaction_interval_secs` |
 | `trawl_syslog_events_dropped_total{reason}` | counter | Syslog events dropped before a WAL write. `backpressure` means the batcher was holding a group that hot-buffer admission refused. `queue_full` means the listener queue was full while the batcher was not blocked, or the batcher was gone |
 | `trawl_hot_buffer_duplicate_batches_total` | counter | Batches dropped because a batch with the same identity was already resident. The resident batch stays. Any increment is a writer bug. Starts at zero |
+
+#### Query engine metrics
+
+These series show the executor pool and the engine sample behind the `duckdb` health check. They carry no label and no principal-derived value. Saturation is visible here and never changes health.
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_query_permits_in_use` | gauge | Executor permits held now, by running queries, exports, field samples, and retained work |
+| `trawl_query_pool_size` | gauge | The executor pool size, `[server] max_concurrent_queries` |
+| `trawl_query_permits_retained` | gauge | Permits held by physical work whose request has already ended. A subset of `trawl_query_permits_in_use` |
+| `trawl_engine_sample_age_seconds` | gauge | Seconds since the latest engine sample finished. It resets every 10 seconds while sampling runs, and it keeps growing while a probe is wedged |
+
+`trawl_query_permits_in_use` at `trawl_query_pool_size` means searches queue, not that the engine is down. Alarm on the sample age instead, or on `checks.duckdb` reading `error`. See [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query).
 
 #### Restart visibility metrics
 

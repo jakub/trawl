@@ -64,6 +64,16 @@ directory closest to its environment's age limit, measures again, and repeats
 until free space is above the threshold. To keep young data, add space rather
 than a longer age limit.
 
+Pressure deletion compares real available bytes. Scratch counts as ordinary
+use of the data filesystem, the same as compaction spill, so trawld does not
+add it back to free space. A large query that spills hundreds of megabytes
+into the scratch directory can push free space below the floor and start
+deletion earlier than the data alone would. Spill is bounded by
+`[server] query_spill_max_bytes` (default `512M`), and its files go away when
+the query ends. Leave room for it when you size the volume and choose
+`min_free_disk_bytes`. See
+[query scratch and budgets](/reference/configuration/#query-scratch-and-budgets).
+
 If free space stays below the threshold:
 
 1. Read `trawl_retention_suppressed` on `/metrics`. A value of 1 means a repin
@@ -92,11 +102,13 @@ trawld measures the filesystem under each of three roles:
   filesystem.
 - `wal`: the live WAL directory, `ingest.wal_dir`. The role exists only when
   ingest is enabled.
-- `spill`: the query engine's temporary files, in a private directory
-  trawld makes in `TMPDIR` or `/tmp`.
+- `spill`: the query scratch directory, `[server] query_scratch_dir`. It holds
+  the query engine's spill, the hot-buffer query snapshots, and export staging
+  files. By default it is a sibling of the data root, so it shares the `data`
+  row.
 
 Roles on the same device share one row, and the row lists each role it holds.
-A `wal_dir` or temporary directory on a different device gets its own row.
+A `wal_dir` or scratch directory on a different device gets its own row.
 trawld never adds available bytes across devices, because two directories on
 one device draw on the same free space.
 

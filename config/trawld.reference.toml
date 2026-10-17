@@ -21,7 +21,10 @@
 # It must not be the data root, the WAL directory or a repin staging root
 # (<data.path>.repin-next, <data.path>.repin-aside), nor inside or above
 # any of them. A query-only node with a read-only data root sets it to a
-# writable directory.
+# writable directory. trawld makes the directory 0700 and holds an exclusive
+# lock on it, so a second trawld on the same directory refuses to start. At
+# boot it removes the spill directories, snapshots and export files an
+# earlier trawld left behind; any other entry refuses the start.
 # query_scratch_dir = "/var/lib/trawl/data.query-scratch"
 
 # Budgets of the query database, shared by every query, export and field
