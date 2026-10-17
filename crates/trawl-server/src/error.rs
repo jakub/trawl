@@ -524,9 +524,13 @@ impl ServerError {
     /// unable to say what was refused.
     pub fn safe_message(&self) -> String {
         match self {
-            Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
-                "query execution failed".to_owned()
-            }
+            // An exhausted query budget answers as a database failure until
+            // its own 503 contract lands (ADR-0056).
+            Self::Engine(
+                EngineError::Database(_)
+                | EngineError::ResourceExhausted
+                | EngineError::BudgetNotApplied { .. },
+            ) => "query execution failed".to_owned(),
             Self::Store(StoreError::Unavailable(_) | StoreError::Migration(_)) => {
                 "app-state store unavailable".to_owned()
             }
@@ -575,9 +579,13 @@ impl ServerError {
             Self::Engine(EngineError::Refused { .. }) => "refused",
             // A budget refusal ends the query database's open at startup,
             // so no request carries it; it reads as the engine it came from.
-            Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
-                "database"
-            }
+            // An exhausted budget reads the same until its own 503 contract
+            // lands (ADR-0056).
+            Self::Engine(
+                EngineError::Database(_)
+                | EngineError::ResourceExhausted
+                | EngineError::BudgetNotApplied { .. },
+            ) => "database",
             Self::Engine(EngineError::ResultTooLarge(_)) => "result_too_large",
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
             Self::Engine(EngineError::Cancelled) => "cancelled",
@@ -625,6 +633,9 @@ impl ServerError {
     pub fn cause_kind(&self) -> CauseKind {
         match self {
             Self::Engine(EngineError::Database(e)) => CauseKind::of_duckdb(e),
+            // `DuckDB` raised it, as a `DuckDBFailure`; its own kind lands
+            // with its 503 contract (ADR-0056).
+            Self::Engine(EngineError::ResourceExhausted) => CauseKind::DuckdbFailure,
             Self::Engine(EngineError::Io(e)) | Self::HotSnapshot(e) => CauseKind::of_io(e),
             Self::Store(StoreError::Unavailable(e)) => CauseKind::of_sqlx(e),
             Self::Store(StoreError::Migration(e)) => CauseKind::of_store_schema(e),
@@ -837,8 +848,12 @@ impl IntoResponse for ServerError {
             // the latch does not earn the caller a different status than the
             // interrupt it backs up. `error_class` still tells the two apart
             // for telemetry.
+            //
+            // An exhausted query budget answers here too until its own 503
+            // contract lands (ADR-0056).
             Self::Engine(
                 EngineError::Database(_)
+                | EngineError::ResourceExhausted
                 | EngineError::BudgetNotApplied { .. }
                 | EngineError::Io(_)
                 | EngineError::Cancelled,

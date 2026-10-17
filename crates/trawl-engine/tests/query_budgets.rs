@@ -3,13 +3,15 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The query database's budgets against the bundled `DuckDB` (ADR-0056):
-//! they read back from a clone, and a spill past the cap fails without the
-//! spill directory ever holding more than the cap plus one block.
+//! they read back from a clone, and a spill past the cap fails as
+//! [`EngineError::ResourceExhausted`] without the spill directory ever
+//! holding more than the cap plus one block of each temp-file size class.
 
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, QueryBudgets};
 use trawl_engine::scratch::{QueryScratch, is_spill_dir_name};
 
@@ -17,6 +19,17 @@ const MIB: u64 = 1024 * 1024;
 
 /// `DuckDB` 1.5.5's spill block size (`DEFAULT_BLOCK_ALLOC_SIZE`).
 const BLOCK: u64 = 262_144;
+
+/// What the spill directory may hold past the cap on `DuckDB` 1.5.5: one
+/// block of each temp-file size class, 32 KiB to 256 KiB in 32 KiB steps.
+///
+/// `DuckDB` accounts a temp file as its highest block index in use, but
+/// truncates a shrinking file one block past that
+/// (`TemporaryFileManager::RemoveTempBlockIndex`), and keeps one file per
+/// size class until a class passes 4000 blocks, about 1000 MiB. So each
+/// class's file can hold one block it does not count. The spill probe
+/// measured up to 1.9 blocks past the cap.
+const CLASS_SLACK: u64 = 1_179_648;
 
 fn budgets(spill: u64, memory: u64, threads: u32) -> QueryBudgets {
     QueryBudgets {
@@ -76,11 +89,17 @@ fn query_budgets_read_back_from_a_clone() {
         );
         assert_eq!(exec.current_setting("memory_limit").unwrap(), "96.0 MiB");
         assert_eq!(exec.current_setting("threads").unwrap(), "3");
+        assert_eq!(exec.current_setting("errors_as_json").unwrap(), "true");
     }
     assert_eq!(
         diagnostic.current_setting("memory_limit").unwrap(),
         "96.0 MiB",
         "the diagnostic connection shares the database's budgets"
+    );
+    assert_eq!(
+        diagnostic.current_setting("errors_as_json").unwrap(),
+        "true",
+        "the diagnostic connection reports structured errors"
     );
     diagnostic
         .select_one()
@@ -186,10 +205,12 @@ fn stopped_or_gone(pid: u32) -> bool {
 }
 
 /// The child half of [`spill_under`]: run `TRAWL_SPILL_PROBE` in this
-/// process and print its outcome. Ignored, and a no-op without the
-/// variable, so only the parent runs it.
+/// process and print its outcome: `ok <rows>`, or `err <class> <message>`
+/// with the class [`EngineError`] gives the failure and `DuckDB`'s own
+/// message. Ignored, and a no-op without the variable, so only the parent
+/// runs it.
 #[test]
-#[ignore = "child process of the spill probe"]
+#[ignore = "child process of the spill tests"]
 fn spill_probe_child() {
     let Ok(spec) = std::env::var("TRAWL_SPILL_PROBE") else {
         return;
@@ -208,11 +229,20 @@ fn spill_probe_child() {
         &budgets(spill, memory, threads),
     )
     .expect("open");
-    let outcome = exec.count_rows_for_test(&sql);
-    println!(
-        "PROBE-OUTCOME {}",
-        outcome.map_or_else(|e| format!("err {e}"), |n| format!("ok {n}"))
-    );
+    let outcome = match exec.raw_count_rows_for_test(&sql) {
+        Ok(rows) => format!("ok {rows}"),
+        Err(error) => {
+            // One line: the parent reads the outcome line by line.
+            let message = error.to_string().replace('\n', " ");
+            let class = match EngineError::from(error) {
+                EngineError::ResourceExhausted => "resource_exhausted",
+                EngineError::Database(_) => "database",
+                _ => "other",
+            };
+            format!("err {class} {message}")
+        }
+    };
+    println!("PROBE-OUTCOME {outcome}");
 }
 
 /// Run `sql` on a fresh query database under `budgets` in a child process
@@ -275,9 +305,7 @@ fn spill_under(sql: &str, budgets: &QueryBudgets) -> (String, Peak) {
         .lines()
         .find_map(|line| line.strip_prefix("PROBE-OUTCOME "))
         .unwrap_or("no outcome")
-        .chars()
-        .take(140)
-        .collect();
+        .to_owned();
     (outcome, peak)
 }
 
@@ -303,8 +331,12 @@ fn distinct_count(source: &Path) -> String {
 /// The spill probe (ADR-0056, AC4): the natural spill peak of each shape
 /// under a cap it never reaches, then caps swept below that peak, where
 /// the merge phase frees and rewrites blocks before the cap is hit.
-/// Ignored: a measurement, run by hand with `--ignored --nocapture`; its
-/// numbers live in the probe notes.
+///
+/// Ignored: a measurement of the worst overshoot past the cap across both
+/// shapes and two memory limits, kept for re-measuring
+/// [`CLASS_SLACK`] when `DuckDB` is upgraded. Run it by hand with
+/// `--run-ignored only --no-capture`. The bound itself is asserted by
+/// [`spill_stays_within_budget_plus_class_slack`].
 #[test]
 #[ignore = "measurement, run by hand"]
 fn spill_budget_probe() {
@@ -322,6 +354,7 @@ fn spill_budget_probe() {
                 continue;
             }
             let (outcome, natural) = spill_under(&sql, &budgets(4096 * MIB, memory, 2));
+            let outcome: String = outcome.chars().take(160).collect();
             eprintln!(
                 "shape={shape} memory={}MiB uncapped peak_len={} samples={} {outcome}",
                 memory / MIB,
@@ -335,6 +368,7 @@ fn spill_budget_probe() {
             for percent in (20..=100).step_by(4) {
                 let spill = (natural.length * percent / 100).max(BLOCK);
                 let (outcome, peak) = spill_under(&sql, &budgets(spill, memory, 2));
+                let outcome: String = outcome.chars().take(160).collect();
                 let over = i128::from(peak.length.max(peak.allocated)) - i128::from(spill);
                 worst = worst.max(over);
                 eprintln!(
@@ -349,4 +383,98 @@ fn spill_budget_probe() {
             );
         }
     }
+}
+
+/// `DuckDB`'s accounted spill usage and cap from a spill-cap failure's
+/// message, `... (<used>/<cap> used)`, in bytes, with the cap's unit.
+/// Both are `format_bytes` text cut to one decimal, so each is up to a
+/// tenth of its unit low.
+fn accounted_usage(message: &str) -> Option<(u64, u64, u64)> {
+    fn bytes(text: &str) -> Option<(u64, u64)> {
+        let (number, unit) = text.trim().split_once(' ')?;
+        let unit = match unit {
+            "bytes" => 1,
+            "KiB" => 1024,
+            "MiB" => MIB,
+            "GiB" => 1024 * MIB,
+            _ => return None,
+        };
+        let (whole, tenths) = number.split_once('.').unwrap_or((number, "0"));
+        let tenths: u64 = whole.parse::<u64>().ok()? * 10 + tenths.parse::<u64>().ok()?;
+        Some((tenths * unit / 10, unit))
+    }
+    let inner = message.split_once(" (")?.1.split_once(" used)")?.0;
+    let (used, cap) = inner.split_once('/')?;
+    let ((used, _), (cap, unit)) = (bytes(used)?, bytes(cap)?);
+    Some((used, cap, unit))
+}
+
+/// AC4's engine half (ADR-0056): a query that spills past the cap fails as
+/// [`EngineError::ResourceExhausted`], the usage `DuckDB` accounts never
+/// passes the cap, and the spill directory never holds more than the cap
+/// plus [`CLASS_SLACK`].
+///
+/// The shape is a full sort over a million poorly compressible strings at
+/// 128 MiB of memory and two threads, so it spills about 240 MiB with no
+/// cap. The caps sweep from 40% to 96% of that natural peak: below about
+/// half the sort fails while its runs are still growing, and above it
+/// the merge frees and rewrites blocks, which is where the slack appears
+/// (the probe's worst cases sat at 52%, 68% and 76%).
+///
+/// The directory is sampled with the query's process stopped
+/// ([`spill_under`]): one `read_dir` pass over files that other threads
+/// are growing and truncating is not one state of the directory, and its
+/// sum can count a block twice. A stopped process gives a consistent sum,
+/// so the assertion cannot fail on a sampling artefact. Sampling can miss
+/// a peak between two samples, which weakens the check but never makes it
+/// fail falsely.
+#[test]
+fn spill_stays_within_budget_plus_class_slack() {
+    let data = tempfile::tempdir().expect("data");
+    let source = random_strings_parquet(data.path(), 1_000_000);
+    let sql = window_sort(&source);
+    let memory = 128 * MIB;
+
+    let (outcome, natural) = spill_under(&sql, &budgets(4096 * MIB, memory, 2));
+    assert_eq!(outcome, "ok 1", "the uncapped sort completes");
+    assert!(
+        natural.length > 64 * MIB,
+        "the uncapped sort must spill well past the smallest cap: {natural:?}"
+    );
+
+    let mut worst = i128::MIN;
+    for percent in (40..=96).step_by(4) {
+        let cap = natural.length * percent / 100;
+        let (outcome, peak) = spill_under(&sql, &budgets(cap, memory, 2));
+        let message = outcome
+            .strip_prefix("err resource_exhausted ")
+            .unwrap_or_else(|| panic!("cap {cap} ({percent}%): {outcome}"));
+        assert!(
+            message.contains("failed to offload data block")
+                && message.contains("max_temp_directory_size"),
+            "cap {cap} ({percent}%): the spill cap, not memory, stopped the sort: {message}"
+        );
+        let (used, accounted_cap, unit) = accounted_usage(message)
+            .unwrap_or_else(|| panic!("cap {cap} ({percent}%): no accounted usage in {message}"));
+        assert!(
+            accounted_cap <= cap && cap - accounted_cap < unit / 10,
+            "cap {cap} ({percent}%): DuckDB reports a cap of {accounted_cap}"
+        );
+        assert!(
+            used <= accounted_cap,
+            "cap {cap} ({percent}%): DuckDB accounted {used} past its cap {accounted_cap}"
+        );
+        let held = peak.length.max(peak.allocated);
+        assert!(
+            held <= cap + CLASS_SLACK,
+            "cap {cap} ({percent}%): the spill directory held {held} bytes, {} past the cap \
+             ({peak:?})",
+            held - cap
+        );
+        worst = worst.max(i128::from(held) - i128::from(cap));
+    }
+    eprintln!(
+        "natural spill {} bytes; worst overshoot past the cap {worst} bytes (block {BLOCK})",
+        natural.length,
+    );
 }

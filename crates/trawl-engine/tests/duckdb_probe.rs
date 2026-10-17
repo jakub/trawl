@@ -712,6 +712,9 @@ fn count(conn: &duckdb::Connection, sql: &str) -> Result<i64, duckdb::Error> {
 #[test]
 fn pin_blind_int_comparison_on_varchar_column_errors() {
     let conn = varchar_status_conn();
+    // The class is read from the structured diagnostic, as on every
+    // executor connection.
+    conn.execute_batch("SET errors_as_json = true").unwrap();
     let eq: Result<i64, _> = conn.query_row(
         "SELECT count(*)::BIGINT FROM t WHERE v = ?",
         [200i64],
@@ -731,6 +734,7 @@ fn pin_blind_int_comparison_on_varchar_column_errors() {
     let err = in_list.expect_err("Int param IN over 'accepted' must throw");
     assert!(trawl_engine::executor::is_conversion_error(&err), "{err}");
 
+    conn.execute_batch("SET errors_as_json = false").unwrap();
     let ordered: Result<i64, _> = conn.query_row(
         "SELECT count(*)::BIGINT FROM t WHERE v >= ?",
         [400i64],
