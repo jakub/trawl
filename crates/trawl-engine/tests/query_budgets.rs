@@ -386,11 +386,11 @@ fn spill_budget_probe() {
 }
 
 /// `DuckDB`'s accounted spill usage and cap from a spill-cap failure's
-/// message, `... (<used>/<cap> used)`, in bytes, with the cap's unit.
-/// Both are `format_bytes` text cut to one decimal, so each is up to a
-/// tenth of its unit low.
-fn accounted_usage(message: &str) -> Option<(u64, u64, u64)> {
-    fn bytes(text: &str) -> Option<(u64, u64)> {
+/// message, `... (<used>/<cap> used)`: both in bytes, as far as the text
+/// shows them, and the cap's text as written. See [`duckdb_format_bytes`]
+/// for what the text loses.
+fn accounted_usage(message: &str) -> Option<(u64, u64, &str)> {
+    fn bytes(text: &str) -> Option<u64> {
         let (number, unit) = text.trim().split_once(' ')?;
         let unit = match unit {
             "bytes" => 1,
@@ -401,13 +401,59 @@ fn accounted_usage(message: &str) -> Option<(u64, u64, u64)> {
         };
         let (whole, tenths) = number.split_once('.').unwrap_or((number, "0"));
         let tenths: u64 = whole.parse::<u64>().ok()? * 10 + tenths.parse::<u64>().ok()?;
-        Some((tenths * unit / 10, unit))
+        Some(tenths * unit / 10)
     }
     let inner = message.split_once(" (")?.1.split_once(" used)")?.0;
     let (used, cap) = inner.split_once('/')?;
-    let ((used, _), (cap, unit)) = (bytes(used)?, bytes(cap)?);
-    Some((used, cap, unit))
+    Some((bytes(used)?, bytes(cap)?, cap.trim()))
 }
+
+/// `DuckDB` 1.5.5's `StringUtil::BytesToHumanReadableString` for the units
+/// the spill cap reaches. It names the largest unit that is at least one,
+/// then writes one decimal from the next unit down, itself cut to whole
+/// units: 202060595 bytes is 192 MiB and 716 KiB, so `192.6 MiB`, not
+/// `192.7 MiB`. No tolerance covers that exactly, so the test compares the
+/// text `DuckDB` printed with this rendering of the configured cap.
+fn duckdb_format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["bytes", "KiB", "MiB", "GiB"];
+    let mut parts = [0u64; 4];
+    let mut rest = bytes;
+    for part in &mut parts[..3] {
+        *part = rest % 1024;
+        rest /= 1024;
+    }
+    parts[3] = rest;
+    for unit in (1..UNITS.len()).rev() {
+        if parts[unit] > 0 {
+            return format!(
+                "{}.{} {}",
+                parts[unit],
+                parts[unit - 1] * 10 / 1024,
+                UNITS[unit]
+            );
+        }
+    }
+    format!("{} bytes", parts[0])
+}
+
+/// The rendering matches what `DuckDB` printed for the cap that once failed
+/// a tolerance check, and its other unit edges.
+#[test]
+fn duckdb_format_bytes_cuts_like_duckdb() {
+    for (bytes, text) in [
+        (202_060_595, "192.6 MiB"),
+        (1023, "1023 bytes"),
+        (1024, "1.0 KiB"),
+        (MIB, "1.0 MiB"),
+        (1024 * MIB, "1.0 GiB"),
+    ] {
+        assert_eq!(duckdb_format_bytes(bytes), text, "{bytes} bytes");
+    }
+}
+
+/// The last cap of the sweep in [`spill_stays_within_budget_plus_class_slack`],
+/// as a percentage of the natural peak.
+const TOP_PERCENT: u64 = 96;
 
 /// AC4's engine half (ADR-0056): a query that spills past the cap fails as
 /// [`EngineError::ResourceExhausted`], the usage `DuckDB` accounts never
@@ -443,9 +489,22 @@ fn spill_stays_within_budget_plus_class_slack() {
     );
 
     let mut worst = i128::MIN;
-    for percent in (40..=96).step_by(4) {
+    for percent in (40..=TOP_PERCENT).step_by(4) {
         let cap = natural.length * percent / 100;
         let (outcome, peak) = spill_under(&sql, &budgets(cap, memory, 2));
+        // The natural peak is the largest spill the samples saw, and the sort's
+        // real peak varies with thread timing. A cap in the last step can sit
+        // above this run's real peak, and then the sort completes: correct
+        // behaviour, so it keeps the directory bound and skips the message
+        // checks. Every lower cap must stop the sort.
+        if percent == TOP_PERCENT && outcome == "ok 1" {
+            let held = peak.length.max(peak.allocated);
+            assert!(
+                held <= cap + CLASS_SLACK,
+                "cap {cap} ({percent}%): the completed sort held {held} bytes ({peak:?})"
+            );
+            continue;
+        }
         let message = outcome
             .strip_prefix("err resource_exhausted ")
             .unwrap_or_else(|| panic!("cap {cap} ({percent}%): {outcome}"));
@@ -454,11 +513,12 @@ fn spill_stays_within_budget_plus_class_slack() {
                 && message.contains("max_temp_directory_size"),
             "cap {cap} ({percent}%): the spill cap, not memory, stopped the sort: {message}"
         );
-        let (used, accounted_cap, unit) = accounted_usage(message)
+        let (used, accounted_cap, cap_text) = accounted_usage(message)
             .unwrap_or_else(|| panic!("cap {cap} ({percent}%): no accounted usage in {message}"));
-        assert!(
-            accounted_cap <= cap && cap - accounted_cap < unit / 10,
-            "cap {cap} ({percent}%): DuckDB reports a cap of {accounted_cap}"
+        assert_eq!(
+            cap_text,
+            duckdb_format_bytes(cap),
+            "cap {cap} ({percent}%): DuckDB reports a different cap"
         );
         assert!(
             used <= accounted_cap,
