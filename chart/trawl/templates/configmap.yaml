@@ -80,6 +80,7 @@ data:
     wal_dir = {{ .Values.config.ingest.walDir | quote }}
     {{- end }}
     compaction_interval_secs = {{ .Values.config.ingest.compactionIntervalSecs | int }}
+    compaction_memory_limit = {{ .Values.config.ingest.compactionMemoryLimit | quote }}
     internal_telemetry = {{ .Values.config.ingest.internalTelemetry }}
     daily_rollup = {{ .Values.config.ingest.dailyRollup }}
     event_bus_capacity = {{ .Values.config.ingest.eventBusCapacity | int }}

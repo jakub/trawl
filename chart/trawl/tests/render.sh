@@ -423,6 +423,42 @@ if grep -Eq 'default_timezone|sender_timezones' "$syslog_default_config"; then
   exit 1
 fi
 
+# Sizing (ADR-0056): the trawld and sidecar memory limits, the startup
+# probe's five minutes, and a termination grace derived from the drain.
+sizing="$work_dir/sizing.yaml"
+render "${web_enabled[@]}" >"$sizing"
+if ! grep -Eq '^      terminationGracePeriodSeconds: 60$' "$sizing"; then
+  echo "expected the default drain to render terminationGracePeriodSeconds: 60" >&2
+  exit 1
+fi
+render --set config.server.shutdownDrainSecs=90 >"$work_dir/raised-drain.yaml"
+if ! grep -Eq '^      terminationGracePeriodSeconds: 120$' "$work_dir/raised-drain.yaml"; then
+  echo "expected a 90 s drain to render terminationGracePeriodSeconds: 120" >&2
+  exit 1
+fi
+startup=$(sed -n '/startupProbe:/,/livenessProbe:/p' "$sizing")
+for line in 'failureThreshold: 60' 'periodSeconds: 5' 'timeoutSeconds: 5'; do
+  if [[ $startup != *"$line"* ]]; then
+    echo "expected the trawld startupProbe to carry '${line}', found: ${startup}" >&2
+    exit 1
+  fi
+done
+for limit in 'memory: 8Gi' 'memory: 512Mi'; do
+  if ! grep -Fq -- "$limit" "$sizing"; then
+    echo "expected the rendered pod to carry the limit '${limit}'" >&2
+    exit 1
+  fi
+done
+sizing_config="$work_dir/sizing-config.yaml"
+render_only configmap.yaml >"$sizing_config"
+for line in 'query_spill_max_bytes = "4GiB"' 'query_memory_limit = "2GiB"' \
+  'query_threads = 4' 'min_free_disk_bytes = "6GiB"' 'compaction_memory_limit = "1GiB"'; do
+  if ! grep -Fq -- "$line" "$sizing_config"; then
+    echo "expected the rendered trawld.toml to carry '${line}'" >&2
+    exit 1
+  fi
+done
+
 python3 "$chart/tests/image.py"
 python3 "$chart/tests/notes.py"
 python3 "$chart/tests/tls.py"

@@ -229,12 +229,12 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `crashDump.retain` | int | `10` | Dumps to keep, passed as `TRAWL_CRASH_DUMP_RETAIN` |
 | `config.server.httpAddr` | string | `0.0.0.0:5514` | `[server] http_addr` |
 | `config.server.timeoutSecs` | int | `30` | `[server] timeout_secs` |
-| `config.server.maxConcurrentQueries` | string | `""` | `[server] max_concurrent_queries`. Empty uses the CPU count |
+| `config.server.maxConcurrentQueries` | string | `""` | `[server] max_concurrent_queries`. Empty uses the CPU count, at most 8 |
 | `config.server.maxResultRows` | int | `100000` | `[server] max_result_rows` |
 | `config.server.maxExportRows` | int | `1000000` | `[server] max_export_rows` |
 | `config.server.maxRequestBodyBytes` | string | `128K` | `[server] max_request_body_bytes` |
 | `config.server.maxConcurrentRequests` | int | `32` | `[server] max_concurrent_requests`: HTTP requests in progress across the listener, 1 to 65536. When full, trawld refuses the next request at once with 503 `request_limit_reached` and no `Retry-After`. Two fixed allowances sit beside it: 3 for health and metrics (`probe`) and 4 for query list/cancel (`control`). The `allowance` label on `trawl_http_requests_refused_total` is `regular`, `probe` or `control` |
-| `config.server.shutdownDrainSecs` | int | `30` | `[server] shutdown_drain_secs`, also the pod's `terminationGracePeriodSeconds` |
+| `config.server.shutdownDrainSecs` | int | `30` | `[server] shutdown_drain_secs`. The pod's `terminationGracePeriodSeconds` is this plus 30 |
 | `config.server.maxSseConnections` | int | `32` | `[server] max_sse_connections` |
 | `config.server.tlsReloadIntervalSecs` | int | `300` | `[server] tls_reload_interval_secs`, rendered for `tls.mode` `secret` and `certManager` |
 | `config.server.corsAllowedOrigins` | list | `[]` | `[server] cors_allowed_origins` |
@@ -243,15 +243,16 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.server.rateLimit.defaultRpm` | int | `100` | `[server.rate_limit] default_rpm`, requests per minute per key on the API routes. `0` disables |
 | `config.server.rateLimit.ingestRpm` | int | `1000` | `[server.rate_limit] ingest_rpm`, requests per minute per key on `/api/v1/ingest`. `0` disables |
 | `config.server.queryScratchDir` | string | `""` | `[server] query_scratch_dir`: where queries spill, hot-buffer query snapshots live and exports stage. Empty leaves trawld's default, `<config.data.path>.query-scratch`, which is on the data volume while `config.data.path` is below `/var/lib/trawl`. A value must be an absolute path below `/var/lib/trawl`, outside the data root, the WAL directory and the repin staging roots. The render fails when the effective directory would sit off the data volume |
-| `config.server.querySpillMaxBytes` | string | `512M` | `[server] query_spill_max_bytes`: the most one trawld holds in the scratch directory |
-| `config.server.queryMemoryLimit` | string | `256M` | `[server] query_memory_limit`: DuckDB memory limit for the query database |
-| `config.server.queryThreads` | int | `2` | `[server] query_threads`: DuckDB threads for the query database |
+| `config.server.querySpillMaxBytes` | string | `4GiB` | `[server] query_spill_max_bytes`: the most one trawld holds in the scratch directory |
+| `config.server.queryMemoryLimit` | string | `2GiB` | `[server] query_memory_limit`: DuckDB memory limit for the query database |
+| `config.server.queryThreads` | int | `4` | `[server] query_threads`: DuckDB threads for the query database |
 | `config.data.path` | string | `/var/lib/trawl/data` | `[data] path`. With `tls.mode: auto` and `web.enabled`, an absolute path whose parent is on the data volume, with no `.` or `..` components |
 | `config.auth.auditIntervalSecs` | int | `30` | `[auth] audit_interval_secs` |
 | `config.ingest.enabled` | bool | `true` | `[ingest] enabled` |
 | `config.ingest.maxBodyBytes` | string | `16M` | `[ingest] max_body_bytes` |
 | `config.ingest.walDir` | string | `""` | `[ingest] wal_dir`. Empty uses `{data.path}/wal` |
 | `config.ingest.compactionIntervalSecs` | int | `10` | `[ingest] compaction_interval_secs` |
+| `config.ingest.compactionMemoryLimit` | string | `1GiB` | `[ingest] compaction_memory_limit`: DuckDB memory limit for each compaction, rollup, conform and repin database |
 | `config.ingest.internalTelemetry` | bool | `true` | `[ingest] internal_telemetry` |
 | `config.ingest.dailyRollup` | bool | `true` | `[ingest] daily_rollup` |
 | `config.ingest.eventBusCapacity` | int | `4096` | `[ingest] event_bus_capacity` |
@@ -262,7 +263,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.ingest.severityFrom` | list | `[severity, severity_text, level]` | `[ingest] severity_from`. Each entry is a name or `{field, dialect}` with dialect `otel` or `syslog` |
 | `config.ingest.timeFrom` | list | `[_time, timestamp, "@timestamp"]` | `[ingest] time_from`. Must contain `_time` |
 | `config.retention.maxAgeDays` | int | `90` | `[retention] max_age_days`. `0` keeps data until disk pressure |
-| `config.retention.minFreeDiskBytes` | string | `1G` | `[retention] min_free_disk_bytes`. `0` disables disk-pressure deletion |
+| `config.retention.minFreeDiskBytes` | string | `6GiB` | `[retention] min_free_disk_bytes`. `0` disables disk-pressure deletion. Keep it above `querySpillMaxBytes` |
 | `config.retention.retentionIntervalSecs` | int | `3600` | `[retention] retention_interval_secs` |
 | `config.retention.envs` | map | `{}` | Environment name to `max_age_days`, rendered as `[retention.env.<name>]` tables |
 | `config.syslog.enabled` | bool | `false` | `[syslog] enabled` |
@@ -300,7 +301,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `storage.database.existingSecretKey` | string | `TRAWL_DATABASE_URL` | Key in that Secret. Injected into trawld as `TRAWL_DATABASE_URL` |
 | `initAuth.enabled` | bool | `true` | Run `fleet-admin migrate` in an init container on every pod start |
 | `initAuth.resources` | object | cpu `50m`, memory `64Mi` to `128Mi` | Init container resources |
-| `resources` | object | cpu `250m`, memory `1Gi` to `4Gi`, no CPU limit | trawld container resources |
+| `resources` | object | cpu `250m`, memory `1Gi` to `8Gi`, no CPU limit | trawld container resources. The limit holds the worst case at the defaults, about 6.1-6.6 GiB |
 | `extraEnv` | list | `[]` | Extra environment variables for the trawld container |
 | `web.enabled` | bool | `true` | Run the trawl-web sidecar |
 | `web.bindAddr` | string | `0.0.0.0:8090` | trawl-web bind address, rendered as `[web] bind_addr`. Must be reachable from the pod IP |
@@ -308,7 +309,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `web.sessionTtlSecs` | int | `86400` | `[web] session_ttl_secs` |
 | `web.allowInsecureCookies` | bool | `false` | `[web] allow_insecure_cookies`. Set `true` only when the browser connects over HTTP |
 | `web.sharedDomain` | string | `""` | `[web] shared_domain`, the parent domain for a session shared with other Fleet applications. Empty scopes the cookie to the origin |
-| `web.resources` | object | cpu `50m`, memory `64Mi` to `256Mi` | Sidecar resources |
+| `web.resources` | object | cpu `50m`, memory `64Mi` to `512Mi` | Sidecar resources |
 | `web.extraEnv` | list | `[]` | Extra environment variables for the sidecar. The chart trusts whoever writes the values file: an entry can override `TRAWL_WEB_UPSTREAM_CA_PATH` or `TRAWL_HTTP_ADDR` and bypass the chart's pin of trawld's certificate |
 | `web.runAsUser` | int | `1001` | The sidecar's uid. Must differ from trawld's uid so the sidecar cannot read trawld's private key |
 | `web.extraVolumes` | list | `[]` | Extra pod volumes, for example the CA file that `tls.upstreamCa` names by path |

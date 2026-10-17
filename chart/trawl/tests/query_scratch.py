@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Check that the chart places query scratch on the data volume (ADR-0056).
+"""Check the chart's query scratch placement and sizing (ADR-0056).
 
 The root filesystem is read-only and the /tmp emptyDir is evicted past its
 sizeLimit, so scratch must resolve to a directory under the data mount. The
-default is trawld's own: the sibling <data.path>.query-scratch. The chart
-renders offline through Helm, with no cluster.
+default is trawld's own: the sibling <data.path>.query-scratch. The budgets,
+the container memory limits, the termination grace and the startup probe
+render to the sizes ADR-0056 states. The chart renders offline through Helm,
+with no cluster.
 """
 
 import json
@@ -66,9 +68,16 @@ def server_config(rendered):
     return tomllib.loads(rendered["configmap"]["data"]["trawld.toml"])
 
 
-def trawld(rendered):
+def container(rendered, name):
     containers = rendered["statefulset"]["spec"]["template"]["spec"]["containers"]
-    return next(c for c in containers if c["name"] == "trawld")
+    return next(c for c in containers if c["name"] == name)
+
+
+def trawld(rendered):
+    return container(rendered, "trawld")
+
+
+WEB = {"web": {"enabled": True, "publicOrigins": ["https://trawl.example.com"]}}
 
 
 def effective_scratch(config):
@@ -114,10 +123,19 @@ class QueryScratch(unittest.TestCase):
         self.assertEqual(mount_covering(trawld(rendered), "/var/lib/trawl/scratch")["name"], "data")
 
     def test_budget_keys_render_with_their_defaults(self):
-        server = server_config(objects())["server"]
-        self.assertEqual(server["query_spill_max_bytes"], "512M")
-        self.assertEqual(server["query_memory_limit"], "256M")
-        self.assertEqual(server["query_threads"], 2)
+        config = server_config(objects())
+        server = config["server"]
+        self.assertEqual(server["query_spill_max_bytes"], "4GiB")
+        self.assertEqual(server["query_memory_limit"], "2GiB")
+        self.assertEqual(server["query_threads"], 4)
+        # trawld's own default, min(CPU count, 8), not a chart guess.
+        self.assertNotIn("max_concurrent_queries", server)
+        self.assertEqual(config["retention"]["min_free_disk_bytes"], "6GiB")
+        self.assertEqual(config["ingest"]["compaction_memory_limit"], "1GiB")
+
+    def test_compaction_memory_limit_follows_the_values(self):
+        config = server_config(objects({"config": {"ingest": {"compactionMemoryLimit": "2GiB"}}}))
+        self.assertEqual(config["ingest"]["compaction_memory_limit"], "2GiB")
 
     def test_budget_keys_follow_the_values(self):
         values = {"querySpillMaxBytes": "1G", "queryMemoryLimit": "512M", "queryThreads": 4}
@@ -129,8 +147,29 @@ class QueryScratch(unittest.TestCase):
     def test_trawld_is_sized_for_the_budgets(self):
         resources = trawld(objects())["resources"]
         self.assertEqual(resources["requests"]["memory"], "1Gi")
-        self.assertEqual(resources["limits"]["memory"], "4Gi")
+        self.assertEqual(resources["limits"]["memory"], "8Gi")
         self.assertNotIn("cpu", resources["limits"])
+
+    def test_web_sidecar_is_sized_for_its_bodies(self):
+        resources = container(objects(WEB), "trawl-web")["resources"]
+        self.assertEqual(resources["requests"]["memory"], "64Mi")
+        self.assertEqual(resources["limits"]["memory"], "512Mi")
+
+    def test_termination_grace_follows_the_drain(self):
+        # The drain, the runtime's 10 s shutdown and the 5 s telemetry flush
+        # all run after SIGTERM; 30 s covers the last two with margin.
+        for drain, grace in [(None, 60), (90, 120), (0, 30)]:
+            with self.subTest(drain=drain):
+                settings = {} if drain is None else {"config": {"server": {"shutdownDrainSecs": drain}}}
+                spec = objects(settings)["statefulset"]["spec"]["template"]["spec"]
+                self.assertEqual(spec["terminationGracePeriodSeconds"], grace)
+
+    def test_startup_probe_allows_five_minutes(self):
+        probe = trawld(objects())["startupProbe"]
+        self.assertEqual(probe["periodSeconds"], 5)
+        self.assertEqual(probe["failureThreshold"], 60)
+        self.assertEqual(probe["timeoutSeconds"], 5)
+        self.assertEqual(probe["periodSeconds"] * probe["failureThreshold"], 300)
 
     def test_data_root_at_the_mount_would_put_scratch_off_the_volume(self):
         result = render({"config": {"data": {"path": DATA_MOUNT}}})
