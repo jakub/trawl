@@ -1671,6 +1671,94 @@ mod tests {
         }
     }
 
+    /// The cap mark rides every results title, the placeholders included.
+    ///
+    /// `timechart span=1m count() by host | where count > 1` over 10,000
+    /// hosts seen once and a new one seen twice drops that last host at the
+    /// group cap, and the filter leaves nothing: the snapshot has the
+    /// timechart's columns, no rows and the cap, while the whole answer has
+    /// one row. A grouped timechart with no rows has no series, so both
+    /// chart views draw the placeholder, and that is where the drop changed
+    /// the answer. A capped result whose columns are all hidden draws a
+    /// placeholder of its own.
+    #[test]
+    fn live_capped_snapshot_marks_every_placeholder_title() {
+        use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+
+        const MARK: &str = " partial: groups > 10000 ";
+        let capped = || {
+            vec![SnapshotCap {
+                cap: SnapshotCapKind::Groups,
+                limit: 10_000,
+            }]
+        };
+        let title = |app: &mut App| {
+            let backend = ratatui::backend::TestBackend::new(100, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| ui::render(app, frame)).unwrap();
+            let area = app
+                .layout
+                .results
+                .expect("the query layout has a results pane");
+            let buffer = terminal.backend().buffer().clone();
+            let cells: Vec<_> = (area.x..area.x + area.width)
+                .map(|x| buffer[(x, area.y)].clone())
+                .collect();
+            (cells, terminal.backend().to_string())
+        };
+        let assert_marked = |app: &mut App, case: &str, shows: &str| {
+            let (cells, screen) = title(app);
+            let text: String = cells.iter().map(ratatui::buffer::Cell::symbol).collect();
+            let at = text
+                .find(MARK)
+                .unwrap_or_else(|| panic!("{case}: no mark in {text:?}\n{screen}"));
+            let start = text[..at].chars().count();
+            for cell in &cells[start..start + MARK.chars().count()] {
+                assert_eq!(
+                    cell.fg, app.theme.status_warning,
+                    "{case}: the mark is a warning: {text:?}"
+                );
+            }
+            assert!(screen.contains(shows), "{case}: shows {shows:?}\n{screen}");
+        };
+
+        for view in [ChartView::LineChart, ChartView::Sparkline] {
+            let mut app = test_app();
+            app.query_tx
+                .send(QueryResult {
+                    result: Ok(make_query_response(vec!["_time", "host", "count"], vec![])),
+                    duration: Duration::from_secs(0),
+                    capped: capped(),
+                })
+                .unwrap();
+            app.poll_query_results();
+            assert_eq!(
+                app.tab.chart_view,
+                ChartView::LineChart,
+                "a timechart opens as a line chart"
+            );
+            app.tab.chart_view = view;
+            assert_marked(&mut app, &format!("{view:?}"), "Command Palette");
+        }
+
+        let mut app = test_app();
+        app.query_tx
+            .send(QueryResult {
+                result: Ok(make_query_response(
+                    vec!["host", "count"],
+                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                )),
+                duration: Duration::from_secs(0),
+                capped: capped(),
+            })
+            .unwrap();
+        app.poll_query_results();
+        for column in &mut app.tab.column_config.as_mut().unwrap().columns {
+            column.hidden = true;
+        }
+        assert_marked(&mut app, "all columns hidden", "All columns hidden");
+    }
+
     #[test]
     fn poll_query_result_sets_error_status() {
         let mut app = test_app();

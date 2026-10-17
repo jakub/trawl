@@ -487,7 +487,11 @@ fn render_all_hidden_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Results ")
+        .title(capped_title(
+            " Results ",
+            &app.active_tab().live_capped,
+            theme,
+        ))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
@@ -523,10 +527,17 @@ fn render_placeholder(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Style::default().fg(theme.border_unfocused)
     };
 
+    // The charts fall back to this placeholder when a result has no
+    // series, and a live aggregate that dropped input can leave exactly
+    // that, so the cap mark rides here too.
     let tab = app.active_tab();
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(pane_title(&tab.status, theme))
+        .title(capped_title(
+            pane_title(&tab.status, theme),
+            &tab.live_capped,
+            theme,
+        ))
         .border_style(border_style)
         .padding(Padding::horizontal(1));
 
