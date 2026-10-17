@@ -887,6 +887,40 @@ async fn log_marker_collision_refuses_before_database_or_storage_mutation() {
 }
 
 #[tokio::test]
+async fn soft_descriptor_limit_rises_to_the_hard_limit_at_startup() {
+    use rustix::process::{Resource, getrlimit};
+    // The test inherits the hard limit; the daemon's parent shell lowers
+    // only the soft one, the way systemd's default 1024 arrives.
+    let Some(hard) = getrlimit(Resource::Nofile)
+        .maximum
+        .filter(|&hard| hard > 1024)
+    else {
+        panic!("this test needs a finite hard RLIMIT_NOFILE above 1024");
+    };
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", r#"ulimit -Sn 1024 && exec "$@""#, "sh"])
+        .arg(env!("CARGO_BIN_EXE_trawld"));
+    let mut daemon = fixture.launch(command, false);
+    daemon.ready().await;
+    daemon.stop().await;
+    let log = daemon.log();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("descriptor limit"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(
+        lines[0].contains("descriptor limit raised to the hard limit")
+            && lines[0].contains(&format!("nofile_soft={hard}"))
+            && lines[0].contains(&format!("nofile_hard={hard}")),
+        "{log}"
+    );
+}
+
+#[tokio::test]
 async fn log_inside_fresh_data_root_starts_and_restarts() {
     let mut fixture = Fixture::new().await;
     fixture.log_file = Some(fixture.data().join("logs/server.json"));
