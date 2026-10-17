@@ -48,6 +48,10 @@
 //! Postgres on every request, so revoking or expiring a key refuses its
 //! next use whether or not its entry is cached, and a rotated key changes
 //! `stored_hash`, which makes the old entry unreachable until it ages out.
+//! A rotation that commits while a verification is in flight refuses that
+//! verification too, cached or not: its `last_used` update requires the
+//! hash it read, so the old plaintext is never authenticated against a
+//! hash it was not checked under.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};

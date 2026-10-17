@@ -1638,6 +1638,173 @@ async fn warm_cache_then_hash_rotation_refuses_the_old_token(pool: sqlx::PgPool)
         .expect("the donor still verifies");
 }
 
+/// Start a verification of `token` while another transaction holds the
+/// key's row, so the verification's `last_used` UPDATE waits on the lock
+/// after its SELECT read the old hash and after argon2id, if it ran,
+/// accepted the old plaintext. Rotate the hash to `donor_id`'s in the
+/// holding transaction, commit, and return what the verification decided
+/// once the lock let it continue.
+async fn verify_while_the_hash_rotates(
+    store: &KeyStore,
+    token: &str,
+    key_id: i64,
+    donor_id: i64,
+) -> Result<fleet_auth::VerifiedKey, AuthError> {
+    let mut holder = store.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
+        .bind(key_id)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let verifying = tokio::spawn({
+        let store = store.clone();
+        let token = token.to_owned();
+        async move { store.verify_key(&token).await }
+    });
+
+    // Wait until the verification's UPDATE is blocked on the held row:
+    // its SELECT and any KDF are behind it by then.
+    let started = std::time::Instant::now();
+    loop {
+        let blocked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database()
+               AND wait_event_type = 'Lock'
+               AND query LIKE 'UPDATE api_keys%'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        if blocked >= 1 {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the verification never reached its last_used UPDATE"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    sqlx::query(
+        "UPDATE api_keys
+         SET hash = (SELECT hash FROM api_keys WHERE id = $2)
+         WHERE id = $1",
+    )
+    .bind(key_id)
+    .bind(donor_id)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+    holder.commit().await.unwrap();
+
+    verifying
+        .await
+        .expect("the verification task ran to its end")
+}
+
+/// A rotation that commits after a verification read the old hash and
+/// argon2id accepted the old plaintext, but before its `last_used` UPDATE
+/// ran, refuses that verification: the UPDATE requires the hash it was
+/// verified against, so the old token never authenticates a rotated key.
+#[sqlx::test]
+async fn concurrent_hash_rotation_refuses_the_old_token_on_a_cache_miss(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+    let rotated = store
+        .create_key(
+            "rotated",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let donor = store
+        .create_key(
+            "donor",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.cache_stats().entries, 0, "nothing is cached yet");
+
+    let result = verify_while_the_hash_rotates(
+        &store,
+        &rotated.plaintext_token,
+        rotated.info.id,
+        donor.info.id,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(AuthError::InvalidKey(_))),
+        "the old token authenticated a rotated key: {result:?}"
+    );
+    assert_eq!(
+        store.cache_stats().entries,
+        0,
+        "a refused verification inserts nothing"
+    );
+    store
+        .verify_key(&donor.plaintext_token)
+        .await
+        .expect("the donor still verifies");
+}
+
+/// The same race on a cache hit: the warm entry skips argon2id, and the
+/// UPDATE still refuses once the hash it was looked up under is gone.
+#[sqlx::test]
+async fn concurrent_hash_rotation_refuses_the_old_token_on_a_cache_hit(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+    let rotated = store
+        .create_key(
+            "rotated",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let donor = store
+        .create_key(
+            "donor",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .verify_key(&rotated.plaintext_token)
+        .await
+        .expect("the old token verifies and warms the cache");
+    assert_eq!(store.cache_stats().entries, 1);
+
+    let result = verify_while_the_hash_rotates(
+        &store,
+        &rotated.plaintext_token,
+        rotated.info.id,
+        donor.info.id,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(AuthError::InvalidKey(_))),
+        "the old token authenticated a rotated key from the cache: {result:?}"
+    );
+    assert_eq!(
+        store.cache_stats().entries,
+        1,
+        "the stale entry stays, bound to a hash no row has"
+    );
+    store
+        .verify_key(&donor.plaintext_token)
+        .await
+        .expect("the donor still verifies");
+}
+
 #[sqlx::test]
 async fn revocation_through_a_second_store_refuses_the_first_stores_warm_key(pool: sqlx::PgPool) {
     // Two processes sharing one database each hold their own cache. A

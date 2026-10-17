@@ -327,9 +327,13 @@ impl KeyStore {
     /// enumeration oracle.
     ///
     /// A prefix miss still pays one argon2id verification so response time
-    /// doesn't leak prefix existence, and liveness is rechecked inside the
-    /// `last_used` UPDATE, which also locks the row for the role resolution
-    /// that follows.
+    /// doesn't leak prefix existence. Liveness is rechecked inside the
+    /// `last_used` UPDATE, which also requires the stored hash to still be
+    /// the one this check verified against, or hit the cache under, and
+    /// locks the row for the role resolution that follows. A hash rotation
+    /// that commits between the row read and that UPDATE therefore refuses
+    /// the check in flight: the presented plaintext was never checked
+    /// against the new hash, so it is not authenticated.
     pub async fn verify_key(&self, plaintext: &str) -> Result<VerifiedKey, AuthError> {
         let prefix = token::extract_prefix(plaintext).ok_or_else(|| {
             AuthError::MalformedToken("token must start with flt_ and be at least 12 chars".into())
@@ -384,20 +388,28 @@ impl KeyStore {
             return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
-        // The UPDATE both rechecks liveness and locks the api_keys row until
-        // commit. Role assign/unassign operations lock the same row before
-        // mutating key_roles, so the role resolution below observes a role
-        // set that cannot change underneath this in-flight verify.
+        // The UPDATE rechecks liveness, requires the hash to be the one this
+        // check verified against (a rotation committed since the SELECT
+        // above would otherwise authenticate a plaintext the new hash was
+        // never asked about), and locks the api_keys row until commit. Role
+        // assign/unassign operations lock the same row before mutating
+        // key_roles, so the role resolution below observes a role set that
+        // cannot change underneath this in-flight verify. Under READ
+        // COMMITTED a blocked UPDATE re-evaluates its WHERE on the row
+        // version that won, which is what makes the hash predicate a
+        // fail-closed check rather than a stale read.
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE api_keys
              SET last_used = NOW()
              WHERE id = $1
+               AND hash = $2
                AND active = TRUE
                AND (expires_at IS NULL OR expires_at > NOW())
              RETURNING id",
         )
         .bind(id)
+        .bind(&stored_hash)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -413,9 +425,10 @@ impl KeyStore {
         let kind: PrincipalKind = kind_str.parse()?;
 
         // Insert only after this request ran the KDF and then passed every
-        // database check — never pollute the cache with (prefix, hash,
-        // fingerprint) triples that lost a race, and never re-insert on a
-        // hit.
+        // database check, the hash predicate included, so the entry is for
+        // a hash a row still holds — never pollute the cache with (prefix,
+        // hash, fingerprint) triples that lost a race, and never re-insert
+        // on a hit.
         if ran_kdf {
             self.cache.insert(cache_key);
         }
