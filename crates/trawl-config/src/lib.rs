@@ -56,7 +56,9 @@ pub struct ServerConfig {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 
-    /// Maximum concurrent queries (bounds the executor pool).
+    /// Maximum concurrent queries (bounds the executor pool). Default: the
+    /// CPU count, at most [`MAX_DEFAULT_CONCURRENT_QUERIES`] (4 when the CPU
+    /// count is unknown).
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
 
@@ -169,8 +171,8 @@ pub struct ServerConfig {
     pub query_scratch_dir: Option<PathBuf>,
 
     /// The query database's spill cap, `DuckDB`'s `max_temp_directory_size`,
-    /// shared by every query, export and field sample (default: 512 MiB).
-    /// Accepts human-readable sizes like `"512M"`. Zero is refused.
+    /// shared by every query, export and field sample (default: 4 GiB).
+    /// Accepts human-readable sizes like `"4G"`. Zero is refused.
     #[serde(
         default = "default_query_spill_max_bytes",
         deserialize_with = "deserialize_nonzero_byte_size"
@@ -178,8 +180,8 @@ pub struct ServerConfig {
     pub query_spill_max_bytes: NonZeroU64,
 
     /// The query database's memory limit, `DuckDB`'s `memory_limit`
-    /// (default: 256 MiB). It bounds `DuckDB`-managed memory, not the
-    /// process. Accepts human-readable sizes like `"256M"`. Zero is refused.
+    /// (default: 2 GiB). It bounds `DuckDB`-managed memory, not the
+    /// process. Accepts human-readable sizes like `"2G"`. Zero is refused.
     #[serde(
         default = "default_query_memory_limit",
         deserialize_with = "deserialize_nonzero_byte_size"
@@ -187,7 +189,7 @@ pub struct ServerConfig {
     pub query_memory_limit: NonZeroU64,
 
     /// The query database's worker threads, `DuckDB`'s `threads`
-    /// (default: 2). Independent of `max_concurrent_queries`, which counts
+    /// (default: 4). Independent of `max_concurrent_queries`, which counts
     /// queries, not threads. Zero is refused.
     #[serde(
         default = "default_query_threads",
@@ -387,7 +389,8 @@ pub struct IngestConfig {
     /// earlier rather than letting `DuckDB` use 80% of container RAM.
     /// Compaction, conform and repin each open a database with it, and they
     /// can run at the same time. Accepts `DuckDB` memory strings like
-    /// `"2GB"`, `"512MB"`. Default: `"256MB"`.
+    /// `"2GiB"`, `"512MiB"`; `DuckDB` reads `GB` and `MB` as powers of ten.
+    /// Default: `"1GiB"`.
     #[serde(default = "default_compaction_memory_limit")]
     pub compaction_memory_limit: String,
 
@@ -1197,12 +1200,16 @@ pub const DEFAULT_COMPACTION_CHUNK_SIZE: usize = 500;
 /// a fixed size derived from this count, so a larger chunk could publish a
 /// marker that recovery then refuses to read. Eight times the default.
 pub const MAX_COMPACTION_CHUNK_SIZE: usize = 4096;
-/// Default spill cap of the query database (512 MiB).
-pub const DEFAULT_QUERY_SPILL_MAX_BYTES: NonZeroU64 = NonZeroU64::new(512 * 1024 * 1024).unwrap();
-/// Default memory limit of the query database (256 MiB).
-pub const DEFAULT_QUERY_MEMORY_LIMIT: NonZeroU64 = NonZeroU64::new(256 * 1024 * 1024).unwrap();
+/// Default spill cap of the query database (4 GiB).
+pub const DEFAULT_QUERY_SPILL_MAX_BYTES: NonZeroU64 = NonZeroU64::new(4 << 30).unwrap();
+/// Default memory limit of the query database (2 GiB).
+pub const DEFAULT_QUERY_MEMORY_LIMIT: NonZeroU64 = NonZeroU64::new(2 << 30).unwrap();
 /// Default worker threads of the query database.
-pub const DEFAULT_QUERY_THREADS: NonZeroU32 = NonZeroU32::new(2).unwrap();
+pub const DEFAULT_QUERY_THREADS: NonZeroU32 = NonZeroU32::new(4).unwrap();
+/// Most executor permits the `max_concurrent_queries` default gives. Every
+/// permit shares the one query memory limit, so permits past this many only
+/// split it thinner. An explicit value may go higher.
+pub const MAX_DEFAULT_CONCURRENT_QUERIES: usize = 8;
 /// Suffix of the data root's sibling that [`Config::query_scratch_dir`]
 /// defaults to.
 pub const QUERY_SCRATCH_SUFFIX: &str = ".query-scratch";
@@ -1210,12 +1217,16 @@ pub const QUERY_SCRATCH_SUFFIX: &str = ".query-scratch";
 pub const REPIN_SHADOW_SUFFIX: &str = ".repin-next";
 /// Suffix of the repin aside (previous-generation) sibling root.
 pub const REPIN_ASIDE_SUFFIX: &str = ".repin-aside";
-/// Default `DuckDB` memory limit for compaction connections.
-pub const DEFAULT_COMPACTION_MEMORY_LIMIT: &str = "256MB";
+/// Default `DuckDB` memory limit for compaction connections (1 GiB). A raw
+/// `DuckDB` string, so the unit is spelled `GiB`: `DuckDB` reads `GB` as
+/// 10^9 bytes.
+pub const DEFAULT_COMPACTION_MEMORY_LIMIT: &str = "1GiB";
 /// Default retention max age (days).
 pub const DEFAULT_RETENTION_MAX_AGE_DAYS: u64 = 90;
-/// Default retention minimum free disk space (bytes). 1 GiB.
-pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 1_073_741_824;
+/// Default retention minimum free disk space (bytes). 6 GiB: room for the
+/// default 4 GiB spill budget, the hot-buffer snapshots and export staging
+/// above ENOSPC. Nothing validates the floor against the spill budget.
+pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 6 << 30;
 /// Default retention check interval (seconds). 1 hour.
 pub const DEFAULT_RETENTION_INTERVAL_SECS: u64 = 3600;
 /// Default per-key rate limit on the interactive API routes
@@ -1582,7 +1593,14 @@ fn default_timeout_secs() -> u64 {
 }
 
 fn default_max_concurrent_queries() -> usize {
-    num_cpus()
+    default_query_permits(num_cpus())
+}
+
+/// One executor permit per CPU, at most [`MAX_DEFAULT_CONCURRENT_QUERIES`].
+/// An unknown CPU count gives [`FALLBACK_CPU_COUNT`].
+fn default_query_permits(cpus: Option<usize>) -> usize {
+    cpus.unwrap_or(FALLBACK_CPU_COUNT)
+        .min(MAX_DEFAULT_CONCURRENT_QUERIES)
 }
 
 fn default_max_result_rows() -> usize {
@@ -1687,9 +1705,12 @@ impl Default for RateLimitConfig {
     }
 }
 
-/// Portable CPU count without pulling in the `num_cpus` crate.
-fn num_cpus() -> usize {
-    std::thread::available_parallelism().map_or(FALLBACK_CPU_COUNT, std::num::NonZero::get)
+/// Portable CPU count without pulling in the `num_cpus` crate. `None` when
+/// the platform cannot say.
+fn num_cpus() -> Option<usize> {
+    std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZero::get)
 }
 
 /// Expand a leading `~/` to `$HOME/`.
@@ -2948,7 +2969,7 @@ path = "/data"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.retention.max_age_days, 90);
-        assert_eq!(config.retention.min_free_disk_bytes, 1_073_741_824);
+        assert_eq!(config.retention.min_free_disk_bytes, 6_442_450_944);
         assert_eq!(config.retention.retention_interval_secs, 3600);
     }
 
@@ -4132,10 +4153,63 @@ severity_from = [7]
             config.query_scratch_dir(),
             Path::new("/var/lib/trawl/data.query-scratch")
         );
-        assert_eq!(config.server.query_spill_max_bytes.get(), 512 * 1024 * 1024);
-        assert_eq!(config.server.query_memory_limit.get(), 256 * 1024 * 1024);
-        assert_eq!(config.server.query_threads.get(), 2);
-        assert_eq!(config.ingest.compaction_memory_limit, "256MB");
+        assert_eq!(config.server.query_spill_max_bytes.get(), 4_294_967_296);
+        assert_eq!(config.server.query_memory_limit.get(), 2_147_483_648);
+        assert_eq!(config.server.query_threads.get(), 4);
+        assert_eq!(
+            config.server.max_concurrent_queries,
+            default_max_concurrent_queries()
+        );
+        assert_eq!(config.retention.min_free_disk_bytes, 6_442_450_944);
+        assert_eq!(config.ingest.compaction_memory_limit, "1GiB");
+    }
+
+    #[test]
+    fn query_scratch_defaults_cap_query_permits_at_eight() {
+        // One permit per core up to eight. The memory budget is shared, so a
+        // large node gains no headroom from more permits than that.
+        assert_eq!(default_query_permits(Some(1)), 1);
+        assert_eq!(default_query_permits(Some(4)), 4);
+        assert_eq!(default_query_permits(Some(8)), 8);
+        assert_eq!(default_query_permits(Some(64)), 8);
+        // An unknown count falls back to four, not to the cap.
+        assert_eq!(default_query_permits(None), 4);
+    }
+
+    #[test]
+    fn query_scratch_spill_budget_and_disk_floor_are_independent() {
+        // Nothing ties the retention floor to the spill budget: a floor
+        // below the budget, a floor of zero and a floor far above it all load.
+        for (spill, floor) in [
+            ("\"8G\"", "\"1G\""),
+            ("\"4G\"", "0"),
+            ("\"1M\"", "\"100G\""),
+        ] {
+            let config = Config::from_toml(&format!(
+                "[server]\nquery_spill_max_bytes = {spill}\n[data]\npath = \"/data\"\n\
+                 [retention]\nmin_free_disk_bytes = {floor}\n"
+            ))
+            .unwrap_or_else(|e| panic!("spill={spill} floor={floor}: {e}"));
+            assert_eq!(
+                config.server.query_spill_max_bytes.get(),
+                parse_byte_size(spill.trim_matches('"')).unwrap()
+            );
+            assert_eq!(
+                config.retention.min_free_disk_bytes,
+                parse_byte_size(floor.trim_matches('"')).unwrap()
+            );
+        }
+        // Each key keeps its own default when only the other is set.
+        let config = Config::from_toml(
+            "[server]\n[data]\npath = \"/data\"\n[retention]\nmin_free_disk_bytes = 0\n",
+        )
+        .unwrap();
+        assert_eq!(config.server.query_spill_max_bytes.get(), 4_294_967_296);
+        let config = Config::from_toml(
+            "[server]\nquery_spill_max_bytes = \"64G\"\n[data]\npath = \"/data\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.retention.min_free_disk_bytes, 6_442_450_944);
     }
 
     #[test]
