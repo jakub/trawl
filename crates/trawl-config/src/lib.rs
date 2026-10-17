@@ -164,7 +164,8 @@ pub struct ServerConfig {
     /// export staging files. Unset means [`Config::query_scratch_dir`]'s
     /// default, the data root's sibling `<data.path>.query-scratch`. It may
     /// not be the data root, the WAL directory or a repin staging root, nor
-    /// sit inside or above any of them.
+    /// sit inside or above any of them. A value is an absolute path with no
+    /// `..` component and no glob metacharacter.
     pub query_scratch_dir: Option<PathBuf>,
 
     /// The query database's spill cap, `DuckDB`'s `max_temp_directory_size`,
@@ -578,7 +579,8 @@ pub fn is_valid_env_name(name: &str) -> bool {
 /// `read_parquet` expands it as a pattern, while the filesystem presence
 /// check at startup resolves the literal name. A directory called
 /// `trawl*data` passes the literal check and then reads the files of
-/// `trawlXdata` next door.
+/// `trawlXdata` next door. The query scratch directory is refused for the
+/// same reason: `read_json` reads the hot-buffer snapshots there by path.
 const GLOB_METACHARACTERS: &[char] = &['*', '?', '[', ']', '{', '}'];
 
 /// Maximum service name length (ADR-0009 path segment cap).
@@ -2048,6 +2050,17 @@ impl Config {
             }
         }
         let scratch = self.query_scratch_dir();
+        // The snapshot paths in the scratch directory reach `read_json`,
+        // which expands a glob as `read_parquet` does `data.path`.
+        if let Some(found) = scratch
+            .to_string_lossy()
+            .chars()
+            .find(|c| GLOB_METACHARACTERS.contains(c))
+        {
+            return Err(ConfigError::Validation(format!(
+                "{KEY} must be a directory path without glob metacharacters; found '{found}'"
+            )));
+        }
         let data = self.data.base_dir();
         let owned = [
             (data.clone(), "the data root (data.path)"),
@@ -4288,6 +4301,42 @@ severity_from = [7]
             err.contains("server.query_scratch_dir cannot be empty"),
             "{err}"
         );
+    }
+
+    /// Snapshot paths in the scratch directory reach `DuckDB`'s `read_json`,
+    /// which expands a glob, so the scratch directory carries no glob
+    /// metacharacter: `scratch[1]` would also read the snapshots of a
+    /// `scratch1` beside it. The refusal names the character, not the path.
+    #[test]
+    fn query_scratch_refuses_glob_metacharacters() {
+        for metacharacter in GLOB_METACHARACTERS {
+            let scratch = format!("/srv/private-secret{metacharacter}scratch");
+            let err = query_scratch_config(&format!("query_scratch_dir = '{scratch}'"), "")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "config validation error: server.query_scratch_dir must be a directory \
+                     path without glob metacharacters; found '{metacharacter}'"
+                )
+            );
+        }
+        // The default inherits the data root's name, which refuses the same
+        // characters first.
+        for metacharacter in GLOB_METACHARACTERS {
+            let err = Config::from_toml(&format!(
+                "[server]\n[data]\npath = '/srv/data{metacharacter}x'\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!(
+                    "without glob metacharacters; found '{metacharacter}'"
+                )),
+                "{err}"
+            );
+        }
     }
 
     /// A component comparison cannot see where `..` or a working directory
