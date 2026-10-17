@@ -1,6 +1,6 @@
 # trawld counts requests in progress against one server-wide limit
 
-status: accepted (2026-10-08), prep record for #293; amended (2026-10-08): probes and query control have separate allowances, prep record for #298, see the Amendment
+status: accepted (2026-10-08), prep record for #293; amended (2026-10-08): probes and query control have separate allowances, prep record for #298, see the Amendment; amended (2026-10-17) by ADR-0056: health takes no executor permit
 
 `[server] max_concurrent_requests` (default 256) was meant to cap the HTTP requests trawld works on at once. It did not. `with_edge_layers` added tower's `ConcurrencyLimitLayer` through `Router::layer`, and axum applies a layer once per route and once per method on that route. Each application built its own semaphore. That gave about 40 independent budgets of 256, so the real ceiling was near 10,000. The layer also never refused anything. It waits for a permit inside `poll_ready`, and axum's `Route` always reports ready, so a request over the limit waited with no deadline. The configuration reference, `config/trawld.reference.toml` and the Debian example all said "past it trawld answers 503", which was false. A value of 0 was accepted and made every request wait forever.
 
@@ -126,3 +126,7 @@ A probe refusal has its own message: `trawld is at its HTTP probe allowance; the
 - A separate listener for probes, rejected. It adds a port, TLS, chart and doctor surface. It is the fence if probe floods ever matter.
 
 **Proof of the fix.** A test on the production router locks the `api_keys` table in an open transaction, which parks a junk-token query-list request inside the key check, before any decision. With the control allowance full of such requests, health and `/metrics` answer 200. At `c8675375` the same test fails.
+
+## Amendment: health takes no executor permit, 2026-10-17
+
+ADR-0056 makes health read a sampled engine check instead of taking an executor permit. The sentence "an exhausted executor pool is a real 503" no longer holds: pool saturation, retained permits and live streams never change the health status. The rejection "Leave health out of the count" still stands, on HTTP grounds alone. Each health request still holds a connection, a TLS session and handler time, and the count is what bounds those for callers who need no key. The probe allowance stays 3 and the control allowance stays 4.

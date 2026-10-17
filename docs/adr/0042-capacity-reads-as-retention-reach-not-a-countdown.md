@@ -1,6 +1,6 @@
 # Capacity reads as retention reach, not a countdown
 
-status: accepted (2026-09-23), prep record for #202
+status: accepted (2026-09-23), prep record for #202; amended (2026-10-17) by ADR-0056: the spill role is the query scratch directory
 
 With a deletion floor set, a trawl data disk does not fill. When free space drops below `min_free_disk_bytes`, pressure deletion removes date directories in expiry-ratio order (ADR-0018). The loss lands on retention: an environment that should hold 90 days quietly holds 40. A "days until full" countdown answers the wrong question. The free-space line also stays flat exactly while pressure deletion is destroying data. So trawl reports capacity as **retention reach**: how many days of each environment's policy the disk is projected to hold.
 
@@ -95,3 +95,7 @@ The Decision anchors the zero-fill on the environment's oldest surviving date. D
 The Decision withholds a projection while a repin holds two generations. During the #202 run, reviews showed that no reading of the data root can prove that. A job can build a shadow, then swap or abandon it, sweep, and drop its marker while a sample runs. After that, nothing on disk shows it happened. So each sample reads the repin engine's job generation before and after it measures. The engine enters that generation before a job's first write under the data root. It leaves after the job's last cleanup, whatever the outcome. A sample that overlaps any job in the process reports the repin, and the projection is withheld as `retention_suppressed`. A job here is a repin that enters the staged rewrite. The corpus scan, a dry run and a refusal at the scan gate build no second generation, so they do not suppress. Scratch that the scan spills is transient free-space use, like compaction or query spill. The sample also reads the marker and the staging roots at both ends. Those catch staging that an earlier process left behind.
 
 Writes to the data directory from outside the process are out of scope. The data root is trusted storage that only trawld rearranges. Inferring a repin from directory inodes was rejected. Each review found an interleaving that the inference missed.
+
+## Amendment: the spill role is the query scratch directory, 2026-10-17
+
+ADR-0056 moves query spill, the hot-buffer query snapshots and export staging out of the system temp directory into `[server] query_scratch_dir`. The **spill** role now names that directory. Its default sits beside the data root, so on a default install it shares the data filesystem and collapses into the data row. It gets its own row only when an operator puts it on another device. Scratch is transient use of ordinary headroom, like compaction spill. Pressure deletion keeps comparing real available bytes with the floor, so a large query can start it early. The human ruled this on 2026-10-17, over counting scratch bytes as free, because the WAL must keep its room.

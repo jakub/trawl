@@ -1,7 +1,8 @@
 # Bound lateral expansion and account for work after timeout
 
 Status: accepted 2026-09-05, amended 2026-09-07 after re-prep of
-[#150](https://github.com/jakub/trawl/issues/150).
+[#150](https://github.com/jakub/trawl/issues/150), amended 2026-10-17 by
+ADR-0056 (the ping no longer takes a permit).
 
 A short query can spend seconds in DuckDB binding before reading a row.
 In a single SELECT list, DuckDB copies an earlier alias's original
@@ -222,3 +223,7 @@ reveals occupied capacity after the request ends.
 ## Amendment: an HTTP request count is not an executor permit, 2026-10-08
 
 ADR-0054 adds a server-wide count of HTTP requests in progress. A query's count ends with its request. Its executor permit may stay retained after that, as this ADR describes. The two are separate charges with separate lifetimes, and the HTTP count does not follow retained executor work. Only blocking work that holds a request's body, which is ingest decode, the ingest WAL write and the preview report, keeps its request's count until that work ends.
+
+## Amendment: the ping no longer takes a permit, 2026-10-17
+
+ADR-0056 replaces the request-triggered ping. The sentence "Ping has a 250 ms total probe budget" and the 503 on its exhaustion no longer describe health. A dedicated thread samples `SELECT 1` every 10 seconds on a diagnostic connection cloned from the query database, outside the executor pool, with a 250 ms budget per sample. Health reads the latest sample and never waits for a permit, so a full or retained pool cannot fail it. Field sampling keeps its 1 second acquisition bound and its permit. The retained-permit rules above apply to every permit the pool still issues.

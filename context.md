@@ -204,6 +204,22 @@ _Avoid_: prepare, compile, plan (as a verb)
 Additional expression work caused by substituting earlier same-stage targets, including repeated references introduced by SQL translation. Independent expressions and flat lists without such references have zero lateral expansion.
 _Avoid_: query complexity, bind cost, node count
 
+**Executor pool**:
+The fixed set of connections to the query database that user queries, exports and field samples take turns on, one permit each. Its size is `max_concurrent_queries`.
+_Avoid_: query pool, connection pool, worker pool
+
+**Query scratch**:
+The directory where the query database writes transient bytes: its spill files, the hot-buffer query snapshots and export staging files. It belongs to one trawld at a time and holds nothing that must survive a restart.
+_Avoid_: temp dir, tmp, spill directory (that is one database's private directory inside it)
+
+**Spill budget**:
+The most bytes the query database may write into query scratch as spill at once, shared by every query running on it. A query that needs more fails with a resource error; it does not wait.
+_Avoid_: spill quota, scratch limit, disk budget
+
+**Engine sample**:
+The latest result of the periodic `SELECT 1` that trawld runs on its own connection to the query database, outside the executor pool. The health check reads it and never waits for a new one.
+_Avoid_: ping, liveness check, engine probe
+
 **Retained permit**:
 An executor-pool permit still held by physical work after its request has ended. Request completion and permit reclamation are separate events.
 _Avoid_: leaked permit, stuck query (the permit is the thing named)
