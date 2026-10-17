@@ -2945,11 +2945,17 @@ async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
 /// `GET /schema/repin/status?id=<id>` with `token`, raw, so a test sees the
 /// status code and body the route gives for that id.
 async fn status_by_id(h: &Harness, token: &str, id: i64) -> (u16, serde_json::Value) {
+    status_with_query(h, token, &format!("id={id}")).await
+}
+
+/// `GET /api/v1/schema/repin/status?<query>`, for a query no well-formed
+/// id produces.
+async fn status_with_query(h: &Harness, token: &str, query: &str) -> (u16, serde_json::Value) {
     let resp = common::harness_client_builder()
         .build()
         .unwrap()
         .get(format!(
-            "{}/api/v1/schema/repin/status?id={id}",
+            "{}/api/v1/schema/repin/status?{query}",
             h.server.url
         ))
         .bearer_auth(token)
@@ -3064,6 +3070,13 @@ async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_sl
     let (status, body) = status_by_id(&h, &token, second.id + 1000).await;
     assert_eq!(status, 404, "an unknown id is not found: {body}");
     assert_eq!(body["error"]["code"], "not_found", "{body}");
+
+    let (status, body) = status_with_query(&h, &token, "id=seven").await;
+    assert_eq!(
+        status, 400,
+        "an id that is not an integer is refused: {body}"
+    );
+    assert_eq!(body["error"]["code"], "bad_request", "{body}");
 
     TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
     h.wait_terminal(second.id).await;

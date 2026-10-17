@@ -2534,9 +2534,11 @@ pub struct RepinStatusParams {
 /// surfaces show state without offering the trigger). A read by id also
 /// accepts `SchemaWrite`, because it is how a trigger caller follows its
 /// own job: the trigger needs `SchemaWrite` alone, and a dry run it started
-/// can answer 202 and leave its report here. A write key can produce that
-/// report by starting a dry run anyway, so the id read shows it nothing
-/// new. An id the store never issued is a 404.
+/// can answer 202 and leave its report here. Any id answers, not only the
+/// caller's own: a write key can produce the same scan report by starting
+/// a dry run of that field, so the read shows it no corpus data it could
+/// not already reach. An id the store never issued is a 404, and one that
+/// is not an integer a 400.
 pub async fn schema_repin_status(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
