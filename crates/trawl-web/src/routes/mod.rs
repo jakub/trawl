@@ -16,6 +16,7 @@ use axum::http::StatusCode;
 use axum::routing::{any, get, post};
 
 use crate::assets;
+use crate::middleware::body_deadline;
 use crate::middleware::request_count::{PROXY_MAX_REQUESTS, RequestCount};
 use crate::middleware::security_headers;
 use crate::state::AppState;
@@ -37,8 +38,11 @@ pub fn build(state: AppState) -> Router {
 ///
 /// Every route, the SPA fallback included, sits inside the count; only
 /// `/healthz` is merged in outside it, so the probes are never refused
-/// (`middleware::request_count`). The security headers wrap the refusal
-/// too.
+/// (`middleware::request_count`). The body deadline sits inside the
+/// count and outside every route, so whichever extractor or handler
+/// reads a body reads it under the deadline and a stalled body gives its
+/// count back at the deadline (`middleware::body_deadline`). The
+/// security headers wrap the refusals too.
 pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
     let (csp, hsts, xcto, refp, xfo) = security_headers::layers();
 
@@ -47,7 +51,7 @@ pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
     // colliding with POST-only HTTP handlers (which would 405 on GET
     // navigation and break deep-links to the login page). Their bodies
     // are held to the login limit, innermost, and its refusal gets the
-    // envelope outside it.
+    // envelope outside it. Their deadline is the router's, below.
     let auth_routes = Router::new()
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -105,10 +109,15 @@ pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
         })
     };
 
-    let counted = router.layer(axum::middleware::from_fn_with_state(
-        count,
-        crate::middleware::request_count::count_request,
-    ));
+    let counted = router
+        .layer(axum::middleware::from_fn_with_state(
+            state.limits().body_read_timeout,
+            body_deadline::bound_body_read,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            count,
+            crate::middleware::request_count::count_request,
+        ));
     let probes = Router::new().route("/healthz", get(|| async { (StatusCode::OK, "ok") }));
 
     counted

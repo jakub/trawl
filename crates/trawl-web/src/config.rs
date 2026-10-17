@@ -127,8 +127,9 @@ pub struct ProxyLimits {
     /// The most the proxy buffers of one request body before it calls
     /// trawld: `[server] max_request_body_bytes`.
     pub request_body_bytes: usize,
-    /// How long the proxy waits for a request body to arrive whole. Past
-    /// it the request is answered 408 `timeout` and its count released.
+    /// How long the proxy waits for a request body to arrive whole, on
+    /// every route (`middleware::body_deadline`). Past it the request is
+    /// answered 408 `timeout` and its count released.
     pub body_read_timeout: Duration,
     /// How long the proxy waits for trawld's response head: `[server]
     /// timeout_secs` plus [`Self::UPSTREAM_HEAD_SLACK`]. Past it the

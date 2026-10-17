@@ -45,6 +45,13 @@ impl RequestCount {
     pub fn new(size: usize) -> Self {
         Self(Arc::new(Semaphore::new(size)))
     }
+
+    /// How many requests the count still admits. For tests that need to
+    /// know the count is full before they send the request it refuses.
+    #[cfg(test)]
+    pub(crate) fn available(&self) -> usize {
+        self.0.available_permits()
+    }
 }
 
 /// Take the count for the request, or refuse it at once.

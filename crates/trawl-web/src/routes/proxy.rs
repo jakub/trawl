@@ -27,6 +27,7 @@ use futures::StreamExt as _;
 
 use crate::config::ProxyLimits;
 use crate::error::ProxyError;
+use crate::middleware::body_deadline::BodyDeadlineElapsed;
 use crate::middleware::session_extractor::Auth;
 use crate::state::AppState;
 
@@ -198,14 +199,16 @@ pub(crate) fn refuse_redirect(status: reqwest::StatusCode) -> Result<(), ProxyEr
     Ok(())
 }
 
-/// Buffer a request body whole, within the proxy's limits.
+/// Buffer a request body whole, within the proxy's body limit.
 ///
 /// A `Content-Length` past the limit is refused before a byte is read,
 /// and a body found over the limit while it streams in is refused at the
 /// byte that crosses it: 413 `request_too_large`, with trawld's sentence.
-/// A body that is not whole within the deadline is 408 `timeout`. Neither
-/// refusal contacts trawld. The count the request holds is released with
-/// the refusal, as with any response head.
+/// The body deadline is the router's (`middleware::body_deadline`); a
+/// read that fails because it passed is 408 `timeout` here, the answer
+/// the layer gives whatever a handler makes of it. Neither refusal
+/// contacts trawld. The count the request holds is released with the
+/// refusal, as with any response head.
 ///
 /// # Errors
 /// [`ProxyError::RequestTooLarge`], [`ProxyError::BodyTimeout`], or
@@ -227,29 +230,31 @@ async fn collect_body(
     if announced.is_some_and(|length| length > limit) {
         return Err(too_large());
     }
-    let read = async {
-        let mut stream = body.into_data_stream();
-        let mut chunks: Vec<Bytes> = Vec::new();
-        let mut total = 0_usize;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| ProxyError::BadRequest(format!("request body: {e}")))?;
-            total = total.saturating_add(chunk.len());
-            if total > limit {
-                return Err(too_large());
+    let mut stream = body.into_data_stream();
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut total = 0_usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            let e = e.into_inner();
+            if e.is::<BodyDeadlineElapsed>() {
+                ProxyError::BodyTimeout
+            } else {
+                ProxyError::BadRequest(format!("request body: {e}"))
             }
-            chunks.push(chunk);
+        })?;
+        total = total.saturating_add(chunk.len());
+        if total > limit {
+            return Err(too_large());
         }
-        // One chunk, the common case, goes on as it arrived; several are
-        // joined once.
-        Ok(match chunks.len() {
-            0 => Bytes::new(),
-            1 => chunks.remove(0),
-            _ => Bytes::from(chunks.concat()),
-        })
-    };
-    tokio::time::timeout(limits.body_read_timeout, read)
-        .await
-        .map_err(|_elapsed| ProxyError::BodyTimeout)?
+        chunks.push(chunk);
+    }
+    // One chunk, the common case, goes on as it arrived; several are
+    // joined once.
+    Ok(match chunks.len() {
+        0 => Bytes::new(),
+        1 => chunks.remove(0),
+        _ => Bytes::from(chunks.concat()),
+    })
 }
 
 /// Compose the upstream URL: the configured base followed by the
@@ -308,7 +313,7 @@ mod tests {
     use wiremock::{Mock, ResponseTemplate};
 
     use crate::config::ResolvedConfig;
-    use crate::middleware::request_count::RequestCount;
+    use crate::middleware::request_count::{PROXY_MAX_REQUESTS, RequestCount};
     use crate::routes;
     use crate::test_support::{HandUpstream, TlsUpstream};
 
@@ -353,6 +358,16 @@ mod tests {
         count: usize,
         adjust: impl FnOnce(&mut ResolvedConfig),
     ) -> Router {
+        limited_app_under(upstream, RequestCount::new(count), adjust)
+    }
+
+    /// [`limited_app`] under a count the test built itself, so it can
+    /// watch the count fill.
+    fn limited_app_under(
+        upstream: &HandUpstream,
+        count: RequestCount,
+        adjust: impl FnOnce(&mut ResolvedConfig),
+    ) -> Router {
         let web = WebConfig {
             allow_insecure_cookies: true,
             public_origins: vec![TEST_ORIGIN.to_owned()],
@@ -360,10 +375,21 @@ mod tests {
         };
         let mut cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
         adjust(&mut cfg);
-        routes::build_with_count(
-            AppState::from_config(cfg).unwrap(),
-            RequestCount::new(count),
-        )
+        routes::build_with_count(AppState::from_config(cfg).unwrap(), count)
+    }
+
+    /// A login whose body starts and never finishes: one byte, then
+    /// nothing, forever. It carries no token, so anyone can send it.
+    fn stalled_login() -> Request<Body> {
+        let stalled = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from("{")) })
+            .chain(futures::stream::pending());
+        Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("origin", TEST_ORIGIN)
+            .header("content-type", "application/json")
+            .body(Body::from_stream(stalled))
+            .unwrap()
     }
 
     /// A bearer POST of `body` to `path`.
@@ -762,9 +788,9 @@ mod tests {
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
     }
 
-    /// A body that stops arriving is answered 408 `timeout` at the body
-    /// deadline, trawld is never called, and the request's count is free
-    /// again for the next request.
+    /// A forwarded body that stops arriving is answered 408 `timeout` at
+    /// the body deadline, trawld is never called, and the request's count
+    /// is free again for the next request.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_collection_deadline_releases_slot() {
         let upstream = HandUpstream::start().await;
@@ -793,7 +819,7 @@ mod tests {
             resp,
             StatusCode::REQUEST_TIMEOUT,
             trawl_api::ErrorCode::Timeout,
-            "request body was not received within trawl-web's deadline",
+            crate::error::BODY_TIMEOUT_MESSAGE,
         )
         .await;
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
@@ -805,6 +831,118 @@ mod tests {
         )
         .await
         .expect("the next request was answered")
+        .unwrap();
+        assert_eq!(next.status(), StatusCode::OK, "the count was not released");
+    }
+
+    /// A login whose body stops arriving is answered 408 `timeout` at the
+    /// body deadline like the forwarder's, trawld is never asked, and the
+    /// count is free again. The deadline is the router's, not one
+    /// handler's: login reads its body through axum's `Json`, which has
+    /// no deadline of its own, and it is the route anyone can send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_stalled_login_body_releases_slot_and_answers_408() {
+        let upstream = HandUpstream::start().await;
+        let app = limited_app(&upstream, 1, |cfg| {
+            cfg.limits.body_read_timeout = Duration::from_millis(200);
+        });
+
+        let started = std::time::Instant::now();
+        let resp =
+            tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(stalled_login()))
+                .await
+                .expect("the deadline answered the stalled login")
+                .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(160),
+            "answered before the deadline: {:?}",
+            started.elapsed()
+        );
+        assert_envelope_refusal(
+            resp,
+            StatusCode::REQUEST_TIMEOUT,
+            trawl_api::ErrorCode::Timeout,
+            crate::error::BODY_TIMEOUT_MESSAGE,
+        )
+        .await;
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+
+        // The only count is free again.
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(bearer_get("/api/v1/schema")),
+        )
+        .await
+        .expect("the next request was answered")
+        .unwrap();
+        assert_eq!(next.status(), StatusCode::OK, "the count was not released");
+    }
+
+    /// Sixty-four stalled login bodies, the whole production count, hold
+    /// it only until the deadline. While they stall, the next request is
+    /// refused; at the deadline every one of them is answered 408; and
+    /// the request after them is served. No token is needed to send a
+    /// login, so without the deadline this is a pre-authentication
+    /// lockout of every route but `/healthz`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_stalled_logins_release_the_whole_count_at_the_deadline() {
+        let upstream = HandUpstream::start().await;
+        let count = RequestCount::new(PROXY_MAX_REQUESTS);
+        let app = limited_app_under(&upstream, count.clone(), |cfg| {
+            cfg.limits.body_read_timeout = Duration::from_millis(500);
+        });
+
+        let stalled: Vec<_> = (0..PROXY_MAX_REQUESTS)
+            .map(|_| tokio::spawn(app.clone().oneshot(stalled_login())))
+            .collect();
+        let started = std::time::Instant::now();
+        while count.available() > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{} of the stalled logins never took a count",
+                count.available()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Full: the next request is refused at once, not queued.
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone().oneshot(bearer_get("/api/v1/schema")),
+        )
+        .await
+        .expect("the refusal is immediate")
+        .unwrap();
+        assert_proxy_request_limit_refusal(refused).await;
+
+        // The deadline answers every stalled login and frees its count.
+        for login in stalled {
+            let resp = tokio::time::timeout(Duration::from_secs(5), login)
+                .await
+                .expect("the deadline answered the stalled login")
+                .unwrap()
+                .unwrap();
+            assert_envelope_refusal(
+                resp,
+                StatusCode::REQUEST_TIMEOUT,
+                trawl_api::ErrorCode::Timeout,
+                crate::error::BODY_TIMEOUT_MESSAGE,
+            )
+            .await;
+        }
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+        assert_eq!(
+            count.available(),
+            PROXY_MAX_REQUESTS,
+            "a stalled login kept its count"
+        );
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(bearer_get("/api/v1/schema")),
+        )
+        .await
+        .expect("the request after the stalled logins was answered")
         .unwrap();
         assert_eq!(next.status(), StatusCode::OK, "the count was not released");
     }

@@ -114,9 +114,10 @@ pub enum ProxyError {
     },
 
     /// A request body that did not arrive whole within
-    /// [`crate::config::ProxyLimits::BODY_READ_TIMEOUT`]. Answered 408
-    /// with the envelope code `timeout`; the request's count is released
-    /// with it. Nothing was sent to trawld.
+    /// [`crate::config::ProxyLimits::BODY_READ_TIMEOUT`], the deadline
+    /// `middleware::body_deadline` holds every route's body to. Answered
+    /// 408 with the envelope code `timeout`; the request's count is
+    /// released with it. Nothing was sent to trawld.
     #[error("request body not received in time")]
     BodyTimeout,
 
@@ -127,6 +128,10 @@ pub enum ProxyError {
     #[error("upstream response head not received in time")]
     UpstreamHeadTimeout,
 }
+
+/// The 408 the proxy answers when a request body is not whole by the
+/// body deadline.
+pub const BODY_TIMEOUT_MESSAGE: &str = "request body was not received within trawl-web's deadline";
 
 /// The 504 the proxy answers when trawld's head is late. It says the
 /// work may still be running, because trawld only learns of the drop
@@ -175,7 +180,7 @@ impl IntoResponse for ProxyError {
                 return envelope(
                     StatusCode::REQUEST_TIMEOUT,
                     ErrorCode::Timeout,
-                    "request body was not received within trawl-web's deadline",
+                    BODY_TIMEOUT_MESSAGE,
                 );
             }
             Self::UpstreamHeadTimeout => {
