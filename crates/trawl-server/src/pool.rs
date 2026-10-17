@@ -1048,16 +1048,20 @@ pub struct ExecutorPool {
     #[cfg(any(test, feature = "test-support"))]
     seams: Arc<seam::Table>,
     /// A connection to the query database that no permit hands out: the
-    /// source of [`Self::detached_executor`]. Declared after the registry
-    /// and before the scratch lock, so the database's connections close
-    /// before the lock on the directory holding its spill is released.
+    /// source of [`Self::detached_executor`] and of the engine sample's
+    /// connection.
     clone_source: Arc<Mutex<Executor>>,
-    /// The locked query scratch directory: the query database spills into
-    /// it, and hot-buffer snapshots and export staging files are made in
-    /// it (ADR-0056).
-    scratch: Arc<ScratchLock>,
+    /// The query scratch directory: the query database spills into it, and
+    /// hot-buffer snapshots and export staging files are made in it
+    /// (ADR-0056). Its lock is not held here but by every connection to
+    /// the query database ([`Executor::open_query_database`]), so it stays
+    /// held while any worker's connection is open, the pool gone or not.
+    scratch: QueryScratch,
     /// The temp directory a [`Self::for_test`] pool's scratch lives in,
-    /// declared last so it is removed after everything inside it closed.
+    /// declared last so it is removed after the pool's own connections
+    /// closed. A worker that outlives the pool does not hold it: a test
+    /// that drops a pool with retained work makes its own scratch
+    /// directory.
     #[cfg(any(test, feature = "test-support"))]
     _test_scratch: Option<Arc<tempfile::TempDir>>,
 }
@@ -1287,8 +1291,9 @@ impl ExecutorPool {
     /// Opens the query database in the locked `scratch` directory under
     /// `budgets` ([`Executor::open_query_database`]), then pre-creates
     /// `max_concurrent` executors cloned from it, so every query shares one
-    /// spill cap, one memory limit and one thread count (ADR-0056). The
-    /// pool keeps `scratch` locked for as long as any clone of it lives.
+    /// spill cap, one memory limit and one thread count (ADR-0056). Every
+    /// connection to that database holds `scratch`, so the directory stays
+    /// locked for as long as any of them is open.
     ///
     /// # Errors
     /// The database or its spill directory could not be set up, as when the
@@ -1304,7 +1309,8 @@ impl ExecutorPool {
         scratch: Arc<ScratchLock>,
         budgets: &QueryBudgets,
     ) -> Result<Self, trawl_engine::error::EngineError> {
-        let root = Executor::open_query_database(scratch.scratch(), budgets)?;
+        let query_scratch = scratch.scratch().clone();
+        let root = Executor::open_query_database(scratch, budgets)?;
         let mut executors = Vec::with_capacity(max_concurrent);
         for _ in 0..max_concurrent {
             executors.push(root.try_clone()?);
@@ -1337,7 +1343,7 @@ impl ExecutorPool {
             #[cfg(any(test, feature = "test-support"))]
             seams: Arc::new(seam::Table::default()),
             clone_source: Arc::new(Mutex::new(root)),
-            scratch,
+            scratch: query_scratch,
             #[cfg(any(test, feature = "test-support"))]
             _test_scratch: None,
         })
@@ -1404,14 +1410,7 @@ impl ExecutorPool {
     /// The query scratch directory this pool's database spills into.
     #[must_use]
     pub fn scratch(&self) -> &QueryScratch {
-        self.scratch.scratch()
-    }
-
-    /// The lock on the query scratch directory, for a holder that must keep
-    /// it for as long as its own connection to the query database lives.
-    #[must_use]
-    pub fn scratch_lock(&self) -> Arc<ScratchLock> {
-        Arc::clone(&self.scratch)
+        &self.scratch
     }
 
     /// The connection the engine sample runs on (ADR-0056): cloned from the
@@ -1767,7 +1766,7 @@ impl ExecutorPool {
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
         let hot_buffer = self.hot_buffer.clone();
-        let scratch = Arc::clone(&self.scratch);
+        let scratch = self.scratch.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
         // Dispatch to the work-start transition; the worker ends it.
@@ -1830,7 +1829,7 @@ impl ExecutorPool {
                         clock,
                         &dsl,
                         &source,
-                        hot_buffer.as_ref().map(|hb| (hb, scratch.scratch())),
+                        hot_buffer.as_ref().map(|hb| (hb, &scratch)),
                         &pins,
                         cap,
                         utc_offset_secs,
@@ -2348,7 +2347,7 @@ impl ExecutorPool {
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
         let hot_buffer = self.hot_buffer.clone();
-        let scratch = Arc::clone(&self.scratch);
+        let scratch = self.scratch.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
         // Dispatch to the work-start transition; the worker ends it.
@@ -2374,14 +2373,14 @@ impl ExecutorPool {
 
                     // Write to a staging file in the query scratch
                     // directory (ADR-0056), then read it back as bytes.
-                    let tmp = scratch.scratch().export_file().map_err(|e| {
+                    let tmp = scratch.export_file().map_err(|e| {
                         ServerError::Internal(format!("failed to create temp file: {e}"))
                     })?;
                     let tmp_path = tmp.path().to_owned();
 
                     // Snapshot hot buffer for fresh events.
                     let hot_snapshot = hot_source(hot_buffer.as_ref().map_or(Ok(None), |hb| {
-                        clock.time(QueryPhase::HotSnapshot, || hb.snapshot(scratch.scratch()))
+                        clock.time(QueryPhase::HotSnapshot, || hb.snapshot(&scratch))
                     }))?;
 
                     let pins = clock.time(QueryPhase::Source, || field_catalog.all());
@@ -4628,6 +4627,105 @@ mod tests {
         .await;
         assert!(!pool.cancel_by_id(id));
         assert!(registry_is_empty(&pool));
+    }
+
+    /// Work that outlives its request and its pool keeps the query scratch
+    /// directory locked until its connection to the query database closes
+    /// (ADR-0056), whichever lane it came through. A field sample and a
+    /// `from saved` run park past their deadlines; then the pool and the
+    /// engine sampler drop. A second lock on the directory must refuse
+    /// while either worker still holds a connection: taking it would
+    /// reclaim the spill directory the parked database still writes into.
+    /// Once both workers finish, the lock frees, and the database removed
+    /// its own spill directory on the way out.
+    #[tokio::test(start_paused = true)]
+    async fn a_retained_worker_keeps_the_scratch_locked_past_its_pool() {
+        use trawl_engine::scratch::{Reclaimed, ScratchError};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("query-scratch");
+        let pool = ExecutorPool::new(
+            "/nonexistent".into(),
+            2,
+            100,
+            None,
+            Arc::new(ScratchLock::open(&path).expect("the first lock")),
+            &QueryBudgets {
+                spill_max_bytes: crate::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
+                memory_limit: crate::config::DEFAULT_QUERY_MEMORY_LIMIT,
+                threads: crate::config::DEFAULT_QUERY_THREADS,
+            },
+        )
+        .expect("pool");
+        let sample = crate::engine_sample::EngineSample::start(&pool).expect("sampler");
+        sample.wait_for_first();
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
+
+        let sampler = pool.clone();
+        let field = tokio::spawn(async move {
+            sampler
+                .sample_field_values(
+                    "service",
+                    None,
+                    10,
+                    Deadline::after(Duration::from_secs(5)),
+                    TEST_SAMPLE_WORK,
+                )
+                .await
+        });
+        until("the field sample starts", || started.arrivals() == 1).await;
+        let saved = pool.clone();
+        let run = tokio::spawn(async move {
+            saved
+                .execute_with_source(
+                    saved.allocate_query_id(),
+                    "*",
+                    "read_parquet('/nonexistent/run.parquet')",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("the saved run starts", || started.arrivals() == 2).await;
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let field = field.await.expect("the sample joins");
+        assert!(matches!(field, Err(ServerError::Timeout)), "{field:?}");
+        let run = run.await.expect("the run joins").result;
+        assert!(matches!(run, Err(ServerError::Timeout)), "{run:?}");
+        assert_eq!(pool.retained(), 2, "both workers outlive their requests");
+
+        sample.stop_and_wait_for_test();
+        drop(pool);
+        let refused = ScratchLock::open(&path).expect_err("a parked worker still holds the lock");
+        assert!(
+            matches!(refused, ScratchError::Locked { .. }),
+            "expected the held lock, got {refused}"
+        );
+
+        started.release();
+        let begun = std::time::Instant::now();
+        let reopened = loop {
+            match ScratchLock::open(&path) {
+                Ok(lock) => break lock,
+                Err(ScratchError::Locked { .. }) => {
+                    assert!(
+                        begun.elapsed() < Duration::from_secs(20),
+                        "the lock never freed after the workers finished"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("the scratch directory refused a reopen: {error}"),
+            }
+        };
+        assert_eq!(
+            reopened.reclaimed(),
+            Reclaimed::default(),
+            "the database removed its own spill directory before the lock freed"
+        );
     }
 
     /// When the cutover cannot take the pool, the log says what is in the

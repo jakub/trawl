@@ -9,11 +9,12 @@
 
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, QueryBudgets};
-use trawl_engine::scratch::{QueryScratch, is_spill_dir_name};
+use trawl_engine::scratch::{Reclaimed, ScratchError, ScratchLock, is_spill_dir_name};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -39,6 +40,11 @@ fn budgets(spill: u64, memory: u64, threads: u32) -> QueryBudgets {
     }
 }
 
+/// The query scratch directory at `path`, locked for this test.
+fn lock(path: &Path) -> ScratchLock {
+    ScratchLock::open(path).expect("the scratch directory locks")
+}
+
 /// The one spill directory the query database made in `scratch`.
 fn spill_dir_in(scratch: &Path) -> PathBuf {
     let mut dirs: Vec<_> = std::fs::read_dir(scratch)
@@ -56,7 +62,7 @@ fn query_budgets_read_back_from_a_clone() {
     let scratch = tempfile::tempdir().expect("scratch");
     // Values off the 1000/1024 boundary, so a unit mix-up reads back wrong.
     let configured = budgets(48 * MIB, 96 * MIB, 3);
-    let root = Executor::open_query_database(&QueryScratch::new(scratch.path()), &configured)
+    let root = Executor::open_query_database(Arc::new(lock(scratch.path())), &configured)
         .expect("the query database opens");
 
     let spill = spill_dir_in(scratch.path());
@@ -107,8 +113,12 @@ fn query_budgets_read_back_from_a_clone() {
 
     drop((root, clone));
     assert!(spill.is_dir(), "the diagnostic connection still holds it");
+    let held = ScratchLock::open(scratch.path()).expect_err("an open connection holds the lock");
+    assert!(matches!(held, ScratchError::Locked { .. }), "{held}");
     drop(diagnostic);
     assert!(!spill.exists(), "the last connection removed it");
+    let reopened = ScratchLock::open(scratch.path()).expect("the last connection freed the lock");
+    assert_eq!(reopened.reclaimed(), Reclaimed::default());
 }
 
 /// Budgets `DuckDB` takes at a different value are refused at open, not
@@ -118,7 +128,7 @@ fn query_budgets_read_back_from_a_clone() {
 fn a_budget_that_reads_back_differently_refuses_the_open() {
     let scratch = tempfile::tempdir().expect("scratch");
     let error = Executor::open_query_database(
-        &QueryScratch::new(scratch.path()),
+        Arc::new(lock(scratch.path())),
         &budgets(32 * MIB, u64::MAX / 2, 2),
     )
     .expect_err("an unrepresentable memory limit");
@@ -225,7 +235,7 @@ fn spill_probe_child() {
         next().to_owned(),
     );
     let exec = Executor::open_query_database(
-        &QueryScratch::new(&scratch),
+        Arc::new(lock(Path::new(&scratch))),
         &budgets(spill, memory, threads),
     )
     .expect("open");

@@ -24,6 +24,7 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
 use crate::error::{DuckDbDiagnostic, EngineError};
+use crate::scratch::ScratchLock;
 use crate::timing::{Fallback, PhaseClock, QueryPhase};
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64};
 
@@ -478,7 +479,7 @@ impl DiagnosticConnection {
 pub struct DiagnosticConnection {
     // Declared first, so it drops first, as in `Executor`.
     conn: Connection,
-    _spill: Arc<tempfile::TempDir>,
+    _spill: Arc<Spill>,
 }
 
 impl DiagnosticConnection {
@@ -496,15 +497,34 @@ impl DiagnosticConnection {
     }
 }
 
+/// What every connection to one database holds behind its connection: the
+/// database's private spill directory and, for the query database, the
+/// lock on the scratch directory that spill directory sits in (ADR-0056).
+///
+/// [`Executor`] and [`DiagnosticConnection`] declare their connection
+/// before it, so the connection closes first. The last connection of the
+/// database to close removes the spill directory and only then releases
+/// the lock. No other trawld can take the scratch directory, and with it
+/// reclaim this spill directory, while any connection to the database is
+/// open, whatever holds that connection: a pool, a worker that outlived
+/// its request and its pool, the engine sample or a detached executor.
+#[derive(Debug)]
+struct Spill {
+    // Declared first, so the directory is removed while the lock holds.
+    dir: tempfile::TempDir,
+    _scratch: Option<Arc<ScratchLock>>,
+}
+
 /// Query executor backed by an in-memory `DuckDB` connection.
 #[derive(Debug)]
 pub struct Executor {
     // Declared first, so it drops first: `DuckDB` closes and removes its
     // spill files before the directory holding them goes.
     conn: Connection,
-    /// The database's private spill directory, shared with every clone
-    /// and removed when the last of them drops.
-    spill: Arc<tempfile::TempDir>,
+    /// The database's private spill directory, and the scratch lock over
+    /// it, shared with every clone and released when the last of them
+    /// drops ([`Spill`]).
+    spill: Arc<Spill>,
 }
 
 impl Executor {
@@ -529,24 +549,40 @@ impl Executor {
     /// It sets no budgets, so `DuckDB` sizes its memory and spill caps from
     /// the host. trawld's query database is [`Self::open_query_database`].
     pub fn new() -> Result<Self, EngineError> {
-        Self::open(private_spill_dir()?, crate::scratch::TMPDIR_SETTING, None)
+        Self::open(
+            Spill {
+                dir: private_spill_dir()?,
+                _scratch: None,
+            },
+            crate::scratch::TMPDIR_SETTING,
+            None,
+        )
     }
 
     /// Open the query database (ADR-0056): spill into a private directory
-    /// inside `scratch`, under `budgets`.
+    /// inside the scratch directory `scratch` locks, under `budgets`.
     ///
     /// The budgets are database-global and go on before anything clones
     /// the database, so every later clone shares them. A clone then reads
     /// each one back, and a setting `DuckDB` rejects or reads back
     /// differently refuses the open. The spill directory is made and
-    /// checked as [`Self::new`] describes, inside `scratch` instead of the
-    /// system temp dir.
+    /// checked as [`Self::new`] describes, inside the scratch directory
+    /// instead of the system temp dir.
+    ///
+    /// Every connection to the database, this one and each clone, holds
+    /// `scratch` until it closes ([`Spill`]), so the directory stays locked
+    /// for as long as any of them is open, and no longer than that unless
+    /// another holder keeps it.
     pub fn open_query_database(
-        scratch: &crate::scratch::QueryScratch,
+        scratch: Arc<ScratchLock>,
         budgets: &QueryBudgets,
     ) -> Result<Self, EngineError> {
+        let dir = scratch.scratch().private_spill_dir()?;
         let root = Self::open(
-            scratch.private_spill_dir()?,
+            Spill {
+                dir,
+                _scratch: Some(scratch),
+            },
             crate::scratch::SCRATCH_SETTING,
             Some(budgets),
         )?;
@@ -562,13 +598,13 @@ impl Executor {
     /// diagnostic the error classification reads ([`DuckDbDiagnostic`]),
     /// including a refused budget below.
     fn open(
-        spill: tempfile::TempDir,
+        spill: Spill,
         setting: &str,
         budgets: Option<&QueryBudgets>,
     ) -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(ERRORS_AS_JSON_SQL)?;
-        conn.execute_batch(&temp_directory_statement(spill.path(), setting)?)?;
+        conn.execute_batch(&temp_directory_statement(spill.dir.path(), setting)?)?;
         if let Some(budgets) = budgets {
             conn.execute_batch(&budgets.statements())?;
         }
@@ -4891,21 +4927,22 @@ mod structured_error_classification {
         classify_export_outcome, classify_query_outcome, cold_action, is_binder_column_error,
         is_no_files_error, remap_binder_error,
     };
-    use crate::scratch::QueryScratch;
+    use crate::scratch::ScratchLock;
 
     const MIB: u64 = 1024 * 1024;
 
     /// A query database in a fresh scratch directory under these budgets.
     fn query_database(spill: u64, memory: u64) -> (tempfile::TempDir, Executor) {
-        let scratch = tempfile::tempdir().expect("scratch");
+        let parent = tempfile::tempdir().expect("scratch parent");
+        let scratch = ScratchLock::open(&parent.path().join("query-scratch")).expect("scratch");
         let budgets = QueryBudgets {
             spill_max_bytes: NonZeroU64::new(spill).unwrap(),
             memory_limit: NonZeroU64::new(memory).unwrap(),
             threads: NonZeroU32::new(2).unwrap(),
         };
-        let exec = Executor::open_query_database(&QueryScratch::new(scratch.path()), &budgets)
+        let exec = Executor::open_query_database(std::sync::Arc::new(scratch), &budgets)
             .expect("the query database opens");
-        (scratch, exec)
+        (parent, exec)
     }
 
     /// The raw error `sql` raises on `exec`'s own connection, rows drained.

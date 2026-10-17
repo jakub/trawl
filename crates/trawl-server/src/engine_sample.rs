@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::DiagnosticConnection;
-use trawl_engine::scratch::ScratchLock;
 
 /// How often the sampler starts a probe. A probe that runs into the next
 /// start skips it: the next probe starts at the first start time after
@@ -133,13 +132,11 @@ pub(crate) trait Probe: Send + 'static {
 
 /// The production probe: `SELECT 1` on the diagnostic connection.
 ///
-/// Holds the scratch lock as well as the connection, declared after it, so
-/// a sampler that outlives the pool still closes its connection to the
-/// query database before the directory that database spills into is
-/// unlocked.
+/// The connection holds the query scratch lock until it closes, so a
+/// sampler that outlives the pool keeps the directory its database spills
+/// into locked.
 struct DiagnosticProbe {
     connection: DiagnosticConnection,
-    _scratch: Arc<ScratchLock>,
 }
 
 impl Probe for DiagnosticProbe {
@@ -294,7 +291,6 @@ impl EngineSample {
             connection: pool
                 .diagnostic_connection()
                 .map_err(|e| std::io::Error::other(e.to_string()))?,
-            _scratch: pool.scratch_lock(),
         };
         Self::spawn(probe, SampleConfig::DEFAULT, Arc::new(MonotonicClock))
     }
@@ -514,6 +510,23 @@ impl EngineSample {
                 state.publish(Outcome::Overran);
             }
             EngineCheck::Error => state.publish(Outcome::Failed),
+        }
+    }
+}
+
+#[cfg(test)]
+impl EngineSample {
+    /// Drop this handle, which must be the last, and wait until both
+    /// sampler threads have left. The sampler thread drops its probe before
+    /// it lets go of the shared state, so once no thread holds that state
+    /// the probe's connection is closed.
+    pub(crate) fn stop_and_wait_for_test(self) {
+        let shared = Arc::downgrade(&self.shared);
+        drop(self);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while shared.strong_count() > 0 {
+            assert!(Instant::now() < deadline, "the sampler threads never left");
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }
