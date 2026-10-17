@@ -16,6 +16,7 @@ use ratatui::widgets::{
 };
 use std::collections::HashSet;
 use trawl_api::display::{downsample, extract_series, is_timechart_result, value_to_string};
+use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 use trawl_engine::value::Value;
 
 use crate::tui::App;
@@ -33,6 +34,40 @@ fn pane_title(status: &TabStatus, theme: &Theme) -> Line<'static> {
         TabStatus::Error { .. } => (" Error ", theme.status_error),
     };
     Line::from(Span::styled(text, Style::default().fg(color)))
+}
+
+/// A results title for a result whose live aggregate dropped input past a
+/// cap (ADR-0001): the mark leads, in the warning colour, so a narrow pane
+/// cuts the row counts before it cuts the warning. Without a cap the title
+/// is unchanged. The result is still a result, so nothing here reads as an
+/// error.
+fn capped_title(
+    title: impl Into<Line<'static>>,
+    capped: &[SnapshotCap],
+    theme: &Theme,
+) -> Line<'static> {
+    let mut title = title.into();
+    if !capped.is_empty() {
+        let caps: Vec<String> = capped
+            .iter()
+            .map(|c| format!("{} > {}", cap_label(c.cap), c.limit))
+            .collect();
+        let mark = format!(" partial: {} ", caps.join(", "));
+        title.spans.insert(
+            0,
+            Span::styled(mark, Style::default().fg(theme.status_warning)),
+        );
+    }
+    title
+}
+
+/// What a cap bounds, as the results title names it.
+fn cap_label(cap: SnapshotCapKind) -> &'static str {
+    match cap {
+        SnapshotCapKind::Groups => "groups",
+        SnapshotCapKind::DistinctValues => "distinct values",
+        SnapshotCapKind::ExactValues => "exact values",
+    }
 }
 
 /// Render the results pane (table/sparkline + optional search bar).
@@ -333,9 +368,13 @@ fn render_table(
         _ => {
             let scroll_start = pinned_count + h_scroll + 1;
             let scroll_end = (pinned_count + h_scroll + visible_scrollable).min(visible_count);
-            Line::from(format!(
-                " Results ({total_rows} rows, cols {scroll_start}-{scroll_end}/{visible_count}{pinned_info}{hidden_info}) "
-            ))
+            capped_title(
+                format!(
+                    " Results ({total_rows} rows, cols {scroll_start}-{scroll_end}/{visible_count}{pinned_info}{hidden_info}) "
+                ),
+                &tab.live_capped,
+                theme,
+            )
         }
     };
 
@@ -748,7 +787,7 @@ fn render_line_chart(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .title(capped_title(title, &app.active_tab().live_capped, theme))
         .title_bottom(series_info)
         .border_style(border_style);
 
@@ -933,7 +972,11 @@ fn render_bar_chart(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {metric_name} by {label_name} "))
+        .title(capped_title(
+            format!(" {metric_name} by {label_name} "),
+            &app.active_tab().live_capped,
+            theme,
+        ))
         .title_bottom(" 'v' to toggle view ")
         .border_style(border_style);
 
@@ -1041,7 +1084,7 @@ fn render_sparkline(
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(title)
+            .title(capped_title(title, &app.active_tab().live_capped, theme))
             .title_bottom(format!(" {} points  •  'v' to toggle view ", values.len()))
             .border_style(border_style)
             .padding(Padding::horizontal(1));
@@ -1209,7 +1252,7 @@ fn render_stacked_sparklines(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
+        .title(capped_title(title, &app.active_tab().live_capped, theme))
         .title_bottom(series_info)
         .border_style(border_style)
         .padding(Padding::new(1, 1, 1, 0));

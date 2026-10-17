@@ -79,6 +79,9 @@ pub(super) struct QueryResult {
     pub(super) result: Result<QueryResponse, QueryError>,
     /// Execution duration.
     pub(super) duration: Duration,
+    /// The caps a live aggregate snapshot reported as having dropped input
+    /// (ADR-0001). Empty for every other result.
+    pub(super) capped: Vec<trawl_api::stream::SnapshotCap>,
 }
 
 /// Result of a mutation operation (save/delete saved query).
@@ -273,7 +276,11 @@ impl App {
                 result.is_ok()
             );
 
-            let _ = tx.send(QueryResult { result, duration });
+            let _ = tx.send(QueryResult {
+                result,
+                duration,
+                capped: Vec::new(),
+            });
         });
 
         // Store handle for cancellation.
@@ -526,6 +533,7 @@ impl App {
                     }
 
                     tab.result = Some(response);
+                    tab.live_capped = query_result.capped;
                     #[allow(clippy::cast_possible_truncation)] // Query duration < u64::MAX ms
                     let duration_ms = query_result.duration.as_millis() as u64;
                     tab.status = TabStatus::Success { duration_ms };
@@ -985,7 +993,7 @@ fn snapshot_large_unsigned_exact() {
         serde_json::from_str(r#"[{"service":"nginx","total":18446744073709551615}]"#)
             .expect("valid snapshot JSON");
     let mut buffer = state::LiveBuffer::new(10);
-    buffer.replace_with_snapshot(&["service".to_owned(), "total".to_owned()], &rows);
+    buffer.replace_with_snapshot(&["service".to_owned(), "total".to_owned()], &rows, &[]);
 
     let response = buffer.to_query_response();
     assert_eq!(
@@ -1578,6 +1586,7 @@ mod tests {
             .send(QueryResult {
                 result: Ok(response),
                 duration: Duration::from_millis(50),
+                capped: Vec::new(),
             })
             .unwrap();
 
@@ -1585,6 +1594,81 @@ mod tests {
 
         assert!(app.tab.result.is_some());
         assert!(matches!(app.tab.status, TabStatus::Success { .. }));
+    }
+
+    /// A live aggregate that dropped input is still a result, not an error:
+    /// the rows render, and the results title carries the cap in the
+    /// theme's warning colour, ahead of the row counts so a narrow pane
+    /// keeps it. The latest snapshot decides, so one with nothing dropped
+    /// clears the mark.
+    #[test]
+    fn live_capped_snapshot_marks_results_title() {
+        use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+
+        const MARK: &str = " partial: groups > 10000 ";
+        let capped = vec![SnapshotCap {
+            cap: SnapshotCapKind::Groups,
+            limit: 10_000,
+        }];
+        let snapshot = |capped: Vec<SnapshotCap>| QueryResult {
+            result: Ok(make_query_response(
+                vec!["host", "count"],
+                vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+            )),
+            duration: Duration::from_secs(0),
+            capped,
+        };
+        let title_row = |app: &mut App, width: u16| {
+            let backend = ratatui::backend::TestBackend::new(width, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| ui::render(app, frame)).unwrap();
+            let area = app
+                .layout
+                .results
+                .expect("the query layout has a results pane");
+            let buffer = terminal.backend().buffer().clone();
+            let cells: Vec<_> = (area.x..area.x + area.width)
+                .map(|x| buffer[(x, area.y)].clone())
+                .collect();
+            (cells, terminal.backend().to_string())
+        };
+
+        for width in [100_u16, 40] {
+            let mut app = test_app();
+            app.query_tx.send(snapshot(capped.clone())).unwrap();
+            app.poll_query_results();
+            assert!(
+                matches!(app.tab.status, TabStatus::Success { .. }),
+                "a capped snapshot is a result: {:?}",
+                app.tab.status
+            );
+
+            let (cells, screen) = title_row(&mut app, width);
+            let text: String = cells.iter().map(ratatui::buffer::Cell::symbol).collect();
+            let at = text
+                .find(MARK)
+                .unwrap_or_else(|| panic!("width {width}: no mark in {text:?}"));
+            let start = text[..at].chars().count();
+            for cell in &cells[start..start + MARK.chars().count()] {
+                assert_eq!(
+                    cell.fg, app.theme.status_warning,
+                    "width {width}: the mark is a warning: {text:?}"
+                );
+            }
+            assert!(
+                screen.contains("web-1"),
+                "width {width}: rows render\n{screen}"
+            );
+
+            app.query_tx.send(snapshot(Vec::new())).unwrap();
+            app.poll_query_results();
+            let (cells, _) = title_row(&mut app, width);
+            let text: String = cells.iter().map(ratatui::buffer::Cell::symbol).collect();
+            assert!(
+                !text.contains("partial"),
+                "width {width}: an uncapped snapshot clears the mark: {text:?}"
+            );
+        }
     }
 
     #[test]
@@ -1597,6 +1681,7 @@ mod tests {
                     details: Vec::new(),
                 }),
                 duration: Duration::from_millis(10),
+                capped: Vec::new(),
             })
             .unwrap();
 
@@ -1619,6 +1704,7 @@ mod tests {
             .send(QueryResult {
                 result: Ok(response),
                 duration: Duration::from_millis(1),
+                capped: Vec::new(),
             })
             .unwrap();
 
@@ -1644,6 +1730,7 @@ mod tests {
             .send(QueryResult {
                 result: Ok(response),
                 duration: Duration::from_millis(1),
+                capped: Vec::new(),
             })
             .unwrap();
 
@@ -1788,6 +1875,7 @@ mod tests {
                 .send(QueryResult {
                     result: Ok(response),
                     duration: Duration::from_millis(1),
+                    capped: Vec::new(),
                 })
                 .unwrap();
         }

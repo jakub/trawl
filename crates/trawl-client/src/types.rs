@@ -74,6 +74,9 @@ pub enum StreamEvent {
         columns: Vec<String>,
         /// Each row is a field map of column→value.
         rows: Vec<serde_json::Map<String, serde_json::Value>>,
+        /// The caps that dropped input since the stream started, so the
+        /// rows are partial. Empty when nothing was dropped (ADR-0001).
+        capped: Vec<trawl_api::stream::SnapshotCap>,
     },
     /// Server-side error message.
     Error(String),

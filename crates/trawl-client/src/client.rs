@@ -1023,16 +1023,21 @@ impl HttpClient {
                         }
                         Some("snapshot") => {
                             if let Some(data) = event_data {
-                                // Parse {"columns":[...],"rows":[...]} payload.
+                                // Parse {"columns":[...],"rows":[...],"capped":[...]}
+                                // payload; `capped` is omitted when nothing
+                                // was dropped.
                                 #[derive(serde::Deserialize)]
                                 struct SnapshotPayload {
                                     columns: Vec<String>,
                                     rows: Vec<serde_json::Map<String, serde_json::Value>>,
+                                    #[serde(default)]
+                                    capped: Vec<trawl_api::stream::SnapshotCap>,
                                 }
                                 if let Ok(s) = serde_json::from_str::<SnapshotPayload>(&data) {
                                     yield StreamEvent::Snapshot {
                                         columns: s.columns,
                                         rows: s.rows,
+                                        capped: s.capped,
                                     };
                                 }
                             }
@@ -1884,6 +1889,70 @@ mod tests {
         let (result, request) = tokio::join!(client.health(), serve_once(listener, response));
         assert!(request.starts_with("GET /api/v1/health "), "{request}");
         result
+    }
+
+    /// A snapshot frame's `capped` reaches the event; a frame without it
+    /// reads as nothing dropped.
+    #[tokio::test]
+    async fn snapshot_event_carries_capped() {
+        use futures::StreamExt as _;
+        use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let body = concat!(
+            "event: snapshot\n",
+            r#"data: {"columns":["host","count"],"rows":[{"host":"a","count":1}],"capped":[{"cap":"groups","limit":10000},{"cap":"exact_values","limit":100000}]}"#,
+            "\n\n",
+            "event: snapshot\n",
+            r#"data: {"columns":["count"],"rows":[{"count":2}]}"#,
+            "\n\n",
+        );
+        let response = http_response("200 OK", "text/event-stream", body.as_bytes());
+        let (events, request) = tokio::join!(
+            async {
+                let stream = client.stream_events("* | stats count() by host").await?;
+                Ok::<_, ClientError>(stream.collect::<Vec<_>>().await)
+            },
+            serve_once(listener, response)
+        );
+        assert!(request.starts_with("GET /api/v1/stream?"), "{request}");
+        let events: Vec<StreamEvent> = events
+            .expect("the stream opens")
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .expect("every frame reads");
+        let capped: Vec<Vec<SnapshotCap>> = events
+            .into_iter()
+            .map(|event| match event {
+                StreamEvent::Snapshot { capped, .. } => capped,
+                other => panic!("expected a snapshot, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            capped,
+            vec![
+                vec![
+                    SnapshotCap {
+                        cap: SnapshotCapKind::Groups,
+                        limit: 10_000,
+                    },
+                    SnapshotCap {
+                        cap: SnapshotCapKind::ExactValues,
+                        limit: 100_000,
+                    },
+                ],
+                Vec::new(),
+            ]
+        );
     }
 
     /// An unavailable daemon answers 503 with its per-check body. That body
