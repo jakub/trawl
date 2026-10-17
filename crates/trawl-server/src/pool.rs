@@ -4629,6 +4629,105 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
+    /// A budget exhausted by the `_raw`-free retry is the query's answer
+    /// (ADR-0056). A bare word binds `_raw`, a corpus without it fails that
+    /// bind, and the retry that binds `message` instead runs out of the
+    /// shared budget. Reporting the first attempt's missing `_raw` there
+    /// answered a 400 for a column the reader never named, and, with a hot
+    /// buffer, routed the query into the hot-only fallback and a 200 that
+    /// left the cold rows out. Both lanes, with and without a hot buffer,
+    /// must answer `query_resource_exhausted`.
+    #[tokio::test]
+    async fn an_exhausted_raw_free_retry_answers_resource_exhausted() {
+        use std::num::{NonZeroU32, NonZeroU64};
+
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+        use trawl_engine::error::EngineError;
+
+        const MIB: u64 = 1024 * 1024;
+        const DSL: &str = "hello | dedup message | stats count()";
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data = dir.path().join("data");
+        let hour = data.join("prod/2026-01-03/00");
+        std::fs::create_dir_all(&hour).expect("hour dir");
+        let corpus = hour.join("svc.parquet");
+        duckdb::Connection::open_in_memory()
+            .expect("fixture duckdb")
+            .execute_batch(&format!(
+                "COPY (SELECT TIMESTAMP '2026-01-03 00:05:00' AS _time, \
+                 'hello ' || i::VARCHAR AS message FROM range(1000000) t(i)) \
+                 TO '{}' (FORMAT PARQUET)",
+                corpus.to_str().expect("utf-8")
+            ))
+            .expect("a corpus with no _raw column");
+        let budgets = QueryBudgets {
+            spill_max_bytes: NonZeroU64::new(4 * MIB).unwrap(),
+            memory_limit: NonZeroU64::new(32 * MIB).unwrap(),
+            threads: NonZeroU32::new(2).unwrap(),
+        };
+        let hot = || {
+            let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+                max_events: 100,
+                max_bytes: 1 << 20,
+            }));
+            let mut event = serde_json::Map::new();
+            event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+            event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
+            event.insert("service".into(), "svc".into());
+            event.insert("message".into(), "hello hot".into());
+            hot.insert_for_test(Arc::new(IngestBatch {
+                batch_id: "prod/svc_hot".into(),
+                service: "svc".into(),
+                byte_size: 64,
+                events: vec![event],
+            }));
+            hot
+        };
+
+        let exhausted = |error: &ServerError| {
+            matches!(error, ServerError::Engine(EngineError::ResourceExhausted))
+        };
+        let mut wrong = Vec::new();
+        for (label, hot) in [("cold only", None), ("with a hot buffer", Some(hot()))] {
+            let pool = ExecutorPool::for_test_with_budgets(
+                data.to_str().expect("utf-8").to_owned(),
+                1,
+                100_000,
+                hot,
+                &budgets,
+            )
+            .expect("pool");
+            let deadline = || Deadline::after(Duration::from_secs(120));
+
+            let query = pool
+                .execute(
+                    pool.allocate_query_id(),
+                    DSL,
+                    deadline(),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+                .result;
+            if !query.as_ref().is_err_and(exhausted) {
+                wrong.push(format!("query, {label}: {:?}", query.map(|r| r.rows)));
+            }
+            let export = pool
+                .export_parquet(pool.allocate_query_id(), DSL, 1_000, deadline(), TEST_WORK)
+                .await;
+            if !export.as_ref().is_err_and(exhausted) {
+                wrong.push(format!(
+                    "export, {label}: {:?}",
+                    export.map(|bytes| parquet_rows(&bytes))
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// Work that outlives its request and its pool keeps the query scratch
     /// directory locked until its connection to the query database closes
     /// (ADR-0056), whichever lane it came through. A field sample and a

@@ -1838,11 +1838,12 @@ fn validate_timechart_inputs(
 /// Rather than trust the error message (a missing `_raw` and a genuinely
 /// unknown field read the same), this asks for evidence: re-run with the
 /// `_raw` side bound to a typed NULL, and take that result only if it binds.
-/// If it fails too, the missing column was the user's, so the original error
-/// is what they see — unless the retry came back with something only it could
-/// know: a cancellation, or a refusal it proved against the relation the
-/// caller meant. The parameter list is identical between the two SQL strings
-/// (ADR-0009).
+/// If it fails to bind a column too, the missing column was the user's, so
+/// the original error is what they see. Any other outcome of the retry is
+/// its own answer, failures included: a cancellation, a refusal it proved
+/// against the relation the caller meant, an exhausted query budget
+/// (ADR-0056), a result past its cap. The parameter list is identical
+/// between the two SQL strings (ADR-0009).
 ///
 /// Costs nothing on the success path, and nothing for queries without a text
 /// search — `raw_free_sql` is `None` there.
@@ -1868,20 +1869,21 @@ fn with_raw_fallback<T>(
         raw_free_timechart_input_checks: Vec::new(),
         ..query.clone()
     };
-    attempt(&fallback).map_err(|e| match e {
-        // A cancellation the retry hit is its own answer: reporting the
-        // first attempt's missing-column error would tell the caller its
-        // query was wrong when the caller is the one who stopped it.
-        //
-        // So is a refusal, and for the same reason one level down: the
-        // retry is the attempt that bound the relation the caller meant,
-        // and it asked `DuckDB` about the column the caller named. The
-        // first attempt's error is about `_raw`, which is trawl's column
-        // and not theirs — and it is an `Emit`, so handing it back would
-        // also route a proven-wrong query into the hot lanes' benign
-        // binder policy.
-        EngineError::Cancelled | EngineError::Refused { .. } => e,
-        _ => err,
+    // Only a retry that also failed to bind a column hands back the first
+    // attempt's error. Every other failure is the retry's own answer: the
+    // first attempt's error is about `_raw`, which is trawl's column and
+    // not the caller's, and it is a missing column, which the hot lanes
+    // answer from the hot buffer alone. Handed back in place of a
+    // cancellation, it tells the caller their query was wrong when they
+    // stopped it; in place of a refusal, an exhausted budget or any other
+    // failure past the bind, it answers a 400, or a 200 without the cold
+    // rows, for a query whose real answer is that failure.
+    attempt(&fallback).map_err(|e| {
+        if is_missing_column_failure(&e) {
+            err
+        } else {
+            e
+        }
     })
 }
 
@@ -3234,6 +3236,42 @@ fn raw_free_retry_still_reports_the_original_missing_column() {
             "the original error, not the retry's copy of it"
         ),
         other => panic!("expected the first attempt's error, got {other:?}"),
+    }
+}
+
+/// A retry that binds and then fails answers with its own failure. The
+/// first attempt's missing `_raw` is a column of trawl's, and handing it
+/// back for a query the retry proved binds would answer a 400 for an
+/// exhausted budget or a result past its cap, and send the hot lanes into
+/// their hot-only fallback, a 200 without the cold rows (ADR-0056).
+#[cfg(test)]
+#[test]
+fn a_failure_past_the_raw_free_bind_is_the_retry_s_answer() {
+    let emitted = raw_fallback_query();
+    for retry_error in [
+        EngineError::ResourceExhausted,
+        EngineError::ResultTooLarge(10),
+    ] {
+        let expected = retry_error.to_string();
+        let retry_error = std::cell::Cell::new(Some(retry_error));
+        let attempts = std::cell::Cell::new(0_u32);
+        let outcome: Result<(), EngineError> =
+            with_raw_fallback(&emitted, &PhaseClock::off(), |_| {
+                attempts.set(attempts.get() + 1);
+                Err(if attempts.get() == 1 {
+                    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+                        message: "unknown field: _raw".to_owned(),
+                    })
+                } else {
+                    retry_error.take().expect("one retry")
+                })
+            });
+        assert_eq!(attempts.get(), 2, "{expected}: both passes ran");
+        assert_eq!(
+            outcome.map_err(|e| e.to_string()),
+            Err(expected.clone()),
+            "the retry's own failure"
+        );
     }
 }
 
