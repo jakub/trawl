@@ -2769,6 +2769,44 @@ async fn query_scratch_symlink_refuses_the_start() {
     assert_mode(&target, 0o755);
 }
 
+/// #304 F1: a scratch directory whose path differs from the storage roots'
+/// paths but reaches one of them through a symlink refuses the start, and
+/// boot removes nothing there. Two spellings: an hour directory of the
+/// corpus through a link to the data root, whose one file carries an
+/// export staging file's name, and the WAL directory itself through a link
+/// to the state directory. The configured paths share no prefix with the
+/// roots', so only the opened directories show the overlap.
+#[tokio::test]
+async fn query_scratch_reached_through_a_link_refuses_the_start() {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let data = fixture.data();
+    let hour = data.join("prod/2026-10-17/00");
+    std::fs::create_dir_all(&hour).unwrap();
+    std::fs::write(data.join("EPOCH"), b"3\n").unwrap();
+    let corpus = hour.join("trawl-export-abc123.parquet");
+    std::fs::write(&corpus, b"a corpus file").unwrap();
+    std::fs::create_dir_all(fixture.wal()).unwrap();
+    for dir in [&data, &fixture.wal()] {
+        set_mode(dir, 0o700);
+    }
+    let alias = fixture.root.path().join("alias");
+    std::os::unix::fs::symlink(&data, &alias).unwrap();
+    let state = fixture.root.path().join("state");
+    std::os::unix::fs::symlink(fixture.storage_root(), &state).unwrap();
+
+    for (scratch, diagnostic) in [
+        (alias.join("prod/2026-10-17/00"), "is inside the data root"),
+        (state.join("wal"), "is the WAL directory"),
+    ] {
+        fixture.query_scratch_dir = Some(scratch.clone());
+        assert_scratch_refusal(&fixture, diagnostic, &fixture.storage_root()).await;
+        let log = fixture_log(&fixture);
+        assert!(log.contains(&scratch.display().to_string()), "{log}");
+        assert_eq!(std::fs::read(&corpus).unwrap(), b"a corpus file");
+    }
+}
+
 /// AC11 (#304): an entry trawld does not make refuses the start, naming the
 /// entry. The preflight reads the whole tree first, so the stale entries
 /// beside it, which a clean boot would reclaim, are left too.

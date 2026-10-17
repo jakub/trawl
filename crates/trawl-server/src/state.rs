@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use trawl_api::{DashboardSnapshot, SchemaColumnResponse, ServiceSchema};
-use trawl_engine::scratch::ScratchLock;
+use trawl_engine::scratch::{OwnedRoot, ScratchLock};
 
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
@@ -569,8 +569,14 @@ impl DegradedSnapshot {
     }
 }
 
-/// Lock and clear `[server] query_scratch_dir` ([`ScratchLock::open`]),
-/// and log what an earlier trawld left there and boot removed.
+/// Lock and clear `[server] query_scratch_dir`
+/// ([`ScratchLock::open_apart_from`]), and log what an earlier trawld left
+/// there and boot removed.
+///
+/// The directory is kept apart from the data root, the WAL directory and
+/// both repin staging roots, compared as the filesystem resolves them
+/// (ADR-0056). Config validation compares the spellings; this compares the
+/// directories, which a symlink in either path can make the same.
 ///
 /// trawld calls this before it waits on `PostgreSQL`: the scratch lock, not
 /// the sole-writer lock, authorizes the clearing (ADR-0056), so a second
@@ -579,7 +585,26 @@ impl DegradedSnapshot {
 pub fn open_query_scratch(
     config: &Config,
 ) -> Result<ScratchLock, trawl_engine::scratch::ScratchError> {
-    let scratch = ScratchLock::open(&config.query_scratch_dir())?;
+    let data = config.data.base_dir();
+    let roots = [
+        OwnedRoot {
+            what: "the data root ([data] path)",
+            path: data.clone(),
+        },
+        OwnedRoot {
+            what: "the WAL directory ([ingest] wal_dir)",
+            path: config.wal_dir(),
+        },
+        OwnedRoot {
+            what: "the repin shadow root (<[data] path>.repin-next)",
+            path: crate::repin::marker::shadow_root(&data),
+        },
+        OwnedRoot {
+            what: "the repin aside root (<[data] path>.repin-aside)",
+            path: crate::repin::marker::aside_root(&data),
+        },
+    ];
+    let scratch = ScratchLock::open_apart_from(&config.query_scratch_dir(), &roots)?;
     let reclaimed = scratch.reclaimed();
     tracing::info!(
         event_type = "lifecycle",

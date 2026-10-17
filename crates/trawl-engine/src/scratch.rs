@@ -16,16 +16,18 @@
 //! names without `O_EXCL`, so a directory another user could enter would let
 //! them plant or read one.
 //!
-//! [`ScratchLock::open`] makes the scratch directory itself trawld's for the
-//! life of the process. It makes the directory 0700 if it is missing, holds
-//! its final component no-follow as ADR-0052 holds a storage root, takes an
-//! exclusive `flock` on that handle, and only then clears what an earlier
-//! trawld left behind, such as after a SIGKILL or an eviction. The clearing
-//! reads the whole tree before it removes anything: one entry it does not
-//! recognize refuses the start with nothing deleted. It never follows a
-//! link and never crosses a mount. The `PostgreSQL` sole-writer lock does
-//! not authorize it: that lock guards one app-state database, not this
-//! directory, and a lost lock can go unseen for seconds.
+//! [`ScratchLock::open_apart_from`] makes the scratch directory itself
+//! trawld's for the life of the process. It makes the directory 0700 if it
+//! is missing, holds its final component no-follow as ADR-0052 holds a
+//! storage root, and refuses the held directory if, by device and inode, it
+//! is one of trawld's storage roots or sits inside or above one. It then
+//! takes an exclusive `flock` on that handle, and only then clears what an
+//! earlier trawld left behind, such as after a SIGKILL or an eviction. The
+//! clearing reads the whole tree before it removes anything: one entry it
+//! does not recognize refuses the start with nothing deleted. It never
+//! follows a link and never crosses a mount. The `PostgreSQL` sole-writer
+//! lock does not authorize it: that lock guards one app-state database, not
+//! this directory, and a lost lock can go unseen for seconds.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -243,10 +245,62 @@ pub(crate) fn check_private(path: &Path, euid: u32, setting: &str) -> std::io::R
     ))
 }
 
+/// A directory whose entries trawld names and removes on its own, which the
+/// scratch directory must not be, sit inside or sit above (ADR-0056): the
+/// data root, the WAL directory and the two repin staging roots.
+#[derive(Debug, Clone)]
+pub struct OwnedRoot {
+    /// What the root is, with the setting it comes from, such as `the data
+    /// root ([data] path)`.
+    pub what: &'static str,
+    /// Its configured path. It need not exist yet.
+    pub path: PathBuf,
+}
+
+/// How the scratch directory overlaps an [`OwnedRoot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlap {
+    /// It is the root.
+    Is,
+    /// It sits inside the root.
+    Inside,
+    /// The root sits inside it, or would once trawld makes the root.
+    Above,
+}
+
+impl std::fmt::Display for Overlap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Is => "is",
+            Self::Inside => "is inside",
+            Self::Above => "is above",
+        })
+    }
+}
+
 /// Why [`ScratchLock::open`] refused the scratch directory. Every message
 /// names `[server] query_scratch_dir`, the setting the operator changes.
 #[derive(Debug, thiserror::Error)]
 pub enum ScratchError {
+    /// The directory overlaps one of trawld's roots as the filesystem
+    /// resolves both. A symlink, `..` or a relative path can hide that from
+    /// the configured spellings.
+    #[error(
+        "the query scratch directory {} {overlap} {what} {}, as the filesystem resolves them; \
+         point {SCRATCH_SETTING} at a directory of its own",
+        .path.display(),
+        .root.display()
+    )]
+    Overlap {
+        /// The configured path.
+        path: PathBuf,
+        /// How it overlaps the root.
+        overlap: Overlap,
+        /// What the root is ([`OwnedRoot::what`]).
+        what: &'static str,
+        /// The root's configured path.
+        root: PathBuf,
+    },
     /// The path does not end in a directory name: it is empty, `/`, or ends
     /// in `..`.
     #[error(
@@ -390,20 +444,37 @@ pub struct ScratchLock {
 }
 
 impl ScratchLock {
-    /// Make, check, lock and clear the scratch directory at `path`.
+    /// [`Self::open_apart_from`] with no root to keep apart from, for a
+    /// directory that cannot overlap trawld's storage, such as a test's own
+    /// temporary directory.
+    pub fn open(path: &Path) -> Result<Self, ScratchError> {
+        Self::open_apart_from(path, &[])
+    }
+
+    /// Make, check, lock and clear the scratch directory at `path`, which
+    /// must not be, sit inside or sit above any of `roots`.
     ///
     /// A missing directory is made 0700, below parents made as needed, as
-    /// the epoch gate makes the data root. Its final component is then
-    /// opened no-follow, and everything after is judged and done through
-    /// that handle. It refuses a symlink, a non-directory, a directory
-    /// another user owns, and one on a read-only filesystem. A group or
-    /// other bit is removed through the handle, as ADR-0052 closes a root,
-    /// and refused if it survives. Then it takes the lock, refusing if
-    /// another process holds it, and clears the directory (see the module
-    /// documentation).
-    pub fn open(path: &Path) -> Result<Self, ScratchError> {
+    /// the epoch gate makes the data root, unless the directory that would
+    /// hold it is or sits inside a root. Its final component is then opened
+    /// no-follow, and everything after is judged and done through that
+    /// handle. It refuses a symlink, a non-directory, a directory that
+    /// overlaps a root, a directory another user owns, and one on a
+    /// read-only filesystem. A group or other bit is removed through the
+    /// handle, as ADR-0052 closes a root, and refused if it survives. Then
+    /// it takes the lock, refusing if another process holds it, and clears
+    /// the directory (see the module documentation).
+    ///
+    /// The overlap is judged by device and inode, never by spelling: the
+    /// handle's own directory and each one above it, reached by opening
+    /// `..`, against each root and each directory above it, or, for a root
+    /// that does not exist yet, above where it would be made. A symlink, a
+    /// `..` and a relative path in either path all resolve to the same
+    /// pairs. Judging the handle makes the answer hold for the directory
+    /// that is locked and cleared, whatever its path names by then.
+    pub fn open_apart_from(path: &Path, roots: &[OwnedRoot]) -> Result<Self, ScratchError> {
         #[cfg(unix)]
-        return Self::open_as(path, rustix::process::geteuid().as_raw());
+        return Self::open_as(path, roots, rustix::process::geteuid().as_raw());
         #[cfg(not(unix))]
         return Err(ScratchError::Io {
             action: "lock",
@@ -412,9 +483,9 @@ impl ScratchLock {
         });
     }
 
-    /// [`Self::open`] for a trawld running as `euid`.
+    /// [`Self::open_apart_from`] for a trawld running as `euid`.
     #[cfg(unix)]
-    fn open_as(path: &Path, euid: u32) -> Result<Self, ScratchError> {
+    fn open_as(path: &Path, roots: &[OwnedRoot], euid: u32) -> Result<Self, ScratchError> {
         use std::fs::TryLockError;
         use std::os::fd::AsFd as _;
 
@@ -423,8 +494,10 @@ impl ScratchLock {
         let path = lock::final_name(path).ok_or_else(|| ScratchError::BadPath {
             path: path.to_owned(),
         })?;
+        lock::refuse_making_inside(&path, roots)?;
         lock::make(&path)?;
         let handle = lock::hold(&path)?;
+        lock::refuse_overlap(&path, &handle, roots)?;
         let io = |action| {
             let path = path.clone();
             move |source: std::io::Error| ScratchError::Io {
@@ -503,8 +576,8 @@ mod lock {
     use rustix::io::Errno;
 
     use super::{
-        Reclaimed, ScratchError, is_export_file_name, is_snapshot_file_name, is_spill_dir_name,
-        is_spill_file_name,
+        Overlap, OwnedRoot, Reclaimed, ScratchError, is_export_file_name, is_snapshot_file_name,
+        is_spill_dir_name, is_spill_file_name,
     };
 
     /// The group and other permission bits.
@@ -573,6 +646,177 @@ mod lock {
                 source: e.into(),
             }),
         }
+    }
+
+    /// A directory's device and inode. Every spelling of a directory, a
+    /// symlink, a `..`, a relative path or a bind mount, leads to one pair.
+    type Identity = (u64, u64);
+
+    /// Flags for an open that only finds a directory, following links. On
+    /// Linux `O_PATH` needs no read permission, only search on the way.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const LOOKUP_FLAGS: OFlags = OFlags::PATH.union(OFlags::DIRECTORY).union(OFlags::CLOEXEC);
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const LOOKUP_FLAGS: OFlags = OFlags::RDONLY
+        .union(OFlags::DIRECTORY)
+        .union(OFlags::CLOEXEC);
+
+    #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
+    fn identity(fd: BorrowedFd<'_>) -> io::Result<Identity> {
+        let stat = rustix::fs::fstat(fd)?;
+        Ok((stat.st_dev as u64, stat.st_ino as u64))
+    }
+
+    /// The identities of the directory `fd` holds and of each directory
+    /// above it, nearest first, up to the process's root. Each step opens
+    /// `..` from the step before, so the kernel names every parent.
+    fn lineage(fd: BorrowedFd<'_>) -> io::Result<Vec<Identity>> {
+        let mut lineage = vec![identity(fd)?];
+        let mut dir = rustix::fs::openat(fd, c"..", LOOKUP_FLAGS, Mode::empty())?;
+        loop {
+            let id = identity(dir.as_fd())?;
+            // The root is its own parent.
+            if lineage.last() == Some(&id) {
+                return Ok(lineage);
+            }
+            lineage.push(id);
+            dir = rustix::fs::openat(&dir, c"..", LOOKUP_FLAGS, Mode::empty())?;
+        }
+    }
+
+    /// `path`, or failing that the nearest directory on its path above it,
+    /// opened for lookups, with whether it is `path` itself. `None` when
+    /// nothing on the path opens.
+    fn nearest(path: &Path) -> Option<(rustix::fd::OwnedFd, bool)> {
+        let open = |dir: &Path| {
+            let dir = if dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                dir
+            };
+            rustix::fs::open(dir, LOOKUP_FLAGS, Mode::empty()).ok()
+        };
+        if let Some(fd) = open(path) {
+            return Some((fd, true));
+        }
+        path.ancestors()
+            .skip(1)
+            .find_map(open)
+            .map(|fd| (fd, false))
+    }
+
+    /// Where a root is, as far as the filesystem says.
+    struct Located {
+        /// The root itself, when it is a directory.
+        at: Option<Identity>,
+        /// The directories above it, or, for a root that is not there yet,
+        /// the nearest one on its path that is and those above that: where
+        /// trawld would make it.
+        above: Vec<Identity>,
+    }
+
+    fn locate(root: &Path) -> io::Result<Located> {
+        Ok(match nearest(root) {
+            Some((fd, true)) => {
+                let mut above = lineage(fd.as_fd())?;
+                let at = above.remove(0);
+                Located {
+                    at: Some(at),
+                    above,
+                }
+            }
+            Some((fd, false)) => Located {
+                at: None,
+                above: lineage(fd.as_fd())?,
+            },
+            None => Located {
+                at: None,
+                above: Vec::new(),
+            },
+        })
+    }
+
+    /// How the directory `here` with the directories `above` it overlaps
+    /// `root`. Without `here`, `above` is where a directory will be made,
+    /// which can only land inside a root.
+    fn overlap(here: Option<Identity>, above: &[Identity], root: &Located) -> Option<Overlap> {
+        if here.is_some() && root.at == here {
+            Some(Overlap::Is)
+        } else if root.at.is_some_and(|at| above.contains(&at)) {
+            Some(Overlap::Inside)
+        } else if here.is_some_and(|here| root.above.contains(&here)) {
+            Some(Overlap::Above)
+        } else {
+            None
+        }
+    }
+
+    /// Refuse at the first of `roots` that `here` and `above` overlap.
+    fn refuse_roots(
+        path: &Path,
+        here: Option<Identity>,
+        above: &[Identity],
+        roots: &[OwnedRoot],
+    ) -> Result<(), ScratchError> {
+        for root in roots {
+            let located = locate(&root.path).map_err(|source| ScratchError::Io {
+                action: "compare trawld's storage roots with",
+                path: path.to_owned(),
+                source,
+            })?;
+            if let Some(overlap) = overlap(here, above, &located) {
+                return Err(ScratchError::Overlap {
+                    path: path.to_owned(),
+                    overlap,
+                    what: root.what,
+                    root: root.path.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse before [`make`] runs when the directory that would hold
+    /// `path`, its parent or the nearest directory above that exists, is a
+    /// root or sits inside one: making `path` there would make directories
+    /// inside the root.
+    pub(super) fn refuse_making_inside(
+        path: &Path,
+        roots: &[OwnedRoot],
+    ) -> Result<(), ScratchError> {
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let Some((holder, _)) = path.parent().and_then(nearest) else {
+            return Ok(());
+        };
+        let above = lineage(holder.as_fd()).map_err(|source| ScratchError::Io {
+            action: "inspect the parents of",
+            path: path.to_owned(),
+            source,
+        })?;
+        refuse_roots(path, None, &above, roots)
+    }
+
+    /// Refuse the directory `handle` holds when it is one of `roots`, sits
+    /// inside one, or sits above one or above where trawld would make one.
+    pub(super) fn refuse_overlap(
+        path: &Path,
+        handle: &File,
+        roots: &[OwnedRoot],
+    ) -> Result<(), ScratchError> {
+        if roots.is_empty() {
+            return Ok(());
+        }
+        let lineage = lineage(handle.as_fd()).map_err(|source| ScratchError::Io {
+            action: "inspect the parents of",
+            path: path.to_owned(),
+            source,
+        })?;
+        let (here, above) = lineage
+            .split_first()
+            .expect("a lineage starts at its directory");
+        refuse_roots(path, Some(*here), above, roots)
     }
 
     /// Where an inode lives: its filesystem and, where the kernel says,
@@ -1161,6 +1405,172 @@ mod tests {
         }
     }
 
+    /// The roots trawld derives from a data root and a WAL directory, as
+    /// `trawl-server` lists them, with short names for the assertions.
+    #[cfg(unix)]
+    fn owned_roots(data: &Path, wal: &Path) -> Vec<OwnedRoot> {
+        let sibling = |suffix: &str| {
+            let mut name = data.file_name().expect("a data root name").to_owned();
+            name.push(suffix);
+            data.with_file_name(name)
+        };
+        vec![
+            OwnedRoot {
+                what: "data root",
+                path: data.to_owned(),
+            },
+            OwnedRoot {
+                what: "WAL directory",
+                path: wal.to_owned(),
+            },
+            OwnedRoot {
+                what: "repin shadow root",
+                path: sibling(".repin-next"),
+            },
+            OwnedRoot {
+                what: "repin aside root",
+                path: sibling(".repin-aside"),
+            },
+        ]
+    }
+
+    /// `path` spelled relative to the working directory, through `..` up to
+    /// `/`.
+    #[cfg(unix)]
+    fn relative_to_cwd(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.join(path.strip_prefix("/").expect("an absolute path"))
+    }
+
+    /// #304 F1: the scratch directory is judged against the roots by device
+    /// and inode, so no spelling hides an overlap: a symlink in the
+    /// scratch path or a root's path, a `..`, or a root spelled relative to
+    /// the working directory. Each refusal changes nothing, a directory
+    /// that would be made inside a root is not made, and a root that does
+    /// not exist yet is refused below the scratch directory.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_open_refuses_an_owned_root_however_it_is_spelled() {
+        let parent = tempfile::tempdir().expect("parent");
+        let base = parent.path();
+        let data = base.join("data");
+        let wal = base.join("wal");
+        let hour = data.join("prod/2026-10-17/00");
+        std::fs::create_dir_all(&hour).expect("hour");
+        std::fs::create_dir(&wal).expect("wal");
+        std::fs::write(hour.join("trawl-export-abc123.parquet"), b"corpus").expect("corpus");
+        std::fs::create_dir(base.join("s")).expect("s");
+        std::fs::create_dir(base.join("s/data")).expect("s/data");
+        std::fs::create_dir(base.join("s2")).expect("s2");
+        std::os::unix::fs::symlink(&data, base.join("alias")).expect("alias");
+        std::os::unix::fs::symlink(base, base.join("up")).expect("up");
+        let roots = owned_roots(&data, &wal);
+
+        let cases: [(&str, PathBuf, Vec<OwnedRoot>, Overlap, &str); 8] = [
+            (
+                "an hour directory through a link to the data root",
+                base.join("alias/prod/2026-10-17/00"),
+                roots.clone(),
+                Overlap::Inside,
+                "data root",
+            ),
+            (
+                "the data root through a link above it",
+                base.join("up/data"),
+                roots.clone(),
+                Overlap::Is,
+                "data root",
+            ),
+            (
+                "the WAL directory through a link above it",
+                base.join("up/wal"),
+                roots.clone(),
+                Overlap::Is,
+                "WAL directory",
+            ),
+            (
+                "the data root's hour directory through `..` out of the WAL directory",
+                base.join("wal/../data/prod/2026-10-17/00"),
+                roots.clone(),
+                Overlap::Inside,
+                "data root",
+            ),
+            (
+                "an hour directory below a data root spelled relative to the cwd",
+                base.join("alias/prod/2026-10-17/00"),
+                owned_roots(&relative_to_cwd(&data), &wal),
+                Overlap::Inside,
+                "data root",
+            ),
+            (
+                "a directory that holds a data root spelled through a link",
+                base.join("s"),
+                owned_roots(&base.join("up/s/data"), &wal),
+                Overlap::Above,
+                "data root",
+            ),
+            (
+                "a directory below which a missing data root would be made",
+                base.join("s2"),
+                owned_roots(&base.join("up/s2/data"), &wal),
+                Overlap::Above,
+                "data root",
+            ),
+            (
+                "a missing directory that would be made inside the data root",
+                base.join("alias/newenv/x"),
+                roots.clone(),
+                Overlap::Inside,
+                "data root",
+            ),
+        ];
+        for (case, scratch, roots, overlap, what) in cases {
+            let before = tree(base);
+            let error = ScratchLock::open_apart_from(&scratch, &roots).expect_err(case);
+            assert!(
+                matches!(&error, ScratchError::Overlap { overlap: o, what: w, .. } if *o == overlap && *w == what),
+                "{case}: {error}"
+            );
+            let message = error.to_string();
+            for needle in [
+                format!("{} {overlap} {what}", scratch.display()),
+                "[server] query_scratch_dir".to_owned(),
+            ] {
+                assert!(
+                    message.contains(&needle),
+                    "{case}: {needle:?} missing from {message}"
+                );
+            }
+            assert_eq!(
+                tree(base),
+                before,
+                "{case}: the refused open changed the tree"
+            );
+        }
+        assert!(!data.join("newenv").exists());
+    }
+
+    /// Siblings and lookalikes beside the roots open, and the repin roots
+    /// beside the data root, which do not exist, refuse nothing.
+    #[cfg(unix)]
+    #[test]
+    fn scratch_open_accepts_the_roots_siblings() {
+        let parent = tempfile::tempdir().expect("parent");
+        let data = parent.path().join("data");
+        let wal = data.join("wal");
+        std::fs::create_dir_all(&wal).expect("wal");
+        let roots = owned_roots(&data, &wal);
+        for scratch in ["data.query-scratch", "dat", "data-scratch", "elsewhere"] {
+            let scratch = parent.path().join(scratch);
+            ScratchLock::open_apart_from(&scratch, &roots)
+                .unwrap_or_else(|e| panic!("{}: {e}", scratch.display()));
+        }
+    }
+
     /// A directory another user owns refuses the start before anything
     /// changes, even one trawld could tighten; so does an entry inside
     /// another user owns. An unprivileged test cannot own either as
@@ -1177,7 +1587,7 @@ mod tests {
         set_mode(&path, 0o755);
         let before = tree(&path);
 
-        let error = ScratchLock::open_as(&path, other).expect_err("foreign");
+        let error = ScratchLock::open_as(&path, &[], other).expect_err("foreign");
         assert!(
             matches!(error, ScratchError::ForeignOwner { owner, euid: e, .. } if owner == euid && e == other),
             "{error}"

@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -2025,17 +2025,27 @@ impl Config {
     /// makes in scratch, and repin swaps the data root with its siblings.
     ///
     /// The comparison is lexical, component by component, so it needs no
-    /// filesystem and also serves `--check-config` and the doctors. Startup
-    /// repeats the check against the opened directory.
+    /// filesystem and also serves `--check-config` and the doctors. A
+    /// comparison of spellings cannot see where `..` or the working
+    /// directory leads, so an explicit directory must be absolute and free
+    /// of `..`; the default follows `data.path`'s rules. Startup repeats the
+    /// check against the opened directory, which also sees symlinks.
     fn validate_query_scratch_dir(&self) -> Result<(), ConfigError> {
         const KEY: &str = "server.query_scratch_dir";
-        if self
-            .server
-            .query_scratch_dir
-            .as_ref()
-            .is_some_and(|dir| dir.as_os_str().is_empty())
-        {
-            return Err(ConfigError::Validation(format!("{KEY} cannot be empty")));
+        if let Some(dir) = &self.server.query_scratch_dir {
+            if dir.as_os_str().is_empty() {
+                return Err(ConfigError::Validation(format!("{KEY} cannot be empty")));
+            }
+            if dir.is_relative() {
+                return Err(ConfigError::Validation(format!(
+                    "{KEY} must be an absolute path"
+                )));
+            }
+            if dir.components().any(|c| c == Component::ParentDir) {
+                return Err(ConfigError::Validation(format!(
+                    "{KEY} must not contain a '..' component"
+                )));
+            }
         }
         let scratch = self.query_scratch_dir();
         let data = self.data.base_dir();
@@ -4277,6 +4287,39 @@ severity_from = [7]
         assert!(
             err.contains("server.query_scratch_dir cannot be empty"),
             "{err}"
+        );
+    }
+
+    /// A component comparison cannot see where `..` or a working directory
+    /// leads, so an explicit scratch directory spells neither. Startup
+    /// compares the opened directories as well.
+    #[test]
+    fn query_scratch_refuses_relative_paths_and_parent_components() {
+        for (scratch, reason) in [
+            ("scratch", "must be an absolute path"),
+            ("./scratch", "must be an absolute path"),
+            ("../trawl/data/prod", "must be an absolute path"),
+            (
+                "/var/lib/trawl/x/../data/prod",
+                "must not contain a '..' component",
+            ),
+            ("/srv/scratch/..", "must not contain a '..' component"),
+        ] {
+            let err = query_scratch_config(&format!("query_scratch_dir = \"{scratch}\""), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("server.query_scratch_dir {reason}")),
+                "{scratch}: {err}"
+            );
+            assert!(!err.contains("/var") && !err.contains("/srv"), "{err}");
+        }
+        // The default beside a relative data root follows the data root's
+        // own rules.
+        let config = Config::from_toml("[server]\n[data]\npath = \"relative/data\"\n").unwrap();
+        assert_eq!(
+            config.query_scratch_dir(),
+            Path::new("relative/data.query-scratch")
         );
     }
 }
