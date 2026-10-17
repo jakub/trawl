@@ -170,7 +170,14 @@ impl DuckDbDiagnostic {
         let duckdb::Error::DuckDBFailure(_, Some(message)) = error else {
             return None;
         };
-        serde_json::from_str(message).ok()
+        // The derive also takes a positional sequence for a struct, so
+        // `["Out of Memory","x"]` would parse. Only an object reaches it,
+        // where the derive refuses a repeated key.
+        let json = message.trim_start_matches([' ', '\t', '\n', '\r']);
+        if !json.starts_with('{') {
+            return None;
+        }
+        serde_json::from_str(json).ok()
     }
 
     /// `DuckDB`'s text form of the same error, `<type> Error: <message>`,
@@ -259,7 +266,8 @@ mod structured_error_classification {
     /// A message that is not a well-formed diagnostic stays a database
     /// error, whatever it says: text from a connection without
     /// `errors_as_json`, broken or partial JSON, a non-string type, a
-    /// repeated key, and the driver's own variants.
+    /// repeated key, an array (serde's derive takes a positional sequence
+    /// for a struct), and the driver's own variants.
     #[test]
     fn a_malformed_diagnostic_stays_a_database_error() {
         let malformed = [
@@ -277,6 +285,7 @@ mod structured_error_classification {
                 r#"{"exception_type":"Binder","exception_message":"x","exception_type":"Out of Memory"}"#,
             ),
             failure(r#"[{"exception_type":"Out of Memory","exception_message":"x"}]"#),
+            failure(r#"["Out of Memory","x"]"#),
             failure(r#"{"exception_type":"Out of Memory","exception_message":"x"} trailing"#),
             duckdb::Error::DuckDBFailure(duckdb::ffi::Error::new(1), None),
             duckdb::Error::InvalidColumnName("Out of Memory".into()),
