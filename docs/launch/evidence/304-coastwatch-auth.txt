@@ -1,0 +1,41 @@
+# Coastwatch against the #304 fleet-auth (commits 0dd416fd 8bbf60a9 75fe8877 on the issue branch; W3 originals 5bdce4dc f7110d65 0f1c6701)
+# coastwatch adf426b, detached worktree; Cargo.toml fleet-* path deps pointed at the trawl branch's crates/
+# Postgres: pgvector/pgvector:pg18 disposable, DATABASE_URL=<cw db>, FLEET_DATABASE_URL=<fleet_test>, COASTWATCH_ENV=test
+
+== cargo check --workspace
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+== nextest auth + web auth matrices
+        PASS [   0.004s] (26/31) coastwatch-auth::middleware_unit require_permission_without_auth_middleware_returns_500
+        PASS [   0.003s] (27/31) coastwatch-auth translate::tests::human_kind_is_never_flagged
+        PASS [   0.003s] (28/31) coastwatch-auth::middleware_unit zero_coastwatch_permissions_returns_403
+        PASS [   0.011s] (29/31) coastwatch-auth translate::tests::no_coastwatch_permissions_errors_no_coastwatch_grant
+        PASS [   0.004s] (30/31) coastwatch-auth translate::tests::analyst_bundle_translates_to_full_permission_set
+        PASS [   0.004s] (31/31) coastwatch-auth::middleware_unit unknown_strings_only_returns_403
+────────────
+     Summary [   0.012s] 31 tests run: 31 passed, 0 skipped
+warning: unused config key `resolver.incompatible-publish-age` in `/home/jakub/.cargo/config.toml`
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+────────────
+ Nextest run ID ada36847-32d7-4a3c-99cc-ae5d2b42c839 with nextest profile: default
+    Starting 18 tests across 3 binaries
+        PASS [   0.004s] ( 1/18) coastwatch-web::auth_routes me_returns_500_when_layers_are_reversed
+        PASS [   0.004s] ( 2/18) coastwatch-web::auth_routes me_returns_exact_roles_and_permissions_shape_for_analyst
+        PASS [   0.005s] ( 3/18) coastwatch-web::auth_routes me_returns_403_when_principal_has_no_coastwatch_permissions
+        PASS [   0.005s] ( 4/18) coastwatch-web::auth_routes me_drops_the_dead_operator_string_and_keeps_canonical_order
+        PASS [   0.570s] ( 5/18) coastwatch-web::export_auth_routes analyst_bearer_is_200
+        PASS [   0.727s] ( 6/18) coastwatch-web::build_with_spa_role_gate valid_operator_cookie_cannot_upload_from_an_unapproved_origin
+        PASS [   0.848s] ( 7/18) coastwatch-web::build_with_spa_role_gate siem_cookie_is_403_on_post_documents
+        PASS [   0.902s] ( 8/18) coastwatch-web::build_with_spa_role_gate uploads_route_is_session_guarded_not_upload_gated
+        PASS [   0.410s] ( 9/18) coastwatch-web::export_auth_routes expired_bearer_is_401
+        PASS [   1.012s] (10/18) coastwatch-web::build_with_spa_role_gate analyst_cookie_clears_upload_gate_on_post_documents
+        PASS [   1.013s] (11/18) coastwatch-web::build_with_spa_role_gate operator_cookie_clears_upload_gate_on_post_documents
+        PASS [   1.058s] (12/18) coastwatch-web::build_with_spa_role_gate session_origin_policy_checks_safe_methods_and_preserves_missing_origin
+        PASS [   0.353s] (13/18) coastwatch-web::export_auth_routes foreign_app_only_bearer_is_403_no_coastwatch_grant
+        PASS [   0.054s] (14/18) coastwatch-web::export_auth_routes missing_bearer_is_401
+        PASS [   0.415s] (15/18) coastwatch-web::export_auth_routes operator_bearer_without_permission_is_403
+        PASS [   0.264s] (16/18) coastwatch-web::export_auth_routes session_cookie_only_is_401_on_bearer_subrouter
+        PASS [   0.487s] (17/18) coastwatch-web::export_auth_routes siem_consumer_bearer_is_200
+        PASS [   0.389s] (18/18) coastwatch-web::export_auth_routes unknown_coastwatch_strings_only_bearer_is_403
+────────────
+     Summary [   2.943s] 18 tests run: 18 passed, 0 skipped
