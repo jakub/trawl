@@ -17,6 +17,7 @@ pub mod csv;
 pub mod display;
 pub mod doctor;
 pub mod ingest_preview;
+pub mod stream;
 pub mod value;
 
 use crate::value::{QueryResult, SchemaColumn};

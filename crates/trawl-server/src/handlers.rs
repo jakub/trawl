@@ -3565,6 +3565,12 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
 /// Build an SSE snapshot event from the current aggregation state,
 /// applying post-stages to each row.
 ///
+/// The payload carries `capped`, one `{cap, limit}` per cap that dropped
+/// input since the stream started, on this and every later snapshot, and
+/// omits it while nothing has been dropped (ADR-0001). An event dropped at
+/// a cap still counts toward the next snapshot, so the scheduled snapshot
+/// discloses a cap even when no further input arrives.
+///
 /// `ctx` is the one instant this snapshot evaluates `now()` at, for every
 /// post-stage row alike (ADR-0017 §3) — a distinct type from the per-event
 /// context the feeding loop samples, so the two cannot be swapped at a call
@@ -3579,11 +3585,30 @@ fn emit_agg_snapshot(
     let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx);
     let rows: Vec<_> = rows.into_iter().map(trawl_core::row::to_json).collect();
 
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "columns": columns,
         "rows": rows,
     });
+    let capped: Vec<_> = aggregation.capped().into_iter().map(snapshot_cap).collect();
+    if !capped.is_empty() {
+        payload["capped"] = serde_json::json!(capped);
+    }
     Event::default().event("snapshot").data(payload.to_string())
+}
+
+/// One dropped-input cap as the snapshot wire spells it.
+fn snapshot_cap(cap: trawl_core::stream::AggregationCap) -> trawl_api::stream::SnapshotCap {
+    use trawl_api::stream::SnapshotCapKind;
+    use trawl_core::stream::AggregationCap;
+    let kind = match cap {
+        AggregationCap::Groups => SnapshotCapKind::Groups,
+        AggregationCap::DistinctValues => SnapshotCapKind::DistinctValues,
+        AggregationCap::ExactValues => SnapshotCapKind::ExactValues,
+    };
+    trawl_api::stream::SnapshotCap {
+        cap: kind,
+        limit: cap.limit() as u64,
+    }
 }
 
 /// The snapshot instant, sampled here and nowhere deeper: trawl-core takes
