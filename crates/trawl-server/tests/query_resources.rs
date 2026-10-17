@@ -69,6 +69,7 @@ fn query_resources_child() {
     match scenario.to_str().expect("a UTF-8 scenario") {
         "tmpdir" => runtime.block_on(tmpdir_child(&work)),
         "spill_budget" => runtime.block_on(spill_budget_child(&work)),
+        "shared_budget_generous" => runtime.block_on(shared_budget_generous_child(&work)),
         "shared_budget" => runtime.block_on(shared_budget_child(&work)),
         other => panic!("unknown scenario {other}"),
     }
@@ -952,23 +953,39 @@ async fn a_stored_run_read_past_the_budget_logs_no_path() {
 
 // -- AC6: one budget, shared --------------------------------------------------
 
+/// The memory limit of [`clones_share_one_spill_budget`]. Under it four
+/// [`SPILLING`] queries at once all complete when spill is free; 128 MiB
+/// stopped two of four on memory alone.
+const SHARED_MEMORY: u64 = 256 * MIB;
+
 /// The spill cap of [`clones_share_one_spill_budget`]. [`SPILLING`] alone
-/// accounts 66 to 80 MB of spill on `DuckDB` 1.5.5, and under a 128 MiB cap
-/// it still failed about one run in ten under load, so one query gets well
-/// over twice what a sampler sees it use. Four at once ask for about
-/// 300 MB.
-const SHARED_CAP: u64 = 192 * MIB;
+/// spills nothing under [`SHARED_MEMORY`]; four at once accounted 260 to
+/// 340 MB of spill on `DuckDB` 1.5.5, about two to two and a half times
+/// this cap.
+const SHARED_CAP: u64 = 128 * MIB;
+
+/// The spill cap of the calibration run, far past what four queries
+/// spill.
+const GENEROUS_CAP: u64 = 1024 * MIB;
 
 /// Concurrent queries, one per permit, in [`clones_share_one_spill_budget`].
 const SHARERS: usize = 4;
 
 /// Concurrent queries on clones of the query database share its one
-/// spill cap (ADR-0056). One query fits the cap alone; four started
-/// together cannot all fit, so at least one answers 503
-/// `query_resource_exhausted`, where a cap per clone would let all four
-/// complete. The spill directory never holds more than the one cap.
+/// spill cap (ADR-0056). Four [`SPILLING`] queries started together all
+/// complete under [`SHARED_MEMORY`] when spill is free, and `DuckDB`
+/// accounts more spill for them than [`SHARED_CAP`]: memory alone does not
+/// stop them. Under the cap one query still completes alone, but four
+/// cannot all fit, so at least one answers 503 `query_resource_exhausted`,
+/// where a cap per clone would let all four complete. The same statements
+/// run raw on clones fail with `DuckDB`'s spill-cap message, not its
+/// memory one. Neither the spill `DuckDB` accounts nor the spill directory
+/// passes the one cap.
 #[test]
 fn clones_share_one_spill_budget() {
+    let generous = tempfile::tempdir().expect("work dir");
+    run_child("shared_budget_generous", generous.path(), &[]);
+
     let work = tempfile::tempdir().expect("work dir");
     let peak = spill_peak_of_child("shared_budget", work.path());
     assert!(peak.samples > 0, "the spill directory was never sampled");
@@ -978,22 +995,22 @@ fn clones_share_one_spill_budget() {
         peak.held(),
         peak.held().saturating_sub(SHARED_CAP)
     );
+    assert!(
+        peak.held() >= SHARED_CAP / 2,
+        "the queries never spilled near the cap, so the cap is not what stopped them ({peak:?})"
+    );
 }
 
-/// The child half of [`clones_share_one_spill_budget`].
-async fn shared_budget_child(work: &Path) {
-    let server = Arc::new(spill_server(work, 60, knobs(SHARERS, SHARED_CAP, 128 * MIB)).await);
-
-    let alone = post_query(&server, SPILLING).await;
-    assert_eq!(alone.status, 200, "one query fits the cap: {}", alone.body);
-
-    // All start before any runs: each parks at the work-start seam until
-    // the others have arrived. The session releases its gates when
-    // dropped, so it lives as long as the hold.
+/// [`SHARERS`] [`SPILLING`] queries on `server`, every one started before
+/// any runs, and the most spill `DuckDB` accounted while they ran.
+async fn spill_together(server: &Arc<common::TestServer>) -> (Vec<Answer>, i64) {
+    // Each parks at the work-start seam until the others have arrived.
+    // The session releases its gates when dropped, so it lives as long as
+    // the hold.
     let seams = server.state.query.pool.seams();
     let started = seams.hold(Seam::Started);
     let all = tokio::spawn({
-        let server = Arc::clone(&server);
+        let server = Arc::clone(server);
         async move {
             let queries: Vec<_> = (0..SHARERS)
                 .map(|_| {
@@ -1020,7 +1037,80 @@ async fn shared_budget_child(work: &Path) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     started.release();
-    let (answers, accounted) = all.await.unwrap();
+    all.await.unwrap()
+}
+
+/// A statement of [`SPILLING`]'s shape, written out over the file
+/// [`spill_corpus`] wrote under `work`: the same window over every
+/// distinct message, so it spills as the query does.
+fn spilling_sql(work: &Path) -> String {
+    let corpus = work.join("data/prod/2026-01-02/10/blob.parquet");
+    format!(
+        "SELECT count(*) AS \"count\" FROM ( \
+           SELECT * EXCLUDE (\"_rn\") FROM ( \
+             SELECT *, ROW_NUMBER() OVER (PARTITION BY \"message\" \
+               ORDER BY TRY_CAST(\"_time\" AS TIMESTAMP) DESC) AS \"_rn\" \
+             FROM read_parquet('{}') WHERE \"service\" = 'blob') \
+           WHERE \"_rn\" = 1)",
+        corpus.display()
+    )
+}
+
+/// [`SHARERS`] copies of [`spilling_sql`] at once, each on its own clone
+/// of `server`'s query database, with the failures `DuckDB` raised. A 503
+/// names no cause, so this is where the test reads which budget stopped
+/// the work.
+fn spill_together_raw(server: &common::TestServer, work: &Path) -> Vec<Result<u64, duckdb::Error>> {
+    let sql = spilling_sql(work);
+    let barrier = Arc::new(std::sync::Barrier::new(SHARERS));
+    let runs: Vec<_> = (0..SHARERS)
+        .map(|_| {
+            let executor = server
+                .state
+                .query
+                .pool
+                .detached_executor()
+                .expect("a clone of the query database");
+            let (barrier, sql) = (Arc::clone(&barrier), sql.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                executor.raw_count_rows_for_test(&sql)
+            })
+        })
+        .collect();
+    runs.into_iter().map(|run| run.join().unwrap()).collect()
+}
+
+/// The calibration half of [`clones_share_one_spill_budget`]: the same
+/// work under the same memory limit, with spill to spare.
+async fn shared_budget_generous_child(work: &Path) {
+    let server =
+        Arc::new(spill_server(work, 60, knobs(SHARERS, GENEROUS_CAP, SHARED_MEMORY)).await);
+    let (answers, accounted) = spill_together(&server).await;
+    for answer in &answers {
+        assert_eq!(
+            answer.status, 200,
+            "memory alone stopped a query: {}",
+            answer.body
+        );
+    }
+    assert!(
+        u64::try_from(accounted).unwrap() > SHARED_CAP,
+        "{SHARERS} queries accounted {accounted} bytes of spill at most, within the shared cap"
+    );
+    for outcome in spill_together_raw(&server, work) {
+        outcome.unwrap_or_else(|e| panic!("memory alone stopped a raw statement: {e}"));
+    }
+}
+
+/// The capped half of [`clones_share_one_spill_budget`].
+async fn shared_budget_child(work: &Path) {
+    let server = Arc::new(spill_server(work, 60, knobs(SHARERS, SHARED_CAP, SHARED_MEMORY)).await);
+
+    let alone = post_query(&server, SPILLING).await;
+    assert_eq!(alone.status, 200, "one query fits the cap: {}", alone.body);
+
+    let (answers, accounted) = spill_together(&server).await;
     assert!(
         u64::try_from(accounted).unwrap() <= SHARED_CAP,
         "DuckDB accounted {accounted} bytes of spill past the shared cap"
@@ -1036,6 +1126,22 @@ async fn shared_budget_child(work: &Path) {
     for answer in exhausted {
         assert_exhausted(answer);
         assert_exhausted_failure(QUERY_ROUTE, &answer.request_id);
+    }
+
+    let failures: Vec<String> = spill_together_raw(&server, work)
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err().map(ToString::to_string))
+        .collect();
+    assert!(
+        !failures.is_empty(),
+        "{SHARERS} raw statements that together spill past the cap all completed"
+    );
+    for message in &failures {
+        assert!(
+            message.contains("failed to offload data block")
+                && message.contains("max_temp_directory_size"),
+            "the spill cap, not memory, stopped the statement: {message}"
+        );
     }
 }
 
