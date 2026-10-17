@@ -2373,8 +2373,13 @@ impl ExecutorPool {
 
                     // Write to a staging file in the query scratch
                     // directory (ADR-0056), then read it back as bytes.
+                    // The error keeps only its kind: `tempfile` appends the
+                    // path it tried, and an internal error's text is logged.
                     let tmp = scratch.export_file().map_err(|e| {
-                        ServerError::Internal(format!("failed to create temp file: {e}"))
+                        ServerError::Internal(format!(
+                            "failed to create the export staging file: {}",
+                            e.kind()
+                        ))
                     })?;
                     let tmp_path = tmp.path().to_owned();
 
@@ -4627,6 +4632,36 @@ mod tests {
         .await;
         assert!(!pool.cancel_by_id(id));
         assert!(registry_is_empty(&pool));
+    }
+
+    /// An export whose staging file cannot be made in the query scratch
+    /// directory fails without naming it (ADR-0056). The error's text is
+    /// what the internal-error log records, and the I/O error `tempfile`
+    /// raises carries the path it tried.
+    #[tokio::test]
+    async fn a_staging_file_failure_names_no_path() {
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100, None).unwrap();
+        let scratch = pool.scratch().path().to_owned();
+        std::fs::remove_dir_all(&scratch).expect("the scratch directory");
+
+        let error = pool
+            .export_parquet(
+                pool.allocate_query_id(),
+                "*",
+                10,
+                Deadline::after(Duration::from_secs(30)),
+                TEST_WORK,
+            )
+            .await
+            .expect_err("no staging file, no export");
+        assert!(matches!(error, ServerError::Internal(_)), "{error:?}");
+        let shown = error.to_string();
+        for named in [scratch.to_str().unwrap(), "trawl-export-"] {
+            assert!(
+                !shown.contains(named),
+                "{named:?} reached the error: {shown}"
+            );
+        }
     }
 
     /// A budget exhausted by the `_raw`-free retry is the query's answer

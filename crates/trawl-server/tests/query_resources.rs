@@ -492,12 +492,25 @@ const QUERY_ROUTE: &str = "/api/v1/query";
 const EXPORT_ROUTE: &str = "/api/v1/export";
 
 async fn post(server: &common::TestServer, path: &str, dsl: &str) -> Answer {
-    let response = common::harness_client_builder()
+    let request = common::harness_client_builder()
         .build()
         .unwrap()
         .post(format!("{}{path}", server.url))
+        .json(&serde_json::json!({ "query": dsl }));
+    send(server, request).await
+}
+
+async fn get(server: &common::TestServer, path: &str) -> Answer {
+    let request = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .get(format!("{}{path}", server.url));
+    send(server, request).await
+}
+
+async fn send(server: &common::TestServer, request: reqwest::RequestBuilder) -> Answer {
+    let response = request
         .bearer_auth(&server.analyst_token)
-        .json(&serde_json::json!({ "query": dsl }))
         .send()
         .await
         .unwrap();
@@ -846,6 +859,95 @@ async fn memory_limit() {
         &before,
         &[&answer.request_id, &export.request_id, &small.request_id],
     );
+}
+
+/// A stored run whose read runs out of the query budgets answers the same
+/// 503 contract, and nothing trawld logs about it names the stored file
+/// (ADR-0056). The saved-run read runs on a clone of the query database,
+/// so its budget failure is a query's, and a query's names no path.
+///
+/// The run is planted with a result file whose one row group is a 16 MiB
+/// column chunk, which the scan reads whole, outside what `DuckDB` can
+/// spill, against an 8 MiB memory limit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_run_read_past_the_budget_logs_no_path() {
+    use trawl_server::store::{RunClaim, RunStatus};
+
+    let work = tempfile::tempdir().expect("work dir");
+    let server = spill_server(
+        work.path(),
+        60,
+        knobs(
+            2,
+            trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES.get(),
+            8 * MIB,
+        ),
+    )
+    .await;
+    let client = trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token)
+        .expect("a client");
+    let saved = client
+        .create_saved("budgeted_run", SMALL)
+        .await
+        .expect("the saved query is created")
+        .id;
+    client
+        .set_schedule(saved, "1h", None, true, None, None)
+        .await
+        .expect("the schedule is attached");
+    let schedule: i64 = sqlx::query_scalar("SELECT id FROM schedules WHERE saved_query_id = $1")
+        .bind(saved)
+        .fetch_one(&common::app_pool(&server.app_db_url).await)
+        .await
+        .expect("the schedule the API just attached");
+    let store = &server.state.storage.schedule;
+    let run = match store
+        .claim_run(schedule, saved, SMALL, None, None)
+        .await
+        .expect("claim a run")
+    {
+        RunClaim::Started(id) => id,
+        other => panic!("expected a started run, got {other:?}"),
+    };
+    let relative = format!("scheduled/run_{run}.parquet");
+    let stored = Path::new(server.state.query.pool.base_dir()).join(&relative);
+    std::fs::create_dir_all(stored.parent().unwrap()).expect("the scheduled directory");
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT md5(i::VARCHAR) || md5((i * 7)::VARCHAR) || md5((i * 13)::VARCHAR) \
+                    || md5((i * 31)::VARCHAR) AS message \
+             FROM range(131072) t(i)) TO '{}' (FORMAT PARQUET, ROW_GROUP_SIZE 131072)",
+            stored.display()
+        ))
+        .unwrap();
+    store
+        .finish_run(
+            run,
+            RunStatus::Success,
+            5,
+            Some(131_072),
+            None,
+            None,
+            Some(&relative),
+        )
+        .await
+        .expect("finish the run");
+    let before = mark();
+
+    let answer = get(&server, &format!("/api/v1/saved/{saved}/runs/{run}")).await;
+    assert_exhausted(&answer);
+
+    let named: Vec<String> = stdout_lines()[before.stdout..]
+        .iter()
+        .filter(|line| line.contains(&relative))
+        .cloned()
+        .collect();
+    assert!(
+        named.is_empty(),
+        "the stored file reached stdout: {named:#?}"
+    );
+    assert_nothing_leaked(work.path(), &before, &[&answer.request_id]);
 }
 
 // -- AC6: one budget, shared --------------------------------------------------

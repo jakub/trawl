@@ -3077,6 +3077,23 @@ pub async fn get_report_run(
         .await
         {
             Ok(Ok(qr)) => Some(qr),
+            // An exhausted query budget is a query's failure, and what is
+            // logged about one names no path, size or `DuckDB` text
+            // (ADR-0056): the classification alone.
+            Ok(Err(e @ trawl_engine::error::EngineError::ResourceExhausted)) => {
+                let err = ServerError::Engine(e);
+                tracing::warn!(
+                    event_type = "report_run_parquet_read_failed",
+                    run_id,
+                    error_class = err.error_class(),
+                    cause_kind = err.cause_kind().as_str(),
+                    "the stored parquet result could not be read within the query budgets"
+                );
+                return Err(
+                    crate::from_saved::unavailable_run_conflict(std::slice::from_ref(&file))
+                        .unwrap_or(err),
+                );
+            }
             Ok(Err(e)) => {
                 tracing::warn!(
                     event_type = "report_run_parquet_read_failed",
