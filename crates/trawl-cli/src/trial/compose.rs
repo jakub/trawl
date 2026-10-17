@@ -745,6 +745,25 @@ mod tests {
     }
 
     #[test]
+    fn query_scratch_sits_on_the_trawld_volume() {
+        let config = trawl_config::Config::from_toml(&trawld_toml()).unwrap();
+        let scratch = config.query_scratch_dir();
+        assert_eq!(
+            scratch,
+            std::path::Path::new("/var/lib/trawl/data.query-scratch")
+        );
+        let project = render_compose(&state());
+        let mounts = project["services"]["trawld"]["volumes"].as_array().unwrap();
+        let covering: Vec<_> = mounts
+            .iter()
+            .filter(|m| scratch.starts_with(m["target"].as_str().unwrap()))
+            .collect();
+        assert_eq!(covering.len(), 1, "{mounts:?}");
+        assert_eq!(covering[0]["source"], "trawld");
+        assert_eq!(covering[0]["target"], TRAWL_VOLUME_ROOT);
+    }
+
+    #[test]
     fn web_toml_parses_through_trawl_config() {
         let config = trawl_config::Config::parse_toml(&web_toml(&state())).unwrap();
         let web = config.web;
