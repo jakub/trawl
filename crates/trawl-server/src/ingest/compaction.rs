@@ -7869,20 +7869,30 @@ mod tests {
     /// existing file is trawl's own and conformant. Both inputs are kept.
     #[test]
     fn maintenance_out_of_memory_is_a_resource_failure_in_compaction_merge() {
-        use chrono::Timelike as _;
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
+        // Compaction writes into the hour its own clock reads, after this
+        // setup. Plant the existing file in this hour and the next, so a
+        // run that crosses an hour boundary still meets one and takes the
+        // merge path.
         let now = chrono::Utc::now();
-        let existing = data_dir
-            .join(now.format("%Y-%m-%d").to_string())
-            .join(format!("{:02}", now.hour()))
-            .join("svc.parquet");
+        let existing: Vec<PathBuf> = [now, now + chrono::Duration::hours(1)]
+            .iter()
+            .map(|at| {
+                data_dir
+                    .join(at.format("%Y-%m-%d").to_string())
+                    .join(at.format("%H").to_string())
+                    .join("svc.parquet")
+            })
+            .collect();
         // A 64 MiB column chunk: the merge allocates 128 MiB to read it,
         // past a limit that still holds the WAL read's two 32 MiB buffers.
-        oom_support::parquet_of(&existing, 524_288);
-        let existing_before = std::fs::read(&existing).unwrap();
+        oom_support::parquet_of(&existing[0], 524_288);
+        std::fs::create_dir_all(existing[1].parent().unwrap()).unwrap();
+        std::fs::copy(&existing[0], &existing[1]).unwrap();
+        let existing_before = std::fs::read(&existing[0]).unwrap();
         let wal = write_wal_file(&wal_dir, "svc", &[OPERATIONAL_ROW]);
 
         let (result, logs, exhausted) = oom_support::capture(|| {
@@ -7898,7 +7908,14 @@ mod tests {
         assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
         assert!(!logs.contains("catalog_invariant_violation"), "{logs}");
         assert!(wal.is_file(), "the WAL is kept");
-        assert_eq!(std::fs::read(&existing).unwrap(), existing_before);
+        for file in &existing {
+            assert_eq!(std::fs::read(file).unwrap(), existing_before, "{file:?}");
+        }
+        assert_eq!(
+            find_files_by_ext(&data_dir, "parquet").len(),
+            existing.len(),
+            "no other hour gained a file"
+        );
     }
 
     /// A rollup that runs out of memory is a resource failure, not
