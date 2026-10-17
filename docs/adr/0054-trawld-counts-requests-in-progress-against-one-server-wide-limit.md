@@ -150,7 +150,7 @@ The count bounds requests that trawld has read the head of. Three things sat in 
 **What this does not cover.** These are the human's rulings in #304.
 
 - HTTP/2 on either daemon, for the reason above.
-- A per-listener connection count. trawld raises its soft `RLIMIT_NOFILE` to the hard limit at startup instead, so the chart, image and trial get the same descriptor headroom as the Debian unit, and the OS limit is the bound.
+- A per-listener connection count. The descriptor limit is the bound instead, and trawld raises its soft limit to the hard limit at startup, as [ADR-0056](0056-queries-spill-into-a-bounded-scratch-directory-and-health-samples-the-engine.md) records under its descriptor limit, so the chart, the image and the trial are not held to the soft limit they inherit.
 - A write timeout for slow readers. A client that reads a response slowly holds a connection and a buffer, and the count already bounds it once the head is out.
 - A body deadline on trawld. A slow body there is sent by an authenticated caller and is bounded by `max_concurrent_requests`; the proxy's body deadline covers the browser path.
 - Fairness between the proxy's callers. One count lets any of them fill it, as trawld's does.

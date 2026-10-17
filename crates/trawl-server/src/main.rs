@@ -1139,7 +1139,6 @@ fn log_crash_dump(status: &trawl_crashdump::Status) {
     }
 }
 
-/// Resolve a path, expanding `~` to the home directory.
 /// Raises the soft `RLIMIT_NOFILE` to the hard limit and logs both once.
 ///
 /// Every query, maintenance pass and ingest connection holds descriptors,
@@ -1200,6 +1199,7 @@ fn rlimit_text(limit: Option<u64>) -> String {
     limit.map_or_else(|| "unlimited".to_owned(), |n| n.to_string())
 }
 
+/// Resolve a path, expanding `~` to the home directory.
 fn resolve_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).as_ref())
 }

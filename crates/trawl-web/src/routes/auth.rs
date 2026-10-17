@@ -741,10 +741,10 @@ mod tests {
 
     #[tokio::test]
     async fn logout_allows_the_configured_origin_with_no_host_header_at_all() {
-        // Over HTTP/2 a browser sends `:authority` and no `Host` header,
-        // which hyper parks in the request URI. Since ADR-0016 neither is
-        // read: the configured allowlist decides, so a request carrying
-        // only a matching `Origin` is accepted and clears the cookie.
+        // A request with an absolute URI and no `Host` header: since
+        // ADR-0016 neither is read, and the configured allowlist decides,
+        // so a request carrying only a matching `Origin` is accepted and
+        // clears the cookie.
         let app = routes::build(test_state(unreached_upstream()));
 
         let req = Request::builder()
