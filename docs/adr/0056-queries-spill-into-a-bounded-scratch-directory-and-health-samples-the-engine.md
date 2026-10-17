@@ -1,6 +1,6 @@
 # Queries spill into a bounded scratch directory, and health samples the engine
 
-status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-17
+status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-17; amended (2026-10-17): sizing for an 8 GiB process ceiling, see the Amendment
 
 On 2026-10-17 one search from the web UI took the homelab's only trawld pod out of service twice in one minute. The chart gave trawld a 512Mi `/tmp` emptyDir, and the query engine spilled into it. DuckDB sizes its spill cap from `statvfs` on the temp directory, and inside a disk-backed emptyDir `statvfs` reports the node's disk, not the `sizeLimit`. Nothing in trawld set `max_temp_directory_size`, `memory_limit` or `threads` on the query database. The kubelet evicted the pod for exceeding the emptyDir limit 30 seconds after the query timed out.
 
@@ -22,9 +22,11 @@ The scratch directory is not the data root, the WAL directory or a repin staging
 | `[server] query_memory_limit` | `memory_limit` | `256M` |
 | `[server] query_threads` | `threads` | `2` |
 
+*Amended 2026-10-17: the defaults are now 4 GiB, 2 GiB and 4. See the amendment.*
+
 Every query, export and field sample that runs on the query database shares these budgets. DuckDB enforces the spill cap on the bytes it accounts. On disk it can hold a little more: when a temp file shrinks, DuckDB keeps one block of that file's size class past its count, so the directory can exceed the cap by one block per size class, 1,179,648 bytes on DuckDB 1.5.5. Startup refuses a zero, an overflow or a setting DuckDB rejects. It does not compare `query_spill_max_bytes` with the free or total space of the filesystem: a maximum is not a reservation, and free space changes after the check.
 
-`[ingest] compaction_memory_limit` drops from `2GB` to `256MB`. Compaction, conform and repin each open their own database with that limit, and they can run at the same time. The chart's trawld container moves to a 4Gi memory limit with a 1Gi request. The 2Gi limit could not hold the documented ceilings: 1 GiB of request bodies and 512 MiB of argon2 before any DuckDB database. DuckDB limits bound DuckDB-managed memory only, not the process RSS, so the change carries a committed mixed run of ingest, queries, compaction and repin at these defaults.
+`[ingest] compaction_memory_limit` drops from `2GB` to `256MB`. Compaction, conform and repin each open their own database with that limit, and they can run at the same time. The chart's trawld container moves to a 4Gi memory limit with a 1Gi request. The 2Gi limit could not hold the documented ceilings: 1 GiB of request bodies and 512 MiB of argon2 before any DuckDB database. DuckDB limits bound DuckDB-managed memory only, not the process RSS, so the change carries a committed mixed run of ingest, queries, compaction and repin at these defaults. *Amended 2026-10-17: the limit is now `1GiB`, at most two of these databases run at once, and the container limit is 8Gi. See the amendment.*
 
 Snapshots need no budget of their own. Every query that takes a snapshot holds an executor permit, and the cache keeps one file per generation, so at most `max_concurrent_queries + 1` snapshot files exist, each no larger than the serialized hot buffer. Export staging files are bounded in count by the permits, not in size.
 
@@ -60,3 +62,38 @@ Snapshots need no budget of their own. Every query that takes a snapshot holds a
 - Compaction and conform still spill into the data root without a private directory. This decision does not change that.
 - Live-tail streams take an SSE slot and no executor permit, so this decision leaves their capacity alone.
 - The 512Mi `/tmp` emptyDir stays, for the read-only root filesystem, and holds no query data.
+
+## Amendment: sizing for an 8 GiB process ceiling, 2026-10-17
+
+The budgets above were sized to fit a 4Gi container. They are now sized for an 8 GiB process ceiling, which the chart and the Debian unit both enforce, and every byte value is written in GiB.
+
+| key | default |
+|---|---|
+| `[server] query_spill_max_bytes` | 4 GiB |
+| `[server] query_memory_limit` | 2 GiB |
+| `[server] query_threads` | 4 |
+| `[server] max_concurrent_queries` | the CPU count, at most 8; 4 when the count cannot be read |
+| `[ingest] compaction_memory_limit` | `"1GiB"` |
+| `[retention] min_free_disk_bytes` | 6 GiB |
+
+trawl's byte sizes are 1024-based. `compaction_memory_limit` is a raw DuckDB string, and DuckDB reads `GB` as 10^9, so its default is spelled `1GiB`. The permit default stops at 8 because the chart sets no CPU limit: on a 64-core node every one of 64 permits would share the same 2 GiB. The shared CPU-count helper is not capped; only the permit default is.
+
+**Memory arithmetic.** At the defaults the components that can peak together are:
+
+| component | ceiling |
+|---|---|
+| query database, `query_memory_limit` | 2 GiB |
+| maintenance databases at `compaction_memory_limit`, at most two at once | 2 × 1 GiB |
+| in-flight ingest bodies, 32 requests × (sent + decoded) × 16 MiB | 1 GiB |
+| argon2, 4 checks × 128 MiB | 512 MiB |
+| hot buffer, self-telemetry buffer and RSS DuckDB does not account | the rest |
+
+At most two maintenance databases are open at once: the ingest pipeline's compaction and rollup pass, and a repin. The conformance pass runs at boot, before either starts. The sum is about 6.1 to 6.6 GiB of the 8 GiB ceiling. That is a sizing, not a measured bound. The chart's trawld container gets an 8Gi limit and keeps its 1Gi request. The trawl-web sidecar gets a 512Mi limit. On Debian, `trawld.service` sets `MemoryMax=8G` and `trawl-web.service` sets `MemoryMax=512M`. `MemoryMax` is a ceiling, not a reservation.
+
+**Disk arithmetic.** The 6 GiB pressure floor covers the 4 GiB spill budget, `max_concurrent_queries + 1` hot-buffer snapshots (9 × 100 MiB at 8 permits), and export staging. This is documented, not validated. The decision above already rules that startup does not compare the spill budget with free space, and the same holds for the floor: a floor below the spill budget, including `0`, still starts. The two keys are independent, and the docs tell the operator to raise them together.
+
+**Maintenance out of memory.** Compaction, rollup, conform and repin turn on `errors_as_json` and classify a statement failure by the same `exception_type` the query database uses. An `Out of Memory` there is a resource failure, not bad input. trawld does not quarantine or isolate the WAL file, does not mark a day unreadable, and does not skip a file as foreign. It keeps the inputs, logs `maintenance_resource_exhausted`, counts the statement in `trawl_maintenance_resource_exhausted_total`, and the next pass retries. Before this change, an `Out of Memory` while compaction read a sound WAL file went to isolation, the probe ran out too, and the file was quarantined as data loss.
+
+**Termination grace.** The chart derives `terminationGracePeriodSeconds` as `shutdown_drain_secs + 30`. After the drain, trawld gives the runtime 10 seconds to shut down and the telemetry flush 5 seconds; 30 seconds covers both with margin. It is not a proven exit bound. DuckDB's interrupt is cooperative, so a statement in flight can outlast it, and the kubelet then sends SIGKILL. Acknowledged ingest survives that in the WAL (ADR-0041). The startup probe allows five minutes (`periodSeconds: 5`, `failureThreshold: 60`, `timeoutSeconds: 5`) for boot recovery, hydration and the conformance pass.
+
+**Descriptor limit.** Each query, maintenance pass and ingest connection holds descriptors, and DuckDB opens one per Parquet file it scans. At startup trawld raises its soft `RLIMIT_NOFILE` to the hard limit and logs both values once. It does not follow an unlimited hard limit, because Linux refuses a descriptor limit above `fs.nr_open`. If the raise fails, trawld warns and runs on the inherited limits. `trawld.service` sets `LimitNOFILE=65536`, which sets both limits.

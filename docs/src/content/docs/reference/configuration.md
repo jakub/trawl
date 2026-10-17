@@ -423,11 +423,11 @@ The HTTPS listener, query limits, TLS, and logging.
 |-----|------|---------|-------------|
 | `http_addr` | string | `"127.0.0.1:5514"` | HTTPS listen address |
 | `timeout_secs` | integer | `30` | Absolute query deadline in seconds, counted from authentication and including queue waits |
-| `max_concurrent_queries` | integer | *(CPU count)* | DuckDB executor pool size. Must be greater than 0 |
+| `max_concurrent_queries` | integer | *(CPU count, at most 8)* | DuckDB executor pool size. The default is the CPU count up to 8, or 4 when trawld cannot read the count. Every permit shares `query_memory_limit`, so a large host does not get one permit per core. Must be greater than 0 |
 | `query_scratch_dir` | path | `<data.path>.query-scratch` | Where queries spill, where hot-buffer query snapshots live, and where exports stage. The default is a sibling of the data root. See [query scratch and budgets](#query-scratch-and-budgets) |
-| `query_spill_max_bytes` | byte size | `"512M"` | The most spill the query database writes into the scratch directory at once, shared by every query. A query that needs more fails with 503 `query_resource_exhausted`. Zero is refused |
-| `query_memory_limit` | byte size | `"256M"` | DuckDB memory limit of the query database. It bounds DuckDB-managed memory, not the process. Zero is refused |
-| `query_threads` | integer | `2` | DuckDB worker threads of the query database. Independent of `max_concurrent_queries`. Zero is refused |
+| `query_spill_max_bytes` | byte size | `"4GiB"` | The most spill the query database writes into the scratch directory at once, shared by every query. A query that needs more fails with 503 `query_resource_exhausted`. Zero is refused |
+| `query_memory_limit` | byte size | `"2GiB"` | DuckDB memory limit of the query database. It bounds DuckDB-managed memory, not the process. Zero is refused |
+| `query_threads` | integer | `4` | DuckDB worker threads of the query database. Independent of `max_concurrent_queries`. Zero is refused |
 | `max_result_rows` | integer | `100000` | Rows a query may return before trawld rejects it |
 | `max_export_rows` | integer | `1000000` | Rows an export may return. Exports do not use `max_result_rows` |
 | `max_request_body_bytes` | byte size | `"128K"` | Request body limit on every route except `/api/v1/ingest`, which has `[ingest] max_body_bytes`. `/api/v1/health` and `/metrics` read no body, so no body limit applies to them. A route that reads a body reads it before it checks the route's own permission, so any key with a trawl permission can make one request hold up to this many bytes |
@@ -492,13 +492,13 @@ Searches, exports, and field samples all run on one query database. A big query 
 | Key | DuckDB setting | Default | Refused at startup |
 |-----|----------------|---------|--------------------|
 | `query_scratch_dir` | none | `<data.path>.query-scratch` | An empty path. An explicit path that is relative or has a `..` component. A path with a glob metacharacter (`*`, `?`, `[`, `]`, `{`, `}`). A path equal to, inside, or above the data root, the WAL directory, or a repin staging root (`<data.path>.repin-next`, `<data.path>.repin-aside`) |
-| `query_spill_max_bytes` | `max_temp_directory_size` | `"512M"` | Zero. A value that overflows 64 bits. A value DuckDB rejects |
-| `query_memory_limit` | `memory_limit` | `"256M"` | Zero. A value that overflows 64 bits. A value DuckDB rejects |
-| `query_threads` | `threads` | `2` | Zero. A value that overflows 32 bits |
+| `query_spill_max_bytes` | `max_temp_directory_size` | `"4GiB"` | Zero. A value that overflows 64 bits. A value DuckDB rejects |
+| `query_memory_limit` | `memory_limit` | `"2GiB"` | Zero. A value that overflows 64 bits. A value DuckDB rejects |
+| `query_threads` | `threads` | `4` | Zero. A value that overflows 32 bits |
 
-Each refusal names the key, such as `server.query_scratch_dir must not be inside the data root (data.path)`. `trawld --check-config` reports the config-level refusals without starting the daemon. Byte sizes use the same suffixes as the other byte-size keys. trawld applies the three budgets to the query database once, before it clones the connections the executor pool uses, and reads each one back from a clone at startup. Every query, export, and field sample shares them, so two queries together cannot spill more than `query_spill_max_bytes`. trawld does not compare `query_spill_max_bytes` with the free space of the filesystem. The value is a maximum, not a reservation, and free space changes after any check. Size the volume for it yourself.
+Each refusal names the key, such as `server.query_scratch_dir must not be inside the data root (data.path)`. `trawld --check-config` reports the config-level refusals without starting the daemon. Byte sizes use the same suffixes as the other byte-size keys. trawld applies the three budgets to the query database once, before it clones the connections the executor pool uses, and reads each one back from a clone at startup. Every query, export, and field sample shares them, so two queries together cannot spill more than `query_spill_max_bytes`. trawld does not compare `query_spill_max_bytes` with the free space of the filesystem. The value is a maximum, not a reservation, and free space changes after any check. Size the volume for it yourself, and see [the disk arithmetic](#the-disk-arithmetic) for how it sits beside `[retention] min_free_disk_bytes`.
 
-**What lands in the scratch directory.** Three things: each query database's private spill directory (`trawl-spill-*`, mode 0700), the hot-buffer query snapshots (`trawl-snapshot-*.ndjson`), and the Parquet export staging files (`trawl-export-*.parquet`). trawld writes nothing large to `TMPDIR` for a query, a snapshot, or an export. Compaction, conform, and repin spill under the data root, and they have their own `[ingest] compaction_memory_limit`.
+**What lands in the scratch directory.** Three things: each query database's private spill directory (`trawl-spill-*`, mode 0700), the hot-buffer query snapshots (`trawl-snapshot-*.ndjson`), and the Parquet export staging files (`trawl-export-*.parquet`). trawld writes nothing large to `TMPDIR` for a query, a snapshot, or an export. Compaction, rollup, conform, and repin spill under the data root, and they have their own `[ingest] compaction_memory_limit`.
 
 The spill cap counts the bytes DuckDB accounts. On disk, DuckDB can hold a little more: up to one block per temp-file size class, 1,179,648 bytes each on DuckDB 1.5.5. Snapshots and export staging files have no budget of their own. At most `max_concurrent_queries + 1` snapshot files exist, each no larger than the serialized hot buffer. Export staging is bounded in count by `max_concurrent_queries`, not in size, so a large export can still fill the filesystem. `max_export_rows` limits it indirectly.
 
@@ -528,17 +528,21 @@ Any other entry refuses the start: a different name, a symlink, a special file, 
 
 ##### The memory arithmetic
 
-DuckDB limits bound DuckDB-managed memory only. They do not bound the process resident set. The Helm chart gives the `trawld` container a 4Gi limit and a 1Gi request. The limit is the ceiling the kernel enforces, so it has to hold the sum of the components that can peak together:
+DuckDB limits bound DuckDB-managed memory only. They do not bound the process resident set. The Helm chart gives the `trawld` container an 8Gi limit and a 1Gi request, and the Debian unit sets `MemoryMax=8G`. The limit is the ceiling the kernel enforces, so it has to hold the sum of the components that can peak together:
 
 | Component | Ceiling at the defaults |
 |-----------|------------------------|
-| Ingest request bodies: `max_concurrent_requests` × (`[ingest] max_body_bytes` as sent + decoded) | 32 × (16 MiB + 16 MiB) = 1 GiB |
+| Query database: `query_memory_limit` | 2 GiB |
+| Maintenance databases: `compaction_memory_limit` each, at most two at once (the compaction and rollup pass beside a repin; the conformance pass runs at boot, before either) | 2 × 1 GiB = 2 GiB |
+| Ingest request bodies: `max_concurrent_requests` × (`[ingest] max_body_bytes` as sent + decoded) | 32 × 2 × 16 MiB = 1 GiB |
 | Token checks: 4 Argon2id checks at 128 MiB | 512 MiB |
-| Query database: `query_memory_limit` | 256 MiB |
-| Compaction, conform, and repin: `compaction_memory_limit` each, all three at once | 3 × 256 MB, about 732 MiB |
-| Total of the above | about 2.5 GiB |
+| Total of the above | 5.5 GiB |
 
-The remaining 1.5 GiB of the 4Gi limit covers what no limit bounds: the hot buffer (`hot_buffer_max_bytes` is its serialized size, and its resident size is larger), parse structures, response buffers, DuckDB allocations outside its limit, and allocator overhead. The 1Gi request is what the scheduler reserves for the pod; an idle trawld uses well under it. If you raise `max_concurrent_requests`, `query_memory_limit`, or `compaction_memory_limit`, raise the container limit by the same amount.
+The hot buffer (`hot_buffer_max_bytes` is its serialized size, and its resident size is larger), the self-telemetry buffer, parse structures, response buffers, DuckDB allocations outside its limit, and allocator overhead come on top. With them, the worst case at the defaults is about 6.1 to 6.6 GiB of the 8 GiB limit. That is a sizing, not a measured bound. The 1Gi request is what the scheduler reserves for the pod; an idle trawld uses well under it. If you raise `max_concurrent_requests`, `query_memory_limit`, or `compaction_memory_limit`, raise the container limit by the same amount.
+
+##### The disk arithmetic
+
+Query spill, snapshots, and export staging use ordinary headroom on the data filesystem, and pressure deletion compares the real free space with `[retention] min_free_disk_bytes`. The default floor of 6 GiB covers the 4 GiB spill budget, `max_concurrent_queries + 1` hot-buffer snapshots (9 × 100 MiB at 8 permits), and some export staging. A large query can therefore start pressure deletion early, but it does not eat the room the WAL needs. trawld does not check the floor against the spill budget, and a floor of `0` stays valid. If you raise `query_spill_max_bytes`, raise the floor by the same amount.
 
 #### `[server.rate_limit]`
 
@@ -604,7 +608,7 @@ CLI's `trawl query --data` option instead.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `path` | string | *(required)* | Parquet data directory. Glob metacharacters (`*`, `?`, `[`) are not accepted |
+| `path` | string | *(required)* | Parquet data directory. Glob metacharacters (`*`, `?`, `[`, `]`, `{`, `}`) are not accepted |
 
 Notes:
 
@@ -653,7 +657,7 @@ Notes:
 | `telemetry_flush_interval_secs` | integer | `1` | How often buffered tracing events are flushed to the WAL |
 | `telemetry_buffer_max_bytes` | byte size | `"16M"` | One estimated memory budget for everything self-telemetry holds while the WAL is unhealthy: active buffer, retry queue, and the batch in flight. Minimum `"64K"` |
 | `compaction_chunk_size` | integer | `500` | Maximum WAL files merged per compaction chunk. A larger backlog is split into chunks. At most `4096`, because each chunk's publication marker names every file it merges |
-| `compaction_memory_limit` | string | `"256MB"` | DuckDB memory limit for each compaction, conform, and repin database, as a DuckDB memory string. `MB` is 1000-based here. Those three can run at the same time, beside `[server] query_memory_limit`. See [the memory arithmetic](#the-memory-arithmetic) |
+| `compaction_memory_limit` | string | `"1GiB"` | DuckDB memory limit for each compaction, rollup, conform, and repin database, as a DuckDB memory string. `GiB` and `MiB` are 1024-based; DuckDB reads `GB` and `MB` as powers of ten. At most two of these databases run at once, beside `[server] query_memory_limit`. A statement that runs out of this limit is a resource failure, not bad input: trawld logs `maintenance_resource_exhausted`, counts it in `trawl_maintenance_resource_exhausted_total`, keeps the inputs, and retries them on the next pass. See [the memory arithmetic](#the-memory-arithmetic) |
 | `default_env` | string | `"prod"` | Fills a missing `env`, recorded as the `env.defaulted` repair. Must pass the env charset and belong to `envs` |
 | `envs` | string array | `[default_env]` | Environment allowlist. Entries must match `[a-z0-9_-]{1,32}`. `wal` and `scheduled` are reserved |
 | `trusted_relays` | CIDR array | `[]` | Peers whose address trawld must never stamp as a `host` |
@@ -731,13 +735,13 @@ install-wide.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_age_days` | integer | `90` | Delete data older than this many days in every env without an override. `0` keeps that data forever |
-| `min_free_disk_bytes` | byte size | `"1G"` | Below this much free disk, delete date directories until free space is back above it. `0` disables |
+| `min_free_disk_bytes` | byte size | `"6GiB"` | Below this much free disk, delete date directories until free space is back above it. `0` disables. Not checked against `[server] query_spill_max_bytes`; see [the disk arithmetic](#the-disk-arithmetic) |
 | `retention_interval_secs` | integer | `3600` | How often the retention task runs |
 
 ```toml
 [retention]
 max_age_days = 90
-min_free_disk_bytes = "1G"
+min_free_disk_bytes = "6GiB"
 retention_interval_secs = 3600
 
 # Sub-tables go last: a scalar after this header lands inside it.

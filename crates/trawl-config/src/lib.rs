@@ -267,8 +267,8 @@ pub struct RateLimitConfig {
 pub struct DataConfig {
     /// Directory containing parquet files (e.g. "/var/lib/trawl/data").
     ///
-    /// Must be a directory path. Glob metacharacters (`*`, `?`, `[`) are
-    /// rejected when daemon configuration is validated.
+    /// Must be a directory path. Glob metacharacters (`*`, `?`, `[`, `]`,
+    /// `{`, `}`) are rejected when daemon configuration is validated.
     pub path: String,
 }
 

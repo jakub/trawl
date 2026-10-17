@@ -18,7 +18,7 @@ states the rules and defaults.
    ```toml
    [retention]
    max_age_days = 90
-   min_free_disk_bytes = "1G"
+   min_free_disk_bytes = "6GiB"
    retention_interval_secs = 3600
 
    [retention.env.prod]
@@ -66,13 +66,14 @@ than a longer age limit.
 
 Pressure deletion compares real available bytes. Scratch counts as ordinary
 use of the data filesystem, the same as compaction spill, so trawld does not
-add it back to free space. A large query that spills hundreds of megabytes
-into the scratch directory can push free space below the floor and start
-deletion earlier than the data alone would. Spill is bounded by
-`[server] query_spill_max_bytes` (default `512M`), and its files go away when
-the query ends. Leave room for it when you size the volume and choose
-`min_free_disk_bytes`. See
-[query scratch and budgets](/reference/configuration/#query-scratch-and-budgets).
+add it back to free space. A large query that spills gigabytes into the
+scratch directory can push free space below the floor and start deletion
+earlier than the data alone would. Spill is bounded by
+`[server] query_spill_max_bytes` (default `4GiB`), and its files go away when
+the query ends. The default floor of `6GiB` holds that budget, the hot-buffer
+query snapshots and some export staging. trawld does not check the floor
+against the spill budget, so raise the two together. See
+[the disk arithmetic](/reference/configuration/#the-disk-arithmetic).
 
 If free space stays below the threshold:
 

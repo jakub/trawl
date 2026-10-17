@@ -416,18 +416,34 @@ cluster.
 On Helm, query scratch is `/var/lib/trawl/data.query-scratch` on the same
 PVC as the data root. The root filesystem is read-only, and the 512Mi `/tmp`
 emptyDir exists for that reason. It holds no query data. Size the PVC with
-room for `config.server.querySpillMaxBytes` (default `512M`) beside the data.
-The trawld container asks for 1Gi of memory and is limited to 4Gi. The limit
-covers 1 GiB of request bodies, 512 MiB of password hashing, the 256M query
-database, and three 256MB compaction, conform, and repin databases, with
-room left for the hot buffer. See [the memory arithmetic](/reference/configuration/#the-memory-arithmetic)
-before you raise `config.server.maxConcurrentRequests` or
-`config.server.queryMemoryLimit`. The chart refuses to render a
-`config.server.queryScratchDir` that sits off the data volume.
+room for `config.server.querySpillMaxBytes` (default `4GiB`) beside the data,
+and keep `config.retention.minFreeDiskBytes` (default `6GiB`) above it; see
+[the disk arithmetic](/reference/configuration/#the-disk-arithmetic).
+The trawld container asks for 1Gi of memory and is limited to 8Gi. The limit
+covers the 2 GiB query database, two 1 GiB maintenance databases, 1 GiB of
+request bodies and 512 MiB of password hashing, with room left for the hot
+buffer and memory DuckDB does not account. The trawl-web sidecar is limited
+to 512Mi. See [the memory arithmetic](/reference/configuration/#the-memory-arithmetic)
+before you raise `config.server.maxConcurrentRequests`,
+`config.server.queryMemoryLimit` or `config.ingest.compactionMemoryLimit`.
+The chart refuses to render a `config.server.queryScratchDir` that sits off
+the data volume.
+
+The pod's `terminationGracePeriodSeconds` is `config.server.shutdownDrainSecs`
+plus 30 seconds: the drain, then the runtime's 10-second shutdown and the
+5-second telemetry flush, with margin. It is a sizing, not a proven bound on
+how long trawld takes to exit. The startup probe allows five minutes
+(`failureThreshold: 60` at `periodSeconds: 5`) for boot recovery, hydration
+and the boot conformance pass.
 
 On Debian, the same directory sits in `/var/lib/trawl`, inside the unit's
 writable paths. A `query_scratch_dir` outside `/var/lib/trawl` needs the
-unit's `ReadWritePaths=` extended in a drop-in. `trawl trial` places scratch
+unit's `ReadWritePaths=` extended in a drop-in. The units cap memory the same
+way: `trawld.service` sets `MemoryMax=8G`, and `trawl-web.service` sets
+`MemoryMax=512M`. `MemoryMax` is a ceiling, not a reservation, so a host with
+less RAM runs out before the unit does. `trawld.service` also sets
+`LimitNOFILE=65536`, and trawld raises its soft descriptor limit to the hard
+limit at startup and logs both values as `descriptor limit`. `trawl trial` places scratch
 on its `trawld` volume.
 
 Stored data is owner-only on Helm too, but the modes differ from the

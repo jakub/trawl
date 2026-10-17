@@ -12,7 +12,8 @@
 # timeout_secs = 30
 
 # Maximum concurrent queries (bounds the DuckDB executor pool).
-# Defaults to the number of available CPUs.
+# Defaults to the number of available CPUs, at most 8 (4 when the count
+# cannot be read). Every permit shares query_memory_limit.
 # max_concurrent_queries = 4
 
 # Query scratch directory: each query's spill, the hot-buffer query
@@ -37,16 +38,18 @@
 # sample. A query that needs more fails with 503 query_resource_exhausted;
 # the server keeps serving. Zero is refused.
 # Spill cap (DuckDB max_temp_directory_size). It is a maximum, not a
-# reservation: trawld does not compare it with the free space.
-# query_spill_max_bytes = "512M"
+# reservation: trawld does not compare it with the free space or with
+# [retention] min_free_disk_bytes. Keep that floor above it.
+# query_spill_max_bytes = "4GiB"
 # Memory limit (DuckDB memory_limit). It bounds DuckDB-managed memory, not
 # the whole process: plan for it plus compaction_memory_limit for each of
-# compaction, conform and repin, which can run at the same time, plus the
-# request bodies counted under max_concurrent_requests.
-# query_memory_limit = "256M"
+# the two maintenance databases that can run at once, plus the request
+# bodies counted under max_concurrent_requests. At the defaults that comes
+# to about 6.1-6.6 GiB resident, under the packaged 8 GiB ceiling.
+# query_memory_limit = "2GiB"
 # Worker threads of the query database. Independent of
 # max_concurrent_queries, which counts queries, not threads.
-# query_threads = 2
+# query_threads = 4
 
 # Maximum rows a single query can return before being rejected.
 # Increase if analysts need larger result sets; decrease to bound memory.
@@ -142,7 +145,8 @@
 # ingest_rpm = 1000
 
 [data]
-# Directory containing parquet files. Glob patterns are not accepted.
+# Directory containing parquet files. The glob metacharacters * ? [ ] { }
+# are refused.
 path = "~/.trawl/data"
 
 [auth]
@@ -181,10 +185,12 @@ path = "~/.trawl/data"
 # WAL files are merged into parquet. Lower = fresher data but more I/O.
 # compaction_interval_secs = 10
 
-# DuckDB memory limit for each compaction, conform and repin database, as a
-# DuckDB memory string (MB is 1000-based here). Those three can run at the
-# same time, beside the query database's query_memory_limit.
-# compaction_memory_limit = "256MB"
+# DuckDB memory limit for each compaction, rollup, conform and repin
+# database, as a DuckDB memory string (GiB is 1024-based; DuckDB reads GB as
+# a power of ten). At most two run at once, beside the query database's
+# query_memory_limit. A pass that runs out logs maintenance_resource_exhausted
+# and keeps its inputs for the next pass.
+# compaction_memory_limit = "1GiB"
 
 # Write internal server events (queries, auth, compaction) to the ingest
 # pipeline as service:trawld. Enables self-hosted dashboards.
@@ -289,7 +295,10 @@ path = "~/.trawl/data"
 # directories regardless of age, taking the one that has used up the
 # largest fraction of its env's age limit first. 0 = disabled. Acts as
 # a safety net independent of max_age_days.
-# min_free_disk_bytes = "1G"
+# The 6GiB default holds the 4GiB query spill budget, the hot-buffer
+# snapshots and export staging. Nothing checks it against
+# query_spill_max_bytes: raise the two together.
+# min_free_disk_bytes = "6GiB"
 
 # How often the retention task runs (seconds). More frequent checks
 # respond faster to disk pressure but add minor I/O overhead.
