@@ -8,6 +8,7 @@
 //! and result extraction.
 
 use std::borrow::Cow;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -288,21 +289,22 @@ pub fn spill_dir() -> std::path::PathBuf {
 /// Make a directory in [`spill_dir`] that only this process's user can
 /// enter, with a fresh random name.
 fn private_spill_dir() -> std::io::Result<tempfile::TempDir> {
-    private_dir_in(&spill_dir(), |_| Ok(()))
+    crate::scratch::private_dir_in(&spill_dir(), crate::scratch::TMPDIR_SETTING, |_| Ok(()))
 }
 
-/// The `SET temp_directory` statement for `dir`.
+/// The `SET temp_directory` statement for `dir`. `setting` is what a
+/// refusal tells the operator to change.
 ///
 /// The path goes into SQL as text, so one that is not UTF-8 is refused
 /// rather than converted: a lossy conversion would point `DuckDB` at a
 /// different path than the private directory that was checked (ADR-0052).
-fn temp_directory_statement(dir: &Path) -> std::io::Result<String> {
+fn temp_directory_statement(dir: &Path, setting: &str) -> std::io::Result<String> {
     let text = dir.to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "the query spill directory {} is not valid UTF-8, so it cannot be \
-                 handed to the query engine; point TMPDIR at a path that is",
+                 handed to the query engine; point {setting} at a path that is",
                 dir.display()
             ),
         )
@@ -310,59 +312,157 @@ fn temp_directory_statement(dir: &Path) -> std::io::Result<String> {
     Ok(format!("SET temp_directory='{}'", text.replace('\'', "''")))
 }
 
-/// Make a private directory in `parent`, run `after_create` on it (tests
-/// stand in a filesystem that ignores the requested mode), then check it.
+/// The budgets of the query database (ADR-0056): `DuckDB`'s
+/// `max_temp_directory_size`, `memory_limit` and `threads`.
 ///
-/// The directory is asked for at 0700, and a filesystem can still answer
-/// otherwise: a fixed-mode mount ignores the mode. So it is opened
-/// no-follow and its owner and mode are read from that handle: it must
-/// belong to this process's euid and carry no group or other bit, or it is
-/// refused and removed.
-fn private_dir_in(
-    parent: &Path,
-    after_create: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> std::io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("trawl-spill-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(0o700));
-    }
-    let dir = builder.tempdir_in(parent)?;
-    after_create(dir.path())?;
-    #[cfg(unix)]
-    check_private(dir.path(), rustix::process::geteuid().as_raw())?;
-    Ok(dir)
+/// All three are database-global, so every connection cloned from the
+/// database shares them: one query's spill counts against the cap of every
+/// other query on the same database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudgets {
+    /// Bytes the database may hold in its spill directory.
+    pub spill_max_bytes: NonZeroU64,
+    /// Bytes of memory `DuckDB` may manage for the database.
+    pub memory_limit: NonZeroU64,
+    /// Worker threads of the database.
+    pub threads: NonZeroU32,
 }
 
-/// Refuse the directory at `path` unless `euid` owns it and it has no group
-/// or other bit, read through a handle opened without following a symlink.
-#[cfg(unix)]
-fn check_private(path: &Path, euid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    use rustix::fs::{Mode, OFlags};
-    /// The group and other permission bits.
-    const GROUP_OTHER: u32 = 0o077;
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let handle = std::fs::File::from(rustix::fs::open(path, flags, Mode::empty())?);
-    let meta = handle.metadata()?;
-    let (owner, mode) = (meta.uid(), meta.mode() & 0o7777);
-    if owner == euid && mode & GROUP_OTHER == 0 {
-        return Ok(());
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
+impl QueryBudgets {
+    /// The `SET GLOBAL` statements that apply the budgets.
+    ///
+    /// Byte values go in as `'<n> bytes'`: `DuckDB` reads `M` and `MB` as
+    /// 1000-based, while trawl's byte sizes are 1024-based, so handing it the
+    /// configured spelling would set a different number.
+    fn statements(&self) -> String {
         format!(
-            "the query spill directory {} is not private to uid {euid}, the user \
-             trawld runs as (owner uid {}, mode {mode:04o}), so other users could \
-             read spilled query state; point TMPDIR at a directory on a \
-             filesystem that keeps Unix modes",
-            path.display(),
-            owner,
-        ),
-    ))
+            "SET GLOBAL max_temp_directory_size = '{} bytes'; \
+             SET GLOBAL memory_limit = '{} bytes'; \
+             SET GLOBAL threads = {};",
+            self.spill_max_bytes, self.memory_limit, self.threads
+        )
+    }
+
+    /// Refuse a connection that does not read the budgets back.
+    ///
+    /// `DuckDB` reads a byte setting back through its human-readable format
+    /// (`512.0 MiB`), so the comparison is with `format_bytes` of the
+    /// configured value, the same function over the same 1024 base, rather
+    /// than with the number. The format rounds, so this proves `DuckDB`
+    /// took the setting at the configured magnitude, not to the byte.
+    fn check_applied(&self, conn: &Connection) -> Result<(), EngineError> {
+        // `format_bytes` takes a signed count, so a budget past `i64::MAX`
+        // cannot be checked and is refused as unchecked.
+        let checkable = |setting: &'static str, bytes: NonZeroU64| {
+            i64::try_from(bytes.get()).map_err(|_| EngineError::BudgetNotApplied {
+                setting,
+                configured: format!("{bytes} bytes"),
+                applied: String::from("a value past what the readback can check"),
+            })
+        };
+        let spill = checkable("max_temp_directory_size", self.spill_max_bytes)?;
+        let memory = checkable("memory_limit", self.memory_limit)?;
+        let (spill_applied, spill_expected, memory_applied, memory_expected, threads) = conn
+            .query_row(
+                "SELECT current_setting('max_temp_directory_size'), format_bytes(?), \
+                        current_setting('memory_limit'), format_bytes(?), \
+                        current_setting('threads')",
+                duckdb::params![spill, memory],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )?;
+        let mismatch = |setting, configured: String, applied: String| {
+            Err(EngineError::BudgetNotApplied {
+                setting,
+                configured,
+                applied,
+            })
+        };
+        if spill_applied != spill_expected {
+            return mismatch("max_temp_directory_size", spill_expected, spill_applied);
+        }
+        if memory_applied != memory_expected {
+            return mismatch("memory_limit", memory_expected, memory_applied);
+        }
+        if i64::from(self.threads.get()) != threads {
+            return mismatch("threads", self.threads.to_string(), threads.to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Reads of an executor's own connection for tests: the settings it runs
+/// under and the outcome of a statement the DSL cannot spell. Compiled for
+/// this crate's tests and the `test-support` feature only.
+#[cfg(any(test, feature = "test-support"))]
+impl Executor {
+    /// `current_setting(name)` on this connection, as text.
+    pub fn current_setting(&self, name: &str) -> Result<String, EngineError> {
+        Ok(self
+            .conn
+            .query_row("SELECT current_setting(?)::VARCHAR", [name], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Run `sql` on this connection and count the rows it returns. A
+    /// failure converts as every lane's does.
+    pub fn count_rows_for_test(&self, sql: &str) -> Result<u64, EngineError> {
+        let mut statement = self.conn.prepare(sql)?;
+        let mut rows = statement.query([])?;
+        let mut count = 0;
+        while rows.next()?.is_some() {
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DiagnosticConnection {
+    /// `current_setting(name)` on this connection, as text.
+    pub fn current_setting(&self, name: &str) -> Result<String, EngineError> {
+        Ok(self
+            .conn
+            .query_row("SELECT current_setting(?)::VARCHAR", [name], |row| {
+                row.get(0)
+            })?)
+    }
+}
+
+/// A connection to a query database that runs only the engine sample's
+/// `SELECT 1` (ADR-0056).
+///
+/// Made by [`Executor::diagnostic_connection`]. It is its own type so the
+/// health sampler can hold it without holding a query executor, and so no
+/// pool can take it as one.
+#[derive(Debug)]
+pub struct DiagnosticConnection {
+    // Declared first, so it drops first, as in `Executor`.
+    conn: Connection,
+    _spill: Arc<tempfile::TempDir>,
+}
+
+impl DiagnosticConnection {
+    /// Run `SELECT 1` on the query database.
+    pub fn select_one(&self) -> Result<(), EngineError> {
+        self.conn
+            .query_row("SELECT 1", [], |_row| Ok(()))
+            .map_err(EngineError::from)
+    }
+
+    /// Get an interrupt handle for stopping an overrunning sample from
+    /// another thread.
+    pub fn interrupt_handle(&self) -> Arc<duckdb::InterruptHandle> {
+        self.conn.interrupt_handle()
+    }
 }
 
 /// Query executor backed by an in-memory `DuckDB` connection.
@@ -394,14 +494,65 @@ impl Executor {
     /// that exits without dropping it, as on a wedged shutdown, leaves the
     /// empty directory behind; `DuckDB` deletes its own files when the
     /// database closes.
+    ///
+    /// It sets no budgets, so `DuckDB` sizes its memory and spill caps from
+    /// the host. trawld's query database is [`Self::open_query_database`].
     pub fn new() -> Result<Self, EngineError> {
+        Self::open(private_spill_dir()?, crate::scratch::TMPDIR_SETTING, None)
+    }
+
+    /// Open the query database (ADR-0056): spill into a private directory
+    /// inside `scratch`, under `budgets`.
+    ///
+    /// The budgets are database-global and go on before anything clones
+    /// the database, so every later clone shares them. A clone then reads
+    /// each one back, and a setting `DuckDB` rejects or reads back
+    /// differently refuses the open. The spill directory is made and
+    /// checked as [`Self::new`] describes, inside `scratch` instead of the
+    /// system temp dir.
+    pub fn open_query_database(
+        scratch: &crate::scratch::QueryScratch,
+        budgets: &QueryBudgets,
+    ) -> Result<Self, EngineError> {
+        let root = Self::open(
+            scratch.private_spill_dir()?,
+            crate::scratch::SCRATCH_SETTING,
+            Some(budgets),
+        )?;
+        budgets.check_applied(&root.try_clone()?.conn)?;
+        Ok(root)
+    }
+
+    /// Open an in-memory database spilling into `spill`, with `budgets` if
+    /// given, then configure its first connection.
+    fn open(
+        spill: tempfile::TempDir,
+        setting: &str,
+        budgets: Option<&QueryBudgets>,
+    ) -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
-        let spill = private_spill_dir()?;
-        conn.execute_batch(&temp_directory_statement(spill.path())?)?;
+        conn.execute_batch(&temp_directory_statement(spill.path(), setting)?)?;
+        if let Some(budgets) = budgets {
+            conn.execute_batch(&budgets.statements())?;
+        }
         Self::configure(&conn)?;
         Ok(Self {
             conn,
             spill: Arc::new(spill),
+        })
+    }
+
+    /// Clone the connection the engine sample runs on (ADR-0056).
+    ///
+    /// It shares this database, and so its budgets and spill directory,
+    /// but it is a [`DiagnosticConnection`], not an [`Executor`]: it runs
+    /// `SELECT 1` and nothing else, so it can never join a query pool.
+    pub fn diagnostic_connection(&self) -> Result<DiagnosticConnection, EngineError> {
+        let conn = self.conn.try_clone()?;
+        Self::configure(&conn)?;
+        Ok(DiagnosticConnection {
+            conn,
+            _spill: Arc::clone(&self.spill),
         })
     }
 
@@ -2493,11 +2644,13 @@ fn an_executor_spills_into_a_private_directory_of_its_own() {
 fn a_spill_path_that_is_not_utf8_is_refused() {
     use std::os::unix::ffi::OsStrExt as _;
     let dir = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/trawl-spill-\xff"));
-    let error = temp_directory_statement(dir).expect_err("a non-UTF-8 spill path");
+    let error = temp_directory_statement(dir, crate::scratch::TMPDIR_SETTING)
+        .expect_err("a non-UTF-8 spill path");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("TMPDIR"), "{error}");
     assert_eq!(
-        temp_directory_statement(Path::new("/tmp/it's")).expect("a UTF-8 path"),
+        temp_directory_statement(Path::new("/tmp/it's"), crate::scratch::TMPDIR_SETTING)
+            .expect("a UTF-8 path"),
         "SET temp_directory='/tmp/it''s'"
     );
 }
@@ -2511,11 +2664,12 @@ fn a_spill_directory_left_open_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
     let parent = tempfile::tempdir().expect("parent");
     let mut made = None;
-    let error = private_dir_in(parent.path(), |dir| {
-        made = Some(dir.to_owned());
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
-    })
-    .expect_err("a 0755 spill directory");
+    let error =
+        crate::scratch::private_dir_in(parent.path(), crate::scratch::TMPDIR_SETTING, |dir| {
+            made = Some(dir.to_owned());
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+        })
+        .expect_err("a 0755 spill directory");
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     let text = error.to_string();
     assert!(text.contains("mode 0755"), "{text}");
@@ -2531,10 +2685,12 @@ fn a_spill_directory_left_open_is_refused() {
 #[test]
 fn a_spill_directory_another_user_owns_is_refused() {
     let parent = tempfile::tempdir().expect("parent");
-    let dir = private_dir_in(parent.path(), |_| Ok(())).expect("private");
+    let setting = crate::scratch::TMPDIR_SETTING;
+    let dir = crate::scratch::private_dir_in(parent.path(), setting, |_| Ok(())).expect("private");
     let euid = rustix::process::geteuid().as_raw();
-    check_private(dir.path(), euid).expect("its own");
-    let error = check_private(dir.path(), euid.wrapping_add(1)).expect_err("another uid");
+    crate::scratch::check_private(dir.path(), euid, setting).expect("its own");
+    let error = crate::scratch::check_private(dir.path(), euid.wrapping_add(1), setting)
+        .expect_err("another uid");
     assert!(error.to_string().contains("mode 0700"), "{error}");
 }
 

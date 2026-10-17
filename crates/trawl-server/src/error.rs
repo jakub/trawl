@@ -524,7 +524,9 @@ impl ServerError {
     /// unable to say what was refused.
     pub fn safe_message(&self) -> String {
         match self {
-            Self::Engine(EngineError::Database(_)) => "query execution failed".to_owned(),
+            Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
+                "query execution failed".to_owned()
+            }
             Self::Store(StoreError::Unavailable(_) | StoreError::Migration(_)) => {
                 "app-state store unavailable".to_owned()
             }
@@ -571,7 +573,11 @@ impl ServerError {
             Self::Engine(EngineError::Parse(_)) => "parse",
             Self::Engine(EngineError::Emit(_)) => "emit",
             Self::Engine(EngineError::Refused { .. }) => "refused",
-            Self::Engine(EngineError::Database(_)) => "database",
+            // A budget refusal ends the query database's open at startup,
+            // so no request carries it; it reads as the engine it came from.
+            Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
+                "database"
+            }
             Self::Engine(EngineError::ResultTooLarge(_)) => "result_too_large",
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
             Self::Engine(EngineError::Cancelled) => "cancelled",
@@ -832,7 +838,10 @@ impl IntoResponse for ServerError {
             // interrupt it backs up. `error_class` still tells the two apart
             // for telemetry.
             Self::Engine(
-                EngineError::Database(_) | EngineError::Io(_) | EngineError::Cancelled,
+                EngineError::Database(_)
+                | EngineError::BudgetNotApplied { .. }
+                | EngineError::Io(_)
+                | EngineError::Cancelled,
             ) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),

@@ -54,6 +54,18 @@ pub enum EngineError {
     #[error("{message}")]
     Refused { message: String },
 
+    /// The query database refused a budget, or a clone read one back other
+    /// than configured (ADR-0056). Raised only while the database opens, so
+    /// trawld refuses to start rather than run without its bounds.
+    #[error(
+        "the query engine did not apply {setting}: configured {configured}, reads back {applied}"
+    )]
+    BudgetNotApplied {
+        setting: &'static str,
+        configured: String,
+        applied: String,
+    },
+
     /// Filesystem I/O error (e.g. writing temp files for parquet export).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
