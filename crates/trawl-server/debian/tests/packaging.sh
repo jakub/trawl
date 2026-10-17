@@ -392,4 +392,20 @@ if naming=$(cd "$repo_root" && grep -rlF -- "$removed_switch" crates/trawl-serve
   fail "these files under crates/trawl-server/debian name the removed $removed_switch switch: ${naming//$'\n'/, }"
 fi
 
+# -- 12. resource ceilings match the chart's (ADR-0056) --------------------
+#
+# Exactly one active value of each, after normalizing the spacing systemd
+# ignores, so a second directive cannot quietly override the first.
+
+assert_one_directive() { # assert_one_directive <unit> <name> <directive> <value>
+  local unit=$1 name=$2 directive=$3 value=$4 active
+  active=$(normalize_directives "$unit" | grep -E "^${directive}=" || true)
+  if [[ "$active" != "${directive}=${value}" ]]; then
+    fail "${name} needs exactly one active ${directive}=${value}, found: ${active:-none}"
+  fi
+}
+assert_one_directive "$service" trawld.service LimitNOFILE 65536
+assert_one_directive "$service" trawld.service MemoryMax 8G
+assert_one_directive "$web_service" trawl-web.service MemoryMax 512M
+
 echo "debian packaging assertions passed"

@@ -30,6 +30,9 @@ WorkingDirectory=/var/lib/trawl
 Restart=on-failure
 RestartSec=5s
 
+# The chart's sidecar limit (ADR-0056).
+MemoryMax=512M
+
 # Sandboxing
 ProtectSystem=strict
 ProtectHome=true
