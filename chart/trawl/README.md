@@ -242,6 +242,10 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `config.server.maxQueryHistory` | int | `1000` | `[server] max_query_history` |
 | `config.server.rateLimit.defaultRpm` | int | `100` | `[server.rate_limit] default_rpm`, requests per minute per key on the API routes. `0` disables |
 | `config.server.rateLimit.ingestRpm` | int | `1000` | `[server.rate_limit] ingest_rpm`, requests per minute per key on `/api/v1/ingest`. `0` disables |
+| `config.server.queryScratchDir` | string | `""` | `[server] query_scratch_dir`: where queries spill, hot-buffer query snapshots live and exports stage. Empty leaves trawld's default, `<config.data.path>.query-scratch`, which is on the data volume while `config.data.path` is below `/var/lib/trawl`. A value must be an absolute path below `/var/lib/trawl`, outside the data root, the WAL directory and the repin staging roots. The render fails when the effective directory would sit off the data volume |
+| `config.server.querySpillMaxBytes` | string | `512M` | `[server] query_spill_max_bytes`: the most one trawld holds in the scratch directory |
+| `config.server.queryMemoryLimit` | string | `256M` | `[server] query_memory_limit`: DuckDB memory limit for the query database |
+| `config.server.queryThreads` | int | `2` | `[server] query_threads`: DuckDB threads for the query database |
 | `config.data.path` | string | `/var/lib/trawl/data` | `[data] path`. With `tls.mode: auto` and `web.enabled`, an absolute path whose parent is on the data volume, with no `.` or `..` components |
 | `config.auth.auditIntervalSecs` | int | `30` | `[auth] audit_interval_secs` |
 | `config.ingest.enabled` | bool | `true` | `[ingest] enabled` |
@@ -297,7 +301,7 @@ The runbook includes a matching `rule_files` and HTTPS scrape configuration.
 | `storage.database.existingSecretKey` | string | `TRAWL_DATABASE_URL` | Key in that Secret. Injected into trawld as `TRAWL_DATABASE_URL` |
 | `initAuth.enabled` | bool | `true` | Run `fleet-admin migrate` in an init container on every pod start |
 | `initAuth.resources` | object | cpu `50m`, memory `64Mi` to `128Mi` | Init container resources |
-| `resources` | object | cpu `250m`, memory `512Mi` to `2Gi`, no CPU limit | trawld container resources |
+| `resources` | object | cpu `250m`, memory `1Gi` to `4Gi`, no CPU limit | trawld container resources |
 | `extraEnv` | list | `[]` | Extra environment variables for the trawld container |
 | `web.enabled` | bool | `true` | Run the trawl-web sidecar |
 | `web.bindAddr` | string | `0.0.0.0:8090` | trawl-web bind address, rendered as `[web] bind_addr`. Must be reachable from the pod IP |

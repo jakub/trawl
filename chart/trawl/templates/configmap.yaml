@@ -25,6 +25,23 @@ data:
     max_sse_connections = {{ .Values.config.server.maxSseConnections | int }}
     schema_cache_ttl_secs = {{ .Values.config.server.schemaCacheTtlSecs | int }}
     max_query_history = {{ .Values.config.server.maxQueryHistory | int }}
+    {{- /* Scratch must land on the data volume: the root filesystem is
+         read-only and the /tmp emptyDir is evicted past its sizeLimit.
+         trawld's default is the sibling <data.path>.query-scratch, which is
+         on the volume exactly when data.path is below its mount. */}}
+    {{- $mount := include "trawl.dataMountPath" . }}
+    {{- $scratch := toString .Values.config.server.queryScratchDir }}
+    {{- if $scratch }}
+    {{- if not (hasPrefix (printf "%s/" $mount) (clean $scratch)) }}
+    {{- fail (printf "config.server.queryScratchDir must be an absolute path below %s so scratch lands on the data volume; got %q" $mount $scratch) }}
+    {{- end }}
+    query_scratch_dir = {{ clean $scratch | quote }}
+    {{- else if not (hasPrefix (printf "%s/" $mount) (clean (toString .Values.config.data.path))) }}
+    {{- fail (printf "config.data.path %q is not below %s, so trawld's default scratch directory <data.path>.query-scratch would sit off the data volume: set config.server.queryScratchDir to a directory below %s" (toString .Values.config.data.path) $mount $mount) }}
+    {{- end }}
+    query_spill_max_bytes = {{ .Values.config.server.querySpillMaxBytes | quote }}
+    query_memory_limit = {{ .Values.config.server.queryMemoryLimit | quote }}
+    query_threads = {{ .Values.config.server.queryThreads | int }}
     {{- if .Values.config.server.corsAllowedOrigins }}
     cors_allowed_origins = [{{ range $i, $o := .Values.config.server.corsAllowedOrigins }}{{ if $i }}, {{ end }}{{ $o | quote }}{{ end }}]
     {{- end }}

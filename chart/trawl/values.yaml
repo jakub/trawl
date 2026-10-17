@@ -145,8 +145,24 @@ config:
     # the listener can fill the probe allowance, and junk tokens can fill the
     # control allowance; block such a source at the network. At 32, ingest
     # bodies alone can reach 1 GiB (count x (wire + decoded body)), inside
-    # the 2Gi container limit.
+    # the 4Gi container limit.
     maxConcurrentRequests: 32
+    # Query scratch (ADR-0056): where queries spill, where hot-buffer query
+    # snapshots live and where exports stage. Empty leaves trawld's default,
+    # the sibling <data.path>.query-scratch, which is on the data volume
+    # whenever data.path sits below /var/lib/trawl. A value must be an
+    # absolute path below /var/lib/trawl, outside the data root, the WAL
+    # directory and the repin staging roots. Not the /tmp emptyDir: the
+    # kubelet evicts a pod whose emptyDir passes its sizeLimit.
+    queryScratchDir: ""
+    # Ceiling on the bytes one trawld may hold in the scratch directory.
+    # DuckDB overshoots it by up to one block while it writes a spill file.
+    querySpillMaxBytes: "512M"
+    # DuckDB memory_limit for the query database. Compaction, conform and
+    # repin have their own, [ingest] compaction_memory_limit (256MB).
+    queryMemoryLimit: "256M"
+    # DuckDB threads for the query database.
+    queryThreads: 2
     shutdownDrainSecs: 30
     maxSseConnections: 32
     # How often to check for rotated TLS certs (seconds). Default: 300.
@@ -354,10 +370,12 @@ initAuth:
 resources:
   requests:
     cpu: 250m
-    memory: 512Mi
+    memory: 1Gi
   limits:
-    # No CPU limit — DuckDB benefits from burst capacity.
-    memory: 2Gi
+    # No CPU limit — DuckDB benefits from burst capacity. The limit covers
+    # the documented ceilings (1 GiB of request bodies, 512 MiB of argon2)
+    # plus the DuckDB budgets, which bound DuckDB-managed memory only.
+    memory: 4Gi
 
 # -- Extra environment variables for the trawld container.
 # Example:
