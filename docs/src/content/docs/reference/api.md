@@ -416,8 +416,31 @@ data: {"missed": 40}
 | Event | Data | When |
 |-------|------|------|
 | `data` | One row object | Each matching event, for a pipeline with no aggregation |
-| `snapshot` | `{"columns": [...], "rows": [...]}` | For an aggregating pipeline, every 500 ms or every 100 matching events, whichever comes first, and only when new events arrived |
+| `snapshot` | `{"columns": [...], "rows": [...], "capped": [...]}` | For an aggregating pipeline, every 500 ms or every 100 matching events, whichever comes first, and only when new events arrived. `capped` is present only when the aggregation dropped input. |
 | `lagged` | `{"missed": n}` | The subscriber fell behind the event bus and `n` ingest batches were skipped. A batch holds one or more events, so the number of missed events is unknown. |
+
+Each `snapshot` replaces the whole result. A live aggregation stops taking
+input at three caps, and a snapshot's `capped` lists each cap that dropped
+input since the stream started, with its limit:
+
+```json
+{"columns":["host","count"],"rows":[{"host":"web-01","count":12}],"capped":[{"cap":"groups","limit":10000}]}
+```
+
+| `cap` | Limit | Input it drops |
+|-------|-------|----------------|
+| `groups` | 10,000 | A new group when the aggregation already holds the limit. A `timechart` counts groups per bucket. |
+| `distinct_values` | 10,000 | An unseen value for a `dc()` or `values()` that already holds the limit in one group |
+| `exact_values` | 100,000 | A number for a `median` or percentile that already holds the limit in one group |
+
+Reaching a cap exactly drops nothing, so `capped` stays absent. Once a cap
+drops input, every later snapshot of the stream reports it, because the
+dropped input does not come back. A new stream starts with nothing dropped.
+`top`, `rare` and the number of `timechart` buckets have no cap. The batch
+lane runs the same aggregation for an `extract kv` pipeline and has no field
+to report a partial answer, so it refuses an aggregation that would drop
+input with `400 result_too_large` and a message that names the cap and its
+limit.
 
 The stream closes when the pipeline finishes, for example after `| limit 10`.
 

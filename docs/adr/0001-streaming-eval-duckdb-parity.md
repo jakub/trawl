@@ -1,6 +1,7 @@
 # Streaming eval mirrors DuckDB scalar-function semantics
 
-**Status:** Accepted
+**Status:** Accepted; amended 2026-10-17 (#304): aggregation caps are reported
+live and refused in batch, see the Amendment
 
 trawl has two expression evaluators that must produce the same answer for the
 same DSL: the **batch path** (`emitter/` → DuckDB SQL → DuckDB) used by
@@ -85,3 +86,49 @@ deliberate and documented here.
   when a `Timestamp`-valued `let` is serialized into the event) must match
   DuckDB's timestamp text format (space separator, microsecond precision,
   trailing-fraction trimming) — pinned by the parity test.
+
+## Amendment: aggregation caps are disclosed, 2026-10-17
+
+Issue #304 (the ADR-0056 limits review) found a second silent divergence. The
+streaming accumulators stop taking input at three caps: 10,000 groups (per
+bucket for a `timechart`), 10,000 distinct values per `dc()` or `values()`, and
+100,000 values per `median` or percentile. DuckDB has no such caps, so a
+capped live aggregate answered differently from the same DSL in batch, and
+nothing said so. The human ruled on 2026-10-17 that the caps keep their values
+and that the divergence is disclosed.
+
+- **The aggregation records which caps dropped input.** `trawl-core`'s
+  `AggregationCap` names the three caps and their limits, and
+  `CompiledAggregation::capped` lists the ones that dropped input. A cap is
+  marked only when input is dropped: a new group while the map is full, an
+  unseen value while the set is full, a number while the store is full.
+  Reaching a cap exactly marks nothing. A mark lasts for the life of the
+  aggregation, because the dropped input does not come back.
+- **Live tail reports it on every snapshot.** Each aggregate `snapshot` carries
+  `capped`, a list of `{cap, limit}` with the names `groups`,
+  `distinct_values` and `exact_values` (`trawl_api::stream`). The field is
+  omitted while nothing is dropped. The limit travels on the wire, so no
+  client hard-codes it. An event dropped at a cap still counts toward the next
+  snapshot, so the scheduled snapshot discloses a cap even when no more input
+  arrives. The web UI shows a persistent "Live aggregate is partial" notice
+  above the results. The TUI marks the results title in the theme's warning
+  colour. Neither turns the result into an error.
+- **The batch tail refuses.** The Rust post-stages behind `extract kv` run the
+  same accumulators over the SQL prefix's rows, but a query response has no
+  field for a partial answer. An aggregation there that would drop input
+  refuses with `400 result_too_large`, and the message names the cap and its
+  limit (`EngineError::AggregationCapped`). A cut aggregate is a wrong answer,
+  not a short one, so the batch lane does not return it.
+- **`top`, `rare` and the timechart bucket count stay uncapped.** Bounding them
+  needs its own design (human ruling).
+
+Considered and rejected:
+
+- **A separate SSE event for the cap.** A snapshot replaces the client's whole
+  view, so the report rides with the rows it qualifies and survives a
+  reconnect without a second ordering rule.
+- **Returning the batch answer with a warning.** The query response has no
+  warning channel for this, and adding one would still hand scripts and
+  scheduled reports a wrong number.
+- **Raising the caps or making them configuration.** They bound per-stream
+  memory, and nobody asked for a key.
