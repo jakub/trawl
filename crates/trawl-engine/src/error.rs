@@ -104,6 +104,23 @@ pub enum EngineError {
 /// `DuckDB`'s exception type for running out of memory or spill space.
 const OUT_OF_MEMORY: &str = "Out of Memory";
 
+/// `DuckDB`'s exception type for a statement stopped by an interrupt.
+const INTERRUPT: &str = "INTERRUPT";
+
+impl EngineError {
+    /// Whether `DuckDB` stopped the statement because its connection was
+    /// interrupted, read off the structured diagnostic's `exception_type`
+    /// like every other classification here.
+    ///
+    /// The engine sample (ADR-0056) reads it to tell the interrupt it
+    /// raised on its own overrunning probe from a failure of the engine.
+    #[must_use]
+    pub fn is_interrupt(&self) -> bool {
+        matches!(self, Self::Database(error)
+            if DuckDbDiagnostic::of(error).is_some_and(|d| d.exception_type == INTERRUPT))
+    }
+}
+
 impl From<duckdb::Error> for EngineError {
     /// Classify a `DuckDB` error by its diagnostic's `exception_type`.
     ///
@@ -287,6 +304,50 @@ mod structured_error_classification {
             error.to_string().starts_with("Out of Memory Error: "),
             "{error}"
         );
+    }
+
+    /// A statement stopped through the connection's interrupt handle is an
+    /// interrupt, and no other failure is: not another type, not the word
+    /// in a message, not a message that is not a diagnostic.
+    #[test]
+    fn only_an_interrupt_diagnostic_is_an_interrupt() {
+        let conn = duckdb::Connection::open_in_memory().expect("duckdb");
+        conn.execute_batch("SET errors_as_json = true")
+            .expect("errors_as_json");
+        let handle = conn.interrupt_handle();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // `DuckDB` clears the flag when a statement begins, so one interrupt
+        // could land before the statement and be lost: keep raising it
+        // until the statement has stopped.
+        let interrupter = std::thread::spawn({
+            let done = std::sync::Arc::clone(&done);
+            move || {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    handle.interrupt();
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        });
+        let error = conn
+            .query_row(
+                "SELECT max(md5(range::VARCHAR)) FROM range(1000000000000)",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect_err("an interrupted statement fails");
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        interrupter.join().expect("interrupter");
+        assert!(EngineError::from(error).is_interrupt());
+
+        for other in [
+            live("SELECT error('INTERRUPT')", true),
+            failure(r#"{"exception_type":"Binder","exception_message":"INTERRUPT"}"#),
+            failure("INTERRUPT Error: Interrupted!"),
+        ] {
+            let shown = other.to_string();
+            assert!(!EngineError::from(other).is_interrupt(), "{shown}");
+        }
+        assert!(!EngineError::Cancelled.is_interrupt());
     }
 
     /// A database error reads as `DuckDB`'s text form, not as the JSON the

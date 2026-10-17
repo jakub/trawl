@@ -31,6 +31,9 @@ use crate::tracker::QueryTracker;
 pub struct AppState {
     /// Query execution resources.
     pub query: QueryState,
+    /// The engine sample the `duckdb` health check reads (ADR-0056): taken
+    /// on its own thread and connection, outside the executor pool.
+    pub engine_sample: crate::engine_sample::EngineSample,
     /// Authentication resources.
     pub auth: AuthState,
     /// Postgres app-state stores (history, saved queries, schedules, runs).
@@ -771,7 +774,21 @@ impl AppState {
             ))
         })?;
 
+        // The first sample is taken before the state serves anything, so
+        // health never answers `error` for want of one. Waiting is bounded
+        // by the sample budget: past it the watchdog publishes an overrun.
+        let engine_sample = crate::engine_sample::EngineSample::start(&pool).map_err(|e| {
+            crate::error::ServerError::ServiceUnavailable(format!(
+                "failed to start the engine sample: {e}"
+            ))
+        })?;
+        let first = engine_sample.clone();
+        tokio::task::spawn_blocking(move || first.wait_for_first())
+            .await
+            .map_err(|e| crate::error::ServerError::from_join("engine sample", e))?;
+
         let state = Self {
+            engine_sample,
             query: QueryState {
                 // Comparison typing: the pool snapshots the full pin set per
                 // query. The catalog is constructed unconditionally above,

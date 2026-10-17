@@ -257,6 +257,14 @@ pub enum ServerError {
     #[error("hot buffer snapshot failed")]
     HotSnapshot(#[source] std::io::Error),
 
+    /// The engine sample reads `error` (ADR-0056): its latest probe
+    /// returned a `DuckDB` error, or no probe succeeded within the success
+    /// window. Health builds its 503 itself and records this as the
+    /// request's failure. Fixed text: the sample's own error stays in the
+    /// sampler.
+    #[error("query engine sample failed")]
+    EngineSampleFailed,
+
     /// The request was refused at the edge because its allowance had no
     /// request in progress free (503, no `Retry-After`, `Cache-Control:
     /// no-store`, ADR-0054). No handler ran and the body was never read.
@@ -369,11 +377,14 @@ pub enum CauseKind {
     /// requests in progress, its probe allowance or its control allowance
     /// (ADR-0054).
     RequestLimitReached,
+    /// Health answered 503 because the engine sample read `error`
+    /// (ADR-0056).
+    EngineSampleFailed,
 }
 
 impl CauseKind {
     /// Every kind, for closed-set checks and for consumers that enumerate.
-    pub const ALL: [Self; 33] = [
+    pub const ALL: [Self; 34] = [
         Self::None,
         Self::Unknown,
         Self::IoNotFound,
@@ -407,6 +418,7 @@ impl CauseKind {
         Self::RestartBacklog,
         Self::RollupPending,
         Self::RequestLimitReached,
+        Self::EngineSampleFailed,
     ];
 
     /// The fixed `snake_case` literal this kind is recorded as.
@@ -446,6 +458,7 @@ impl CauseKind {
             Self::RestartBacklog => "restart_backlog",
             Self::RollupPending => "rollup_pending",
             Self::RequestLimitReached => "request_limit_reached",
+            Self::EngineSampleFailed => "engine_sample_failed",
         }
     }
 
@@ -566,8 +579,9 @@ impl ServerError {
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
             // `IngestBodyTooLarge`, `RequestTooLarge`, `HotBufferFull`,
             // `IngestBatchTooLarge`, `PreviewTooLarge`, `UnsupportedEncoding`,
-            // `CorpusRecovering`, `HotSnapshot` and `RequestLimitReached`
-            // render fixed text and counts, with nothing to redact.
+            // `CorpusRecovering`, `HotSnapshot`, `EngineSampleFailed` and
+            // `RequestLimitReached` render fixed text and counts, with
+            // nothing to redact.
             other => other.to_string(),
         }
     }
@@ -615,9 +629,11 @@ impl ServerError {
             // `cause_kind` names it, as it does an auth backend outage.
             // An unsettled corpus and a failed hot snapshot are too: the
             // reason and the I/O kind are cause kinds, not classes. So is a
-            // request refused at the request limit (ADR-0054), and a query
-            // that exhausted the query database's budgets (ADR-0056).
+            // request refused at the request limit (ADR-0054), a query
+            // that exhausted the query database's budgets, and a failed
+            // engine sample (ADR-0056).
             Self::Engine(EngineError::ResourceExhausted)
+            | Self::EngineSampleFailed
             | Self::ServiceUnavailable(_)
             | Self::AuthBackend(_)
             | Self::HotBufferFull { .. }
@@ -652,6 +668,7 @@ impl ServerError {
             // One kind for every allowance: the metric label, not the
             // failure record, tells them apart.
             Self::RequestLimitReached(_) => CauseKind::RequestLimitReached,
+            Self::EngineSampleFailed => CauseKind::EngineSampleFailed,
             // A pre-start capacity refusal is a pressure outcome the class
             // names in full. Every other 503 was built from a string and
             // kept no typed source.
@@ -1052,6 +1069,10 @@ impl IntoResponse for ServerError {
                     "recent events could not be read for this query",
                 ),
             ),
+            Self::EngineSampleFailed => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "query engine unavailable"),
+            ),
             // No `Retry-After`: nothing predicts when a request in progress
             // ends, and a fixed hint would make senders retry together
             // (ADR-0054). `Cache-Control: no-store` is added below.
@@ -1274,6 +1295,10 @@ mod tests {
             "internal"
         );
         assert_eq!(ServerError::Panicked("query worker").error_class(), "panic");
+        assert_eq!(
+            ServerError::EngineSampleFailed.error_class(),
+            "service_unavailable"
+        );
     }
 
     /// The cause kind is persisted beside the class, so it is held to the
@@ -1318,10 +1343,11 @@ mod tests {
                 | CauseKind::HotBufferFull
                 | CauseKind::RestartBacklog
                 | CauseKind::RollupPending
-                | CauseKind::RequestLimitReached => true,
+                | CauseKind::RequestLimitReached
+                | CauseKind::EngineSampleFailed => true,
             })
             .count();
-        assert_eq!(variants, 33, "ALL lists every variant");
+        assert_eq!(variants, 34, "ALL lists every variant");
 
         let mut seen = std::collections::HashSet::new();
         for kind in CauseKind::ALL {
@@ -1371,6 +1397,10 @@ mod tests {
             (
                 ServerError::Engine(EngineError::ResourceExhausted),
                 CauseKind::DuckdbResourceExhausted,
+            ),
+            (
+                ServerError::EngineSampleFailed,
+                CauseKind::EngineSampleFailed,
             ),
             (
                 ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut)),

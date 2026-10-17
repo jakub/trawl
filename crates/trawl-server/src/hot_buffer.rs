@@ -2850,7 +2850,8 @@ mod hydrate {
                 &buf.publication(),
                 "/nonexistent/*.parquet",
                 None,
-                0,
+                std::path::Path::new("/nonexistent/scratch"),
+                crate::metrics::QueryGauges::default(),
                 &crate::repin::JobGeneration::default(),
             );
         });

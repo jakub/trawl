@@ -550,7 +550,7 @@ pub struct Reclaim<'a> {
     pub kind: WorkKind,
     /// How long the work outlived its request.
     pub retained_for: Duration,
-    /// Absent for work that has no timing account (ping, sampling).
+    /// Absent for work that has no timing account (sampling).
     pub correlation: Option<&'a Correlation>,
     pub physical: PhysicalOutcome,
     /// The worker's final totals; absent when the work never started or

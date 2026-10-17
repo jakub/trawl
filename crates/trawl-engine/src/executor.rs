@@ -275,14 +275,12 @@ impl Cancellable<'_> {
     }
 }
 
-/// The directory `DuckDB` spills query state under: the system temp dir.
-///
-/// The one source of that path: [`Executor::new`] makes each database's
-/// private spill directory in it, and the server's headroom measurement
-/// stats the filesystem under it (ADR-0042). A directory made in it is on
-/// its filesystem, so the two can never measure different devices.
+/// The directory a database [`Executor::new`] opens spills under: the
+/// system temp dir. trawld's query database spills into its query scratch
+/// directory instead ([`Executor::open_query_database`]), and the server's
+/// headroom measurement stats that (ADR-0056).
 #[must_use]
-pub fn spill_dir() -> std::path::PathBuf {
+fn spill_dir() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
@@ -458,6 +456,15 @@ impl DiagnosticConnection {
             .query_row("SELECT current_setting(?)::VARCHAR", [name], |row| {
                 row.get(0)
             })?)
+    }
+
+    /// Run `sql` in place of the sample's `SELECT 1`, discarding its rows,
+    /// so a test can make a probe overrun or fail in `DuckDB` itself.
+    pub fn select_for_test(&self, sql: &str) -> Result<(), EngineError> {
+        let mut statement = self.conn.prepare(sql)?;
+        let mut rows = statement.query([])?;
+        while rows.next()?.is_some() {}
+        Ok(())
     }
 }
 
@@ -641,13 +648,6 @@ impl Executor {
             cancel,
             clock: PhaseClock::off(),
         }
-    }
-
-    /// Lightweight health check: runs `SELECT 1` to verify the connection is alive.
-    pub fn ping(&self) -> Result<(), EngineError> {
-        self.conn
-            .query_row("SELECT 1", [], |_row| Ok(()))
-            .map_err(EngineError::from)
     }
 
     /// Full pipeline: parse DSL, emit SQL, execute.

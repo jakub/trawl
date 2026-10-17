@@ -82,6 +82,17 @@ pub const REQUEST_ALLOWANCE: &str = "trawl_http_request_allowance";
 /// deliberately label-free: the only cardinality a query id or a key
 /// name could add here is unbounded.
 pub const QUERY_PERMITS_RETAINED: &str = "trawl_query_permits_retained";
+/// Executor-pool permits held right now, by running or retained work and
+/// by the repin cutover's exclusive hold (ADR-0056). Label-free, like the
+/// retained count.
+pub const QUERY_PERMITS_IN_USE: &str = "trawl_query_permits_in_use";
+/// The executor pool's size: `[server] max_concurrent_queries`.
+pub const QUERY_POOL_SIZE: &str = "trawl_query_pool_size";
+/// Seconds since the engine sample's latest probe started, or since the
+/// sampler started before its first (ADR-0056). It cycles under the sample
+/// interval while the sampler runs, and keeps growing while a probe is
+/// wedged.
+pub const ENGINE_SAMPLE_AGE_SECONDS: &str = "trawl_engine_sample_age_seconds";
 pub const PARQUET_FILES: &str = "trawl_parquet_files_total";
 pub const PARQUET_BYTES: &str = "trawl_parquet_size_bytes";
 pub const HEALTH_CHECK: &str = "trawl_health_check";
@@ -526,6 +537,21 @@ pub fn describe_metrics() {
         QUERY_PERMITS_RETAINED,
         "Executor-pool permits held by query work whose request already \
          answered (a subset of the permits in use)"
+    );
+    describe_gauge!(
+        QUERY_PERMITS_IN_USE,
+        "Executor-pool permits held right now, by running and retained \
+         query work"
+    );
+    describe_gauge!(
+        QUERY_POOL_SIZE,
+        "Executor-pool permits in all (server.max_concurrent_queries)"
+    );
+    describe_gauge!(
+        ENGINE_SAMPLE_AGE_SECONDS,
+        "Seconds since the engine sample behind the duckdb health check \
+         started its latest probe; grows past the 10 s interval while a \
+         probe is wedged"
     );
     describe_gauge!(
         PARQUET_FILES,
@@ -1118,26 +1144,62 @@ fn headroom_cache() -> &'static StorageCache<crate::capacity::HeadroomSample> {
     CACHE.get_or_init(StorageCache::default)
 }
 
-/// Update gauges that require periodic polling (hot buffer + corpus state +
-/// parquet + WAL files).
+/// The executor pool's and the engine sample's numbers for one
+/// collection, read before it starts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryGauges {
+    /// Permits held right now ([`QUERY_PERMITS_IN_USE`]).
+    pub permits_in_use: usize,
+    /// Permits in all ([`QUERY_POOL_SIZE`]).
+    pub pool_size: usize,
+    /// Permits held by work whose request already answered
+    /// ([`QUERY_PERMITS_RETAINED`]).
+    pub permits_retained: usize,
+    /// The engine sample's age ([`ENGINE_SAMPLE_AGE_SECONDS`]).
+    pub engine_sample_age: std::time::Duration,
+}
+
+impl QueryGauges {
+    /// Read the numbers off `pool` and `sample`. Call it on the reactor
+    /// before the blocking collection: no pool registry lock travels with
+    /// these numbers through a storage scan or attempt-owner wait.
+    #[must_use]
+    pub fn read(
+        pool: &crate::pool::ExecutorPool,
+        sample: &crate::engine_sample::EngineSample,
+    ) -> Self {
+        Self {
+            permits_in_use: pool.capacity().saturating_sub(pool.available_permits()),
+            pool_size: pool.capacity(),
+            permits_retained: pool.retained(),
+            engine_sample_age: sample.age(),
+        }
+    }
+}
+
+/// Update gauges that require periodic polling (query pool + engine sample +
+/// hot buffer + corpus state + parquet + WAL files).
 ///
 /// Called by Prometheus scrapes and the stats emitter. Filesystem scans and
 /// competing attempts may block; dashboard readers only read the short cache.
-/// `repin_jobs` is this process's repin job generation
-/// ([`crate::state::AppState::repin_jobs`]), which fences both capacity
-/// samples.
+/// `scratch_dir` is the query scratch directory, which the headroom's spill
+/// role samples (ADR-0056). `repin_jobs` is this process's repin job
+/// generation ([`crate::state::AppState::repin_jobs`]), which fences both
+/// capacity samples.
 #[allow(clippy::cast_precision_loss)] // gauge values are f64; precision loss beyond 2^52 is fine
 pub fn collect_gauges(
     hot_buffer: Option<&Arc<HotBuffer>>,
     publication: &PublicationGate,
     fallback_glob: &str,
     wal_dir: Option<&Path>,
-    retained_permits: usize,
+    scratch_dir: &Path,
+    query: QueryGauges,
     repin_jobs: &crate::repin::JobGeneration,
 ) {
-    // Callers snapshot the pool count before collection. No pool registry lock
-    // travels with this number through a storage scan or attempt-owner wait.
-    metrics::gauge!(QUERY_PERMITS_RETAINED).set(retained_permits as f64);
+    metrics::gauge!(QUERY_PERMITS_RETAINED).set(query.permits_retained as f64);
+    metrics::gauge!(QUERY_PERMITS_IN_USE).set(query.permits_in_use as f64);
+    metrics::gauge!(QUERY_POOL_SIZE).set(query.pool_size as f64);
+    metrics::gauge!(ENGINE_SAMPLE_AGE_SECONDS).set(query.engine_sample_age.as_secs_f64());
 
     // Read from the gate now, never cached: each reason's series is its own
     // 0/1, so a switch from one reason to the other shows in both.
@@ -1168,7 +1230,7 @@ pub fn collect_gauges(
         collect_wal_gauges(dir);
     }
 
-    collect_headroom(data_root, wal_dir, repin_jobs);
+    collect_headroom(data_root, wal_dir, scratch_dir, repin_jobs);
 }
 
 /// The data root the fallback glob selects: the Parquet scan walks it and
@@ -1227,10 +1289,13 @@ fn scan_parquet_with(
 
 /// Sample the data, WAL and spill filesystems with the shared attempt/cache
 /// policy (ADR-0042 headroom under ADR-0033 status and age). `wal_dir` is the
-/// live WAL writer's directory, so a query-only node stats no WAL role.
+/// live WAL writer's directory, so a query-only node stats no WAL role. The
+/// spill role is the query scratch directory, where the query database
+/// spills (ADR-0056).
 fn collect_headroom(
     data_root: &Path,
     wal_dir: Option<&Path>,
+    scratch_dir: &Path,
     repin_jobs: &crate::repin::JobGeneration,
 ) {
     headroom_cache().collect(
@@ -1239,7 +1304,7 @@ fn collect_headroom(
             crate::capacity::sample_headroom(
                 data_root,
                 wal_dir,
-                &trawl_engine::spill_dir(),
+                scratch_dir,
                 repin_jobs,
                 crate::capacity::stat_filesystem,
             )
@@ -3145,7 +3210,8 @@ mod tests {
             &PublicationGate::new(),
             "/nonexistent/path/**/*.parquet",
             None,
-            0,
+            Path::new("/nonexistent/scratch"),
+            QueryGauges::default(),
             &crate::repin::JobGeneration::default(),
         );
     }
@@ -3181,7 +3247,8 @@ mod tests {
                 &buf.publication(),
                 "/nonexistent/path/**/*.parquet",
                 None,
-                0,
+                Path::new("/nonexistent/scratch"),
+                QueryGauges::default(),
                 &crate::repin::JobGeneration::default(),
             );
             let rendered = handle.render();
@@ -3206,7 +3273,8 @@ mod tests {
                 &buf.publication(),
                 "/nonexistent/path/**/*.parquet",
                 None,
-                0,
+                Path::new("/nonexistent/scratch"),
+                QueryGauges::default(),
                 &crate::repin::JobGeneration::default(),
             );
             let rendered = handle.render();
@@ -3234,7 +3302,8 @@ mod tests {
                 &buf.publication(),
                 "/nonexistent/path/**/*.parquet",
                 None,
-                0,
+                Path::new("/nonexistent/scratch"),
+                QueryGauges::default(),
                 &crate::repin::JobGeneration::default(),
             );
             let rendered = handle.render();
@@ -3276,7 +3345,8 @@ mod tests {
                     gate,
                     "/nonexistent/path/**/*.parquet",
                     None,
-                    0,
+                    Path::new("/nonexistent/scratch"),
+                    QueryGauges::default(),
                     &crate::repin::JobGeneration::default(),
                 );
                 (series(RollupPending), series(RestartBacklog))
@@ -3371,7 +3441,8 @@ mod tests {
                 &buf.publication(),
                 "/nonexistent/path/**/*.parquet",
                 None,
-                0,
+                Path::new("/nonexistent/scratch"),
+                QueryGauges::default(),
                 &crate::repin::JobGeneration::default(),
             );
             let rendered = handle.render();

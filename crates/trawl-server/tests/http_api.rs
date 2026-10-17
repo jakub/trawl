@@ -945,8 +945,8 @@ async fn query_timing_export_formats() {
     }
 }
 
-/// Live tail, the health probe's pool ping and field sampling are not
-/// DSL queries, and open no timing account.
+/// Live tail, the health check's engine sample read and field sampling
+/// are not DSL queries, and open no timing account.
 #[tokio::test(flavor = "multi_thread")]
 async fn non_dsl_work_emits_no_query_timing() {
     let (capture, _turn) = telemetry::timing().await;
@@ -984,7 +984,7 @@ async fn non_dsl_work_emits_no_query_timing() {
             .and_then(|c| c.get("duckdb"))
             .map(String::as_str),
         Some("ok"),
-        "the probe pinged the pool: {health:?}"
+        "the engine sample answered: {health:?}"
     );
 
     let sampled = raw
@@ -1004,7 +1004,7 @@ async fn non_dsl_work_emits_no_query_timing() {
 
     for (what, request_id) in [
         ("live tail", stream_id),
-        ("pool ping", health_id),
+        ("health", health_id),
         ("field sampling", sampled_id),
     ] {
         let events = capture.timing_of(&request_id);

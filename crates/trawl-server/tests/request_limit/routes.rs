@@ -420,10 +420,12 @@ async fn request_limit_precedes_auth_body_rate_and_routing() {
 
 /// With the regular count full, every probe and control route and method
 /// reaches its handler. Each handler is recognised by what only it
-/// produces: health's `DuckDB` probe arrives at the pool, `/metrics`
-/// answers Prometheus text, the query list answers its three lists, and a
+/// produces: health answers 200 with its checks, the engine sample's
+/// `duckdb: ok` among them (a refusal is a 503), `/metrics` answers
+/// Prometheus text, the query list answers its three lists, and a
 /// cancellation answers a cancel result. HEAD carries the same
-/// representation without the body. Health is not required to be 200.
+/// representation without the body. Health reads the engine sample and
+/// takes no permit, so the parked query cannot fail it (ADR-0056).
 ///
 /// Regular never borrows the probe or control allowance: a regular request
 /// is refused while every probe and control place is free. The allowance
@@ -466,23 +468,22 @@ async fn control_allowance_survives_regular_saturation() {
         ),
     );
     wait_for(|| parked.arrivals() == 1, "the query's worker parks").await;
-    // Later workers, health's probe among them, pass and are counted.
-    let probes = seams.watch(Seam::Started);
     let fill = Fill::hold(&app, &[("/api/v1/validate", &server.admin_token)]).await;
     assert_regular_full(&app, &server.analyst_token).await;
 
-    // Health, GET and HEAD: its `DuckDB` probe reached the pool each time.
+    // Health, GET and HEAD: the handler's own 200, read off the engine
+    // sample.
     let health = call(&app, empty("GET", "/api/v1/health", None)).await;
     let status = health.status();
     let body = body_json(health).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
-        body["status"].is_string() && body["checks"].is_object(),
+        body["status"].is_string() && body["checks"]["duckdb"] == "ok",
         "{status}: {body}"
     );
-    assert_eq!(probes.arrivals(), 1, "GET health ran its probe");
     let head = call(&app, empty("HEAD", "/api/v1/health", None)).await;
+    assert_eq!(head.status(), StatusCode::OK);
     assert!(body_bytes(head).await.is_empty());
-    assert_eq!(probes.arrivals(), 2, "HEAD health ran its probe");
 
     // `/metrics`, GET and HEAD: Prometheus text.
     let metrics = call(&app, empty("GET", "/metrics", None)).await;
