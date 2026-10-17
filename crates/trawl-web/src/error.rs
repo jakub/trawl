@@ -119,7 +119,20 @@ pub enum ProxyError {
     /// with it. Nothing was sent to trawld.
     #[error("request body not received in time")]
     BodyTimeout,
+
+    /// trawld's response head did not arrive within
+    /// [`crate::config::ProxyLimits::upstream_head_timeout`]. Answered 504
+    /// with the envelope code `timeout`. The proxy drops its side of the
+    /// call; trawld may still be running the work it was asked for.
+    #[error("upstream response head not received in time")]
+    UpstreamHeadTimeout,
 }
+
+/// The 504 the proxy answers when trawld's head is late. It says the
+/// work may still be running, because trawld only learns of the drop
+/// when it next writes.
+pub const UPSTREAM_HEAD_TIMEOUT_MESSAGE: &str =
+    "trawld did not answer within trawl-web's deadline; trawld may still be running the work";
 
 /// The envelope answers: trawld's error shape, `Cache-Control:
 /// no-store`, and no cookie.
@@ -165,6 +178,14 @@ impl IntoResponse for ProxyError {
                     "request body was not received within trawl-web's deadline",
                 );
             }
+            Self::UpstreamHeadTimeout => {
+                tracing::warn!(error = %self, "proxy upstream head deadline passed");
+                return envelope(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    ErrorCode::Timeout,
+                    UPSTREAM_HEAD_TIMEOUT_MESSAGE,
+                );
+            }
             _ => {}
         }
         let (status, message) = match &self {
@@ -183,9 +204,10 @@ impl IntoResponse for ProxyError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream certificate not available",
             ),
-            Self::RequestLimitReached | Self::RequestTooLarge { .. } | Self::BodyTimeout => {
-                unreachable!("answered above")
-            }
+            Self::RequestLimitReached
+            | Self::RequestTooLarge { .. }
+            | Self::BodyTimeout
+            | Self::UpstreamHeadTimeout => unreachable!("answered above"),
         };
 
         // Severity per variant: network and upstream failures are outage
@@ -210,9 +232,10 @@ impl IntoResponse for ProxyError {
             Self::ServiceUnavailable(_) => {
                 tracing::warn!(error = %self, "proxy service unavailable");
             }
-            Self::RequestLimitReached | Self::RequestTooLarge { .. } | Self::BodyTimeout => {
-                unreachable!("answered above")
-            }
+            Self::RequestLimitReached
+            | Self::RequestTooLarge { .. }
+            | Self::BodyTimeout
+            | Self::UpstreamHeadTimeout => unreachable!("answered above"),
         }
 
         // Only the expired-session path clears the cookie; see the

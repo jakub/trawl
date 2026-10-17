@@ -43,16 +43,15 @@ pub async fn forward(
         state.upstream_url().trim_end_matches('/')
     );
 
-    // One client for the request and the whole stream it opens.
-    let upstream_resp = state
+    // One client for the request and the whole stream it opens. The head
+    // deadline covers the request only; the stream outlives it.
+    let request = state
         .upstream_client()
         .await?
         .get(&upstream_url)
         .bearer_auth(auth.token())
-        .query(&[("query", &params.query)])
-        .send()
-        .await
-        .map_err(ProxyError::Network)?;
+        .query(&[("query", &params.query)]);
+    let upstream_resp = state.send_to_upstream(request).await?;
 
     forward_sse_response(&state, &auth, upstream_resp)
 }
@@ -68,15 +67,14 @@ pub async fn forward_dashboard(
         state.upstream_url().trim_end_matches('/')
     );
 
-    // One client for the request and the whole stream it opens.
-    let upstream_resp = state
+    // One client for the request and the whole stream it opens. The head
+    // deadline covers the request only; the stream outlives it.
+    let request = state
         .upstream_client()
         .await?
         .get(&upstream_url)
-        .bearer_auth(auth.token())
-        .send()
-        .await
-        .map_err(ProxyError::Network)?;
+        .bearer_auth(auth.token());
+    let upstream_resp = state.send_to_upstream(request).await?;
 
     forward_sse_response(&state, &auth, upstream_resp)
 }

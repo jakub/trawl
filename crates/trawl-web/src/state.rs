@@ -81,11 +81,31 @@ impl AppState {
         })
     }
 
-    /// The bounds every request is held to: the body limit and the body
-    /// deadline.
+    /// The bounds every request is held to: the body limit, the body
+    /// deadline and the upstream head deadline.
     #[must_use]
     pub fn limits(&self) -> &ProxyLimits {
         &self.inner.limits
+    }
+
+    /// Send `request` to trawld and wait for its response head within
+    /// [`ProxyLimits::upstream_head_timeout`]. Every call to trawld goes
+    /// through here, so no handler can wait on a silent trawld for
+    /// longer than the deadline. The returned response's body is not
+    /// under the deadline: a stream it opens runs as long as trawld
+    /// keeps it open.
+    ///
+    /// # Errors
+    /// [`ProxyError::UpstreamHeadTimeout`] past the deadline;
+    /// [`ProxyError::Network`] when the call fails before a head.
+    pub async fn send_to_upstream(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ProxyError> {
+        tokio::time::timeout(self.inner.limits.upstream_head_timeout, request.send())
+            .await
+            .map_err(|_elapsed| ProxyError::UpstreamHeadTimeout)?
+            .map_err(ProxyError::Network)
     }
 
     #[must_use]

@@ -117,7 +117,7 @@ async fn do_forward(
         upstream_req = upstream_req.body(body_bytes);
     }
 
-    let upstream_resp = upstream_req.send().await.map_err(ProxyError::Network)?;
+    let upstream_resp = state.send_to_upstream(upstream_req).await?;
     refuse_redirect(upstream_resp.status())?;
     relay_response(upstream_resp, &auth)
 }
@@ -654,6 +654,85 @@ mod tests {
             trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES
         );
         assert_eq!(limits.body_read_timeout, Duration::from_secs(30));
+        assert_eq!(limits.upstream_head_timeout, Duration::from_secs(40));
+    }
+
+    /// A trawld that has not sent a response head by the deadline is
+    /// answered 504 `timeout` with the envelope, and the count is free
+    /// again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_returns_504_timeout_when_upstream_head_is_late() {
+        let upstream = HandUpstream::start().await;
+        let app = limited_app(&upstream, 1, |cfg| {
+            cfg.limits.upstream_head_timeout = Duration::from_millis(200);
+        });
+        upstream.hold();
+
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone().oneshot(bearer_get("/api/v1/schema")),
+        )
+        .await
+        .expect("the deadline answered the request")
+        .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(160),
+            "answered before the deadline: {:?}",
+            started.elapsed()
+        );
+        assert_envelope_refusal(
+            resp,
+            StatusCode::GATEWAY_TIMEOUT,
+            trawl_api::ErrorCode::Timeout,
+            crate::error::UPSTREAM_HEAD_TIMEOUT_MESSAGE,
+        )
+        .await;
+
+        // The only count is free again, and a released upstream answers.
+        upstream.release();
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(bearer_get("/api/v1/schema")),
+        )
+        .await
+        .expect("the next request was answered")
+        .unwrap();
+        assert_eq!(next.status(), StatusCode::OK, "the count was not released");
+    }
+
+    /// The head deadline covers the head only: a server-sent event stream
+    /// whose head arrived in time keeps flowing well past the deadline.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_sse_outlives_the_head_deadline() {
+        let upstream = HandUpstream::start().await;
+        let deadline = Duration::from_millis(200);
+        let app = limited_app(&upstream, 4, |cfg| {
+            cfg.limits.upstream_head_timeout = deadline;
+        });
+
+        let stream = app
+            .oneshot(bearer_get("/api/v1/stream?query=_severity%3Derror"))
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        let mut body = stream.into_body().into_data_stream();
+        let started = std::time::Instant::now();
+        let mut events = 0_usize;
+        while started.elapsed() < deadline * 3 {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .expect("an event before the deadline")
+                .expect("the stream is still open")
+                .unwrap();
+            assert!(chunk.starts_with(b"data: "), "{chunk:?}");
+            events += 1;
+        }
+        assert!(
+            events > 3,
+            "only {events} events in {:?}",
+            started.elapsed()
+        );
     }
 
     /// A login body over 16 KiB is answered 413 `request_too_large` with

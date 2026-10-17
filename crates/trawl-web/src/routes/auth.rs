@@ -163,14 +163,8 @@ async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyErro
         "{}/api/v1/whoami",
         state.upstream_url().trim_end_matches('/')
     );
-    let resp = state
-        .upstream_client()
-        .await?
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(ProxyError::Network)?;
+    let request = state.upstream_client().await?.get(&url).bearer_auth(token);
+    let resp = state.send_to_upstream(request).await?;
 
     match resp.status() {
         s if s.is_success() => {
