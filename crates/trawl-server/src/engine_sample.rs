@@ -13,7 +13,10 @@
 //! once and interrupts the probe. The probe loop is sequential, so no new
 //! probe starts until the interrupted one returns. An answer counts as a
 //! success only if the probe's own elapsed time is within the budget, so a
-//! watchdog that runs late cannot let a late answer pass as on time.
+//! watchdog that runs late cannot let a late answer pass as on time. The
+//! diagnostic connection shares the query database's budgets, so a probe
+//! can find them full while queries hold them; that reads as an overrun
+//! does, not as a broken engine.
 //!
 //! `/api/v1/health` only reads the latest sample ([`EngineSample::read`]).
 //! It never waits for a probe and never starts one, so no number of health
@@ -43,12 +46,13 @@ pub const SUCCESS_WINDOW: Duration = Duration::from_secs(60);
 pub enum EngineCheck {
     /// The latest sample succeeded within its budget.
     Ok,
-    /// The latest sample ran past its budget, and a sample succeeded
-    /// within the last [`SUCCESS_WINDOW`]. Health reads `degraded`, 200.
+    /// The latest sample ran past its budget or found the query budgets
+    /// full, and a sample succeeded within the last [`SUCCESS_WINDOW`].
+    /// Health reads `degraded`, 200.
     Slow,
-    /// The latest sample returned a `DuckDB` error, or no sample succeeded
-    /// within the last [`SUCCESS_WINDOW`], or none has since boot. Health
-    /// reads `unavailable`, 503.
+    /// The latest sample returned any other `DuckDB` error, or no sample
+    /// succeeded within the last [`SUCCESS_WINDOW`], or none has since
+    /// boot. Health reads `unavailable`, 503.
     Error,
 }
 
@@ -72,6 +76,12 @@ enum Outcome {
     /// The probe ran past the budget: it is still running, it answered
     /// late, or it returned the interrupt the watchdog raised on it.
     Overran,
+    /// The probe found the query database's budgets full: `DuckDB` raised
+    /// `Out of Memory` on it. The diagnostic connection shares those
+    /// budgets with every query, and busy queries are not a broken engine
+    /// (ADR-0056), so this reads as an overrun does: `slow` while a
+    /// success is recent.
+    Exhausted,
     /// The probe returned a `DuckDB` error of its own, or the sampler
     /// panicked.
     Failed,
@@ -240,7 +250,7 @@ impl Shared {
         match state.latest {
             _ if !recent => EngineCheck::Error,
             Some(Outcome::Succeeded) => EngineCheck::Ok,
-            Some(Outcome::Overran) => EngineCheck::Slow,
+            Some(Outcome::Overran | Outcome::Exhausted) => EngineCheck::Slow,
             Some(Outcome::Failed) | None => EngineCheck::Error,
         }
     }
@@ -426,6 +436,11 @@ fn sample(shared: &Shared, mut probe: impl Probe) {
             // probe for running past its budget: slow, not broken.
             Ok(Ok(())) => Outcome::Overran,
             Ok(Err(error)) if late && error.is_interrupt() => Outcome::Overran,
+            // The queries hold the budgets the probe shares with them:
+            // busy, not broken. No success either, so an engine they
+            // starve for good still reads `error` once the success window
+            // passes.
+            Ok(Err(EngineError::ResourceExhausted)) => Outcome::Exhausted,
             Ok(Err(_)) | Err(_) => Outcome::Failed,
         };
         if outcome == Outcome::Succeeded {
@@ -599,6 +614,9 @@ mod tests {
         Answer,
         /// Return a `DuckDB` error of its own.
         Fail,
+        /// Return `DuckDB`'s `Out of Memory`: the query database's budgets
+        /// were full when the probe needed some of them.
+        Exhaust,
         /// Block until interrupted, then until the test releases it, then
         /// return the interrupt.
         Wedge,
@@ -670,6 +688,7 @@ mod tests {
             let result = match step {
                 Step::Answer => Ok(()),
                 Step::Fail => Err(duckdb_error("Catalog")),
+                Step::Exhaust => Err(duckdb_error("Out of Memory")),
                 Step::Wedge => {
                     let mut guard = script.lock.lock().unwrap();
                     while !script.interrupted.load(Ordering::SeqCst)
@@ -714,9 +733,9 @@ mod tests {
     }
 
     /// The check reads off the latest sample and the latest success alone:
-    /// no sample yet is `error`; a success is `ok`; an overrun after a
-    /// success is `slow`; a `DuckDB` error is `error`, even right after a
-    /// success.
+    /// no sample yet is `error`; a success is `ok`; an overrun or an
+    /// exhausted budget after a success is `slow`; another `DuckDB` error
+    /// is `error`, even right after a success.
     #[test]
     fn engine_sample_maps_each_outcome_to_its_check() {
         let script = Script::new(&[], Step::Answer);
@@ -741,11 +760,20 @@ mod tests {
         assert_eq!(check(None, None), EngineCheck::Error, "none since boot");
         assert_eq!(check(Some(Outcome::Succeeded), Some(now)), EngineCheck::Ok);
         assert_eq!(check(Some(Outcome::Overran), Some(now)), EngineCheck::Slow);
+        assert_eq!(
+            check(Some(Outcome::Exhausted), Some(now)),
+            EngineCheck::Slow
+        );
         assert_eq!(check(Some(Outcome::Failed), Some(now)), EngineCheck::Error);
         assert_eq!(
             check(Some(Outcome::Overran), None),
             EngineCheck::Error,
             "an overrun with no success since boot"
+        );
+        assert_eq!(
+            check(Some(Outcome::Exhausted), None),
+            EngineCheck::Error,
+            "an exhausted budget with no success since boot"
         );
     }
 
@@ -763,6 +791,58 @@ mod tests {
         until("the failing probe", || published(&sample) >= 2);
         assert_eq!(sample.read(), EngineCheck::Error);
         assert_eq!(script.interrupts.load(Ordering::SeqCst), 0);
+    }
+
+    /// A probe that finds the query budgets full reads `slow` right after a
+    /// success, not `error`: the diagnostic connection shares the query
+    /// database's memory and spill budgets, and exhausted budgets never
+    /// change the status (ADR-0056). It is no success either, so the
+    /// success before it stays the latest.
+    #[test]
+    fn engine_sample_reads_an_exhausted_budget_as_slow() {
+        let script = Script::new(&[Step::Answer], Step::Exhaust);
+        let clock = TestClock::new();
+        let on_time = clock.now();
+        let sample = EngineSample::spawn(
+            ScriptedProbe(Arc::clone(&script)),
+            FAST,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .unwrap();
+        sample.wait_for_first();
+        assert_eq!(sample.read(), EngineCheck::Ok);
+        until("an exhausted probe", || published(&sample) >= 2);
+        assert_eq!(sample.read(), EngineCheck::Slow);
+        assert_eq!(
+            sample.shared.lock().last_success,
+            Some(on_time),
+            "an exhausted probe is not a success"
+        );
+        assert_eq!(script.interrupts.load(Ordering::SeqCst), 0);
+    }
+
+    /// Sixty seconds of nothing but exhausted probes after one success turn
+    /// `slow` into `error`, as sixty seconds of overruns do: an engine the
+    /// queries starve for good still fails health.
+    #[test]
+    fn engine_sample_reads_error_after_sixty_seconds_of_exhausted_budgets() {
+        let script = Script::new(&[Step::Answer], Step::Exhaust);
+        let clock = TestClock::new();
+        let sample = EngineSample::spawn(
+            ScriptedProbe(Arc::clone(&script)),
+            FAST,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .unwrap();
+        sample.wait_for_first();
+        assert_eq!(sample.read(), EngineCheck::Ok);
+        until("an exhausted probe", || published(&sample) >= 2);
+        clock.advance(Duration::from_secs(59));
+        let seen = published(&sample);
+        until("another exhausted probe", || published(&sample) > seen);
+        assert_eq!(sample.read(), EngineCheck::Slow);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(sample.read(), EngineCheck::Error, "60 s without success");
     }
 
     /// A wedged probe: past its budget the check reads `slow` while it is
@@ -1015,5 +1095,69 @@ mod tests {
         });
         assert_eq!(sample.read(), EngineCheck::Slow);
         assert_eq!(sample.shared.lock().latest, Some(Outcome::Overran));
+    }
+
+    /// Answers once, then runs a statement the query database's memory
+    /// limit cannot hold.
+    struct Starved {
+        connection: DiagnosticConnection,
+        answered: bool,
+    }
+
+    impl Probe for Starved {
+        fn run(&mut self) -> Result<(), EngineError> {
+            if !std::mem::replace(&mut self.answered, true) {
+                return self.connection.select_one();
+            }
+            // One string far larger than the memory limit, which no spill
+            // can hold off.
+            self.connection.select_for_test(
+                "SELECT length(string_agg(md5(i::VARCHAR), ',')) FROM range(2000000) t(i)",
+            )
+        }
+
+        fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
+            self.connection.interrupt_handle()
+        }
+    }
+
+    /// `DuckDB`'s own `Out of Memory` on the diagnostic connection of a
+    /// real query database reads `slow` after a success. The budget is
+    /// generous, so the probe fails within it and the watchdog never runs:
+    /// the exhausted budget alone is what reads `slow`.
+    #[test]
+    fn engine_sample_reads_duckdb_s_own_out_of_memory_as_slow() {
+        const PATIENT: SampleConfig = SampleConfig {
+            interval: Duration::from_millis(20),
+            budget: Duration::from_secs(120),
+            success_window: SUCCESS_WINDOW,
+        };
+        let pool = crate::pool::ExecutorPool::for_test_with_budgets(
+            String::new(),
+            1,
+            10,
+            None,
+            &trawl_engine::executor::QueryBudgets {
+                spill_max_bytes: std::num::NonZeroU64::new(64 * 1024 * 1024).unwrap(),
+                memory_limit: std::num::NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+                threads: std::num::NonZeroU32::new(2).unwrap(),
+            },
+        )
+        .unwrap();
+        let sample = EngineSample::spawn(
+            Starved {
+                connection: pool.diagnostic_connection().unwrap(),
+                answered: false,
+            },
+            PATIENT,
+            Arc::new(MonotonicClock),
+        )
+        .unwrap();
+        sample.wait_for_first();
+        assert_eq!(sample.read(), EngineCheck::Ok);
+        until("the starved probe returns", || published(&sample) >= 2);
+        let _hold = sample.hold();
+        assert_eq!(sample.read(), EngineCheck::Slow);
+        assert_eq!(sample.shared.lock().latest, Some(Outcome::Exhausted));
     }
 }

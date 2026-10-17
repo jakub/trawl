@@ -33,8 +33,8 @@ Snapshots need no budget of their own. Every query that takes a snapshot holds a
 **Health reads an engine sample instead of taking a permit.** trawld clones one diagnostic connection from the query database. It sits outside the executor pool: it takes no permit and never appears in the query listing. A dedicated thread, not tokio's blocking pool, runs `SELECT 1` on it every 10 seconds with a 250 ms budget. When the budget runs out, trawld interrupts the probe, and it starts no new probe until that one returns. `/api/v1/health` reads the latest sample and never waits for one. The `duckdb` check reads:
 
 - `ok`: the latest sample succeeded within its budget;
-- `slow`: the latest sample ran past its budget, and a sample succeeded in the last 60 seconds;
-- `error`: the latest sample returned a DuckDB error, no sample has succeeded in the last 60 seconds, or none has succeeded since boot.
+- `slow`: the latest sample ran past its budget or failed with `Out of Memory`, and a sample succeeded in the last 60 seconds. The diagnostic connection shares the query database's budgets, so queries that fill them can starve the sample too, and a starved sample is not a success;
+- `error`: the latest sample returned any other DuckDB error, no sample has succeeded in the last 60 seconds, or none has succeeded since boot.
 
 `slow` makes the status `degraded` at HTTP 200. `error` makes it `unavailable` at 503, as before. A wedged engine therefore still fails readiness and, after the liveness threshold, gets restarted, and acknowledged ingest survives that in the WAL (ADR-0041). Pool saturation, retained permits, live streams and exhausted budgets never change the status. The human ruled this on 2026-10-17: a long queue never closes the shop, but a broken till does. `/metrics` reports the permits in use, the pool size and the sample's age, so saturation stays visible. The startup, readiness and liveness probes keep calling `/api/v1/health`, and the probe and control allowances of ADR-0054 do not change.
 

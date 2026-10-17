@@ -199,10 +199,10 @@ curl --fail-with-body "$TRAWL_URL/api/v1/health"
 | `duckdb` | Meaning | `status` | HTTP |
 |----------|---------|----------|------|
 | `ok` | The latest sample succeeded within its budget | `ok` unless another check differs | 200 |
-| `slow` | The latest sample ran past its budget, and a sample succeeded in the last 60 seconds | `degraded` | 200 |
-| `error` | The latest sample returned a DuckDB error, no sample has succeeded in the last 60 seconds, or none has succeeded since boot | `unavailable` | 503 |
+| `slow` | The latest sample ran past its budget or failed with `Out of Memory`, and a sample succeeded in the last 60 seconds | `degraded` | 200 |
+| `error` | The latest sample returned any other DuckDB error, no sample has succeeded in the last 60 seconds, or none has succeeded since boot | `unavailable` | 503 |
 
-A busy engine never turns the check to `error`. A full executor pool, permits held after a timeout, live streams, and exhausted query budgets do not change `duckdb` or `status`, because the sample uses no permit. Read saturation from `trawl_query_permits_in_use` and `trawl_query_pool_size` on [`/metrics`](#prometheus-metrics). The response adds no sample age or diagnostics; `trawl_engine_sample_age_seconds` reports the age.
+A busy engine does not turn the check to `error` while a sample has succeeded in the last 60 seconds. A full executor pool, permits held after a timeout, and live streams do not change `duckdb` or `status`, because the sample uses no permit. The sample shares the query memory and spill budgets, so queries that exhaust them can make it read `slow`. Read saturation from `trawl_query_permits_in_use` and `trawl_query_pool_size` on [`/metrics`](#prometheus-metrics). The response adds no sample age or diagnostics; `trawl_engine_sample_age_seconds` reports the age.
 
 `ingest_capacity` reads `refusing` while the hot buffer refuses ingest for lack of space, and `ok` otherwise, including on a node with ingest disabled. Reads keep working while it refuses, so the response stays 200 and probes do not restart the server. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission).
 

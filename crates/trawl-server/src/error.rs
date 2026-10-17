@@ -258,10 +258,10 @@ pub enum ServerError {
     HotSnapshot(#[source] std::io::Error),
 
     /// The engine sample reads `error` (ADR-0056): its latest probe
-    /// returned a `DuckDB` error, or no probe succeeded within the success
-    /// window. Health builds its 503 itself and records this as the
-    /// request's failure. Fixed text: the sample's own error stays in the
-    /// sampler.
+    /// returned a `DuckDB` error other than `Out of Memory`, or no probe
+    /// succeeded within the success window. Health builds its 503 itself
+    /// and records this as the request's failure. Fixed text: the sample's
+    /// own error stays in the sampler.
     #[error("query engine sample failed")]
     EngineSampleFailed,
 
