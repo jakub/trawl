@@ -120,10 +120,15 @@ impl KeyStore {
     /// [`Self::ping`] to confirm the database is reachable). Migrations are
     /// applied via [`crate::migrate`] from an operational tool, never here.
     pub fn from_pool(pool: PgPool) -> Self {
-        Self {
-            pool,
-            cache: VerificationCache::new(),
-        }
+        Self::with_cache(pool, VerificationCache::new())
+    }
+
+    /// Construct from an existing pool and the given verification cache.
+    /// Crate-private: the store's tests pass a small cache to reach
+    /// eviction, and the product only ever constructs through
+    /// [`Self::from_pool`].
+    pub(crate) fn with_cache(pool: PgPool, cache: VerificationCache) -> Self {
+        Self { pool, cache }
     }
 
     /// Connect to Postgres from a database URL and construct a store.
@@ -1335,8 +1340,13 @@ mod pg_tests {
     use sqlx::PgPool;
     use tokio::time::timeout;
 
+    use std::pin::pin;
+    use std::time::Duration;
+
     use super::tests::{ARGON2_LIMIT_TESTS, DEADLINE, Parked, available_permits};
     use super::{ARGON2_CHECK_LIMIT, KeyStore};
+    use crate::cache::VerificationCache;
+    use crate::error::AuthError;
     use crate::types::PrincipalKind;
 
     /// A key whose check is cached runs no argon2, so it verifies while
@@ -1399,6 +1409,93 @@ mod pg_tests {
             store.cache.insert_calls(),
             1,
             "a cache hit must not insert again"
+        );
+        assert_eq!(store.cache_stats().entries, 1);
+    }
+
+    /// An evicted key pays argon2id again: with every permit parked, its
+    /// check cannot finish until one is freed. A wrong token for an evicted
+    /// prefix, or for a cached one, is refused by a KDF run and inserts
+    /// nothing. Eviction changes cost, never the answer.
+    #[sqlx::test]
+    async fn eviction_forces_a_kdf_run_and_never_authenticates_a_wrong_token(pool: PgPool) {
+        let _serial = ARGON2_LIMIT_TESTS.lock().await;
+        let store = KeyStore::with_cache(pool, VerificationCache::with_capacity(1));
+        let first = store
+            .create_key("first", PrincipalKind::Service, &[], None)
+            .await
+            .expect("create first");
+        let second = store
+            .create_key("second", PrincipalKind::Service, &[], None)
+            .await
+            .expect("create second");
+
+        store
+            .verify_key(&first.plaintext_token)
+            .await
+            .expect("first runs argon2 and is cached");
+        store
+            .verify_key(&second.plaintext_token)
+            .await
+            .expect("second runs argon2 and evicts first");
+        assert_eq!(store.cache_stats().entries, 1);
+        assert_eq!(store.cache.insert_calls(), 2);
+
+        // Park every permit. The evicted key needs one, so its check stays
+        // pending; a check that found a stale entry would finish at once.
+        let mut parked = Vec::new();
+        for _ in 0..ARGON2_CHECK_LIMIT {
+            parked.push(Parked::hold().await);
+        }
+        assert_eq!(available_permits(), 0, "four parked checks hold the limit");
+        let mut check = pin!(store.verify_key(&first.plaintext_token));
+        assert!(
+            timeout(Duration::from_millis(500), check.as_mut())
+                .await
+                .is_err(),
+            "an evicted key waits for an argon2 permit"
+        );
+        parked.pop().expect("a parked check").finish().await;
+        let verified = timeout(DEADLINE, check)
+            .await
+            .expect("the freed permit lets the KDF run")
+            .expect("the evicted key verifies again");
+        assert_eq!(verified.name, "first");
+        assert_eq!(
+            store.cache.insert_calls(),
+            3,
+            "the KDF run inserted the key again"
+        );
+        assert_eq!(store.cache_stats().entries, 1);
+        for check in parked {
+            check.finish().await;
+        }
+        assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
+
+        // `second` is the evicted key now. A wrong token with its prefix
+        // reaches argon2id and is refused there.
+        let tampered_second = format!(
+            "{}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0",
+            &second.plaintext_token[..12]
+        );
+        assert!(matches!(
+            store.verify_key(&tampered_second).await,
+            Err(AuthError::InvalidKey(_))
+        ));
+        // And a wrong token with the cached prefix misses the cache, because
+        // the entry is bound to the plaintext fingerprint, and is refused too.
+        let tampered_first = format!(
+            "{}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0",
+            &first.plaintext_token[..12]
+        );
+        assert!(matches!(
+            store.verify_key(&tampered_first).await,
+            Err(AuthError::InvalidKey(_))
+        ));
+        assert_eq!(
+            store.cache.insert_calls(),
+            3,
+            "a refused token inserts nothing"
         );
         assert_eq!(store.cache_stats().entries, 1);
     }

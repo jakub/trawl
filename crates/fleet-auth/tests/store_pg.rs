@@ -1501,3 +1501,183 @@ fn validation_reexported_works() {
     let t = token::generate_token();
     assert!(t.plaintext.starts_with("flt_"));
 }
+
+// ---------------------------------------------------------------------------
+// A warm cache never outranks the database (#304). The cache only records
+// that argon2id accepted a plaintext; activity, expiry, roles and the
+// stored hash are read from Postgres on every verify.
+// ---------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn warm_cache_then_expiry_refuses_the_next_verify(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key(
+            "short-lived",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+    // Warm the cache while the key is live.
+    store
+        .verify_key(&created.plaintext_token)
+        .await
+        .expect("a live key verifies");
+    assert_eq!(store.cache_stats().entries, 1);
+
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let result = store.verify_key(&created.plaintext_token).await;
+    assert!(
+        matches!(result, Err(AuthError::InvalidKey(_))),
+        "a cached entry does not outlive the key's expiry"
+    );
+    assert_eq!(
+        store.cache_stats().entries,
+        1,
+        "the database refused the key; the entry is still cached"
+    );
+}
+
+#[sqlx::test]
+async fn warm_cache_then_role_change_shows_on_the_next_verify(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let created = store
+        .create_key(
+            "promoted",
+            PrincipalKind::Human,
+            &names(&["trawl-analyst"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let warm = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert_eq!(warm.roles(), ["trawl-analyst"]);
+    assert_eq!(store.cache_stats().entries, 1);
+
+    store
+        .assign_role(&created.info.prefix, "trawl-admin")
+        .await
+        .unwrap();
+    let promoted = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert_eq!(promoted.roles(), ["trawl-admin", "trawl-analyst"]);
+
+    store
+        .unassign_role(&created.info.prefix, "trawl-analyst")
+        .await
+        .unwrap();
+    let demoted = store.verify_key(&created.plaintext_token).await.unwrap();
+    assert_eq!(demoted.roles(), ["trawl-admin"]);
+    assert_eq!(
+        store.cache_stats().entries,
+        1,
+        "role changes never touch the cache; each verify read them from the database"
+    );
+}
+
+#[sqlx::test]
+async fn warm_cache_then_hash_rotation_refuses_the_old_token(pool: sqlx::PgPool) {
+    let store = KeyStore::from_pool(pool);
+    seed_roles(&store).await;
+
+    let rotated = store
+        .create_key(
+            "rotated",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    let donor = store
+        .create_key(
+            "donor",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .verify_key(&rotated.plaintext_token)
+        .await
+        .expect("the old token verifies and warms the cache");
+    assert_eq!(store.cache_stats().entries, 1);
+
+    // Rotate the stored hash out from under the cached entry. The donor's
+    // hash is a valid PHC string whose plaintext is not the rotated token.
+    sqlx::query(
+        "UPDATE api_keys
+         SET hash = (SELECT hash FROM api_keys WHERE id = $2)
+         WHERE id = $1",
+    )
+    .bind(rotated.info.id)
+    .bind(donor.info.id)
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    // The cache key binds the stored hash, so the warm entry is unreachable
+    // and argon2id refuses the old plaintext against the new hash.
+    let result = store.verify_key(&rotated.plaintext_token).await;
+    assert!(matches!(result, Err(AuthError::InvalidKey(_))));
+    assert_eq!(
+        store.cache_stats().entries,
+        1,
+        "a refused KDF run inserts nothing"
+    );
+    // The untouched key is unaffected.
+    store
+        .verify_key(&donor.plaintext_token)
+        .await
+        .expect("the donor still verifies");
+}
+
+#[sqlx::test]
+async fn revocation_through_a_second_store_refuses_the_first_stores_warm_key(pool: sqlx::PgPool) {
+    // Two processes sharing one database each hold their own cache. A
+    // revocation through either refuses the key everywhere on its next use.
+    let first = KeyStore::from_pool(pool.clone());
+    let second = KeyStore::from_pool(pool);
+    seed_roles(&first).await;
+
+    let created = first
+        .create_key(
+            "shared-db",
+            PrincipalKind::Human,
+            &names(&["trawl-admin"]),
+            None,
+        )
+        .await
+        .unwrap();
+    first
+        .verify_key(&created.plaintext_token)
+        .await
+        .expect("warm the first store");
+    second
+        .verify_key(&created.plaintext_token)
+        .await
+        .expect("warm the second store");
+    assert_eq!(first.cache_stats().entries, 1);
+    assert_eq!(second.cache_stats().entries, 1);
+
+    second.revoke_key(&created.info.prefix).await.unwrap();
+
+    let through_first = first.verify_key(&created.plaintext_token).await;
+    assert!(
+        matches!(through_first, Err(AuthError::InvalidKey(_))),
+        "the first store's warm entry does not outrank the revocation"
+    );
+    let through_second = second.verify_key(&created.plaintext_token).await;
+    assert!(matches!(through_second, Err(AuthError::InvalidKey(_))));
+    assert_eq!(
+        first.cache_stats().entries,
+        1,
+        "the database refused the key; the first store's entry is still cached"
+    );
+}

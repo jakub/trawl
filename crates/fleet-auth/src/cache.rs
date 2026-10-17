@@ -139,10 +139,10 @@ impl VerificationCache {
         Self::default()
     }
 
-    /// A cache that holds `capacity` entries. Tests use a small capacity to
-    /// reach eviction without thousands of inserts; the product always uses
-    /// [`VERIFICATION_CACHE_CAPACITY`].
-    fn with_capacity(capacity: usize) -> Self {
+    /// A cache that holds `capacity` entries. Crate-private: the store's
+    /// tests use a small capacity to reach eviction without thousands of
+    /// inserts, and the product always uses [`VERIFICATION_CACHE_CAPACITY`].
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 entries: HashSet::with_capacity(capacity),
