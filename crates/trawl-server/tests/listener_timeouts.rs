@@ -37,6 +37,13 @@ const SHORT: ConnectionTimeouts = ConnectionTimeouts {
 /// deadline for a loaded machine, never an ordering.
 const SLACK: Duration = Duration::from_secs(5);
 
+/// The least a deadline-driven close may take from the client's clock,
+/// which starts a little after the server's: a close much sooner is a
+/// refusal, not a deadline.
+fn no_sooner_than(deadline: Duration) -> Duration {
+    deadline.mul_f32(0.8)
+}
+
 /// The start of a TLS record carrying a `ClientHello`: a handshake record
 /// of 512 bytes, a `ClientHello` of 508, the client version, and nothing
 /// more. rustls reads the whole record before it parses, so a server that
@@ -216,7 +223,7 @@ async fn listener_drops_slow_handshake() {
         "the server kept a stalled handshake open past its deadline"
     );
     assert!(
-        started.elapsed() >= SHORT.tls_handshake,
+        started.elapsed() >= no_sooner_than(SHORT.tls_handshake),
         "closed after {:?}, before the {:?} deadline: a refusal, not a timeout",
         started.elapsed(),
         SHORT.tls_handshake
@@ -342,7 +349,7 @@ async fn listener_drops_partial_headers_despite_byte_progress() {
         );
     };
     assert!(
-        closed_after >= SHORT.header_read,
+        closed_after >= no_sooner_than(SHORT.header_read),
         "closed after {closed_after:?}, before the {:?} deadline",
         SHORT.header_read
     );
@@ -380,7 +387,7 @@ async fn listener_closes_idle_keep_alive() {
         "the server wrote on an idle connection"
     );
     assert!(
-        idle_from.elapsed() >= SHORT.header_read,
+        idle_from.elapsed() >= no_sooner_than(SHORT.header_read),
         "closed after {:?} idle, before the {:?} deadline",
         idle_from.elapsed(),
         SHORT.header_read
