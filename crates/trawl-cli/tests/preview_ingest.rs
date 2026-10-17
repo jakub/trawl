@@ -152,6 +152,10 @@ impl Server {
                 query_log_max_bytes: trawl_server::config::DEFAULT_QUERY_LOG_MAX_BYTES,
                 rate_limit: RateLimitConfig::default(),
                 monitor_refresh_ms: 1000,
+                query_scratch_dir: None,
+                query_spill_max_bytes: trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
+                query_memory_limit: trawl_server::config::DEFAULT_QUERY_MEMORY_LIMIT,
+                query_threads: trawl_server::config::DEFAULT_QUERY_THREADS,
             },
             data: DataConfig {
                 path: data.to_str().expect("utf-8 data path").to_owned(),

@@ -15,6 +15,30 @@
 # Defaults to the number of available CPUs.
 # max_concurrent_queries = 4
 
+# Query scratch directory: each query's spill, the hot-buffer query
+# snapshots and the Parquet export staging files. Defaults to the data
+# root's sibling, <data.path>.query-scratch, so it sits on the data volume.
+# It must not be the data root, the WAL directory or a repin staging root
+# (<data.path>.repin-next, <data.path>.repin-aside), nor inside or above
+# any of them. A query-only node with a read-only data root sets it to a
+# writable directory.
+# query_scratch_dir = "/var/lib/trawl/data.query-scratch"
+
+# Budgets of the query database, shared by every query, export and field
+# sample. A query that needs more fails with 503 query_resource_exhausted;
+# the server keeps serving. Zero is refused.
+# Spill cap (DuckDB max_temp_directory_size). It is a maximum, not a
+# reservation: trawld does not compare it with the free space.
+# query_spill_max_bytes = "512M"
+# Memory limit (DuckDB memory_limit). It bounds DuckDB-managed memory, not
+# the whole process: plan for it plus compaction_memory_limit for each of
+# compaction, conform and repin, which can run at the same time, plus the
+# request bodies counted under max_concurrent_requests.
+# query_memory_limit = "256M"
+# Worker threads of the query database. Independent of
+# max_concurrent_queries, which counts queries, not threads.
+# query_threads = 2
+
 # Maximum rows a single query can return before being rejected.
 # Increase if analysts need larger result sets; decrease to bound memory.
 # max_result_rows = 100000
@@ -147,6 +171,11 @@ path = "~/.trawl/data"
 # How often the compaction task runs (seconds). Controls how quickly
 # WAL files are merged into parquet. Lower = fresher data but more I/O.
 # compaction_interval_secs = 10
+
+# DuckDB memory limit for each compaction, conform and repin database, as a
+# DuckDB memory string (MB is 1000-based here). Those three can run at the
+# same time, beside the query database's query_memory_limit.
+# compaction_memory_limit = "256MB"
 
 # Write internal server events (queries, auth, compaction) to the ingest
 # pipeline as service:trawld. Enables self-hosted dashboards.
