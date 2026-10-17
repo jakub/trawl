@@ -71,7 +71,7 @@ Every error that trawld itself produces has this body:
 |------|--------|---------|
 | `parse_error` | 400 | The DSL does not parse |
 | `validation_error` | 400 | The DSL parses but fails semantic checks: unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
-| `result_too_large` | 400 | The result exceeded `max_result_rows` |
+| `result_too_large` | 400 | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at a cap. The message names the cap and its limit. See [stream live events](#stream-live-events) for the caps |
 | `bad_request` | 400 | Malformed input. Also the code on every 409, which has no code of its own. |
 | `ingest_error` | 400, 413 | An ingest body that cannot be read. 413 when a gzip body decodes past `[ingest] max_body_bytes` |
 | `ingest_batch_too_large` | 413 | An ingest request holds more events or bytes than external producers may place in the hot buffer, so it can never be admitted |
@@ -276,7 +276,7 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
 | 400 | `bad_request` | `timezone` is not `UTC`, `local`, or a fixed offset, or `offset + limit` exceeds `max_result_rows` |
-| 400 | `result_too_large` | The result exceeded `max_result_rows` |
+| 400 | `result_too_large` | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
 | 404 | `not_found` | A `from saved` stage names a saved query the key does not own, or one with no successful run |
 | 409 | `bad_request` | A `from saved` stage selects a run that has rows but no Parquet file. The message names the run route. |
 | 500 | `execution_error` | DuckDB failed or the query was cancelled |
@@ -372,7 +372,7 @@ The body is the file. The headers name its type:
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
-| 400 | `result_too_large` | An `extract kv` pipeline read more than `max_export_rows` input rows |
+| 400 | `result_too_large` | An `extract kv` pipeline read more than `max_export_rows` input rows, or its aggregation would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
 | 400 | none | `format` is not `csv`, `json`, or `parquet`. Plain-text body from the framework. |
 | 500 | `execution_error` | DuckDB failed |
 | 503 | `query_resource_exhausted` | The export went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
@@ -2281,6 +2281,14 @@ These series show the executor pool and the engine sample behind the `duckdb` he
 | `trawl_engine_sample_age_seconds` | gauge | Seconds since the latest probe started, or since the sampler started before the first probe. It resets every 10 seconds while probes finish, and it keeps growing while one is wedged |
 
 `trawl_query_permits_in_use` at `trawl_query_pool_size` means searches queue, not that the engine is down. Alarm on the sample age instead, or on `checks.duckdb` reading `error`. `trawl_health_check{subsystem="duckdb"}` is set each time `/api/v1/health` answers. It reads `1` for `ok` and `slow`, and `0` for `error`. See [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query).
+
+#### Maintenance memory metric
+
+Compaction, rollup, conform and repin each open a DuckDB database bounded by `[ingest] compaction_memory_limit`. See [the memory arithmetic](/reference/configuration/#the-memory-arithmetic).
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_maintenance_resource_exhausted_total` | counter | Maintenance statements that ran out of `compaction_memory_limit`. trawld logs `maintenance_resource_exhausted`, keeps the inputs and retries them on the next pass. Starts at zero, carries no label |
 
 #### Restart visibility metrics
 
