@@ -23,7 +23,7 @@ use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
-use crate::error::{DuckDbDiagnostic, EngineError};
+use crate::error::{DuckDbDiagnostic, EngineError, locate};
 use crate::scratch::ScratchLock;
 use crate::timing::{Fallback, PhaseClock, QueryPhase};
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64};
@@ -84,11 +84,12 @@ pub mod prepare_probe {
 
 /// One lane bind: counted and recorded for the tests, then handed to
 /// `DuckDB`. The probe sees exactly the text `DuckDB` prepares, because
-/// it is the same argument.
+/// it is the same argument. A failure carries its place in `sql`
+/// ([`locate`]), as every lane statement's failure does.
 fn prepare_statement<'c>(conn: &'c Connection, sql: &str) -> duckdb::Result<duckdb::Statement<'c>> {
     #[cfg(any(test, feature = "test-support"))]
     prepare_probe::record(sql);
-    conn.prepare(sql)
+    conn.prepare(sql).map_err(|e| locate(e, sql))
 }
 
 /// How a query lane bounds the rows it hands back.
@@ -973,7 +974,10 @@ impl Executor {
 
         // start query execution — column metadata is only available
         // after DuckDB resolves table-valued functions like read_parquet()
-        let mut result_rows = match stmt.query(param_refs.as_slice()) {
+        let mut result_rows = match stmt
+            .query(param_refs.as_slice())
+            .map_err(|e| locate(e, &statement))
+        {
             Ok(r) => r,
             Err(e) if is_no_files_error(&e) => {
                 return Ok((QueryResult::empty(), TimestampColumns::new()));
@@ -1002,7 +1006,7 @@ impl Executor {
         let mut is_timestamp = vec![false; col_count];
 
         let mut rows = Vec::new();
-        while let Some(row) = result_rows.next()? {
+        while let Some(row) = result_rows.next().map_err(|e| locate(e, &statement))? {
             match cap {
                 RowCap::Refuse(max_rows) if rows.len() >= max_rows => {
                     return Err(EngineError::ResultTooLarge(max_rows));
@@ -1468,7 +1472,7 @@ impl Executor {
                     clock.time(QueryPhase::Execute, || stmt.execute(param_refs.as_slice()));
                 if let Err(e) = staged {
                     cleanup(&self.conn);
-                    return Err(e.into());
+                    return Err(locate(e, &create_sql).into());
                 }
             }
             Err(e) => {
@@ -1495,7 +1499,7 @@ impl Executor {
             if let Err(e) = self.conn.execute_batch(&copy_sql) {
                 cleanup(&self.conn);
                 let _ = std::fs::remove_file(output_path);
-                return Err(e.into());
+                return Err(locate(e, &copy_sql).into());
             }
             cleanup(&self.conn);
             Ok(())
@@ -1686,8 +1690,11 @@ fn is_no_files_error(e: &duckdb::Error) -> bool {
 /// Check if a `DuckDB` error is a binder error about a missing column. This is
 /// a user error (querying a nonexistent field), not a server error.
 ///
-/// A `Binder` diagnostic whose message is about a column or something not
-/// found.
+/// A `Binder` diagnostic whose message says "column" or "not found". The
+/// lanes put the statement line back at the end of that message
+/// ([`locate`]), as `DuckDB`'s text form has it, so a binder error over a
+/// field whose name says "column" matches as it did before the structured
+/// diagnostic, and the same error over another field does not.
 fn is_binder_column_error(e: &duckdb::Error) -> bool {
     DuckDbDiagnostic::of(e).is_some_and(|d| {
         let msg = &d.exception_message;
@@ -1797,7 +1804,10 @@ fn validate_timechart_inputs(
 
         let params = bind_params(&check.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
-        let rows = match stmt.query(param_refs.as_slice()) {
+        let rows = match stmt
+            .query(param_refs.as_slice())
+            .map_err(|e| locate(e, &check.sql))
+        {
             Ok(rows) => rows,
             Err(e) if is_no_files_error(&e) => continue,
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
@@ -2324,7 +2334,9 @@ fn glob_list_items(source: &str) -> Option<Vec<&str>> {
 /// so it surfaces as HTTP 400 instead of 500.
 ///
 /// Called only on an error [`is_binder_column_error`] accepted, so it has
-/// a diagnostic; the field name comes from its message, which quotes it.
+/// a diagnostic. The field name is the first quoted identifier of its text
+/// form, statement line included ([`locate`]), as before the structured
+/// diagnostic.
 fn remap_binder_error(e: &duckdb::Error) -> EngineError {
     let msg = DuckDbDiagnostic::of(e).map_or_else(|| e.to_string(), |d| d.text());
     // try to extract the field name from the error message
@@ -4961,9 +4973,9 @@ mod structured_error_classification {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use super::{
-        ColdAction, ColdPresence, EngineError, Executor, HotColdOutcome, HotLane, QueryBudgets,
-        classify_export_outcome, classify_query_outcome, cold_action, is_binder_column_error,
-        is_no_files_error, remap_binder_error,
+        ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, HotLane,
+        QueryBudgets, classify_export_outcome, classify_query_outcome, cold_action,
+        is_binder_column_error, is_no_files_error, remap_binder_error,
     };
     use crate::scratch::ScratchLock;
 
@@ -5105,6 +5117,103 @@ mod structured_error_classification {
         // A message about a column under another type is not a binder error.
         let catalog = raw_error(&exec, r#"SELECT * FROM "Binder Error: column not found""#);
         assert!(!is_binder_column_error(&catalog), "{catalog}");
+    }
+
+    /// Every binder failure of the cold query lane answers as it did before
+    /// `errors_as_json` (b02b8acf). The binder-column fallback read
+    /// `DuckDB`'s text form then, and that text ends with the statement line
+    /// the error sits on. So a field whose name says "column" made any
+    /// binder error on its line the unknown-field 400, naming the first
+    /// quoted identifier of the text, and the same error over another field
+    /// stayed a 500. The structured diagnostic drops that line and keeps
+    /// only its offset.
+    #[test]
+    fn binder_failures_answer_as_before_structured_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = super::timechart_fixture(&dir);
+        let (_scratch, exec) = query_database(64 * MIB, 64 * MIB);
+        let run = |dsl: &str| exec.run_query(dsl, &source, &FieldTypes::new(), usize::MAX, 0);
+        for (dsl, field) in [
+            ("* | stats sum(column_name)", "column_name"),
+            ("* | stats avg(column_name)", "column_name"),
+            ("* | stats sum(column_name) by hostname", "hostname"),
+            ("* | let x = column_name * 2", "column_name"),
+            ("* | stats sum(nope)", "nope"),
+            ("* | fields nope", "nope"),
+            ("* | sort nope", "nope"),
+            ("nope=1", "nope"),
+            ("* | stats count() by nope", "nope"),
+            ("* | timechart on nope count()", "nope"),
+        ] {
+            match run(dsl) {
+                Err(EngineError::Emit(e)) => assert_eq!(
+                    e.to_string(),
+                    format!("unsupported operation: unknown field: {field}"),
+                    "{dsl}"
+                ),
+                other => panic!("{dsl}: expected the unknown-field refusal, got {other:?}"),
+            }
+        }
+        for dsl in [
+            "* | stats sum(hostname)",
+            "* | stats avg(hostname)",
+            "* | let x = hostname * 2",
+            "* | let x = lower(n)",
+            "* | where hostname > 5",
+        ] {
+            let outcome = run(dsl);
+            assert!(
+                matches!(outcome, Err(EngineError::Database(_))),
+                "{dsl}: {outcome:?}"
+            );
+        }
+    }
+
+    /// The hot lanes route the same binder failure as before too: the union
+    /// cannot sum a column the cold side stores as text, the fallback reads
+    /// it as a missing column, and the hot-only read answers. The hot buffer
+    /// holds the column as a number, so the hot-only read binds.
+    #[test]
+    fn a_binder_failure_on_its_statement_line_still_reaches_the_hot_buffer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = super::timechart_fixture(&dir);
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+             \"column_name\":5}\n",
+        )
+        .expect("hot buffer writes");
+        let hot = hot.to_str().expect("temp path is valid UTF-8");
+        // The shipped budgets: `read_json`'s buffers alone outgrow 64 MiB.
+        let (_scratch, exec) = query_database(512 * MIB, 256 * MIB);
+        let dsl = "* | stats sum(column_name)";
+
+        let result = exec
+            .run_query_with_hot(
+                dsl,
+                &source,
+                hot,
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            )
+            .expect("the hot-only read answers");
+        assert_eq!(result.rows.len(), 1, "{result:?}");
+
+        let out = dir.path().join("out.parquet");
+        exec.export_parquet_with_hot(
+            dsl,
+            &source,
+            hot,
+            &FieldTypes::new(),
+            &FieldTypes::new(),
+            &out,
+            usize::MAX,
+        )
+        .expect("the hot-only export answers");
+        assert!(out.is_file());
     }
 
     #[test]

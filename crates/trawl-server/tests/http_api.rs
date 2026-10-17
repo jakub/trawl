@@ -2512,6 +2512,56 @@ async fn validate_query_unknown_function() {
     assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
 }
 
+/// On a query-only node, with no hot buffer to fall back to, a binder
+/// failure answers with the status it had before `DuckDB`'s structured
+/// errors (ADR-0056): summing a text field whose name says "column" is the
+/// unknown-field 400, because the fallback reads the statement line the
+/// error sits on, and summing another text field stays the 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binder_failure_on_a_query_only_node_keeps_its_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = common::setup_in_dir_with_ingest(dir.path(), false).await;
+    assert!(server.state.query.hot_buffer.is_none());
+    let hour = dir.path().join("data/prod/2024-01-15/10");
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2024-01-15 10:00:03' AS _time, \
+                    TIMESTAMP '2024-01-15 10:00:13' AS _ingested, 'raw3' AS _raw, \
+                    NULL::VARCHAR AS _repairs, 'prod' AS env, 'odd' AS service, \
+                    'web02' AS host, 9::BIGINT AS severity, 'info' AS severity_text, \
+                    'odd one' AS message, 'c1' AS column_name) \
+             TO '{}' (FORMAT PARQUET)",
+            hour.join("odd.parquet").display()
+        ))
+        .unwrap();
+    let query = |dsl: &'static str| {
+        let request = common::harness_client_builder()
+            .build()
+            .unwrap()
+            .post(format!("{}/api/v1/query", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": dsl }));
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            (status, response.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+
+    let (status, body) = query("* | stats sum(column_name)").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "validation_error", "{body}");
+    assert_eq!(
+        body["error"]["message"], "unsupported operation: unknown field: column_name",
+        "{body}"
+    );
+
+    let (status, body) = query("* | stats sum(host)").await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(body["error"]["code"], "execution_error", "{body}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn query_pagination_limit_offset() {
     let server = setup().await;

@@ -148,7 +148,7 @@ impl From<duckdb::Error> for EngineError {
 /// connections raise carries one. `exception_type` is `DuckDB`'s
 /// `ExceptionTypeToString` name (`Out of Memory`, `Binder`, `IO`,
 /// `Conversion`, ...). The other keys are the exception's extra info and
-/// are ignored.
+/// are ignored, except that [`locate`] reads `position`.
 ///
 /// `DuckDB` 1.5.5 passes a raw message that already starts with `{`
 /// through unchanged (`ErrorData::ConvertErrorToJSON`), so a statement
@@ -170,21 +170,182 @@ impl DuckDbDiagnostic {
         let duckdb::Error::DuckDBFailure(_, Some(message)) = error else {
             return None;
         };
-        // The derive also takes a positional sequence for a struct, so
-        // `["Out of Memory","x"]` would parse. Only an object reaches it,
-        // where the derive refuses a repeated key.
-        let json = message.trim_start_matches([' ', '\t', '\n', '\r']);
-        if !json.starts_with('{') {
-            return None;
-        }
-        serde_json::from_str(json).ok()
+        parse_object(message)
     }
 
-    /// `DuckDB`'s text form of the same error, `<type> Error: <message>`,
-    /// without the query-location context the text form appends.
+    /// `DuckDB`'s text form of the same error, `<type> Error: <message>`.
+    /// It carries the query-location context the text form appends only
+    /// once [`locate`] has put it back.
     pub(crate) fn text(&self) -> String {
         format!("{} Error: {}", self.exception_type, self.exception_message)
     }
+}
+
+/// `message` parsed as one JSON object of type `T`, or `None`.
+///
+/// The derive also takes a positional sequence for a struct, so
+/// `["Out of Memory","x"]` would parse. Only an object reaches it, where
+/// the derive refuses a repeated key.
+fn parse_object<T: serde::de::DeserializeOwned>(message: &str) -> Option<T> {
+    let json = message.trim_start_matches([' ', '\t', '\n', '\r']);
+    if !json.starts_with('{') {
+        return None;
+    }
+    serde_json::from_str(json).ok()
+}
+
+/// `error` with `DuckDB`'s query-location context put back into its
+/// diagnostic, for the `statement` that raised it.
+///
+/// Without `errors_as_json`, `DuckDB` ends an error's message with the
+/// statement line the error sits on and a caret under it
+/// (`ErrorData::AddErrorLocation`). With it, the diagnostic carries only
+/// the byte offset of that place, as its `position` key. The message
+/// matchers in `executor` (no files, binder column) were written against
+/// the text form: a binder error over a field whose name says "column"
+/// matched on that line alone. So each lane puts the context back for the
+/// statement it ran. The diagnostic keeps its `exception_type`, gains the
+/// context at the end of its `exception_message`, as `DuckDB` adds it, and
+/// drops its other keys, which nothing reads.
+///
+/// Every other error comes back unchanged: a driver variant, a message that
+/// is not a diagnostic, one with no `position` or one that is not a decimal
+/// string, and a position at or past the statement's end, where `DuckDB`
+/// adds nothing either.
+pub(crate) fn locate(error: duckdb::Error, statement: &str) -> duckdb::Error {
+    match error {
+        duckdb::Error::DuckDBFailure(code, Some(message)) => {
+            let located = locate_message(&message, statement).unwrap_or(message);
+            duckdb::Error::DuckDBFailure(code, Some(located))
+        }
+        other => other,
+    }
+}
+
+/// The diagnostic `message` with its location context added, or `None`
+/// when [`locate`] leaves it alone.
+fn locate_message(message: &str, statement: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Position {
+        position: String,
+    }
+    let diagnostic: DuckDbDiagnostic = parse_object(message)?;
+    let Position { position } = parse_object(message)?;
+    let context = query_location_context(statement, position.parse().ok()?)?;
+    Some(
+        serde_json::json!({
+            "exception_type": diagnostic.exception_type,
+            "exception_message": format!("{}\n\n{context}", diagnostic.exception_message),
+        })
+        .to_string(),
+    )
+}
+
+/// The query-location context `DuckDB` 1.5.5 appends to an error's text
+/// form: `LINE <n>: `, the statement line the error sits on, cut to about
+/// 60 columns on each side of the error with `...` where it is cut, and a
+/// line with a caret under the error. A port of
+/// `QueryErrorContext::Format`. `None` where `DuckDB` appends nothing: an
+/// error at or past the statement's end.
+///
+/// `DuckDB` counts the cut in grapheme clusters and their render widths
+/// (utf8proc). This counts each `char` as one cluster one column wide, and
+/// a control character as zero columns. That is exact for an ASCII line,
+/// and for any line short enough that nothing is cut. A long line with
+/// wide or combining characters near the error can be cut a few
+/// characters away from where `DuckDB` cuts it.
+fn query_location_context(query: &str, error_location: usize) -> Option<String> {
+    const MAX_LINE_RENDER_WIDTH: usize = 120;
+    let bytes = query.as_bytes();
+    if error_location >= bytes.len() {
+        return None;
+    }
+    // The line the error sits on, and its number. A `\r` ends a line
+    // unless a `\n` follows it before the error.
+    let mut line_start = 0;
+    let mut line_number = 1;
+    for i in 0..error_location {
+        let newline = match bytes[i] {
+            b'\r' => i + 1 >= error_location || bytes[i + 1] != b'\n',
+            b'\n' => true,
+            _ => false,
+        };
+        if newline {
+            line_number += 1;
+            line_start = i + 1;
+        }
+    }
+    let line_end = bytes[error_location..]
+        .iter()
+        .position(|&b| b == b'\n' || b == b'\r')
+        .map_or(bytes.len(), |n| error_location + n);
+    let line = query.get(line_start..line_end)?;
+
+    // Each character's offset in the line, its render width, and whether
+    // the line may be cut before it.
+    let mut positions = Vec::new();
+    let mut widths = Vec::new();
+    let mut breaks = Vec::new();
+    for (at, c) in line.char_indices() {
+        positions.push(at);
+        widths.push(usize::from(!c.is_control()));
+        let lead = line.as_bytes()[at];
+        breaks.push(is_operator(lead) || lead.is_ascii_whitespace() || lead == 0x0b);
+    }
+    let epos = positions
+        .iter()
+        .position(|&p| p >= error_location - line_start)
+        .unwrap_or(0);
+
+    // At most half the width before the error, cut where a break lies
+    // within four characters of the limit.
+    let (mut from, mut to) = (line_start, line_end);
+    let mut spos = 0;
+    let mut truncate_beginning = false;
+    let mut width = 0;
+    for i in (1..=epos).rev() {
+        width += widths[i];
+        if width >= MAX_LINE_RENDER_WIDTH / 2 {
+            let cut = (i.saturating_sub(4)..(i + 4).min(epos))
+                .find(|&k| breaks[k])
+                .unwrap_or(i);
+            truncate_beginning = true;
+            from += positions[cut];
+            spos = cut;
+            break;
+        }
+    }
+    // And the same after it.
+    let mut truncate_end = false;
+    width = 0;
+    for (i, w) in widths.iter().enumerate().skip(epos) {
+        width += w;
+        if width >= MAX_LINE_RENDER_WIDTH / 2 {
+            let scan_from = if i > epos + 4 { i - 4 } else { epos };
+            let cut = (scan_from..(i + 4).min(positions.len()))
+                .find(|&k| breaks[k])
+                .unwrap_or(i);
+            truncate_end = true;
+            to = line_start + positions[cut];
+            break;
+        }
+    }
+
+    let indicator = format!("LINE {line_number}: ");
+    let begin = if truncate_beginning { "..." } else { "" };
+    let end = if truncate_end { "..." } else { "" };
+    let caret = widths[spos..epos].iter().sum::<usize>() + indicator.len() + begin.len();
+    Some(format!(
+        "{indicator}{begin}{}{end}\n{}^",
+        query.get(from..to)?,
+        " ".repeat(caret)
+    ))
+}
+
+/// `DuckDB`'s `StringUtil::CharacterIsOperator`: ASCII punctuation other
+/// than `_`.
+fn is_operator(c: u8) -> bool {
+    c != b'_' && c.is_ascii_punctuation()
 }
 
 /// A `DuckDB` error as `DuckDB` would word it without `errors_as_json`.
@@ -202,7 +363,7 @@ fn format_parse_errors(errors: &[ParseError]) -> String {
 
 #[cfg(test)]
 mod structured_error_classification {
-    use super::EngineError;
+    use super::{DuckDbDiagnostic, EngineError};
 
     /// A `DuckDB` failure whose message is `message`, as the driver builds
     /// one from a failed statement.
@@ -357,6 +518,128 @@ mod structured_error_classification {
             assert!(!EngineError::from(other).is_interrupt(), "{shown}");
         }
         assert!(!EngineError::Cancelled.is_interrupt());
+    }
+
+    /// The error `sql` raises with `params` bound, rows drained, on a fresh
+    /// connection with `errors_as_json` set as given.
+    fn raised(sql: &str, params: &[&dyn duckdb::ToSql], json: bool) -> duckdb::Error {
+        let conn = duckdb::Connection::open_in_memory().expect("duckdb");
+        conn.execute_batch(&format!("SET errors_as_json = {json}"))
+            .expect("errors_as_json");
+        conn.prepare(sql)
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query(params)?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            })
+            .expect_err(sql)
+    }
+
+    /// With its place put back, a diagnostic reads exactly as `DuckDB`'s own
+    /// text form of the same error: the statement line, cut where `DuckDB`
+    /// cuts a long one, and the caret. Errors at bind and at execute, on
+    /// short lines, long lines cut on either side or both, runs with no
+    /// break to cut at, `\r\n` and lone `\r` line ends, tabs, and a line of
+    /// one-column non-ASCII characters.
+    #[test]
+    fn a_located_diagnostic_reads_as_duckdb_s_text_form() {
+        let columns = |sep: &str, item: &dyn Fn(usize) -> String| {
+            (0..40).map(item).collect::<Vec<_>>().join(sep)
+        };
+        let wide = columns(", ", &|i| format!("{i} AS c{i:02}"));
+        let tabbed = columns(",\t", &|i| format!("{i}\tAS\tc{i:02}"));
+        let accented = columns(", ", &|i| format!("{i} AS \"é{i:02}\""));
+        let run = "x".repeat(150);
+        let five: &dyn duckdb::ToSql = &5_i64;
+        let cases: Vec<(String, Vec<&dyn duckdb::ToSql>)> = vec![
+            ("SELECT nonexistent_col FROM (SELECT 1 AS x)".into(), vec![]),
+            (
+                "SELECT 1 AS a,\n  2 AS b\nFROM (SELECT 1 AS x)\nWHERE nonexistent_col = 1".into(),
+                vec![],
+            ),
+            (
+                "SELECT 1\r\nFROM (SELECT 1 AS x)\r\nWHERE nope = 1".into(),
+                vec![],
+            ),
+            (
+                "SELECT 1\rFROM (SELECT 1 AS x)\rWHERE nope = 1".into(),
+                vec![],
+            ),
+            (format!("SELECT {wide}, nope FROM (SELECT 1 AS x)"), vec![]),
+            (format!("SELECT nope, {wide} FROM (SELECT 1 AS x)"), vec![]),
+            (
+                format!("SELECT {wide}, nope, {wide} FROM (SELECT 1 AS x)"),
+                vec![],
+            ),
+            (
+                format!("SELECT 1 AS {run}, nope{run} FROM (SELECT 1 AS x)"),
+                vec![],
+            ),
+            (
+                format!("SELECT {tabbed},\tnope FROM (SELECT 1 AS x)"),
+                vec![],
+            ),
+            (
+                format!("SELECT {accented}, nope FROM (SELECT 1 AS x)"),
+                vec![],
+            ),
+            ("SELECT sum(h) FROM (SELECT 'a' AS h)".into(), vec![]),
+            ("SELECT * FROM nonexistent_table".into(), vec![]),
+            (
+                "SELECT *\nFROM (SELECT 'a' AS h)\nWHERE h > ?".into(),
+                vec![five],
+            ),
+        ];
+        for (sql, params) in &cases {
+            let text = raised(sql, params, false).to_string();
+            assert!(text.contains("\nLINE "), "{sql}: a located error: {text}");
+            let located = super::locate(raised(sql, params, true), sql);
+            let diagnostic = DuckDbDiagnostic::of(&located).expect("still a diagnostic");
+            assert_eq!(diagnostic.text(), text, "{sql}");
+        }
+    }
+
+    /// `locate` keeps the exception type, and leaves alone what it cannot
+    /// place: a driver variant, text that is not a diagnostic, a diagnostic
+    /// with no position, one whose position is not a decimal string or is
+    /// repeated, and a position at or past the statement's end.
+    #[test]
+    fn locate_keeps_the_type_and_leaves_the_unplaceable_alone() {
+        let statement = "SELECT 1";
+        let oom = super::locate(
+            failure(r#"{"exception_type":"Out of Memory","exception_message":"x","position":"7"}"#),
+            statement,
+        );
+        assert!(oom.to_string().contains("LINE 1: SELECT 1"), "{oom}");
+        assert!(matches!(
+            EngineError::from(oom),
+            EngineError::ResourceExhausted
+        ));
+        let hostile = super::locate(
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"Out of Memory","position":"0"}"#,
+            ),
+            statement,
+        );
+        assert!(matches!(
+            EngineError::from(hostile),
+            EngineError::Database(_)
+        ));
+
+        for message in [
+            "Binder Error: x",
+            r#"{"exception_type":"Binder","exception_message":"x"}"#,
+            r#"{"exception_type":"Binder","exception_message":"x","position":7}"#,
+            r#"{"exception_type":"Binder","exception_message":"x","position":"seven"}"#,
+            r#"{"exception_type":"Binder","exception_message":"x","position":"7","position":"0"}"#,
+            r#"{"exception_type":"Binder","exception_message":"x","position":"8"}"#,
+            r#"{"exception_type":"Binder","exception_message":"x","position":"80"}"#,
+        ] {
+            let located = super::locate(failure(message), statement);
+            assert_eq!(located.to_string(), message);
+        }
+        let driver = super::locate(duckdb::Error::InvalidColumnName("SELECT".into()), statement);
+        assert!(matches!(driver, duckdb::Error::InvalidColumnName(_)));
     }
 
     /// A database error reads as `DuckDB`'s text form, not as the JSON the
