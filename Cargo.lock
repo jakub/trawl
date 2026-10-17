@@ -6500,6 +6500,8 @@ dependencies = [
  "clap",
  "fleet-auth",
  "futures",
+ "hyper",
+ "hyper-util",
  "libc",
  "mime_guess",
  "nix",
