@@ -12,11 +12,10 @@
 //!   different bodies (the refusal plan, and the error envelope for a
 //!   slot held elsewhere). They are told apart by decoding, never by the
 //!   status code, and never by sniffing error text.
-//! - [`poll_decide`] — the status route is install-wide (there is no
-//!   `?id=`), so every read has to be matched against the job id the
-//!   case file holds. A different id, or no job at all, means the
-//!   one-running slot moved on and our job's record is gone from the
-//!   route: stop, keep what we last saw, say so.
+//! - [`poll_decide`] — a followed job is read by its id (`?id=`), and
+//!   every read is still matched against the id the follower holds. No
+//!   job (the route's 404), or a different one, means our job's record
+//!   is out of reach: stop, keep what we last saw, say so.
 //! - [`recovery_verdict`] — a real run whose response was lost either
 //!   claimed a job or did not, and the client cannot tell which. The
 //!   route only ever gets to say yes (a job it can prove is ours), and
@@ -25,8 +24,9 @@
 //!   right now, which is the only thing that unwedges a modal parked on
 //!   someone else's job.
 //! - [`followed_plan`] — a dry run whose scan outlasted the server's
-//!   answer bound comes back 202, and its terminal row, read from the
-//!   status route, is a plan only when it `succeeded`.
+//!   answer bound comes back 202, and its terminal row, from the 202
+//!   itself or read by id from the status route, is a plan only when it
+//!   `succeeded`.
 //!
 //! All three decisions read one reduction of a status response
 //! ([`StatusProbe`]), so they cannot disagree about what a read said.
@@ -236,9 +236,9 @@ pub fn poll_decide(tracked_id: i64, consecutive_errors: u32, probe: &StatusProbe
                 PollAction::Track
             }
         }
-        // The route is install-wide: a different id is a different job,
-        // never a later view of ours, and `job: null` cannot be ours
-        // either. Both mean our record is unreachable from here.
+        // A different id is a different job, never a later view of ours,
+        // and no job cannot be ours either. Both mean our record is
+        // unreachable from here.
         StatusProbe::Job(_) | StatusProbe::NoJob => PollAction::Lost,
         StatusProbe::Failed => {
             if consecutive_errors >= MAX_POLL_ERRORS {
@@ -460,8 +460,8 @@ pub fn force_step(job: &RepinJobResponse, previewed: bool) -> ForceStep {
 }
 
 /// Shown when a dry run answered 202 can no longer be followed: the
-/// status route reports another job, or none, so this plan's report is
-/// out of reach.
+/// status route no longer holds its job, so this plan's report is out of
+/// reach.
 pub const PLAN_LOST: &str = "The plan's scan outlasted the server's answer, and the repin status \
                              no longer reports its job, so its report can't be read. Get the plan \
                              again.";
@@ -476,8 +476,8 @@ pub const PLAN_UNREADABLE: &str = "The plan's scan outlasted the server's answer
 ///
 /// The server holds a repin request for at most its `[server]
 /// timeout_secs`, so a scan still running at that bound answers 202 with
-/// the running row, dry runs included, and the report is then the status
-/// route's to give.
+/// the claimed row, dry runs included, and the report is then the status
+/// route's to give, read by the job's id.
 #[derive(Debug, Clone)]
 pub enum FollowedPlan {
     /// The scan finished: the row is the plan, exactly as a 200 would
@@ -835,8 +835,8 @@ mod tests {
     fn another_id_or_no_job_loses_the_trail() {
         let other = StatusProbe::Job(probed(43, "running"));
         assert_eq!(poll_decide(42, 0, &other), PollAction::Lost);
-        // Even a terminal row for another id: the install-wide route
-        // never speaks about our job again once the slot moves on.
+        // Even a terminal row for another id: it is someone else's
+        // outcome, never ours.
         let other_done = StatusProbe::Job(probed(43, "succeeded"));
         assert_eq!(poll_decide(42, 0, &other_done), PollAction::Lost);
         assert_eq!(poll_decide(42, 0, &StatusProbe::NoJob), PollAction::Lost);

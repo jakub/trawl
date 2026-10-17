@@ -327,17 +327,17 @@ pub fn RepinModal(
             //
             // A dry run's 202 is a scan that outlasted the server's answer
             // bound (ADR-0054). Its report is the status route's to give,
-            // so the dialog follows the job there and reads the terminal
-            // row as the 200 would have been read. Nothing is handed up: a
-            // dry run mutates nothing, and a dialog closed meanwhile
-            // simply stops following.
+            // so the dialog follows the job there by its id and reads the
+            // terminal row as the 200 would have been read. Nothing is
+            // handed up: a dry run mutates nothing, and a dialog closed
+            // meanwhile simply stops following.
             let outcome = match outcome {
                 Ok(RepinOutcome::Started(job)) if !job.dry_run => {
                     on_close.try_run(Some(job));
                     return;
                 }
                 Ok(RepinOutcome::Started(job)) => {
-                    let Some(followed) = follow_plan(job.id, handles).await else {
+                    let Some(followed) = follow_plan(job, handles).await else {
                         return;
                     };
                     match followed {
@@ -865,22 +865,31 @@ async fn status_probe() -> (StatusProbe, Option<RepinJobResponse>) {
     }
 }
 
-/// Follow the dry run `job_id` through the status route until its row is
-/// terminal: one read at once, then one per [`REPIN_POLL_MS`], under the
-/// case file's own [`poll_decide`] rules. `None` once the dialog is gone,
-/// which stops the reads.
-async fn follow_plan(job_id: i64, handles: Handles) -> Option<FollowedPlan> {
+/// One `/schema/repin/status?id=` read of job `id`, reduced the way
+/// [`status_probe`] reduces the install-wide one. The route's 404 is
+/// [`StatusProbe::NoJob`]: it holds no such job.
+async fn job_probe(id: i64) -> (StatusProbe, Option<RepinJobResponse>) {
+    match api::repin_job_status(id).await {
+        Ok(Some(job)) => (StatusProbe::Job(ProbedJob::from(&job)), Some(job)),
+        Ok(None) => (StatusProbe::NoJob, None),
+        Err(_) => (StatusProbe::Failed, None),
+    }
+}
+
+/// Follow the dry run a 202 answered with until its row is terminal,
+/// under the case file's own [`poll_decide`] rules.
+///
+/// The 202's row is the first read, as in the CLI's `wait_for_terminal`:
+/// a terminal one is classified at once, and only a running one is read
+/// again, by its id, once per [`REPIN_POLL_MS`]. By id, so another job in
+/// the one-running slot can never stand in for this one. `None` once the
+/// dialog is gone, which stops the reads.
+async fn follow_plan(started: RepinJobResponse, handles: Handles) -> Option<FollowedPlan> {
+    let job_id = started.id;
+    let mut probe = StatusProbe::Job(ProbedJob::from(&started));
+    let mut found = Some(started);
     let mut errors = 0_u32;
     loop {
-        let (probe, found) = status_probe().await;
-        if !handles.is_alive() {
-            return None;
-        }
-        errors = if matches!(probe, StatusProbe::Failed) {
-            errors + 1
-        } else {
-            0
-        };
         match poll_decide(job_id, errors, &probe) {
             PollAction::Track | PollAction::Retry => {}
             PollAction::Settle => {
@@ -895,6 +904,15 @@ async fn follow_plan(job_id: i64, handles: Handles) -> Option<FollowedPlan> {
         if !handles.is_alive() {
             return None;
         }
+        (probe, found) = job_probe(job_id).await;
+        if !handles.is_alive() {
+            return None;
+        }
+        errors = if matches!(probe, StatusProbe::Failed) {
+            errors + 1
+        } else {
+            0
+        };
     }
 }
 
