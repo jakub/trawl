@@ -1081,6 +1081,14 @@ enum RunPreview {
     Available(Box<trawl_api::ReportRunResponse>),
     /// The server's sentence about a run whose stored result is gone.
     Unavailable(String),
+    /// The server's sentence about a read that used up the memory or
+    /// scratch space trawld gives queries (`query_resource_exhausted`,
+    /// ADR-0056). The saved-run read runs on that budget, so a big
+    /// stored result can be refused. Like [`Self::Unavailable`] it is
+    /// the server's answer rather than a fault of the read, so it
+    /// travels as a successful outcome that ends the poll: the same read
+    /// spends the same budget again.
+    Exhausted(String),
 }
 
 /// One stored run's result, with the rerun control beneath it.
@@ -1094,7 +1102,9 @@ pub(crate) fn RunResultPreview(
     active: Signal<bool>,
     /// What the LAST read said, and nothing more: [`None`] until one
     /// lands, then whichever [`RunRead`] it answered with, replaced by
-    /// every read after it. Each caller derives what it needs from
+    /// every read after it. A read refused for want of resources puts
+    /// [`None`] back: it summarised nothing, and the summary before it is
+    /// stale. Each caller derives what it needs from
     /// that; this component holds no opinion about what a refusal owes
     /// whatever a caller was showing before it.
     read: RwSignal<Option<RunRead>>,
@@ -1113,7 +1123,10 @@ pub(crate) fn RunResultPreview(
                     status: 409,
                     message,
                 }) => Ok(RunPreview::Unavailable(message)),
-                Err(e) => Err(e),
+                Err(e) => match e.resource_exhausted() {
+                    Some(message) => Ok(RunPreview::Exhausted(message.to_owned())),
+                    None => Err(e),
+                },
             }
         },
     );
@@ -1136,6 +1149,16 @@ pub(crate) fn RunResultPreview(
             read.set(Some(RunRead::Unavailable));
             terminal.set(true);
         }
+        // The refusal says nothing about the run, and a summary this
+        // preview recorded on an earlier poll (`running`, typically: the
+        // run finished and this is the first read of its stored file) is
+        // stale beside it. Clearing hands the receipt back to what the
+        // caller's list knows, as before any read. The poll stops for the
+        // reason above; the control below asks again.
+        Some(Ok(RunPreview::Exhausted(_))) => {
+            read.set(None);
+            terminal.set(true);
+        }
         Some(Err(_)) | None => {}
     });
 
@@ -1154,6 +1177,20 @@ pub(crate) fn RunResultPreview(
                         // failure it was not.
                         RunPreview::Unavailable(message) => return view! {
                             <p class="run-unavailable" role="status">{message}</p>
+                            <Btn
+                                variant=Variant::Secondary
+                                size=Size::Xs
+                                on_click=Callback::new(move |()| {
+                                    terminal.set(false);
+                                    retry.run(());
+                                })
+                            >"Check again"</Btn>
+                        }.into_any(),
+                        // The read ran out of resources: the server's
+                        // sentence, and no automatic retry (AC17). Not a
+                        // load failure and not an empty result.
+                        RunPreview::Exhausted(message) => return view! {
+                            <p class="run-exhausted" role="status">{message}</p>
                             <Btn
                                 variant=Variant::Secondary
                                 size=Size::Xs

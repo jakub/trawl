@@ -1902,6 +1902,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"run-unavailable\"",
     },
     Contract {
+        assignment: "runExhausted: '.run-exhausted',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"run-exhausted\"",
+    },
+    Contract {
         assignment: "previewCap: '.preview-cap',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,

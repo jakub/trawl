@@ -59,7 +59,7 @@ What the results region shows on both results tabs when the server refuses a sna
 _Avoid_: outage, server error, no results
 
 **Resource notice**:
-What the results region shows on both results tabs when the server answers a snapshot with `query_resource_exhausted`: the query ran and used up the memory or scratch space trawld gives queries. The notice has the title "Query ran out of resources" and the server's own sentence, which says to narrow the range or simplify the query. It underlines nothing, since the text is fine, and offers no Retry, since the same request spends the same budget again; the page never resends it on its own. It is never an empty result or a load error. The footer status beside it reads Error. Live mode reads the stream, which never answers with this code.
+What the results region shows on both results tabs when the server answers a snapshot with `query_resource_exhausted`: the query ran and used up the memory or scratch space trawld gives queries. The notice has the title "Query ran out of resources" and the server's own sentence, which says to narrow the range or simplify the query. It underlines nothing, since the text is fine, and offers no Retry, since the same request spends the same budget again; the page never resends it on its own. It is never an empty result or a load error. The footer status beside it reads Error. Live mode reads the stream, which never answers with this code. A stored run's preview, whose read runs on the same budget, shows the sentence with a manual "Check again" instead and stops polling until it is pressed.
 _Avoid_: out of memory, OOM, spill error, no results
 
 **Draft diagnostic**:

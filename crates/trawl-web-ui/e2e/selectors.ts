@@ -529,6 +529,10 @@ export const SEL = {
   /// table: the server's own sentence, in its own element rather than
   /// the generic load-error wrapper (issue #227).
   runUnavailable: '.run-unavailable',
+  /// The line a stored-run read the server refused for resources
+  /// (`query_resource_exhausted`) shows: its own sentence, with a manual
+  /// "Check again" and no polling behind it.
+  runExhausted: '.run-exhausted',
   /// The line naming rows the response never carried. Absent when paging
   /// covers everything.
   previewCap: '.preview-cap',

@@ -2238,8 +2238,10 @@
 .run-preview .results-footer { margin-top: 8px; }
 /* A run that succeeded but whose stored result file is gone (issue #227).
  * Its own line, not the generic load error: the read did not fail, the
- * file did. */
-.run-unavailable {
+ * file did. A read that ran out of resources (ADR-0056) takes the same
+ * line and its own class. */
+.run-unavailable,
+.run-exhausted {
   margin: 0 0 8px; font-size: var(--fs-ui); color: var(--ink-2);
 }
 /* The two cap lines, one rule: each pages the rows its response
