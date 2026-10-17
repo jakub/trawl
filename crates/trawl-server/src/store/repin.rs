@@ -418,6 +418,15 @@ impl RepinStore {
     /// prepared against, not merely present, so a repin that flipped the
     /// field in between refuses instead of scanning under a stale `from`.
     pub async fn claim(&self, claim: RepinClaim<'_>) -> Result<i64, StoreError> {
+        Ok(self.claim_job(claim).await?.id)
+    }
+
+    /// [`Self::claim`], returning the claimed row as the insert wrote it.
+    ///
+    /// The row is the one thing a caller can answer with once it has stopped
+    /// waiting: the repin trigger past its answer bound replies with it
+    /// rather than reading the row back (see `RepinEngine::start_within`).
+    pub async fn claim_job(&self, claim: RepinClaim<'_>) -> Result<RepinJob, StoreError> {
         let mut tx = self.pool.begin().await?;
         // Bound the advisory-lock wait the same way the purge bounds its
         // own side: `lock_timeout` does not cover advisory locks, so
@@ -441,12 +450,12 @@ impl RepinStore {
             });
         }
 
-        let result = sqlx::query_scalar::<_, i64>(
+        let result = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO repin_jobs (field, from_type, to_type, dialect, dry_run, force,
                                      max_nulled_rows, max_ambiguous_rows, requested_by)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             RETURNING id",
-        )
+             RETURNING {JOB_COLS}"
+        )))
         .bind(claim.field)
         .bind(expected)
         .bind(claim.to_type.as_catalog())
@@ -458,12 +467,13 @@ impl RepinStore {
         .bind(claim.requested_by)
         .fetch_one(&mut *tx)
         .await;
-        let id = result.map_err(|e| match classify_violation(&e) {
+        let row = result.map_err(|e| match classify_violation(&e) {
             Some(PgViolation::RepinAlreadyRunning) => StoreError::RepinAlreadyRunning,
             _ => StoreError::from(e),
         })?;
+        let job = row_to_job(&row)?;
         tx.commit().await?;
-        Ok(id)
+        Ok(job)
     }
 
     /// Stamp the scan's whole reading onto the job row.

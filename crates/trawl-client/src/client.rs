@@ -109,10 +109,12 @@ pub enum RepinStart {
     /// request's own ladder was still running it (#109). The corpus is
     /// untouched and the pin unchanged, so this is never a report.
     Cancelled(trawl_api::RepinJobResponse),
-    /// 202: the job is running; poll `schema_repin_status`. Usually the
-    /// rewrite, but a scan that outlasts the server's `[server]
+    /// 202: the job is claimed; follow it with `schema_repin_job`. Usually
+    /// the rewrite, but a scan that outlasts the server's `[server]
     /// timeout_secs` answers 202 too, dry runs included, and the plan or
-    /// refusal is then read from the status route.
+    /// refusal is then read by the job's id. The row is normally
+    /// `running`, but a job that finished as the answer was built can be
+    /// terminal already, and is then its own verdict.
     Started(trawl_api::RepinJobResponse),
     /// 409 with a job body: the scan projected nulled values and no force
     /// flag was passed — the job is the plan the refusal is based on.
@@ -828,11 +830,28 @@ impl HttpClient {
     }
 
     /// Fetch the repin status surface
-    /// (`GET /api/v1/schema/repin/status`).
+    /// (`GET /api/v1/schema/repin/status`): the running job, else the
+    /// newest one.
     pub async fn schema_repin_status(&self) -> Result<RepinStatusResponse, ClientError> {
         let url = self.endpoint("/api/v1/schema/repin/status");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
+    }
+
+    /// Read one repin job by its id
+    /// (`GET /api/v1/schema/repin/status?id=`).
+    ///
+    /// The way to follow a job a trigger answered 202 for: no newer job can
+    /// stand in for it, and the server accepts `schema_write` as well as
+    /// `schema_read` here, so the key that started the job can follow it.
+    /// An id the server does not know is a [`ClientError::Server`] 404.
+    pub async fn schema_repin_job(
+        &self,
+        id: i64,
+    ) -> Result<trawl_api::RepinJobResponse, ClientError> {
+        let url = self.endpoint("/api/v1/schema/repin/status");
+        let req = self.client.get(&url).query(&[("id", id)]);
+        decode_repin_job(id, self.send_authenticated(req).await?)
     }
 
     /// Reclaim pin slots held by dead fields
@@ -1549,6 +1568,29 @@ fn decode_repin_start(
         (_, "succeeded") => Ok(RepinStart::Report(job)),
         (_, "cancelled") => Ok(RepinStart::Cancelled(job)),
         _ => Ok(RepinStart::Failed(job)),
+    }
+}
+
+/// The job a read by id answered with, checked against the id asked for.
+///
+/// The server answers that one job or a 404, so an empty body or another
+/// job's row did not come from a server honouring the id (a server that
+/// predates it answers the unscoped read). Either would hand the caller a
+/// job it did not ask about, which is the stand-in the id exists to
+/// prevent, so both are protocol errors.
+fn decode_repin_job(
+    id: i64,
+    body: RepinStatusResponse,
+) -> Result<trawl_api::RepinJobResponse, ClientError> {
+    match body.job {
+        Some(job) if job.id == id => Ok(job),
+        Some(job) => Err(ClientError::Parse(format!(
+            "repin status: asked for job {id}, the server answered about job {}",
+            job.id
+        ))),
+        None => Err(ClientError::Parse(format!(
+            "repin status: asked for job {id}, the server answered with no job"
+        ))),
     }
 }
 
@@ -3128,6 +3170,38 @@ mod tests {
         let err = decode_repin_start(200, start_job("running"))
             .expect_err("200 + running must not decode");
         assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+    }
+
+    /// A read by id answers the job asked about or nothing a caller may
+    /// use. Another job's row is the stand-in the id exists to prevent, and
+    /// an empty body is no answer about the job either; both are protocol
+    /// errors that name the id asked for.
+    #[test]
+    fn a_repin_read_by_id_accepts_only_the_job_it_asked_for() {
+        let ours = decode_repin_job(
+            1,
+            RepinStatusResponse {
+                job: Some(start_job("running")),
+            },
+        )
+        .expect("the job asked for");
+        assert_eq!(ours.id, 1);
+
+        let mut newer = start_job("running");
+        newer.id = 2;
+        let err = decode_repin_job(1, RepinStatusResponse { job: Some(newer) })
+            .expect_err("another job is not an answer about job 1");
+        assert!(
+            matches!(&err, ClientError::Parse(m) if m.contains("job 1") && m.contains("job 2")),
+            "{err:?}"
+        );
+
+        let err = decode_repin_job(1, RepinStatusResponse { job: None })
+            .expect_err("no job is not an answer about job 1");
+        assert!(
+            matches!(&err, ClientError::Parse(m) if m.contains("job 1")),
+            "{err:?}"
+        );
     }
 
     // ── repin cancel decode (#109) ──────────────────────────────────────

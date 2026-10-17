@@ -2389,10 +2389,13 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 /// non-`SEVERITY` target) are 400s; a query-only node answers 503 — it owns
 /// nothing under the data root.
 ///
-/// The request answers within `[server] timeout_secs`, so its response head
-/// always reaches trawl-web inside the proxy's deadline (ADR-0054). A scan
-/// still running at that bound answers 202 with the claimed row, dry runs
-/// included, and the verdict is then read from `/schema/repin/status`.
+/// The request answers within `[server] timeout_secs` of reaching this
+/// handler, so its response head always reaches trawl-web inside the
+/// proxy's deadline (ADR-0054). A job still running at that bound answers
+/// 202 with the row its claim wrote, dry runs included, and the caller
+/// follows it with `/schema/repin/status?id=`. A request whose claim has
+/// not landed by then answers 503, and a claim that lands later ends its
+/// job `blocked` before any scan (see `RepinEngine::start_within`).
 pub async fn schema_repin(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2516,20 +2519,52 @@ pub async fn schema_repin_cancel(
         .into_response())
 }
 
+/// Query parameters for `GET /api/v1/schema/repin/status`.
+#[derive(Debug, Deserialize)]
+pub struct RepinStatusParams {
+    /// One job, by the id its trigger answered with.
+    pub id: Option<i64>,
+}
+
 /// `GET /api/v1/schema/repin/status` — the running job if any, else the
-/// newest job of any status. `SchemaRead`-gated on purpose (ADR-0011:
-/// read-only surfaces show state without offering the trigger), and served
-/// on query-only nodes too — the job rows live in postgres.
+/// newest job of any status, or with `?id=` that one job. Served on
+/// query-only nodes too — the job rows live in postgres.
+///
+/// The unscoped read is `SchemaRead`-gated on purpose (ADR-0011: read-only
+/// surfaces show state without offering the trigger). A read by id also
+/// accepts `SchemaWrite`, because it is how a trigger caller follows its
+/// own job: the trigger needs `SchemaWrite` alone, and a dry run it started
+/// can answer 202 and leave its report here. A write key can produce that
+/// report by starting a dry run anyway, so the id read shows it nothing
+/// new. An id the store never issued is a 404.
 pub async fn schema_repin_status(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
+    params: Result<Query<RepinStatusParams>, QueryRejection>,
 ) -> Result<Json<trawl_api::RepinStatusResponse>, ServerError> {
-    if !verified.has_permission(Permission::SchemaRead) {
+    let reads = verified.has_permission(Permission::SchemaRead);
+    if !reads && !verified.has_permission(Permission::SchemaWrite) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
-    let job = state.storage.repin.latest().await?;
+    let Query(params) =
+        params.map_err(|_| ServerError::BadRequest("invalid repin status parameters".into()))?;
+    let Some(id) = params.id else {
+        if !reads {
+            return Err(ServerError::Forbidden("insufficient permissions".into()));
+        }
+        let job = state.storage.repin.latest().await?;
+        return Ok(Json(trawl_api::RepinStatusResponse {
+            job: job.map(repin_job_to_wire),
+        }));
+    };
+    let job = state
+        .storage
+        .repin
+        .get(id)
+        .await?
+        .ok_or_else(|| ServerError::NotFound("repin job not found".into()))?;
     Ok(Json(trawl_api::RepinStatusResponse {
-        job: job.map(repin_job_to_wire),
+        job: Some(repin_job_to_wire(job)),
     }))
 }
 
