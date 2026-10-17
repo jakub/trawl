@@ -2388,6 +2388,11 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 /// unknown target type, same-type without force, a dialect on a
 /// non-`SEVERITY` target) are 400s; a query-only node answers 503 — it owns
 /// nothing under the data root.
+///
+/// The request answers within `[server] timeout_secs`, so its response head
+/// always reaches trawl-web inside the proxy's deadline (ADR-0054). A scan
+/// still running at that bound answers 202 with the claimed row, dry runs
+/// included, and the verdict is then read from `/schema/repin/status`.
 pub async fn schema_repin(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2405,7 +2410,8 @@ pub async fn schema_repin(
     };
 
     let outcome = engine
-        .start(
+        .start_within(
+            std::time::Duration::from_secs(state.query.timeout_secs),
             &req.field,
             &req.to,
             req.dialect.as_deref(),
@@ -2421,6 +2427,12 @@ pub async fn schema_repin(
             Some(&verified.name),
         )
         .await?;
+    let outcome = match outcome {
+        crate::repin::BoundedStart::Decided(outcome) => outcome,
+        // Past the bound the job is still running, whatever it was asked
+        // to do, so it answers as a started one.
+        crate::repin::BoundedStart::Running(job) => crate::repin::StartOutcome::Started(job),
+    };
     let (status, job) = match outcome {
         crate::repin::StartOutcome::Started(job) => (StatusCode::ACCEPTED, job),
         crate::repin::StartOutcome::Refused(job) => (StatusCode::CONFLICT, job),

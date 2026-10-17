@@ -49,7 +49,7 @@ async function prepare(page: Page) {
     reads: 0,
     posts: [] as RepinRequest[],
     status: [] as (Reply | ReturnType<typeof pending>)[],
-    postMode: 'busy' as 'busy' | 'plan' | 'lost',
+    postMode: 'busy' as 'busy' | 'plan' | 'lost' | 'late',
     // `bad_request` is the server's supported ErrorResponse code for busy.
     // The audit's `conflict` spelling exercises the conservative fallback.
     busyCode: 'bad_request',
@@ -71,6 +71,11 @@ async function prepare(page: Page) {
       await route.fulfill({ status: 409, json: { error: { code: script.busyCode, message: BUSY } } });
     } else if (script.postMode === 'lost' && !body.dry_run) {
       await route.fulfill(failed);
+    } else if (script.postMode === 'late') {
+      // The scan outlasted the server's answer bound: 202 with the
+      // running row, dry run included (ADR-0054).
+      await route.fulfill({ status: 202, json: { job: { ...running, field: body.field, to_type: body.to,
+        dry_run: body.dry_run, id: 4212, files_done: 0 } } });
     } else {
       await route.fulfill({ json: { job: { ...running, field: body.field, to_type: body.to,
         dry_run: true, status: 'succeeded', id: 4212, files_done: 12 } } });
@@ -216,6 +221,40 @@ for (const dismissal of ['close', 'Escape', 'another field'] as const) {
     await expectNoBackgroundWork(page);
   });
 }
+
+test('repin plan answered 202 past the server bound is followed to its report', async ({ page }) => {
+  const script = await prepare(page);
+  script.postMode = 'late';
+  const planned = { ...running, field: FIELD, to_type: 'BIGINT', dry_run: true, id: 4212, files_done: 0 };
+  // Drawer mount, then the plan's follow: one read still scanning, one
+  // with the finished report.
+  script.status.push(free, { json: { job: planned } },
+    { json: { job: { ...planned, status: 'succeeded', finished_at: '2026-08-01T09:21:00Z' } } });
+  await page.goto(`/search/schema?field=${FIELD}`);
+  await open(page);
+  await expect(modal(page).getByRole('button', { name: 'Planning…', exact: true })).toBeDisabled();
+  // The follow waits one poll interval between its reads.
+  await expect(modal(page).getByRole('button', { name: 'Run repin', exact: true }))
+    .toBeEnabled({ timeout: TIMING.repinPollMs + 5_000 });
+  await expect(modal(page)).toBeVisible();
+  expect(script.posts).toEqual([{ field: FIELD, to: 'BIGINT', dry_run: true, force: false }]);
+  expect(script.reads).toBe(3);
+  await expectNoBackgroundWork(page);
+});
+
+test('repin plan answered 202 whose job the status route loses asks for a new plan', async ({ page }) => {
+  const script = await prepare(page);
+  script.postMode = 'late';
+  // Drawer mount, then a follow that finds another field's job in the slot.
+  script.status.push(free, held);
+  await page.goto(`/search/schema?field=${FIELD}`);
+  await open(page);
+  await expect(modal(page).getByText("The plan's scan outlasted the server's answer", { exact: false })).toBeVisible();
+  await expect(modal(page).getByRole('button', { name: 'Retry plan', exact: true })).toBeEnabled();
+  await expect(modal(page).getByRole('button', { name: /Run repin/ })).toHaveCount(0);
+  expect(script.reads).toBe(2);
+  await expectNoBackgroundWork(page);
+});
 
 test('repin lost execution stays indeterminate after failed and empty probes', async ({ page }) => {
   const script = await prepare(page);

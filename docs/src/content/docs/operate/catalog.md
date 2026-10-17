@@ -119,7 +119,9 @@ envelope field.
    ```
 
    The output is `repin duration: dry run`, the job row, and its case file.
-   Read `rows_carrying`, `projected_nulls`, `ambiguous_numerals`, up to five
+   A scan that runs longer than the server's `[server] timeout_secs` answers
+   before it finishes, and the CLI then polls the job until its report is
+   ready. Read `rows_carrying`, `projected_nulls`, `ambiguous_numerals`, up to five
    `unmapped_samples`, and `requires_force`. `requires_force: true` means the
    same request without `--force` is refused.
 
@@ -181,7 +183,9 @@ than `level`. See
    loss. `refused: over its ceilings` means the finished rewrite exceeded the
    accepted counts. Inspect the new counts before you raise a ceiling.
 
-The server answers 409 for a refusal and 200 for a dry run.
+The server answers 409 for a refusal and 200 for a dry run. A scan that runs
+longer than `[server] timeout_secs` answers 202 instead, and the refusal then
+appears in `schema repin-status` or with `--wait`.
 
 ### Watch the repin
 

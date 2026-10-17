@@ -1087,7 +1087,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE \
 
 Permission: `schema_write`
 
-Changes one field's pinned type across the stored corpus, resurrecting shelved values from `_raw` where the new type can read them. One job runs at a time, install-wide. The request stays open for the scan, and disconnecting does not cancel the job. Ingest keeps running during the rewrite, so a job that started with 202 can still end `refused_needs_force` when the finished rewrite exceeds what the request accepted. See [repin a field](/operate/catalog/#repin-a-field) and [recover a lost response](/operate/catalog/#recover-a-lost-response).
+Changes one field's pinned type across the stored corpus, resurrecting shelved values from `_raw` where the new type can read them. One job runs at a time, install-wide. The request stays open for the scan for at most `[server] timeout_secs`. A scan still running at that point answers 202 with the running job, dry runs included, and the plan or refusal is then read from [repin status](#repin-status). Disconnecting does not cancel the job. Ingest keeps running during the rewrite, so a job that started with 202 can still end `refused_needs_force` when the finished rewrite exceeds what the request accepted. See [repin a field](/operate/catalog/#repin-a-field) and [recover a lost response](/operate/catalog/#recover-a-lost-response).
 
 **Parameters**
 
@@ -1143,7 +1143,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | Status | Code | When |
 |--------|------|------|
 | 200 | none | A dry run, or a job cancelled while the request was still scanning. Read `job.status`. |
-| 202 | none | The rewrite started. Poll [repin status](#repin-status). |
+| 202 | none | The job is running: the rewrite started, or the scan outlasted `[server] timeout_secs`. Poll [repin status](#repin-status) for the plan, the refusal or the outcome. |
 | 409 | none | The body is a job with status `refused_needs_force`: the scan found values the new type cannot read, or ambiguous numerals under the `otel` reading, and `force` was not set, or the finished rewrite exceeded an accepted ceiling. `requires_force_reason` names which. |
 | 409 | `bad_request` | A repin job is already running |
 | 400 | `bad_request` | `field` is an envelope field or not pinned, `to` is not a catalog type, `to` equals the current pin without `force`, `dialect` is unknown or given with a target other than `SEVERITY`, a ceiling is given without `force`, the pin changed between lookup and claim, the staging directory is on a different filesystem from the data root, or free disk is below the affected bytes plus the retention floor |

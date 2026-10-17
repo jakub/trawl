@@ -1152,7 +1152,7 @@ async fn bind_ceilings(
                     },
                 )
                 .await?;
-            match preview {
+            match settle_dry_run(client, preview).await? {
                 trawl_client::RepinStart::Report(job) => accepted_ceilings(&job),
                 // A forced scan resolves its own ceilings, so a refusal here
                 // is one no ceiling covers. Report it instead of executing:
@@ -1262,7 +1262,7 @@ pub async fn run_repin(
             },
         )
         .await?;
-    let (started_as, job) = match outcome {
+    let (started_as, job) = match settle_dry_run(&client, outcome).await? {
         trawl_client::RepinStart::Report(job) => ("dry run", job),
         // The client separates a cancelled row from a report, so the
         // verdict word is decided here rather than by sniffing the status
@@ -1412,6 +1412,30 @@ fn repin_refusal(reason: Option<&str>, forced: bool, lost: u64) -> String {
              remain findable in _raw)"
         ),
     }
+}
+
+/// Follow a dry run the server answered 202 for to its end.
+///
+/// The server holds a repin request for at most its `[server]
+/// timeout_secs`. A scan still running at that bound answers 202 with the
+/// running row, dry runs included, and the report is then the status
+/// route's to give. A dry run exists to print its report, so it is
+/// followed whatever `--wait` says, and the outcome is classified the way
+/// the 200 would have been: only a `succeeded` row is a report.
+async fn settle_dry_run(
+    client: &trawl_client::HttpClient,
+    outcome: trawl_client::RepinStart,
+) -> Result<trawl_client::RepinStart, CliError> {
+    let job = match outcome {
+        trawl_client::RepinStart::Started(job) if job.dry_run => job,
+        other => return Ok(other),
+    };
+    let job = wait_for_terminal(client, job).await?;
+    Ok(match job.status.as_str() {
+        "succeeded" => trawl_client::RepinStart::Report(job),
+        "cancelled" => trawl_client::RepinStart::Cancelled(job),
+        _ => trawl_client::RepinStart::Failed(job),
+    })
 }
 
 /// Poll the status surface until the job leaves `running`.

@@ -314,6 +314,25 @@ pub enum StartOutcome {
     Cancelled(RepinJob),
 }
 
+/// What [`RepinEngine::start_within`] answered.
+#[derive(Debug)]
+pub enum BoundedStart {
+    /// The request reached its verdict within the bound.
+    Decided(StartOutcome),
+    /// The bound passed first. The row is the claimed job as it stood, and
+    /// the job carries on detached.
+    Running(RepinJob),
+}
+
+/// The bounded request's own result, with a join failure answered as one.
+fn decided(
+    joined: Result<Result<StartOutcome, ServerError>, tokio::task::JoinError>,
+) -> Result<BoundedStart, ServerError> {
+    joined
+        .map_err(|e| ServerError::from_join("repin request", e))?
+        .map(BoundedStart::Decided)
+}
+
 /// What the REQUEST stated, carried from `start` into the detached ladder.
 ///
 /// The ceilings here are the operator's numbers, not the job's: resolution
@@ -421,6 +440,96 @@ impl RepinEngine {
         requested: RequestedCeilings,
         requested_by: Option<&str>,
     ) -> Result<StartOutcome, ServerError> {
+        self.run_request(
+            field,
+            to,
+            dialect,
+            dry_run,
+            force,
+            requested,
+            requested_by,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::start`], answering within `bound`.
+    ///
+    /// The scan is a full-corpus pass and can run for minutes, while
+    /// trawl-web gives every upstream call `[server] timeout_secs` plus 10 s
+    /// to send its response head (ADR-0054). The request therefore runs in
+    /// its own task. A decision reached within `bound` answers exactly as
+    /// [`Self::start`] does. Past `bound`, the claimed job's row answers
+    /// instead, as it stands, and the job carries on detached: the caller
+    /// reads its verdict from `/schema/repin/status`, as it already does
+    /// for a rewrite.
+    #[allow(clippy::too_many_arguments)] // one flag bundle per request field
+    pub async fn start_within(
+        self: &Arc<Self>,
+        bound: Duration,
+        field: &str,
+        to: &str,
+        dialect: Option<&str>,
+        dry_run: bool,
+        force: bool,
+        requested: RequestedCeilings,
+        requested_by: Option<&str>,
+    ) -> Result<BoundedStart, ServerError> {
+        let (claimed_tx, mut claimed_rx) = tokio::sync::oneshot::channel();
+        let engine = Arc::clone(self);
+        let field = field.to_owned();
+        let to = to.to_owned();
+        let dialect = dialect.map(str::to_owned);
+        let requested_by = requested_by.map(str::to_owned);
+        let mut request = tokio::spawn(async move {
+            engine
+                .run_request(
+                    &field,
+                    &to,
+                    dialect.as_deref(),
+                    dry_run,
+                    force,
+                    requested,
+                    requested_by.as_deref(),
+                    Some(claimed_tx),
+                )
+                .await
+        });
+        if let Ok(joined) = tokio::time::timeout(bound, &mut request).await {
+            return decided(joined);
+        }
+        // Past the bound. The claim is a short postgres write, so it has
+        // almost always landed by now; a request still validating or
+        // claiming has no row to answer with, so it is waited out. A
+        // request that ended without a claim dropped the sender, and its
+        // own result is the answer.
+        let Ok(job_id) = (&mut claimed_rx).await else {
+            return decided(request.await);
+        };
+        if request.is_finished() {
+            return decided(request.await);
+        }
+        // Dropping `request` detaches it. Everything past the claim already
+        // runs detached and terminalizes the row itself (see `run_request`).
+        Ok(BoundedStart::Running(self.job(job_id).await?))
+    }
+
+    /// The request half of [`Self::start`]. `claimed` hears the job id once
+    /// the claim has landed and the cancel registry is armed for it.
+    // Long because the panic arm's ordering is the point, and splitting it
+    // would move the registry settlement away from the writes it precedes.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_request(
+        self: &Arc<Self>,
+        field: &str,
+        to: &str,
+        dialect: Option<&str>,
+        dry_run: bool,
+        force: bool,
+        requested: RequestedCeilings,
+        requested_by: Option<&str>,
+        claimed: Option<tokio::sync::oneshot::Sender<i64>>,
+    ) -> Result<StartOutcome, ServerError> {
         let field = field.to_ascii_lowercase();
         let to = parse_target(to)?;
         let dialect = resolve_dialect(to, dialect)?;
@@ -481,6 +590,10 @@ impl RepinEngine {
         // that has no id yet, then reconciling it against a claim that may
         // fail — buys a correctness property nothing here needs.
         let cancel = self.cancel.arm(job_id);
+        if let Some(claimed) = claimed {
+            // A caller that stopped listening needs no id.
+            let _ = claimed.send(job_id);
+        }
 
         tracing::info!(
             event_type = "repin_start",

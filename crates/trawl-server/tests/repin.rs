@@ -11,7 +11,7 @@ mod common;
 use std::os::unix::fs::MetadataExt as _;
 use std::time::Duration;
 
-use common::{TestServer, setup_in_dir_with_data};
+use common::{DEFAULT_TEST_TIMEOUT_SECS, TestServer, setup_in_dir_with_data_and_timeout};
 use serde_json::json;
 use trawl_client::{HttpClient, RepinCeilings, RepinStart};
 use trawl_server::catalog::CatalogContext;
@@ -62,6 +62,12 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with_query_timeout(DEFAULT_TEST_TIMEOUT_SECS).await
+}
+
+/// A harness whose `[server] timeout_secs` is `timeout_secs`, which also
+/// bounds how long the repin trigger holds its response.
+async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let wal_dir = root.join("wal");
@@ -69,7 +75,13 @@ async fn harness() -> Harness {
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_path = data_dir.to_str().unwrap().to_owned();
 
-    let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data_and_timeout(
+        &root,
+        data_path,
+        RateLimitConfig::default(),
+        timeout_secs,
+    )
+    .await;
     std::mem::forget(tmp); // outlives the server; OS cleans up
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -2787,6 +2799,147 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
         assert!(!trawl_server::repin::aside_root(&h.data_dir).exists());
         assert_eq!(h.pinned_type("status").await, "BIGINT");
     }
+}
+
+/// A scan that outlasts `[server] timeout_secs` does not hold the request.
+/// trawl-web gives every upstream call `timeout_secs` plus 10 s to send its
+/// response head (ADR-0054), so the trigger answers 202 with the claimed
+/// row once that bound passes, and the verdict is read from the status
+/// route. The dry run here ends `succeeded` with its plan, exactly as it
+/// would have answered 200 inside the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+
+    let answered = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.schema_admin.schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        ),
+    )
+    .await
+    .expect("the trigger must answer within its bound while the scan is held")
+    .expect("an admitted dry run answers with its row");
+    let accepted = match answered {
+        RepinStart::Started(job) => job,
+        other => panic!("expected 202 with the running row, got {other:?}"),
+    };
+    assert!(
+        TEST_SCAN_HELD.load(Ordering::SeqCst),
+        "the answer came while the scan was still held"
+    );
+    assert_eq!(accepted.status, "running");
+    assert!(accepted.dry_run);
+    assert_eq!(
+        accepted.requires_force, None,
+        "no plan is recorded yet, so there is no verdict: {accepted:?}"
+    );
+
+    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    let mut report = None;
+    for _ in 0..300 {
+        let job = h
+            .schema_admin
+            .schema_repin_status()
+            .await
+            .expect("status")
+            .job
+            .expect("the claimed job stays on the status route");
+        assert_eq!(job.id, accepted.id, "no other job can take the slot here");
+        if job.status != "running" {
+            report = Some(job);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = report.expect("the detached dry run must finish once released");
+    assert_eq!(report.status, "succeeded", "{report:?}");
+    assert_eq!(report.files_total, 2, "{report:?}");
+    assert_eq!(report.requires_force, Some(false), "{report:?}");
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+}
+
+/// The CLI half of the answer bound: `trawl schema repin --dry-run` whose
+/// scan outlasts `[server] timeout_secs` gets a 202 with the running row,
+/// follows it through the status route, and prints the report and exits 0,
+/// exactly as it does for a dry run answered inside the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
+    use trawl_cli::cli::{ConnectionParams, OutputFormat};
+    use trawl_cli::schema::{RepinFlags, run_repin};
+
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+
+    let conn = ConnectionParams {
+        url: h.server.url.clone(),
+        token: h.server.schema_admin_token.clone(),
+        trust: trawl_client::TlsTrust::AcceptInvalid,
+    };
+    let flags = RepinFlags {
+        dialect: None,
+        dry_run: true,
+        force: false,
+        yes: false,
+        wait: false,
+        max_nulled_rows: None,
+        max_ambiguous_rows: None,
+    };
+    let mut out = Vec::new();
+    // The claim precedes the scan, so holding the scan for 3 s past its
+    // first file outlasts the 1 s bound whatever the scheduler does: the
+    // request cannot decide while the scan is held, and answers 202.
+    let release = async {
+        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let running = h
+            .schema_admin
+            .schema_repin_status()
+            .await
+            .expect("status")
+            .job
+            .expect("the claimed job is on the status route");
+        assert_eq!(running.status, "running", "{running:?}");
+        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    };
+    let (result, ()) = tokio::join!(
+        run_repin(
+            &mut out,
+            conn,
+            "status",
+            "VARCHAR",
+            flags,
+            Some(OutputFormat::Table),
+        ),
+        release,
+    );
+    let text = String::from_utf8(out).unwrap();
+    result.unwrap_or_else(|e| panic!("the dry run reports and exits 0: {e:?}\n{text}"));
+    assert!(
+        text.contains("repin status: dry run"),
+        "a followed dry run prints as a report, not as started: {text}"
+    );
+    assert!(text.contains("succeeded"), "{text}");
 }
 
 /// A scan that panics answers the request as a panic, not as an ordinary

@@ -24,6 +24,9 @@
 //! - [`slot_check`] — whether the install-wide one-running slot is free
 //!   right now, which is the only thing that unwedges a modal parked on
 //!   someone else's job.
+//! - [`followed_plan`] — a dry run whose scan outlasted the server's
+//!   answer bound comes back 202, and its terminal row, read from the
+//!   status route, is a plan only when it `succeeded`.
 //!
 //! All three decisions read one reduction of a status response
 //! ([`StatusProbe`]), so they cannot disagree about what a read said.
@@ -39,6 +42,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 
 use trawl_api::{ErrorResponse, RepinJobResponse, RepinResponse};
+use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::schema::CanonicalType;
 
 use crate::repin_hint::{repin_is_running, repin_is_terminal};
@@ -455,6 +459,56 @@ pub fn force_step(job: &RepinJobResponse, previewed: bool) -> ForceStep {
     }
 }
 
+/// Shown when a dry run answered 202 can no longer be followed: the
+/// status route reports another job, or none, so this plan's report is
+/// out of reach.
+pub const PLAN_LOST: &str = "The plan's scan outlasted the server's answer, and the repin status \
+                             no longer reports its job, so its report can't be read. Get the plan \
+                             again.";
+
+/// Shown when the status route failed every read in the retry budget
+/// while a dry run answered 202 was being followed.
+pub const PLAN_UNREADABLE: &str = "The plan's scan outlasted the server's answer, and the repin \
+                                   status could not be read, so its report is unknown. Get the \
+                                   plan again.";
+
+/// What a dry run answered 202 came to, once followed to a terminal row.
+///
+/// The server holds a repin request for at most its `[server]
+/// timeout_secs`, so a scan still running at that bound answers 202 with
+/// the running row, dry runs included, and the report is then the status
+/// route's to give.
+#[derive(Debug, Clone)]
+pub enum FollowedPlan {
+    /// The scan finished: the row is the plan, exactly as a 200 would
+    /// have carried it.
+    Plan(Box<RepinJobResponse>),
+    /// The job ended without a plan, or the route stopped reporting it.
+    /// The sentence to show in its place.
+    Ended(String),
+}
+
+/// Read a terminal dry-run row the way a 200 would have been read. Only a
+/// `succeeded` row is a plan; a cancelled, failed or blocked one says why
+/// in its own words.
+#[must_use]
+pub fn followed_plan(job: RepinJobResponse) -> FollowedPlan {
+    if job.status == "succeeded" {
+        return FollowedPlan::Plan(Box::new(job));
+    }
+    // Both come off the wire, so both are display-sanitised.
+    let status = sanitize_display_text(&job.status);
+    FollowedPlan::Ended(job.error.as_deref().map_or_else(
+        || format!("The plan's scan ended without a report ({status})."),
+        |error| {
+            format!(
+                "The plan's scan ended without a report ({status}): {}",
+                sanitize_display_text(error)
+            )
+        },
+    ))
+}
+
 thread_local! {
     /// Repin job ids that have already raised a toast, for the life of
     /// the page.
@@ -480,10 +534,10 @@ pub fn claim_toast(job_id: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundCeilings, ConflictBody, ForceStep, LostRun, MAX_POLL_ERRORS, PollAction, ProbedJob,
-        REPIN_BUSY_FALLBACK, Recovery, RepinJobResponse, SlotCheck, StatusProbe, Unproven,
-        accepted_ceilings, claim_toast, classify_conflict, default_target, force_step,
-        indeterminate_text, is_pre_claim_failure, poll_decide, recovery_verdict,
+        BoundCeilings, ConflictBody, FollowedPlan, ForceStep, LostRun, MAX_POLL_ERRORS, PollAction,
+        ProbedJob, REPIN_BUSY_FALLBACK, Recovery, RepinJobResponse, SlotCheck, StatusProbe,
+        Unproven, accepted_ceilings, claim_toast, classify_conflict, default_target, followed_plan,
+        force_step, indeterminate_text, is_pre_claim_failure, poll_decide, recovery_verdict,
         refusal_is_reusable, repin_targets, slot_check,
     };
     use trawl_core::schema::CanonicalType;
@@ -536,6 +590,57 @@ mod tests {
             ConflictBody::Plan(job) => *job,
             ConflictBody::Busy(m) => panic!("test fixture failed to decode: {m}"),
         }
+    }
+
+    /// A dry run followed past the server's answer bound reads exactly as
+    /// its 200 would have: a `succeeded` row is the plan, ceilings and
+    /// all, and any other terminal row is a sentence, never a plan.
+    #[test]
+    fn a_followed_dry_run_is_a_plan_only_when_it_succeeded() {
+        let mut planned =
+            job_with(r#","accepted_max_nulled_rows":18,"accepted_max_ambiguous_rows":10"#);
+        planned.dry_run = true;
+        planned.status = "succeeded".to_string();
+        match followed_plan(planned) {
+            FollowedPlan::Plan(job) => {
+                assert_eq!(job.status, "succeeded");
+                assert_eq!(
+                    accepted_ceilings(&job),
+                    Some(BoundCeilings {
+                        max_nulled: 18,
+                        max_ambiguous: 10,
+                    }),
+                    "the followed plan keeps the ceilings a forced scan resolved"
+                );
+            }
+            FollowedPlan::Ended(text) => panic!("a succeeded scan is the plan: {text}"),
+        }
+
+        let mut cancelled = job_with("");
+        cancelled.dry_run = true;
+        cancelled.status = "cancelled".to_string();
+        cancelled.error = Some("cancelled by ops during scan".to_string());
+        assert!(
+            matches!(
+                followed_plan(cancelled),
+                FollowedPlan::Ended(text)
+                    if text == "The plan's scan ended without a report (cancelled): \
+                                cancelled by ops during scan"
+            ),
+            "a cancelled scan says so in its own words"
+        );
+
+        let mut failed = job_with("");
+        failed.dry_run = true;
+        failed.status = "failed".to_string();
+        assert!(
+            matches!(
+                followed_plan(failed),
+                FollowedPlan::Ended(text)
+                    if text == "The plan's scan ended without a report (failed)."
+            ),
+            "a failed scan is no plan"
+        );
     }
 
     /// The modal may only restate a pair the report actually resolved.

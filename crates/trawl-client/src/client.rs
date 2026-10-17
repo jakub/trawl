@@ -109,7 +109,10 @@ pub enum RepinStart {
     /// request's own ladder was still running it (#109). The corpus is
     /// untouched and the pin unchanged, so this is never a report.
     Cancelled(trawl_api::RepinJobResponse),
-    /// 202: the rewrite is running; poll `schema_repin_status`.
+    /// 202: the job is running; poll `schema_repin_status`. Usually the
+    /// rewrite, but a scan that outlasts the server's `[server]
+    /// timeout_secs` answers 202 too, dry runs included, and the plan or
+    /// refusal is then read from the status route.
     Started(trawl_api::RepinJobResponse),
     /// 409 with a job body: the scan projected nulled values and no force
     /// flag was passed — the job is the plan the refusal is based on.
@@ -716,8 +719,9 @@ impl HttpClient {
     ///
     /// The HTTP status carries the verdict, so this returns a three-way
     /// outcome instead of flattening 409-with-plan into an opaque error:
-    /// 200 = dry-run report or a cancelled job, 202 = rewrite started, 409
-    /// with a job body = lossy without force (the plan rides back). The 200
+    /// 200 = dry-run report or a cancelled job, 202 = the job is running
+    /// (the rewrite, or a scan that outlasted the server's answer bound),
+    /// 409 with a job body = lossy without force (the plan rides back). The 200
     /// pair is told apart by the row's own status, never by the code alone
     /// (see [`decode_repin_start`]). Every other failure —
     /// including the "already running" 409, whose body is the error
@@ -1522,8 +1526,9 @@ fn connection_cut(e: &(dyn std::error::Error + 'static)) -> bool {
 /// A 200 naming a `running` job contradicts the route's contract — both
 /// 200 shapes are terminal rows — so it is a protocol error rather than a
 /// report a caller would print as a plan. A 202 is left alone: the server
-/// reads the row back after spawning the rewrite, so a fast job can
-/// legitimately be terminal by the time it is serialised.
+/// reads the row back after spawning the rewrite, or once its answer bound
+/// passed mid-scan, so a fast job can legitimately be terminal by the time
+/// it is serialised.
 ///
 /// Every success arm names the status it decodes, and there is no wildcard
 /// into `Report`. There used to be, and a `failed` row fell through it: a

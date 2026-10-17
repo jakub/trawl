@@ -46,9 +46,10 @@ use trawl_core::sanitize::sanitize_display_text;
 
 use crate::api::{self, ApiError, RepinOutcome};
 use crate::repin_flow::{
-    BoundCeilings, ForceStep, LostRun, ProbedJob, Recovery, SlotCheck, StatusProbe, Unproven,
-    default_target, force_step, indeterminate_text, is_pre_claim_failure, recovery_verdict,
-    refusal_is_reusable, repin_targets, slot_check,
+    BoundCeilings, FollowedPlan, ForceStep, LostRun, PLAN_LOST, PLAN_UNREADABLE, PollAction,
+    ProbedJob, REPIN_POLL_MS, Recovery, SlotCheck, StatusProbe, Unproven, default_target,
+    followed_plan, force_step, indeterminate_text, is_pre_claim_failure, poll_decide,
+    recovery_verdict, refusal_is_reusable, repin_targets, slot_check,
 };
 use crate::service_card_fmt::{format_bytes, format_exact};
 use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, Variant};
@@ -315,18 +316,43 @@ pub fn RepinModal(
         let to = target.get_untracked();
         spawn_local(async move {
             let outcome = api::repin(&field, &to, dry_run, forced, ceilings).await;
-            // 202 first, before any liveness or generation gate: the job
-            // is claimed and running detached server-side, so the one
-            // thing that must survive a dialog closed mid-claim is the
-            // hand-up. `try_run` because the callback may be disposed
-            // too — the case-file drawer that owns it outlives this
-            // modal, and in the case where even that is gone, the
+            // A real run's 202 first, before any liveness or generation
+            // gate: the job is claimed and running detached server-side,
+            // so the one thing that must survive a dialog closed mid-claim
+            // is the hand-up. `try_run` because the callback may be
+            // disposed too — the case-file drawer that owns it outlives
+            // this modal, and in the case where even that is gone, the
             // drawer's mount-time status read adopts the running job the
             // next time the case file is opened.
+            //
+            // A dry run's 202 is a scan that outlasted the server's answer
+            // bound (ADR-0054). Its report is the status route's to give,
+            // so the dialog follows the job there and reads the terminal
+            // row as the 200 would have been read. Nothing is handed up: a
+            // dry run mutates nothing, and a dialog closed meanwhile
+            // simply stops following.
             let outcome = match outcome {
-                Ok(RepinOutcome::Started(job)) => {
+                Ok(RepinOutcome::Started(job)) if !job.dry_run => {
                     on_close.try_run(Some(job));
                     return;
+                }
+                Ok(RepinOutcome::Started(job)) => {
+                    let Some(followed) = follow_plan(job.id, handles).await else {
+                        return;
+                    };
+                    match followed {
+                        FollowedPlan::Plan(job) => Ok(RepinOutcome::DryRun(*job)),
+                        FollowedPlan::Ended(message) => {
+                            if generation.try_get_untracked() == Some(seq) {
+                                busy.set(false);
+                                phase.set(Phase::Failed {
+                                    message,
+                                    plan: carried,
+                                });
+                            }
+                            return;
+                        }
+                    }
                 }
                 other => other,
             };
@@ -357,7 +383,8 @@ pub fn RepinModal(
                         Phase::Plan(Box::new(job))
                     });
                 }
-                // Handed to the case file above, before the gates.
+                // A real run was handed to the case file above, before the
+                // gates, and a dry run was followed to its report.
                 Ok(RepinOutcome::Started(_)) => {}
                 Ok(RepinOutcome::Refused(job)) => {
                     // Re-arm the acceptance: a refusal must be accepted
@@ -835,6 +862,39 @@ async fn status_probe() -> (StatusProbe, Option<RepinJobResponse>) {
         },
         // The read said nothing. It must never be read as "no job".
         Err(_) => (StatusProbe::Failed, None),
+    }
+}
+
+/// Follow the dry run `job_id` through the status route until its row is
+/// terminal: one read at once, then one per [`REPIN_POLL_MS`], under the
+/// case file's own [`poll_decide`] rules. `None` once the dialog is gone,
+/// which stops the reads.
+async fn follow_plan(job_id: i64, handles: Handles) -> Option<FollowedPlan> {
+    let mut errors = 0_u32;
+    loop {
+        let (probe, found) = status_probe().await;
+        if !handles.is_alive() {
+            return None;
+        }
+        errors = if matches!(probe, StatusProbe::Failed) {
+            errors + 1
+        } else {
+            0
+        };
+        match poll_decide(job_id, errors, &probe) {
+            PollAction::Track | PollAction::Retry => {}
+            PollAction::Settle => {
+                return Some(
+                    found.map_or_else(|| FollowedPlan::Ended(PLAN_LOST.to_string()), followed_plan),
+                );
+            }
+            PollAction::Lost => return Some(FollowedPlan::Ended(PLAN_LOST.to_string())),
+            PollAction::GiveUp => return Some(FollowedPlan::Ended(PLAN_UNREADABLE.to_string())),
+        }
+        gloo_timers::future::TimeoutFuture::new(REPIN_POLL_MS).await;
+        if !handles.is_alive() {
+            return None;
+        }
     }
 }
 
