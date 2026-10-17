@@ -4,7 +4,7 @@ status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-1
 
 On 2026-10-17 one search from the web UI took the homelab's only trawld pod out of service twice in one minute. The chart gave trawld a 512Mi `/tmp` emptyDir, and the query engine spilled into it. DuckDB sizes its spill cap from `statvfs` on the temp directory, and inside a disk-backed emptyDir `statvfs` reports the node's disk, not the `sizeLimit`. Nothing in trawld set `max_temp_directory_size`, `memory_limit` or `threads` on the query database. The kubelet evicted the pod for exceeding the emptyDir limit 30 seconds after the query timed out.
 
-The readiness probe had failed first. The `duckdb` health check pinged through the executor pool, on the same permits as user queries, with a 250 ms budget. The node had 4 CPUs, so the pool had 4 permits. At the probe, those permits were held by a timed-out query that DuckDB had not yet stopped, two live-tail streams and one other search. The ping expired, health answered 503, and the Service lost its only endpoint. A busy pool made a working engine look dead.
+The readiness probe had failed first. The `duckdb` health check pinged through the executor pool, on the same permits as user queries, with a 250 ms budget. The node had 4 CPUs, so the pool had 4 permits. At the probe, those permits were held by a timed-out query that DuckDB had not yet stopped and by concurrent searches. Live-tail streams take an SSE slot, not an executor permit. The ping expired, health answered 503, and the Service lost its only endpoint. A busy pool made a working engine look dead.
 
 The same spill has no bound on the other channels. Debian spills into the unit's `PrivateTmp`, and the container image and `trawl trial` spill into the container's writable layer. The hot-buffer query snapshots and the Parquet export staging file also write into `TMPDIR`, outside the private spill directory.
 
@@ -58,5 +58,5 @@ Snapshots need no budget of their own. Every query that takes a snapshot holds a
 - The timeout tail stays unbounded. DuckDB's interrupt is cooperative, and only a separate worker process could stop it at a deadline. The budgets bound what the tail can consume: spill, memory and the probe.
 - Export staging files have no byte cap. A large export can still fill the scratch directory's filesystem. `max_export_rows` limits it indirectly.
 - Compaction and conform still spill into the data root without a private directory. This decision does not change that.
-- Live-tail streams still hold executor permits for their whole life, so they shrink the query capacity a busy UI has.
+- Live-tail streams take an SSE slot and no executor permit, so this decision leaves their capacity alone.
 - The 512Mi `/tmp` emptyDir stays, for the read-only root filesystem, and holds no query data.
