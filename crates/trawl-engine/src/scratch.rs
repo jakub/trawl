@@ -863,15 +863,39 @@ mod lock {
         }
     }
 
+    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    thread_local! {
+        /// Whether `statx` answers `ENOSYS` on this thread, as Linux before
+        /// 4.11 does.
+        pub(super) static STATX_ANSWERS_NOSYS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// The entry `name` in `dir`, or with `AtFlags::EMPTY_PATH` the inode
+    /// `dir` holds. Linux before 4.11 has no `statx`; there a plain `stat`
+    /// answers, which names no mount, and [`refusal`] refuses every entry
+    /// as on a kernel before 5.8.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn statx(dir: BorrowedFd<'_>, name: &CStr, flags: AtFlags) -> io::Result<EntryStat> {
         use rustix::fs::StatxFlags;
-        let stat = rustix::fs::statx(
+        let flags = flags | AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT;
+        let answer = rustix::fs::statx(
             dir,
             name,
-            flags | AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT,
+            flags,
             StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
-        )?;
+        );
+        #[cfg(test)]
+        let answer = if STATX_ANSWERS_NOSYS.get() {
+            Err(Errno::NOSYS)
+        } else {
+            answer
+        };
+        let stat = match answer {
+            Ok(stat) => stat,
+            Err(Errno::NOSYS) => return Ok(from_stat(&rustix::fs::statat(dir, name, flags)?)),
+            Err(e) => return Err(e.into()),
+        };
         let mode = u32::from(stat.stx_mode);
         Ok(EntryStat {
             kind: FileType::from_raw_mode(mode),
@@ -897,7 +921,7 @@ mod lock {
         statx(fd, c"", AtFlags::EMPTY_PATH)
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    /// What a plain `stat` says, which names no mount.
     fn from_stat(stat: &rustix::fs::Stat) -> EntryStat {
         #[allow(clippy::cast_sign_loss, clippy::unnecessary_cast)]
         EntryStat {
@@ -1697,6 +1721,37 @@ mod tests {
                 "{needle:?} missing from {message}"
             );
         }
+        assert_eq!(tree(&path), before);
+    }
+
+    /// #304 H3: Linux before 4.11 has no `statx` and answers `ENOSYS`. The
+    /// open then reads a plain `stat`, which names no mount, so an empty
+    /// scratch directory still opens and one with entries refuses, as F4
+    /// rules for a kernel that does not name mounts.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn scratch_open_without_statx_opens_only_an_empty_directory() {
+        let parent = tempfile::tempdir().expect("parent");
+        let path = parent.path().join("scratch");
+        lock::STATX_ANSWERS_NOSYS.set(true);
+        let empty = ScratchLock::open(&path).expect("an empty directory opens without statx");
+        assert_eq!(empty.reclaimed(), Reclaimed::default());
+        drop(empty);
+
+        plant_stale(&path);
+        let before = tree(&path);
+        let Err(error) = ScratchLock::open(&path) else {
+            panic!("an entry passed the open on a kernel without statx");
+        };
+        assert!(
+            matches!(error, ScratchError::ForeignEntry { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("this kernel does not name mounts"),
+            "{message}"
+        );
         assert_eq!(tree(&path), before);
     }
 
