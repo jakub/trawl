@@ -11,7 +11,9 @@
 //! of query work cannot starve the sample. A second thread watches each
 //! probe: when one runs past [`SAMPLE_BUDGET`] it publishes the overrun at
 //! once and interrupts the probe. The probe loop is sequential, so no new
-//! probe starts until the interrupted one returns.
+//! probe starts until the interrupted one returns. An answer counts as a
+//! success only if the probe's own elapsed time is within the budget, so a
+//! watchdog that runs late cannot let a late answer pass as on time.
 //!
 //! `/api/v1/health` only reads the latest sample ([`EngineSample::read`]).
 //! It never waits for a probe and never starts one, so no number of health
@@ -92,10 +94,12 @@ impl SampleConfig {
     };
 }
 
-/// Where the published sample's instants come from. Only the instants that
-/// [`EngineSample::read`] compares come from here; the threads' own waits
-/// run on the monotonic clock, so a test can age the latest success
-/// without waiting a minute.
+/// Where the published sample's instants come from. The instants that
+/// [`EngineSample::read`] compares come from here, and so does the probe's
+/// own elapsed time, which decides whether its answer was within budget.
+/// The threads' own waits run on the monotonic clock, so a test can age the
+/// latest success without waiting a minute, and make a probe late without
+/// the watchdog seeing it.
 pub(crate) trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 }
@@ -372,7 +376,7 @@ impl EngineSample {
 fn sample(shared: &Shared, mut probe: impl Probe) {
     let mut next = Instant::now();
     loop {
-        let (number, start) = {
+        let (number, start, started_at) = {
             let mut state = shared.lock();
             loop {
                 if state.stopped {
@@ -397,27 +401,35 @@ fn sample(shared: &Shared, mut probe: impl Probe) {
                 started: start,
                 overran: false,
             });
-            (number, start)
+            (number, start, state.latest_start)
         };
         shared.changed.notify_all();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe.run()));
+        let answered = shared.clock.now();
 
         let mut state = shared.lock();
-        let overran = state
+        // Past its budget if the watchdog flagged it, or if it took the
+        // budget or longer by its own measure. The watchdog is a thread
+        // too, and under the CPU starvation `slow` describes it can run
+        // late: a probe that answered past its budget before the watchdog
+        // looked did not answer within it.
+        let flagged = state
             .in_flight
             .take()
             .is_some_and(|in_flight| in_flight.number == number && in_flight.overran);
+        let late =
+            flagged || answered.saturating_duration_since(started_at) >= shared.config.budget;
         let outcome = match &result {
-            Ok(Ok(())) if !overran => Outcome::Succeeded,
+            Ok(Ok(())) if !late => Outcome::Succeeded,
             // A late answer, or the interrupt the watchdog raised on this
             // probe for running past its budget: slow, not broken.
             Ok(Ok(())) => Outcome::Overran,
-            Ok(Err(error)) if overran && error.is_interrupt() => Outcome::Overran,
+            Ok(Err(error)) if late && error.is_interrupt() => Outcome::Overran,
             Ok(Err(_)) | Err(_) => Outcome::Failed,
         };
         if outcome == Outcome::Succeeded {
-            state.last_success = Some(shared.clock.now());
+            state.last_success = Some(answered);
         }
         state.publish(outcome);
         // A panicked probe may have left its connection in any state, so
@@ -799,6 +811,78 @@ mod tests {
         drop(SampleHold(Arc::clone(&sample.shared)));
         until("sampling resumes", || sample.probes_started() >= 3);
         until("a later answer", || sample.read() == EngineCheck::Ok);
+    }
+
+    /// Answers once at once, then once after moving the sample clock past
+    /// the budget, then waits for the test.
+    struct LateSecond {
+        clock: Arc<TestClock>,
+        late_by: Duration,
+        runs: u64,
+        gate: Arc<Script>,
+    }
+
+    impl Probe for LateSecond {
+        fn run(&mut self) -> Result<(), EngineError> {
+            self.runs += 1;
+            match self.runs {
+                1 => {}
+                2 => self.clock.advance(self.late_by),
+                _ => {
+                    let mut guard = self.gate.lock.lock().unwrap();
+                    while !self.gate.released.load(Ordering::SeqCst) {
+                        guard = self.gate.wake.wait(guard).unwrap();
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn interrupt_handle(&self) -> Arc<dyn Interrupt> {
+            Arc::clone(&self.gate) as Arc<dyn Interrupt>
+        }
+    }
+
+    /// A probe that answers past its budget is `slow`, and its answer is
+    /// no success, even when the watchdog has not flagged it yet: under
+    /// the CPU starvation `slow` describes, the watchdog thread can be the
+    /// one that runs late. The budget here is an hour of real time, so the
+    /// watchdog never fires; the probe's own elapsed time on the sample
+    /// clock is what runs past it. The success before it stays the latest.
+    #[test]
+    fn engine_sample_judges_a_late_answer_by_its_own_elapsed_time() {
+        const PATIENT: SampleConfig = SampleConfig {
+            interval: Duration::from_millis(20),
+            budget: Duration::from_hours(1),
+            success_window: Duration::from_hours(4),
+        };
+        let clock = TestClock::new();
+        let on_time = clock.now();
+        let gate = Script::new(&[], Step::Answer);
+        let sample = EngineSample::spawn(
+            LateSecond {
+                clock: Arc::clone(&clock),
+                late_by: PATIENT.budget + Duration::from_millis(1),
+                runs: 0,
+                gate: Arc::clone(&gate),
+            },
+            PATIENT,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .unwrap();
+        until("the late answer is published", || published(&sample) >= 2);
+        {
+            let state = sample.shared.lock();
+            assert_eq!(state.latest, Some(Outcome::Overran), "past its budget");
+            assert_eq!(
+                state.last_success,
+                Some(on_time),
+                "a late answer is not a success"
+            );
+        }
+        assert_eq!(sample.read(), EngineCheck::Slow);
+        assert_eq!(gate.interrupts.load(Ordering::SeqCst), 0, "no watchdog");
+        gate.release();
     }
 
     /// Sixty seconds with no success turn `slow` into `error`, on the
