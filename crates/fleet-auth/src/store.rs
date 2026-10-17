@@ -357,7 +357,12 @@ impl KeyStore {
 
         let cache_key = VerificationCacheKey::build(prefix, plaintext, &stored_hash);
 
-        if !self.cache.contains(&cache_key) {
+        // Only the request that ran the KDF may insert. A cache hit skips
+        // the KDF and must leave the cache as it found it: re-inserting on
+        // a hit would turn a lookup into a use, and the eviction order is
+        // insertion order (see the cache module docs).
+        let ran_kdf = !self.cache.contains(&cache_key);
+        if ran_kdf {
             // Cache miss — pay the argon2id cost on the blocking pool so
             // the tokio worker thread stays available for other tasks.
             let hash_valid = verify_token_async(plaintext, &stored_hash).await?;
@@ -402,9 +407,13 @@ impl KeyStore {
 
         let kind: PrincipalKind = kind_str.parse()?;
 
-        // Only insert on full success — never pollute the cache with
-        // (prefix, hash, fingerprint) triples that lost a race.
-        self.cache.insert(cache_key);
+        // Insert only after this request ran the KDF and then passed every
+        // database check — never pollute the cache with (prefix, hash,
+        // fingerprint) triples that lost a race, and never re-insert on a
+        // hit.
+        if ran_kdf {
+            self.cache.insert(cache_key);
+        }
 
         Ok(VerifiedKey::from_roles(id, db_prefix, name, kind, roles))
     }
@@ -1362,5 +1371,35 @@ mod pg_tests {
             check.finish().await;
         }
         assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
+    }
+
+    /// A cache hit runs no KDF, so it inserts nothing. The entry a hit
+    /// finds is the one the KDF run inserted, and a hit neither re-queues
+    /// nor renews it.
+    #[sqlx::test]
+    async fn a_cache_hit_inserts_nothing(pool: PgPool) {
+        let _serial = ARGON2_LIMIT_TESTS.lock().await;
+        let store = KeyStore::from_pool(pool);
+        let created = store
+            .create_key("hit", PrincipalKind::Service, &[], None)
+            .await
+            .expect("create");
+
+        store
+            .verify_key(&created.plaintext_token)
+            .await
+            .expect("the first check runs argon2 and inserts");
+        assert_eq!(store.cache.insert_calls(), 1, "the KDF run inserts once");
+
+        store
+            .verify_key(&created.plaintext_token)
+            .await
+            .expect("the second check hits the cache");
+        assert_eq!(
+            store.cache.insert_calls(),
+            1,
+            "a cache hit must not insert again"
+        );
+        assert_eq!(store.cache_stats().entries, 1);
     }
 }

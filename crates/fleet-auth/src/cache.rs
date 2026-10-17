@@ -110,6 +110,10 @@ struct Inner {
     entries: HashSet<Arc<VerificationCacheKey>>,
     order: VecDeque<Arc<VerificationCacheKey>>,
     capacity: usize,
+    /// How many `insert` calls reached the cache, duplicates included. A
+    /// test seam for the store: a cache hit must not call `insert` at all.
+    #[cfg(test)]
+    insert_calls: usize,
 }
 
 /// Bounded, concurrent, presence-only cache of successful argon2id
@@ -144,6 +148,8 @@ impl VerificationCache {
                 entries: HashSet::with_capacity(capacity),
                 order: VecDeque::with_capacity(capacity),
                 capacity,
+                #[cfg(test)]
+                insert_calls: 0,
             })),
         }
     }
@@ -170,6 +176,10 @@ impl VerificationCache {
     /// under the one lock, so the entry count never passes the capacity.
     pub fn insert(&self, key: VerificationCacheKey) {
         let mut inner = self.lock();
+        #[cfg(test)]
+        {
+            inner.insert_calls += 1;
+        }
         if inner.entries.contains(&key) {
             return;
         }
@@ -191,6 +201,14 @@ impl VerificationCache {
         VerificationCacheStats {
             entries: self.lock().entries.len(),
         }
+    }
+
+    /// How many times `insert` was called on this cache, duplicates
+    /// included. The store's tests read it to prove a cache hit inserts
+    /// nothing.
+    #[cfg(test)]
+    pub(crate) fn insert_calls(&self) -> usize {
+        self.lock().insert_calls
     }
 }
 
