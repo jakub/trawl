@@ -22,7 +22,7 @@ The scratch directory is not the data root, the WAL directory or a repin staging
 | `[server] query_memory_limit` | `memory_limit` | `256M` |
 | `[server] query_threads` | `threads` | `2` |
 
-Every query, export and field sample that runs on the query database shares these budgets. Startup refuses a zero, an overflow or a setting DuckDB rejects. It does not compare `query_spill_max_bytes` with the free or total space of the filesystem: a maximum is not a reservation, and free space changes after the check.
+Every query, export and field sample that runs on the query database shares these budgets. DuckDB enforces the spill cap on the bytes it accounts. On disk it can hold a little more: when a temp file shrinks, DuckDB keeps one block of that file's size class past its count, so the directory can exceed the cap by one block per size class, 1,179,648 bytes on DuckDB 1.5.5. Startup refuses a zero, an overflow or a setting DuckDB rejects. It does not compare `query_spill_max_bytes` with the free or total space of the filesystem: a maximum is not a reservation, and free space changes after the check.
 
 `[ingest] compaction_memory_limit` drops from `2GB` to `256MB`. Compaction, conform and repin each open their own database with that limit, and they can run at the same time. The chart's trawld container moves to a 4Gi memory limit with a 1Gi request. The 2Gi limit could not hold the documented ceilings: 1 GiB of request bodies and 512 MiB of argon2 before any DuckDB database. DuckDB limits bound DuckDB-managed memory only, not the process RSS, so the change carries a committed mixed run of ingest, queries, compaction and repin at these defaults.
 
