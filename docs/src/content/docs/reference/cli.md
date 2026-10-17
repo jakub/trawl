@@ -227,7 +227,8 @@ trawl schema <SUBCOMMAND>
 
 Schema subcommands read and change the field catalog: pinned types, per-service
 observations, and type-conflict evidence. Reads need `schema_read`. Repin,
-cancellation, pin reclamation, and acknowledgement need `schema_write`.
+cancellation, pin reclamation, and acknowledgement need `schema_write`. A repin
+follows its own job by id, which `schema_write` alone allows.
 
 Every subcommand takes `-f, --format` with the `table`, `json`, and `csv` values
 and the TTY auto-detection `query` uses. A `--last` window accepts `s`, `m`,
@@ -303,7 +304,7 @@ trawl schema repin <FIELD> --to TYPE [--dialect otel|syslog] [--dry-run] [--forc
 | `--dry-run` | *(flag)* | `false` | Scan and persist a report job. The corpus is not rewritten |
 | `--force` | *(flag)* | `false` | Accept a projected loss, or run a same-type resurrection pass, inside the ceilings |
 | `--yes` | *(flag)* | `false` | Skip the interactive confirmation. Required off a TTY |
-| `--wait` | *(flag)* | `false` | Poll this job to a terminal result |
+| `--wait` | *(flag)* | `false` | Follow this job by its id to a terminal result |
 | `--max-nulled-rows` | `<N>` | derived | With `--force`, the most rows the rewrite may null |
 | `--max-ambiguous-rows` | `<N>` | derived | With `--force` and `--to severity`, the most dialect-ambiguous numerals the rewrite may carry |
 
@@ -313,8 +314,8 @@ and the CLI prints the ceiling it binds. `requires_force` in the report says
 whether the same executing request would be refused.
 
 With `--wait`, the command exits `0` for a completed rewrite or a dry-run
-report. Any other terminal state exits nonzero, as does a job identity the
-status endpoint stops naming. See [the repin procedure](/operate/catalog/#repin-a-field)
+report. Any other terminal state exits nonzero, as does a job the status
+endpoint no longer holds. See [the repin procedure](/operate/catalog/#repin-a-field)
 and [severity repinning](/operate/catalog/#repin-to-severity).
 
 ```bash
@@ -328,7 +329,8 @@ trawl schema repin-status [-f FORMAT]
 ```
 
 Status needs `schema_read` and returns the running job, or the newest one when
-none is running. There is no lookup by job ID.
+none is running. It takes no job ID; `schema repin --wait` follows its own job
+by ID.
 
 ```bash
 trawl schema repin-status

@@ -39,7 +39,7 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 | `query_cancel` | Cancel the key's own running queries |
 | `server_manage` | Read server stats and the dashboard, [preview ingest](#preview-ingest), cancel any query, and see the text of system-owned retained work |
 | `ingest` | Submit events to `/api/v1/ingest` |
-| `schema_write` | Repin a field, reclaim pins, and acknowledge degraded pins |
+| `schema_write` | Repin a field, read a repin job by its id, reclaim pins, and acknowledge degraded pins |
 
 `schema_read` exposes samples of event values in conflict evidence: up to 5 values per conflict row, each cut to 256 bytes.
 
@@ -1087,7 +1087,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE \
 
 Permission: `schema_write`
 
-Changes one field's pinned type across the stored corpus, resurrecting shelved values from `_raw` where the new type can read them. One job runs at a time, install-wide. The request stays open for the scan for at most `[server] timeout_secs`. A scan still running at that point answers 202 with the running job, dry runs included, and the plan or refusal is then read from [repin status](#repin-status). Disconnecting does not cancel the job. Ingest keeps running during the rewrite, so a job that started with 202 can still end `refused_needs_force` when the finished rewrite exceeds what the request accepted. See [repin a field](/operate/catalog/#repin-a-field) and [recover a lost response](/operate/catalog/#recover-a-lost-response).
+Changes one field's pinned type across the stored corpus, resurrecting shelved values from `_raw` where the new type can read them. One job runs at a time, install-wide. trawld answers within `[server] timeout_secs` of the request's arrival, a bound that covers waiting behind another repin request that has not yet claimed its job, the claim, and the scan. A job claimed but still running at that bound answers 202 with the job as the claim wrote it, dry runs included, and the plan, refusal or outcome is then read from [repin status](#repin-status) by the job's `id`. A request whose claim has not landed by that bound answers 503 `service_unavailable` and starts nothing: a claim that lands later ends `blocked` before its scan, with the corpus unchanged. Disconnecting does not cancel a claimed job. Ingest keeps running during the rewrite, so a job that started with 202 can still end `refused_needs_force` when the finished rewrite exceeds what the request accepted. See [repin a field](/operate/catalog/#repin-a-field) and [recover a lost response](/operate/catalog/#recover-a-lost-response).
 
 **Parameters**
 
@@ -1143,25 +1143,32 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | Status | Code | When |
 |--------|------|------|
 | 200 | none | A dry run, or a job cancelled while the request was still scanning. Read `job.status`. |
-| 202 | none | The job is running: the rewrite started, or the scan outlasted `[server] timeout_secs`. Poll [repin status](#repin-status) for the plan, the refusal or the outcome. |
+| 202 | none | The job was claimed and was still running at `[server] timeout_secs`: the rewrite started, or the scan outlasted the bound. The body is the job as the claim wrote it. Read [repin status](#repin-status) with its `id` for the plan, the refusal or the outcome. |
 | 409 | none | The body is a job with status `refused_needs_force`: the scan found values the new type cannot read, or ambiguous numerals under the `otel` reading, and `force` was not set, or the finished rewrite exceeded an accepted ceiling. `requires_force_reason` names which. |
 | 409 | `bad_request` | A repin job is already running |
 | 400 | `bad_request` | `field` is an envelope field or not pinned, `to` is not a catalog type, `to` equals the current pin without `force`, `dialect` is unknown or given with a target other than `SEVERITY`, a ceiling is given without `force`, the pin changed between lookup and claim, the staging directory is on a different filesystem from the data root, or free disk is below the affected bytes plus the retention floor |
-| 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, or the job could not claim the corpus before its scan and ended `blocked` |
+| 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, the job could not claim the corpus before its scan and ended `blocked`, or no job was claimed within `[server] timeout_secs`. In the last case nothing runs from the request, and it can be retried. |
 | 503 | `corpus_recovering` | The corpus is unsettled. The job ends `blocked`, and its `error` names the reason. See [corpus recovering](#corpus-recovering). |
 
 ### Repin status
 
 `GET /api/v1/schema/repin/status`
 
-Permission: `schema_read`
+Permission: `schema_read`. With `id`, `schema_read` or `schema_write`.
 
-Returns the running job, or else the newest job of any status. There is no lookup by job id, and a newer job hides an older one. Served on every node, including those with ingest disabled.
+Returns the running job, or else the newest job of any status, so a newer job hides an older one. With `id`, returns that job whatever has run since. A caller follows a [repin](#repin-a-field) that answered 202 this way, and the key that started the job needs no more than the `schema_write` the repin required. Served on every node, including those with ingest disabled.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | query | integer | no | A job id, as a repin answered it |
 
 **Request**
 
 ```bash
 curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/schema/repin/status"
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/schema/repin/status?id=7"
 ```
 
 **Response**
@@ -1170,12 +1177,15 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/schema/re
 { "job": { "id": 7, "field": "status", "status": "running", "files_total": 12, "files_done": 4 } }
 ```
 
-`job` is `null` when no repin has ever run. The job shape is the one [repin a field](#repin-a-field) returns.
+Without `id`, `job` is `null` when no repin has ever run. The job shape is the one [repin a field](#repin-a-field) returns.
 
 **Errors**
 
 | Status | Code | When |
 |--------|------|------|
+| 400 | `bad_request` | `id` is not an integer |
+| 403 | `forbidden` | Without `id`, the key lacks `schema_read`. With `id`, it lacks both `schema_read` and `schema_write`. |
+| 404 | `not_found` | No job has that `id` |
 | 503 | `service_unavailable` | The app-state store did not answer |
 
 ### Cancel a running repin

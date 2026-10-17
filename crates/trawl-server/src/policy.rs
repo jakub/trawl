@@ -74,6 +74,11 @@ pub enum Permission {
     /// Separate from [`Self::ServerManage`] so a schema-admin role can
     /// exist without server administration, and read-only surfaces can
     /// show repin state without offering the trigger.
+    ///
+    /// It also reads one repin job by its id, so the caller that started
+    /// a job can follow it without [`Self::SchemaRead`]. A job row's
+    /// `unmapped_samples` are event values, but the same ones a dry run
+    /// this key may start would report.
     SchemaWrite,
 }
 
