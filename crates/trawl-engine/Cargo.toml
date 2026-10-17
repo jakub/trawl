@@ -20,6 +20,10 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# The statement-line context, measured as DuckDB measures it
+# (`error::query_location_context`).
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
 
 # The spill directory is checked through a no-follow handle: `fs` for the
 # open and `fstat`, `process` for the euid it must belong to.

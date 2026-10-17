@@ -5216,6 +5216,68 @@ mod structured_error_classification {
         assert!(out.is_file());
     }
 
+    /// The statement line put back is `DuckDB`'s own, cut where `DuckDB`
+    /// cuts it, which is by grapheme clusters and their render widths. A
+    /// cut in another place changes which binder failures the fallback
+    /// takes for a missing column, not only where the caret sits.
+    ///
+    /// Thirty two-column characters before "column" reach the cut before
+    /// the word, so `DuckDB`'s text form never said "column" and the cold
+    /// type failure stays a database error. Forty `e` + combining acute
+    /// clusters are forty columns, so the text form kept the word and the
+    /// hot-only read answers.
+    #[test]
+    fn the_binder_fallback_cuts_the_statement_line_where_duckdb_does() {
+        let (_scratch, exec) = query_database(512 * MIB, 256 * MIB);
+        for (field, cold_failure_stays) in [
+            (format!("{}column", "界".repeat(30)), true),
+            (format!("{}column", "e\u{301}".repeat(40)), false),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("cold.parquet");
+            let source = source.to_str().expect("temp path is valid UTF-8");
+            duckdb::Connection::open_in_memory()
+                .expect("in-memory duckdb")
+                .execute_batch(&format!(
+                    "COPY (SELECT 'x' AS \"{field}\", 'web-1' AS hostname) \
+                     TO '{source}' (FORMAT PARQUET)"
+                ))
+                .expect("cold fixture writes");
+            let hot = dir.path().join("hot.ndjson");
+            std::fs::write(
+                &hot,
+                serde_json::json!({
+                    "_time": "2026-01-03T00:05:00Z",
+                    "_ingested": "2026-01-03T00:05:01Z",
+                    field.as_str(): 5,
+                })
+                .to_string()
+                    + "\n",
+            )
+            .expect("hot buffer writes");
+            let hot = hot.to_str().expect("temp path is valid UTF-8");
+            let dsl = format!("* | stats sum(`{field}`)");
+            let outcome = exec.run_query_with_hot(
+                &dsl,
+                source,
+                hot,
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            );
+            if cold_failure_stays {
+                assert!(
+                    matches!(outcome, Err(EngineError::Database(_))),
+                    "{dsl}: {outcome:?}"
+                );
+            } else {
+                let result = outcome.unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+                assert_eq!(result.rows.len(), 1, "{dsl}: {result:?}");
+            }
+        }
+    }
+
     #[test]
     fn resource_exhausted_is_fatal_not_retried() {
         let query = classify_query_outcome(&Err(EngineError::ResourceExhausted));

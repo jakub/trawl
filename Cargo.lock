@@ -6421,6 +6421,8 @@ dependencies = [
  "trawl-api",
  "trawl-core",
  "trawl-engine",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

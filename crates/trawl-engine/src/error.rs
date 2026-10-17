@@ -5,6 +5,8 @@
 //! Error types for the query engine.
 
 use trawl_core::parser::ParseError;
+use unicode_segmentation::UnicodeSegmentation as _;
+use unicode_width::UnicodeWidthChar as _;
 
 /// Errors that can occur during query execution.
 #[derive(Debug, thiserror::Error)]
@@ -282,12 +284,21 @@ fn locate_message(message: &str, statement: &str) -> Option<String> {
 /// `QueryErrorContext::Format`. `None` where `DuckDB` appends nothing: an
 /// error at or past the statement's end.
 ///
-/// `DuckDB` counts the cut in grapheme clusters and their render widths
-/// (utf8proc). This counts each `char` as one cluster one column wide, and
-/// a control character as zero columns. That is exact for an ASCII line,
-/// and for any line short enough that nothing is cut. A long line with
-/// wide or combining characters near the error can be cut a few
-/// characters away from where `DuckDB` cuts it.
+/// `DuckDB` walks the line in extended grapheme clusters, and gives each
+/// cluster the render width of its first code point (utf8proc's
+/// `charwidth`): two columns for an East Asian wide character or an emoji,
+/// none for a control character, one for most else. A combining mark or a
+/// joined emoji adds nothing to the cluster it sits in. Where the cut falls
+/// decides whether a word after the error is on the line, so the binder
+/// fallback's answer depends on measuring it the same way.
+///
+/// The tables here are `unicode-segmentation`'s and `unicode-width`'s,
+/// not utf8proc's, which are Unicode 15.1. They agree on assigned
+/// characters other than those added or reclassified since 15.1 and a few
+/// that `unicode-width` measures by its own policy (the soft hyphen, the
+/// line and paragraph separators, Arabic prepended marks, Hangul medial
+/// vowels). They disagree on unassigned code points in wide blocks, which
+/// `unicode-width` counts as two columns and utf8proc as one.
 fn query_location_context(query: &str, error_location: usize) -> Option<String> {
     const MAX_LINE_RENDER_WIDTH: usize = 120;
     let bytes = query.as_bytes();
@@ -315,14 +326,14 @@ fn query_location_context(query: &str, error_location: usize) -> Option<String> 
         .map_or(bytes.len(), |n| error_location + n);
     let line = query.get(line_start..line_end)?;
 
-    // Each character's offset in the line, its render width, and whether
-    // the line may be cut before it.
+    // Each cluster's offset in the line, its render width, and whether the
+    // line may be cut before it.
     let mut positions = Vec::new();
     let mut widths = Vec::new();
     let mut breaks = Vec::new();
-    for (at, c) in line.char_indices() {
+    for (at, cluster) in line.grapheme_indices(true) {
         positions.push(at);
-        widths.push(usize::from(!c.is_control()));
+        widths.push(cluster.chars().next().and_then(char::width).unwrap_or(0));
         let lead = line.as_bytes()[at];
         breaks.push(is_operator(lead) || lead.is_ascii_whitespace() || lead == 0x0b);
     }
@@ -332,7 +343,7 @@ fn query_location_context(query: &str, error_location: usize) -> Option<String> 
         .unwrap_or(0);
 
     // At most half the width before the error, cut where a break lies
-    // within four characters of the limit.
+    // within four clusters of the limit.
     let (mut from, mut to) = (line_start, line_end);
     let mut spos = 0;
     let mut truncate_beginning = false;
@@ -574,8 +585,11 @@ mod structured_error_classification {
     /// text form of the same error: the statement line, cut where `DuckDB`
     /// cuts a long one, and the caret. Errors at bind and at execute, on
     /// short lines, long lines cut on either side or both, runs with no
-    /// break to cut at, `\r\n` and lone `\r` line ends, tabs, and a line of
-    /// one-column non-ASCII characters.
+    /// break to cut at, `\r\n` and lone `\r` line ends, tabs, and lines of
+    /// one-column non-ASCII characters, two-column East Asian characters,
+    /// combining marks, emoji (alone, with a skin tone, joined into one
+    /// cluster, as flag pairs) and decomposed Hangul syllables, each on
+    /// either side of the error.
     #[test]
     fn a_located_diagnostic_reads_as_duckdb_s_text_form() {
         let columns = |sep: &str, item: &dyn Fn(usize) -> String| {
@@ -584,7 +598,31 @@ mod structured_error_classification {
         let wide = columns(", ", &|i| format!("{i} AS c{i:02}"));
         let tabbed = columns(",\t", &|i| format!("{i}\tAS\tc{i:02}"));
         let accented = columns(", ", &|i| format!("{i} AS \"é{i:02}\""));
+        let east_asian = columns(", ", &|i| format!("{i} AS \"界{i:02}\""));
         let run = "x".repeat(150);
+        let mut graphemes = Vec::new();
+        for cluster in [
+            "界",
+            "e\u{301}",
+            "a\u{301}\u{323}\u{308}",
+            "😀",
+            "👍🏽",
+            "👨\u{200d}👩\u{200d}👧",
+            "🇨🇿",
+            "\u{1100}\u{1161}\u{11a8}",
+            "❤\u{fe0f}",
+        ] {
+            let ident = cluster.repeat(70);
+            graphemes.push(format!(
+                "SELECT 1 AS \"{ident}\", nope FROM (SELECT 1 AS x)"
+            ));
+            graphemes.push(format!(
+                "SELECT nope, 1 AS \"{ident}\" FROM (SELECT 1 AS x)"
+            ));
+            graphemes.push(format!(
+                "SELECT 1 AS \"{ident}\", nope, 2 AS \"{ident}\" FROM (SELECT 1 AS x)"
+            ));
+        }
         let five: &dyn duckdb::ToSql = &5_i64;
         let cases: Vec<(String, Vec<&dyn duckdb::ToSql>)> = vec![
             ("SELECT nonexistent_col FROM (SELECT 1 AS x)".into(), vec![]),
@@ -618,6 +656,14 @@ mod structured_error_classification {
                 format!("SELECT {accented}, nope FROM (SELECT 1 AS x)"),
                 vec![],
             ),
+            (
+                format!("SELECT {east_asian}, nope FROM (SELECT 1 AS x)"),
+                vec![],
+            ),
+            (
+                format!("SELECT nope, {east_asian} FROM (SELECT 1 AS x)"),
+                vec![],
+            ),
             ("SELECT sum(h) FROM (SELECT 'a' AS h)".into(), vec![]),
             ("SELECT * FROM nonexistent_table".into(), vec![]),
             (
@@ -625,7 +671,10 @@ mod structured_error_classification {
                 vec![five],
             ),
         ];
-        for (sql, params) in &cases {
+        let cases = cases
+            .into_iter()
+            .chain(graphemes.into_iter().map(|sql| (sql, vec![])));
+        for (sql, params) in &cases.collect::<Vec<_>>() {
             let text = raised(sql, params, false).to_string();
             assert!(text.contains("\nLINE "), "{sql}: a located error: {text}");
             let located = super::locate(raised(sql, params, true), sql);
