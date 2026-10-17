@@ -685,6 +685,14 @@ fn key_row(answer: &KeyAnswer) -> Row {
     let row = |reason| Row::for_key(WebCheck::UpstreamHealth, key, answer.outcome(), reason);
     match answer.value() {
         Reported::Ok => row(None).detail(Text::new("reported ok")),
+        // A slow engine answered its latest sample past the budget, and
+        // answered within the last minute: trawld is degraded, not down
+        // (ADR-0056).
+        Reported::Slow => row(None).detail(Text::new("reported slow")).next(
+            Text::new("trawld is degraded, not down; read trawld's log if ")
+                .key(&key)
+                .lit(" stays slow"),
+        ),
         // A recovering corpus is not a failure: trawld cannot yet vouch for
         // what it holds, so the doctor could not look (ADR-0047).
         recovering @ (Reported::RollupPending | Reported::RestartBacklog) => {
@@ -803,6 +811,39 @@ mod tests {
         assert_eq!(
             summary(&checks(health_rows(503, disagrees)))[0].2,
             Some("the health status and the HTTP status disagree")
+        );
+    }
+
+    /// A starved engine answers 200 `degraded` with `duckdb: slow`. The
+    /// engine row is complete, not failed, and says what it saw (ADR-0056).
+    #[test]
+    fn a_slow_engine_is_degraded_not_failed() {
+        let body = br#"{"status":"degraded","version":"1.0.0","checks":{"duckdb":"slow"}}"#;
+        let rows = checks(health_rows(200, body));
+        assert_eq!(
+            summary(&rows),
+            [
+                ("proxy.upstream.health", Outcome::Complete, None),
+                ("proxy.upstream.health.duckdb", Outcome::Complete, None),
+            ]
+        );
+        assert_eq!(rows[1].detail.as_deref(), Some("reported slow"));
+        assert!(
+            rows[1]
+                .next_action
+                .as_deref()
+                .is_some_and(|next| next.contains("degraded"))
+        );
+        // `slow` is the engine's value alone; on another check it is unknown.
+        let elsewhere =
+            br#"{"status":"degraded","version":"1.0.0","checks":{"storage_db":"slow"}}"#;
+        assert_eq!(
+            summary(&checks(health_rows(200, elsewhere)))[1],
+            (
+                "proxy.upstream.health.storage_db",
+                Outcome::Failed,
+                Some("reported a value this doctor does not know")
+            )
         );
     }
 

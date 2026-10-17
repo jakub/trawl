@@ -156,6 +156,11 @@ pub enum ErrorCode {
     /// processed or ingested. The message never carries the configured
     /// value.
     RequestLimitReached,
+    /// The query ran out of the memory or scratch space trawld gives
+    /// queries (503, no `Retry-After`, ADR-0056). The server is healthy:
+    /// narrowing the time range or simplifying the query is what helps, so
+    /// the message says that and names no path, size or engine text.
+    QueryResourceExhausted,
 }
 
 /// Source location within a query string.

@@ -1515,6 +1515,14 @@ fn key_row(answer: &KeyAnswer) -> Row {
     let row = |reason| Row::for_key(ServerCheck::ListenerHealth, key, answer.outcome(), reason);
     match answer.value() {
         Reported::Ok => row(None).detail(Text::new("reported ok")),
+        // A slow engine answered its latest sample past the budget, and
+        // answered within the last minute: trawld is degraded, not down
+        // (ADR-0056).
+        Reported::Slow => row(None).detail(Text::new("reported slow")).next(
+            Text::new("trawld is degraded, not down; read trawld's log if ")
+                .key(&key)
+                .lit(" stays slow"),
+        ),
         // A recovering corpus is not a failure: trawld cannot yet vouch for
         // what it holds, so the doctor could not look (ADR-0047).
         recovering @ (Reported::RollupPending | Reported::RestartBacklog) => {
@@ -1976,6 +1984,46 @@ mod tests {
                 (row.clone().into_check().id, outcome, reason)
             })
             .collect()
+    }
+
+    /// A starved engine answers 200 `degraded` with `duckdb: slow`. The
+    /// engine row is complete, not failed, and says what it saw, so the run
+    /// is not failed by a server that is degraded and not down (ADR-0056).
+    #[test]
+    fn health_slow_engine_is_degraded_not_failed() {
+        let body =
+            br#"{"status":"degraded","version":"x","checks":{"duckdb":"slow","auth_db":"ok"}}"#;
+        let (row, keyed) = health_rows(200, body);
+        assert_eq!((row.outcome(), row.reason()), (Outcome::Complete, None));
+        assert_eq!(
+            summary(&keyed),
+            [
+                (
+                    "server.listener.health.auth_db".to_owned(),
+                    Outcome::Complete,
+                    None
+                ),
+                (
+                    "server.listener.health.duckdb".to_owned(),
+                    Outcome::Complete,
+                    None
+                ),
+            ]
+        );
+        let duckdb = keyed[1].clone().into_check();
+        assert_eq!(duckdb.detail.as_deref(), Some("reported slow"));
+        assert!(
+            duckdb
+                .next_action
+                .is_some_and(|next| next.contains("degraded"))
+        );
+        // Under a 503 the status and the HTTP status disagree: not trawld's.
+        let (disagrees, rows) = health_rows(
+            503,
+            br#"{"status":"degraded","version":"x","checks":{"duckdb":"slow"}}"#,
+        );
+        assert_eq!(disagrees.outcome(), Outcome::Failed);
+        assert!(rows.is_empty());
     }
 
     /// Each reported value maps as the shared classifier says, and nothing

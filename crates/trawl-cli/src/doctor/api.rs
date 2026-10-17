@@ -700,6 +700,18 @@ fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
             detail: Some("reported ok".to_owned()),
             ..check
         },
+        // A slow engine answered its latest sample past the budget, and
+        // answered within the last minute: the server is degraded, not down
+        // (ADR-0056).
+        ValueClass::Degraded => with_next(
+            Check {
+                detail: Some(format!("reported {value}")),
+                ..check
+            },
+            format!(
+                "the server is degraded, not down; read the server's log if {name} stays {value}"
+            ),
+        ),
         // A recovering corpus is not a failure: the server cannot yet vouch
         // for what it holds, so the doctor could not look (ADR-0047).
         ValueClass::Recovering => with_next(

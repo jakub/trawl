@@ -25,15 +25,19 @@ use super::Outcome;
 use crate::{ErrorCode, ErrorResponse, HealthResponse, HealthStatus};
 
 /// The health check that trawld reports while its corpus recovers after a
-/// restart (ADR-0041). Only this key has values beyond `ok`, `error`, and
-/// `refusing`.
+/// restart (ADR-0041). Only this key has recovery values beyond `ok`,
+/// `error`, and `refusing`.
 pub const CORPUS_KEY: &str = "corpus";
+
+/// The health check that reads trawld's engine sample. Only this key can
+/// report `slow` (ADR-0056).
+pub const DUCKDB_KEY: &str = "duckdb";
 
 /// The names of the checks `GET /api/v1/health` reports, in the order
 /// trawld fills them. [`judge`] gives an answer's check a place of its own
 /// only under one of these names (#269).
 pub const HEALTH_CHECK_NAMES: [&str; 6] = [
-    "duckdb",
+    DUCKDB_KEY,
     "auth_db",
     "storage_db",
     "data_path",
@@ -73,6 +77,10 @@ pub fn is_quotable_value(value: &str) -> bool {
 pub enum ValueClass {
     /// `ok`: the server vouches for the check.
     Ok,
+    /// `slow` on [`DUCKDB_KEY`]: the engine answered its latest sample
+    /// past the budget, but it has answered within the last minute. The
+    /// server is degraded, not down (ADR-0056).
+    Degraded,
     /// The corpus is still recovering after a restart (`rollup_pending` or
     /// `restart_backlog` on [`CORPUS_KEY`]). The server cannot yet vouch
     /// for what it holds, so the doctor could not look.
@@ -89,7 +97,7 @@ impl ValueClass {
     #[must_use]
     pub const fn outcome(self) -> Outcome {
         match self {
-            Self::Ok => Outcome::Complete,
+            Self::Ok | Self::Degraded => Outcome::Complete,
             Self::Recovering => Outcome::NotSampled,
             Self::Refused | Self::Unknown => Outcome::Failed,
         }
@@ -110,6 +118,8 @@ pub fn classify(name: &str, value: &str) -> ValueClass {
 pub enum Reported {
     /// `ok`.
     Ok,
+    /// `slow` on [`DUCKDB_KEY`].
+    Slow,
     /// `rollup_pending` on [`CORPUS_KEY`].
     RollupPending,
     /// `restart_backlog` on [`CORPUS_KEY`].
@@ -129,6 +139,7 @@ impl Reported {
     pub fn of(name: &str, value: &str) -> Self {
         match value {
             "ok" => Self::Ok,
+            "slow" if name == DUCKDB_KEY => Self::Slow,
             "rollup_pending" if name == CORPUS_KEY => Self::RollupPending,
             "restart_backlog" if name == CORPUS_KEY => Self::RestartBacklog,
             "error" => Self::Error,
@@ -142,6 +153,7 @@ impl Reported {
     pub const fn class(self) -> ValueClass {
         match self {
             Self::Ok => ValueClass::Ok,
+            Self::Slow => ValueClass::Degraded,
             Self::RollupPending | Self::RestartBacklog => ValueClass::Recovering,
             Self::Error | Self::Refusing => ValueClass::Refused,
             Self::Unknown => ValueClass::Unknown,
@@ -361,6 +373,10 @@ mod tests {
         let table = [
             ("duckdb", "ok", ValueClass::Ok, Outcome::Complete),
             ("duckdb", "error", ValueClass::Refused, Outcome::Failed),
+            ("duckdb", "slow", ValueClass::Degraded, Outcome::Complete),
+            // Only the engine sample is slow; elsewhere the value is unknown.
+            ("auth_db", "slow", ValueClass::Unknown, Outcome::Failed),
+            ("corpus", "slow", ValueClass::Unknown, Outcome::Failed),
             (
                 "ingest_capacity",
                 "refusing",
@@ -623,6 +639,52 @@ mod tests {
         assert_eq!(degraded.http_status(), 200);
         assert_eq!(degraded.status(), &Degraded);
         assert!(!degraded.has_version());
+    }
+
+    /// A starved engine answers 200 `degraded` with `duckdb: slow` (ADR-0056).
+    /// The doctor reads that as trawld's own health answer, with the engine
+    /// row degraded and not failed, and it keeps the body's other checks.
+    #[test]
+    fn doctor_health_accepts_slow() {
+        let Answer::Health(slow) = judge(
+            200,
+            br#"{"status":"degraded","version":"x","checks":{"duckdb":"slow","auth_db":"ok"}}"#,
+        ) else {
+            panic!("a slow engine's answer is trawld's health body");
+        };
+        assert_eq!(slow.http_status(), 200);
+        assert_eq!(slow.status(), &HealthStatus::Degraded);
+        assert_eq!(slow.outcome(), Outcome::Complete);
+        let rows: Vec<_> = slow
+            .checks()
+            .iter()
+            .map(|check| (check.name(), check.value(), check.outcome()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("auth_db", Reported::Ok, Outcome::Complete),
+                ("duckdb", Reported::Slow, Outcome::Complete),
+            ]
+        );
+        assert_eq!(Reported::Slow.class(), ValueClass::Degraded);
+        // `slow` rides only a 200: a 503 body that says it disagrees.
+        assert_eq!(
+            judge(
+                503,
+                br#"{"status":"degraded","version":"x","checks":{"duckdb":"slow"}}"#
+            ),
+            Answer::Disagrees
+        );
+        // Another check reporting `slow` is a value nobody knows.
+        let Answer::Health(odd) = judge(
+            200,
+            br#"{"status":"degraded","version":"x","checks":{"storage_db":"slow"}}"#,
+        ) else {
+            panic!("trawld's body");
+        };
+        assert_eq!(odd.checks()[0].value(), Reported::Unknown);
+        assert_eq!(odd.checks()[0].outcome(), Outcome::Failed);
     }
 
     /// trawld's request-limit refusal, under the regular or the probe
