@@ -828,6 +828,16 @@ mod lock {
         mount: Option<u64>,
     }
 
+    impl Placement {
+        /// Whether this placement can prove two inodes share a mount, as
+        /// `owner_only` asks of the WAL directory: on Linux it must name its
+        /// mount, since a bind mount keeps the device. Elsewhere the
+        /// platform names no mount, and the device is all there is.
+        const fn names_its_mount(self) -> bool {
+            !cfg!(any(target_os = "linux", target_os = "android")) || self.mount.is_some()
+        }
+    }
+
     /// What one `stat` of an entry says, without following a symlink.
     #[derive(Debug, Clone, Copy)]
     pub(super) struct EntryStat {
@@ -836,6 +846,21 @@ mod lock {
         pub(super) mode: u32,
         inode: u64,
         placement: Placement,
+    }
+
+    #[cfg(test)]
+    impl EntryStat {
+        /// This stat as a kernel before Linux 5.8 answers it, without the
+        /// mount.
+        pub(super) fn without_mount(self) -> Self {
+            Self {
+                placement: Placement {
+                    mount: None,
+                    ..self.placement
+                },
+                ..self
+            }
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -939,11 +964,17 @@ mod lock {
         Export(CString),
     }
 
-    /// Why `stat` refuses whatever its name: a symlink, another mount, or
-    /// another owner.
+    /// Why `stat` refuses whatever its name: a symlink, another mount or a
+    /// mount the kernel does not name, or another owner.
     fn refusal(stat: &EntryStat, home: Placement, euid: u32) -> Option<String> {
         if stat.kind == FileType::Symlink {
             Some("is a symbolic link, which trawld does not follow".to_owned())
+        } else if !home.names_its_mount() || !stat.placement.names_its_mount() {
+            Some(
+                "may be on another mount, which trawld does not cross: this kernel does not \
+                 name mounts (Linux 5.8 and later do)"
+                    .to_owned(),
+            )
         } else if stat.placement != home {
             Some("is on another mount, which trawld does not cross".to_owned())
         } else if stat.owner != euid {
@@ -966,21 +997,38 @@ mod lock {
     /// named by [`is_snapshot_file_name`] or [`is_export_file_name`]. Each
     /// is owned by `euid` and sits in the root's mount. Anything else
     /// refuses: another name, a symlink, a special file, a directory
-    /// inside a spill directory, another owner, another mount.
+    /// inside a spill directory, another owner, another mount. On Linux a
+    /// kernel that does not name mounts, before 5.8, refuses every entry:
+    /// a bind mount keeps the device, so the device alone cannot show an
+    /// entry sits in the root's mount. An empty directory still opens.
     pub(super) fn preflight(
         path: &Path,
         root: &File,
         euid: u32,
     ) -> Result<Vec<Stale>, ScratchError> {
-        let home = stat_handle(root.as_fd())
-            .map_err(|source| ScratchError::Io {
+        preflight_seen(path, root, euid, |stat| stat)
+    }
+
+    /// [`preflight`], with every `stat` passed through `seen`: unchanged in
+    /// production, and in tests a stand-in for a kernel that answers
+    /// differently.
+    pub(super) fn preflight_seen(
+        path: &Path,
+        root: &File,
+        euid: u32,
+        seen: impl Fn(EntryStat) -> EntryStat,
+    ) -> Result<Vec<Stale>, ScratchError> {
+        let home = seen(
+            stat_handle(root.as_fd()).map_err(|source| ScratchError::Io {
                 action: "inspect",
                 path: path.to_owned(),
                 source,
-            })?
-            .placement;
+            })?,
+        )
+        .placement;
         let mut stale = Vec::new();
         for (name, stat) in entries(root, path)? {
+            let stat = seen(stat);
             let os_name = OsStr::from_bytes(name.to_bytes());
             let entry = path.join(os_name);
             let foreign = |entry: &Path, reason: String| ScratchError::ForeignEntry {
@@ -1003,16 +1051,17 @@ mod lock {
                         });
                     }
                 };
-                let opened = stat_handle(dir.as_fd()).map_err(|source| ScratchError::Io {
+                let opened = seen(stat_handle(dir.as_fd()).map_err(|source| ScratchError::Io {
                     action: "inspect",
                     path: entry.clone(),
                     source,
-                })?;
+                })?);
                 if opened.inode != stat.inode || opened.placement != stat.placement {
                     return Err(foreign(&entry, "changed while trawld read it".to_owned()));
                 }
                 let mut files = Vec::new();
                 for (child, child_stat) in entries(&dir, &entry)? {
+                    let child_stat = seen(child_stat);
                     let child_name = OsStr::from_bytes(child.to_bytes());
                     let child_path = entry.join(child_name);
                     if let Some(reason) = refusal(&child_stat, home, euid) {
@@ -1604,6 +1653,50 @@ mod tests {
             message.contains(&format!("is owned by uid {euid}, not uid {other}")),
             "{message}"
         );
+        assert_eq!(tree(&path), before);
+    }
+
+    /// #304 F4: a kernel before Linux 5.8 names no mount, so a bind mount of
+    /// a directory on the scratch directory's own filesystem looks like any
+    /// directory there. With the mount unknown on both sides, the preflight
+    /// refuses the first entry before anything is removed, rather than
+    /// reading two unknown mounts as one. An empty directory has nothing to
+    /// cross and passes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn scratch_preflight_refuses_entries_when_the_kernel_names_no_mount() {
+        let euid = rustix::process::geteuid().as_raw();
+        let parent = tempfile::tempdir().expect("parent");
+        let path = parent.path().join("scratch");
+        std::fs::create_dir(&path).expect("mkdir");
+        set_mode(&path, 0o700);
+        let handle = lock::hold(&path).expect("hold");
+        let empty = lock::preflight_seen(&path, &handle, euid, lock::EntryStat::without_mount)
+            .expect("an empty directory");
+        assert!(empty.is_empty());
+
+        plant_stale(&path);
+        let before = tree(&path);
+        let handle = lock::hold(&path).expect("hold");
+        let Err(error) = lock::preflight_seen(&path, &handle, euid, lock::EntryStat::without_mount)
+        else {
+            panic!("an entry in an unknown mount passed the preflight");
+        };
+        assert!(
+            matches!(error, ScratchError::ForeignEntry { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        for needle in [
+            "this kernel does not name mounts",
+            "has removed nothing",
+            "[server] query_scratch_dir",
+        ] {
+            assert!(
+                message.contains(needle),
+                "{needle:?} missing from {message}"
+            );
+        }
         assert_eq!(tree(&path), before);
     }
 
