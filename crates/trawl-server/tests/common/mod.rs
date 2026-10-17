@@ -1285,6 +1285,46 @@ impl TestServer {
         })
     }
 
+    /// Boot a SECOND server over this fixture's state and TLS material, on
+    /// an ephemeral port of its own, holding connections to `timeouts`
+    /// instead of the production deadlines and reporting the accept
+    /// loop's bookkeeping through `probe`
+    /// (`serve_with_listener_and_timeouts`). Driven by `shutdown` when
+    /// given, else by its own signal listener. Waits until it answers.
+    pub async fn spawn_server_with_timeouts(
+        &self,
+        timeouts: trawl_server::transport::http::ConnectionTimeouts,
+        probe: std::sync::Arc<trawl_server::transport::http::ListenerProbe>,
+        shutdown: Option<trawl_server::shutdown::ShutdownRx>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for a second server");
+        let addr = listener
+            .local_addr()
+            .expect("listener local_addr")
+            .to_string();
+        let state = self.state.clone();
+        let http_config = self.http_config.clone();
+        let server_config = self.server_config.clone();
+        let state_dir = self.state_dir.clone();
+        let task = tokio::spawn(async move {
+            http::serve_with_listener_and_timeouts(
+                listener,
+                timeouts,
+                probe,
+                state,
+                &http_config,
+                &server_config,
+                &state_dir,
+                shutdown,
+            )
+            .await
+            .unwrap();
+        });
+        wait_for_ready(&addr, &task).await;
+        (format!("https://{addr}"), task)
+    }
+
     /// The production router over this fixture's state, with the fixture's
     /// HTTP config as `f` leaves it.
     ///

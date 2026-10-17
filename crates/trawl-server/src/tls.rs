@@ -190,7 +190,7 @@ pub fn parse_pem_pair(
 }
 
 /// The listener's `rustls` config for a parsed pair: TLS 1.2 and 1.3 from
-/// the ring provider, and ALPN for HTTP/2 and HTTP/1.1.
+/// the ring provider, and ALPN for HTTP/1.1 alone.
 ///
 /// # Errors
 /// [`TlsError::Config`] when the chain is empty, or the key is not one
@@ -207,8 +207,12 @@ pub fn serving_config(
             .with_single_cert(certs, key)
             .map_err(|e| TlsError::Config(e.to_string()))?;
 
-    // Support HTTP/2 and HTTP/1.1 via ALPN negotiation.
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // HTTP/1.1 only (ADR-0054, amended 2026-10-17): the listener serves
+    // with hyper's HTTP/1 builder, whose header deadline is the bound on
+    // incomplete requests, and hyper's HTTP/2 has no such deadline. A
+    // client whose ALPN offer holds no `http/1.1` is refused at the
+    // handshake; a client that offers no ALPN gets HTTP/1.1.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(config)
 }
@@ -1230,10 +1234,7 @@ mod tests {
         let (config, self_signed) =
             build_server_config(Some(&cert_path), Some(&key_path), tmp.path()).unwrap();
         assert!(!self_signed);
-        assert_eq!(
-            config.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
     #[test]

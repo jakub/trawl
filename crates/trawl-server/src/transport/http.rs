@@ -9,12 +9,23 @@
 //! address into the request extensions, and lets the shutdown signal call
 //! `graceful_shutdown` per connection so idle keep-alives close instead of
 //! waiting out the drain timeout.
+//!
+//! The listener speaks HTTP/1.1 only, and holds every connection to the
+//! fixed deadlines in [`ConnectionTimeouts`] (ADR-0054, amended
+//! 2026-10-17): the TLS handshake from accept, and a request's headers,
+//! which is also the bound on an idle keep-alive connection. Neither timer
+//! runs while a request body is read or a response, a server-sent event
+//! stream included, is written.
 
 use std::any::Any;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -23,9 +34,10 @@ use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware;
 use axum::response::{IntoResponse as _, Response};
 use axum::routing::{delete, get, post, put};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_rustls::TlsAcceptor;
 use tower::Service;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -449,6 +461,65 @@ fn build_tls_acceptor(
     Ok(TlsAcceptor::from(tls_config))
 }
 
+/// The fixed deadlines the listener holds every connection to (ADR-0054,
+/// amended 2026-10-17).
+///
+/// Constants, not settings: no operator has a reason to tune them, and
+/// the one place that shortens them is a test, through
+/// [`serve_with_listener_and_timeouts`]. Neither covers a request body
+/// after its headers or a response body, so a slow ingest upload and a
+/// quiet server-sent event stream are bounded by the request count and
+/// the stream limits, not by these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionTimeouts {
+    /// From `accept()` to the end of the TLS handshake. A connection that
+    /// has not finished its handshake by then is dropped, and the shutdown
+    /// signal drops it earlier.
+    pub tls_handshake: Duration,
+    /// From the moment hyper waits for a request's first byte to the end
+    /// of its headers. Bytes that arrive do not move the deadline. The
+    /// same timer bounds an idle keep-alive connection, because hyper
+    /// arms it again for every request it waits for.
+    pub header_read: Duration,
+}
+
+impl ConnectionTimeouts {
+    /// Production: 10 s for the handshake, 30 s for the headers.
+    pub const DEFAULT: Self = Self {
+        tls_handshake: Duration::from_secs(10),
+        header_read: Duration::from_secs(30),
+    };
+}
+
+/// What the accept loop has done with its connections, for a test that
+/// reads it through [`serve_with_listener_and_timeouts`].
+///
+/// The loop writes it; nothing in production reads it.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct ListenerProbe {
+    /// Connection tasks the loop still holds after its latest reap.
+    tracked: AtomicUsize,
+    /// Handshakes the loop dropped at their deadline.
+    handshake_timeouts: AtomicUsize,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ListenerProbe {
+    /// Connection tasks the loop holds: every connection accepted whose
+    /// task has not been reaped yet.
+    #[must_use]
+    pub fn tracked_connections(&self) -> usize {
+        self.tracked.load(Ordering::SeqCst)
+    }
+
+    /// Handshakes dropped at their deadline since the loop started.
+    #[must_use]
+    pub fn handshake_timeouts(&self) -> usize {
+        self.handshake_timeouts.load(Ordering::SeqCst)
+    }
+}
+
 /// Start the HTTPS server with graceful shutdown.
 ///
 /// Binds a TCP listener, wraps connections in TLS via `tokio-rustls`,
@@ -481,6 +552,7 @@ pub async fn serve(
     accept_loop(
         Incoming::new(listener),
         tls_acceptor,
+        ConnectionTimeouts::DEFAULT,
         state,
         http,
         config,
@@ -514,6 +586,7 @@ pub async fn serve_with_listener(
     accept_loop(
         incoming,
         tls_acceptor,
+        ConnectionTimeouts::DEFAULT,
         state,
         http,
         config,
@@ -544,6 +617,42 @@ pub async fn serve_with_listener_failing_accepts(
     accept_loop(
         incoming,
         tls_acceptor,
+        ConnectionTimeouts::DEFAULT,
+        state,
+        http,
+        config,
+        external_shutdown,
+    )
+    .await
+}
+
+/// [`serve_with_listener`], holding connections to `timeouts` instead of
+/// [`ConnectionTimeouts::DEFAULT`], and reporting what the accept loop
+/// does with them through `probe`.
+///
+/// The seam behind the listener deadlines: a test cannot wait out 10 s
+/// and 30 s per case, and it cannot see from outside whether the loop
+/// has reaped a finished connection task. The timeouts and the probe
+/// belong to this one server.
+#[cfg(feature = "test-support")]
+#[allow(clippy::too_many_arguments)] // one seam, every production argument plus the two it adds
+pub async fn serve_with_listener_and_timeouts(
+    listener: std::net::TcpListener,
+    timeouts: ConnectionTimeouts,
+    probe: Arc<ListenerProbe>,
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    state_dir: &Path,
+    external_shutdown: Option<ShutdownRx>,
+) -> Result<(), crate::error::ServerError> {
+    let tls_acceptor = build_tls_acceptor(config, state_dir)?;
+    let mut incoming = Incoming::new(adopt_listener(listener)?);
+    incoming.probe = Some(probe);
+    accept_loop(
+        incoming,
+        tls_acceptor,
+        timeouts,
         state,
         http,
         config,
@@ -585,11 +694,15 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 /// The listener the accept loop reads.
 ///
 /// With `test-support`, a queue of errors the next `accept()` calls answer
-/// before the listener is asked: see [`serve_with_listener_failing_accepts`].
+/// before the listener is asked (see
+/// [`serve_with_listener_failing_accepts`]), and the probe the loop
+/// reports to (see [`serve_with_listener_and_timeouts`]).
 struct Incoming {
     listener: TcpListener,
     #[cfg(any(test, feature = "test-support"))]
     faults: VecDeque<std::io::Error>,
+    #[cfg(any(test, feature = "test-support"))]
+    probe: Option<Arc<ListenerProbe>>,
 }
 
 impl Incoming {
@@ -598,6 +711,8 @@ impl Incoming {
             listener,
             #[cfg(any(test, feature = "test-support"))]
             faults: VecDeque::new(),
+            #[cfg(any(test, feature = "test-support"))]
+            probe: None,
         }
     }
 
@@ -608,6 +723,23 @@ impl Incoming {
         }
         self.listener.accept().await
     }
+
+    /// Report how many connection tasks the loop holds.
+    fn note_tracked(&self, tracked: usize) {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(probe) = &self.probe {
+            probe.tracked.store(tracked, Ordering::SeqCst);
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = tracked;
+    }
+
+    /// The counter a connection task bumps when its handshake times out,
+    /// or `None` outside a probed server.
+    #[cfg(any(test, feature = "test-support"))]
+    fn handshake_timeouts(&self) -> Option<Arc<ListenerProbe>> {
+        self.probe.clone()
+    }
 }
 
 /// The shared tail of both serve paths: cert hot-reload, the TLS accept loop,
@@ -616,6 +748,7 @@ impl Incoming {
 async fn accept_loop(
     mut incoming: Incoming,
     tls_acceptor: TlsAcceptor,
+    timeouts: ConnectionTimeouts,
     state: AppState,
     http: &HttpConfig,
     config: &ServerConfig,
@@ -657,7 +790,9 @@ async fn accept_loop(
         rx
     };
 
-    // Track spawned connection tasks for graceful drain.
+    // Track spawned connection tasks for graceful drain. Finished tasks
+    // are reaped by the loop below as they end, so the set holds only
+    // open connections and never grows with the connections served.
     let mut connections = JoinSet::new();
 
     // One receiver the connection tasks clone from. It is a separate handle
@@ -690,8 +825,13 @@ async fn accept_loop(
                     }
                 };
 
+                // The handshake deadline is measured from here, the
+                // accept, not from the task's first poll.
+                let handshake_deadline = Instant::now() + timeouts.tls_handshake;
                 let tls_acceptor = tls_rx.borrow().clone();
                 let tower_service = app.clone();
+                #[cfg(any(test, feature = "test-support"))]
+                let probe = incoming.handshake_timeouts();
 
                 let mut conn_shutdown = conn_rx.clone();
                 connections.spawn(async move {
@@ -701,10 +841,27 @@ async fn accept_loop(
                     // unauthenticated connection flood a durable-write
                     // amplifier. The target is in `UNMETERED_TARGETS`, so the
                     // WAL layer refuses it while stdout keeps it.
-                    let tls_stream = match tls_acceptor.accept(tcp_stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "tls_handshake_failed", peer = %peer_addr, error = %e, "TLS handshake failed");
+                    //
+                    // The handshake is raced with the shutdown signal, so a
+                    // peer that stalls in it never holds the drain.
+                    let tls_stream = tokio::select! {
+                        handshake = tokio::time::timeout_at(handshake_deadline, tls_acceptor.accept(tcp_stream)) => match handshake {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                tracing::warn!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "tls_handshake_failed", peer = %peer_addr, error = %e, "TLS handshake failed");
+                                return;
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "tls_handshake_failed", peer = %peer_addr, error = "handshake deadline passed", "TLS handshake failed");
+                                #[cfg(any(test, feature = "test-support"))]
+                                if let Some(probe) = probe {
+                                    probe.handshake_timeouts.fetch_add(1, Ordering::SeqCst);
+                                }
+                                return;
+                            }
+                        },
+                        () = shutdown_observed(&mut conn_shutdown) => {
+                            tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "tls_handshake_failed", peer = %peer_addr, error = "shutdown during the handshake", "TLS handshake dropped");
                             return;
                         }
                     };
@@ -718,8 +875,16 @@ async fn accept_loop(
                             async move { svc.call(req).await }
                         });
 
-                    let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-                    let conn_fut = builder.serve_connection_with_upgrades(io, hyper_service);
+                    // HTTP/1.1 alone, as ALPN advertised: hyper's HTTP/1
+                    // builder, not protocol detection, which would wait
+                    // without bound for a preface. The header timer needs
+                    // the tokio timer; without one hyper drops the deadline
+                    // silently.
+                    let mut builder = hyper::server::conn::http1::Builder::new();
+                    builder
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(timeouts.header_read);
+                    let conn_fut = builder.serve_connection(io, hyper_service);
                     let mut conn = std::pin::pin!(conn_fut);
 
                     // Poll the connection, but initiate graceful shutdown
@@ -740,6 +905,19 @@ async fn accept_loop(
                         }
                     }
                 });
+                incoming.note_tracked(connections.len());
+            }
+            // Reap a connection task as soon as it ends, so the set never
+            // keeps a finished task until shutdown. The arm is disabled
+            // while the set is empty, where `join_next` would answer at
+            // once and spin the loop.
+            Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(e) = joined && e.is_panic() {
+                    // The payload is dropped unread (ADR-0040); the fact
+                    // is what the operator needs.
+                    tracing::error!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_task_panicked", "a connection task panicked");
+                }
+                incoming.note_tracked(connections.len());
             }
             () = shutdown_observed(&mut accept_rx) => {
                 tracing::info!(event_type = "lifecycle", "shutdown: stopping accept loop");
@@ -772,7 +950,25 @@ async fn accept_loop(
         );
         connections.abort_all();
     }
+    incoming.note_tracked(0);
 
     tracing::info!(event_type = "lifecycle", "HTTPS server stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The production deadlines ADR-0054's amendment states.
+    #[test]
+    fn connection_timeouts_default_to_the_decided_deadlines() {
+        assert_eq!(
+            ConnectionTimeouts::DEFAULT,
+            ConnectionTimeouts {
+                tls_handshake: Duration::from_secs(10),
+                header_read: Duration::from_secs(30),
+            }
+        );
+    }
 }
