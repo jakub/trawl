@@ -410,3 +410,201 @@ pub fn captured_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
     let recorded = lines.lock().expect("capture mutex").clone();
     (outcome, recorded)
 }
+
+/// A hand-written HTTP/1.1 upstream behind a [`TlsFront`], for the answers
+/// wiremock cannot give: a response head held back until the test says so,
+/// and a server-sent event stream that stays open and keeps sending.
+///
+/// Routes, by path:
+/// - `/api/v1/whoami`: a 200 `WhoAmI` body for `alice`, at once.
+/// - `/api/v1/stream` and `/api/v1/dashboard/stream`: a 200
+///   `text/event-stream` head at once, then one event every
+///   [`HandUpstream::EVENT_INTERVAL`] until the connection closes.
+/// - anything else: a 200 `{}` body, after the hold if one is set.
+///
+/// A request is recorded, as `METHOD path`, as soon as its head is read,
+/// before any hold, so a test can wait until the proxy has sent it.
+pub struct HandUpstream {
+    front: TlsFront,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+    hold: tokio::sync::watch::Sender<bool>,
+    accept: JoinHandle<()>,
+}
+
+impl HandUpstream {
+    /// How often an open stream sends an event.
+    pub const EVENT_INTERVAL: Duration = Duration::from_millis(25);
+
+    /// Start the upstream under a fresh CA, answering at once.
+    pub async fn start() -> Self {
+        let plain = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the hand upstream");
+        let plain_addr = plain.local_addr().expect("hand upstream address");
+        let front = TlsFront::start(plain_addr).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (hold, holding) = tokio::sync::watch::channel(false);
+        let log = Arc::clone(&seen);
+        let accept = tokio::spawn(async move {
+            let mut answers = JoinSet::new();
+            while let Ok((stream, _)) = plain.accept().await {
+                while answers.try_join_next().is_some() {}
+                let log = Arc::clone(&log);
+                let holding = holding.clone();
+                answers.spawn(Self::answer(stream, log, holding));
+            }
+        });
+        Self {
+            front,
+            seen,
+            hold,
+            accept,
+        }
+    }
+
+    /// Hold every regular answer's head back until [`Self::release`].
+    pub fn hold(&self) {
+        self.hold.send_replace(true);
+    }
+
+    /// Let the held answers go, and answer at once from now on.
+    pub fn release(&self) {
+        self.hold.send_replace(false);
+    }
+
+    /// Every request head read so far, as `METHOD path`, in arrival order.
+    pub fn seen(&self) -> Vec<String> {
+        self.seen.lock().expect("hand upstream log").clone()
+    }
+
+    /// Wait until `n` request heads have arrived, or fail after 10 s.
+    pub async fn wait_for_requests(&self, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.seen().len() < n {
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {n} requests reached the hand upstream: {:?}",
+                self.seen().len(),
+                self.seen()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// See [`TlsFront::web_config`].
+    pub fn web_config(&self) -> WebConfig {
+        self.front.web_config()
+    }
+
+    async fn answer(
+        mut stream: TcpStream,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        mut holding: tokio::sync::watch::Receiver<bool>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // The head, then the body `content-length` announces, read and
+        // dropped: this upstream answers by path alone.
+        let mut raw = Vec::new();
+        let head_end = loop {
+            if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            let mut buf = [0_u8; 4096];
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        };
+        let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+        let mut lines = head.lines();
+        let request_line = lines.next().unwrap_or_default();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_owned();
+        let path = parts.next().unwrap_or_default().to_owned();
+        let length: usize = lines
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse().ok())
+            .unwrap_or(0);
+        let mut body_read = raw.len() - head_end;
+        while body_read < length {
+            let mut buf = [0_u8; 4096];
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => body_read += n,
+            }
+        }
+        log.lock().expect("hand upstream log").push(format!(
+            "{method} {}",
+            path.split('?').next().unwrap_or_default()
+        ));
+
+        let bare = path.split('?').next().unwrap_or_default();
+        if bare == "/api/v1/whoami" {
+            let body =
+                r#"{"name":"alice","roles":["trawl-analyst"],"permissions":["query","stream"]}"#;
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            return;
+        }
+        if bare == "/api/v1/stream" || bare == "/api/v1/dashboard/stream" {
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                      cache-control: no-cache\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut n = 0_u64;
+            loop {
+                tokio::time::sleep(Self::EVENT_INTERVAL).await;
+                let event = format!("data: {n}\n\n");
+                let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+                if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+                n += 1;
+            }
+        }
+        // A regular answer waits out the hold, if one is set.
+        let _ = holding.wait_for(|holding| !*holding).await;
+        let body = "{}";
+        let _ = stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+    }
+}
+
+impl Drop for HandUpstream {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+impl std::fmt::Debug for HandUpstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandUpstream")
+            .field("front", &self.front)
+            .field("seen", &self.seen())
+            .finish_non_exhaustive()
+    }
+}

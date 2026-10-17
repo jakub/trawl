@@ -4,5 +4,6 @@
 
 //! Axum middleware + extractors.
 
+pub mod request_count;
 pub mod security_headers;
 pub mod session_extractor;

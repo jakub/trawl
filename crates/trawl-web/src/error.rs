@@ -8,6 +8,12 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use fleet_auth::SessionError;
 use serde_json::json;
+use trawl_api::{ErrorCode, ErrorEnvelope, ErrorResponse};
+
+/// The 503 the proxy answers over its request count. It names the hop,
+/// so a caller can tell this refusal from trawld's, and no size.
+pub const REQUEST_LIMIT_MESSAGE: &str = "trawl-web is at its HTTP request limit; the request \
+                                         was not sent to trawld; retry later with backoff";
 
 /// Errors produced anywhere in the proxy, mapped to HTTP responses via
 /// [`IntoResponse`]. Error bodies are intentionally minimal — the browser
@@ -85,10 +91,43 @@ pub enum ProxyError {
     /// An optional upstream is not configured.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// The proxy's request count is full
+    /// (`middleware::request_count`, ADR-0054 amended 2026-10-17). The
+    /// request was not sent to trawld. Answered with the `trawl_api`
+    /// envelope, as trawld answers its own, so the browser handles both
+    /// the same way; no cookie mutation, since the session is fine.
+    #[error("request limit reached")]
+    RequestLimitReached,
+}
+
+/// The envelope answers: trawld's error shape, `Cache-Control:
+/// no-store`, and no cookie.
+///
+/// The legacy `{"error": "..."}` body stays on the older variants; only
+/// the answers that mirror a trawld refusal use the envelope, so the UI
+/// reads them through the same typed contract.
+fn envelope(status: StatusCode, code: ErrorCode, message: &str) -> Response {
+    let body = axum::Json(ErrorResponse {
+        error: ErrorEnvelope::simple(code, message),
+    });
+    let mut response = (status, body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
+        if let Self::RequestLimitReached = self {
+            tracing::warn!(error = %self, "proxy request limit reached");
+            return envelope(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::RequestLimitReached,
+                REQUEST_LIMIT_MESSAGE,
+            );
+        }
         let (status, message) = match &self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::ExpiredSession { .. } => (StatusCode::UNAUTHORIZED, "session expired"),
@@ -105,6 +144,7 @@ impl IntoResponse for ProxyError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream certificate not available",
             ),
+            Self::RequestLimitReached => unreachable!("answered above"),
         };
 
         // Severity per variant: network and upstream failures are outage
@@ -129,6 +169,7 @@ impl IntoResponse for ProxyError {
             Self::ServiceUnavailable(_) => {
                 tracing::warn!(error = %self, "proxy service unavailable");
             }
+            Self::RequestLimitReached => unreachable!("answered above"),
         }
 
         // Only the expired-session path clears the cookie; see the

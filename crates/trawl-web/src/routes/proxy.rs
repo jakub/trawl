@@ -238,6 +238,8 @@ fn copy_response_headers(src: &reqwest::header::HeaderMap, dst: &mut HeaderMap) 
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use axum::Router;
     use axum::body::Body;
@@ -249,8 +251,9 @@ mod tests {
     use wiremock::{Mock, ResponseTemplate};
 
     use crate::config::ResolvedConfig;
+    use crate::middleware::request_count::RequestCount;
     use crate::routes;
-    use crate::test_support::TlsUpstream;
+    use crate::test_support::{HandUpstream, TlsUpstream};
 
     /// The browser origin these fixtures answer on. The CSRF tests below
     /// send it verbatim; anything else is a foreign origin by definition,
@@ -269,6 +272,204 @@ mod tests {
 
     fn build_app(state: AppState) -> Router {
         routes::build(state)
+    }
+
+    /// The production router over a state pointing at the hand upstream,
+    /// under a request count of `count`.
+    fn counted_app(upstream: &HandUpstream, count: usize) -> Router {
+        let web = WebConfig {
+            allow_insecure_cookies: true,
+            public_origins: vec![TEST_ORIGIN.to_owned()],
+            ..upstream.web_config()
+        };
+        let cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
+        routes::build_with_count(
+            AppState::from_config(cfg).unwrap(),
+            RequestCount::new(count),
+        )
+    }
+
+    /// A bearer GET of `path`, the simplest counted request.
+    fn bearer_get(path: &str) -> Request<Body> {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("authorization", "Bearer flt_direct")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Assert `resp` is the proxy's own 503 `request_limit_reached`: the
+    /// envelope with a message naming trawl-web, `Cache-Control:
+    /// no-store`, no `Retry-After` and no cookie change.
+    async fn assert_proxy_request_limit_refusal(resp: Response) {
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let headers = resp.headers().clone();
+        assert_eq!(
+            headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["no-store"]
+        );
+        assert!(headers.get(header::RETRY_AFTER).is_none());
+        assert!(headers.get(header::SET_COOKIE).is_none());
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["code"], "request_limit_reached", "{body}");
+        assert_eq!(
+            body["error"]["message"],
+            crate::error::REQUEST_LIMIT_MESSAGE,
+            "{body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("trawl-web"),
+            "the message names the hop: {body}"
+        );
+    }
+
+    /// Over the count, the proxy answers its own 503 at once and sends
+    /// nothing to trawld; the held requests finish, and the count is free
+    /// again afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_requests_over_the_count_get_503_request_limit_reached() {
+        let upstream = HandUpstream::start().await;
+        upstream.hold();
+        let app = counted_app(&upstream, 2);
+
+        let held: Vec<_> = (0..2)
+            .map(|_| tokio::spawn(app.clone().oneshot(bearer_get("/api/v1/schema"))))
+            .collect();
+        upstream.wait_for_requests(2).await;
+
+        // Under a deadline: a proxy without the count would forward this
+        // to the held upstream and wait there instead of failing.
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone().oneshot(bearer_get("/api/v1/stats")),
+        )
+        .await
+        .expect("the refusal is immediate")
+        .unwrap();
+        assert_proxy_request_limit_refusal(refused).await;
+        // Nothing for the refused request reached trawld, then or later.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            upstream.seen(),
+            vec!["GET /api/v1/schema", "GET /api/v1/schema"],
+            "the upstream saw only the held requests"
+        );
+
+        upstream.release();
+        for request in held {
+            let resp = request.await.unwrap().unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let later = app.oneshot(bearer_get("/api/v1/stats")).await.unwrap();
+        assert_eq!(later.status(), StatusCode::OK, "the count is free again");
+        assert_eq!(upstream.seen().len(), 3);
+    }
+
+    /// With the count full, `/healthz` still answers: the probes are
+    /// outside the count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_healthz_is_never_counted() {
+        let upstream = HandUpstream::start().await;
+        upstream.hold();
+        let app = counted_app(&upstream, 1);
+
+        let held = tokio::spawn(app.clone().oneshot(bearer_get("/api/v1/schema")));
+        upstream.wait_for_requests(1).await;
+
+        // Under a deadline: a proxy without the count would forward this
+        // to the held upstream and wait there instead of failing.
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone().oneshot(bearer_get("/api/v1/stats")),
+        )
+        .await
+        .expect("the refusal is immediate")
+        .unwrap();
+        assert_eq!(
+            refused.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the count is full"
+        );
+        for _ in 0..3 {
+            let probe = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/healthz")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(probe.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(probe.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"ok");
+        }
+
+        upstream.release();
+        assert_eq!(held.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    /// The count is given back at the response head: an open server-sent
+    /// event stream, whose body is still flowing, holds no count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_count_is_released_at_the_response_head() {
+        let upstream = HandUpstream::start().await;
+        let app = counted_app(&upstream, 1);
+
+        let stream = app
+            .clone()
+            .oneshot(bearer_get("/api/v1/stream?query=_severity%3Derror"))
+            .await
+            .unwrap();
+        assert_eq!(stream.status(), StatusCode::OK);
+        assert_eq!(
+            stream.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        // The stream is open: an event arrives.
+        let mut body = stream.into_body().into_data_stream();
+        let first =
+            tokio::time::timeout(Duration::from_secs(5), futures::StreamExt::next(&mut body))
+                .await
+                .expect("an event before the deadline")
+                .expect("the stream is open")
+                .unwrap();
+        assert!(first.starts_with(b"data: "), "{first:?}");
+
+        // With the only count's request still streaming, another request
+        // is admitted.
+        let next = app.oneshot(bearer_get("/api/v1/schema")).await.unwrap();
+        assert_eq!(
+            next.status(),
+            StatusCode::OK,
+            "an open stream held the count past its head"
+        );
+        // And the stream is still flowing afterwards.
+        let later =
+            tokio::time::timeout(Duration::from_secs(5), futures::StreamExt::next(&mut body))
+                .await
+                .expect("another event before the deadline")
+                .expect("the stream is still open")
+                .unwrap();
+        assert!(later.starts_with(b"data: "), "{later:?}");
+        drop(body);
     }
 
     #[tokio::test]
