@@ -37,6 +37,10 @@ const SHORT: ConnectionTimeouts = ConnectionTimeouts {
 /// deadline for a loaded machine, never an ordering.
 const SLACK: Duration = Duration::from_secs(5);
 
+/// How soon the shutdown signal must end a stalled handshake: well under
+/// the fixture's 5 s `shutdown_drain_secs`, which would otherwise end it.
+const PROMPT_SHUTDOWN: Duration = Duration::from_secs(2);
+
 /// The least a deadline-driven close may take from the client's clock,
 /// which starts a little after the server's: a close much sooner is a
 /// refusal, not a deadline.
@@ -316,9 +320,13 @@ async fn listener_shutdown_interrupts_handshake() {
         closed_within(&mut tcp, SLACK).await.is_ok(),
         "the stalled handshake's socket is closed"
     );
+    // The fixture's `shutdown_drain_secs` (5 s) equals `SLACK`, so with the
+    // handshake's shutdown arm gone the drain could abort the stalled task
+    // and still satisfy the timeout above. Finishing well inside the drain
+    // bound is what only the arm itself can do.
     assert!(
-        signalled.elapsed() < long.tls_handshake,
-        "shutdown waited out the handshake deadline"
+        signalled.elapsed() < PROMPT_SHUTDOWN,
+        "shutdown waited out the handshake or the drain, not the arm"
     );
     assert_eq!(probe.handshake_timeouts(), 0, "shutdown, not a timeout");
 }
