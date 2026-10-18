@@ -285,9 +285,21 @@ async fn listener_shutdown_interrupts_handshake() {
         .spawn_server_with_timeouts(long, Arc::clone(&probe), Some(shutdown_rx))
         .await;
 
+    // The readiness poll's connection answered before the server reaped its
+    // task, so until that count reaches zero a count of one could still be
+    // the readiness task, with the stalled connection sitting unaccepted in
+    // the backlog. Shutdown would then close it without the handshake's
+    // shutdown arm ever running.
+    wait_for(
+        || probe.tracked_connections() == 0,
+        "the readiness connection's task reaped",
+    )
+    .await;
+
     let mut tcp = TcpStream::connect(authority(&url)).await.unwrap();
     tcp.write_all(&PARTIAL_CLIENT_HELLO).await.unwrap();
-    // The readiness poll's connection is closed; this one is the only task.
+    // The readiness task is gone, so a tracked connection is this one,
+    // accepted and in its handshake.
     wait_for(
         || probe.tracked_connections() == 1,
         "the stalled handshake tracked",
