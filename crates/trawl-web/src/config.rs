@@ -37,6 +37,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fleet_auth::{
     ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN, ENV_SESSION_COOKIE_PATH,
@@ -106,6 +107,72 @@ pub struct ResolvedConfig {
     /// knows the operator stated an origin and the guard is a plain
     /// membership test with no "unset means allow" branch to forget.
     pub public_origins: PublicOrigins,
+    /// The bounds the proxy holds each request to.
+    pub limits: ProxyLimits,
+}
+
+/// The bounds the proxy holds each request to (ADR-0054, amended
+/// 2026-10-17).
+///
+/// The body limit and the upstream deadline come from trawld's own
+/// `[server]` settings in the file both daemons read, so the proxy
+/// refuses what trawld would refuse without sending it, and gives up on
+/// trawld's head only after trawld's own query deadline has passed. A
+/// trawl-web pointed at a trawld with a different file enforces its own
+/// file's values. The body deadline, the slack over trawld's deadline
+/// and the body budget are constants; a test shrinks them through this
+/// struct, and no key sets them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyLimits {
+    /// The most the proxy buffers of one request body before it calls
+    /// trawld: `[server] max_request_body_bytes`.
+    pub request_body_bytes: usize,
+    /// The most the proxy buffers of request bodies at once, across
+    /// every request in progress (`body_budget`). A body is reserved
+    /// from it before a byte is read, and a body the budget cannot
+    /// cover is refused 503 `request_limit_reached` at once.
+    pub body_budget_bytes: usize,
+    /// How long the proxy waits for a request body to arrive whole, on
+    /// every route (`middleware::body_deadline`). Past it the request is
+    /// answered 408 `timeout` and its count released.
+    pub body_read_timeout: Duration,
+    /// How long the proxy waits for trawld's response head: `[server]
+    /// timeout_secs` plus [`Self::UPSTREAM_HEAD_SLACK`]. Past it the
+    /// request is answered 504 `timeout`. The deadline covers the head
+    /// only; a body or stream already flowing is never cut by it. The
+    /// same value is the `TCP_USER_TIMEOUT` of every connection the proxy
+    /// opens to trawld (`upstream::proxy_client_builder`): a request body
+    /// trawld has not taken for that long ends its connection.
+    pub upstream_head_timeout: Duration,
+}
+
+impl ProxyLimits {
+    /// How long a request body may take to arrive.
+    pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// How much longer than trawld's own `timeout_secs` the proxy waits
+    /// for a head, so trawld's 504 arrives first in the ordinary case
+    /// and the proxy's covers only a trawld that is not answering at all.
+    pub const UPSTREAM_HEAD_SLACK: Duration = Duration::from_secs(10);
+
+    /// The limits for `server`, or for trawld's defaults when the proxy
+    /// resolves without a `[server]` section.
+    #[must_use]
+    pub fn from_server(server: Option<&ServerConfig>) -> Self {
+        let timeout_secs = server.map_or(trawl_config::DEFAULT_TIMEOUT_SECS, |server| {
+            server.timeout_secs
+        });
+        Self {
+            request_body_bytes: server
+                .map_or(trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES, |server| {
+                    server.max_request_body_bytes
+                }),
+            body_budget_bytes: crate::body_budget::PROXY_BODY_BUDGET,
+            body_read_timeout: Self::BODY_READ_TIMEOUT,
+            upstream_head_timeout: Duration::from_secs(timeout_secs)
+                .saturating_add(Self::UPSTREAM_HEAD_SLACK),
+        }
+    }
 }
 
 /// How the proxy's upstream client decides whether to trust trawld's
@@ -434,6 +501,7 @@ impl ResolvedConfig {
             cookie_settings,
             upstream,
             bind_addr,
+            limits,
             configured,
         } = sources;
         let public_origins = public_origins?.origins;
@@ -465,6 +533,7 @@ impl ResolvedConfig {
             cookie_key,
             shared_domain: cookie_settings.shared_domain,
             public_origins,
+            limits,
         })
     }
 }
@@ -753,6 +822,9 @@ pub struct Sources {
     pub upstream: Result<UpstreamPlan, ConfigError>,
     /// The proxy's listen address.
     pub bind_addr: Result<BindAddr, ConfigError>,
+    /// The bounds the proxy holds each request to. Derived from trawld's
+    /// own settings and constants; nothing here can fail.
+    pub limits: ProxyLimits,
     /// The configured values the startup warnings compare with the
     /// environment. Private, so only [`ResolvedConfig::from_sources`]
     /// reaches them.
@@ -786,6 +858,7 @@ impl Sources {
             upstream: resolve_upstream(web, server, &host),
             bind_addr: select_bind_addr(host.bind_addr.as_deref(), web.bind_addr.as_deref())
                 .map(|(addr, from)| BindAddr { addr, from }),
+            limits: ProxyLimits::from_server(server),
             configured: Configured {
                 cookie_secret_env: web.cookie_secret_env.clone(),
                 cookie_secret_path: web.cookie_secret_path.clone(),
@@ -2419,6 +2492,36 @@ session_ttl_secs = 3600
                 assert!(!rendered.contains(SENTINEL), "{rendered}");
             }
         }
+    }
+
+    /// The limits follow `[server]`: the body limit as written, the head
+    /// deadline 10 s past `timeout_secs`; without a section, trawld's
+    /// defaults.
+    #[test]
+    fn proxy_limits_follow_the_server_section() {
+        let web = configured_web();
+        let srv = ServerConfig {
+            timeout_secs: 7,
+            max_request_body_bytes: 99,
+            ..dummy_server()
+        };
+        let resolved = ResolvedConfig::from_parsed(&web, Some(&srv)).unwrap();
+        assert_eq!(resolved.limits.request_body_bytes, 99);
+        assert_eq!(
+            resolved.limits.upstream_head_timeout,
+            Duration::from_secs(17)
+        );
+        assert_eq!(resolved.limits.body_read_timeout, Duration::from_secs(30));
+
+        let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
+        assert_eq!(
+            resolved.limits.request_body_bytes,
+            trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
+        assert_eq!(
+            resolved.limits.upstream_head_timeout,
+            Duration::from_secs(40)
+        );
     }
 
     #[test]

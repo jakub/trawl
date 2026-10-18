@@ -878,7 +878,7 @@ async fn trawld_with_a_pending_rollup(dir: &Path) -> common::TestServer {
 }
 
 /// Each reported health value maps as specified. A real trawld whose
-/// `DuckDB` probe fails answers 503, `unavailable`, which fails the health
+/// engine sample reads `error` answers 503, `unavailable`, which fails the health
 /// check itself, and keeps its body: `duckdb` fails, the rest still report.
 /// An `unavailable` answer fails the check even when no reported check
 /// does. A real trawld with an unresolved rollup reports
@@ -918,13 +918,15 @@ async fn doctor_listener_health_rows() {
     assert_eq!(detail("data_path"), "the value is not shown");
     assert_eq!(detail("corpus"), "reported rollup_pending");
 
-    // A real trawld whose DuckDB probe cannot run in time answers 503.
+    // A real trawld whose engine sample reads `error` answers 503.
     let server = common::setup().await;
-    let seams = server.state.query.pool.seams();
-    let held = seams.hold(trawl_server::pool::seam::Seam::Started);
+    let held = server.state.engine_sample.hold();
+    server
+        .state
+        .engine_sample
+        .publish_for_test(trawl_server::engine_sample::EngineCheck::Error);
     let report = doctor_against(&server, dir.path()).await;
-    held.release();
-    drop(seams);
+    drop(held);
     assert_eq!(outcome(&report, HEALTH), UNAVAILABLE);
     let health = row(&report, HEALTH);
     assert!(

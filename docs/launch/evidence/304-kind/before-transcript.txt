@@ -1,0 +1,1042 @@
+
+## [2026-10-17T06:04:08.564Z] run before: image trawl-i304:before-b02b8acfb8a2, chart $D/build/src-before/chart/trawl, namespace i304-before
+[2026-10-17T06:04:08.565Z] $ kind version
+kind v0.33.0 go1.27.0-X:nodwarf5 linux/amd64
+[2026-10-17T06:04:08.569Z] $ helm version --short
+v4.2.2+gb05881c
+[2026-10-17T06:04:08.593Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 version
+Client Version: v1.36.4
+Kustomize Version: v5.8.1
+Server Version: v1.37.0
+[2026-10-17T06:04:08.638Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 get nodes -o wide
+NAME                       STATUS   ROLES           AGE    VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION            CONTAINER-RUNTIME
+trawl-i304-control-plane   Ready    control-plane   106m   v1.37.0   172.20.0.2    <none>        Debian GNU/Linux 13 (trixie)   7.2.5-3-omarchy (amd64)   containerd://2.3.4
+[2026-10-17T06:04:08.686Z] workload: EVENTS=800000 MSG_CHARS=200 SEED=304 STARVE_WORKERS=4 STARVE_SECS=60 SPILL_ATTEMPTS=8
+[2026-10-17T06:04:08.688Z] STARVE_QUERY: service=i304 | stats count() by message, _raw | stats count()
+[2026-10-17T06:04:08.689Z] SPILL_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count()
+[2026-10-17T06:04:08.690Z] $ docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' 'trawl-i304:before-b02b8acfb8a2'
+sha256:c5f182dd3515c40f216bae9e21dfeadea486c327410b98645ccd462df75aede6 b02b8acfb8a2115b655d930b2fdb457e976853de
+
+## [2026-10-17T06:04:08.707Z] cluster: the kubelet measures emptyDir usage every 2s
+[2026-10-17T06:04:08.735Z] $ docker exec trawl-i304-control-plane grep -E \^\(volumeStatsAggPeriod\|evictionHard\|\ \ nodefs\|\ \ imagefs\) /var/lib/kubelet/config.yaml
+evictionHard:
+  imagefs.available: 0%
+  nodefs.available: 0%
+  nodefs.inodesFree: 0%
+volumeStatsAggPeriod: 2s
+
+## [2026-10-17T06:04:08.752Z] namespace and disposable PostgreSQL
+[2026-10-17T06:04:08.802Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 create namespace i304-before
+namespace/i304-before created
+[2026-10-17T06:04:08.873Z] $ kubectl create secret generic pg-init|fleet-db|trawl-db --from-file=... (values from $D/private/before, not printed)
+secret/pg-init created
+secret/fleet-db created
+secret/trawl-db created
+[2026-10-17T06:04:09.012Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before apply -f $D/postgres.yaml
+deployment.apps/postgres created
+service/postgres created
+[2026-10-17T06:04:09.173Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before rollout status deployment/postgres --timeout=180s
+Waiting for deployment "postgres" rollout to finish: 0 of 1 updated replicas are available...
+deployment "postgres" successfully rolled out
+
+## [2026-10-17T06:04:10.614Z] helm install with the load values (values.yaml + values-load.yaml)
+[2026-10-17T06:04:10.615Z] $ helm --kubeconfig $D/kubeconfig --kube-context kind-trawl-i304 -n i304-before install trawl $D/build/src-before/chart/trawl -f $D/values.yaml -f $D/values-load.yaml --set-string image.repository=trawl-i304 --set-string image.tag=before-b02b8acfb8a2
+NAME: trawl
+LAST DEPLOYED: Fri Oct 16 23:04:10 2026
+NAMESPACE: i304-before
+STATUS: deployed
+REVISION: 1
+DESCRIPTION: Install complete
+NOTES:
+Trawl has been installed.
+
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Run the guide's fleet-admin commands inside the trawld container, for example:
+
+  kubectl exec --namespace i304-before -i trawl-0 -c trawld -- fleet-admin roles list
+
+Use a personal API key to sign in to the browser and a service key for each collector.
+The init-auth container initializes the database schema; it does not create API keys.
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+
+Check the HTTPS API through a local port-forward:
+
+  kubectl port-forward --namespace i304-before svc/trawl 5514:5514
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
+[2026-10-17T06:04:10.878Z] $ sed -n '/^\[server\]/,/^\[server.rate_limit\]/p' '$D/private/before/work/trawld.toml'
+[server]
+http_addr = "0.0.0.0:5514"
+timeout_secs = 30
+max_concurrent_queries = 2
+max_result_rows = 100000
+max_export_rows = 1000000
+max_request_body_bytes = "128K"
+max_concurrent_requests = 32
+shutdown_drain_secs = 30
+max_sse_connections = 32
+schema_cache_ttl_secs = 60
+max_query_history = 1000
+[server.rate_limit]
+[2026-10-17T06:04:10.881Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-before get statefulset trawl -o json | jq -c '.spec.template.spec | {trawld_resources: (.containers[] | select(.name=="trawld") | .resources), tmp: (.volumes[] | select(.name=="tmp")), probes: (.containers[] | select(.name=="trawld") | {readiness: .readinessProbe | {periodSeconds, failureThreshold, timeoutSeconds}, liveness: .livenessProbe | {periodSeconds, failureThreshold}})}'
+{"trawld_resources":{"limits":{"cpu":"16","memory":"6Gi"},"requests":{"cpu":"250m","memory":"512Mi"}},"tmp":{"emptyDir":{"sizeLimit":"512Mi"},"name":"tmp"},"probes":{"readiness":{"periodSeconds":10,"failureThreshold":3,"timeoutSeconds":5},"liveness":{"periodSeconds":30,"failureThreshold":3}}}
+[2026-10-17T06:04:10.989Z] pod trawl-0 uid=2d57eb6d-39c6-4344-a813-cd6e91db676b phase=Pending reason= ready= restarts=
+[2026-10-17T06:04:14.039Z] pod trawl-0 uid=2d57eb6d-39c6-4344-a813-cd6e91db676b phase=Pending reason= ready= restarts=
+[2026-10-17T06:04:17.090Z] pod trawl-0 uid=2d57eb6d-39c6-4344-a813-cd6e91db676b phase=Running reason= ready=False restarts=0
+[2026-10-17T06:04:20.140Z] pod trawl-0 uid=2d57eb6d-39c6-4344-a813-cd6e91db676b phase=Running reason= ready=True restarts=0
+[2026-10-17T06:04:20.141Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE   IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-rvbq6   1/1     Running   0          11s   10.244.0.60   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          10s   10.244.0.62   trawl-i304-control-plane   <none>           <none>
+
+## [2026-10-17T06:04:20.191Z] API key (query, ingest, server_manage) and trawld's certificate
+[2026-10-17T06:04:20.192Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before exec trawl-0 -c trawld -- sh -c DATABASE_URL=\"\$FLEET_DATABASE_URL\"\ exec\ fleet-admin\ roles\ create\ --name\ i304\ --perm\ trawl:query\ --perm\ trawl:ingest\ --perm\ trawl:server_manage
+created role:
+
+  name:      i304
+  rate_rpm:  (class default)
+  perms:     trawl:ingest, trawl:query, trawl:server_manage
+[2026-10-17T06:04:20.306Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name i304 --kind human --role i304 > $PRIV/token
+created API key:
+
+  name:    i304
+  kind:    human
+  roles:   i304
+  prefix:  fKes3NLS
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-17T06:04:20.510Z] token bytes: 48
+[2026-10-17T06:04:20.589Z] $ openssl x509 -in '$D/private/before/cert.pem' -noout -subject -ext subjectAltName
+subject=CN=rcgen self signed cert
+X509v3 Subject Alternative Name: 
+    DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1
+[2026-10-17T06:04:20.899Z] GET /api/v1/health -> 200 {"status":"ok","checks":{"auth_db":"ok","corpus":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok"},"version":"0.9.3"}
+[2026-10-17T06:04:20.900Z] $ curl -sS --cacert '$D/private/before/cert.pem' -K '$D/private/before/curl.conf' https://localhost:15514/api/v1/whoami | jq -c .
+{"prefix":"fKes3NLS","name":"i304","kind":"human","roles":["i304"],"permissions":["query","server_manage","ingest"]}
+
+## [2026-10-17T06:04:21.025Z] ingest 800000 events of 200-character random messages
+[2026-10-17T06:04:21.027Z] $ python3 -I gen-events.py https://localhost:15514/api/v1/ingest $PRIV/cert.pem $PRIV/auth-header 800000 200 304 4000
+  ingested 4000/800000 events, 1 MiB, 0s
+  ingested 104000/800000 events, 29 MiB, 1s
+  ingested 204000/800000 events, 58 MiB, 3s
+  ingested 304000/800000 events, 86 MiB, 4s
+  ingested 404000/800000 events, 115 MiB, 6s
+  ingested 504000/800000 events, 143 MiB, 9s
+  ingested 604000/800000 events, 172 MiB, 12s
+  ingested 704000/800000 events, 200 MiB, 16s
+ingested 800000 events, 228 MiB of NDJSON in 31s
+[2026-10-17T06:04:51.820Z] waiting for the hot buffer to drain into Parquet (trawld's own telemetry keeps a few hundred events there)
+[2026-10-17T06:04:58.022Z] trawl_hot_buffer_events=3
+[2026-10-17T06:04:58.097Z] count query -> 200 0.065009 [[800000]]
+[2026-10-17T06:04:58.098Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-before exec trawl-0 -c trawld -- du -sh /var/lib/trawl/data /tmp
+333M	/var/lib/trawl/data
+4.0K	/tmp
+
+## [2026-10-17T06:04:58.210Z] helm upgrade to the scenario values (values.yaml alone)
+[2026-10-17T06:04:58.273Z] $ helm --kubeconfig $D/kubeconfig --kube-context kind-trawl-i304 -n i304-before upgrade trawl $D/build/src-before/chart/trawl -f $D/values.yaml --set-string image.repository=trawl-i304 --set-string image.tag=before-b02b8acfb8a2
+Release "trawl" has been upgraded. Happy Helming!
+NAME: trawl
+LAST DEPLOYED: Fri Oct 16 23:04:58 2026
+NAMESPACE: i304-before
+STATUS: deployed
+REVISION: 2
+DESCRIPTION: Upgrade complete
+NOTES:
+Trawl has been installed.
+
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Run the guide's fleet-admin commands inside the trawld container, for example:
+
+  kubectl exec --namespace i304-before -i trawl-0 -c trawld -- fleet-admin roles list
+
+Use a personal API key to sign in to the browser and a service key for each collector.
+The init-auth container initializes the database schema; it does not create API keys.
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+
+Check the HTTPS API through a local port-forward:
+
+  kubectl port-forward --namespace i304-before svc/trawl 5514:5514
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
+[2026-10-17T06:04:58.679Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before rollout status statefulset/trawl --timeout=300s
+Waiting for partitioned roll out to finish: 0 out of 1 new pods have been updated...
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+partitioned roll out complete: 1 new pods have been updated...
+[2026-10-17T06:05:02.734Z] $ sed -n '/^\[server\]/,/^\[server.rate_limit\]/p' '$D/private/before/work/trawld.toml'
+[server]
+http_addr = "0.0.0.0:5514"
+timeout_secs = 30
+max_concurrent_queries = 2
+max_result_rows = 100000
+max_export_rows = 1000000
+max_request_body_bytes = "128K"
+max_concurrent_requests = 32
+shutdown_drain_secs = 30
+max_sse_connections = 32
+schema_cache_ttl_secs = 60
+max_query_history = 1000
+[server.rate_limit]
+[2026-10-17T06:05:02.737Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-before get statefulset trawl -o json | jq -c '.spec.template.spec | {trawld_resources: (.containers[] | select(.name=="trawld") | .resources), tmp: (.volumes[] | select(.name=="tmp")), probes: (.containers[] | select(.name=="trawld") | {readiness: .readinessProbe | {periodSeconds, failureThreshold, timeoutSeconds}, liveness: .livenessProbe | {periodSeconds, failureThreshold}})}'
+{"trawld_resources":{"limits":{"cpu":"1","memory":"4Gi"},"requests":{"cpu":"250m","memory":"512Mi"}},"tmp":{"emptyDir":{"sizeLimit":"512Mi"},"name":"tmp"},"probes":{"readiness":{"periodSeconds":10,"failureThreshold":3,"timeoutSeconds":5},"liveness":{"periodSeconds":30,"failureThreshold":3}}}
+[2026-10-17T06:05:02.838Z] pod trawl-0 uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+[2026-10-17T06:05:03.143Z] GET /api/v1/health -> 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+[2026-10-17T06:05:03.336Z] count query -> 200 0.182789 [[800000]]
+
+## [2026-10-17T06:05:03.337Z] phase A, starvation: 4 clients send STARVE_QUERY back to back for 60s; max_concurrent_queries=2
+[2026-10-17T06:05:03.339Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before get pod trawl-0 -o jsonpath=\{range\ .status.conditions\[\*\]\}\{.type\}=\{.status\}\ \{end\}\{\"\\n\"\}
+PodReadyToStartContainers=True Initialized=True Ready=True ContainersReady=True PodScheduled=True 
+[2026-10-17T06:05:03.620Z] one STARVE_QUERY alone -> 200 0.221911 {"execution":{"started_at":"2026-10-17T06:05:03.402695349Z","duration_ms":204},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-17T06:05:05.628Z] workers started at 2026-10-17T06:05:03.622Z; waiting for them to finish their last query
+[2026-10-17T06:06:19.205Z] phase A ended
+
+## [2026-10-17T06:06:19.207Z] phase A: STARVE_QUERY responses (start time, worker, HTTP status, seconds, body head)
+[2026-10-17T06:06:19.208Z] $ sort '$D/private/before/work/a/workers.log'
+2026-10-17T06:05:03.624Z worker=1 -> 200 0.255483 {"execution":{"started_at":"2026-10-17T06:05:03.649940315Z","duration_ms":230},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:03.889Z worker=1 -> 200 0.378867 {"execution":{"started_at":"2026-10-17T06:05:03.907154144Z","duration_ms":268},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:04.125Z worker=2 -> 200 0.361079 {"execution":{"started_at":"2026-10-17T06:05:04.145674614Z","duration_ms":339},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:04.277Z worker=1 -> 200 0.536048 {"execution":{"started_at":"2026-10-17T06:05:04.309842761Z","duration_ms":473},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:04.496Z worker=2 -> 200 0.495252 {"execution":{"started_at":"2026-10-17T06:05:04.510703755Z","duration_ms":476},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:04.626Z worker=3 -> 200 0.668391 {"execution":{"started_at":"2026-10-17T06:05:04.774321361Z","duration_ms":515},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:04.823Z worker=1 -> 200 0.796952 {"execution":{"started_at":"2026-10-17T06:05:04.838188361Z","duration_ms":781},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:05.001Z worker=2 -> 200 0.907958 {"execution":{"started_at":"2026-10-17T06:05:05.021816365Z","duration_ms":884},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:05.128Z worker=4 -> 200 1.069790 {"execution":{"started_at":"2026-10-17T06:05:05.171057626Z","duration_ms":1025},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:05.304Z worker=3 -> 200 1.202822 {"execution":{"started_at":"2026-10-17T06:05:05.322905643Z","duration_ms":1182},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:05.629Z worker=1 -> 200 1.263514 {"execution":{"started_at":"2026-10-17T06:05:05.644059177Z","duration_ms":1245},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:05.919Z worker=2 -> 200 1.164258 {"execution":{"started_at":"2026-10-17T06:05:05.982618871Z","duration_ms":1097},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:06.207Z worker=4 -> 200 1.200861 {"execution":{"started_at":"2026-10-17T06:05:06.223988831Z","duration_ms":1183},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:06.516Z worker=3 -> 200 1.073899 {"execution":{"started_at":"2026-10-17T06:05:06.532312025Z","duration_ms":1055},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:06.902Z worker=1 -> 200 1.005074 {"execution":{"started_at":"2026-10-17T06:05:06.919349221Z","duration_ms":985},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:07.093Z worker=2 -> 200 0.989237 {"execution":{"started_at":"2026-10-17T06:05:07.110894137Z","duration_ms":970},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:07.418Z worker=4 -> 200 1.054286 {"execution":{"started_at":"2026-10-17T06:05:07.484915953Z","duration_ms":937},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:07.599Z worker=3 -> 200 0.983816 {"execution":{"started_at":"2026-10-17T06:05:07.616349323Z","duration_ms":966},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:07.917Z worker=1 -> 200 1.062526 {"execution":{"started_at":"2026-10-17T06:05:07.932810320Z","duration_ms":1043},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:08.092Z worker=2 -> 200 1.011935 {"execution":{"started_at":"2026-10-17T06:05:08.107791483Z","duration_ms":997},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:08.481Z worker=4 -> 200 0.996961 {"execution":{"started_at":"2026-10-17T06:05:08.494976363Z","duration_ms":982},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:08.593Z worker=3 -> 200 1.027629 {"execution":{"started_at":"2026-10-17T06:05:08.607851834Z","duration_ms":1014},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:08.989Z worker=1 -> 200 0.927616 {"execution":{"started_at":"2026-10-17T06:05:09.004633277Z","duration_ms":910},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:09.113Z worker=2 -> 200 1.051968 {"execution":{"started_at":"2026-10-17T06:05:09.129367017Z","duration_ms":989},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:09.488Z worker=4 -> 200 1.004626 {"execution":{"started_at":"2026-10-17T06:05:09.503436986Z","duration_ms":987},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:09.630Z worker=3 -> 200 1.056779 {"execution":{"started_at":"2026-10-17T06:05:09.644690697Z","duration_ms":1033},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:09.925Z worker=1 -> 200 1.178576 {"execution":{"started_at":"2026-10-17T06:05:09.942923150Z","duration_ms":1157},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:10.174Z worker=2 -> 200 1.048860 {"execution":{"started_at":"2026-10-17T06:05:10.191328490Z","duration_ms":1029},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:10.501Z worker=4 -> 200 1.122404 {"execution":{"started_at":"2026-10-17T06:05:10.517737241Z","duration_ms":1101},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:10.696Z worker=3 -> 200 1.086955 {"execution":{"started_at":"2026-10-17T06:05:10.712279386Z","duration_ms":1066},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:11.113Z worker=1 -> 200 1.078093 {"execution":{"started_at":"2026-10-17T06:05:11.180315604Z","duration_ms":1006},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:11.232Z worker=2 -> 200 1.049560 {"execution":{"started_at":"2026-10-17T06:05:11.277028561Z","duration_ms":1005},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:11.633Z worker=4 -> 200 1.056496 {"execution":{"started_at":"2026-10-17T06:05:11.680147752Z","duration_ms":1008},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:11.792Z worker=3 -> 200 0.989424 {"execution":{"started_at":"2026-10-17T06:05:11.809189512Z","duration_ms":971},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:12.201Z worker=1 -> 200 1.018043 {"execution":{"started_at":"2026-10-17T06:05:12.217806572Z","duration_ms":999},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:12.291Z worker=2 -> 200 1.011687 {"execution":{"started_at":"2026-10-17T06:05:12.306238634Z","duration_ms":995},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:12.699Z worker=4 -> 200 1.066145 {"execution":{"started_at":"2026-10-17T06:05:12.712501146Z","duration_ms":1000},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:12.791Z worker=3 -> 200 1.020598 {"execution":{"started_at":"2026-10-17T06:05:12.805171970Z","duration_ms":1004},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:13.228Z worker=1 -> 200 1.072830 {"execution":{"started_at":"2026-10-17T06:05:13.244338321Z","duration_ms":1054},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:13.312Z worker=2 -> 200 1.080371 {"execution":{"started_at":"2026-10-17T06:05:13.325864674Z","duration_ms":1063},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:13.774Z worker=4 -> 200 1.100370 {"execution":{"started_at":"2026-10-17T06:05:13.788868211Z","duration_ms":1083},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:13.821Z worker=3 -> 200 1.081005 {"execution":{"started_at":"2026-10-17T06:05:13.892446144Z","duration_ms":1008},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:14.310Z worker=1 -> 200 1.141789 {"execution":{"started_at":"2026-10-17T06:05:14.325497262Z","duration_ms":1065},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:14.401Z worker=2 -> 200 1.086494 {"execution":{"started_at":"2026-10-17T06:05:14.416829267Z","duration_ms":1054},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:14.883Z worker=4 -> 200 1.047374 {"execution":{"started_at":"2026-10-17T06:05:14.899132115Z","duration_ms":1016},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:14.911Z worker=3 -> 200 1.097311 {"execution":{"started_at":"2026-10-17T06:05:14.924887278Z","duration_ms":1062},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:15.461Z worker=1 -> 200 1.024258 {"execution":{"started_at":"2026-10-17T06:05:15.571012135Z","duration_ms":901},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:15.497Z worker=2 -> 200 1.016145 {"execution":{"started_at":"2026-10-17T06:05:15.611398431Z","duration_ms":878},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:15.940Z worker=4 -> 200 1.125654 {"execution":{"started_at":"2026-10-17T06:05:15.988962535Z","duration_ms":1016},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:16.017Z worker=3 -> 200 0.992708 {"execution":{"started_at":"2026-10-17T06:05:16.057263581Z","duration_ms":945},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:16.494Z worker=1 -> 200 1.028313 {"execution":{"started_at":"2026-10-17T06:05:16.570977793Z","duration_ms":930},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:16.522Z worker=2 -> 200 1.080956 {"execution":{"started_at":"2026-10-17T06:05:16.587928642Z","duration_ms":998},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:17.019Z worker=3 -> 200 1.069013 {"execution":{"started_at":"2026-10-17T06:05:17.071033890Z","duration_ms":1013},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:17.074Z worker=4 -> 200 1.044164 {"execution":{"started_at":"2026-10-17T06:05:17.091614092Z","duration_ms":1024},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:17.531Z worker=1 -> 200 1.068922 {"execution":{"started_at":"2026-10-17T06:05:17.565256413Z","duration_ms":1032},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:17.611Z worker=2 -> 200 1.005754 {"execution":{"started_at":"2026-10-17T06:05:17.634334006Z","duration_ms":979},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:18.097Z worker=3 -> 200 1.076714 {"execution":{"started_at":"2026-10-17T06:05:18.111290731Z","duration_ms":1063},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:18.126Z worker=4 -> 200 0.993017 {"execution":{"started_at":"2026-10-17T06:05:18.140162078Z","duration_ms":977},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:18.609Z worker=1 -> 200 1.079151 {"execution":{"started_at":"2026-10-17T06:05:18.631467582Z","duration_ms":1058},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:18.626Z worker=2 -> 200 1.071322 {"execution":{"started_at":"2026-10-17T06:05:18.678597586Z","duration_ms":1016},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:19.128Z worker=4 -> 200 1.155530 {"execution":{"started_at":"2026-10-17T06:05:19.140925153Z","duration_ms":1139},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:19.183Z worker=3 -> 200 1.038835 {"execution":{"started_at":"2026-10-17T06:05:19.196668410Z","duration_ms":1023},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:19.698Z worker=1 -> 200 1.099440 {"execution":{"started_at":"2026-10-17T06:05:19.714028572Z","duration_ms":1084},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:19.705Z worker=2 -> 200 1.160392 {"execution":{"started_at":"2026-10-17T06:05:19.721709348Z","duration_ms":1095},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:20.231Z worker=3 -> 200 1.257098 {"execution":{"started_at":"2026-10-17T06:05:20.245152287Z","duration_ms":1243},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:20.293Z worker=4 -> 200 1.264086 {"execution":{"started_at":"2026-10-17T06:05:20.309295258Z","duration_ms":1194},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:20.806Z worker=1 -> 200 1.171054 {"execution":{"started_at":"2026-10-17T06:05:20.820387298Z","duration_ms":1158},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:20.874Z worker=2 -> 200 1.099259 {"execution":{"started_at":"2026-10-17T06:05:20.894371550Z","duration_ms":1079},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:21.497Z worker=3 -> 200 1.201072 {"execution":{"started_at":"2026-10-17T06:05:21.572003286Z","duration_ms":1127},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:21.566Z worker=4 -> 200 1.152770 {"execution":{"started_at":"2026-10-17T06:05:21.580141910Z","duration_ms":1138},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:21.982Z worker=2 -> 200 1.197555 {"execution":{"started_at":"2026-10-17T06:05:21.999773977Z","duration_ms":1178},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:21.987Z worker=1 -> 200 1.223334 {"execution":{"started_at":"2026-10-17T06:05:22.008697200Z","duration_ms":1200},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:22.707Z worker=3 -> 200 1.111341 {"execution":{"started_at":"2026-10-17T06:05:22.719810736Z","duration_ms":1094},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:22.727Z worker=4 -> 200 1.067835 {"execution":{"started_at":"2026-10-17T06:05:22.776842989Z","duration_ms":1018},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:23.188Z worker=2 -> 200 1.137413 {"execution":{"started_at":"2026-10-17T06:05:23.201578781Z","duration_ms":1106},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:23.218Z worker=1 -> 200 1.094430 {"execution":{"started_at":"2026-10-17T06:05:23.240932277Z","duration_ms":1066},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:23.803Z worker=4 -> 200 1.082228 {"execution":{"started_at":"2026-10-17T06:05:23.816194653Z","duration_ms":1058},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:23.827Z worker=3 -> 200 1.073983 {"execution":{"started_at":"2026-10-17T06:05:23.840432377Z","duration_ms":1046},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:24.322Z worker=1 -> 200 1.081210 {"execution":{"started_at":"2026-10-17T06:05:24.391364246Z","duration_ms":1008},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:24.334Z worker=2 -> 200 1.148159 {"execution":{"started_at":"2026-10-17T06:05:24.400112359Z","duration_ms":1081},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:24.894Z worker=4 -> 200 1.095844 {"execution":{"started_at":"2026-10-17T06:05:24.917192741Z","duration_ms":1071},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:24.909Z worker=3 -> 200 1.255875 {"execution":{"started_at":"2026-10-17T06:05:24.926030734Z","duration_ms":1183},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:25.412Z worker=1 -> 200 1.080837 {"execution":{"started_at":"2026-10-17T06:05:25.430238756Z","duration_ms":1061},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:25.491Z worker=2 -> 200 1.207354 {"execution":{"started_at":"2026-10-17T06:05:25.507607909Z","duration_ms":1189},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:25.998Z worker=4 -> 200 1.082927 {"execution":{"started_at":"2026-10-17T06:05:26.014944965Z","duration_ms":1066},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:26.174Z worker=3 -> 200 1.091684 {"execution":{"started_at":"2026-10-17T06:05:26.186767877Z","duration_ms":1031},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:26.503Z worker=1 -> 200 1.119291 {"execution":{"started_at":"2026-10-17T06:05:26.518736963Z","duration_ms":1102},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:26.709Z worker=2 -> 200 0.986950 {"execution":{"started_at":"2026-10-17T06:05:26.777960078Z","duration_ms":917},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:27.091Z worker=4 -> 200 1.028993 {"execution":{"started_at":"2026-10-17T06:05:27.106443570Z","duration_ms":1011},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:27.274Z worker=3 -> 200 0.938214 {"execution":{"started_at":"2026-10-17T06:05:27.289974768Z","duration_ms":921},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:27.632Z worker=1 -> 200 1.060725 {"execution":{"started_at":"2026-10-17T06:05:27.678147544Z","duration_ms":1012},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:27.706Z worker=2 -> 200 1.100057 {"execution":{"started_at":"2026-10-17T06:05:27.720643702Z","duration_ms":1083},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:28.129Z worker=4 -> 200 1.058311 {"execution":{"started_at":"2026-10-17T06:05:28.177853844Z","duration_ms":1004},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:28.222Z worker=3 -> 200 1.174668 {"execution":{"started_at":"2026-10-17T06:05:28.236099372Z","duration_ms":1158},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:28.702Z worker=1 -> 200 0.918606 {"execution":{"started_at":"2026-10-17T06:05:28.718761983Z","duration_ms":898},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:28.815Z worker=2 -> 200 1.095161 {"execution":{"started_at":"2026-10-17T06:05:28.839679620Z","duration_ms":1068},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:29.196Z worker=4 -> 200 0.998873 {"execution":{"started_at":"2026-10-17T06:05:29.209655736Z","duration_ms":982},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:29.405Z worker=3 -> 200 1.090983 {"execution":{"started_at":"2026-10-17T06:05:29.422281774Z","duration_ms":1074},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:29.629Z worker=1 -> 200 1.161825 {"execution":{"started_at":"2026-10-17T06:05:29.676468363Z","duration_ms":1112},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:29.919Z worker=2 -> 200 1.091083 {"execution":{"started_at":"2026-10-17T06:05:29.976516533Z","duration_ms":1033},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:30.203Z worker=4 -> 200 1.232088 {"execution":{"started_at":"2026-10-17T06:05:30.219322831Z","duration_ms":1097},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:30.506Z worker=3 -> 200 0.995755 {"execution":{"started_at":"2026-10-17T06:05:30.522663822Z","duration_ms":978},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:30.800Z worker=1 -> 200 1.175296 {"execution":{"started_at":"2026-10-17T06:05:30.817464909Z","duration_ms":1155},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:31.020Z worker=2 -> 200 1.151778 {"execution":{"started_at":"2026-10-17T06:05:31.032802871Z","duration_ms":1138},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:31.445Z worker=4 -> 200 0.875091 {"execution":{"started_at":"2026-10-17T06:05:31.478139952Z","duration_ms":835},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:31.511Z worker=3 -> 200 1.453553 {"execution":{"started_at":"2026-10-17T06:05:31.527096907Z","duration_ms":1383},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:31.984Z worker=1 -> 200 0.827055 {"execution":{"started_at":"2026-10-17T06:05:32.003189139Z","duration_ms":804},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:32.181Z worker=2 -> 200 1.398088 {"execution":{"started_at":"2026-10-17T06:05:32.198364956Z","duration_ms":1380},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:32.329Z worker=4 -> 200 1.175983 {"execution":{"started_at":"2026-10-17T06:05:32.347992793Z","duration_ms":1154},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:32.821Z worker=1 -> 200 1.164784 {"execution":{"started_at":"2026-10-17T06:05:32.835746848Z","duration_ms":1147},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:32.974Z worker=3 -> 200 1.113365 {"execution":{"started_at":"2026-10-17T06:05:32.991722282Z","duration_ms":1094},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:33.514Z worker=4 -> 200 1.096118 {"execution":{"started_at":"2026-10-17T06:05:33.536750480Z","duration_ms":1073},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:33.588Z worker=2 -> 200 1.130046 {"execution":{"started_at":"2026-10-17T06:05:33.605002326Z","duration_ms":1101},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:33.995Z worker=1 -> 200 1.126234 {"execution":{"started_at":"2026-10-17T06:05:34.020446799Z","duration_ms":1082},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:34.097Z worker=3 -> 200 1.237428 {"execution":{"started_at":"2026-10-17T06:05:34.114022694Z","duration_ms":1184},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:34.619Z worker=4 -> 200 1.004977 {"execution":{"started_at":"2026-10-17T06:05:34.634080937Z","duration_ms":968},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:34.727Z worker=2 -> 200 1.173762 {"execution":{"started_at":"2026-10-17T06:05:34.752275794Z","duration_ms":1134},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:35.131Z worker=1 -> 200 0.966440 {"execution":{"started_at":"2026-10-17T06:05:35.186800364Z","duration_ms":892},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:35.343Z worker=3 -> 200 1.072680 {"execution":{"started_at":"2026-10-17T06:05:35.367509285Z","duration_ms":1033},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:35.633Z worker=4 -> 200 1.056370 {"execution":{"started_at":"2026-10-17T06:05:35.659650916Z","duration_ms":1016},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:35.910Z worker=2 -> 200 1.083474 {"execution":{"started_at":"2026-10-17T06:05:35.929373221Z","duration_ms":1055},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:36.106Z worker=1 -> 200 1.007425 {"execution":{"started_at":"2026-10-17T06:05:36.137753497Z","duration_ms":966},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:36.425Z worker=3 -> 200 0.987872 {"execution":{"started_at":"2026-10-17T06:05:36.488536988Z","duration_ms":911},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:36.699Z worker=4 -> 200 0.915562 {"execution":{"started_at":"2026-10-17T06:05:36.727095163Z","duration_ms":869},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:37.003Z worker=2 -> 200 0.900502 {"execution":{"started_at":"2026-10-17T06:05:37.034483931Z","duration_ms":857},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:37.123Z worker=1 -> 200 1.011809 {"execution":{"started_at":"2026-10-17T06:05:37.158264243Z","duration_ms":962},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:37.422Z worker=3 -> 200 0.943398 {"execution":{"started_at":"2026-10-17T06:05:37.500061660Z","duration_ms":797},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:37.623Z worker=4 -> 200 1.000032 {"execution":{"started_at":"2026-10-17T06:05:37.648422744Z","duration_ms":960},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:37.912Z worker=2 -> 200 0.879290 {"execution":{"started_at":"2026-10-17T06:05:37.940847099Z","duration_ms":836},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:38.144Z worker=1 -> 200 0.962571 {"execution":{"started_at":"2026-10-17T06:05:38.185457418Z","duration_ms":913},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:38.374Z worker=3 -> 200 0.862039 {"execution":{"started_at":"2026-10-17T06:05:38.403144901Z","duration_ms":812},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:38.632Z worker=4 -> 200 0.949009 {"execution":{"started_at":"2026-10-17T06:05:38.662980250Z","duration_ms":909},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:38.801Z worker=2 -> 200 0.922716 {"execution":{"started_at":"2026-10-17T06:05:38.830370204Z","duration_ms":878},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:39.116Z worker=1 -> 200 0.907730 {"execution":{"started_at":"2026-10-17T06:05:39.150997369Z","duration_ms":852},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:39.245Z worker=3 -> 200 0.887210 {"execution":{"started_at":"2026-10-17T06:05:39.267610344Z","duration_ms":852},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:39.590Z worker=4 -> 200 1.038007 {"execution":{"started_at":"2026-10-17T06:05:39.614139425Z","duration_ms":994},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:39.733Z worker=2 -> 200 0.974003 {"execution":{"started_at":"2026-10-17T06:05:39.764832952Z","duration_ms":925},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:40.033Z worker=1 -> 200 1.049451 {"execution":{"started_at":"2026-10-17T06:05:40.055506895Z","duration_ms":1021},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:40.140Z worker=3 -> 200 0.995717 {"execution":{"started_at":"2026-10-17T06:05:40.166428491Z","duration_ms":945},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:40.637Z worker=4 -> 200 0.927979 {"execution":{"started_at":"2026-10-17T06:05:40.689869162Z","duration_ms":819},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:40.716Z worker=2 -> 200 0.948709 {"execution":{"started_at":"2026-10-17T06:05:40.737879254Z","duration_ms":858},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:41.092Z worker=1 -> 200 0.936872 {"execution":{"started_at":"2026-10-17T06:05:41.116815237Z","duration_ms":871},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:41.144Z worker=3 -> 200 0.955144 {"execution":{"started_at":"2026-10-17T06:05:41.188693941Z","duration_ms":884},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:41.574Z worker=4 -> 200 0.914972 {"execution":{"started_at":"2026-10-17T06:05:41.600023145Z","duration_ms":889},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:41.674Z worker=2 -> 200 0.931285 {"execution":{"started_at":"2026-10-17T06:05:41.701762708Z","duration_ms":900},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:42.038Z worker=1 -> 200 1.046217 {"execution":{"started_at":"2026-10-17T06:05:42.104957708Z","duration_ms":978},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:42.108Z worker=3 -> 200 1.006898 {"execution":{"started_at":"2026-10-17T06:05:42.126358805Z","duration_ms":987},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:42.498Z worker=4 -> 200 1.084696 {"execution":{"started_at":"2026-10-17T06:05:42.607226924Z","duration_ms":976},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:42.614Z worker=2 -> 200 0.937788 {"execution":{"started_at":"2026-10-17T06:05:42.776427019Z","duration_ms":736},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:43.093Z worker=1 -> 200 1.089686 {"execution":{"started_at":"2026-10-17T06:05:43.106864454Z","duration_ms":1071},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:43.125Z worker=3 -> 200 1.050583 {"execution":{"started_at":"2026-10-17T06:05:43.144529577Z","duration_ms":1032},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:43.561Z worker=2 -> 200 1.053456 {"execution":{"started_at":"2026-10-17T06:05:43.574174717Z","duration_ms":1041},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:43.592Z worker=4 -> 200 1.017497 {"execution":{"started_at":"2026-10-17T06:05:43.606047642Z","duration_ms":1004},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:44.185Z worker=3 -> 200 0.919716 {"execution":{"started_at":"2026-10-17T06:05:44.197588349Z","duration_ms":906},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:44.192Z worker=1 -> 200 0.982285 {"execution":{"started_at":"2026-10-17T06:05:44.206371161Z","duration_ms":967},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:44.619Z worker=4 -> 200 1.060819 {"execution":{"started_at":"2026-10-17T06:05:44.631496497Z","duration_ms":1045},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:44.623Z worker=2 -> 200 1.153258 {"execution":{"started_at":"2026-10-17T06:05:44.636008727Z","duration_ms":1138},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:45.114Z worker=3 -> 200 1.003499 {"execution":{"started_at":"2026-10-17T06:05:45.126360218Z","duration_ms":986},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:45.183Z worker=1 -> 200 1.025688 {"execution":{"started_at":"2026-10-17T06:05:45.197744251Z","duration_ms":1002},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:45.689Z worker=4 -> 200 1.009425 {"execution":{"started_at":"2026-10-17T06:05:45.704376305Z","duration_ms":896},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:45.785Z worker=2 -> 200 0.923768 {"execution":{"started_at":"2026-10-17T06:05:45.802667252Z","duration_ms":891},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:46.126Z worker=3 -> 200 1.068239 {"execution":{"started_at":"2026-10-17T06:05:46.145168144Z","duration_ms":1047},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:46.217Z worker=1 -> 200 1.070390 {"execution":{"started_at":"2026-10-17T06:05:46.364255991Z","duration_ms":919},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:46.707Z worker=4 -> 200 1.078842 {"execution":{"started_at":"2026-10-17T06:05:46.724592264Z","duration_ms":1057},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:46.718Z worker=2 -> 200 1.097285 {"execution":{"started_at":"2026-10-17T06:05:46.784763129Z","duration_ms":1025},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:47.204Z worker=3 -> 200 1.079107 {"execution":{"started_at":"2026-10-17T06:05:47.219712637Z","duration_ms":1060},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:47.296Z worker=1 -> 200 1.023202 {"execution":{"started_at":"2026-10-17T06:05:47.315645107Z","duration_ms":1002},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:47.796Z worker=4 -> 200 0.989126 {"execution":{"started_at":"2026-10-17T06:05:47.812612274Z","duration_ms":971},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:47.824Z worker=2 -> 200 1.093922 {"execution":{"started_at":"2026-10-17T06:05:47.878754656Z","duration_ms":1039},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:48.292Z worker=3 -> 200 1.084446 {"execution":{"started_at":"2026-10-17T06:05:48.309451218Z","duration_ms":1066},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:48.329Z worker=1 -> 200 1.081829 {"execution":{"started_at":"2026-10-17T06:05:48.343830586Z","duration_ms":1065},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:48.794Z worker=4 -> 200 1.011077 {"execution":{"started_at":"2026-10-17T06:05:48.811091751Z","duration_ms":994},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:48.927Z worker=2 -> 200 0.984061 {"execution":{"started_at":"2026-10-17T06:05:48.944078963Z","duration_ms":962},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:49.386Z worker=3 -> 200 0.999372 {"execution":{"started_at":"2026-10-17T06:05:49.402946272Z","duration_ms":974},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:49.420Z worker=1 -> 200 1.064267 {"execution":{"started_at":"2026-10-17T06:05:49.480158150Z","duration_ms":1002},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:49.814Z worker=4 -> 200 1.005186 {"execution":{"started_at":"2026-10-17T06:05:49.831279914Z","duration_ms":987},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:49.920Z worker=2 -> 200 1.087767 {"execution":{"started_at":"2026-10-17T06:05:49.978009387Z","duration_ms":1025},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:50.395Z worker=3 -> 200 0.923606 {"execution":{"started_at":"2026-10-17T06:05:50.411206186Z","duration_ms":905},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:50.493Z worker=1 -> 200 0.989319 {"execution":{"started_at":"2026-10-17T06:05:50.509340489Z","duration_ms":971},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:50.829Z worker=4 -> 200 0.972890 {"execution":{"started_at":"2026-10-17T06:05:50.881300687Z","duration_ms":918},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:51.018Z worker=2 -> 200 0.972407 {"execution":{"started_at":"2026-10-17T06:05:51.033933385Z","duration_ms":954},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:51.328Z worker=3 -> 200 0.948647 {"execution":{"started_at":"2026-10-17T06:05:51.376942461Z","duration_ms":899},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:51.492Z worker=1 -> 200 0.981585 {"execution":{"started_at":"2026-10-17T06:05:51.509543471Z","duration_ms":962},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:51.811Z worker=4 -> 200 0.898753 {"execution":{"started_at":"2026-10-17T06:05:51.826131623Z","duration_ms":882},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:51.999Z worker=2 -> 200 1.015067 {"execution":{"started_at":"2026-10-17T06:05:52.014383575Z","duration_ms":998},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:52.286Z worker=3 -> 200 0.891698 {"execution":{"started_at":"2026-10-17T06:05:52.304375251Z","duration_ms":871},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:52.483Z worker=1 -> 200 1.189320 {"execution":{"started_at":"2026-10-17T06:05:52.497474842Z","duration_ms":1174},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:52.719Z worker=4 -> 200 1.011628 {"execution":{"started_at":"2026-10-17T06:05:52.733902650Z","duration_ms":996},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:53.023Z worker=2 -> 200 1.161773 {"execution":{"started_at":"2026-10-17T06:05:53.038145245Z","duration_ms":1141},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:53.187Z worker=3 -> 200 0.925996 {"execution":{"started_at":"2026-10-17T06:05:53.208768662Z","duration_ms":902},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:53.682Z worker=1 -> 200 1.122611 {"execution":{"started_at":"2026-10-17T06:05:53.697391963Z","duration_ms":1104},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:53.739Z worker=4 -> 200 0.951943 {"execution":{"started_at":"2026-10-17T06:05:53.757592205Z","duration_ms":933},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:54.122Z worker=3 -> 200 0.997866 {"execution":{"started_at":"2026-10-17T06:05:54.136522248Z","duration_ms":980},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:54.193Z worker=2 -> 200 1.080190 {"execution":{"started_at":"2026-10-17T06:05:54.208781304Z","duration_ms":1062},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:54.700Z worker=4 -> 200 0.981214 {"execution":{"started_at":"2026-10-17T06:05:54.715901001Z","duration_ms":965},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:54.814Z worker=1 -> 200 1.073982 {"execution":{"started_at":"2026-10-17T06:05:54.830808835Z","duration_ms":1054},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:55.129Z worker=3 -> 200 0.983525 {"execution":{"started_at":"2026-10-17T06:05:55.179202160Z","duration_ms":930},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:55.283Z worker=2 -> 200 1.025520 {"execution":{"started_at":"2026-10-17T06:05:55.299749052Z","duration_ms":1008},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:55.691Z worker=4 -> 200 0.913015 {"execution":{"started_at":"2026-10-17T06:05:55.707807867Z","duration_ms":892},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:55.898Z worker=1 -> 200 0.899418 {"execution":{"started_at":"2026-10-17T06:05:55.913466997Z","duration_ms":882},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:56.121Z worker=3 -> 200 0.961686 {"execution":{"started_at":"2026-10-17T06:05:56.180640323Z","duration_ms":892},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:56.318Z worker=2 -> 200 1.076356 {"execution":{"started_at":"2026-10-17T06:05:56.382489629Z","duration_ms":1012},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:56.613Z worker=4 -> 200 0.920652 {"execution":{"started_at":"2026-10-17T06:05:56.633489749Z","duration_ms":852},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:56.806Z worker=1 -> 200 1.083878 {"execution":{"started_at":"2026-10-17T06:05:56.820499957Z","duration_ms":1057},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:57.092Z worker=3 -> 200 0.818602 {"execution":{"started_at":"2026-10-17T06:05:57.108394207Z","duration_ms":794},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:57.404Z worker=2 -> 200 0.914511 {"execution":{"started_at":"2026-10-17T06:05:57.417953759Z","duration_ms":887},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:57.543Z worker=4 -> 200 0.882463 {"execution":{"started_at":"2026-10-17T06:05:57.595667005Z","duration_ms":807},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:57.900Z worker=1 -> 200 0.917771 {"execution":{"started_at":"2026-10-17T06:05:57.939816062Z","duration_ms":858},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:57.920Z worker=3 -> 200 1.063007 {"execution":{"started_at":"2026-10-17T06:05:57.968011771Z","duration_ms":1005},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:58.328Z worker=2 -> 200 0.959419 {"execution":{"started_at":"2026-10-17T06:05:58.404432186Z","duration_ms":873},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:58.434Z worker=4 -> 200 0.976588 {"execution":{"started_at":"2026-10-17T06:05:58.456261444Z","duration_ms":947},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:58.826Z worker=1 -> 200 0.902976 {"execution":{"started_at":"2026-10-17T06:05:58.892111440Z","duration_ms":802},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:58.992Z worker=3 -> 200 1.011445 {"execution":{"started_at":"2026-10-17T06:05:59.010491713Z","duration_ms":984},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:59.296Z worker=2 -> 200 1.002668 {"execution":{"started_at":"2026-10-17T06:05:59.324775890Z","duration_ms":972},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:05:59.419Z worker=4 -> 200 1.091273 {"execution":{"started_at":"2026-10-17T06:05:59.496326447Z","duration_ms":1011},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:05:59.738Z worker=1 -> 200 1.035637 {"execution":{"started_at":"2026-10-17T06:05:59.789567889Z","duration_ms":982},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:06:00.012Z worker=3 -> 200 0.971695 {"execution":{"started_at":"2026-10-17T06:06:00.047029349Z","duration_ms":935},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:06:00.309Z worker=2 -> 200 0.968870 {"execution":{"started_at":"2026-10-17T06:06:00.325690211Z","duration_ms":950},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:06:00.520Z worker=4 -> 200 1.066230 {"execution":{"started_at":"2026-10-17T06:06:00.577510612Z","duration_ms":1006},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:06:00.783Z worker=1 -> 200 1.200053 {"execution":{"started_at":"2026-10-17T06:06:00.801015824Z","duration_ms":1182},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:06:00.993Z worker=3 -> 200 1.110196 {"execution":{"started_at":"2026-10-17T06:06:01.008852290Z","duration_ms":1095},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:06:01.287Z worker=2 -> 200 1.201340 {"execution":{"started_at":"2026-10-17T06:06:01.303922234Z","duration_ms":1186},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:06:01.595Z worker=4 -> 200 1.091296 {"execution":{"started_at":"2026-10-17T06:06:01.607661199Z","duration_ms":1079},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:06:01.992Z worker=1 -> 200 0.990459 {"execution":{"started_at":"2026-10-17T06:06:02.005076469Z","duration_ms":978},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-17T06:06:02.113Z worker=3 -> 200 1.097400 {"execution":{"started_at":"2026-10-17T06:06:02.170959635Z","duration_ms":1040},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:06:02.499Z worker=2 -> 200 1.074492 {"execution":{"started_at":"2026-10-17T06:06:02.512210605Z","duration_ms":1059},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:06:02.695Z worker=4 -> 200 1.101469 {"execution":{"started_at":"2026-10-17T06:06:02.708302314Z","duration_ms":1087},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-17T06:06:02.992Z worker=1 -> 200 1.092134 {"execution":{"started_at":"2026-10-17T06:06:03.005192032Z","duration_ms":1077},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+[2026-10-17T06:06:19.212Z] $ awk '{print $4}' '$D/private/before/work/a/workers.log' | sort | uniq -c
+    228 200
+
+## [2026-10-17T06:06:19.216Z] phase A: GET /api/v1/health every second (time, HTTP status, body)
+[2026-10-17T06:06:19.217Z] $ cat '$D/private/before/work/a/health.log'
+2026-10-17T06:05:03.671Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","data_path":"ok","storage_db":"ok","duckdb":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:04.788Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:06.052Z 503 {"status":"unavailable","checks":{"duckdb":"error","data_path":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:07.314Z 503 {"status":"unavailable","checks":{"auth_db":"ok","data_path":"ok","corpus":"ok","duckdb":"error","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:08.625Z 503 {"status":"unavailable","checks":{"corpus":"ok","storage_db":"ok","auth_db":"ok","ingest_capacity":"ok","duckdb":"error","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:09.886Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"error","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:11.148Z 503 {"status":"unavailable","checks":{"corpus":"ok","auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","duckdb":"error","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:12.410Z 503 {"status":"unavailable","checks":{"ingest_capacity":"ok","corpus":"ok","storage_db":"ok","auth_db":"ok","data_path":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:13.674Z 503 {"status":"unavailable","checks":{"duckdb":"error","auth_db":"ok","corpus":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:14.936Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"error","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:16.225Z 503 {"status":"unavailable","checks":{"corpus":"ok","duckdb":"error","storage_db":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:17.488Z 503 {"status":"unavailable","checks":{"corpus":"ok","auth_db":"ok","ingest_capacity":"ok","duckdb":"error","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:18.750Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","duckdb":"error","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:20.012Z 503 {"status":"unavailable","checks":{"storage_db":"ok","duckdb":"error","ingest_capacity":"ok","auth_db":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:21.274Z 503 {"status":"unavailable","checks":{"auth_db":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"error","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:22.537Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"error","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:23.826Z 503 {"status":"unavailable","checks":{"auth_db":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","duckdb":"error","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:25.125Z 503 {"status":"unavailable","checks":{"auth_db":"ok","duckdb":"error","data_path":"ok","corpus":"ok","ingest_capacity":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:26.425Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","corpus":"ok","ingest_capacity":"ok","duckdb":"error","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:27.725Z 503 {"status":"unavailable","checks":{"ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","corpus":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:28.987Z 503 {"status":"unavailable","checks":{"auth_db":"ok","data_path":"ok","corpus":"ok","ingest_capacity":"ok","duckdb":"error","storage_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:30.273Z 503 {"status":"unavailable","checks":{"auth_db":"ok","data_path":"ok","storage_db":"ok","corpus":"ok","duckdb":"error","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:31.536Z 503 {"status":"unavailable","checks":{"auth_db":"ok","corpus":"ok","storage_db":"ok","duckdb":"error","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:32.798Z 503 {"status":"unavailable","checks":{"auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","data_path":"ok","corpus":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:34.062Z 503 {"status":"unavailable","checks":{"data_path":"ok","auth_db":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:35.323Z 503 {"status":"unavailable","checks":{"ingest_capacity":"ok","storage_db":"ok","auth_db":"ok","data_path":"ok","corpus":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:36.586Z 503 {"status":"unavailable","checks":{"data_path":"ok","ingest_capacity":"ok","duckdb":"error","corpus":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:37.847Z 503 {"status":"unavailable","checks":{"auth_db":"ok","storage_db":"ok","corpus":"ok","duckdb":"error","ingest_capacity":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:39.125Z 503 {"status":"unavailable","checks":{"auth_db":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok","duckdb":"error","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:40.386Z 503 {"status":"unavailable","checks":{"ingest_capacity":"ok","corpus":"ok","duckdb":"error","data_path":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:41.673Z 503 {"status":"unavailable","checks":{"corpus":"ok","duckdb":"error","storage_db":"ok","ingest_capacity":"ok","data_path":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:42.935Z 503 {"status":"unavailable","checks":{"data_path":"ok","ingest_capacity":"ok","duckdb":"error","corpus":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:44.196Z 503 {"status":"unavailable","checks":{"auth_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok","duckdb":"error","storage_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:45.457Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:46.719Z 503 {"status":"unavailable","checks":{"duckdb":"error","data_path":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:47.981Z 503 {"status":"unavailable","checks":{"duckdb":"error","ingest_capacity":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:49.244Z 503 {"status":"unavailable","checks":{"duckdb":"error","data_path":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:50.526Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","duckdb":"error","corpus":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:51.788Z 503 {"status":"unavailable","checks":{"auth_db":"ok","storage_db":"ok","data_path":"ok","duckdb":"error","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:53.050Z 503 {"status":"unavailable","checks":{"auth_db":"ok","storage_db":"ok","corpus":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:54.312Z 503 {"status":"unavailable","checks":{"ingest_capacity":"ok","storage_db":"ok","auth_db":"ok","data_path":"ok","duckdb":"error","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:55.624Z 503 {"status":"unavailable","checks":{"ingest_capacity":"ok","duckdb":"error","auth_db":"ok","storage_db":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:05:56.886Z 503 {"status":"unavailable","checks":{"corpus":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok","storage_db":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:58.147Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:05:59.410Z 503 {"status":"unavailable","checks":{"ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","duckdb":"error","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:00.672Z 503 {"status":"unavailable","checks":{"storage_db":"ok","data_path":"ok","duckdb":"error","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:01.935Z 503 {"status":"unavailable","checks":{"auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"error"},"version":"0.9.3"}
+2026-10-17T06:06:03.196Z 503 {"status":"unavailable","checks":{"storage_db":"ok","corpus":"ok","auth_db":"ok","duckdb":"error","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:04.207Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:05.258Z 200 {"status":"ok","checks":{"duckdb":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","data_path":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:06.310Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:07.321Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:08.371Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:09.421Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:10.430Z 200 {"status":"ok","checks":{"storage_db":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok","data_path":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:11.440Z 200 {"status":"ok","checks":{"corpus":"ok","data_path":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:12.450Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","storage_db":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:13.501Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:14.511Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:15.521Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:16.572Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:17.623Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-17T06:06:18.633Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+[2026-10-17T06:06:19.220Z] $ awk '{print $2}' '$D/private/before/work/a/health.log' | sort | uniq -c
+     17 200
+     46 503
+
+## [2026-10-17T06:06:19.224Z] phase A: pool counters and held work every 5 s
+[2026-10-17T06:06:19.225Z] $ cat '$D/private/before/work/a/pool.log'
+2026-10-17T06:05:03.622Z stats={"pool_capacity":2,"pool_available":2,"active_queries":0,"pool_retained":0} queries={"active":[{"id":7,"running_ms":39}],"retained":[]}
+2026-10-17T06:05:08.725Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":31,"running_ms":293},{"id":29,"running_ms":680},{"id":28,"running_ms":855},{"id":32,"running_ms":180}],"retained":[]}
+2026-10-17T06:05:13.824Z stats={"pool_capacity":2,"pool_available":0,"active_queries":3,"pool_retained":0} queries={"active":[{"id":56,"running_ms":192},{"id":53,"running_ms":736},{"id":54,"running_ms":655},{"id":57,"running_ms":88}],"retained":[]}
+2026-10-17T06:05:19.018Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":79,"running_ms":413},{"id":76,"running_ms":951},{"id":75,"running_ms":980},{"id":78,"running_ms":460}],"retained":[]}
+2026-10-17T06:05:24.096Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":98,"running_ms":968},{"id":99,"running_ms":929},{"id":101,"running_ms":353},{"id":102,"running_ms":329}],"retained":[]}
+2026-10-17T06:05:29.173Z stats={"pool_capacity":2,"pool_available":0,"active_queries":3,"pool_retained":0} queries={"active":[{"id":122,"running_ms":482},{"id":121,"running_ms":964},{"id":124,"running_ms":361}],"retained":[]}
+2026-10-17T06:05:34.204Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":147,"running_ms":663},{"id":149,"running_ms":248},{"id":146,"running_ms":731},{"id":150,"running_ms":154}],"retained":[]}
+2026-10-17T06:05:39.271Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":174,"running_ms":45},{"id":171,"running_ms":482},{"id":173,"running_ms":161},{"id":170,"running_ms":650}],"retained":[]}
+2026-10-17T06:05:44.341Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":199,"running_ms":197},{"id":195,"running_ms":829},{"id":196,"running_ms":797},{"id":198,"running_ms":205}],"retained":[]}
+2026-10-17T06:05:49.443Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":219,"running_ms":767},{"id":222,"running_ms":175},{"id":220,"running_ms":634},{"id":223,"running_ms":98}],"retained":[]}
+2026-10-17T06:05:54.616Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":246,"running_ms":542},{"id":244,"running_ms":921},{"id":243,"running_ms":981},{"id":247,"running_ms":470}],"retained":[]}
+2026-10-17T06:05:59.683Z stats={"pool_capacity":2,"pool_available":0,"active_queries":3,"pool_retained":0} queries={"active":[{"id":271,"running_ms":430},{"id":269,"running_ms":744},{"id":272,"running_ms":258}],"retained":[]}
+2026-10-17T06:06:04.758Z stats={"pool_capacity":2,"pool_available":2,"active_queries":0,"pool_retained":0} queries={"active":[],"retained":[]}
+2026-10-17T06:06:09.849Z stats={"pool_capacity":2,"pool_available":2,"active_queries":0,"pool_retained":0} queries={"active":[],"retained":[]}
+2026-10-17T06:06:14.911Z stats={"pool_capacity":2,"pool_available":2,"active_queries":0,"pool_retained":0} queries={"active":[],"retained":[]}
+
+## [2026-10-17T06:06:19.228Z] phase A: pod trawl-0 every 2 s
+[2026-10-17T06:06:19.230Z] $ cat '$D/private/before/work/a/pod.log'
+2026-10-17T06:05:03.622Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:05.686Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:07.748Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:09.800Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:11.853Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:13.904Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:15.957Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:18.011Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:20.067Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:22.122Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:24.177Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:26.231Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:28.284Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:30.340Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:32.397Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:05:34.450Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:36.506Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:38.562Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:40.615Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:42.667Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:44.721Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:46.772Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:48.829Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:50.890Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:52.945Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:55.000Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:57.056Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:05:59.114Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:06:01.165Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:06:03.225Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:06:05.280Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:06:07.335Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:06:09.384Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:06:11.433Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=False restarts=0
+2026-10-17T06:06:13.483Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:15.531Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:17.580Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+
+## [2026-10-17T06:06:19.233Z] phase A: trawld log lines about refused, timed-out or retained work
+[2026-10-17T06:06:19.234Z] $ grep -E 'query_not_started|query_permit|reclaim|retained|outcome="timeout"|status=504|route="/api/v1/health"' '$D/private/before/work/a/trawld.log' | head -n 60
+2026-10-17T06:05:06.049779724Z 2026-10-17T06:05:06.049704Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=19 kind="ping" reason="expired"
+2026-10-17T06:05:06.049806844Z 2026-10-17T06:05:06.049790Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DHC51NXW1Z1H3AB5T9E1" method="GET" route="/api/v1/health" status=503 latency_ms=252 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:42162
+2026-10-17T06:05:07.311472886Z 2026-10-17T06:05:07.311385Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=24 kind="ping" reason="expired"
+2026-10-17T06:05:07.311547666Z 2026-10-17T06:05:07.311517Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DJKM9FWG444KB51CRCYY" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:42202
+2026-10-17T06:05:08.623113787Z 2026-10-17T06:05:08.623068Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=30 kind="ping" reason="expired"
+2026-10-17T06:05:08.623171607Z 2026-10-17T06:05:08.623145Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DKWKAHDBJR581K4A538G" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:42252
+2026-10-17T06:05:09.884052944Z 2026-10-17T06:05:09.883981Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=36 kind="ping" reason="expired"
+2026-10-17T06:05:09.884110774Z 2026-10-17T06:05:09.884078Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DN41XS4HMCA3A7VJ0WGG" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:45102
+2026-10-17T06:05:11.146730353Z 2026-10-17T06:05:11.146681Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=42 kind="ping" reason="expired"
+2026-10-17T06:05:11.146771563Z 2026-10-17T06:05:11.146757Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DPBF78T8M93DBHHQDYYE" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:45138
+2026-10-17T06:05:12.407614172Z 2026-10-17T06:05:12.407535Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=47 kind="ping" reason="expired"
+2026-10-17T06:05:12.407661582Z 2026-10-17T06:05:12.407636Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DQJW46QVFNSKYDPCZHV2" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:45198
+2026-10-17T06:05:12.921920421Z 2026-10-17T06:05:12.921844Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=50 kind="ping" reason="expired"
+2026-10-17T06:05:12.921983630Z 2026-10-17T06:05:12.921959Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DR2ZEECN84W4V4B14114" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=10.244.0.1:41686
+2026-10-17T06:05:13.671277273Z 2026-10-17T06:05:13.671235Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=55 kind="ping" reason="expired"
+2026-10-17T06:05:13.671376322Z 2026-10-17T06:05:13.671353Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DRTBG9X9RQD5DT75ZXAR" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:45254
+2026-10-17T06:05:14.934101052Z 2026-10-17T06:05:14.934068Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=60 kind="ping" reason="expired"
+2026-10-17T06:05:14.934139571Z 2026-10-17T06:05:14.934119Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DT1VRPVV2BTCYVYC3VG5" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:45350
+2026-10-17T06:05:16.223288338Z 2026-10-17T06:05:16.223223Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=65 kind="ping" reason="expired"
+2026-10-17T06:05:16.223330317Z 2026-10-17T06:05:16.223308Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DVA3W3YYD9B8ZR58SMAP" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:45396
+2026-10-17T06:05:17.485944249Z 2026-10-17T06:05:17.485877Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=72 kind="ping" reason="expired"
+2026-10-17T06:05:17.486003598Z 2026-10-17T06:05:17.485971Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DWHHV30SZBDQ3617WR8P" method="GET" route="/api/v1/health" status=503 latency_ms=252 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:45452
+2026-10-17T06:05:18.748905136Z 2026-10-17T06:05:18.748877Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=77 kind="ping" reason="expired"
+2026-10-17T06:05:18.748943786Z 2026-10-17T06:05:18.748925Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DXS1QG32BVRSX1DJWZ79" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:45498
+2026-10-17T06:05:20.009115246Z 2026-10-17T06:05:20.009039Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=84 kind="ping" reason="expired"
+2026-10-17T06:05:20.009154846Z 2026-10-17T06:05:20.009133Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547DZ0EGK30ACVCA6Y46JAY" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:36246
+2026-10-17T06:05:21.271133608Z 2026-10-17T06:05:21.271039Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=89 kind="ping" reason="expired"
+2026-10-17T06:05:21.271189157Z 2026-10-17T06:05:21.271165Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E07W0MKSA4F02D3SS5S4" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:36292
+2026-10-17T06:05:22.534510074Z 2026-10-17T06:05:22.534435Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=94 kind="ping" reason="expired"
+2026-10-17T06:05:22.534549084Z 2026-10-17T06:05:22.534528Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E1FAXV7W7QXXHS7089YZ" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:36342
+2026-10-17T06:05:22.872627640Z 2026-10-17T06:05:22.872548Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=95 kind="ping" reason="expired"
+2026-10-17T06:05:22.872667229Z 2026-10-17T06:05:22.872638Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E1SX806SJ24X9S604M3A" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=10.244.0.1:37896
+2026-10-17T06:05:23.823688659Z 2026-10-17T06:05:23.823654Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=100 kind="ping" reason="expired"
+2026-10-17T06:05:23.823728269Z 2026-10-17T06:05:23.823702Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E2QKRF3HPZTYVSXBAGNG" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:36392
+2026-10-17T06:05:25.123213990Z 2026-10-17T06:05:25.123098Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=105 kind="ping" reason="expired"
+2026-10-17T06:05:25.123236560Z 2026-10-17T06:05:25.123216Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E40876QP2T8H2X9NV3VD" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:36464
+2026-10-17T06:05:26.423214015Z 2026-10-17T06:05:26.423175Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=111 kind="ping" reason="expired"
+2026-10-17T06:05:26.423288835Z 2026-10-17T06:05:26.423268Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E58VSKC94J0RG2VER6VQ" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:36506
+2026-10-17T06:05:27.722903508Z 2026-10-17T06:05:27.722880Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=117 kind="ping" reason="expired"
+2026-10-17T06:05:27.722943768Z 2026-10-17T06:05:27.722925Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E6HF6K9M1HPM2T964G1G" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:36556
+2026-10-17T06:05:28.984085362Z 2026-10-17T06:05:28.984003Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=123 kind="ping" reason="expired"
+2026-10-17T06:05:28.984132132Z 2026-10-17T06:05:28.984109Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E7RW4PP0YE1C8NA5T5P6" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:46928
+2026-10-17T06:05:30.270939231Z 2026-10-17T06:05:30.270906Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=130 kind="ping" reason="expired"
+2026-10-17T06:05:30.270977951Z 2026-10-17T06:05:30.270957Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E90SSBBTMTVGK9MK40X4" method="GET" route="/api/v1/health" status=503 latency_ms=261 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=10.244.0.1:50822
+2026-10-17T06:05:30.271069971Z 2026-10-17T06:05:30.271043Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=129 kind="ping" reason="expired"
+2026-10-17T06:05:30.271082961Z 2026-10-17T06:05:30.271070Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547E90BZA1Z3F7T39T63QHP" method="GET" route="/api/v1/health" status=503 latency_ms=275 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:46978
+2026-10-17T06:05:31.534326853Z 2026-10-17T06:05:31.534297Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=135 kind="ping" reason="expired"
+2026-10-17T06:05:31.534369433Z 2026-10-17T06:05:31.534350Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547EA8J968WX0511PGXB881" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:47020
+2026-10-17T06:05:32.795362577Z 2026-10-17T06:05:32.795294Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=141 kind="ping" reason="expired"
+2026-10-17T06:05:32.795414587Z 2026-10-17T06:05:32.795394Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547EBG0NZ2P02R0N756WVYH" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:47092
+2026-10-17T06:05:32.873108775Z 2026-10-17T06:05:32.873077Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=142 kind="ping" reason="expired"
+2026-10-17T06:05:32.873150165Z 2026-10-17T06:05:32.873129Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547EBJDV492HWKAS6HF96C0" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=10.244.0.1:50828
+2026-10-17T06:05:33.125114640Z 2026-10-17T06:05:33.125065Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=144 kind="ping" reason="expired"
+2026-10-17T06:05:33.125179590Z 2026-10-17T06:05:33.125159Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547EBTAX3NPW1C7XM7M6ZPZ" method="GET" route="/api/v1/health" status=503 latency_ms=250 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=10.244.0.1:50840
+2026-10-17T06:05:34.059706651Z 2026-10-17T06:05:34.059677Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=148 kind="ping" reason="expired"
+2026-10-17T06:05:34.059751191Z 2026-10-17T06:05:34.059729Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547ECQGH70PR4M0MAG3K7Y0" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:47130
+2026-10-17T06:05:35.320810218Z 2026-10-17T06:05:35.320711Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=153 kind="ping" reason="expired"
+2026-10-17T06:05:35.320864258Z 2026-10-17T06:05:35.320833Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547EDYX6JAGA77YC9H1925V" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:47198
+2026-10-17T06:05:36.583453589Z 2026-10-17T06:05:36.583385Z  INFO trawl_server::pool: query work refused before it started event_type="query_not_started" pool=0 query_id=159 kind="ping" reason="expired"
+2026-10-17T06:05:36.583498729Z 2026-10-17T06:05:36.583480Z  WARN trawl_server::transport::failure::unmetered: request failed event_type="http_failure" request_id="01M547EF6BP48XGQX303HSM0SS" method="GET" route="/api/v1/health" status=503 latency_ms=251 stage="handler_error" error_class="service_unavailable" cause_kind="none" peer_addr=127.0.0.1:47248
+[2026-10-17T06:06:19.238Z] $ grep -c 'event_type="query_not_started".*kind="ping"' '$D/private/before/work/a/trawld.log' || true
+55
+[2026-10-17T06:06:19.242Z] $ grep -oE 'outcome="[a-z_]+"' '$D/private/before/work/a/trawld.log' | sort | uniq -c
+    230 outcome="success"
+
+## [2026-10-17T06:06:19.247Z] phase A: kubelet events
+FIRST                  LAST                   COUNT    TYPE      REASON             OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled          postgres-5dbf87b8f6-rvbq6   Successfully assigned i304-before/postgres-5dbf87b8f6-rvbq6 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled          trawl-0                     Successfully assigned i304-before/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled          trawl-0                     Successfully assigned i304-before/trawl-0 to trawl-i304-control-plane
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    SuccessfulCreate   postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-rvbq6
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    Pulled             postgres-5dbf87b8f6-rvbq6   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    Created            postgres-5dbf87b8f6-rvbq6   Container created
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    Started            postgres-5dbf87b8f6-rvbq6   Container started
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Warning   Unhealthy          postgres-5dbf87b8f6-rvbq6   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    ScalingReplicaSet       postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-17T06:04:10Z   2026-10-17T06:04:10Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-17T06:04:10Z   2026-10-17T06:04:10Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-before/data-trawl-0"
+2026-10-17T06:04:10Z   2026-10-17T06:04:10Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-17T06:04:10Z   2026-10-17T06:04:12Z   2        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-17T06:04:13Z   2026-10-17T06:04:13Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-bc3b47b9-7a94-4095-8df4-db820ad518f8
+2026-10-17T06:04:15Z   2026-10-17T06:04:15Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:04:15Z   2026-10-17T06:04:15Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:04:15Z   2026-10-17T06:04:15Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:04:16Z   2026-10-17T06:04:16Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:04:16Z   2026-10-17T06:04:16Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:04:16Z   2026-10-17T06:04:16Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:04:58Z   2026-10-17T06:04:58Z   1        Normal    Killing                 trawl-0                     Stopping container trawld
+2026-10-17T06:04:58Z   2026-10-17T06:04:58Z   1        Normal    SuccessfulDelete        trawl                       Delete Pod trawl-0 in StatefulSet trawl successful
+2026-10-17T06:04:10Z   2026-10-17T06:04:59Z   2        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:05:30Z   2026-10-17T06:06:00Z   2        Warning   Unhealthy               trawl-0                     Liveness probe failed: HTTP probe failed with statuscode: 503
+2026-10-17T06:05:12Z   2026-10-17T06:06:03Z   7        Warning   Unhealthy               trawl-0                     Readiness probe failed: HTTP probe failed with statuscode: 503
+[2026-10-17T06:06:19.306Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before get pod trawl-0 -o jsonpath=\{range\ .status.conditions\[\*\]\}\{.type\}=\{.status\}\ \{.lastTransitionTime\}\{\"\\n\"\}\{end\}
+PodReadyToStartContainers=True 2026-10-17T06:05:00Z
+Initialized=True 2026-10-17T06:05:00Z
+Ready=True 2026-10-17T06:06:12Z
+ContainersReady=True 2026-10-17T06:06:12Z
+PodScheduled=True 2026-10-17T06:04:59Z
+[2026-10-17T06:06:19.356Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE     IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-rvbq6   1/1     Running   0          2m10s   10.244.0.60   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          80s     10.244.0.63   trawl-i304-control-plane   <none>           <none>
+[2026-10-17T06:06:19.404Z] waiting for trawl-0 to be Ready before phase B
+[2026-10-17T06:06:19.453Z] pod trawl-0 uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+
+## [2026-10-17T06:06:19.767Z] phase B, eviction: SPILL_QUERY up to 8 times, 20s apart; trawld's /tmp is a 512Mi emptyDir
+[2026-10-17T06:06:19.817Z] trawl-0 uid before phase B: 0bef6073-703a-4108-8674-781e6978b029
+[2026-10-17T06:06:23.805Z] SPILL_QUERY attempt 1 at 2026-10-17T06:06:19.820Z -> 200 3.975429 {"execution":{"started_at":"2026-10-17T06:06:19.832559959Z","duration_ms":3964},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-17T06:06:50.627Z] SPILL_QUERY attempt 2 at 2026-10-17T06:06:43.909Z -> 200 6.709354 {"execution":{"started_at":"2026-10-17T06:06:43.945321527Z","duration_ms":6668},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-17T06:07:16.096Z] SPILL_QUERY attempt 3 at 2026-10-17T06:07:10.732Z -> 200 5.354791 {"execution":{"started_at":"2026-10-17T06:07:10.748757370Z","duration_ms":5312},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-17T06:07:40.778Z] SPILL_QUERY attempt 4 at 2026-10-17T06:07:36.211Z -> 200 4.557734 {"execution":{"started_at":"2026-10-17T06:07:36.227763816Z","duration_ms":4534},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-17T06:08:05.551Z] SPILL_QUERY attempt 5 at 2026-10-17T06:08:00.884Z -> 200 4.657982 {"execution":{"started_at":"2026-10-17T06:08:00.899255721Z","duration_ms":4640},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-17T06:08:30.240Z] SPILL_QUERY attempt 6 at 2026-10-17T06:08:25.656Z -> 200 4.575713 {"execution":{"started_at":"2026-10-17T06:08:25.685028002Z","duration_ms":4543},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-17T06:08:54.002Z] SPILL_QUERY attempt 7 at 2026-10-17T06:08:50.344Z -> 500 3.648199 {"error":{"code":"execution_error","message":"query execution failed"}}
+[2026-10-17T06:08:54.060Z] attempts done (evicted=yes); sampling 45 s more
+
+## [2026-10-17T06:09:39.166Z] phase B: trawld /tmp usage every 2 s (time, bytes, path)
+[2026-10-17T06:09:39.167Z] $ cat '$D/private/before/work/b/tmp.log'
+2026-10-17T06:06:19.819Z 4202	/tmp
+2026-10-17T06:06:21.905Z 814453028	/tmp
+2026-10-17T06:06:24.002Z 4202	/tmp
+2026-10-17T06:06:26.083Z 4202	/tmp
+2026-10-17T06:06:28.163Z 4202	/tmp
+2026-10-17T06:06:30.242Z 4202	/tmp
+2026-10-17T06:06:32.321Z 4202	/tmp
+2026-10-17T06:06:34.400Z 4202	/tmp
+2026-10-17T06:06:36.480Z 4202	/tmp
+2026-10-17T06:06:38.566Z 4202	/tmp
+2026-10-17T06:06:40.728Z 4202	/tmp
+2026-10-17T06:06:42.810Z 4202	/tmp
+2026-10-17T06:06:44.944Z 1826	/tmp
+2026-10-17T06:06:47.037Z 1433077910	/tmp
+2026-10-17T06:06:49.742Z 1647413338	/tmp
+2026-10-17T06:06:51.938Z 1826	/tmp
+2026-10-17T06:06:54.018Z 1826	/tmp
+2026-10-17T06:06:56.098Z 1826	/tmp
+2026-10-17T06:06:58.184Z 1826	/tmp
+2026-10-17T06:07:00.269Z 1826	/tmp
+2026-10-17T06:07:02.359Z 1826	/tmp
+2026-10-17T06:07:04.438Z 1826	/tmp
+2026-10-17T06:07:06.521Z 1826	/tmp
+2026-10-17T06:07:08.601Z 1826	/tmp
+2026-10-17T06:07:10.681Z 5590	/tmp
+2026-10-17T06:07:12.764Z 188028560	/tmp
+2026-10-17T06:07:14.846Z 1576834954	/tmp
+2026-10-17T06:07:16.978Z 5590	/tmp
+2026-10-17T06:07:19.105Z 5590	/tmp
+2026-10-17T06:07:21.193Z 5590	/tmp
+2026-10-17T06:07:23.274Z 5590	/tmp
+2026-10-17T06:07:25.354Z 5590	/tmp
+2026-10-17T06:07:27.433Z 5590	/tmp
+2026-10-17T06:07:29.513Z 5590	/tmp
+2026-10-17T06:07:31.597Z 5590	/tmp
+2026-10-17T06:07:33.679Z 5590	/tmp
+2026-10-17T06:07:35.768Z 5590	/tmp
+2026-10-17T06:07:37.859Z 9310494	/tmp
+2026-10-17T06:07:39.962Z 1876365724	/tmp
+2026-10-17T06:07:42.056Z 4196	/tmp
+2026-10-17T06:07:44.135Z 4196	/tmp
+2026-10-17T06:07:46.215Z 4196	/tmp
+2026-10-17T06:07:48.294Z 4196	/tmp
+2026-10-17T06:07:50.374Z 4196	/tmp
+2026-10-17T06:07:52.454Z 4196	/tmp
+2026-10-17T06:07:54.534Z 4196	/tmp
+2026-10-17T06:07:56.616Z 4196	/tmp
+2026-10-17T06:07:58.707Z 4196	/tmp
+2026-10-17T06:08:00.795Z 4196	/tmp
+2026-10-17T06:08:02.876Z 281448736	/tmp
+2026-10-17T06:08:04.981Z 1223299486	/tmp
+2026-10-17T06:08:07.064Z 4198	/tmp
+2026-10-17T06:08:09.145Z 4198	/tmp
+2026-10-17T06:08:11.241Z 4198	/tmp
+2026-10-17T06:08:13.325Z 4198	/tmp
+2026-10-17T06:08:15.410Z 4198	/tmp
+2026-10-17T06:08:17.496Z 4198	/tmp
+2026-10-17T06:08:19.576Z 4198	/tmp
+2026-10-17T06:08:21.657Z 4198	/tmp
+2026-10-17T06:08:23.739Z 4198	/tmp
+2026-10-17T06:08:25.821Z 4198	/tmp
+2026-10-17T06:08:27.905Z 720474400	/tmp
+2026-10-17T06:08:30.029Z 295145760	/tmp
+2026-10-17T06:08:32.115Z 4198	/tmp
+2026-10-17T06:08:34.197Z 4198	/tmp
+2026-10-17T06:08:36.278Z 4198	/tmp
+2026-10-17T06:08:38.359Z 4198	/tmp
+2026-10-17T06:08:40.441Z 4198	/tmp
+2026-10-17T06:08:42.522Z 4198	/tmp
+2026-10-17T06:08:44.606Z 4198	/tmp
+2026-10-17T06:08:46.711Z 4198	/tmp
+2026-10-17T06:08:48.792Z 4198	/tmp
+2026-10-17T06:08:50.878Z 4198	/tmp
+2026-10-17T06:08:52.980Z 587600160	/tmp
+2026-10-17T06:08:55.065Z error: unable to upgrade connection: container not found ("trawld")
+2026-10-17T06:08:57.202Z 36	/tmp
+2026-10-17T06:08:59.285Z 36	/tmp
+2026-10-17T06:09:01.373Z 36	/tmp
+2026-10-17T06:09:03.457Z 36	/tmp
+2026-10-17T06:09:05.538Z 36	/tmp
+2026-10-17T06:09:07.622Z 36	/tmp
+2026-10-17T06:09:09.704Z 36	/tmp
+2026-10-17T06:09:11.787Z 36	/tmp
+2026-10-17T06:09:13.869Z 36	/tmp
+2026-10-17T06:09:15.955Z 36	/tmp
+2026-10-17T06:09:18.041Z 36	/tmp
+2026-10-17T06:09:20.128Z 36	/tmp
+2026-10-17T06:09:22.210Z 36	/tmp
+2026-10-17T06:09:24.292Z 36	/tmp
+2026-10-17T06:09:26.375Z 36	/tmp
+2026-10-17T06:09:28.457Z 36	/tmp
+2026-10-17T06:09:30.539Z 36	/tmp
+2026-10-17T06:09:32.622Z 36	/tmp
+2026-10-17T06:09:34.710Z 36	/tmp
+2026-10-17T06:09:36.797Z 36	/tmp
+2026-10-17T06:09:38.881Z 36	/tmp
+
+## [2026-10-17T06:09:39.170Z] phase B: pod trawl-0 every 2 s
+[2026-10-17T06:09:39.172Z] $ cat '$D/private/before/work/b/pod.log'
+2026-10-17T06:06:19.819Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:21.872Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:23.936Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:25.985Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:28.035Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:30.086Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:32.135Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:34.186Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:36.240Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:38.293Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:40.345Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:42.395Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:44.449Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:46.504Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:48.557Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:50.608Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:52.659Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:54.709Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:56.760Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:06:58.810Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:00.865Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:02.919Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:04.967Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:07.017Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:09.066Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:11.116Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:13.165Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:15.224Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:17.279Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:19.329Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:21.382Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:23.431Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:25.480Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:27.528Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:29.576Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:31.627Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:33.679Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:35.731Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:37.791Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:39.856Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:42.011Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:44.061Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:46.112Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:48.161Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:50.211Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:52.261Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:54.311Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:56.379Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:07:58.435Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:00.490Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:02.539Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:04.591Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:06.644Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:08.694Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:10.745Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:12.795Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:14.846Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:16.901Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:18.956Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:21.005Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:23.054Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:25.104Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:27.153Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:29.206Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:31.258Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:33.308Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:35.359Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:37.408Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:39.458Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:41.507Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:43.557Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:45.609Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:47.660Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:49.711Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:51.768Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:53.824Z uid=0bef6073-703a-4108-8674-781e6978b029 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:55.877Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Pending reason= ready=False restarts=0
+2026-10-17T06:08:57.942Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:08:59.996Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:02.051Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:04.107Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:06.158Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:08.207Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:10.258Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:12.307Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:14.357Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:16.407Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:18.460Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:20.515Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:22.565Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:24.615Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:26.664Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:28.714Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:30.766Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:32.817Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:34.874Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:36.931Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+2026-10-17T06:09:38.980Z uid=ef08580e-917a-4474-8e2e-28e78ce58ee1 phase=Running reason= ready=True restarts=0
+
+## [2026-10-17T06:09:39.175Z] phase B: GET /api/v1/health every second (time, HTTP status, body)
+[2026-10-17T06:09:39.176Z] $ awk '{print $1, $2, $3}' '$D/private/before/work/b/health.log' | uniq -f1 -c | head -n 60
+      1 2026-10-17T06:06:19.869Z 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:20.880Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:21.933Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","auth_db":"ok","duckdb":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:22.943Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","ingest_capacity":"ok","storage_db":"ok","data_path":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:23.994Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:25.004Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:26.054Z 200 {"status":"ok","checks":{"corpus":"ok","storage_db":"ok","ingest_capacity":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:27.105Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:28.114Z 200 {"status":"ok","checks":{"storage_db":"ok","corpus":"ok","data_path":"ok","duckdb":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:29.165Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:30.175Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","duckdb":"ok","corpus":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:31.184Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:32.235Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","auth_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:33.285Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:34.294Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:35.346Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:36.357Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:37.368Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:38.379Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","duckdb":"ok","corpus":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:39.431Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:40.441Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:41.492Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:42.543Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:43.593Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","storage_db":"ok","data_path":"ok","auth_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:44.645Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:45.656Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok","ingest_capacity":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:46.667Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","corpus":"ok","ingest_capacity":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:47.719Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:48.771Z 200 {"status":"ok","checks":{"duckdb":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:49.782Z 200 {"status":"ok","checks":{"duckdb":"ok","ingest_capacity":"ok","data_path":"ok","auth_db":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:50.793Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","storage_db":"ok","corpus":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:51.843Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:52.893Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:53.943Z 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:54.953Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","storage_db":"ok","corpus":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:56.004Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:57.015Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:58.065Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:06:59.116Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:00.168Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:01.180Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","duckdb":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:02.230Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","data_path":"ok","corpus":"ok","ingest_capacity":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:03.239Z 200 {"status":"ok","checks":{"corpus":"ok","ingest_capacity":"ok","duckdb":"ok","storage_db":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:04.290Z 200 {"status":"ok","checks":{"corpus":"ok","data_path":"ok","auth_db":"ok","duckdb":"ok","ingest_capacity":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:05.340Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:06.390Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:07.400Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:08.450Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:09.500Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:10.510Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","corpus":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:11.561Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","auth_db":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:12.615Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","duckdb":"ok","ingest_capacity":"ok","data_path":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:13.699Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","data_path":"ok","corpus":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:14.751Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:15.804Z 200 {"status":"ok","checks":{"corpus":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"ok","storage_db":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:16.814Z 200 {"status":"ok","checks":{"auth_db":"ok","corpus":"ok","ingest_capacity":"ok","storage_db":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:17.867Z 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","duckdb":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:18.918Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","duckdb":"ok","corpus":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:19.929Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-17T06:07:20.979Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+
+## [2026-10-17T06:09:39.180Z] phase B: trawld log lines about the query, errors and shutdown
+[2026-10-17T06:09:39.181Z] $ grep -E 'query_start|query_complete|query_failed|query_error_text|query_timing|http_failure|ERROR|shutdown|signal' '$D/private/before/work/b/trawld.log' | grep -v 'route="/api/v1/health"' | cut -c1-600 | head -n 80
+2026-10-17T06:06:19.832562619Z 2026-10-17T06:06:19.832504Z  INFO http_request{request_id="01M547FSNK9F69F2STC7R278C4" peer_addr=127.0.0.1:45150 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=309 query_len=295 limit=100000 offset=0
+2026-10-17T06:06:23.796786288Z 2026-10-17T06:06:23.796722Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=309 kind="query" request_id="01M547FSNK9F69F2STC7R278C4" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=3964159 query_other_us=377 query_dsl_check_us=198 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=9 query_source_us=838 query_hot_snapshot_us=170 query_emit_us=265 query_bind_us=11707 query_execute_us=3950330 query_post_us=265
+2026-10-17T06:06:23.801164407Z 2026-10-17T06:06:23.801136Z  INFO http_request{request_id="01M547FSNK9F69F2STC7R278C4" peer_addr=127.0.0.1:45150 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=309 query_len=295 total_rows=1 returned_rows=1 duration_ms=3964
+2026-10-17T06:06:43.945317117Z 2026-10-17T06:06:43.945270Z  INFO http_request{request_id="01M547GH6D6RGRSYYQSD8890K3" peer_addr=127.0.0.1:59484 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=337 query_len=295 limit=100000 offset=0
+2026-10-17T06:06:50.614222023Z 2026-10-17T06:06:50.614169Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=337 kind="query" request_id="01M547GH6D6RGRSYYQSD8890K3" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=6668844 query_other_us=337 query_dsl_check_us=216 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=11 query_source_us=961 query_hot_snapshot_us=146 query_emit_us=243 query_bind_us=7155 query_execute_us=6659440 query_post_us=335
+2026-10-17T06:06:50.624286888Z 2026-10-17T06:06:50.624252Z  INFO http_request{request_id="01M547GH6D6RGRSYYQSD8890K3" peer_addr=127.0.0.1:59484 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=337 query_len=295 total_rows=1 returned_rows=1 duration_ms=6668
+2026-10-17T06:07:10.748742980Z 2026-10-17T06:07:10.748701Z  INFO http_request{request_id="01M547HBCM96W05G76C437Y43X" peer_addr=127.0.0.1:57030 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=367 query_len=295 limit=100000 offset=0
+2026-10-17T06:07:16.061789887Z 2026-10-17T06:07:16.061714Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=367 kind="query" request_id="01M547HBCM96W05G76C437Y43X" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=5312954 query_other_us=609 query_dsl_check_us=162 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=9 query_source_us=764 query_hot_snapshot_us=138 query_emit_us=278 query_bind_us=16366 query_execute_us=5294386 query_post_us=242
+2026-10-17T06:07:16.092529954Z 2026-10-17T06:07:16.092472Z  INFO http_request{request_id="01M547HBCM96W05G76C437Y43X" peer_addr=127.0.0.1:57030 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=367 query_len=295 total_rows=1 returned_rows=1 duration_ms=5312
+2026-10-17T06:07:36.227754186Z 2026-10-17T06:07:36.227702Z  INFO http_request{request_id="01M547J48TKZ4YE0RW6CZ6AAV5" peer_addr=127.0.0.1:52008 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=396 query_len=295 limit=100000 offset=0
+2026-10-17T06:07:40.762606864Z 2026-10-17T06:07:40.762413Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=396 kind="query" request_id="01M547J48TKZ4YE0RW6CZ6AAV5" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=4534646 query_other_us=450 query_dsl_check_us=191 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=11 query_source_us=992 query_hot_snapshot_us=161 query_emit_us=356 query_bind_us=13262 query_execute_us=4518907 query_post_us=316
+2026-10-17T06:07:40.774033101Z 2026-10-17T06:07:40.773996Z  INFO http_request{request_id="01M547J48TKZ4YE0RW6CZ6AAV5" peer_addr=127.0.0.1:52008 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=396 query_len=295 total_rows=1 returned_rows=1 duration_ms=4534
+2026-10-17T06:08:00.899241981Z 2026-10-17T06:08:00.899199Z  INFO http_request{request_id="01M547JWBVF7GTT2M5A3MCFZYW" peer_addr=127.0.0.1:59430 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=424 query_len=295 limit=100000 offset=0
+2026-10-17T06:08:05.539972458Z 2026-10-17T06:08:05.539937Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=424 kind="query" request_id="01M547JWBVF7GTT2M5A3MCFZYW" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=4640679 query_other_us=455 query_dsl_check_us=184 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=12 query_source_us=913 query_hot_snapshot_us=155 query_emit_us=311 query_bind_us=13113 query_execute_us=4625134 query_post_us=402
+2026-10-17T06:08:05.547226756Z 2026-10-17T06:08:05.547190Z  INFO http_request{request_id="01M547JWBVF7GTT2M5A3MCFZYW" peer_addr=127.0.0.1:59430 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=424 query_len=295 total_rows=1 returned_rows=1 duration_ms=4640
+2026-10-17T06:08:25.685011982Z 2026-10-17T06:08:25.684970Z  INFO http_request{request_id="01M547KMHZ0Q2V0S8JQ5ZAWW4M" peer_addr=127.0.0.1:49878 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=452 query_len=295 limit=100000 offset=0
+2026-10-17T06:08:30.228271255Z 2026-10-17T06:08:30.228199Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=452 kind="query" request_id="01M547KMHZ0Q2V0S8JQ5ZAWW4M" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=4543168 query_other_us=345 query_dsl_check_us=198 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=10 query_source_us=767 query_hot_snapshot_us=147 query_emit_us=239 query_bind_us=11113 query_execute_us=4530085 query_post_us=264
+2026-10-17T06:08:30.236957557Z 2026-10-17T06:08:30.236924Z  INFO http_request{request_id="01M547KMHZ0Q2V0S8JQ5ZAWW4M" peer_addr=127.0.0.1:49878 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=452 query_len=295 total_rows=1 returned_rows=1 duration_ms=4543
+2026-10-17T06:08:50.361639246Z 2026-10-17T06:08:50.361591Z  INFO http_request{request_id="01M547MCNG8FGQX69VBQQJ3X1T" peer_addr=127.0.0.1:33150 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=480 query_len=295 limit=100000 offset=0
+2026-10-17T06:08:53.962786986Z 2026-10-17T06:08:53.962746Z  INFO trawl_server::shutdown: received SIGTERM, shutting down event_type="shutdown_signal"
+2026-10-17T06:08:53.962829386Z 2026-10-17T06:08:53.962799Z  INFO trawl_server::transport::http: shutdown: stopping accept loop event_type="lifecycle"
+2026-10-17T06:08:53.962843115Z 2026-10-17T06:08:53.962830Z  INFO trawl_server::pool: interrupted active queries for shutdown event_type="lifecycle" count=1
+2026-10-17T06:08:53.962860925Z 2026-10-17T06:08:53.962845Z  INFO trawl_server::transport::http: shutdown: draining in-flight connections event_type="lifecycle" drain_secs=30 connections=515
+2026-10-17T06:08:53.998148308Z 2026-10-17T06:08:53.998107Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=480 kind="query" request_id="01M547MCNG8FGQX69VBQQJ3X1T" outcome="error" work_started=true error_class="database" timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=3636462 query_other_us=282 query_dsl_check_us=206 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=13 query_source_us=874 query_hot_snapshot_us=146 query_emit_us=278 query_bind_us=10871 query_execute_us=3623792
+2026-10-17T06:08:53.998219208Z 2026-10-17T06:08:53.998194Z ERROR http_request{request_id="01M547MCNG8FGQX69VBQQJ3X1T" peer_addr=127.0.0.1:33150 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failed: engine error event_type="query_failed" error_type="engine" error_class="database" user=i304 query_id=480 query_len=295 duration_ms=3636
+2026-10-17T06:08:53.998317778Z 2026-10-17T06:08:53.998294Z DEBUG http_request{request_id="01M547MCNG8FGQX69VBQQJ3X1T" peer_addr=127.0.0.1:33150 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failure detail (DEBUG-only: never stored under the default filter) event_type="query_error_text" query_id=480 error_class="database" error=database error: INTERRUPT Error: Interrupted! safe_error=query execution failed
+2026-10-17T06:08:53.998370828Z 2026-10-17T06:08:53.998353Z ERROR trawl_server::transport::failure: request failed event_type="http_failure" request_id="01M547MCNG8FGQX69VBQQJ3X1T" method="POST" route="/api/v1/query" status=500 latency_ms=3645 stage="handler_error" error_class="database" cause_kind="duckdb_failure" query_id=480 key_id=1
+2026-10-17T06:08:54.037785326Z 2026-10-17T06:08:54.037765Z  INFO trawl_server::scheduler: scheduler shutting down event_type="scheduler_shutdown"
+
+## [2026-10-17T06:09:39.185Z] phase B: kubelet events
+FIRST                  LAST                   COUNT    TYPE      REASON              OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled           postgres-5dbf87b8f6-rvbq6   Successfully assigned i304-before/postgres-5dbf87b8f6-rvbq6 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-before/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-before/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-before/trawl-0 to trawl-i304-control-plane
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    ScalingReplicaSet   postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    Created             postgres-5dbf87b8f6-rvbq6   Container created
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    Started             postgres-5dbf87b8f6-rvbq6   Container started
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Warning   Unhealthy           postgres-5dbf87b8f6-rvbq6   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    SuccessfulCreate        postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-rvbq6
+2026-10-17T06:04:09Z   2026-10-17T06:04:09Z   1        Normal    Pulled                  postgres-5dbf87b8f6-rvbq6   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-17T06:04:10Z   2026-10-17T06:04:10Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-before/data-trawl-0"
+2026-10-17T06:04:10Z   2026-10-17T06:04:10Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-17T06:04:10Z   2026-10-17T06:04:10Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-17T06:04:10Z   2026-10-17T06:04:12Z   2        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-17T06:04:13Z   2026-10-17T06:04:13Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-bc3b47b9-7a94-4095-8df4-db820ad518f8
+2026-10-17T06:04:15Z   2026-10-17T06:04:15Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:04:15Z   2026-10-17T06:04:15Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:04:15Z   2026-10-17T06:04:15Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:04:16Z   2026-10-17T06:04:16Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:04:16Z   2026-10-17T06:04:16Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:04:16Z   2026-10-17T06:04:16Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:04:58Z   2026-10-17T06:04:58Z   1        Normal    Killing                 trawl-0                     Stopping container trawld
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:05:00Z   2026-10-17T06:05:00Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:05:30Z   2026-10-17T06:06:00Z   2        Warning   Unhealthy               trawl-0                     Liveness probe failed: HTTP probe failed with statuscode: 503
+2026-10-17T06:05:12Z   2026-10-17T06:06:03Z   7        Warning   Unhealthy               trawl-0                     Readiness probe failed: HTTP probe failed with statuscode: 503
+2026-10-17T06:08:53Z   2026-10-17T06:08:53Z   1        Warning   Evicted                 trawl-0                     Usage of EmptyDir volume "tmp" exceeds the limit "512Mi". 
+2026-10-17T06:08:53Z   2026-10-17T06:08:53Z   1        Normal    Killing                 trawl-0                     Stopping container trawld
+2026-10-17T06:08:55Z   2026-10-17T06:08:55Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:08:55Z   2026-10-17T06:08:55Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-17T06:08:55Z   2026-10-17T06:08:55Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:04:10Z   2026-10-17T06:08:55Z   3        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-17T06:04:58Z   2026-10-17T06:08:55Z   2        Normal    SuccessfulDelete        trawl                       Delete Pod trawl-0 in StatefulSet trawl successful
+2026-10-17T06:08:56Z   2026-10-17T06:08:56Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:before-b02b8acfb8a2" already present on machine and can be accessed by the pod
+2026-10-17T06:08:56Z   2026-10-17T06:08:56Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-17T06:08:57Z   2026-10-17T06:08:57Z   1        Normal    Started                 trawl-0                     Container started
+[2026-10-17T06:09:39.244Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE     IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-rvbq6   1/1     Running   0          5m30s   10.244.0.60   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          44s     10.244.0.64   trawl-i304-control-plane   <none>           <none>
+[2026-10-17T06:09:39.292Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-before get pod trawl-0 -o jsonpath=\{.metadata.uid\}\ \{.status.phase\}\ \{.status.reason\}\ \{.status.message\}\{\"\\n\"\}
+ef08580e-917a-4474-8e2e-28e78ce58ee1 Running  
+[2026-10-17T06:09:39.339Z] evicted=yes
+
+## [2026-10-17T06:09:39.340Z] done before

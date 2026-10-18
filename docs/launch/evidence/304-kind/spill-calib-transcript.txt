@@ -1,0 +1,212 @@
+
+## [2026-10-18T09:29:07.234Z] run spill-calib: image trawl-i304:after-7dc64b27f566, chart $D/build/src-after/chart/trawl, namespace i304-spill-calib
+[2026-10-18T09:29:07.240Z] $ kind version
+kind v0.33.0 go1.27.0-X:nodwarf5 linux/amd64
+[2026-10-18T09:29:07.267Z] $ helm version --short
+v4.2.2+gb05881c
+[2026-10-18T09:29:07.479Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 version
+Client Version: v1.36.4
+Kustomize Version: v5.8.1
+Server Version: v1.37.0
+[2026-10-18T09:29:07.645Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 get nodes -o wide
+NAME                       STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION            CONTAINER-RUNTIME
+trawl-i304-control-plane   Ready    control-plane   29h   v1.37.0   172.20.0.2    <none>        Debian GNU/Linux 13 (trixie)   7.2.5-3-omarchy (amd64)   containerd://2.3.4
+[2026-10-18T09:29:07.819Z] workload: EVENTS=800000 MSG_CHARS=200 SEED=304 STARVE_WORKERS=4 STARVE_SECS=60 SPILL_ATTEMPTS=8
+[2026-10-18T09:29:07.822Z] STARVE_QUERY: service=i304 | stats count() by message, _raw | stats count()
+[2026-10-18T09:29:07.825Z] SPILL_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count()
+[2026-10-18T09:29:07.830Z] SPILL_BIG_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count() (SPILL_BIG_ATTEMPTS=4 SPILL_BIG_PAUSE=5)
+[2026-10-18T09:29:07.835Z] SMALL_QUERY: service=i304 | stats count()
+[2026-10-18T09:29:07.837Z] $ docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' 'trawl-i304:after-7dc64b27f566'
+sha256:9dd5d5dd8c26e6a674adeb8f8621a96323784d6202ad03c32c258d90976ec067 7dc64b27f566bc3c1052865d4261eb6e1ee3997d
+
+## [2026-10-18T09:29:07.885Z] cluster: the kubelet measures emptyDir usage every 2s
+[2026-10-18T09:29:07.965Z] $ docker exec trawl-i304-control-plane grep -E \^\(volumeStatsAggPeriod\|evictionHard\|\ \ nodefs\|\ \ imagefs\) /var/lib/kubelet/config.yaml
+evictionHard:
+  imagefs.available: 0%
+  nodefs.available: 0%
+  nodefs.inodesFree: 0%
+volumeStatsAggPeriod: 2s
+
+## [2026-10-18T09:29:08.027Z] namespace and disposable PostgreSQL
+[2026-10-18T09:29:08.202Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 create namespace i304-spill-calib
+namespace/i304-spill-calib created
+[2026-10-18T09:29:08.391Z] $ kubectl create secret generic pg-init|fleet-db|trawl-db --from-file=... (values from $D/private/spill-calib, not printed)
+secret/pg-init created
+secret/fleet-db created
+secret/trawl-db created
+[2026-10-18T09:29:08.877Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib apply -f $D/postgres.yaml
+deployment.apps/postgres created
+service/postgres created
+[2026-10-18T09:29:09.326Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib rollout status deployment/postgres --timeout=180s
+Waiting for deployment "postgres" rollout to finish: 0 of 1 updated replicas are available...
+deployment "postgres" successfully rolled out
+
+## [2026-10-18T09:29:16.291Z] helm install with the load values (values.yaml + values-load.yaml)
+[2026-10-18T09:29:16.297Z] $ helm --kubeconfig $D/kubeconfig --kube-context kind-trawl-i304 -n i304-spill-calib install trawl $D/build/src-after/chart/trawl -f $D/values.yaml -f $D/values-load.yaml --set-string image.repository=trawl-i304 --set-string image.tag=after-7dc64b27f566
+NAME: trawl
+LAST DEPLOYED: Sun Oct 18 02:29:16 2026
+NAMESPACE: i304-spill-calib
+STATUS: deployed
+REVISION: 1
+DESCRIPTION: Install complete
+NOTES:
+Trawl has been installed.
+
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Run the guide's fleet-admin commands inside the trawld container, for example:
+
+  kubectl exec --namespace i304-spill-calib -i trawl-0 -c trawld -- fleet-admin roles list
+
+Use a personal API key to sign in to the browser and a service key for each collector.
+The init-auth container initializes the database schema; it does not create API keys.
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+
+Check the HTTPS API through a local port-forward:
+
+  kubectl port-forward --namespace i304-spill-calib svc/trawl 5514:5514
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
+[2026-10-18T09:29:16.903Z] $ sed -n '/^\[server\]/,/^\[server.rate_limit\]/p' '$D/private/spill-calib/work/trawld.toml'
+[server]
+http_addr = "0.0.0.0:5514"
+timeout_secs = 30
+max_concurrent_queries = 2
+max_result_rows = 100000
+max_export_rows = 1000000
+max_request_body_bytes = "128K"
+max_concurrent_requests = 32
+shutdown_drain_secs = 30
+max_sse_connections = 32
+schema_cache_ttl_secs = 60
+max_query_history = 1000
+query_spill_max_bytes = "4GiB"
+query_memory_limit = "2GiB"
+query_threads = 4
+[server.rate_limit]
+[2026-10-18T09:29:16.915Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-spill-calib get statefulset trawl -o json | jq -c '.spec.template.spec | {trawld_resources: (.containers[] | select(.name=="trawld") | .resources), tmp: (.volumes[] | select(.name=="tmp")), probes: (.containers[] | select(.name=="trawld") | {readiness: .readinessProbe | {periodSeconds, failureThreshold, timeoutSeconds}, liveness: .livenessProbe | {periodSeconds, failureThreshold}})}'
+{"trawld_resources":{"limits":{"cpu":"16","memory":"6Gi"},"requests":{"cpu":"250m","memory":"512Mi"}},"tmp":{"emptyDir":{"sizeLimit":"512Mi"},"name":"tmp"},"probes":{"readiness":{"periodSeconds":10,"failureThreshold":3,"timeoutSeconds":5},"liveness":{"periodSeconds":30,"failureThreshold":3}}}
+[2026-10-18T09:29:17.260Z] pod trawl-0 uid=6071ca06-6f28-4d0a-949a-539035b04f02 phase=Pending reason= ready= restarts=
+[2026-10-18T09:29:20.445Z] pod trawl-0 uid=6071ca06-6f28-4d0a-949a-539035b04f02 phase=Pending reason= ready= restarts=
+[2026-10-18T09:29:23.617Z] pod trawl-0 uid=6071ca06-6f28-4d0a-949a-539035b04f02 phase=Running reason= ready=False restarts=0
+[2026-10-18T09:29:26.797Z] pod trawl-0 uid=6071ca06-6f28-4d0a-949a-539035b04f02 phase=Running reason= ready=True restarts=0
+[2026-10-18T09:29:26.801Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE   IP             NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-7nzl7   1/1     Running   0          17s   10.244.0.98    trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          10s   10.244.0.100   trawl-i304-control-plane   <none>           <none>
+
+## [2026-10-18T09:29:26.998Z] API key (query, ingest, server_manage) and trawld's certificate
+[2026-10-18T09:29:27.002Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib exec trawl-0 -c trawld -- sh -c DATABASE_URL=\"\$FLEET_DATABASE_URL\"\ exec\ fleet-admin\ roles\ create\ --name\ i304\ --perm\ trawl:query\ --perm\ trawl:ingest\ --perm\ trawl:server_manage
+created role:
+
+  name:      i304
+  rate_rpm:  (class default)
+  perms:     trawl:ingest, trawl:query, trawl:server_manage
+[2026-10-18T09:29:27.328Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name i304 --kind human --role i304 > $PRIV/token
+created API key:
+
+  name:    i304
+  kind:    human
+  roles:   i304
+  prefix:  VOnvdX7-
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T09:29:27.858Z] token bytes: 48
+[2026-10-18T09:29:28.085Z] $ openssl x509 -in '$D/private/spill-calib/cert.pem' -noout -subject -ext subjectAltName
+subject=CN=rcgen self signed cert
+X509v3 Subject Alternative Name: 
+    DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1
+[2026-10-18T09:29:28.449Z] GET /api/v1/health -> 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+[2026-10-18T09:29:28.453Z] $ curl -sS --cacert '$D/private/spill-calib/cert.pem' -K '$D/private/spill-calib/curl.conf' https://localhost:15514/api/v1/whoami | jq -c .
+{"prefix":"VOnvdX7-","name":"i304","kind":"human","roles":["i304"],"permissions":["query","server_manage","ingest"]}
+
+## [2026-10-18T09:29:28.663Z] ingest 800000 events of 200-character random messages
+[2026-10-18T09:29:28.667Z] $ python3 -I gen-events.py https://localhost:15514/api/v1/ingest $PRIV/cert.pem $PRIV/auth-header 800000 200 304 4000
+  ingested 4000/800000 events, 1 MiB, 0s
+  ingested 104000/800000 events, 29 MiB, 3s
+  ingested 204000/800000 events, 58 MiB, 7s
+  ingested 304000/800000 events, 86 MiB, 11s
+  ingested 404000/800000 events, 115 MiB, 15s
+  ingested 504000/800000 events, 143 MiB, 19s
+  ingested 604000/800000 events, 172 MiB, 24s
+  ingested 704000/800000 events, 200 MiB, 30s
+ingested 800000 events, 228 MiB of NDJSON in 44s
+[2026-10-18T09:30:12.679Z] waiting for the hot buffer to drain into Parquet (trawld's own telemetry keeps a few hundred events there)
+[2026-10-18T09:30:16.803Z] trawl_hot_buffer_events=2
+[2026-10-18T09:30:16.886Z] count query -> 200 0.055332 [[800000]]
+[2026-10-18T09:30:16.890Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-spill-calib exec trawl-0 -c trawld -- du -sh /var/lib/trawl/data /tmp
+333M	/var/lib/trawl/data
+0	/tmp
+
+## [2026-10-18T09:30:17.139Z] helm upgrade to the scenario values (values.yaml alone)
+[2026-10-18T09:30:17.144Z] $ helm --kubeconfig $D/kubeconfig --kube-context kind-trawl-i304 -n i304-spill-calib upgrade trawl $D/build/src-after/chart/trawl -f $D/values.yaml --set-string image.repository=trawl-i304 --set-string image.tag=after-7dc64b27f566
+Release "trawl" has been upgraded. Happy Helming!
+NAME: trawl
+LAST DEPLOYED: Sun Oct 18 02:30:17 2026
+NAMESPACE: i304-spill-calib
+STATUS: deployed
+REVISION: 2
+DESCRIPTION: Upgrade complete
+NOTES:
+Trawl has been installed.
+
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Run the guide's fleet-admin commands inside the trawld container, for example:
+
+  kubectl exec --namespace i304-spill-calib -i trawl-0 -c trawld -- fleet-admin roles list
+
+Use a personal API key to sign in to the browser and a service key for each collector.
+The init-auth container initializes the database schema; it does not create API keys.
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+
+Check the HTTPS API through a local port-forward:
+
+  kubectl port-forward --namespace i304-spill-calib svc/trawl 5514:5514
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
+[2026-10-18T09:30:17.999Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib rollout status statefulset/trawl --timeout=300s
+Waiting for partitioned roll out to finish: 0 out of 1 new pods have been updated...
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+partitioned roll out complete: 1 new pods have been updated...
+[2026-10-18T09:30:24.550Z] $ sed -n '/^\[server\]/,/^\[server.rate_limit\]/p' '$D/private/spill-calib/work/trawld.toml'
+[server]
+http_addr = "0.0.0.0:5514"
+timeout_secs = 30
+max_concurrent_queries = 2
+max_result_rows = 100000
+max_export_rows = 1000000
+max_request_body_bytes = "128K"
+max_concurrent_requests = 32
+shutdown_drain_secs = 30
+max_sse_connections = 32
+schema_cache_ttl_secs = 60
+max_query_history = 1000
+query_spill_max_bytes = "4GiB"
+query_memory_limit = "2GiB"
+query_threads = 4
+[server.rate_limit]
+[2026-10-18T09:30:24.563Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-spill-calib get statefulset trawl -o json | jq -c '.spec.template.spec | {trawld_resources: (.containers[] | select(.name=="trawld") | .resources), tmp: (.volumes[] | select(.name=="tmp")), probes: (.containers[] | select(.name=="trawld") | {readiness: .readinessProbe | {periodSeconds, failureThreshold, timeoutSeconds}, liveness: .livenessProbe | {periodSeconds, failureThreshold}})}'
+{"trawld_resources":{"limits":{"cpu":"1","memory":"4Gi"},"requests":{"cpu":"250m","memory":"512Mi"}},"tmp":{"emptyDir":{"sizeLimit":"512Mi"},"name":"tmp"},"probes":{"readiness":{"periodSeconds":10,"failureThreshold":3,"timeoutSeconds":5},"liveness":{"periodSeconds":30,"failureThreshold":3}}}
+[2026-10-18T09:30:24.903Z] pod trawl-0 uid=76402b4d-3b90-4428-9956-3670d81f72ee phase=Running reason= ready=True restarts=0
+[2026-10-18T09:30:25.240Z] GET /api/v1/health -> 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","auth_db":"ok","corpus":"ok","ingest_capacity":"ok","storage_db":"ok"},"version":"0.9.3"}
+[2026-10-18T09:30:25.567Z] count query -> 200 0.300958 [[800000]]
+[2026-10-18T09:30:25.570Z] stopping after ingest (STOP_AFTER=ingest, calibration only)

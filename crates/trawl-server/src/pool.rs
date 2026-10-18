@@ -42,7 +42,8 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use trawl_engine::cancel::CancelLatch;
-use trawl_engine::executor::{Executor, RowCap};
+use trawl_engine::executor::{Executor, QueryBudgets, RowCap};
+use trawl_engine::scratch::{QueryScratch, ScratchLock};
 use trawl_engine::timing::{PhaseClock, QueryPhase};
 use trawl_engine::value::QueryResult;
 
@@ -63,14 +64,6 @@ pub static TEST_QUERY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 /// Hands each [`ExecutorPool`] its `instance` id.
 static NEXT_POOL_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
-/// The whole budget one health probe gets: queue wait plus the `SELECT 1`
-/// (ADR-0024).
-///
-/// `/health` is unauthenticated and unthrottled, so its cost under a busy
-/// pool has to be a fast unhealthy answer, not a request that waits as
-/// long as a query would.
-const PING_BUDGET: Duration = Duration::from_millis(250);
-
 /// The longest an autocomplete sample waits to GET a permit and the
 /// publication guard, together (ADR-0024).
 ///
@@ -82,9 +75,9 @@ const SAMPLE_ACQUIRE_BUDGET: Duration = Duration::from_secs(1);
 /// Which door a unit of pool work came through.
 ///
 /// Presentation and authorization metadata only: every kind takes the same
-/// permit, the same executor and the same cleanup. `Ping` and `Sample` are
-/// the helper lanes — they hold capacity like any query, so they are in
-/// the registry and in the retained count.
+/// permit, the same executor and the same cleanup. `Sample` is the helper
+/// lane — it holds capacity like any query, so it is in the registry and in
+/// the retained count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkKind {
     /// `POST /api/v1/query`.
@@ -95,8 +88,6 @@ pub enum WorkKind {
     Export,
     /// A scheduled report run.
     Scheduled,
-    /// The health route's `SELECT 1` probe.
-    Ping,
     /// Autocomplete's distinct-value sample.
     Sample,
 }
@@ -110,7 +101,6 @@ impl WorkKind {
             Self::FromSaved => "from_saved",
             Self::Export => "export",
             Self::Scheduled => "scheduled",
-            Self::Ping => "ping",
             Self::Sample => "sample",
         }
     }
@@ -125,7 +115,7 @@ impl WorkKind {
 pub enum WorkOwner {
     /// The key that submitted the request.
     Key(i64),
-    /// The server itself: scheduled runs, health probes. No human owner,
+    /// The server itself: scheduled runs. No human owner,
     /// admin-cancellable.
     System,
 }
@@ -437,9 +427,9 @@ impl WorkSlot {
     /// so the classification never depends on which side of a `select!`
     /// was polled first.
     ///
-    /// Every lane has a budget, helpers included: ping brings its own
-    /// [`PING_BUDGET`] one, so there is no escape hatch here for work
-    /// that could start after its caller stopped waiting.
+    /// Every lane has a budget, the sampling helper included, so there is
+    /// no escape hatch here for work that could start after its caller
+    /// stopped waiting.
     fn begin_work(&self, deadline: Deadline) -> Result<(), StartRefusal> {
         let mut registry = self.registry.lock();
         if registry
@@ -1022,7 +1012,8 @@ pub(crate) fn severity_columns_for(
 ///
 /// Executors are pre-created at startup and reused across queries.
 /// Each executor holds a connection to the same in-memory `DuckDB`
-/// database, sharing cached metadata.
+/// database, the query database (ADR-0056), sharing cached metadata and
+/// its budgets.
 #[derive(Clone)]
 pub struct ExecutorPool {
     publication: Arc<crate::publication::PublicationGate>,
@@ -1056,6 +1047,23 @@ pub struct ExecutorPool {
     /// holding one pool's workers cannot park another's.
     #[cfg(any(test, feature = "test-support"))]
     seams: Arc<seam::Table>,
+    /// A connection to the query database that no permit hands out: the
+    /// source of [`Self::detached_executor`] and of the engine sample's
+    /// connection.
+    clone_source: Arc<Mutex<Executor>>,
+    /// The query scratch directory: the query database spills into it, and
+    /// hot-buffer snapshots and export staging files are made in it
+    /// (ADR-0056). Its lock is not held here but by every connection to
+    /// the query database ([`Executor::open_query_database`]), so it stays
+    /// held while any worker's connection is open, the pool gone or not.
+    scratch: QueryScratch,
+    /// The temp directory a [`Self::for_test`] pool's scratch lives in,
+    /// declared last so it is removed after the pool's own connections
+    /// closed. A worker that outlives the pool does not hold it: a test
+    /// that drops a pool with retained work makes its own scratch
+    /// directory.
+    #[cfg(any(test, feature = "test-support"))]
+    _test_scratch: Option<Arc<tempfile::TempDir>>,
 }
 
 impl std::fmt::Debug for ExecutorPool {
@@ -1095,19 +1103,20 @@ fn run_query_blocking(
     clock: &PhaseClock,
     dsl: &str,
     source: &str,
-    hot_buffer: Option<&Arc<HotBuffer>>,
+    hot: Option<(&Arc<HotBuffer>, &QueryScratch)>,
     pins: &trawl_core::schema::FieldTypes,
     cap: RowCap,
     utc_offset_secs: i32,
     capture_debug: bool,
 ) -> (Result<QueryResult, ServerError>, Option<PoolDebugInfo>) {
+    let hot_buffer = hot.map(|(buffer, _)| buffer);
     // Snapshot hot buffer to a temp ndjson file so fresh events
     // are visible to this query via UNION ALL BY NAME. Returns a
     // cached file when the buffer hasn't changed since the last snapshot;
     // the snapshot also carries the catalog pins (∩ observed keys) the
     // executor conforms the hot branch with.
-    let hot_snapshot = hot_source(hot_buffer.map_or(Ok(None), |hb| {
-        clock.time(QueryPhase::HotSnapshot, || hb.snapshot())
+    let hot_snapshot = hot_source(hot.map_or(Ok(None), |(hb, scratch)| {
+        clock.time(QueryPhase::HotSnapshot, || hb.snapshot(scratch))
     }));
 
     // Capture debug info if requested (query log is active). Its
@@ -1279,12 +1288,17 @@ impl ExecutorPool {
 
     /// Create a pool with the given concurrency limit and base data directory.
     ///
-    /// Pre-creates `max_concurrent` executors sharing the same in-memory
-    /// `DuckDB` database.
+    /// Opens the query database in the locked `scratch` directory under
+    /// `budgets` ([`Executor::open_query_database`]), then pre-creates
+    /// `max_concurrent` executors cloned from it, so every query shares one
+    /// spill cap, one memory limit and one thread count (ADR-0056). Every
+    /// connection to that database holds `scratch`, so the directory stays
+    /// locked for as long as any of them is open.
     ///
     /// # Errors
     /// The database or its spill directory could not be set up, as when the
-    /// spill directory is not private ([`Executor::new`]). Fatal at startup:
+    /// spill directory is not private, or a budget was refused or read back
+    /// differently ([`Executor::open_query_database`]). Fatal at startup:
     /// the server cannot function without `DuckDB`, and the start fails
     /// with this error.
     pub fn new(
@@ -1292,13 +1306,15 @@ impl ExecutorPool {
         max_concurrent: usize,
         max_result_rows: usize,
         hot_buffer: Option<Arc<HotBuffer>>,
+        scratch: Arc<ScratchLock>,
+        budgets: &QueryBudgets,
     ) -> Result<Self, trawl_engine::error::EngineError> {
-        let root = Executor::new()?;
+        let query_scratch = scratch.scratch().clone();
+        let root = Executor::open_query_database(scratch, budgets)?;
         let mut executors = Vec::with_capacity(max_concurrent);
-        for _ in 1..max_concurrent {
+        for _ in 0..max_concurrent {
             executors.push(root.try_clone()?);
         }
-        executors.push(root);
 
         let fallback_glob: Arc<str> =
             Arc::from(format!("{}/**/*.parquet", base_dir.trim_end_matches('/')));
@@ -1326,7 +1342,101 @@ impl ExecutorPool {
             field_catalog: Arc::new(crate::catalog::FieldCatalog::new()),
             #[cfg(any(test, feature = "test-support"))]
             seams: Arc::new(seam::Table::default()),
+            clone_source: Arc::new(Mutex::new(root)),
+            scratch: query_scratch,
+            #[cfg(any(test, feature = "test-support"))]
+            _test_scratch: None,
         })
+    }
+
+    /// A pool for tests: [`Self::new`] over a fresh scratch directory in a
+    /// temp directory the pool owns, under the default budgets.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(
+        base_dir: String,
+        max_concurrent: usize,
+        max_result_rows: usize,
+        hot_buffer: Option<Arc<HotBuffer>>,
+    ) -> Result<Self, trawl_engine::error::EngineError> {
+        Self::for_test_with_budgets(
+            base_dir,
+            max_concurrent,
+            max_result_rows,
+            hot_buffer,
+            &QueryBudgets {
+                spill_max_bytes: crate::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
+                memory_limit: crate::config::DEFAULT_QUERY_MEMORY_LIMIT,
+                threads: crate::config::DEFAULT_QUERY_THREADS,
+            },
+        )
+    }
+
+    /// [`Self::for_test`] under `budgets`.
+    ///
+    /// # Errors
+    /// As [`Self::new`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test_with_budgets(
+        base_dir: String,
+        max_concurrent: usize,
+        max_result_rows: usize,
+        hot_buffer: Option<Arc<HotBuffer>>,
+        budgets: &QueryBudgets,
+    ) -> Result<Self, trawl_engine::error::EngineError> {
+        let dir = tempfile::tempdir()?;
+        let scratch = ScratchLock::open(&dir.path().join("query-scratch"))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut pool = Self::new(
+            base_dir,
+            max_concurrent,
+            max_result_rows,
+            hot_buffer,
+            Arc::new(scratch),
+            budgets,
+        )?;
+        #[expect(
+            clippy::used_underscore_binding,
+            reason = "the field is never read: it is held so the directory outlives the pool"
+        )]
+        {
+            pool._test_scratch = Some(Arc::new(dir));
+        }
+        Ok(pool)
+    }
+
+    /// The query scratch directory this pool's database spills into.
+    #[must_use]
+    pub fn scratch(&self) -> &QueryScratch {
+        &self.scratch
+    }
+
+    /// The connection the engine sample runs on (ADR-0056): cloned from the
+    /// query database, outside every permit, and never in the registry.
+    ///
+    /// # Errors
+    /// The clone failed ([`Executor::diagnostic_connection`]).
+    pub fn diagnostic_connection(
+        &self,
+    ) -> Result<trawl_engine::executor::DiagnosticConnection, trawl_engine::error::EngineError>
+    {
+        self.clone_source.lock().diagnostic_connection()
+    }
+
+    /// A connection to the query database that takes no permit.
+    ///
+    /// For work that reads or writes one stored result outside the query
+    /// lanes: the scheduler's result write and the saved-run read. It shares
+    /// the database's budgets and spill directory with every query, so it
+    /// spills nowhere else and counts against the same caps (ADR-0056), but
+    /// it is not interruptible through the pool and holds no permit.
+    ///
+    /// # Errors
+    /// The clone failed ([`Executor::try_clone`]).
+    pub fn detached_executor(&self) -> Result<Executor, trawl_engine::error::EngineError> {
+        self.clone_source.lock().try_clone()
     }
 
     /// Take this pool's worker seams for one test (see [`seam`]).
@@ -1656,6 +1766,7 @@ impl ExecutorPool {
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
         let hot_buffer = self.hot_buffer.clone();
+        let scratch = self.scratch.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
         // Dispatch to the work-start transition; the worker ends it.
@@ -1718,7 +1829,7 @@ impl ExecutorPool {
                         clock,
                         &dsl,
                         &source,
-                        hot_buffer.as_ref(),
+                        hot_buffer.as_ref().map(|hb| (hb, &scratch)),
                         &pins,
                         cap,
                         utc_offset_secs,
@@ -1980,7 +2091,7 @@ impl ExecutorPool {
     /// Acquire every permit: the repin cutover's exclusion primitive.
     ///
     /// Every lane that can read parquet funnels through this semaphore
-    /// (queries, `from saved`, exports, value sampling, ping), and each lane
+    /// (queries, `from saved`, exports, value sampling), and each lane
     /// computes its source and snapshots its comparison pins inside the
     /// permit-holding task, so holding all permits means no query can
     /// straddle the per-env swap or the pin flip. SSE streams hold no
@@ -2070,81 +2181,6 @@ impl ExecutorPool {
 
     pub fn fallback_glob(&self) -> &Arc<str> {
         &self.fallback_glob
-    }
-
-    /// Lightweight health check: acquire a permit, grab an executor, run
-    /// `SELECT 1`, and return it. Proves the pool and `DuckDB` are functional.
-    ///
-    /// A permit-holding lane like any other, so it registers in the
-    /// lifecycle registry and its capacity shows up in the retained count
-    /// if the probe outlives its caller.
-    ///
-    /// It carries its own [`PING_BUDGET`] deadline, covering the queue
-    /// wait AND the probe together (ADR-0024). `/health` is
-    /// unauthenticated and unthrottled, so a pool full of slow queries
-    /// must cost it a fast unhealthy answer rather than a hung request
-    /// per prober — and a probe that gives up is exactly like any other
-    /// abandoned request: it keeps its permit until the work stops, and
-    /// the failure lands on this probe's own record and nothing else.
-    pub async fn ping(&self) -> Result<(), ServerError> {
-        let deadline = Deadline::after(PING_BUDGET);
-        let semaphore = Arc::clone(&self.semaphore);
-        let id = self.allocate_query_id();
-        let work = WorkContext::system(WorkKind::Ping);
-        let kind = work.kind;
-        // One refusal, told once, however this work ends up refused.
-        let refusal_log = RefusalOnce::new(self.instance);
-        #[cfg(any(test, feature = "test-support"))]
-        let seams = Arc::clone(&self.seams);
-        let permit = match deadline.run(semaphore.acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(ServerError::Internal("executor pool shut down".into())),
-            Err(crate::deadline::Expired) => {
-                return Err(refusal_log.refuse(id, kind, StartRefusal::Expired));
-            }
-        };
-
-        let mut slot = self.begin_slot(id, &work, None, permit, None)?;
-        let started = Arc::clone(&slot.started);
-
-        let mut task = tokio::task::spawn_blocking({
-            let refusal_log = refusal_log.clone();
-            #[cfg(any(test, feature = "test-support"))]
-            let seams = Arc::clone(&seams);
-            move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker_seam!(seams, Entry);
-                    if !slot.publish_interrupt(slot.executor().interrupt_handle()) {
-                        return Err(refusal_log.refuse(id, kind, StartRefusal::Cancelled));
-                    }
-                    if let Err(refusal) = slot.begin_work(deadline) {
-                        return Err(refusal_log.refuse(id, kind, refusal));
-                    }
-                    worker_seam!(seams, Started);
-                    let result = slot.executor().ping().map_err(ServerError::from);
-                    worker_seam!(seams, Finished);
-                    result
-                }));
-                let result = outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("ping")));
-                slot.finish(&result);
-                result
-            }
-        });
-
-        let mut request = RequestGuard::new(self, id, kind, &started, None);
-        tokio::select! {
-            joined = &mut task => {
-                request.disarm();
-                joined.map_err(|e| ServerError::from_join("ping", e))?
-            }
-            () = tokio::time::sleep_until(deadline.instant()) => {
-                if request.abandon() {
-                    Err(ServerError::Timeout)
-                } else {
-                    Err(refusal_log.refuse(id, kind, StartRefusal::Expired))
-                }
-            }
-        }
     }
 
     /// Sample distinct values of one field for autocomplete.
@@ -2311,6 +2347,7 @@ impl ExecutorPool {
         let dsl = dsl.to_owned();
         let base_dir = Arc::clone(&self.base_dir);
         let hot_buffer = self.hot_buffer.clone();
+        let scratch = self.scratch.clone();
         let field_catalog = Arc::clone(&self.field_catalog);
 
         // Dispatch to the work-start transition; the worker ends it.
@@ -2334,15 +2371,21 @@ impl ExecutorPool {
                     let clock = slot.clock();
                     let source = clock.time(QueryPhase::Source, || compute_source(&base_dir, &dsl));
 
-                    // Write to a temp file, then read it back as bytes.
-                    let tmp = tempfile::NamedTempFile::new().map_err(|e| {
-                        ServerError::Internal(format!("failed to create temp file: {e}"))
+                    // Write to a staging file in the query scratch
+                    // directory (ADR-0056), then read it back as bytes.
+                    // The error keeps only its kind: `tempfile` appends the
+                    // path it tried, and an internal error's text is logged.
+                    let tmp = scratch.export_file().map_err(|e| {
+                        ServerError::Internal(format!(
+                            "failed to create the export staging file: {}",
+                            e.kind()
+                        ))
                     })?;
                     let tmp_path = tmp.path().to_owned();
 
                     // Snapshot hot buffer for fresh events.
                     let hot_snapshot = hot_source(hot_buffer.as_ref().map_or(Ok(None), |hb| {
-                        clock.time(QueryPhase::HotSnapshot, || hb.snapshot())
+                        clock.time(QueryPhase::HotSnapshot, || hb.snapshot(&scratch))
                     }))?;
 
                     let pins = clock.time(QueryPhase::Source, || field_catalog.all());
@@ -2449,7 +2492,11 @@ mod tests {
             max_events: 100,
             max_bytes: 1 << 20,
         }));
+        // The envelope columns ingest stamps on every event: written here
+        // by hand because this buffer is filled directly.
         let mut event = serde_json::Map::new();
+        event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+        event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
         event.insert("service".into(), "svc".into());
         event.insert("message".into(), "hello".into());
         hot.insert_for_test(Arc::new(IngestBatch {
@@ -2458,7 +2505,7 @@ mod tests {
             byte_size: 64,
             events: vec![event],
         }));
-        ExecutorPool::new("/nonexistent".into(), max_concurrent, 100_000, Some(hot)).unwrap()
+        ExecutorPool::for_test("/nonexistent".into(), max_concurrent, 100_000, Some(hot)).unwrap()
     }
 
     /// Wait for a blocking thread to reach a state, without letting paused
@@ -2755,7 +2802,10 @@ mod tests {
             })
             .with_field_catalog(Arc::clone(&catalog)),
         );
+        // The envelope columns ingest stamps on every event.
         let mut event = serde_json::Map::new();
+        event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+        event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
         event.insert("service".into(), "svc".into());
         event.insert("lvl".into(), 17.into());
         hot.insert_for_test(Arc::new(IngestBatch {
@@ -2765,9 +2815,10 @@ mod tests {
             events: vec![event],
         }));
 
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, Some(Arc::clone(&hot)))
-            .unwrap()
-            .with_field_catalog(Arc::clone(&catalog));
+        let pool =
+            ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, Some(Arc::clone(&hot)))
+                .unwrap()
+                .with_field_catalog(Arc::clone(&catalog));
 
         let outcome = pool
             .execute(
@@ -2839,7 +2890,7 @@ mod tests {
             events: vec![event],
         }));
 
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, Some(hot)).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, Some(hot)).unwrap();
         let outcome = pool
             .execute(
                 pool.allocate_query_id(),
@@ -2914,7 +2965,7 @@ mod tests {
             byte_size: 64,
             events: vec![event("hot")],
         }));
-        let pool = ExecutorPool::new(
+        let pool = ExecutorPool::for_test(
             data_dir.to_str().unwrap().to_owned(),
             1,
             100_000,
@@ -2922,6 +2973,62 @@ mod tests {
         )
         .unwrap();
         (dir, hot, pool)
+    }
+
+    /// `drop` of a field no event carries is a no-op on the hot lanes too,
+    /// as the live tail answers it (ADR-0001): over cold and hot data, and
+    /// over a hot buffer with no cold data, every row comes back with every
+    /// column. `* EXCLUDE` answered both with an empty result: its refusal
+    /// read as a missing column, and the hot-only retry refused the same way.
+    #[tokio::test]
+    async fn drop_of_an_absent_field_keeps_every_row_on_the_hot_lanes() {
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+
+        async fn columns_and_rows(pool: &ExecutorPool, dsl: &str) -> (Vec<String>, usize) {
+            let result = pool
+                .execute(
+                    pool.allocate_query_id(),
+                    dsl,
+                    Deadline::after(Duration::from_secs(30)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+                .result
+                .unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            let mut names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+            names.sort();
+            (names, result.row_count())
+        }
+
+        let (_dir, _hot, hot_and_cold) = cold_and_hot_pool().await;
+        let all = columns_and_rows(&hot_and_cold, "*").await;
+        assert_eq!(all.1, 2, "one cold row and one hot row");
+        assert_eq!(columns_and_rows(&hot_and_cold, "* | drop nope").await, all);
+
+        let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+            max_events: 100,
+            max_bytes: 1 << 20,
+        }));
+        let mut event = serde_json::Map::new();
+        event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+        event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
+        event.insert("service".into(), "svc".into());
+        event.insert("message".into(), "hello".into());
+        hot.insert_for_test(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 64,
+            events: vec![event],
+        }));
+        let hot_only =
+            ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, Some(hot)).unwrap();
+        let all = columns_and_rows(&hot_only, "*").await;
+        assert_eq!(all.1, 1, "the one hot row");
+        assert!(all.0.contains(&"message".to_owned()), "{all:?}");
+        assert_eq!(columns_and_rows(&hot_only, "* | drop nope").await, all);
     }
 
     /// Rows in a Parquet export's bytes.
@@ -3054,6 +3161,153 @@ mod tests {
         );
     }
 
+    /// The hot-buffer snapshot files in a pool's scratch directory, by
+    /// size.
+    fn snapshot_files(pool: &ExecutorPool) -> Vec<u64> {
+        std::fs::read_dir(pool.scratch().path())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| trawl_engine::scratch::is_snapshot_file_name(&entry.file_name()))
+            .filter_map(|entry| entry.metadata().ok().map(|meta| meta.len()))
+            .collect()
+    }
+
+    /// Snapshots get no byte budget of their own (ADR-0056): at most one
+    /// file per permit plus the cached one exists, each no larger than the
+    /// serialized buffer, however many generations pass while every permit
+    /// holds a snapshot.
+    ///
+    /// Each round parks one export per permit at `Finished`, where it still
+    /// holds its snapshot, and starts each after a fresh insert, so every
+    /// permit holds a different generation's file. A sampler counts the
+    /// files the whole time, including while one round's exports release
+    /// and the next round's take the permits.
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)] // one scenario, round by round
+    async fn snapshot_files_bounded_by_permits() {
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+        use std::sync::atomic::AtomicUsize;
+
+        /// One round's gate and its parked exports.
+        type Round = (
+            Arc<seam::Gate>,
+            Vec<tokio::task::JoinHandle<Result<Vec<u8>, ServerError>>>,
+        );
+        const PERMITS: usize = 3;
+        const ROUNDS: usize = 3;
+
+        let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+            max_events: 10_000,
+            max_bytes: 64 << 20,
+        }));
+        let pool = ExecutorPool::for_test(
+            "/nonexistent".into(),
+            PERMITS,
+            100_000,
+            Some(Arc::clone(&hot)),
+        )
+        .unwrap();
+        let seams = pool.seams();
+        let mut inserted = 0_usize;
+        let mut insert = || {
+            inserted += 1;
+            let events = (0..50)
+                .map(|i| {
+                    let mut event = serde_json::Map::new();
+                    event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+                    event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
+                    event.insert("service".into(), "svc".into());
+                    event.insert(
+                        "message".into(),
+                        format!("batch {inserted} event {i}").into(),
+                    );
+                    event
+                })
+                .collect();
+            hot.insert_for_test(Arc::new(IngestBatch {
+                batch_id: format!("prod/svc_{inserted}").into(),
+                service: "svc".into(),
+                byte_size: 4096,
+                events,
+            }));
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let most = Arc::new(AtomicUsize::new(0));
+        let sampler = std::thread::spawn({
+            let (pool, stop, most) = (pool.clone(), Arc::clone(&stop), Arc::clone(&most));
+            move || {
+                while !stop.load(Ordering::SeqCst) {
+                    most.fetch_max(snapshot_files(&pool).len(), Ordering::SeqCst);
+                    std::thread::yield_now();
+                }
+            }
+        });
+
+        let mut previous: Option<Round> = None;
+        for round in 0..ROUNDS {
+            let gate = seams.hold(Seam::Finished);
+            if let Some((gate, exports)) = previous.take() {
+                gate.release();
+                for export in exports {
+                    export.await.unwrap().expect("the export answers");
+                }
+                assert_eq!(
+                    snapshot_files(&pool).len(),
+                    1,
+                    "round {round}: with no permit held, only the cached file remains"
+                );
+            }
+            let mut exports = Vec::new();
+            for held in 1..=PERMITS {
+                insert();
+                let pool = pool.clone();
+                exports.push(tokio::spawn(async move {
+                    pool.export_parquet(
+                        pool.allocate_query_id(),
+                        "*",
+                        1_000,
+                        Deadline::after(Duration::from_secs(60)),
+                        TEST_WORK,
+                    )
+                    .await
+                }));
+                until("an export holds its snapshot", || gate.arrivals() == held).await;
+            }
+            let files = snapshot_files(&pool);
+            assert_eq!(
+                files.len(),
+                PERMITS,
+                "round {round}: one file per permit, each its own generation, the newest cached"
+            );
+            let whole = hot.serialized_len_for_test();
+            assert!(
+                files.iter().all(|&len| len > 0 && len <= whole),
+                "round {round}: every file is at most the serialized buffer ({whole}): {files:?}"
+            );
+            previous = Some((gate, exports));
+        }
+        let (gate, exports) = previous.unwrap();
+        gate.release();
+        for export in exports {
+            export.await.unwrap().expect("the export answers");
+        }
+        stop.store(true, Ordering::SeqCst);
+        sampler.join().unwrap();
+
+        let most = most.load(Ordering::SeqCst);
+        assert!(
+            most <= PERMITS + 1,
+            "{most} snapshot files existed at once with {PERMITS} permits"
+        );
+        assert_eq!(
+            snapshot_files(&pool).len(),
+            1,
+            "the cached file alone remains"
+        );
+    }
+
     /// A run that produced no rows carries no presentation metadata: an
     /// error and a timeout both stamp nothing, because there is nothing to
     /// present and the walk's answer would describe a result the caller
@@ -3062,7 +3316,7 @@ mod tests {
     async fn a_failed_run_stamps_no_severity_columns() {
         let catalog = Arc::new(crate::catalog::FieldCatalog::new());
         catalog.repin("lvl", trawl_core::schema::CanonicalType::Severity);
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None)
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None)
             .unwrap()
             .with_field_catalog(Arc::clone(&catalog));
 
@@ -3122,7 +3376,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_rejects_invalid_dsl() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
         // Must start with `|` to trigger a parse error — bare text is valid DSL.
         let outcome = pool
             .execute(
@@ -3139,7 +3393,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_respects_concurrency_limit() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
         // just verifying it doesn't panic with a single permit
         let _ = pool
             .execute(
@@ -3155,7 +3409,7 @@ mod tests {
 
     #[tokio::test]
     async fn pool_reuses_executors() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
 
         // Run two sequential queries — both should succeed and the pool
         // should have the same number of idle executors before and after.
@@ -3190,13 +3444,13 @@ mod tests {
 
     #[test]
     fn fallback_glob_derived_from_base_dir() {
-        let pool = ExecutorPool::new("/var/lib/trawl/data".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/var/lib/trawl/data".into(), 1, 100_000, None).unwrap();
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
     #[test]
     fn fallback_glob_strips_trailing_slash() {
-        let pool = ExecutorPool::new("/var/lib/trawl/data/".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/var/lib/trawl/data/".into(), 1, 100_000, None).unwrap();
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
@@ -3213,7 +3467,7 @@ mod tests {
     /// query timeout.
     #[tokio::test(start_paused = true)]
     async fn queue_wait_counts_against_the_deadline() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
         let idle_before = idle_len(&pool);
         // The pool's one permit, held by someone else for the duration.
         let held = pool
@@ -3254,7 +3508,7 @@ mod tests {
     /// so still a capacity refusal.
     #[tokio::test(start_paused = true)]
     async fn publication_wait_counts_against_the_deadline() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
         let idle_before = idle_len(&pool);
         let writer = pool.publication.write().await;
 
@@ -3295,7 +3549,7 @@ mod tests {
         // The worker is held past its work-start transition, so what the
         // request reports is a timeout on work that really is running.
         // Sleeping instead would race the blocking pool's own startup.
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
         let seams = pool.seams();
         let started = seams.hold(Seam::Started);
         let id = pool.allocate_query_id();
@@ -3325,7 +3579,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pool_executor_reclaimed_after_timeout() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
         let seams = pool.seams();
         let started = seams.hold(Seam::Started);
         let idle_before = idle_len(&pool);
@@ -3366,7 +3620,7 @@ mod tests {
     /// forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_drains_queries_and_blocks_new_ones() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
 
         // Nothing in flight: exclusivity is immediate.
         let guard = pool
@@ -3405,7 +3659,7 @@ mod tests {
     /// per-env swap and read after it, sampling a half-swapped corpus.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_blocks_field_value_sampling() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
         let guard = pool
             .exclusive(Duration::from_secs(1))
             .await
@@ -3436,7 +3690,7 @@ mod tests {
 
     #[tokio::test]
     async fn field_value_sampling_publication_timeout_releases_permit() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
         let writer = pool.publication.write().await;
         let idle_before = idle_len(&pool);
 
@@ -3480,7 +3734,7 @@ mod tests {
     /// the job's `blocked` outcome), never an indefinite wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_times_out_bounded_while_a_query_runs() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 2, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
         // This pool's own seam holds the query mid-flight: waiting a fixed
         // 50 ms for it to take its permit, and relying on a delay any
         // sibling test could reset, is a bet on how busy the runner is.
@@ -4280,7 +4534,6 @@ mod tests {
                 TEST_SAMPLE_WORK,
             )
             .await;
-        pool.ping().await.expect("the pool pings");
 
         assert_eq!(idle_len(&pool), baseline_idle);
         assert_eq!(pool.available_permits(), baseline_permits);
@@ -4289,16 +4542,15 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// Neither helper lane may wait like a query (ADR-0024).
+    /// The sampling helper may not wait like a query (ADR-0024).
     ///
-    /// The pool's one permit is parked in a worker, so both helpers can
-    /// only queue. Ping gives up after its own 250 ms probe budget and
-    /// sampling after one second of acquisition, no matter how long the
-    /// caller's overall deadline is — and the smaller of the two always
-    /// wins, so a 300 ms caller waits 300 ms. Each answers the safe
-    /// capacity refusal, and neither leaves anything behind.
+    /// The pool's one permit is parked in a worker, so the sample can
+    /// only queue. It gives up after one second of acquisition, no matter
+    /// how long the caller's overall deadline is — and the smaller of the
+    /// two always wins, so a 300 ms caller waits 300 ms. It answers the
+    /// safe capacity refusal, and leaves nothing behind.
     #[tokio::test(start_paused = true)]
-    async fn ping_and_sampling_bound_their_wait() {
+    async fn sampling_bounds_its_wait() {
         let pool = hot_pool(1);
         let seams = pool.seams();
         let parked = seams.hold(Seam::Started);
@@ -4319,27 +4571,6 @@ mod tests {
         });
         until("the pool's one permit is taken", || parked.arrivals() == 1).await;
         assert_eq!(pool.available_permits(), 0);
-
-        // -- ping: 250 ms, acquisition included --
-        let prober = pool.clone();
-        let probe = tokio::spawn(async move { prober.ping().await });
-        settle().await;
-        tokio::time::advance(Duration::from_millis(200)).await;
-        settle().await;
-        assert!(
-            !probe.is_finished(),
-            "the probe must still be waiting inside its budget"
-        );
-        tokio::time::advance(Duration::from_millis(51)).await;
-        settle().await;
-        let refused = probe
-            .await
-            .expect("the probe task joins")
-            .expect_err("a full pool cannot be pinged");
-        assert!(
-            matches!(&refused, ServerError::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED),
-            "expected the safe capacity refusal, got {refused:?}"
-        );
 
         // -- sampling: one second of acquisition under a long deadline --
         let sampler = pool.clone();
@@ -4464,6 +4695,234 @@ mod tests {
         .await;
         assert!(!pool.cancel_by_id(id));
         assert!(registry_is_empty(&pool));
+    }
+
+    /// An export whose staging file cannot be made in the query scratch
+    /// directory fails without naming it (ADR-0056). The error's text is
+    /// what the internal-error log records, and the I/O error `tempfile`
+    /// raises carries the path it tried.
+    #[tokio::test]
+    async fn a_staging_file_failure_names_no_path() {
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100, None).unwrap();
+        let scratch = pool.scratch().path().to_owned();
+        std::fs::remove_dir_all(&scratch).expect("the scratch directory");
+
+        let error = pool
+            .export_parquet(
+                pool.allocate_query_id(),
+                "*",
+                10,
+                Deadline::after(Duration::from_secs(30)),
+                TEST_WORK,
+            )
+            .await
+            .expect_err("no staging file, no export");
+        assert!(matches!(error, ServerError::Internal(_)), "{error:?}");
+        let shown = error.to_string();
+        for named in [scratch.to_str().unwrap(), "trawl-export-"] {
+            assert!(
+                !shown.contains(named),
+                "{named:?} reached the error: {shown}"
+            );
+        }
+    }
+
+    /// A budget exhausted by the `_raw`-free retry is the query's answer
+    /// (ADR-0056). A bare word binds `_raw`, a corpus without it fails that
+    /// bind, and the retry that binds `message` instead runs out of the
+    /// shared budget. Reporting the first attempt's missing `_raw` there
+    /// answered a 400 for a column the reader never named, and, with a hot
+    /// buffer, routed the query into the hot-only fallback and a 200 that
+    /// left the cold rows out. Both lanes, with and without a hot buffer,
+    /// must answer `query_resource_exhausted`.
+    #[tokio::test]
+    async fn an_exhausted_raw_free_retry_answers_resource_exhausted() {
+        use std::num::{NonZeroU32, NonZeroU64};
+
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+        use trawl_engine::error::EngineError;
+
+        const MIB: u64 = 1024 * 1024;
+        const DSL: &str = "hello | dedup message | stats count()";
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data = dir.path().join("data");
+        let hour = data.join("prod/2026-01-03/00");
+        std::fs::create_dir_all(&hour).expect("hour dir");
+        let corpus = hour.join("svc.parquet");
+        duckdb::Connection::open_in_memory()
+            .expect("fixture duckdb")
+            .execute_batch(&format!(
+                "COPY (SELECT TIMESTAMP '2026-01-03 00:05:00' AS _time, \
+                 'hello ' || i::VARCHAR AS message FROM range(1000000) t(i)) \
+                 TO '{}' (FORMAT PARQUET)",
+                corpus.to_str().expect("utf-8")
+            ))
+            .expect("a corpus with no _raw column");
+        let budgets = QueryBudgets {
+            spill_max_bytes: NonZeroU64::new(4 * MIB).unwrap(),
+            memory_limit: NonZeroU64::new(32 * MIB).unwrap(),
+            threads: NonZeroU32::new(2).unwrap(),
+        };
+        let hot = || {
+            let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+                max_events: 100,
+                max_bytes: 1 << 20,
+            }));
+            let mut event = serde_json::Map::new();
+            event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+            event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
+            event.insert("service".into(), "svc".into());
+            event.insert("message".into(), "hello hot".into());
+            hot.insert_for_test(Arc::new(IngestBatch {
+                batch_id: "prod/svc_hot".into(),
+                service: "svc".into(),
+                byte_size: 64,
+                events: vec![event],
+            }));
+            hot
+        };
+
+        let exhausted = |error: &ServerError| {
+            matches!(error, ServerError::Engine(EngineError::ResourceExhausted))
+        };
+        let mut wrong = Vec::new();
+        for (label, hot) in [("cold only", None), ("with a hot buffer", Some(hot()))] {
+            let pool = ExecutorPool::for_test_with_budgets(
+                data.to_str().expect("utf-8").to_owned(),
+                1,
+                100_000,
+                hot,
+                &budgets,
+            )
+            .expect("pool");
+            let deadline = || Deadline::after(Duration::from_secs(120));
+
+            let query = pool
+                .execute(
+                    pool.allocate_query_id(),
+                    DSL,
+                    deadline(),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+                .result;
+            if !query.as_ref().is_err_and(exhausted) {
+                wrong.push(format!("query, {label}: {:?}", query.map(|r| r.rows)));
+            }
+            let export = pool
+                .export_parquet(pool.allocate_query_id(), DSL, 1_000, deadline(), TEST_WORK)
+                .await;
+            if !export.as_ref().is_err_and(exhausted) {
+                wrong.push(format!(
+                    "export, {label}: {:?}",
+                    export.map(|bytes| parquet_rows(&bytes))
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Work that outlives its request and its pool keeps the query scratch
+    /// directory locked until its connection to the query database closes
+    /// (ADR-0056), whichever lane it came through. A field sample and a
+    /// `from saved` run park past their deadlines; then the pool and the
+    /// engine sampler drop. A second lock on the directory must refuse
+    /// while either worker still holds a connection: taking it would
+    /// reclaim the spill directory the parked database still writes into.
+    /// Once both workers finish, the lock frees, and the database removed
+    /// its own spill directory on the way out.
+    #[tokio::test(start_paused = true)]
+    async fn a_retained_worker_keeps_the_scratch_locked_past_its_pool() {
+        use trawl_engine::scratch::{Reclaimed, ScratchError};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("query-scratch");
+        let pool = ExecutorPool::new(
+            "/nonexistent".into(),
+            2,
+            100,
+            None,
+            Arc::new(ScratchLock::open(&path).expect("the first lock")),
+            &QueryBudgets {
+                spill_max_bytes: crate::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
+                memory_limit: crate::config::DEFAULT_QUERY_MEMORY_LIMIT,
+                threads: crate::config::DEFAULT_QUERY_THREADS,
+            },
+        )
+        .expect("pool");
+        let sample = crate::engine_sample::EngineSample::start(&pool).expect("sampler");
+        sample.wait_for_first();
+        let seams = pool.seams();
+        let started = seams.hold(Seam::Started);
+
+        let sampler = pool.clone();
+        let field = tokio::spawn(async move {
+            sampler
+                .sample_field_values(
+                    "service",
+                    None,
+                    10,
+                    Deadline::after(Duration::from_secs(5)),
+                    TEST_SAMPLE_WORK,
+                )
+                .await
+        });
+        until("the field sample starts", || started.arrivals() == 1).await;
+        let saved = pool.clone();
+        let run = tokio::spawn(async move {
+            saved
+                .execute_with_source(
+                    saved.allocate_query_id(),
+                    "*",
+                    "read_parquet('/nonexistent/run.parquet')",
+                    Deadline::after(Duration::from_secs(5)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+        });
+        until("the saved run starts", || started.arrivals() == 2).await;
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let field = field.await.expect("the sample joins");
+        assert!(matches!(field, Err(ServerError::Timeout)), "{field:?}");
+        let run = run.await.expect("the run joins").result;
+        assert!(matches!(run, Err(ServerError::Timeout)), "{run:?}");
+        assert_eq!(pool.retained(), 2, "both workers outlive their requests");
+
+        sample.stop_and_wait_for_test();
+        drop(pool);
+        let refused = ScratchLock::open(&path).expect_err("a parked worker still holds the lock");
+        assert!(
+            matches!(refused, ScratchError::Locked { .. }),
+            "expected the held lock, got {refused}"
+        );
+
+        started.release();
+        let begun = std::time::Instant::now();
+        let reopened = loop {
+            match ScratchLock::open(&path) {
+                Ok(lock) => break lock,
+                Err(ScratchError::Locked { .. }) => {
+                    assert!(
+                        begun.elapsed() < Duration::from_secs(20),
+                        "the lock never freed after the workers finished"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("the scratch directory refused a reopen: {error}"),
+            }
+        };
+        assert_eq!(
+            reopened.reclaimed(),
+            Reclaimed::default(),
+            "the database removed its own spill directory before the lock freed"
+        );
     }
 
     /// When the cutover cannot take the pool, the log says what is in the
@@ -4594,7 +5053,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_all_clears_interrupts() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
         // No active queries — cancel_all should be a no-op.
         pool.cancel_all();
         assert!(pool.registry.lock().interrupts.is_empty());
@@ -4674,7 +5133,7 @@ mod tests {
     /// ran out and no worker phase: nothing started (ADR-0046).
     #[tokio::test(start_paused = true)]
     async fn capacity_refusal_reports_wait_phases() {
-        let pool = ExecutorPool::new("/nonexistent".into(), 1, 100_000, None).unwrap();
+        let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
 
         // Refused in the queue: the pool's one permit is held elsewhere.
         let held = pool

@@ -130,7 +130,9 @@ config:
   server:
     httpAddr: "0.0.0.0:5514"
     timeoutSecs: 30
-    # Defaults to CPU count when empty.
+    # Executor permits. Empty leaves trawld's default, the CPU count up to 8.
+    # The chart sets no CPU limit, so a large node would otherwise get one
+    # permit per host core, all sharing queryMemoryLimit.
     maxConcurrentQueries: ""
     maxResultRows: 100000
     maxExportRows: 1000000
@@ -145,8 +147,35 @@ config:
     # the listener can fill the probe allowance, and junk tokens can fill the
     # control allowance; block such a source at the network. At 32, ingest
     # bodies alone can reach 1 GiB (count x (wire + decoded body)), inside
-    # the 2Gi container limit.
+    # the 8Gi container limit (see resources below).
     maxConcurrentRequests: 32
+    # Query scratch (ADR-0056): where queries spill, where hot-buffer query
+    # snapshots live and where exports stage. Empty leaves trawld's default,
+    # the sibling <data.path>.query-scratch, which is on the data volume
+    # whenever data.path sits below /var/lib/trawl. A value must be an
+    # absolute path below /var/lib/trawl, outside the data root, the WAL
+    # directory and the repin staging roots. Not the /tmp emptyDir: the
+    # kubelet evicts a pod whose emptyDir passes its sizeLimit. With
+    # crashDump.enabled the render also refuses a crashDump.mountPath at,
+    # under, or above the effective scratch directory: that mount would put
+    # scratch on the crash-dump volume.
+    queryScratchDir: ""
+    # Ceiling on the spill one trawld holds in the scratch directory, shared
+    # by every query. DuckDB overshoots it on disk by up to one block (32 to
+    # 256 KiB) per live temp file while it writes. A size class adds a file
+    # each time it passes 4000 blocks, so at 4GiB it can hold several. Keep
+    # retention.minFreeDiskBytes above it: nothing checks the two against
+    # each other.
+    querySpillMaxBytes: "4GiB"
+    # DuckDB memory_limit for the query database, shared by every query.
+    # Compaction, rollup, conform and repin have their own,
+    # ingest.compactionMemoryLimit.
+    queryMemoryLimit: "2GiB"
+    # DuckDB threads for the query database.
+    queryThreads: 4
+    # Seconds trawld drains in-flight requests after SIGTERM. The pod's
+    # terminationGracePeriodSeconds is this plus 30, for the runtime's 10 s
+    # shutdown and the 5 s telemetry flush that follow the drain.
     shutdownDrainSecs: 30
     maxSseConnections: 32
     # How often to check for rotated TLS certs (seconds). Default: 300.
@@ -178,6 +207,15 @@ config:
     # Defaults to {data.path}/wal when empty.
     walDir: ""
     compactionIntervalSecs: 10
+    # DuckDB memory_limit of each compaction, rollup, conform and repin
+    # database, as a DuckDB string (GiB is binary; DuckDB reads GB as 10^9).
+    # At most two run at once. A statement that runs out logs
+    # maintenance_resource_exhausted. Compaction and rollup retry on the next
+    # pass. A repin statement that runs out, with no fallback, ends the job
+    # failed and needs a new job. Boot conformance retries at the next boot.
+    # Optional sampling falls back and the pass completes: misfit samples in
+    # compaction and conform, and the repin scan's sampled count.
+    compactionMemoryLimit: "1GiB"
     internalTelemetry: true
     dailyRollup: true
     eventBusCapacity: 4096
@@ -208,7 +246,11 @@ config:
 
   retention:
     maxAgeDays: 90
-    minFreeDiskBytes: "1G"
+    # Pressure deletion starts below this much free space on the data
+    # volume. 6GiB holds the 4GiB spill budget, the hot-buffer snapshots
+    # ((maxConcurrentQueries + 1) x the serialized hot buffer) and export
+    # staging. Raise it with querySpillMaxBytes; nothing validates the pair.
+    minFreeDiskBytes: "6GiB"
     retentionIntervalSecs: 3600
     # Per-env age overrides: env name -> max_age_days. An env with no
     # entry keeps maxAgeDays above; 0 disables age-based deletion for that
@@ -256,7 +298,6 @@ config:
   scheduler:
     enabled: true
     pollIntervalSecs: 10
-    reportMaxRows: 10000
     maxRunsPerSchedule: 100
     reportRetentionDays: 30
     # Intervals of missed coverage one since_last catch-up run may cover
@@ -354,10 +395,15 @@ initAuth:
 resources:
   requests:
     cpu: 250m
-    memory: 512Mi
+    memory: 1Gi
   limits:
-    # No CPU limit — DuckDB benefits from burst capacity.
-    memory: 2Gi
+    # No CPU limit — DuckDB benefits from burst capacity. Worst-case resident
+    # memory at the defaults is about 6.1-6.6 GiB: the query database 2 GiB,
+    # two maintenance databases at 1 GiB each, in-flight ingest bodies
+    # 32 x 2 x 16 MiB = 1 GiB, argon2 4 x 128 MiB = 512 MiB, the hot buffer
+    # and telemetry, and RSS DuckDB does not account. A sizing, not a bound:
+    # the DuckDB budgets cover DuckDB-managed memory only.
+    memory: 8Gi
 
 # -- Extra environment variables for the trawld container.
 # Example:
@@ -417,7 +463,12 @@ web:
       cpu: 50m
       memory: 64Mi
     limits:
-      memory: 256Mi
+      # ADR-0054 (amended 2026-10-17) and ADR-0056. The proxy admits at
+      # most 64 requests in progress and buffers at most 128 MiB of
+      # request bodies across them, whatever
+      # config.server.maxRequestBodyBytes is; the other 384 MiB is
+      # headroom for the runtime, TLS, response buffers and the SPA.
+      memory: 512Mi
   extraEnv: []
   # The sidecar's own uid. In tls.mode=auto it mounts trawld's tls
   # directory, which holds only cert.pem. trawld's key.pem is in tls-key/,

@@ -109,7 +109,14 @@ pub enum RepinStart {
     /// request's own ladder was still running it (#109). The corpus is
     /// untouched and the pin unchanged, so this is never a report.
     Cancelled(trawl_api::RepinJobResponse),
-    /// 202: the rewrite is running; poll `schema_repin_status`.
+    /// 202: the job is claimed; follow it with `schema_repin_job`. Usually
+    /// the rewrite, but a job whose decision is still pending at the
+    /// server's `[server] timeout_secs` answers 202 too, dry runs included
+    /// (usually the scan, but the corpus-gate wait, the plan write and the
+    /// pre-flight can also outlast it), and the plan or refusal is then read
+    /// by the job's id. The row is normally
+    /// `running`, but a job that finished as the answer was built can be
+    /// terminal already, and is then its own verdict.
     Started(trawl_api::RepinJobResponse),
     /// 409 with a job body: the scan projected nulled values and no force
     /// flag was passed — the job is the plan the refusal is based on.
@@ -716,8 +723,10 @@ impl HttpClient {
     ///
     /// The HTTP status carries the verdict, so this returns a three-way
     /// outcome instead of flattening 409-with-plan into an opaque error:
-    /// 200 = dry-run report or a cancelled job, 202 = rewrite started, 409
-    /// with a job body = lossy without force (the plan rides back). The 200
+    /// 200 = dry-run report or a cancelled job, 202 = the job is running
+    /// (the rewrite, or a decision still pending at the server's answer
+    /// bound),
+    /// 409 with a job body = lossy without force (the plan rides back). The 200
     /// pair is told apart by the row's own status, never by the code alone
     /// (see [`decode_repin_start`]). Every other failure —
     /// including the "already running" 409, whose body is the error
@@ -824,11 +833,28 @@ impl HttpClient {
     }
 
     /// Fetch the repin status surface
-    /// (`GET /api/v1/schema/repin/status`).
+    /// (`GET /api/v1/schema/repin/status`): the running job, else the
+    /// newest one.
     pub async fn schema_repin_status(&self) -> Result<RepinStatusResponse, ClientError> {
         let url = self.endpoint("/api/v1/schema/repin/status");
         let req = self.client.get(&url);
         self.send_authenticated(req).await
+    }
+
+    /// Read one repin job by its id
+    /// (`GET /api/v1/schema/repin/status?id=`).
+    ///
+    /// The way to follow a job a trigger answered 202 for: no newer job can
+    /// stand in for it, and the server accepts `schema_write` as well as
+    /// `schema_read` here, so the key that started the job can follow it.
+    /// An id the server does not know is a [`ClientError::Server`] 404.
+    pub async fn schema_repin_job(
+        &self,
+        id: i64,
+    ) -> Result<trawl_api::RepinJobResponse, ClientError> {
+        let url = self.endpoint("/api/v1/schema/repin/status");
+        let req = self.client.get(&url).query(&[("id", id)]);
+        decode_repin_job(id, self.send_authenticated(req).await?)
     }
 
     /// Reclaim pin slots held by dead fields
@@ -1023,16 +1049,21 @@ impl HttpClient {
                         }
                         Some("snapshot") => {
                             if let Some(data) = event_data {
-                                // Parse {"columns":[...],"rows":[...]} payload.
+                                // Parse {"columns":[...],"rows":[...],"capped":[...]}
+                                // payload; `capped` is omitted when nothing
+                                // was dropped.
                                 #[derive(serde::Deserialize)]
                                 struct SnapshotPayload {
                                     columns: Vec<String>,
                                     rows: Vec<serde_json::Map<String, serde_json::Value>>,
+                                    #[serde(default)]
+                                    capped: Vec<trawl_api::stream::SnapshotCap>,
                                 }
                                 if let Ok(s) = serde_json::from_str::<SnapshotPayload>(&data) {
                                     yield StreamEvent::Snapshot {
                                         columns: s.columns,
                                         rows: s.rows,
+                                        capped: s.capped,
                                     };
                                 }
                             }
@@ -1517,8 +1548,9 @@ fn connection_cut(e: &(dyn std::error::Error + 'static)) -> bool {
 /// A 200 naming a `running` job contradicts the route's contract — both
 /// 200 shapes are terminal rows — so it is a protocol error rather than a
 /// report a caller would print as a plan. A 202 is left alone: the server
-/// reads the row back after spawning the rewrite, so a fast job can
-/// legitimately be terminal by the time it is serialised.
+/// reads the row back after spawning the rewrite, or once its answer bound
+/// passed mid-scan, so a fast job can legitimately be terminal by the time
+/// it is serialised.
 ///
 /// Every success arm names the status it decodes, and there is no wildcard
 /// into `Report`. There used to be, and a `failed` row fell through it: a
@@ -1539,6 +1571,29 @@ fn decode_repin_start(
         (_, "succeeded") => Ok(RepinStart::Report(job)),
         (_, "cancelled") => Ok(RepinStart::Cancelled(job)),
         _ => Ok(RepinStart::Failed(job)),
+    }
+}
+
+/// The job a read by id answered with, checked against the id asked for.
+///
+/// The server answers that one job or a 404, so an empty body or another
+/// job's row did not come from a server honouring the id (a server that
+/// predates it answers the unscoped read). Either would hand the caller a
+/// job it did not ask about, which is the stand-in the id exists to
+/// prevent, so both are protocol errors.
+fn decode_repin_job(
+    id: i64,
+    body: RepinStatusResponse,
+) -> Result<trawl_api::RepinJobResponse, ClientError> {
+    match body.job {
+        Some(job) if job.id == id => Ok(job),
+        Some(job) => Err(ClientError::Parse(format!(
+            "repin status: asked for job {id}, the server answered about job {}",
+            job.id
+        ))),
+        None => Err(ClientError::Parse(format!(
+            "repin status: asked for job {id}, the server answered with no job"
+        ))),
     }
 }
 
@@ -1884,6 +1939,70 @@ mod tests {
         let (result, request) = tokio::join!(client.health(), serve_once(listener, response));
         assert!(request.starts_with("GET /api/v1/health "), "{request}");
         result
+    }
+
+    /// A snapshot frame's `capped` reaches the event; a frame without it
+    /// reads as nothing dropped.
+    #[tokio::test]
+    async fn snapshot_event_carries_capped() {
+        use futures::StreamExt as _;
+        use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+
+        init();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = HttpClient::with_trust_timeout(
+            format!("http://{address}"),
+            "tok",
+            &TlsTrust::System,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        let body = concat!(
+            "event: snapshot\n",
+            r#"data: {"columns":["host","count"],"rows":[{"host":"a","count":1}],"capped":[{"cap":"groups","limit":10000},{"cap":"exact_values","limit":100000}]}"#,
+            "\n\n",
+            "event: snapshot\n",
+            r#"data: {"columns":["count"],"rows":[{"count":2}]}"#,
+            "\n\n",
+        );
+        let response = http_response("200 OK", "text/event-stream", body.as_bytes());
+        let (events, request) = tokio::join!(
+            async {
+                let stream = client.stream_events("* | stats count() by host").await?;
+                Ok::<_, ClientError>(stream.collect::<Vec<_>>().await)
+            },
+            serve_once(listener, response)
+        );
+        assert!(request.starts_with("GET /api/v1/stream?"), "{request}");
+        let events: Vec<StreamEvent> = events
+            .expect("the stream opens")
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .expect("every frame reads");
+        let capped: Vec<Vec<SnapshotCap>> = events
+            .into_iter()
+            .map(|event| match event {
+                StreamEvent::Snapshot { capped, .. } => capped,
+                other => panic!("expected a snapshot, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            capped,
+            vec![
+                vec![
+                    SnapshotCap {
+                        cap: SnapshotCapKind::Groups,
+                        limit: 10_000,
+                    },
+                    SnapshotCap {
+                        cap: SnapshotCapKind::ExactValues,
+                        limit: 100_000,
+                    },
+                ],
+                Vec::new(),
+            ]
+        );
     }
 
     /// An unavailable daemon answers 503 with its per-check body. That body
@@ -3054,6 +3173,38 @@ mod tests {
         let err = decode_repin_start(200, start_job("running"))
             .expect_err("200 + running must not decode");
         assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+    }
+
+    /// A read by id answers the job asked about or nothing a caller may
+    /// use. Another job's row is the stand-in the id exists to prevent, and
+    /// an empty body is no answer about the job either; both are protocol
+    /// errors that name the id asked for.
+    #[test]
+    fn a_repin_read_by_id_accepts_only_the_job_it_asked_for() {
+        let ours = decode_repin_job(
+            1,
+            RepinStatusResponse {
+                job: Some(start_job("running")),
+            },
+        )
+        .expect("the job asked for");
+        assert_eq!(ours.id, 1);
+
+        let mut newer = start_job("running");
+        newer.id = 2;
+        let err = decode_repin_job(1, RepinStatusResponse { job: Some(newer) })
+            .expect_err("another job is not an answer about job 1");
+        assert!(
+            matches!(&err, ClientError::Parse(m) if m.contains("job 1") && m.contains("job 2")),
+            "{err:?}"
+        );
+
+        let err = decode_repin_job(1, RepinStatusResponse { job: None })
+            .expect_err("no job is not an answer about job 1");
+        assert!(
+            matches!(&err, ClientError::Parse(m) if m.contains("job 1")),
+            "{err:?}"
+        );
     }
 
     // ── repin cancel decode (#109) ──────────────────────────────────────

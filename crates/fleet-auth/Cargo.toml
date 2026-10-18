@@ -19,7 +19,6 @@ blake3 = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true, features = ["serde"] }
 cookie = { workspace = true, optional = true }
-dashmap = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
@@ -36,13 +35,12 @@ default = ["keystore"]
 # Postgres-backed KeyStore + token + cache + migration export. Pure types
 # (PrincipalKind, RoleAssignment) are always available; future re-export
 # consumers that need to stay wasm-clean can disable the default to drop the
-# native deps (sqlx, argon2, dashmap, blake3, rand, chrono, tracing).
+# native deps (sqlx, argon2, blake3, rand, chrono, tracing).
 keystore = [
     "dep:argon2",
     "dep:base64ct",
     "dep:blake3",
     "dep:chrono",
-    "dep:dashmap",
     "dep:rand",
     "dep:sqlx",
     "dep:tokio",

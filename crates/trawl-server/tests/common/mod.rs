@@ -299,6 +299,17 @@ const FLEET_DB_PREFIX: &str = "trawl_fleet_test";
 /// appear here or its leftovers accumulate forever.
 const SWEPT_PREFIXES: [&str; 2] = [APP_DB_PREFIX, FLEET_DB_PREFIX];
 
+/// The most databases one sweep drops.
+///
+/// The sweep runs inside a test's setup, and every `DROP DATABASE` forces a
+/// checkpoint and waits for it: a fraction of a second on an idle cluster,
+/// seconds on a loaded one. A full trawl-server run leaves hundreds of
+/// databases behind, so a setup that dropped them all ran past nextest's
+/// 300 s timeout. Every mint adds one database and sweeps, and a sweep that
+/// wins the lock drops up to this many, so a backlog shrinks whenever more
+/// than one mint in four wins it.
+const SWEEP_MAX_DROPS: usize = 4;
+
 /// Fleet-keystore pool size for one fixture server.
 pub const FLEET_POOL_MAX: u32 = 3;
 
@@ -518,7 +529,9 @@ fn pid_alive(pid: u32) -> bool {
 /// the server's first connection — and (b) the owner pid encoded in its
 /// name is no longer alive. A single advisory lock elects one sweeper at a
 /// time, and DROP without FORCE is a final safety net (live connections
-/// make it error harmlessly). One lock, one pass, one LIKE per prefix.
+/// make it error harmlessly). One lock, one pass, one LIKE per prefix, and
+/// at most [`SWEEP_MAX_DROPS`] drops, so the mint that wins the lock never
+/// pays for the whole backlog.
 async fn sweep_stale_test_databases() {
     use sqlx::Row as _;
 
@@ -536,7 +549,7 @@ async fn sweep_stale_test_databases() {
         return;
     }
 
-    let marker = run_marker();
+    let mut listed = Vec::new();
     for prefix in SWEPT_PREFIXES {
         let Ok(rows) = sqlx::query("SELECT datname FROM pg_database WHERE datname LIKE $1")
             .bind(format!("{prefix}_%"))
@@ -549,22 +562,41 @@ async fn sweep_stale_test_databases() {
             let Ok(name): Result<String, _> = row.try_get("datname") else {
                 continue;
             };
-            let Some((owner_marker, owner_pid)) = owner_of(&name, prefix) else {
-                continue;
-            };
-            if owner_marker == marker || pid_alive(owner_pid) {
-                continue;
-            }
-            let _ = admin
-                .execute(sqlx::AssertSqlSafe(format!(
-                    r#"DROP DATABASE IF EXISTS "{name}""#
-                )))
-                .await;
+            listed.push((prefix, name));
         }
+    }
+    for name in sweep_batch(&listed, &run_marker(), pid_alive) {
+        let _ = admin
+            .execute(sqlx::AssertSqlSafe(format!(
+                r#"DROP DATABASE IF EXISTS "{name}""#
+            )))
+            .await;
     }
     let _ = sqlx::query("SELECT pg_advisory_unlock(741_852_963)")
         .execute(&mut admin)
         .await;
+}
+
+/// The databases one sweep drops, in listing order: the first
+/// [`SWEEP_MAX_DROPS`] `listed` names, each paired with the prefix whose
+/// LIKE matched it, that both guards call abandoned. A name the run
+/// `marker` claims is skipped before `alive` is asked about its pid, and no
+/// pid is asked about once the batch is full.
+fn sweep_batch<'a>(
+    listed: &'a [(&'static str, String)],
+    marker: &str,
+    mut alive: impl FnMut(u32) -> bool,
+) -> Vec<&'a str> {
+    listed
+        .iter()
+        .filter(|(prefix, name)| {
+            owner_of(name, prefix).is_some_and(|(owner_marker, owner_pid)| {
+                owner_marker != marker && !alive(owner_pid)
+            })
+        })
+        .map(|(_, name)| name.as_str())
+        .take(SWEEP_MAX_DROPS)
+        .collect()
 }
 
 #[test]
@@ -595,6 +627,58 @@ fn sweep_guards_parse_own_database_name() {
     );
     assert!(owner_of(&app, FLEET_DB_PREFIX).is_none());
     assert!(owner_of("someone_elses_database", APP_DB_PREFIX).is_none());
+}
+
+#[test]
+fn a_sweep_drops_one_batch_of_a_backlog() {
+    // A finished run leaves hundreds of databases behind. Each DROP forces
+    // a checkpoint, and the first sweep of the next run on that cluster
+    // used to drop them all inside one test's setup: past nextest's 300 s
+    // timeout under load. A sweep takes one batch, in listing order.
+    let backlog: Vec<(&'static str, String)> = (0..3 * SWEEP_MAX_DROPS)
+        .map(|n| {
+            let prefix = SWEPT_PREFIXES[n % SWEPT_PREFIXES.len()];
+            (prefix, format!("{prefix}_finishedrun_4194000_{n:0>12}"))
+        })
+        .collect();
+    let mut asked = 0;
+    let batch = sweep_batch(&backlog, &run_marker(), |_| {
+        asked += 1;
+        false
+    });
+    let first: Vec<&str> = backlog[..SWEEP_MAX_DROPS]
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect();
+    assert_eq!(batch, first);
+    assert_eq!(
+        asked, SWEEP_MAX_DROPS,
+        "no owner is checked past a full batch"
+    );
+
+    // Both guards still hold ahead of the batch: this run's own databases
+    // and those of a live owner are never in it, nor a name of another
+    // scheme.
+    let own = format!("{APP_DB_PREFIX}_{}_4194000_abcdefghijkl", run_marker());
+    let live = format!("{FLEET_DB_PREFIX}_otherrun_1_abcdefghijkl");
+    let abandoned = format!("{APP_DB_PREFIX}_otherrun_4194000_abcdefghijkl");
+    let listed = [
+        (APP_DB_PREFIX, own),
+        (FLEET_DB_PREFIX, live),
+        (APP_DB_PREFIX, format!("{APP_DB_PREFIX}_unparsed")),
+        (APP_DB_PREFIX, abandoned.clone()),
+    ];
+    let mut asked = Vec::new();
+    let batch = sweep_batch(&listed, &run_marker(), |pid| {
+        asked.push(pid);
+        pid == 1
+    });
+    assert_eq!(batch, [abandoned.as_str()]);
+    assert_eq!(
+        asked,
+        [1, 4_194_000],
+        "the own-run name is never pid-checked"
+    );
 }
 
 /// The database name a DSN points at.
@@ -1285,6 +1369,46 @@ impl TestServer {
         })
     }
 
+    /// Boot a SECOND server over this fixture's state and TLS material, on
+    /// an ephemeral port of its own, holding connections to `timeouts`
+    /// instead of the production deadlines and reporting the accept
+    /// loop's bookkeeping through `probe`
+    /// (`serve_with_listener_and_timeouts`). Driven by `shutdown` when
+    /// given, else by its own signal listener. Waits until it answers.
+    pub async fn spawn_server_with_timeouts(
+        &self,
+        timeouts: trawl_server::transport::http::ConnectionTimeouts,
+        probe: std::sync::Arc<trawl_server::transport::http::ListenerProbe>,
+        shutdown: Option<trawl_server::shutdown::ShutdownRx>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for a second server");
+        let addr = listener
+            .local_addr()
+            .expect("listener local_addr")
+            .to_string();
+        let state = self.state.clone();
+        let http_config = self.http_config.clone();
+        let server_config = self.server_config.clone();
+        let state_dir = self.state_dir.clone();
+        let task = tokio::spawn(async move {
+            http::serve_with_listener_and_timeouts(
+                listener,
+                timeouts,
+                probe,
+                state,
+                &http_config,
+                &server_config,
+                &state_dir,
+                shutdown,
+            )
+            .await
+            .unwrap();
+        });
+        wait_for_ready(&addr, &task).await;
+        (format!("https://{addr}"), task)
+    }
+
     /// The production router over this fixture's state, with the fixture's
     /// HTTP config as `f` leaves it.
     ///
@@ -1567,6 +1691,53 @@ pub async fn setup_in_dir_with_data_and_timeout(
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
+    )
+    .await
+}
+
+/// The query pool and the query database's budgets a fixture runs with
+/// (ADR-0056).
+#[derive(Debug, Clone, Copy)]
+pub struct QueryKnobs {
+    pub max_concurrent_queries: usize,
+    pub spill_max_bytes: std::num::NonZeroU64,
+    pub memory_limit: std::num::NonZeroU64,
+    pub threads: std::num::NonZeroU32,
+}
+
+impl QueryKnobs {
+    /// Two permits under the shipped budgets.
+    pub const DEFAULT: Self = Self {
+        max_concurrent_queries: 2,
+        spill_max_bytes: trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
+        memory_limit: trawl_server::config::DEFAULT_QUERY_MEMORY_LIMIT,
+        threads: trawl_server::config::DEFAULT_QUERY_THREADS,
+    };
+}
+
+/// A fixture over a caller-owned `dir` and data root whose query pool and
+/// budgets are `query` and whose queries time out after `timeout_secs`.
+pub async fn setup_with_query_knobs(
+    dir: &std::path::Path,
+    data_path: String,
+    timeout_secs: u64,
+    query: QueryKnobs,
+) -> TestServer {
+    setup_with_ingest_config(
+        dir,
+        data_path,
+        RateLimitConfig::default(),
+        timeout_secs,
+        true,
+        RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
+        SchedulerConfig::default(),
+        None,
+        None,
+        &[],
+        FleetPoolSize::DEFAULT,
+        query,
     )
     .await
 }
@@ -1628,6 +1799,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1671,6 +1843,7 @@ pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1694,6 +1867,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await
 }
@@ -1716,6 +1890,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1741,6 +1916,7 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         None,
         cidrs,
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1787,6 +1963,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         None,
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await
 }
@@ -1815,6 +1992,7 @@ pub async fn setup_observing_boot(
         Some(before_boot),
         &[],
         FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
     )
     .await
 }
@@ -1834,6 +2012,7 @@ async fn setup_with_ingest_config(
     before_boot: Option<&mut dyn FnMut(&AppState)>,
     trusted_relays: &[&str],
     fleet_pool_size: FleetPoolSize,
+    query: QueryKnobs,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -1891,7 +2070,7 @@ async fn setup_with_ingest_config(
         server: ServerConfig {
             http_addr: addr.clone(),
             timeout_secs,
-            max_concurrent_queries: 2,
+            max_concurrent_queries: query.max_concurrent_queries,
             max_result_rows: row_caps.max_result_rows,
             max_export_rows: row_caps.max_export_rows,
             max_request_body_bytes: body_limits.max_request_body_bytes,
@@ -1909,6 +2088,10 @@ async fn setup_with_ingest_config(
             query_log_max_bytes: trawl_server::config::DEFAULT_QUERY_LOG_MAX_BYTES,
             rate_limit,
             monitor_refresh_ms: 1000,
+            query_scratch_dir: None,
+            query_spill_max_bytes: query.spill_max_bytes,
+            query_memory_limit: query.memory_limit,
+            query_threads: query.threads,
         },
         data: DataConfig { path: data_path },
         auth: AuthConfig {
@@ -1948,12 +2131,14 @@ async fn setup_with_ingest_config(
     let storage = trawl_server::store::StorageState::from_pool(app_pool(&app_db_url).await)
         .await
         .expect("boot the app-state database");
+    let scratch = trawl_server::state::open_query_scratch(&config).expect("lock the query scratch");
     let (state, http_config) = AppState::from_parts(
         &config,
         test_metrics_handle(),
         resolve_derivation(&config),
         auth,
         storage,
+        scratch,
     )
     .await
     .expect("failed to create app state");
@@ -2079,6 +2264,7 @@ pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
         None,
         &[],
         size,
+        QueryKnobs::DEFAULT,
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).

@@ -143,7 +143,8 @@ APT repository from [Installation](/getting-started/).
    same host. See [Set the browser origin](/operate/access/#set-the-browser-origin).
 
    Mount storage at `/var/lib/trawl`, not at `/var/lib/trawl/data`. A repin
-   writes a sibling directory next to `data/` on the same filesystem.
+   writes a sibling directory next to `data/` on the same filesystem, and so
+   does query scratch, `data.query-scratch`.
 
 4. Decide on TLS. Without `tls_cert_path` and `tls_key_path`, trawld
    generates a self-signed certificate for `localhost` under
@@ -185,6 +186,7 @@ and `tls/cert.pem`. It reaches stored events only through trawld's API.
 | `/etc/default/trawl-web` | root:root 0644 | Environment for `trawl-web.service`: `RUST_LOG`. World-readable, so no secrets. |
 | `/var/lib/trawl` | trawl:trawl 0750 | State directory. The package creates it, and systemd reapplies the mode at every start of `trawld.service`. `trawld` writes only here and to `/var/log/trawl`. The `trawl` group lets `trawl-web` pass through to `web.cookie` and `tls/`. |
 | `/var/lib/trawl/data` | trawl:trawl 0700 | Parquet files, `wal/`, `scheduled/`, and the `EPOCH` and `CATALOG` markers. Everything trawld creates beneath it is 0700 or 0600. trawld creates it at 0700 on first start, and removes any group or other permission from it at every start. |
+| `/var/lib/trawl/data.query-scratch` | trawl:trawl 0700 | Query scratch: query spill, hot-buffer query snapshots, and export staging files. trawld creates it, locks it, and empties what a killed process left. It holds nothing that must survive a restart. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets). |
 | `/var/lib/trawl/tls` | trawl:trawl 0755 | `cert.pem`, mode 0644, generated when `[server]` names no certificate. trawld creates both on first start. The packaged `[web] upstream_ca_path` pins the certificate. |
 | `/var/lib/trawl/tls-key` | trawl:trawl 0700 | `key.pem`, mode 0600, the private key of the generated certificate. trawld creates both on first start. |
 | `/var/lib/trawl/web.cookie` | trawl:trawl 0640 | 32-byte session cookie key, generated once on first install. The `trawl` group lets `trawl-web` read it. |
@@ -410,6 +412,39 @@ cluster.
    [verify the installation](#verify-the-installation), through
    `kubectl -n trawl port-forward svc/trawl 5514:5514` if port 5514 is not
    published.
+
+On Helm, query scratch is `/var/lib/trawl/data.query-scratch` on the same
+PVC as the data root. The root filesystem is read-only, and the 512Mi `/tmp`
+emptyDir exists for that reason. It holds no query data. Size the PVC with
+room for `config.server.querySpillMaxBytes` (default `4GiB`) beside the data,
+and keep `config.retention.minFreeDiskBytes` (default `6GiB`) above it; see
+[the disk arithmetic](/reference/configuration/#the-disk-arithmetic).
+The trawld container asks for 1Gi of memory and is limited to 8Gi. The limit
+covers the 2 GiB query database, two 1 GiB maintenance databases, 1 GiB of
+request bodies and 512 MiB of password hashing, with room left for the hot
+buffer and memory DuckDB does not account. The trawl-web sidecar is limited
+to 512Mi. See [the memory arithmetic](/reference/configuration/#the-memory-arithmetic)
+before you raise `config.server.maxConcurrentRequests`,
+`config.server.queryMemoryLimit` or `config.ingest.compactionMemoryLimit`.
+The chart refuses to render a `config.server.queryScratchDir` that sits off
+the data volume.
+
+The pod's `terminationGracePeriodSeconds` is `config.server.shutdownDrainSecs`
+plus 30 seconds: the drain, then the runtime's 10-second shutdown and the
+5-second telemetry flush, with margin. It is a sizing, not a proven bound on
+how long trawld takes to exit. The startup probe allows five minutes
+(`failureThreshold: 60` at `periodSeconds: 5`) for boot recovery, hydration
+and the boot conformance pass.
+
+On Debian, the same directory sits in `/var/lib/trawl`, inside the unit's
+writable paths. A `query_scratch_dir` outside `/var/lib/trawl` needs the
+unit's `ReadWritePaths=` extended in a drop-in. The units cap memory the same
+way: `trawld.service` sets `MemoryMax=8G`, and `trawl-web.service` sets
+`MemoryMax=512M`. `MemoryMax` is a ceiling, not a reservation, so a host with
+less RAM runs out before the unit does. `trawld.service` also sets
+`LimitNOFILE=65536`, and trawld raises its soft descriptor limit to the hard
+limit at startup and logs both values as `descriptor limit`. `trawl trial` places scratch
+on its `trawld` volume.
 
 Stored data is owner-only on Helm too, but the modes differ from the
 [Debian table](#install-the-debian-package). The chart's `fsGroup` makes the
@@ -686,12 +721,15 @@ nothing else. You supply what the package supplies:
   [`crates/trawl-server/debian/`](https://github.com/jakub/trawl/tree/{{release.tag}}/crates/trawl-server/debian).
   The supervisor needs no umask setting. trawld sets its own umask to 077
   before it creates a file.
-- A `TMPDIR` that keeps Unix modes, or none, which means `/tmp`. The query
-  engine spills into a private directory that trawld makes there, and
-  trawld refuses a spill directory that is not 0700 and owned by `trawl`.
-  Other users must not be able to rename entries in `TMPDIR`. The system
-  `/tmp` is safe, because its sticky bit stops that. A directory that only
-  `trawl` can write is safe too.
+- A filesystem that keeps Unix modes under the data directory's parent. The
+  query engine spills into the query scratch directory,
+  `<data.path>.query-scratch` by default, and trawld makes it 0700, holds an
+  exclusive lock on it, and refuses a directory that another user owns or
+  that keeps group or other bits. It is not the data directory, the WAL
+  directory, or a repin staging root. trawld writes nothing large to
+  `TMPDIR`, so `TMPDIR` needs no sizing. Set `[server] query_scratch_dir` to a
+  writable directory if the data directory is read-only. See
+  [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets).
 
 ## Use a current storage root
 
@@ -891,8 +929,11 @@ ServiceMonitor creation; neither option installs a monitoring system.
    `api.health.duckdb`, `api.health.auth_db`, `api.health.storage_db`,
    `api.health.data_path`, and `api.health.ingest_capacity` are `complete`.
    `api.identity` is `complete` and shows the key's name, kind, and
-   permissions. A `degraded` server fails the run, because the failing check
-   has its own `failed` line. Each failed line names its next action. The
+   permissions. A `degraded` server fails the run when a check reports a failing
+   value, because that check has its own `failed` line. The one exception is
+   `duckdb: slow`, an engine that is slow but has answered within the last
+   minute: that row is `complete`, carries a next action, and does not fail the
+   run. Each failed line names its next action. The
    [CLI reference](/reference/cli/#doctor-mode) lists every check.
 
    `web.origin` shows that `trawl-web` accepts the origin. Together, the three

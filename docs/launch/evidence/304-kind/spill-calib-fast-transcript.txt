@@ -1,0 +1,329 @@
+
+## [2026-10-18T09:30:33.658Z] calib-fast spill-calib: namespace i304-spill-calib, queries SPILL_BIG_QUERY SPILL_BIG_QUERY SPILL_BIG_QUERY SPILL_QUERY, 5s apart
+[2026-10-18T09:30:33.663Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib get pod trawl-0 -o jsonpath=uid=\{.metadata.uid\}\ image=\{.spec.containers\[\?\(@.name==\"trawld\"\)\].image\}\ imageID=\{.status.containerStatuses\[\?\(@.name==\"trawld\"\)\].imageID\}\ restarts=\{.status.containerStatuses\[\?\(@.name==\"trawld\"\)\].restartCount\}\{\"\\n\"\}
+uid=76402b4d-3b90-4428-9956-3670d81f72ee image=trawl-i304:after-7dc64b27f566 imageID=docker.io/library/import-2026-10-18@sha256:8c561b95361fa56d1efc3ca2db6d0fc33b8cd1886a033b7d36752c51d5250039 restarts=0
+[2026-10-18T09:30:33.819Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-spill-calib get statefulset trawl -o json | jq -c '.spec.template.spec.containers[] | select(.name=="trawld") | .resources'
+{"limits":{"cpu":"1","memory":"4Gi"},"requests":{"cpu":"250m","memory":"512Mi"}}
+[2026-10-18T09:30:34.146Z] $ grep -E '^query_spill_max_bytes|^query_memory_limit|^query_threads|^max_concurrent_queries' '$D/private/spill-calib/work/fast/trawld.toml'
+max_concurrent_queries = 2
+query_spill_max_bytes = "4GiB"
+query_memory_limit = "2GiB"
+query_threads = 4
+[2026-10-18T09:30:34.154Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib exec trawl-0 -c trawld -- sh -c echo\ memory.max\ \$\(cat\ /sys/fs/cgroup/memory.max\)\ nproc\ \$\(nproc\)
+memory.max 4294967296 nproc 16
+[2026-10-18T09:30:34.405Z] spill budget 4294967296 bytes + block slack 1179648 = 4296146944; query_memory_limit 2GiB = 2147483648 bytes
+[2026-10-18T09:30:34.410Z] SPILL_BIG_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count()
+[2026-10-18T09:30:34.414Z] SPILL_BIG_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count()
+[2026-10-18T09:30:34.417Z] SPILL_BIG_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count()
+[2026-10-18T09:30:34.420Z] SPILL_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count()
+[2026-10-18T09:30:34.686Z] GET /api/v1/health -> 200
+
+## [2026-10-18T09:30:34.688Z] run 1: SPILL_BIG_QUERY, with scratch and memory sampled in the pod every 0.2 s
+[2026-10-18T09:30:46.840Z] SPILL_BIG_QUERY sent 2026-10-18T09:30:35.699Z, answered 2026-10-18T09:30:45.464Z -> 503 9.744468 {"error":{"code":"query_resource_exhausted","message":"query could not complete with the available query resources; narrow the time range or simplify the query"}}
+
+## [2026-10-18T09:30:46.846Z] run 1: samples (UTC time, scratch bytes, cgroup anon bytes, cgroup memory.current bytes)
+[2026-10-18T09:30:46.849Z] $ cat '$D/private/spill-calib/work/fast/fast1.log'
+09:30:34.913 scratch=13839 anon=49160192 current=67440640
+09:30:35.128 scratch=13839 anon=49176576 current=66248704
+09:30:35.377 scratch=13839 anon=49098752 current=67051520
+09:30:35.587 scratch=13839 anon=49176576 current=67399680
+09:30:35.797 scratch=18057 anon=52424704 current=70340608
+09:30:36.007 scratch=18057 anon=478732288 current=503017472
+09:30:36.221 scratch=18057 anon=714756096 current=737886208
+09:30:36.431 scratch=18057 anon=960008192 current=975310848
+09:30:36.720 scratch=18057 anon=1185959936 current=1200451584
+09:30:36.929 scratch=18057 anon=1481748480 current=1500315648
+09:30:37.213 scratch=18057 anon=1723588608 current=1745473536
+09:30:37.423 scratch=18057 anon=1974194176 current=1992372224
+09:30:37.639 scratch=90556229 anon=2064617472 current=2175139840
+09:30:37.920 scratch=173524867 anon=2160275456 current=2354401280
+09:30:38.130 scratch=300763011 anon=2185863168 current=2507440128
+09:30:38.339 scratch=448776129 anon=2246889472 current=2713620480
+09:30:38.613 scratch=681297857 anon=2287210496 current=3001364480
+09:30:38.825 scratch=828000253 anon=2384175104 current=3233632256
+09:30:39.034 scratch=998131709 anon=2388078592 current=3405852672
+09:30:39.249 scratch=1158727677 anon=2447097856 current=3565662208
+09:30:39.519 scratch=1285277759 anon=2409156608 current=3621896192
+09:30:39.735 scratch=1487292479 anon=2347941888 current=3672330240
+09:30:40.009 scratch=1643923519 anon=2372767744 current=3702546432
+09:30:40.222 scratch=1799604287 anon=2375819264 current=3720634368
+09:30:40.433 scratch=1937000511 anon=2287521792 current=3693469696
+09:30:40.645 scratch=2058733631 anon=2321539072 current=3729235968
+09:30:40.856 scratch=2154547263 anon=2117201920 current=3572867072
+09:30:41.120 scratch=2246854779 anon=2204442624 current=3675791360
+09:30:41.332 scratch=2330085499 anon=2072449024 current=3544584192
+09:30:41.542 scratch=2412923003 anon=2157019136 current=3657723904
+09:30:41.751 scratch=2520860795 anon=2253078528 current=3727470592
+09:30:41.964 scratch=2661435515 anon=2307940352 current=3816493056
+09:30:42.219 scratch=2790639739 anon=2313609216 current=3836952576
+09:30:42.433 scratch=2955757691 anon=2395758592 current=3885232128
+09:30:42.714 scratch=3124316283 anon=2328268800 current=3842420736
+09:30:42.926 scratch=3251292283 anon=2391285760 current=3917512704
+09:30:43.142 scratch=3443378299 anon=2504200192 current=3900620800
+09:30:43.418 scratch=3450357883 anon=2516525056 current=3881791488
+09:30:43.629 scratch=3561605243 anon=2565550080 current=3939831808
+09:30:43.841 scratch=3696478331 anon=2425036800 current=3782111232
+09:30:44.115 scratch=3844589811 anon=2320465920 current=3826581504
+09:30:44.327 scratch=3969730931 anon=2326626304 current=3831439360
+09:30:44.538 scratch=4082813299 anon=2434170880 current=3928834048
+09:30:44.811 scratch=4277062003 anon=2414678016 current=3912093696
+09:30:45.023 scratch=2590918593 anon=2302947328 current=2999795712
+09:30:45.320 scratch=638437253 anon=2302730240 current=2438037504
+09:30:45.542 scratch=18057 anon=813006848 current=833253376
+09:30:45.754 scratch=18057 anon=756154368 current=773894144
+09:30:45.971 scratch=18057 anon=756162560 current=773480448
+09:30:46.182 scratch=18057 anon=756146176 current=773685248
+09:30:46.393 scratch=18057 anon=756076544 current=774230016
+09:30:46.604 scratch=18057 anon=756154368 current=773722112
+[2026-10-18T09:30:46.874Z] run 1: 52 samples; scratch peak 4277062003 bytes at 09:30:44.811; peak - budget = -17905293 bytes; within budget + slack: yes
+[2026-10-18T09:30:46.888Z] run 1: anon peak 2565550080 bytes; memory.current peak 3939831808 bytes
+
+## [2026-10-18T09:30:51.895Z] run 2: SPILL_BIG_QUERY, with scratch and memory sampled in the pod every 0.2 s
+[2026-10-18T09:31:02.922Z] SPILL_BIG_QUERY sent 2026-10-18T09:30:52.906Z, answered 2026-10-18T09:31:01.632Z -> 503 8.706773 {"error":{"code":"query_resource_exhausted","message":"query could not complete with the available query resources; narrow the time range or simplify the query"}}
+
+## [2026-10-18T09:31:02.925Z] run 2: samples (UTC time, scratch bytes, cgroup anon bytes, cgroup memory.current bytes)
+[2026-10-18T09:31:02.929Z] $ cat '$D/private/spill-calib/work/fast/fast2.log'
+09:30:52.128 scratch=18057 anon=753569792 current=771096576
+09:30:52.342 scratch=18057 anon=753664000 current=770977792
+09:30:52.556 scratch=18057 anon=753664000 current=771366912
+09:30:52.765 scratch=18057 anon=753659904 current=771817472
+09:30:52.971 scratch=8747 anon=758956032 current=776617984
+09:30:53.179 scratch=8747 anon=1074245632 current=1094369280
+09:30:53.391 scratch=8747 anon=1111683072 current=1132433408
+09:30:53.620 scratch=8747 anon=1297752064 current=1323397120
+09:30:53.832 scratch=8747 anon=1538232320 current=1559658496
+09:30:54.112 scratch=8747 anon=1632862208 current=1657184256
+09:30:54.326 scratch=8747 anon=1861296128 current=1883451392
+09:30:54.535 scratch=49521321 anon=2018725888 current=2088464384
+09:30:54.819 scratch=184296167 anon=2103214080 current=2309423104
+09:30:55.110 scratch=346235685 anon=2191446016 current=2581217280
+09:30:55.347 scratch=527803173 anon=2274701312 current=2833989632
+09:30:55.612 scratch=690070309 anon=2187489280 current=2930462720
+09:30:55.825 scratch=771466021 anon=2079494144 current=2881703936
+09:30:56.039 scratch=868098913 anon=2018738176 current=2917810176
+09:30:56.315 scratch=960996255 anon=2181672960 current=3172941824
+09:30:56.527 scratch=1124246431 anon=2229723136 current=3383410688
+09:30:56.812 scratch=1306174433 anon=2236530688 current=2942226432
+09:30:57.020 scratch=1430758369 anon=2233282560 current=3072389120
+09:30:57.233 scratch=1565631457 anon=2330927104 current=3297800192
+09:30:57.444 scratch=1720165345 anon=2261204992 current=3406135296
+09:30:57.655 scratch=1866310625 anon=2352263168 current=2994311168
+09:30:57.909 scratch=2021467105 anon=2315071488 current=3121225728
+09:30:58.119 scratch=2163614689 anon=2310787072 current=3266977792
+09:30:58.334 scratch=2336302109 anon=2341318656 current=3454091264
+09:30:58.546 scratch=2481497117 anon=2339258368 current=2987274240
+09:30:58.756 scratch=2655855645 anon=2365538304 current=3195940864
+09:30:58.969 scratch=2831819805 anon=2399883264 current=3399938048
+09:30:59.219 scratch=3023119389 anon=2379243520 current=2938298368
+09:30:59.430 scratch=3211666461 anon=2416492544 current=3160662016
+09:30:59.643 scratch=3393627165 anon=2423074816 current=3358232576
+09:30:59.855 scratch=3534922781 anon=2437820416 current=2816708608
+09:31:00.119 scratch=3659506717 anon=2510344192 current=3020263424
+09:31:00.332 scratch=3716981789 anon=2567249920 current=3129585664
+09:31:00.544 scratch=3840943199 anon=2468110336 current=3154272256
+09:31:00.756 scratch=4008518811 anon=2503438336 current=3355598848
+09:31:01.015 scratch=4163282075 anon=2503041024 current=2910191616
+09:31:01.225 scratch=4278756507 anon=2240532480 current=2767040512
+09:31:01.437 scratch=2761171877 anon=2199707648 current=2377703424
+09:31:01.646 scratch=8747 anon=2199584768 current=2223620096
+09:31:01.856 scratch=8747 anon=1762508800 current=1774137344
+09:31:02.069 scratch=8747 anon=914227200 current=936443904
+09:31:02.280 scratch=8747 anon=914219008 current=936316928
+09:31:02.489 scratch=8747 anon=914223104 current=936443904
+09:31:02.700 scratch=8747 anon=914161664 current=936435712
+[2026-10-18T09:31:02.957Z] run 2: 48 samples; scratch peak 4278756507 bytes at 09:31:01.225; peak - budget = -16210789 bytes; within budget + slack: yes
+[2026-10-18T09:31:02.972Z] run 2: anon peak 2567249920 bytes; memory.current peak 3454091264 bytes
+
+## [2026-10-18T09:31:07.977Z] run 3: SPILL_BIG_QUERY, with scratch and memory sampled in the pod every 0.2 s
+[2026-10-18T09:31:19.353Z] SPILL_BIG_QUERY sent 2026-10-18T09:31:08.991Z, answered 2026-10-18T09:31:17.923Z -> 503 8.912819 {"error":{"code":"query_resource_exhausted","message":"query could not complete with the available query resources; narrow the time range or simplify the query"}}
+
+## [2026-10-18T09:31:19.357Z] run 3: samples (UTC time, scratch bytes, cgroup anon bytes, cgroup memory.current bytes)
+[2026-10-18T09:31:19.360Z] $ cat '$D/private/spill-calib/work/fast/fast3.log'
+09:31:08.207 scratch=8747 anon=914276352 current=936407040
+09:31:08.420 scratch=8747 anon=914206720 current=936398848
+09:31:08.630 scratch=8747 anon=914284544 current=936198144
+09:31:08.842 scratch=8747 anon=914288640 current=936484864
+09:31:09.051 scratch=14516 anon=914886656 current=937164800
+09:31:09.309 scratch=14516 anon=1273380864 current=1296760832
+09:31:09.548 scratch=14516 anon=1506467840 current=1526886400
+09:31:09.818 scratch=14516 anon=1706881024 current=1727684608
+09:31:10.030 scratch=14516 anon=1860567040 current=1888972800
+09:31:10.316 scratch=47659314 anon=2102325248 current=2170826752
+09:31:10.528 scratch=168638832 anon=2191953920 current=2384822272
+09:31:10.735 scratch=296073646 anon=2258567168 current=2562355200
+09:31:10.949 scratch=299448750 anon=2236583936 current=2557304832
+09:31:11.162 scratch=299448750 anon=2236620800 current=2556162048
+09:31:11.410 scratch=480655852 anon=2205786112 current=2710806528
+09:31:11.619 scratch=661633578 anon=2275053568 current=2959994880
+09:31:11.830 scratch=804960810 anon=2043666432 current=2862964736
+09:31:12.121 scratch=856603178 anon=2115739648 current=2996170752
+09:31:12.331 scratch=918567526 anon=2040856576 current=2980749312
+09:31:12.613 scratch=1026701926 anon=2134167552 current=3106062336
+09:31:12.824 scratch=1138178662 anon=2227707904 current=3197976576
+09:31:13.034 scratch=1307982504 anon=2251059200 current=3249963008
+09:31:13.314 scratch=1453079208 anon=2312503296 current=3269582848
+09:31:13.535 scratch=1608104616 anon=2320453632 current=3263864832
+09:31:13.747 scratch=1761983144 anon=2367987712 current=3241332736
+09:31:14.016 scratch=1992735400 anon=2391887872 current=3273506816
+09:31:14.227 scratch=2163686056 anon=2422722560 current=3268718592
+09:31:14.439 scratch=2334112544 anon=2363944960 current=3252490240
+09:31:14.653 scratch=2485271328 anon=2302435328 current=3241746432
+09:31:14.862 scratch=2679880480 anon=2286747648 current=3243249664
+09:31:15.115 scratch=2813967136 anon=2371514368 current=3315425280
+09:31:15.325 scratch=2952575776 anon=2349662208 current=2912600064
+09:31:15.538 scratch=3136469852 anon=2326474752 current=3073941504
+09:31:15.757 scratch=3280878428 anon=2317754368 current=2695176192
+09:31:16.020 scratch=3474242396 anon=2362597376 current=2926514176
+09:31:16.238 scratch=3666361180 anon=2361507840 current=3097100288
+09:31:16.514 scratch=3782818652 anon=2382536704 current=2746105856
+09:31:16.727 scratch=3922312094 anon=2362048512 current=2862788608
+09:31:16.936 scratch=3931257758 anon=2366296064 current=2872340480
+09:31:17.210 scratch=4130192286 anon=2363146240 current=3072167936
+09:31:17.423 scratch=4237671326 anon=2431385600 current=2752749568
+09:31:17.633 scratch=3444292448 anon=2460033024 current=2664153088
+09:31:17.866 scratch=555727214 anon=2437922816 current=2465898496
+09:31:18.081 scratch=14516 anon=1940217856 current=1948299264
+09:31:18.292 scratch=14516 anon=701472768 current=718606336
+09:31:18.497 scratch=14516 anon=701329408 current=719171584
+09:31:18.711 scratch=14516 anon=701485056 current=719728640
+09:31:18.923 scratch=14516 anon=701489152 current=719863808
+09:31:19.132 scratch=14516 anon=704245760 current=723324928
+[2026-10-18T09:31:19.382Z] run 3: 49 samples; scratch peak 4237671326 bytes at 09:31:17.423; peak - budget = -57295970 bytes; within budget + slack: yes
+[2026-10-18T09:31:19.399Z] run 3: anon peak 2460033024 bytes; memory.current peak 3315425280 bytes
+
+## [2026-10-18T09:31:24.404Z] run 4: SPILL_QUERY, with scratch and memory sampled in the pod every 0.2 s
+[2026-10-18T09:31:43.029Z] SPILL_QUERY sent 2026-10-18T09:31:25.416Z, answered 2026-10-18T09:31:41.570Z -> 200 16.137687 {"execution":{"started_at":"2026-10-18T09:31:25.435928989Z","duration_ms":16117},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+
+## [2026-10-18T09:31:43.034Z] run 4: samples (UTC time, scratch bytes, cgroup anon bytes, cgroup memory.current bytes)
+[2026-10-18T09:31:43.037Z] $ cat '$D/private/spill-calib/work/fast/fast4.log'
+09:31:24.634 scratch=14516 anon=701440000 current=718610432
+09:31:24.851 scratch=14516 anon=701456384 current=719466496
+09:31:25.066 scratch=14516 anon=701362176 current=719560704
+09:31:25.277 scratch=14516 anon=701448192 current=719163392
+09:31:25.489 scratch=15906 anon=704753664 current=724103168
+09:31:25.710 scratch=15906 anon=1158410240 current=1178857472
+09:31:25.919 scratch=15906 anon=1366536192 current=1387139072
+09:31:26.131 scratch=15906 anon=1578807296 current=1603522560
+09:31:26.343 scratch=15906 anon=1770819584 current=1791115264
+09:31:26.618 scratch=15906 anon=1952133120 current=1972600832
+09:31:26.830 scratch=15906 anon=2201235456 current=2226298880
+09:31:27.040 scratch=15906 anon=2459611136 current=2481451008
+09:31:27.318 scratch=31899356 anon=2663936000 current=2726039552
+09:31:27.530 scratch=172736342 anon=2715508736 current=2922307584
+09:31:27.740 scratch=327892822 anon=2788872192 current=3142283264
+09:31:27.956 scratch=469843798 anon=2833387520 current=3335122944
+09:31:28.230 scratch=577421142 anon=2452156416 current=3045801984
+09:31:28.450 scratch=605044566 anon=1995358208 current=2619850752
+09:31:28.660 scratch=661077846 anon=2094247936 current=2774384640
+09:31:28.870 scratch=701677458 anon=2119237632 current=2839126016
+09:31:29.080 scratch=729071506 anon=2082037760 current=2831101952
+09:31:29.289 scratch=836943762 anon=2079285248 current=2880634880
+09:31:29.520 scratch=880820114 anon=2132201472 current=2971701248
+09:31:29.730 scratch=926597010 anon=2142076928 current=3016376320
+09:31:29.945 scratch=973684626 anon=2079121408 current=2996740096
+09:31:30.156 scratch=1033977746 anon=2148315136 current=3111346176
+09:31:30.423 scratch=1093222290 anon=2126082048 current=3132276736
+09:31:30.634 scratch=1140047762 anon=2168504320 current=3216289792
+09:31:30.845 scratch=1188183954 anon=2165407744 current=3257561088
+09:31:31.056 scratch=1218297746 anon=2188808192 current=3309551616
+09:31:31.312 scratch=1293139858 anon=2186846208 current=3344150528
+09:31:31.537 scratch=1328005010 anon=2244255744 current=3424493568
+09:31:31.746 scratch=1370046354 anon=2337652736 current=3527106560
+09:31:32.015 scratch=1414283220 anon=2363416576 current=3577708544
+09:31:32.228 scratch=1457962964 anon=2372313088 current=3608031232
+09:31:32.440 scratch=1490075604 anon=2323488768 current=3566247936
+09:31:32.648 scratch=1509801940 anon=2338693120 current=3595825152
+09:31:32.912 scratch=1558396884 anon=2287513600 current=3543298048
+09:31:33.125 scratch=1619214292 anon=2335219712 current=3629031424
+09:31:33.337 scratch=1646608400 anon=2357796864 current=3651477504
+09:31:33.546 scratch=1700675600 anon=2355388416 current=3700625408
+09:31:33.756 scratch=1728495632 anon=2364391424 current=3732725760
+09:31:33.969 scratch=1778925584 anon=2313289728 current=3681210368
+09:31:34.178 scratch=1811136528 anon=2259648512 current=3646468096
+09:31:34.415 scratch=1844133904 anon=2241601536 current=3634733056
+09:31:34.627 scratch=1874214928 anon=2270711808 current=3660763136
+09:31:34.840 scratch=1901182992 anon=2261843968 current=3669356544
+09:31:35.050 scratch=1919565840 anon=2279227392 current=3698556928
+09:31:35.260 scratch=1942503440 anon=2294755328 current=3705327616
+09:31:35.469 scratch=1973469200 anon=2296274944 current=3733266432
+09:31:35.682 scratch=1995849744 anon=2324361216 current=3759677440
+09:31:35.915 scratch=2044674064 anon=2329169920 current=3777941504
+09:31:36.127 scratch=2058960912 anon=2299109376 current=3756388352
+09:31:36.344 scratch=2078228496 anon=2327961600 current=3797925888
+09:31:36.555 scratch=2085339152 anon=2395828224 current=3869413376
+09:31:36.768 scratch=2101788688 anon=2431807488 current=3910844416
+09:31:37.016 scratch=2141143056 anon=2330771456 current=3788693504
+09:31:37.233 scratch=2169126928 anon=2313203712 current=3787452416
+09:31:37.446 scratch=2196652048 anon=2323693568 current=3818201088
+09:31:37.662 scratch=2214051856 anon=2333560832 current=3833655296
+09:31:37.873 scratch=2250981392 anon=2356985856 current=3856121856
+09:31:38.116 scratch=2293645328 anon=2352562176 current=3859853312
+09:31:38.326 scratch=2322022416 anon=2343223296 current=3841925120
+09:31:38.541 scratch=2387132432 anon=2369601536 current=3871326208
+09:31:38.752 scratch=2398535696 anon=2166431744 current=3699200000
+09:31:39.017 scratch=2384674832 anon=2135629824 current=3795210240
+09:31:39.229 scratch=2384674832 anon=2003705856 current=3701846016
+09:31:39.439 scratch=2382577680 anon=1680072704 current=3488059392
+09:31:39.712 scratch=2382446546 anon=1529147392 current=3417247744
+09:31:39.926 scratch=2270904274 anon=1180303360 current=3111641088
+09:31:40.138 scratch=2270314450 anon=974794752 current=2997760000
+09:31:40.348 scratch=2270314450 anon=826671104 current=2922590208
+09:31:40.559 scratch=2238758866 anon=667795456 current=2805960704
+09:31:40.815 scratch=1175142174 anon=573730816 current=1665990656
+09:31:41.116 scratch=1174879964 anon=573214720 current=1659817984
+09:31:41.468 scratch=202194592 anon=573087744 current=798859264
+09:31:41.715 scratch=15906 anon=532930560 current=567345152
+09:31:41.923 scratch=15906 anon=533028864 current=567107584
+09:31:42.133 scratch=15906 anon=495210496 current=529424384
+09:31:42.349 scratch=15906 anon=495144960 current=528236544
+09:31:42.574 scratch=15906 anon=405094400 current=438534144
+09:31:42.787 scratch=15906 anon=405196800 current=439808000
+[2026-10-18T09:31:43.058Z] run 4: 82 samples; scratch peak 2398535696 bytes at 09:31:38.752; peak - budget = -1896431600 bytes; within budget + slack: yes
+[2026-10-18T09:31:43.075Z] run 4: anon peak 2833387520 bytes; memory.current peak 3910844416 bytes
+
+## [2026-10-18T09:31:43.080Z] after the runs
+[2026-10-18T09:31:43.084Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib get pod trawl-0 -o jsonpath=uid=\{.metadata.uid\}\ phase=\{.status.phase\}\ ready=\{.status.conditions\[\?\(@.type==\"Ready\"\)\].status\}\ restarts=\{.status.containerStatuses\[\?\(@.name==\"trawld\"\)\].restartCount\}\ lastState=\{.status.containerStatuses\[\?\(@.name==\"trawld\"\)\].lastState\}\{\"\\n\"\}
+uid=76402b4d-3b90-4428-9956-3670d81f72ee phase=Running ready=True restarts=0 lastState={}
+[2026-10-18T09:31:43.248Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-spill-calib exec trawl-0 -c trawld -- cat /sys/fs/cgroup/memory.events
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+sock_throttled 0
+FIRST                  LAST                   COUNT    TYPE      REASON              OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-spill-calib/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-spill-calib/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           postgres-5dbf87b8f6-7nzl7   Successfully assigned i304-spill-calib/postgres-5dbf87b8f6-7nzl7 to trawl-i304-control-plane
+2026-10-18T09:29:09Z   2026-10-18T09:29:09Z   1        Normal    ScalingReplicaSet   postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-18T09:29:09Z   2026-10-18T09:29:09Z   1        Normal    SuccessfulCreate    postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-7nzl7
+2026-10-18T09:29:09Z   2026-10-18T09:29:09Z   1        Normal    Pulled              postgres-5dbf87b8f6-7nzl7   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-18T09:29:10Z   2026-10-18T09:29:10Z   1        Normal    Created             postgres-5dbf87b8f6-7nzl7   Container created
+2026-10-18T09:29:10Z   2026-10-18T09:29:10Z   1        Normal    Started             postgres-5dbf87b8f6-7nzl7   Container started
+2026-10-18T09:29:10Z   2026-10-18T09:29:10Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-7nzl7   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-18T09:29:12Z   2026-10-18T09:29:14Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-7nzl7   Readiness probe failed: /var/run/postgresql:5432 - rejecting connections
+
+2026-10-18T09:29:16Z   2026-10-18T09:29:16Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-spill-calib/data-trawl-0"
+2026-10-18T09:29:16Z   2026-10-18T09:29:16Z   1        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-18T09:29:16Z   2026-10-18T09:29:16Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-18T09:29:16Z   2026-10-18T09:29:16Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-18T09:29:19Z   2026-10-18T09:29:19Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-a0e2f50b-1752-4afb-beb0-9971644612d0
+2026-10-18T09:29:21Z   2026-10-18T09:29:21Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:29:21Z   2026-10-18T09:29:21Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:29:21Z   2026-10-18T09:29:21Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:29:22Z   2026-10-18T09:29:22Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:29:22Z   2026-10-18T09:29:22Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:29:22Z   2026-10-18T09:29:22Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:30:17Z   2026-10-18T09:30:17Z   1        Normal    Killing                 trawl-0                     Stopping container trawld
+2026-10-18T09:30:17Z   2026-10-18T09:30:17Z   1        Normal    SuccessfulDelete        trawl                       Delete Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T09:29:16Z   2026-10-18T09:30:18Z   2        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T09:30:19Z   2026-10-18T09:30:19Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:30:19Z   2026-10-18T09:30:19Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:30:19Z   2026-10-18T09:30:19Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:30:20Z   2026-10-18T09:30:20Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:30:20Z   2026-10-18T09:30:20Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:30:20Z   2026-10-18T09:30:20Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+
+## [2026-10-18T09:31:43.708Z] done calib-fast spill-calib

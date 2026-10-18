@@ -317,6 +317,8 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         monitor = monitor_active,
         "starting trawld"
     );
+    #[cfg(unix)]
+    raise_nofile_limit();
 
     // Install the prometheus metrics recorder before building state.
     let metrics_handle = trawl_server::metrics::prometheus_builder()
@@ -355,6 +357,13 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         &config.wal_dir(),
         config.ingest.enabled,
     )?;
+
+    // Lock and clear the query scratch directory before anything waits on
+    // PostgreSQL either (ADR-0056). Its own lock authorizes the clearing, so
+    // a second trawld on the same directory refuses here, before it touches
+    // the database, and boot never removes spill a live process still uses.
+    // The state holds the lock for the life of the process.
+    let scratch = trawl_server::state::open_query_scratch(&config).map_err(|e| e.to_string())?;
 
     // Admit both databases before the epoch gate can initialize a fresh
     // root or repin recovery can rename/sweep an existing corpus. This exact
@@ -414,7 +423,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     .await?;
 
     let (mut state, http_config) =
-        AppState::from_parts(&config, metrics_handle, derivation, auth, storage).await?;
+        AppState::from_parts(&config, metrics_handle, derivation, auth, storage, scratch).await?;
 
     // Open query debug log if configured (CLI flag overrides config).
     let query_log_path = cli.query_log.or(config.server.query_log.clone());
@@ -1130,6 +1139,66 @@ fn log_crash_dump(status: &trawl_crashdump::Status) {
     }
 }
 
+/// Raises the soft `RLIMIT_NOFILE` to the hard limit and logs both once.
+///
+/// Every query, maintenance pass and ingest connection holds descriptors,
+/// and the query engine opens one per Parquet file it scans, so the 1024
+/// soft limit systemd and most shells hand out runs short well before
+/// memory or disk do. The hard limit is the operator's ceiling (`LimitNOFILE=` in the
+/// Debian unit); trawld only stops leaving headroom under it unused. A
+/// refusal is logged with the inherited values and trawld runs on them.
+#[cfg(unix)]
+fn raise_nofile_limit() {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let inherited = getrlimit(Resource::Nofile);
+    let Some(soft) = raised_nofile_soft(inherited.current, inherited.maximum) else {
+        tracing::info!(
+            event_type = "lifecycle",
+            nofile_soft = %rlimit_text(inherited.current),
+            nofile_hard = %rlimit_text(inherited.maximum),
+            "descriptor limit"
+        );
+        return;
+    };
+    let raised = Rlimit {
+        current: Some(soft),
+        maximum: inherited.maximum,
+    };
+    match setrlimit(Resource::Nofile, raised) {
+        Ok(()) => tracing::info!(
+            event_type = "lifecycle",
+            nofile_soft = %rlimit_text(raised.current),
+            nofile_hard = %rlimit_text(raised.maximum),
+            "descriptor limit raised to the hard limit"
+        ),
+        Err(error) => tracing::warn!(
+            event_type = "config_warning",
+            nofile_soft = %rlimit_text(inherited.current),
+            nofile_hard = %rlimit_text(inherited.maximum),
+            %error,
+            "could not raise the descriptor limit to the hard limit"
+        ),
+    }
+}
+
+/// The soft `RLIMIT_NOFILE` to set, given the inherited soft and hard limits
+/// (`None` is unlimited): the hard limit when it is finite and above the
+/// soft one, otherwise `None`, meaning keep what was inherited. An unlimited
+/// hard limit is not followed: Linux refuses a descriptor limit above
+/// `fs.nr_open`, which infinity always is.
+#[cfg(unix)]
+fn raised_nofile_soft(soft: Option<u64>, hard: Option<u64>) -> Option<u64> {
+    match (soft, hard) {
+        (Some(soft), Some(hard)) if hard > soft => Some(hard),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn rlimit_text(limit: Option<u64>) -> String {
+    limit.map_or_else(|| "unlimited".to_owned(), |n| n.to_string())
+}
+
 /// Resolve a path, expanding `~` to the home directory.
 fn resolve_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).as_ref())
@@ -1138,6 +1207,27 @@ fn resolve_path(path: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn nofile_soft_limit_rises_to_a_finite_hard_limit_only() {
+        // The systemd default: soft 1024 under a much higher hard limit.
+        assert_eq!(raised_nofile_soft(Some(1024), Some(524_288)), Some(524_288));
+        // The unit's LimitNOFILE=65536 sets both: nothing to raise.
+        assert_eq!(raised_nofile_soft(Some(65_536), Some(65_536)), None);
+        // An unlimited hard limit is above the kernel's nr_open, so a soft
+        // limit of infinity would be refused; keep what was inherited.
+        assert_eq!(raised_nofile_soft(Some(1024), None), None);
+        assert_eq!(raised_nofile_soft(None, None), None);
+        assert_eq!(raised_nofile_soft(None, Some(4096)), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofile_limits_render_unlimited_by_name() {
+        assert_eq!(rlimit_text(Some(65_536)), "65536");
+        assert_eq!(rlimit_text(None), "unlimited");
+    }
 
     #[test]
     fn prepare_data_root_refuses_epoch_or_wal_before_repin_cleanup() {

@@ -30,9 +30,13 @@ use tower::ServiceExt as _;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::deadline::Deadline;
+use trawl_server::engine_sample::EngineCheck;
+use trawl_server::error::ServerError;
 use trawl_server::ingest::producer::Derivation;
 use trawl_server::ingest::wal::WalWriter;
 use trawl_server::pool::seam::{INJECTED_PANIC_PAYLOAD, Seam};
+use trawl_server::pool::{WorkContext, WorkKind};
 use trawl_server::state::HttpConfig;
 use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
 use trawl_server::transport::failure::{FAILURE_TARGET, UNMETERED_FAILURE_TARGET, mark_handler};
@@ -597,73 +601,20 @@ async fn exactly_one_http_failure_per_5xx() {
     }
 }
 
-/// `/api/v1/health` is in scope: a 503 from it is one WARN failure on the
+/// `/api/v1/health` is in scope: an engine sample that reads `error` makes
+/// it answer 503 `unavailable`, and that 503 is one WARN failure on the
 /// unmetered target, carrying the peer address, since no key was metered.
-/// A panic the pool caught under the `DuckDB` probe is recorded as one: the
-/// panic stage and class, the payload nowhere.
+/// The record names the failed sample: class `service_unavailable`, cause
+/// `engine_sample_failed`, staged as the handler's own error (ADR-0056).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_health_503_is_one_unmetered_warn_failure() {
+async fn engine_sample_error_is_one_unmetered_warn_503() {
     sinks();
     let server = common::setup().await;
-    let seams = server.state.query.pool.seams();
-    let _panic = seams.panic_at(Seam::Started);
-
-    let response = raw_client()
-        .get(format!("{}/api/v1/health", server.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 503);
-    let request_id = request_id_of(response.headers());
-
-    let lines = stdout_failures_for(&request_id);
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    let line = &lines[0];
-    assert_eq!(level(line), "WARN", "{line}");
-    assert!(line.contains(UNMETERED_FAILURE_TARGET), "{line}");
-    assert_eq!(field(line, "route").as_deref(), Some("/api/v1/health"));
-    assert_eq!(field(line, "stage").as_deref(), Some("panicked"), "{line}");
-    assert_eq!(field(line, "reached"), None, "{line}");
-    assert_eq!(
-        field(line, "error_class").as_deref(),
-        Some("panic"),
-        "{line}"
-    );
-    assert_eq!(field(line, "cause_kind").as_deref(), Some("none"), "{line}");
-    let peer = field(line, "peer_addr").expect("an unmetered failure names its peer");
-    assert!(peer.starts_with("127.0.0.1:"), "{line}");
-
-    // Unmetered, and well under the cap: persisted, peer included.
-    let records = wal_failures_for(&request_id);
-    assert_eq!(records.len(), 1, "{records:?}");
-    assert_eq!(records[0]["target"], UNMETERED_FAILURE_TARGET);
-    assert_eq!(records[0]["level"], "warn");
-    assert_eq!(records[0]["stage"], "panicked");
-    assert_eq!(records[0]["error_class"], "panic");
-    assert_eq!(records[0]["peer_addr"], peer.as_str());
-
-    assert!(
-        stdout_lines()
-            .iter()
-            .all(|line| !line.contains(INJECTED_PANIC_PAYLOAD)),
-        "the panic payload reached stdout"
-    );
-    assert!(
-        wal_records()
-            .iter()
-            .all(|record| !record.to_string().contains(INJECTED_PANIC_PAYLOAD)),
-        "the panic payload reached the WAL"
-    );
-}
-
-/// A `DuckDB` probe that outlives its budget answers the same 503, and the
-/// failure names what the probe returned: a timeout in the handler.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_health_probe_timeout_records_its_class() {
-    sinks();
-    let server = common::setup().await;
-    let seams = server.state.query.pool.seams();
-    let _held = seams.hold(Seam::Started);
+    let _hold = server.state.engine_sample.hold();
+    server
+        .state
+        .engine_sample
+        .publish_for_test(EngineCheck::Error);
 
     let response = raw_client()
         .get(format!("{}/api/v1/health", server.url))
@@ -676,6 +627,32 @@ async fn a_health_probe_timeout_records_its_class() {
     assert_eq!(body["status"], "unavailable", "{body}");
     assert_eq!(body["checks"]["duckdb"], "error", "{body}");
 
+    let lines = stdout_failures_for(&request_id);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert_eq!(level(line), "WARN", "{line}");
+    assert!(line.contains(UNMETERED_FAILURE_TARGET), "{line}");
+    assert_eq!(field(line, "route").as_deref(), Some("/api/v1/health"));
+    assert_eq!(
+        field(line, "stage").as_deref(),
+        Some("handler_error"),
+        "{line}"
+    );
+    assert_eq!(field(line, "reached"), None, "{line}");
+    assert_eq!(
+        field(line, "error_class").as_deref(),
+        Some("service_unavailable"),
+        "{line}"
+    );
+    assert_eq!(
+        field(line, "cause_kind").as_deref(),
+        Some("engine_sample_failed"),
+        "{line}"
+    );
+    let peer = field(line, "peer_addr").expect("an unmetered failure names its peer");
+    assert!(peer.starts_with("127.0.0.1:"), "{line}");
+
+    // Unmetered, and well under the cap: persisted, peer included.
     let records = wal_failures_for(&request_id);
     assert_eq!(records.len(), 1, "{records:?}");
     let record = &records[0];
@@ -684,10 +661,195 @@ async fn a_health_probe_timeout_records_its_class() {
     assert_eq!(record["route"], "/api/v1/health");
     assert_eq!(record["status"], 503);
     assert_eq!(record["stage"], "handler_error");
-    assert!(record.get("reached").is_none(), "{record}");
-    assert_eq!(record["error_class"], "timeout");
-    assert_eq!(record["cause_kind"], "none");
-    assert_eq!(stdout_failures_for(&request_id).len(), 1);
+    assert_eq!(record["error_class"], "service_unavailable");
+    assert_eq!(record["cause_kind"], "engine_sample_failed");
+    assert_eq!(record["peer_addr"], peer.as_str());
+}
+
+/// An engine sample past its budget is a warning, not an outage: health
+/// answers 200 `degraded` with `duckdb: slow`, and records no failure
+/// (ADR-0056).
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_sample_slow_answers_200_degraded() {
+    sinks();
+    let server = common::setup().await;
+    let _hold = server.state.engine_sample.hold();
+    server
+        .state
+        .engine_sample
+        .publish_for_test(EngineCheck::Slow);
+
+    let response = raw_client()
+        .get(format!("{}/api/v1/health", server.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let request_id = request_id_of(response.headers());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "degraded", "{body}");
+    assert_eq!(body["checks"]["duckdb"], "slow", "{body}");
+    assert!(stdout_failures_for(&request_id).is_empty());
+    assert!(wal_failures_for(&request_id).is_empty());
+}
+
+/// Health reads the sample and starts no `DuckDB` work: 50 concurrent
+/// health requests, with the sampler held so it starts no probe of its own,
+/// all answer `duckdb: ok` from the latest sample. The held sampler would
+/// hang any request that waited for a probe; the sampler thread alone owns
+/// the diagnostic connection, so no request can run one; and no executor
+/// worker is reached, so none took a permit.
+///
+/// The requests call the production handler directly: the probe allowance
+/// (3) would refuse most of 50 concurrent requests at the edge, before the
+/// handler this pins.
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_sample_fifty_health_requests_start_no_duckdb_work() {
+    let server = common::setup().await;
+    let seams = server.state.query.pool.seams();
+    let entered = seams.watch(Seam::Entry);
+    let hold = server.state.engine_sample.hold();
+    let started = server.state.engine_sample.probes_started();
+
+    let requests: Vec<_> = (0..50)
+        .map(|_| {
+            tokio::spawn(trawl_server::handlers::health(axum::extract::State(
+                server.state.clone(),
+            )))
+        })
+        .collect();
+    let answers = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut answers = Vec::with_capacity(requests.len());
+        for request in requests {
+            answers.push(request.await.unwrap());
+        }
+        answers
+    })
+    .await
+    .expect("no health request waited for a probe");
+    for (status, body) in answers {
+        assert_eq!(status, StatusCode::OK);
+        let checks = body.0.checks.expect("health names its checks");
+        assert_eq!(checks["duckdb"], "ok", "{checks:?}");
+    }
+    assert_eq!(server.state.engine_sample.probes_started(), started);
+    assert_eq!(entered.arrivals(), 0, "a health request reached a worker");
+    assert_eq!(
+        server.state.query.pool.available_permits(),
+        server.state.query.pool.capacity()
+    );
+    drop(hold);
+}
+
+// -- #304 AC12 ----------------------------------------------------------------------
+
+/// Health takes no executor permit, so a full pool never fails it (ADR-0056).
+///
+/// Every permit is held: one by a search that timed out and stays
+/// retained while its worker is parked, the rest by searches still
+/// running. Health answers 200 with `duckdb: ok` at once, and the pool is
+/// still full when it does. Live tail is not a lever: its streams take no
+/// permit.
+#[tokio::test(flavor = "multi_thread")]
+async fn health_ignores_a_full_pool() {
+    const PERMITS: usize = 3;
+    sinks();
+    let tmp = tempfile::tempdir().unwrap();
+    let server = common::setup_with_query_knobs(
+        tmp.path(),
+        common::seed_data_root(tmp.path()),
+        600,
+        common::QueryKnobs {
+            max_concurrent_queries: PERMITS,
+            ..common::QueryKnobs::DEFAULT
+        },
+    )
+    .await;
+    let pool = server.state.query.pool.clone();
+    let seams = pool.seams();
+    let parked = seams.hold(Seam::Started);
+
+    // One search past its work-start transition times out and keeps its
+    // permit: its worker is parked, so the work outlives the request.
+    let timed_out = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            pool.execute(
+                pool.allocate_query_id(),
+                "*",
+                Deadline::after(std::time::Duration::from_secs(2)),
+                false,
+                0,
+                WorkContext::key(WorkKind::Query, 1),
+            )
+            .await
+        }
+    });
+    until("the timed-out search started", || parked.arrivals() == 1).await;
+    let outcome = timed_out.await.unwrap();
+    assert!(
+        matches!(outcome.result, Err(ServerError::Timeout)),
+        "{:?}",
+        outcome.result
+    );
+    assert_eq!(pool.retained(), 1);
+
+    // The rest are searches still running, through the query route.
+    let running: Vec<_> = (1..PERMITS)
+        .map(|_| {
+            let url = format!("{}/api/v1/query", server.url);
+            let token = server.analyst_token.clone();
+            tokio::spawn(async move {
+                raw_client()
+                    .post(url)
+                    .bearer_auth(token)
+                    .json(&serde_json::json!({ "query": "*" }))
+                    .send()
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    until("every permit is held", || parked.arrivals() == PERMITS).await;
+    assert_eq!(pool.available_permits(), 0);
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        raw_client()
+            .get(format!("{}/api/v1/health", server.url))
+            .send(),
+    )
+    .await
+    .expect("health never waits for a permit")
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    let request_id = request_id_of(response.headers());
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["checks"]["duckdb"], "ok", "{body}");
+    assert_eq!(body["status"], "ok", "{body}");
+    assert!(wal_failures_for(&request_id).is_empty());
+    assert_eq!(pool.available_permits(), 0, "the pool was full throughout");
+    assert_eq!(pool.retained(), 1);
+
+    parked.release();
+    for search in running {
+        assert_eq!(search.await.unwrap().status(), 200);
+    }
+    until("every permit returns", || {
+        pool.available_permits() == PERMITS && pool.retained() == 0
+    })
+    .await;
+}
+
+/// Poll `cond` until it holds, failing after a generous bound.
+async fn until(what: &str, cond: impl Fn() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !cond() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
 }
 
 // -- AC4 ------------------------------------------------------------------------
@@ -1036,8 +1198,8 @@ async fn request_limit_refusal_is_one_unmetered_warn() {
 /// cap.
 ///
 /// Health is a test handler at the production route template: the
-/// production handler cannot be held without a seam, because its `DuckDB`
-/// ping gives up after its own budget.
+/// production handler never waits on anything a test could hold, since it
+/// reads the latest engine sample.
 #[tokio::test(flavor = "multi_thread")]
 async fn probe_refusal_is_one_unmetered_warn() {
     sinks();

@@ -18,6 +18,7 @@ use std::sync::{
 use trawl_api::ExportFormat;
 
 use crate::api;
+use crate::components::resource_notice::ResourceNotice;
 use crate::download;
 use crate::search_url::{EMPTY_QUERY_REFUSAL, is_executable};
 use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, ToastBus, ToastKind, Variant};
@@ -42,6 +43,12 @@ pub fn ExportModal(
     // What this modal refused, shown in its own body rather than as a
     // toast: the reader is looking at the dialog they just submitted.
     let refusal = RwSignal::new(None::<&'static str>);
+    // The server's sentence when it refused the export for want of the
+    // memory or scratch space it gives queries (ADR-0056), shown through
+    // the search page's notice. The same request spends the same budget
+    // again, so nothing retries it: the reader narrows the query and
+    // downloads again.
+    let exhausted = RwSignal::new(None::<String>);
 
     let q_for_submit = query.clone();
     let do_download = Callback::new(move |()| {
@@ -57,6 +64,7 @@ pub fn ExportModal(
             return;
         }
         refusal.set(None);
+        exhausted.set(None);
         downloading.set(true);
         let q = q_for_submit.clone();
         let fmt = format.get_untracked();
@@ -82,7 +90,12 @@ pub fn ExportModal(
                 }
                 Err(e) => {
                     downloading.try_set(false);
-                    bus.push(ToastKind::Error, "Export failed", Some(e.to_string()));
+                    match e.resource_exhausted() {
+                        Some(message) => {
+                            exhausted.try_set(Some(message.to_owned()));
+                        }
+                        None => bus.push(ToastKind::Error, "Export failed", Some(e.to_string())),
+                    }
                 }
             }
         });
@@ -111,6 +124,8 @@ pub fn ExportModal(
             <Show when=move || refusal.get().is_some()>
                 <div class="m-refusal">{move || refusal.get().unwrap_or_default()}</div>
             </Show>
+
+            {move || exhausted.get().map(|message| view! { <ResourceNotice message=message/> })}
 
             <div class="m-field">
                 <label>"Format"</label>

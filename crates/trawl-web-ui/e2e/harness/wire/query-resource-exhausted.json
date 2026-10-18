@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "query_resource_exhausted",
+    "message": "query could not complete with the available query resources; narrow the time range or simplify the query"
+  }
+}

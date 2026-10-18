@@ -55,10 +55,12 @@ use crate::components::exact_table::ExactTable;
 use crate::components::export_modal::ExportModal;
 use crate::components::facet_sidebar::FacetSidebar;
 use crate::components::histogram::Histogram;
+use crate::components::live_cap_notice::LiveCapNotice;
 use crate::components::malformed_notice::MalformedNotice;
 use crate::components::meta_strip::MetaStrip;
 use crate::components::query_error_notice::QueryErrorNotice;
 use crate::components::recovering_notice::RecoveringNotice;
+use crate::components::resource_notice::ResourceNotice;
 use crate::components::results_table::ResultsTable;
 use crate::components::save_as_net_modal::SaveAsNetModal;
 use crate::components::search_quick_start::SearchQuickStart;
@@ -544,6 +546,10 @@ pub fn Search() -> impl IntoView {
     let stream_query = RwSignal::new(String::new());
     let lagged = RwSignal::new(None::<u64>);
     let stream_failure = RwSignal::new(None::<&'static str>);
+    // The caps the open stream's latest snapshot reported (ADR-0001).
+    // Its own signal, apart from the failure and the lag: a disconnect
+    // or a lag notice says nothing about what the aggregation dropped.
+    let live_capped = RwSignal::new(Vec::<trawl_api::stream::SnapshotCap>::new());
     // Aggregation frames this session accepted — the footer's `Updates`
     // count. The ring's own `epoch` is the raw twin (`Received`).
     let frames = RwSignal::new(0_u64);
@@ -574,6 +580,7 @@ pub fn Search() -> impl IntoView {
         live_snapshot.set(None);
         lagged.set(None);
         stream_failure.set(None);
+        live_capped.set(Vec::new());
         // A new session counts from zero. An automatic EventSource
         // reconnect does not re-run this effect, so a blip keeps the
         // rows and both counts.
@@ -596,6 +603,7 @@ pub fn Search() -> impl IntoView {
                 latest: stream_opened_at,
                 session,
             }),
+            capped: Some(live_capped),
         };
         if let Some(handle) = start_stream(&q, signals) {
             stream_handle.update_value(|slot| *slot = Some(handle));
@@ -736,15 +744,38 @@ pub fn Search() -> impl IntoView {
             _ => None,
         })
     });
-    // A named refusal (a query error, or the corpus recovering) the
-    // resource still holds after a newer request superseded it: the same
-    // text re-sent, or new text not yet answered. The tables would render
-    // it as "Couldn't load results" with a Retry, which a query error
-    // never offers and which would misname a recovering server, so the
-    // region waits for the new answer instead.
+    // The resource notice, when the failure on screen is the CURRENT
+    // request answered with `query_resource_exhausted` (ADR-0056): the
+    // query used up the memory or scratch space trawld gives queries.
+    // The text is fine and nothing ran to completion, so this is neither
+    // a query error nor an empty result. Identity decides, as for the
+    // notices above. Live reads the stream, which never answers with
+    // this code, so live shows no such notice.
+    let resource_notice = Memo::new(move |_| -> Option<String> {
+        if unreadable.get() || live.get() || snapshot_q.get().trim().is_empty() || loading.get() {
+            return None;
+        }
+        rows.with(|result| match result {
+            Some(Err(failure))
+                if failure.intent == request_intent.get()
+                    && failure.generation == request_generation.get() =>
+            {
+                failure.error.resource_exhausted().map(str::to_owned)
+            }
+            _ => None,
+        })
+    });
+    // A named refusal (a query error, the corpus recovering, or the
+    // query's resources exhausted) the resource still holds after a newer
+    // request superseded it: the same text re-sent, or new text not yet
+    // answered. The tables would render it as "Couldn't load results"
+    // with a Retry, which a query error and an exhausted query never
+    // offer and which would misname a recovering server, so the region
+    // waits for the new answer instead.
     let refusal_superseded = Signal::derive(move || {
         query_notice.get().is_none()
             && recovering_notice.get().is_none()
+            && resource_notice.get().is_none()
             && !unreadable.get()
             && !live.get()
             && !snapshot_q.get().trim().is_empty()
@@ -754,6 +785,7 @@ pub fn Search() -> impl IntoView {
                     Some(Err(failure))
                         if failure.error.query_error().is_some()
                             || failure.error.recovering().is_some()
+                            || failure.error.resource_exhausted().is_some()
                 )
             })
     });
@@ -1178,6 +1210,12 @@ pub fn Search() -> impl IntoView {
                 // worth reading, and the Visualization tab is drawn from
                 // the same incomplete rows.
                 <DegradedNotice query=effective_q fields=degraded_fields/>
+                // The live twin, for a stream whose aggregation dropped
+                // input past a cap. Above the results for the same
+                // reason: the rows under it are the partial ones, on
+                // either tab. Only a live stream sets it, and starting
+                // any stream, or leaving Live, clears it.
+                <LiveCapNotice capped=live_capped/>
                 <Show when=move || !unreadable.get()
                     && mode.get() == Mode::Live
                     && (active_tab.get() == ResultsTab::Events || !is_chart_query.get())
@@ -1232,6 +1270,16 @@ pub fn Search() -> impl IntoView {
                     view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
                             <RecoveringNotice message=message on_retry=Callback::new(move |()| rerun_request())/>
+                        </div>
+                    }.into_any()
+                } else if let Some(message) = resource_notice.get() {
+                    // The query used up its resources, on either tab:
+                    // no underline, no empty table, and no Retry, since
+                    // the same request spends the same budget again. The
+                    // server's sentence says what helps.
+                    view! {
+                        <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
+                            <ResourceNotice message=message/>
                         </div>
                     }.into_any()
                 } else if refusal_superseded.get() {

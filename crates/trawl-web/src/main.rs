@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use clap::{CommandFactory as _, FromArgMatches as _, Parser};
 use tracing_subscriber::EnvFilter;
 use trawl_web::config::ResolvedConfig;
+use trawl_web::listener::{self, ConnectionTimeouts};
 use trawl_web::routes;
 use trawl_web::state::AppState;
 use trawl_web::upstream::CA_REREAD_INTERVAL;
@@ -163,6 +164,41 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(addr = %listener.local_addr()?, "trawl-web listening");
-    axum::serve(listener, router).await?;
+    listener::serve(
+        listener,
+        router,
+        ConnectionTimeouts::DEFAULT,
+        shutdown_signal(),
+    )
+    .await;
     Ok(())
+}
+
+/// Resolve on SIGINT or SIGTERM: the listener then stops accepting and
+/// drains its open connections.
+async fn shutdown_signal() {
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %error, "cannot listen for SIGINT; shutdown waits for SIGTERM");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "cannot listen for SIGTERM; shutdown waits for SIGINT");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupt => tracing::info!("SIGINT received; shutting down"),
+        () = terminate => tracing::info!("SIGTERM received; shutting down"),
+    }
 }

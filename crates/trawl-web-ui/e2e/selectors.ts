@@ -136,6 +136,21 @@ export const SEL = {
   recoveringNotice: '#search-results .recovering-notice[role="alert"]',
   recoveringNoticeTitle: '.recovering-notice-title',
   recoveringNoticeText: '.recovering-notice-text',
+  /// crates/trawl-web-ui/src/components/resource_notice.rs — the
+  /// resource notice, which search.rs mounts in the results region in
+  /// place of the table or chart when a snapshot is answered with
+  /// `query_resource_exhausted`. Its parts are chained off the notice.
+  resourceNotice: '#search-results .resource-notice[role="alert"]',
+  resourceNoticeTitle: '.resource-notice-title',
+  resourceNoticeText: '.resource-notice-text',
+  /// crates/trawl-web-ui/src/components/live_cap_notice.rs — the live cap
+  /// notice, which search.rs mounts above the results when the open
+  /// stream's latest snapshot reports `capped`. The `role="status"`
+  /// wrapper stays mounted; the notice inside it comes and goes. Its
+  /// parts are chained off the notice.
+  liveCapNotice: '.live-cap-live[role="status"] .live-cap-notice',
+  liveCapNoticeTitle: '.live-cap-notice-title',
+  liveCapNoticeText: '.live-cap-notice-text',
   /// crates/trawl-web-ui/src/components/results_table.rs — the one cell
   /// an empty snapshot page renders.
   resultsEmptyCell: '.results-empty-cell',
@@ -189,6 +204,11 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/export_modal.rs — what the modal
   /// says when it refuses its own query rather than posting it.
   modalRefusal: '.m-refusal',
+  /// crates/trawl-web-ui/src/components/export_modal.rs — the resource
+  /// notice the modal shows in its body when the server answers an
+  /// export with `query_resource_exhausted` (ADR-0056). Its parts are
+  /// the search page's `resourceNoticeTitle` and `resourceNoticeText`.
+  modalResourceNotice: '.modal .resource-notice[role="alert"]',
   /// crates/fleet-ui/src/toast/runtime.rs Toasts, whose class is
   /// `toast {kind}` from crates/fleet-ui/src/toast/kinds.rs. An error
   /// toast is what a producer refusal raises.
@@ -522,6 +542,10 @@ export const SEL = {
   /// table: the server's own sentence, in its own element rather than
   /// the generic load-error wrapper (issue #227).
   runUnavailable: '.run-unavailable',
+  /// The line a stored-run read the server refused for resources
+  /// (`query_resource_exhausted`) shows: its own sentence, with a manual
+  /// "Check again" and no polling behind it.
+  runExhausted: '.run-exhausted',
   /// The line naming rows the response never carried. Absent when paging
   /// covers everything.
   previewCap: '.preview-cap',
@@ -607,6 +631,13 @@ export const COPY = {
   /// crates/trawl-web-ui/src/components/recovering_notice.rs — the
   /// recovering notice's title.
   recoveringTitle: 'Search is recovering',
+  /// crates/trawl-web-ui/src/components/resource_notice.rs — the
+  /// resource notice's title.
+  resourceTitle: 'Query ran out of resources',
+  /// crates/trawl-web-ui/src/live_cap_copy.rs — the live cap notice's
+  /// title and the sentence that closes its text.
+  liveCapTitle: 'Live aggregate is partial',
+  liveCapAdvice: 'Narrow the query, or switch to Snapshot.',
   /// crates/trawl-web-ui/src/state/stream_session.rs STREAM_UNAVAILABLE.
   streamUnavailable: 'Live stream unavailable. Retry or switch to Snapshot.',
   /// crates/trawl-web-ui/src/components/editor_wrap.rs — the visible

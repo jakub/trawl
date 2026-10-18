@@ -20,6 +20,8 @@ type RepinRequest = { field: string; to: string; dry_run: boolean; force: boolea
 const free: Reply = { json: { job: null } };
 const held: Reply = { json: { job: { ...running, field: OTHER } } };
 const failed: Reply = { status: 503, json: { error: { code: 'unavailable', message: 'Fixture status unavailable' } } };
+/** What a read by id gets for a job the server does not hold. */
+const gone: Reply = { status: 404, json: { error: { code: 'not_found', message: 'repin job not found' } } };
 
 /** A read remains pending until the test releases it. No timer decides when
  * the response arrives, including responses delivered after modal disposal. */
@@ -46,15 +48,30 @@ async function prepare(page: Page) {
   } }));
 
   const script = {
+    // Install-wide reads (no `?id=`), answered from `status`.
     reads: 0,
+    // The ids of reads by id, answered in order from `jobs`; once `jobs`
+    // is empty the job is `gone`.
+    jobReads: [] as number[],
+    jobs: [] as Reply[],
     posts: [] as RepinRequest[],
     status: [] as (Reply | ReturnType<typeof pending>)[],
-    postMode: 'busy' as 'busy' | 'plan' | 'lost',
+    postMode: 'busy' as 'busy' | 'plan' | 'lost' | 'late',
+    // Merged over the row a `late` 202 carries, which is otherwise the
+    // claimed job still running.
+    late: {} as Record<string, unknown>,
     // `bad_request` is the server's supported ErrorResponse code for busy.
     // The audit's `conflict` spelling exercises the conservative fallback.
     busyCode: 'bad_request',
   };
-  await page.route('**/api/v1/schema/repin/status', async route => {
+  // A predicate, not a glob: `**/repin/status` would not match `?id=`.
+  await page.route(url => url.pathname === '/api/v1/schema/repin/status', async route => {
+    const id = new URL(route.request().url()).searchParams.get('id');
+    if (id !== null) {
+      script.jobReads.push(Number(id));
+      await route.fulfill(script.jobs.shift() ?? gone);
+      return;
+    }
     script.reads++;
     const next = script.status.shift() ?? free;
     if ('response' in next) {
@@ -71,6 +88,11 @@ async function prepare(page: Page) {
       await route.fulfill({ status: 409, json: { error: { code: script.busyCode, message: BUSY } } });
     } else if (script.postMode === 'lost' && !body.dry_run) {
       await route.fulfill(failed);
+    } else if (script.postMode === 'late') {
+      // The scan outlasted the server's answer bound: 202 with the
+      // claimed row, dry run included (ADR-0054).
+      await route.fulfill({ status: 202, json: { job: { ...running, field: body.field, to_type: body.to,
+        dry_run: body.dry_run, id: 4212, files_done: 0, ...script.late } } });
     } else {
       await route.fulfill({ json: { job: { ...running, field: body.field, to_type: body.to,
         dry_run: true, status: 'succeeded', id: 4212, files_done: 12 } } });
@@ -216,6 +238,100 @@ for (const dismissal of ['close', 'Escape', 'another field'] as const) {
     await expectNoBackgroundWork(page);
   });
 }
+
+test('repin plan answered 202 past the server bound is followed by its id to its report', async ({ page }) => {
+  const script = await prepare(page);
+  script.postMode = 'late';
+  const planned = { ...running, field: FIELD, to_type: 'BIGINT', dry_run: true, id: 4212, files_done: 0 };
+  // Drawer mount, and from then on another field's job holds the slot, so
+  // the install-wide read never names the plan's job again.
+  script.status.push(free, held, held, held);
+  // The plan's follow: one read still scanning, one with the report.
+  script.jobs.push({ json: { job: planned } },
+    { json: { job: { ...planned, status: 'succeeded', finished_at: '2026-08-01T09:21:00Z' } } });
+  await page.goto(`/search/schema?field=${FIELD}`);
+  await open(page);
+  await expect(modal(page).getByRole('button', { name: 'Planning…', exact: true })).toBeDisabled();
+  // The 202 row is the first read; each re-read waits one poll interval.
+  await expect(modal(page).getByRole('button', { name: 'Run repin', exact: true }))
+    .toBeEnabled({ timeout: 2 * TIMING.repinPollMs + 5_000 });
+  await expect(modal(page)).toBeVisible();
+  expect(script.posts).toEqual([{ field: FIELD, to: 'BIGINT', dry_run: true, force: false }]);
+  expect(script.jobReads).toEqual([4212, 4212]);
+  expect(script.reads).toBe(1);
+  await expectNoBackgroundWork(page);
+});
+
+for (const [name, late, outcome] of [
+  ['succeeded', { status: 'succeeded', files_done: 12, finished_at: '2026-08-01T09:21:00Z' }, null],
+  ['cancelled', { status: 'cancelled', finished_at: '2026-08-01T09:21:00Z', error: 'cancelled by e2e during scan' },
+    "The plan's scan ended without a report (cancelled): cancelled by e2e during scan"],
+] as const) {
+  test(`repin plan answered 202 with a ${name} row is read from the 202 alone`, async ({ page }) => {
+    const script = await prepare(page);
+    script.postMode = 'late';
+    script.late = late;
+    script.status.push(free);
+    await page.goto(`/search/schema?field=${FIELD}`);
+    await open(page);
+    if (outcome === null) {
+      await expect(modal(page).getByRole('button', { name: 'Run repin', exact: true })).toBeEnabled();
+    } else {
+      await expect(modal(page).getByText(outcome, { exact: true })).toBeVisible();
+      await expect(modal(page).getByRole('button', { name: 'Retry plan', exact: true })).toBeEnabled();
+      await expect(modal(page).getByRole('button', { name: /Run repin/ })).toHaveCount(0);
+    }
+    expect(script.posts).toEqual([{ field: FIELD, to: 'BIGINT', dry_run: true, force: false }]);
+    // A terminal row is the answer: nothing is read after it.
+    expect(script.jobReads).toEqual([]);
+    expect(script.reads).toBe(1);
+    await expectNoBackgroundWork(page);
+  });
+}
+
+test('repin plan answered 202 whose job the status route no longer holds asks for a new plan', async ({ page }) => {
+  const script = await prepare(page);
+  script.postMode = 'late';
+  // Drawer mount. No read by id is scripted, so the plan's job is `gone`.
+  script.status.push(free);
+  await page.goto(`/search/schema?field=${FIELD}`);
+  await open(page);
+  await expect(modal(page).getByText("The plan's scan outlasted the server's answer", { exact: false }))
+    .toBeVisible({ timeout: TIMING.repinPollMs + 5_000 });
+  await expect(modal(page).getByRole('button', { name: 'Retry plan', exact: true })).toBeEnabled();
+  await expect(modal(page).getByRole('button', { name: /Run repin/ })).toHaveCount(0);
+  expect(script.jobReads).toEqual([4212]);
+  expect(script.reads).toBe(1);
+  await expectNoBackgroundWork(page);
+});
+
+test('repin run answered 202 is followed by its id after another job takes the slot', async ({ page }) => {
+  const script = await prepare(page);
+  script.postMode = 'plan';
+  const started = { ...running, field: FIELD, to_type: 'BIGINT', dry_run: false, id: 4212, files_done: 0 };
+  // Drawer mount, and from then on another field's job holds the slot.
+  script.status.push(free, held, held, held);
+  script.jobs.push({ json: { job: { ...started, status: 'succeeded', files_done: 12,
+    rows_rewritten: 41822, finished_at: '2026-08-01T09:21:00Z' } } });
+  await page.goto(`/search/schema?field=${FIELD}`);
+  await open(page);
+  const run = modal(page).getByRole('button', { name: 'Run repin', exact: true });
+  await expect(run).toBeEnabled();
+  script.postMode = 'late';
+  await run.click();
+  // The 202 hands the running job to the case file, which follows it.
+  await expect(modal(page)).toHaveCount(0);
+  await expect(page.getByText('Repin finished', { exact: true })).toBeVisible();
+  await expect(page.getByText('Repin status unavailable', { exact: false })).toHaveCount(0);
+  expect(script.posts).toEqual([
+    { field: FIELD, to: 'BIGINT', dry_run: true, force: false },
+    { field: FIELD, to: 'BIGINT', dry_run: false, force: false },
+  ]);
+  expect(script.jobReads).toEqual([4212]);
+  expect(script.reads).toBe(1);
+  expect(await intervalCount(page, TIMING.repinPollMs)).toBe(0);
+  expect(await toastCount(page)).toBe(1);
+});
 
 test('repin lost execution stays indeterminate after failed and empty probes', async ({ page }) => {
   const script = await prepare(page);

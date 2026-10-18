@@ -120,10 +120,15 @@ impl KeyStore {
     /// [`Self::ping`] to confirm the database is reachable). Migrations are
     /// applied via [`crate::migrate`] from an operational tool, never here.
     pub fn from_pool(pool: PgPool) -> Self {
-        Self {
-            pool,
-            cache: VerificationCache::new(),
-        }
+        Self::with_cache(pool, VerificationCache::new())
+    }
+
+    /// Construct from an existing pool and the given verification cache.
+    /// Crate-private: the store's tests pass a small cache to reach
+    /// eviction, and the product only ever constructs through
+    /// [`Self::from_pool`].
+    pub(crate) fn with_cache(pool: PgPool, cache: VerificationCache) -> Self {
+        Self { pool, cache }
     }
 
     /// Connect to Postgres from a database URL and construct a store.
@@ -322,9 +327,13 @@ impl KeyStore {
     /// enumeration oracle.
     ///
     /// A prefix miss still pays one argon2id verification so response time
-    /// doesn't leak prefix existence, and liveness is rechecked inside the
-    /// `last_used` UPDATE, which also locks the row for the role resolution
-    /// that follows.
+    /// doesn't leak prefix existence. Liveness is rechecked inside the
+    /// `last_used` UPDATE, which also requires the stored hash to still be
+    /// the one this check verified against, or hit the cache under, and
+    /// locks the row for the role resolution that follows. A hash rotation
+    /// that commits between the row read and that UPDATE therefore refuses
+    /// the check in flight: the presented plaintext was never checked
+    /// against the new hash, so it is not authenticated.
     pub async fn verify_key(&self, plaintext: &str) -> Result<VerifiedKey, AuthError> {
         let prefix = token::extract_prefix(plaintext).ok_or_else(|| {
             AuthError::MalformedToken("token must start with flt_ and be at least 12 chars".into())
@@ -357,7 +366,12 @@ impl KeyStore {
 
         let cache_key = VerificationCacheKey::build(prefix, plaintext, &stored_hash);
 
-        if !self.cache.contains(&cache_key) {
+        // Only the request that ran the KDF may insert. A cache hit skips
+        // the KDF and must leave the cache as it found it: re-inserting on
+        // a hit would turn a lookup into a use, and the eviction order is
+        // insertion order (see the cache module docs).
+        let ran_kdf = !self.cache.contains(&cache_key);
+        if ran_kdf {
             // Cache miss — pay the argon2id cost on the blocking pool so
             // the tokio worker thread stays available for other tasks.
             let hash_valid = verify_token_async(plaintext, &stored_hash).await?;
@@ -374,20 +388,28 @@ impl KeyStore {
             return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
-        // The UPDATE both rechecks liveness and locks the api_keys row until
-        // commit. Role assign/unassign operations lock the same row before
-        // mutating key_roles, so the role resolution below observes a role
-        // set that cannot change underneath this in-flight verify.
+        // The UPDATE rechecks liveness, requires the hash to be the one this
+        // check verified against (a rotation committed since the SELECT
+        // above would otherwise authenticate a plaintext the new hash was
+        // never asked about), and locks the api_keys row until commit. Role
+        // assign/unassign operations lock the same row before mutating
+        // key_roles, so the role resolution below observes a role set that
+        // cannot change underneath this in-flight verify. Under READ
+        // COMMITTED a blocked UPDATE re-evaluates its WHERE on the row
+        // version that won, which is what makes the hash predicate a
+        // fail-closed check rather than a stale read.
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE api_keys
              SET last_used = NOW()
              WHERE id = $1
+               AND hash = $2
                AND active = TRUE
                AND (expires_at IS NULL OR expires_at > NOW())
              RETURNING id",
         )
         .bind(id)
+        .bind(&stored_hash)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -402,9 +424,14 @@ impl KeyStore {
 
         let kind: PrincipalKind = kind_str.parse()?;
 
-        // Only insert on full success — never pollute the cache with
-        // (prefix, hash, fingerprint) triples that lost a race.
-        self.cache.insert(cache_key);
+        // Insert only after this request ran the KDF and then passed every
+        // database check, the hash predicate included, so the entry is for
+        // a hash a row still holds — never pollute the cache with (prefix,
+        // hash, fingerprint) triples that lost a race, and never re-insert
+        // on a hit.
+        if ran_kdf {
+            self.cache.insert(cache_key);
+        }
 
         Ok(VerifiedKey::from_roles(id, db_prefix, name, kind, roles))
     }
@@ -1326,8 +1353,13 @@ mod pg_tests {
     use sqlx::PgPool;
     use tokio::time::timeout;
 
+    use std::pin::pin;
+    use std::time::Duration;
+
     use super::tests::{ARGON2_LIMIT_TESTS, DEADLINE, Parked, available_permits};
     use super::{ARGON2_CHECK_LIMIT, KeyStore};
+    use crate::cache::VerificationCache;
+    use crate::error::AuthError;
     use crate::types::PrincipalKind;
 
     /// A key whose check is cached runs no argon2, so it verifies while
@@ -1362,5 +1394,122 @@ mod pg_tests {
             check.finish().await;
         }
         assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
+    }
+
+    /// A cache hit runs no KDF, so it inserts nothing. The entry a hit
+    /// finds is the one the KDF run inserted, and a hit neither re-queues
+    /// nor renews it.
+    #[sqlx::test]
+    async fn a_cache_hit_inserts_nothing(pool: PgPool) {
+        let _serial = ARGON2_LIMIT_TESTS.lock().await;
+        let store = KeyStore::from_pool(pool);
+        let created = store
+            .create_key("hit", PrincipalKind::Service, &[], None)
+            .await
+            .expect("create");
+
+        store
+            .verify_key(&created.plaintext_token)
+            .await
+            .expect("the first check runs argon2 and inserts");
+        assert_eq!(store.cache.insert_calls(), 1, "the KDF run inserts once");
+
+        store
+            .verify_key(&created.plaintext_token)
+            .await
+            .expect("the second check hits the cache");
+        assert_eq!(
+            store.cache.insert_calls(),
+            1,
+            "a cache hit must not insert again"
+        );
+        assert_eq!(store.cache_stats().entries, 1);
+    }
+
+    /// An evicted key pays argon2id again: with every permit parked, its
+    /// check cannot finish until one is freed. A wrong token for an evicted
+    /// prefix, or for a cached one, is refused by a KDF run and inserts
+    /// nothing. Eviction changes cost, never the answer.
+    #[sqlx::test]
+    async fn eviction_forces_a_kdf_run_and_never_authenticates_a_wrong_token(pool: PgPool) {
+        let _serial = ARGON2_LIMIT_TESTS.lock().await;
+        let store = KeyStore::with_cache(pool, VerificationCache::with_capacity(1));
+        let first = store
+            .create_key("first", PrincipalKind::Service, &[], None)
+            .await
+            .expect("create first");
+        let second = store
+            .create_key("second", PrincipalKind::Service, &[], None)
+            .await
+            .expect("create second");
+
+        store
+            .verify_key(&first.plaintext_token)
+            .await
+            .expect("first runs argon2 and is cached");
+        store
+            .verify_key(&second.plaintext_token)
+            .await
+            .expect("second runs argon2 and evicts first");
+        assert_eq!(store.cache_stats().entries, 1);
+        assert_eq!(store.cache.insert_calls(), 2);
+
+        // Park every permit. The evicted key needs one, so its check stays
+        // pending; a check that found a stale entry would finish at once.
+        let mut parked = Vec::new();
+        for _ in 0..ARGON2_CHECK_LIMIT {
+            parked.push(Parked::hold().await);
+        }
+        assert_eq!(available_permits(), 0, "four parked checks hold the limit");
+        let mut check = pin!(store.verify_key(&first.plaintext_token));
+        assert!(
+            timeout(Duration::from_millis(500), check.as_mut())
+                .await
+                .is_err(),
+            "an evicted key waits for an argon2 permit"
+        );
+        parked.pop().expect("a parked check").finish().await;
+        let verified = timeout(DEADLINE, check)
+            .await
+            .expect("the freed permit lets the KDF run")
+            .expect("the evicted key verifies again");
+        assert_eq!(verified.name, "first");
+        assert_eq!(
+            store.cache.insert_calls(),
+            3,
+            "the KDF run inserted the key again"
+        );
+        assert_eq!(store.cache_stats().entries, 1);
+        for check in parked {
+            check.finish().await;
+        }
+        assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
+
+        // `second` is the evicted key now. A wrong token with its prefix
+        // reaches argon2id and is refused there.
+        let tampered_second = format!(
+            "{}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0",
+            &second.plaintext_token[..12]
+        );
+        assert!(matches!(
+            store.verify_key(&tampered_second).await,
+            Err(AuthError::InvalidKey(_))
+        ));
+        // And a wrong token with the cached prefix misses the cache, because
+        // the entry is bound to the plaintext fingerprint, and is refused too.
+        let tampered_first = format!(
+            "{}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0",
+            &first.plaintext_token[..12]
+        );
+        assert!(matches!(
+            store.verify_key(&tampered_first).await,
+            Err(AuthError::InvalidKey(_))
+        ));
+        assert_eq!(
+            store.cache.insert_calls(),
+            3,
+            "a refused token inserts nothing"
+        );
+        assert_eq!(store.cache_stats().entries, 1);
     }
 }

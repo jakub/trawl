@@ -1,0 +1,8 @@
+{
+  "columns": ["service", "count"],
+  "rows": [
+    { "service": "nginx", "count": 41 },
+    { "service": "postgres", "count": 7 }
+  ],
+  "capped": [{ "cap": "groups", "limit": 10000 }]
+}

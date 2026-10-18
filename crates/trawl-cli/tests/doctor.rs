@@ -1714,6 +1714,36 @@ fn doctor_recovering_corpus_is_not_sampled() {
     }
 }
 
+/// A starved engine answers 200 `degraded` with `duckdb: slow`. The
+/// engine row is `complete` with the reported value as its detail, not
+/// failed and not a value this CLI does not know, so the run passes and
+/// exits 0 (ADR-0056).
+#[test]
+fn doctor_slow_engine_is_degraded_not_failed() {
+    let body = format!(
+        r#"{{"status":"degraded","checks":{{"duckdb":"slow","ingest_capacity":"ok"}},"version":"{}"}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    let (output, stub) = doctor_against(vec![(HEALTH_PATH, 200, body), whoami(r#""query""#)]);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let report = report(&output);
+    assert_eq!(report["verdict"], "pass");
+    assert_eq!(check_by_id(&report, "api.health")["outcome"], "complete");
+    let duckdb = check_by_id(&report, "api.health.duckdb");
+    assert_eq!(duckdb["outcome"], "complete", "{duckdb}");
+    assert_eq!(duckdb["detail"], "reported slow");
+    assert!(duckdb["reason"].is_null(), "{duckdb}");
+    assert!(
+        duckdb["next_action"]
+            .as_str()
+            .is_some_and(|next| next.contains("degraded")),
+        "{duckdb}"
+    );
+    let requests = stub.requests();
+    let paths: Vec<&str> = requests.iter().map(|r| r.path.as_str()).collect();
+    assert_eq!(paths, [HEALTH_PATH, WHOAMI_PATH]);
+}
+
 /// A 503 keeps its per-check body. Rows are sorted by name: `ok` is
 /// complete (the unknown `wal` included), `error` and `refusing` fail, an
 /// unrecognized value fails and is shown when it is a plain identifier, and

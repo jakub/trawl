@@ -12,8 +12,44 @@
 # timeout_secs = 30
 
 # Maximum concurrent queries (bounds the DuckDB executor pool).
-# Defaults to the number of available CPUs.
+# Defaults to the number of available CPUs, at most 8 (4 when the count
+# cannot be read). Every permit shares query_memory_limit.
 # max_concurrent_queries = 4
+
+# Query scratch directory: each query's spill, the hot-buffer query
+# snapshots and the Parquet export staging files. Defaults to the data
+# root's sibling, <data.path>.query-scratch, so it sits on the data volume.
+# It must not be the data root, the WAL directory or a repin staging root
+# (<data.path>.repin-next, <data.path>.repin-aside), nor inside or above
+# any of them. An explicit path must be absolute, with no '..' component
+# and none of the glob metacharacters * ? [ ] { }. Startup compares the
+# opened directory with those roots by device and inode, so an overlap
+# refuses however the path spells it. A query-only node with a read-only
+# data root sets it to a writable directory. trawld makes the directory
+# 0700 and holds an exclusive lock on it, so a second trawld on the same
+# directory refuses to start. At boot it removes the spill directories,
+# snapshots and export files an earlier trawld left behind; any other entry
+# refuses the start. A Linux kernel before 5.8 cannot report mount ids, so
+# there a directory with any entry refuses the start and only an empty one
+# opens.
+# query_scratch_dir = "/var/lib/trawl/data.query-scratch"
+
+# Budgets of the query database, shared by every query, export and field
+# sample. A query that needs more fails with 503 query_resource_exhausted;
+# the server keeps serving. Zero is refused.
+# Spill cap (DuckDB max_temp_directory_size). It is a maximum, not a
+# reservation: trawld does not compare it with the free space or with
+# [retention] min_free_disk_bytes. Keep that floor above it.
+# query_spill_max_bytes = "4GiB"
+# Memory limit (DuckDB memory_limit). It bounds DuckDB-managed memory, not
+# the whole process: plan for it plus compaction_memory_limit for each of
+# the two maintenance databases that can run at once, plus the request
+# bodies counted under max_concurrent_requests. At the defaults that comes
+# to about 6.1-6.6 GiB resident, under the packaged 8 GiB ceiling.
+# query_memory_limit = "2GiB"
+# Worker threads of the query database. Independent of
+# max_concurrent_queries, which counts queries, not threads.
+# query_threads = 4
 
 # Maximum rows a single query can return before being rejected.
 # Increase if analysts need larger result sets; decrease to bound memory.
@@ -109,7 +145,8 @@
 # ingest_rpm = 1000
 
 [data]
-# Directory containing parquet files. Glob patterns are not accepted.
+# Directory containing parquet files. The glob metacharacters * ? [ ] { }
+# are refused.
 path = "~/.trawl/data"
 
 [auth]
@@ -147,6 +184,17 @@ path = "~/.trawl/data"
 # How often the compaction task runs (seconds). Controls how quickly
 # WAL files are merged into parquet. Lower = fresher data but more I/O.
 # compaction_interval_secs = 10
+
+# DuckDB memory limit for each compaction, rollup, conform and repin
+# database, as a DuckDB memory string (GiB is 1024-based; DuckDB reads GB as
+# a power of ten). At most two run at once, beside the query database's
+# query_memory_limit. A statement that runs out logs
+# maintenance_resource_exhausted. Compaction and rollup retry on the next
+# pass. A repin statement that runs out, with no fallback, ends the job
+# failed and needs a new job. Boot conformance retries at the next boot.
+# Optional sampling falls back and the pass completes: misfit samples in
+# compaction and conform, and the repin scan's sampled count.
+# compaction_memory_limit = "1GiB"
 
 # Write internal server events (queries, auth, compaction) to the ingest
 # pipeline as service:trawld. Enables self-hosted dashboards.
@@ -251,7 +299,10 @@ path = "~/.trawl/data"
 # directories regardless of age, taking the one that has used up the
 # largest fraction of its env's age limit first. 0 = disabled. Acts as
 # a safety net independent of max_age_days.
-# min_free_disk_bytes = "1G"
+# The 6GiB default holds the 4GiB query spill budget, the hot-buffer
+# snapshots and export staging. Nothing checks it against
+# query_spill_max_bytes: raise the two together.
+# min_free_disk_bytes = "6GiB"
 
 # How often the retention task runs (seconds). More frequent checks
 # respond faster to disk pressure but add minor I/O overhead.

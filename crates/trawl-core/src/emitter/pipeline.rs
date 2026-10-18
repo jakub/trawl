@@ -220,19 +220,26 @@ fn process_frequency(
     ctx.limit = Some(count);
 }
 
+/// `drop` keeps every incoming column but the named ones.
+///
+/// A field no incoming column carries drops nothing, as the live tail
+/// ignores it ([`crate::stream`], ADR-0001), so the stage excludes
+/// through [`columns_excluding`] and not `* EXCLUDE`, which refuses a
+/// name the input lacks.
 fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
     ctx.flush_if(FlushCondition::IfModified);
 
-    let excluded: Vec<String> = drop_stage.fields.iter().map(|f| quote_field(f)).collect();
-    ctx.select = vec![format!("* EXCLUDE ({})", excluded.join(", "))];
+    ctx.select = vec![columns_excluding(&drop_stage.fields)];
     ctx.has_projection = true;
 }
 
 /// The wildcard half of an OVERWRITING projection: every incoming column
-/// except the ones the stage is about to project under its own aliases.
+/// except the ones the stage is about to project under its own aliases,
+/// and the whole of a `drop`.
 ///
 /// Unlike `* EXCLUDE (...)` the lambda tolerates a name no incoming
-/// column carries, which `let a = expr` needs when `a` is brand new.
+/// column carries, which `let a = expr` needs when `a` is brand new, and
+/// `drop` needs for a field no event carries.
 /// It folds both sides because `DuckDB` binds identifiers
 /// case-insensitively and [`crate::projection::check_projection`] folds
 /// every output name: a raw `c NOT IN ('Host')` would leave an incoming

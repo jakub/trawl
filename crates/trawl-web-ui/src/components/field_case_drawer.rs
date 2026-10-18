@@ -180,8 +180,8 @@ pub fn FieldCaseDrawer(
     let bus = expect_context::<ToastBus>();
     let job = RwSignal::new(None::<RepinJobResponse>);
     // The id polling follows. Set on a 202 and on adopting a running
-    // job at mount; cleared the moment the job settles or the
-    // install-wide slot moves on.
+    // job at mount; cleared the moment the job settles, the status route
+    // stops reporting it, or its reads give up.
     let tracked_job_id = RwSignal::new(None::<i64>);
     // Whether this surface started the job it holds — a 202 from its own
     // modal — as against merely adopting one the status route reported.
@@ -282,8 +282,10 @@ pub fn FieldCaseDrawer(
         }
     };
 
-    // One status read. Every branch is `repin_flow::poll_decide`'s —
-    // this closure only carries out the decision.
+    // One status read of the tracked job, by its id, so a job that took
+    // the one-running slot after it can never stand in for it. Every
+    // branch is `repin_flow::poll_decide`'s — this closure only carries
+    // out the decision.
     let poll_once = Callback::new(move |()| {
         let Some(tracked) = tracked_job_id.get_untracked() else {
             stop_poll();
@@ -296,7 +298,7 @@ pub fn FieldCaseDrawer(
         }
         poll_in_flight.set(true);
         spawn_local(async move {
-            let result = api::repin_status().await;
+            let result = api::repin_job_status(tracked).await;
             // First, before any read: the interval cannot cancel a read
             // already awaiting, and every branch below reads this
             // drawer's own signals — which panic once disposed, where a
@@ -306,10 +308,9 @@ pub fn FieldCaseDrawer(
             }
             poll_in_flight.set(false);
             let (probe, row) = match result {
-                Ok(resp) => match resp.job {
-                    Some(j) => (StatusProbe::Job(ProbedJob::from(&j)), Some(j)),
-                    None => (StatusProbe::NoJob, None),
-                },
+                Ok(Some(j)) => (StatusProbe::Job(ProbedJob::from(&j)), Some(j)),
+                // The route's 404: it holds no job with that id.
+                Ok(None) => (StatusProbe::NoJob, None),
                 Err(_) => (StatusProbe::Failed, None),
             };
             let errors = if matches!(probe, StatusProbe::Failed) {
@@ -791,9 +792,9 @@ pub fn FieldCaseDrawer(
             })}
             {move || status_lost.get().then(|| view! {
                 <div class="fc-err" role="alert">
-                    "Repin status unavailable \u{2014} the one-running slot has moved on to \
-                     another job, or the store stopped answering. What is shown above is the \
-                     last state this page saw; "
+                    "Repin status unavailable \u{2014} the status route no longer reports this \
+                     job, or the store stopped answering. What is shown above is the last state \
+                     this page saw; "
                     <span class="mono">"trawl schema repin-status"</span>
                     " reads the current one."
                     {move || recheck_note.get().map(|note| view! { <p>{note}</p> })}

@@ -152,6 +152,10 @@ impl Server {
                 query_log_max_bytes: trawl_server::config::DEFAULT_QUERY_LOG_MAX_BYTES,
                 rate_limit: RateLimitConfig::default(),
                 monitor_refresh_ms: 1000,
+                query_scratch_dir: None,
+                query_spill_max_bytes: trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
+                query_memory_limit: trawl_server::config::DEFAULT_QUERY_MEMORY_LIMIT,
+                query_threads: trawl_server::config::DEFAULT_QUERY_THREADS,
             },
             data: DataConfig {
                 path: data.to_str().expect("utf-8 data path").to_owned(),
@@ -183,10 +187,17 @@ impl Server {
             trawl_server::ingest::producer::Derivation::resolve(&config.ingest)
                 .expect("the default derivation lists resolve"),
         );
-        let (state, http_config) =
-            AppState::from_parts(&config, metrics_handle(), derivation, auth, storage)
-                .await
-                .expect("build the app state");
+        let scratch = trawl_server::state::open_query_scratch(&config).expect("lock the scratch");
+        let (state, http_config) = AppState::from_parts(
+            &config,
+            metrics_handle(),
+            derivation,
+            auth,
+            storage,
+            scratch,
+        )
+        .await
+        .expect("build the app state");
         trawl_server::boot::prepare_corpus(&state, &config)
             .await
             .expect("prepare the corpus");

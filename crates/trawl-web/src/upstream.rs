@@ -75,6 +75,9 @@ struct Pin {
     /// The pin file, tilde-expanded.
     path: PathBuf,
     connect: Option<UpstreamConnect>,
+    /// The head deadline each rebuilt client carries as its connections'
+    /// `TCP_USER_TIMEOUT` ([`proxy_client_builder`]).
+    head_deadline: Duration,
     /// The client built from the file's last good contents, `None` until
     /// the file first holds a usable certificate. The lock is held only to
     /// clone or replace the client, never across an `.await` or a build.
@@ -115,24 +118,31 @@ enum Refusal {
 }
 
 impl Upstream {
-    /// The upstream client for `tls`, dialing `connect` when set.
+    /// The upstream client for `tls`, dialing `connect` when set, whose
+    /// connections carry `head_deadline` as their `TCP_USER_TIMEOUT`
+    /// ([`proxy_client_builder`]).
     ///
     /// A pin whose file did not exist at resolution starts with no client.
     /// Resolution already logged that once.
     ///
     /// # Errors
     /// Returns the `reqwest::Error` if the client cannot be built.
-    pub fn new(tls: UpstreamTls, connect: Option<UpstreamConnect>) -> Result<Self, reqwest::Error> {
+    pub fn new(
+        tls: UpstreamTls,
+        connect: Option<UpstreamConnect>,
+        head_deadline: Duration,
+    ) -> Result<Self, reqwest::Error> {
         match tls {
             UpstreamTls::System => Ok(Self(Trust::System(
-                upstream_client(Client::builder(), None, connect.as_ref()).build()?,
+                upstream_client(proxy_client_builder(head_deadline), None, connect.as_ref())
+                    .build()?,
             ))),
             UpstreamTls::PinnedCa { path, roots } => {
                 let (client, observed) = match roots {
                     Some(roots) => (
                         Some(
                             upstream_client(
-                                Client::builder(),
+                                proxy_client_builder(head_deadline),
                                 Some(roots.certificates()),
                                 connect.as_ref(),
                             )
@@ -154,6 +164,7 @@ impl Upstream {
                 Ok(Self(Trust::Pinned(Arc::new(Pin {
                     path,
                     connect,
+                    head_deadline,
                     client: RwLock::new(client),
                     reread: Arc::new(Mutex::new(observed)),
                     reads_started: AtomicU64::new(0),
@@ -316,7 +327,7 @@ impl Pin {
     fn build(&self, pem: &[u8]) -> Result<Client, &'static str> {
         let roots = pinned_roots(pem)?;
         upstream_client(
-            Client::builder(),
+            proxy_client_builder(self.head_deadline),
             Some(roots.certificates()),
             self.connect.as_ref(),
         )
@@ -360,11 +371,12 @@ impl std::fmt::Debug for Upstream {
 /// `pinned` certificates replace the platform roots, with host-name
 /// verification left on. `None` trusts the platform roots.
 ///
-/// Takes a builder so a caller can add settings the rules leave alone. A
-/// test passes one with its own resolver or proxy and sees what the rules
-/// override; the doctor passes one with its timeouts, no retries and no
-/// connection pool, and so probes trawld through the same rules the
-/// proxy's requests use.
+/// Takes a builder so a caller can add settings the rules leave alone. The
+/// proxy passes [`proxy_client_builder`], which bounds a send trawld never
+/// takes; a test passes one with its own resolver or proxy and sees what
+/// the rules override; the doctor passes one with its timeouts, no retries
+/// and no connection pool, and so probes trawld through the same rules
+/// the proxy's requests use.
 pub(crate) fn upstream_client(
     builder: ClientBuilder,
     pinned: Option<&[Certificate]>,
@@ -382,6 +394,38 @@ pub(crate) fn upstream_client(
         None => builder,
         Some(roots) => builder.tls_certs_only(roots.iter().cloned()),
     }
+}
+
+/// The builder each of the proxy's own clients starts from: reqwest's
+/// defaults, with every connection's `TCP_USER_TIMEOUT` at
+/// `head_deadline`, the proxy's deadline for trawld's response head
+/// (`ProxyLimits::upstream_head_timeout`, `[server] timeout_secs` plus
+/// 10 s).
+///
+/// The kernel then closes a connection whose sent bytes trawld has not
+/// acknowledged, or whose queued bytes trawld's closed window has not
+/// taken, for that long. hyper drops the connection's write queue with
+/// it, so a buffered request body still queued there is freed, and its
+/// budget reservation with it (`routes::proxy::ReservedBody`). Without a
+/// bound, a body sent to a route whose handler ignores it, answered with
+/// a response the browser then stops reading, wedged both ends for good
+/// (ADR-0054, amended 2026-10-18): trawld had closed its reads and
+/// blocked on its writes, the proxy blocked on its send, and the body
+/// stayed charged to the budget. reqwest's own default is a fixed 30 s;
+/// this follows `[server] timeout_secs`, as the head deadline does, so a
+/// trawld that is only slow is given the same time either way.
+///
+/// The option exists on Linux, Android and Fuchsia, where every build of
+/// trawl-web runs (the deb, the chart's image, CI). On another OS reqwest
+/// offers no such setting, the bound is not set, and the kernel's own
+/// retransmission limit is the only end to such a connection.
+fn proxy_client_builder(head_deadline: Duration) -> ClientBuilder {
+    let builder = Client::builder();
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(head_deadline);
+    #[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+    let _ = head_deadline;
+    builder
 }
 
 #[cfg(test)]
@@ -534,10 +578,16 @@ mod tests {
         }
     }
 
-    /// A pin resolved from `path`, as startup resolves it.
+    /// A pin resolved from `path`, as startup resolves it, under the
+    /// default head deadline.
     fn pinned(path: &Path) -> Upstream {
         let tls = crate::config::resolve_upstream_tls(Some(path)).expect("the pin resolves");
-        Upstream::new(tls, None).expect("the client builds")
+        Upstream::new(
+            tls,
+            None,
+            crate::config::ProxyLimits::from_server(None).upstream_head_timeout,
+        )
+        .expect("the client builds")
     }
 
     /// Whether `client` completes a request to `upstream`: its certificate

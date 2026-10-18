@@ -32,6 +32,7 @@ use trawl_engine::value::{QueryResult, Value};
 use std::collections::BTreeMap;
 
 use crate::bus::{EventBus, EventSubscriber as _};
+use crate::engine_sample::EngineCheck;
 use crate::error::ServerError;
 use crate::policy::{Permission, TrawlAuthz as _};
 use crate::pool::PoolDebugInfo;
@@ -562,7 +563,8 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
     // Read here, on the reactor: the closure below deliberately holds no
     // pool state, so the registry lock never travels onto the blocking
     // pool behind a filesystem walk.
-    let retained_permits = state.query.pool.retained();
+    let query = crate::metrics::QueryGauges::read(&state.query.pool, &state.engine_sample);
+    let scratch_dir = state.query.pool.scratch().path().to_path_buf();
     let wal_dir = state
         .ingest
         .wal_writer
@@ -577,7 +579,8 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             &publication,
             &fallback_glob,
             wal_dir.as_deref(),
-            retained_permits,
+            &scratch_dir,
+            query,
             &repin_jobs,
         );
     })
@@ -599,7 +602,12 @@ pub use trawl_api::doctor::health::HEALTH_CHECK_NAMES;
 
 /// `GET /api/v1/health` — unauthenticated health check with subsystem probes.
 pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
-    // Probe duckdb, the fleet keystore and the app-state store concurrently.
+    // The `duckdb` check reads the latest engine sample (ADR-0056). It
+    // never waits for a probe and never starts one, and it takes no
+    // executor permit, so a full or retained pool cannot fail it.
+    let duckdb = state.engine_sample.read();
+
+    // Probe the fleet keystore and the app-state store concurrently.
     //
     // `/health` is unauthenticated and unthrottled — it sits outside
     // `require_bearer_only` and `rate_limit_middleware` — so it must not amplify a
@@ -609,12 +617,8 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     // one in-flight connection. It is also timeout-bounded, so a slow/downed
     // keystore reports an unhealthy auth subsystem (non-critical → `Degraded` →
     // HTTP 200) instead of stalling this liveness path.
-    let pool = state.query.pool.clone();
-    let (duckdb_join, auth_result, storage_result) = tokio::join!(
-        tokio::spawn(async move { pool.ping().await }),
-        state.auth.ping_cached(),
-        state.storage.ping_cached(),
-    );
+    let (auth_result, storage_result) =
+        tokio::join!(state.auth.ping_cached(), state.storage.ping_cached());
 
     // Data path: check that the base directory exists and is readable.
     let base_dir = state.query.pool.base_dir().to_owned();
@@ -632,18 +636,14 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
             |_| Ok(()),
         );
 
-    // The `DuckDB` probe is the one whose failure answers 503, and the 503
-    // below is built directly rather than through `ServerError`'s response,
-    // so its typed error is recorded here: the request's `http_failure`
-    // names the probe's class and cause, and a caught panic its stage.
-    let duckdb_result = duckdb_join
-        .map_err(|e| ServerError::from_join("ping", e))
-        .and_then(|probe| probe);
-    if let Err(err) = &duckdb_result {
-        crate::transport::failure::record_error(err);
+    // The engine sample is the one check whose failure answers 503, and the
+    // 503 below is built directly rather than through `ServerError`'s
+    // response, so its typed error is recorded here: the request's
+    // `http_failure` names the failed sample as its cause.
+    if duckdb == EngineCheck::Error {
+        crate::transport::failure::record_error(&ServerError::EngineSampleFailed);
     }
 
-    let duckdb_healthy = duckdb_result.is_ok();
     let auth_healthy = auth_result.is_ok();
     let storage_healthy = storage_result.is_ok();
     let data_healthy = data_result.is_ok();
@@ -655,7 +655,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     // One value per name in `HEALTH_CHECK_NAMES`, in its order. The array's
     // type holds the two lists to the same length.
     let values: [String; HEALTH_CHECK_NAMES.len()] = [
-        check_value(duckdb_healthy),
+        String::from(duckdb.as_str()),
         check_value(auth_healthy),
         check_value(storage_healthy),
         check_value(data_healthy),
@@ -668,11 +668,14 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
         .zip(values)
         .collect();
 
-    metrics::gauge!("trawl_health_check", "subsystem" => "duckdb").set(if duckdb_healthy {
-        1.0
-    } else {
-        0.0
-    });
+    // `slow` is a warning, not a failure: the gauge drops only on `error`.
+    metrics::gauge!("trawl_health_check", "subsystem" => "duckdb").set(
+        if duckdb == EngineCheck::Error {
+            0.0
+        } else {
+            1.0
+        },
+    );
     metrics::gauge!("trawl_health_check", "subsystem" => "auth_db").set(if auth_healthy {
         1.0
     } else {
@@ -697,7 +700,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     });
 
     let status = derive_health_status(
-        duckdb_healthy,
+        duckdb,
         auth_healthy,
         storage_healthy,
         data_healthy,
@@ -749,23 +752,30 @@ fn corpus_check(publication: &crate::publication::PublicationGate) -> &'static s
 ///
 /// - All green → `Ok`
 /// - Any non-critical (`auth_db`, `storage_db`, `data_path`,
-///   `ingest_capacity`, `corpus`) fails → `Degraded` (HTTP 200 — the query
-///   path can still serve, or for `corpus` serves again once compaction
-///   settles it, so no probe may restart the server)
-/// - Any critical (duckdb) fails → `Unavailable`
+///   `ingest_capacity`, `corpus`) fails, or the engine sample reads `slow`
+///   → `Degraded` (HTTP 200 — the query path can still serve, or for
+///   `corpus` serves again once compaction settles it, so no probe may
+///   restart the server)
+/// - The engine sample reads `error` → `Unavailable`
 #[allow(clippy::fn_params_excessive_bools)] // subsystem flags, call sites are named
 fn derive_health_status(
-    duckdb_ok: bool,
+    duckdb: EngineCheck,
     auth_ok: bool,
     storage_ok: bool,
     data_ok: bool,
     ingest_admitting: bool,
     corpus_settled: bool,
 ) -> HealthStatus {
-    if !duckdb_ok {
+    if duckdb == EngineCheck::Error {
         return HealthStatus::Unavailable;
     }
-    if !auth_ok || !storage_ok || !data_ok || !ingest_admitting || !corpus_settled {
+    if duckdb == EngineCheck::Slow
+        || !auth_ok
+        || !storage_ok
+        || !data_ok
+        || !ingest_admitting
+        || !corpus_settled
+    {
         return HealthStatus::Degraded;
     }
     HealthStatus::Ok
@@ -1032,7 +1042,7 @@ fn is_date_dir(name: &str) -> bool {
 /// while `recent` shows it for the same id would be an incoherence, not a
 /// protection. `Permission::Query` is the gate on all three lists.
 ///
-/// System work (a scheduled run, a health probe) is the exception: it has
+/// System work (a scheduled run) is the exception: it has
 /// no human owner and its DSL is the server's own, so only an operator
 /// (`ServerManage`) sees its text. Owner ids never leave the server in
 /// either case, and viewing is not cancellation. That authority is still
@@ -1092,7 +1102,7 @@ pub async fn queries(
 /// May this key ask for that work to stop?
 ///
 /// Admin (`ServerManage`) can cancel any work, including the server's own
-/// (a scheduled run, a health probe). A `QueryCancel` holder can cancel
+/// (a scheduled run). A `QueryCancel` holder can cancel
 /// work it submitted, and ownership is the exact keystore id: display
 /// names are mutable and non-unique, so two keys sharing a name must stay
 /// isolated from each other. Keys holding neither permission are rejected
@@ -2378,6 +2388,15 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 /// unknown target type, same-type without force, a dialect on a
 /// non-`SEVERITY` target) are 400s; a query-only node answers 503 — it owns
 /// nothing under the data root.
+///
+/// The request answers within `[server] timeout_secs` of this handler's
+/// call to `RepinEngine::start_within`, inside trawl-web's head deadline
+/// of `timeout_secs + 10 s` unless authentication or body reading before
+/// the handler takes the rest (ADR-0054). A job still running at that bound answers
+/// 202 with the row its claim wrote, dry runs included, and the caller
+/// follows it with `/schema/repin/status?id=`. A request whose claim has
+/// not landed by then answers 503, and a claim that lands later ends its
+/// job `blocked` before any scan (see `RepinEngine::start_within`).
 pub async fn schema_repin(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2394,8 +2413,13 @@ pub async fn schema_repin(
         ));
     };
 
+    // Both halves of the caller's identity go on the job row: the display
+    // name an operator reads, and the key's row id, which is what a status
+    // read by id with `schema_write` alone is matched against.
+    let requester = crate::store::Requester::new(verified.id, verified.name.clone());
     let outcome = engine
-        .start(
+        .start_within(
+            std::time::Duration::from_secs(state.query.timeout_secs),
             &req.field,
             &req.to,
             req.dialect.as_deref(),
@@ -2408,9 +2432,15 @@ pub async fn schema_repin(
                 max_nulled: req.max_nulled_rows,
                 max_ambiguous: req.max_ambiguous_rows,
             },
-            Some(&verified.name),
+            Some(&requester),
         )
         .await?;
+    let outcome = match outcome {
+        crate::repin::BoundedStart::Decided(outcome) => outcome,
+        // Past the bound the job is still running, whatever it was asked
+        // to do, so it answers as a started one.
+        crate::repin::BoundedStart::Running(job) => crate::repin::StartOutcome::Started(job),
+    };
     let (status, job) = match outcome {
         crate::repin::StartOutcome::Started(job) => (StatusCode::ACCEPTED, job),
         crate::repin::StartOutcome::Refused(job) => (StatusCode::CONFLICT, job),
@@ -2494,20 +2524,62 @@ pub async fn schema_repin_cancel(
         .into_response())
 }
 
+/// Query parameters for `GET /api/v1/schema/repin/status`.
+#[derive(Debug, Deserialize)]
+pub struct RepinStatusParams {
+    /// One job, by the id its trigger answered with.
+    pub id: Option<i64>,
+}
+
 /// `GET /api/v1/schema/repin/status` — the running job if any, else the
-/// newest job of any status. `SchemaRead`-gated on purpose (ADR-0011:
-/// read-only surfaces show state without offering the trigger), and served
-/// on query-only nodes too — the job rows live in postgres.
+/// newest job of any status, or with `?id=` that one job. Served on
+/// query-only nodes too — the job rows live in postgres.
+///
+/// The unscoped read is `SchemaRead`-gated on purpose (ADR-0011: read-only
+/// surfaces show state without offering the trigger). A read by id also
+/// accepts `SchemaWrite`, because it is how a trigger caller follows its
+/// own job: the trigger needs `SchemaWrite` alone, and a dry run it started
+/// can answer 202 and leave its report here. Its own job only, though: with
+/// `SchemaWrite` and no `SchemaRead`, the read matches the id against the
+/// key's row id the claim recorded, and any other id answers the 404 an id
+/// the store never issued answers, body and all. The job rows are durable,
+/// carry event values in `unmapped_samples`, and name other operators, so
+/// the write grant alone must not be able to walk them and learn which
+/// exist. With `SchemaRead`, any id answers. The store decides existence
+/// and ownership in one statement (`RepinStore::get_requested_by`), so no
+/// row is read and then checked. An id that is not an integer is a 400.
 pub async fn schema_repin_status(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
+    params: Result<Query<RepinStatusParams>, QueryRejection>,
 ) -> Result<Json<trawl_api::RepinStatusResponse>, ServerError> {
-    if !verified.has_permission(Permission::SchemaRead) {
+    let reads = verified.has_permission(Permission::SchemaRead);
+    if !reads && !verified.has_permission(Permission::SchemaWrite) {
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
-    let job = state.storage.repin.latest().await?;
+    let Query(params) =
+        params.map_err(|_| ServerError::BadRequest("invalid repin status parameters".into()))?;
+    let Some(id) = params.id else {
+        if !reads {
+            return Err(ServerError::Forbidden("insufficient permissions".into()));
+        }
+        let job = state.storage.repin.latest().await?;
+        return Ok(Json(trawl_api::RepinStatusResponse {
+            job: job.map(repin_job_to_wire),
+        }));
+    };
+    let job = if reads {
+        state.storage.repin.get(id).await?
+    } else {
+        state
+            .storage
+            .repin
+            .get_requested_by(id, verified.id)
+            .await?
+    };
+    let job = job.ok_or_else(|| ServerError::NotFound("repin job not found".into()))?;
     Ok(Json(trawl_api::RepinStatusResponse {
-        job: job.map(repin_job_to_wire),
+        job: Some(repin_job_to_wire(job)),
     }))
 }
 
@@ -2992,7 +3064,6 @@ pub async fn trigger_run(
             run_id,
             &query,
             &query_name,
-            0,
             timeout_secs,
         )
         .await;
@@ -3057,13 +3128,33 @@ pub async fn get_report_run(
         }
 
         let path = file.absolute_path.clone();
+        // A clone of the query database, so the read spills into the query
+        // scratch directory under the query budgets (ADR-0056).
+        let pool = state.query.pool.clone();
         match tokio::task::spawn_blocking(move || {
-            let executor = trawl_engine::executor::Executor::new()?;
+            let executor = pool.detached_executor()?;
             executor.read_parquet_to_result(&path, max_rows)
         })
         .await
         {
             Ok(Ok(qr)) => Some(qr),
+            // An exhausted query budget is a query's failure, and what is
+            // logged about one names no path, size or `DuckDB` text
+            // (ADR-0056): the classification alone.
+            Ok(Err(e @ trawl_engine::error::EngineError::ResourceExhausted)) => {
+                let err = ServerError::Engine(e);
+                tracing::warn!(
+                    event_type = "report_run_parquet_read_failed",
+                    run_id,
+                    error_class = err.error_class(),
+                    cause_kind = err.cause_kind().as_str(),
+                    "the stored parquet result could not be read within the query budgets"
+                );
+                return Err(
+                    crate::from_saved::unavailable_run_conflict(std::slice::from_ref(&file))
+                        .unwrap_or(err),
+                );
+            }
             Ok(Err(e)) => {
                 tracing::warn!(
                     event_type = "report_run_parquet_read_failed",
@@ -3535,6 +3626,12 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
 /// Build an SSE snapshot event from the current aggregation state,
 /// applying post-stages to each row.
 ///
+/// The payload carries `capped`, one `{cap, limit}` per cap that dropped
+/// input since the stream started, on this and every later snapshot, and
+/// omits it while nothing has been dropped (ADR-0001). An event dropped at
+/// a cap still counts toward the next snapshot, so the scheduled snapshot
+/// discloses a cap even when no further input arrives.
+///
 /// `ctx` is the one instant this snapshot evaluates `now()` at, for every
 /// post-stage row alike (ADR-0017 §3) — a distinct type from the per-event
 /// context the feeding loop samples, so the two cannot be swapped at a call
@@ -3549,11 +3646,30 @@ fn emit_agg_snapshot(
     let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx);
     let rows: Vec<_> = rows.into_iter().map(trawl_core::row::to_json).collect();
 
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "columns": columns,
         "rows": rows,
     });
+    let capped: Vec<_> = aggregation.capped().into_iter().map(snapshot_cap).collect();
+    if !capped.is_empty() {
+        payload["capped"] = serde_json::json!(capped);
+    }
     Event::default().event("snapshot").data(payload.to_string())
+}
+
+/// One dropped-input cap as the snapshot wire spells it.
+fn snapshot_cap(cap: trawl_core::stream::AggregationCap) -> trawl_api::stream::SnapshotCap {
+    use trawl_api::stream::SnapshotCapKind;
+    use trawl_core::stream::AggregationCap;
+    let kind = match cap {
+        AggregationCap::Groups => SnapshotCapKind::Groups,
+        AggregationCap::DistinctValues => SnapshotCapKind::DistinctValues,
+        AggregationCap::ExactValues => SnapshotCapKind::ExactValues,
+    };
+    trawl_api::stream::SnapshotCap {
+        cap: kind,
+        limit: cap.limit() as u64,
+    }
 }
 
 /// The snapshot instant, sampled here and nowhere deeper: trawl-core takes
@@ -3907,7 +4023,7 @@ mod tests {
         }
     }
 
-    /// System work (a scheduled run, a health probe) has no human owner,
+    /// System work (a scheduled run) has no human owner,
     /// so its DSL reaches an operator and nobody else. No `query`
     /// permission holder can ever match `WorkOwner::System`.
     #[test]
@@ -4144,7 +4260,7 @@ mod tests {
     #[test]
     fn health_all_ok() {
         assert_eq!(
-            derive_health_status(true, true, true, true, true, true),
+            derive_health_status(EngineCheck::Ok, true, true, true, true, true),
             HealthStatus::Ok
         );
     }
@@ -4152,7 +4268,7 @@ mod tests {
     #[test]
     fn health_auth_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, false, true, true, true, true),
+            derive_health_status(EngineCheck::Ok, false, true, true, true, true),
             HealthStatus::Degraded
         );
     }
@@ -4162,7 +4278,7 @@ mod tests {
         // App-state store loss is non-critical: queries still serve, so the
         // wire contract is Degraded + HTTP 200 (never a liveness failure).
         assert_eq!(
-            derive_health_status(true, true, false, true, true, true),
+            derive_health_status(EngineCheck::Ok, true, false, true, true, true),
             HealthStatus::Degraded
         );
     }
@@ -4170,7 +4286,7 @@ mod tests {
     #[test]
     fn health_data_path_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, true, true, false, true, true),
+            derive_health_status(EngineCheck::Ok, true, true, false, true, true),
             HealthStatus::Degraded
         );
     }
@@ -4178,7 +4294,7 @@ mod tests {
     #[test]
     fn health_all_noncritical_down_is_degraded() {
         assert_eq!(
-            derive_health_status(true, false, false, false, true, true),
+            derive_health_status(EngineCheck::Ok, false, false, false, true, true),
             HealthStatus::Degraded
         );
     }
@@ -4188,7 +4304,7 @@ mod tests {
         // A refusing ledger is back-pressure: queries still serve, so the
         // wire contract is Degraded + HTTP 200.
         assert_eq!(
-            derive_health_status(true, true, true, true, false, true),
+            derive_health_status(EngineCheck::Ok, true, true, true, false, true),
             HealthStatus::Degraded
         );
     }
@@ -4196,7 +4312,7 @@ mod tests {
     #[test]
     fn health_duckdb_down_while_ingest_refusing_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, true, true, true, false, true),
+            derive_health_status(EngineCheck::Error, true, true, true, false, true),
             HealthStatus::Unavailable
         );
     }
@@ -4267,7 +4383,7 @@ mod tests {
         // An unsettled corpus refuses reads but clears without a restart:
         // Degraded + HTTP 200, so no probe restarts the server (ADR-0041).
         assert_eq!(
-            derive_health_status(true, true, true, true, true, false),
+            derive_health_status(EngineCheck::Ok, true, true, true, true, false),
             HealthStatus::Degraded
         );
     }
@@ -4275,7 +4391,7 @@ mod tests {
     #[test]
     fn health_duckdb_down_while_corpus_unsettled_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, true, true, true, true, false),
+            derive_health_status(EngineCheck::Error, true, true, true, true, false),
             HealthStatus::Unavailable
         );
     }
@@ -4324,10 +4440,25 @@ mod tests {
         assert_eq!(corpus_check(&gate), "ok");
     }
 
+    /// A sample past its budget is a warning: degraded at HTTP 200, with
+    /// everything else green, and never better than degraded beside a
+    /// non-critical failure (ADR-0056).
+    #[test]
+    fn health_duckdb_slow_is_degraded() {
+        assert_eq!(
+            derive_health_status(EngineCheck::Slow, true, true, true, true, true),
+            HealthStatus::Degraded
+        );
+        assert_eq!(
+            derive_health_status(EngineCheck::Slow, false, true, true, false, false),
+            HealthStatus::Degraded
+        );
+    }
+
     #[test]
     fn health_duckdb_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, true, true, true, true, true),
+            derive_health_status(EngineCheck::Error, true, true, true, true, true),
             HealthStatus::Unavailable
         );
     }
@@ -4335,7 +4466,7 @@ mod tests {
     #[test]
     fn health_all_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, false, false, false, true, true),
+            derive_health_status(EngineCheck::Error, false, false, false, true, true),
             HealthStatus::Unavailable
         );
     }
@@ -4343,7 +4474,7 @@ mod tests {
     #[test]
     fn health_duckdb_and_noncritical_down_is_unavailable() {
         assert_eq!(
-            derive_health_status(false, false, true, true, true, true),
+            derive_health_status(EngineCheck::Error, false, true, true, true, true),
             HealthStatus::Unavailable
         );
     }

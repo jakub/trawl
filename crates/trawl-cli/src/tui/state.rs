@@ -1822,6 +1822,9 @@ pub struct LiveBuffer {
     rows: VecDeque<Vec<Value>>,
     /// Max rows to retain.
     max_rows: usize,
+    /// The caps the latest aggregation snapshot reported as having dropped
+    /// input (ADR-0001). Empty for a pass-through stream.
+    capped: Vec<trawl_api::stream::SnapshotCap>,
 }
 
 impl LiveBuffer {
@@ -1832,7 +1835,14 @@ impl LiveBuffer {
             column_index: HashMap::new(),
             rows: VecDeque::new(),
             max_rows,
+            capped: Vec::new(),
         }
+    }
+
+    /// The caps the latest snapshot reported, which qualify the rows the
+    /// buffer holds.
+    pub fn capped(&self) -> &[trawl_api::stream::SnapshotCap] {
+        &self.capped
     }
 
     /// Pre-seed column ordering from a DSL `fields`/`table` stage.
@@ -1910,12 +1920,15 @@ impl LiveBuffer {
     /// Replace the entire buffer contents with an aggregation snapshot.
     ///
     /// Used when the server emits a `snapshot` event (aggregation mode).
-    /// The buffer is cleared and rebuilt from the given columns and rows.
+    /// The buffer is cleared and rebuilt from the given columns and rows,
+    /// and the snapshot's `capped` report replaces the previous one.
     pub fn replace_with_snapshot(
         &mut self,
         columns: &[String],
         rows: &[serde_json::Map<String, serde_json::Value>],
+        capped: &[trawl_api::stream::SnapshotCap],
     ) {
+        self.capped = capped.to_vec();
         self.column_names = columns.to_vec();
         self.column_index.clear();
         for (i, name) in columns.iter().enumerate() {
@@ -1977,6 +1990,10 @@ pub struct Tab {
     pub last_edit_time: Option<std::time::Instant>,
     /// Active ghost-text autocomplete suggestion (if any).
     pub ghost: Option<super::autocomplete::Completion>,
+    /// The caps the result's live aggregate snapshot reported as having
+    /// dropped input (ADR-0001). Replaced with every result, so it is empty
+    /// for a batch result and for an uncapped snapshot.
+    pub live_capped: Vec<trawl_api::stream::SnapshotCap>,
 }
 
 impl Tab {
@@ -1997,6 +2014,7 @@ impl Tab {
             validation_dirty: false,
             last_edit_time: None,
             ghost: None,
+            live_capped: Vec::new(),
         }
     }
 
@@ -2015,6 +2033,7 @@ impl Tab {
         self.validation_dirty = false;
         self.last_edit_time = None;
         self.ghost = None;
+        self.live_capped.clear();
         // Abort any running query task.
         if let Some(handle) = self.query_task.take() {
             handle.abort();

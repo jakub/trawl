@@ -7,5 +7,5 @@ WITH _s0 AS (
   FROM read_parquet('/data/**/*.parquet', union_by_name=true)
   GROUP BY "host"
 )
-SELECT * EXCLUDE ("avg_duration")
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('avg_duration'))
 FROM "_s0"

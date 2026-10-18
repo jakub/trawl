@@ -71,6 +71,9 @@ const CODEMIRROR_TS: &str = include_str!("../vendor/src/codemirror.ts");
 const QUERY_ERROR_NOTICE_RS: &str = include_str!("../src/components/query_error_notice.rs");
 const SEARCH_RS: &str = include_str!("../src/pages/search.rs");
 const RECOVERING_NOTICE_RS: &str = include_str!("../src/components/recovering_notice.rs");
+const RESOURCE_NOTICE_RS: &str = include_str!("../src/components/resource_notice.rs");
+const LIVE_CAP_NOTICE_RS: &str = include_str!("../src/components/live_cap_notice.rs");
+const LIVE_CAP_COPY_RS: &str = include_str!("../src/live_cap_copy.rs");
 
 /// One (assignment, source file, hook) triple: `assignment` is the full
 /// `key: 'value',` line as it appears in `selectors.ts`, and `hook` must
@@ -681,6 +684,24 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/export_modal.rs",
         source: EXPORT_MODAL_RS,
         hook: "class=\"m-refusal\"",
+    },
+    Contract {
+        assignment: "modalResourceNotice: '.modal .resource-notice[role=\"alert\"]',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "else { \"modal\" };",
+    },
+    Contract {
+        assignment: "modalResourceNotice: '.modal .resource-notice[role=\"alert\"]',",
+        source_path: "src/components/export_modal.rs",
+        source: EXPORT_MODAL_RS,
+        hook: "<ResourceNotice message=",
+    },
+    Contract {
+        assignment: "modalResourceNotice: '.modal .resource-notice[role=\"alert\"]',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "<div class=\"resource-notice\" role=\"alert\">",
     },
     Contract {
         assignment: "emptyQueryRefusal: 'Nothing to export: the query is empty.',",
@@ -1901,6 +1922,12 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"run-unavailable\"",
     },
     Contract {
+        assignment: "runExhausted: '.run-exhausted',",
+        source_path: "src/components/net_drawer.rs",
+        source: NET_DRAWER_RS,
+        hook: "class=\"run-exhausted\"",
+    },
+    Contract {
         assignment: "previewCap: '.preview-cap',",
         source_path: "src/components/net_drawer.rs",
         source: NET_DRAWER_RS,
@@ -2208,6 +2235,84 @@ const CONTRACTS: &[Contract] = &[
         source_path: "src/components/recovering_notice.rs",
         source: RECOVERING_NOTICE_RS,
         hook: "\"Search is recovering\"",
+    },
+    Contract {
+        assignment: "resourceNotice: '#search-results .resource-notice[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<ResourceNotice message=message/>",
+    },
+    Contract {
+        assignment: "resourceNotice: '#search-results .resource-notice[role=\"alert\"]',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<div id=\"search-results\" class=\"results\"",
+    },
+    Contract {
+        assignment: "resourceNotice: '#search-results .resource-notice[role=\"alert\"]',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "<div class=\"resource-notice\" role=\"alert\">",
+    },
+    Contract {
+        assignment: "resourceNoticeTitle: '.resource-notice-title',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "class=\"resource-notice-title\"",
+    },
+    Contract {
+        assignment: "resourceNoticeText: '.resource-notice-text',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "class=\"resource-notice-text\"",
+    },
+    Contract {
+        assignment: "resourceTitle: 'Query ran out of resources',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "\"Query ran out of resources\"",
+    },
+    Contract {
+        assignment: "liveCapNotice: '.live-cap-live[role=\"status\"] .live-cap-notice',",
+        source_path: "src/pages/search.rs",
+        source: SEARCH_RS,
+        hook: "<LiveCapNotice capped=live_capped/>",
+    },
+    Contract {
+        assignment: "liveCapNotice: '.live-cap-live[role=\"status\"] .live-cap-notice',",
+        source_path: "src/components/live_cap_notice.rs",
+        source: LIVE_CAP_NOTICE_RS,
+        hook: "<div class=\"live-cap-live\" role=\"status\">",
+    },
+    Contract {
+        assignment: "liveCapNotice: '.live-cap-live[role=\"status\"] .live-cap-notice',",
+        source_path: "src/components/live_cap_notice.rs",
+        source: LIVE_CAP_NOTICE_RS,
+        hook: "<div class=\"live-cap-notice\">",
+    },
+    Contract {
+        assignment: "liveCapNoticeTitle: '.live-cap-notice-title',",
+        source_path: "src/components/live_cap_notice.rs",
+        source: LIVE_CAP_NOTICE_RS,
+        hook: "class=\"live-cap-notice-title\"",
+    },
+    Contract {
+        assignment: "liveCapNoticeText: '.live-cap-notice-text',",
+        source_path: "src/components/live_cap_notice.rs",
+        source: LIVE_CAP_NOTICE_RS,
+        hook: "class=\"live-cap-notice-text\"",
+    },
+    Contract {
+        assignment: "liveCapTitle: 'Live aggregate is partial',",
+        source_path: "src/live_cap_copy.rs",
+        source: LIVE_CAP_COPY_RS,
+        hook: "pub const LIVE_CAP_TITLE: &str = \"Live aggregate is partial\";",
+    },
+    Contract {
+        assignment: "liveCapAdvice: 'Narrow the query, or switch to Snapshot.',",
+        source_path: "src/live_cap_copy.rs",
+        source: LIVE_CAP_COPY_RS,
+        hook: "pub const LIVE_CAP_ADVICE: &str = \"Narrow the query, or switch to Snapshot.\";",
     },
     Contract {
         assignment: "resultsEmptyCell: '.results-empty-cell',",

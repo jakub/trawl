@@ -18,6 +18,7 @@ pub mod config;
 pub mod config_check;
 pub mod deadline;
 pub mod doctor;
+pub mod engine_sample;
 pub(crate) mod env_dirs;
 pub mod epoch;
 pub mod error;

@@ -34,7 +34,7 @@ pub const RUNS_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(2
 /// The failure type lives in a pure module so its body decoder is tested
 /// natively; the transport below is the only part that needs a browser.
 pub use crate::api_error::ApiError;
-use crate::api_error::decode_error_body;
+use crate::api_error::{decode_error_body, export_failure};
 
 impl From<gloo_net::Error> for ApiError {
     fn from(e: gloo_net::Error) -> Self {
@@ -235,8 +235,10 @@ pub async fn catalog_field(
 pub enum RepinOutcome {
     /// 200 — the scan ran and stopped. The job is the plan.
     DryRun(RepinJobResponse),
-    /// 202 — the rewrite is claimed and running detached. Poll
-    /// [`repin_status`] for the rest of its life.
+    /// 202 — the job is claimed and was still running when the server
+    /// stopped waiting for it, dry runs included. Follow it by its id
+    /// ([`repin_job_status`]) for the rest of its life; a row that is
+    /// already terminal is the answer as it stands.
     Started(RepinJobResponse),
     /// 409 whose body decoded as a job — the scan projected values the
     /// target pin cannot keep and no force was passed. Terminal
@@ -313,9 +315,9 @@ pub async fn repin(
 /// GET `/api/v1/schema/repin/status` — the running job if any, else the
 /// newest job of any status.
 ///
-/// Install-wide and unfiltered by design (there is no `?id=`): the
-/// caller matches `job.id` against the id it holds and treats anything
-/// else as the slot having moved on.
+/// Install-wide and unfiltered: this is the read for a job nobody here
+/// holds the id of. A job this page started or adopted is followed by
+/// its id instead ([`repin_job_status`]).
 pub async fn repin_status() -> Result<RepinStatusResponse, ApiError> {
     let resp = Request::get("/api/v1/schema/repin/status").send().await?;
     match resp.status() {
@@ -323,6 +325,28 @@ pub async fn repin_status() -> Result<RepinStatusResponse, ApiError> {
             .json::<RepinStatusResponse>()
             .await
             .map_err(|e| ApiError::Decode(e.to_string())),
+        401 => Err(ApiError::Unauthorized),
+        s => Err(ApiError::Status(s)),
+    }
+}
+
+/// GET `/api/v1/schema/repin/status?id=` — job `id`, whatever has run
+/// since it was claimed. `Ok(None)` is the route's 404: it holds no job
+/// with that id.
+///
+/// Gated server-side on `schema_write` or `schema_read`, so the session
+/// that started a job can always follow it.
+pub async fn repin_job_status(id: i64) -> Result<Option<RepinJobResponse>, ApiError> {
+    let resp = Request::get(&format!("/api/v1/schema/repin/status?id={id}"))
+        .send()
+        .await?;
+    match resp.status() {
+        200 => resp
+            .json::<RepinStatusResponse>()
+            .await
+            .map(|r| r.job)
+            .map_err(|e| ApiError::Decode(e.to_string())),
+        404 => Ok(None),
         401 => Err(ApiError::Unauthorized),
         s => Err(ApiError::Status(s)),
     }
@@ -593,7 +617,7 @@ pub async fn export(
             Ok((bytes, filename))
         }
         401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
+        s => Err(export_failure(s, resp.text().await.ok().as_deref())),
     }
 }
 

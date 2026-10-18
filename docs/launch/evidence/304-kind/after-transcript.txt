@@ -1,0 +1,1352 @@
+
+## [2026-10-18T09:00:42.899Z] run after: image trawl-i304:after-7dc64b27f566, chart $D/build/src-after/chart/trawl, namespace i304-after
+[2026-10-18T09:00:42.901Z] $ kind version
+kind v0.33.0 go1.27.0-X:nodwarf5 linux/amd64
+[2026-10-18T09:00:42.925Z] $ helm version --short
+v4.2.2+gb05881c
+[2026-10-18T09:00:43.021Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 version
+Client Version: v1.36.4
+Kustomize Version: v5.8.1
+Server Version: v1.37.0
+[2026-10-18T09:00:43.107Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 get nodes -o wide
+NAME                       STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION            CONTAINER-RUNTIME
+trawl-i304-control-plane   Ready    control-plane   28h   v1.37.0   172.20.0.2    <none>        Debian GNU/Linux 13 (trixie)   7.2.5-3-omarchy (amd64)   containerd://2.3.4
+[2026-10-18T09:00:43.198Z] workload: EVENTS=800000 MSG_CHARS=200 SEED=304 STARVE_WORKERS=4 STARVE_SECS=60 SPILL_ATTEMPTS=8
+[2026-10-18T09:00:43.199Z] STARVE_QUERY: service=i304 | stats count() by message, _raw | stats count()
+[2026-10-18T09:00:43.201Z] SPILL_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count()
+[2026-10-18T09:00:43.202Z] SPILL_BIG_QUERY: service=i304 | let k = concat(_raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message, _raw, message) | dedup k | stats count() (SPILL_BIG_ATTEMPTS=4 SPILL_BIG_PAUSE=5)
+[2026-10-18T09:00:43.204Z] SMALL_QUERY: service=i304 | stats count()
+[2026-10-18T09:00:43.205Z] $ docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' 'trawl-i304:after-7dc64b27f566'
+sha256:9dd5d5dd8c26e6a674adeb8f8621a96323784d6202ad03c32c258d90976ec067 7dc64b27f566bc3c1052865d4261eb6e1ee3997d
+
+## [2026-10-18T09:00:43.289Z] cluster: the kubelet measures emptyDir usage every 2s
+[2026-10-18T09:00:43.332Z] $ docker exec trawl-i304-control-plane grep -E \^\(volumeStatsAggPeriod\|evictionHard\|\ \ nodefs\|\ \ imagefs\) /var/lib/kubelet/config.yaml
+evictionHard:
+  imagefs.available: 0%
+  nodefs.available: 0%
+  nodefs.inodesFree: 0%
+volumeStatsAggPeriod: 2s
+
+## [2026-10-18T09:00:43.374Z] namespace and disposable PostgreSQL
+[2026-10-18T09:00:43.458Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 create namespace i304-after
+namespace/i304-after created
+[2026-10-18T09:00:43.552Z] $ kubectl create secret generic pg-init|fleet-db|trawl-db --from-file=... (values from $D/private/after, not printed)
+secret/pg-init created
+secret/fleet-db created
+secret/trawl-db created
+[2026-10-18T09:00:43.819Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after apply -f $D/postgres.yaml
+deployment.apps/postgres created
+service/postgres created
+[2026-10-18T09:00:44.135Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after rollout status deployment/postgres --timeout=180s
+Waiting for deployment "postgres" rollout to finish: 0 of 1 updated replicas are available...
+deployment "postgres" successfully rolled out
+
+## [2026-10-18T09:00:51.430Z] helm install with the load values (values.yaml + values-load.yaml)
+[2026-10-18T09:00:51.431Z] $ helm --kubeconfig $D/kubeconfig --kube-context kind-trawl-i304 -n i304-after install trawl $D/build/src-after/chart/trawl -f $D/values.yaml -f $D/values-load.yaml --set-string image.repository=trawl-i304 --set-string image.tag=after-7dc64b27f566
+NAME: trawl
+LAST DEPLOYED: Sun Oct 18 02:00:51 2026
+NAMESPACE: i304-after
+STATUS: deployed
+REVISION: 1
+DESCRIPTION: Install complete
+NOTES:
+Trawl has been installed.
+
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Run the guide's fleet-admin commands inside the trawld container, for example:
+
+  kubectl exec --namespace i304-after -i trawl-0 -c trawld -- fleet-admin roles list
+
+Use a personal API key to sign in to the browser and a service key for each collector.
+The init-auth container initializes the database schema; it does not create API keys.
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+
+Check the HTTPS API through a local port-forward:
+
+  kubectl port-forward --namespace i304-after svc/trawl 5514:5514
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
+[2026-10-18T09:00:51.829Z] $ sed -n '/^\[server\]/,/^\[server.rate_limit\]/p' '$D/private/after/work/trawld.toml'
+[server]
+http_addr = "0.0.0.0:5514"
+timeout_secs = 30
+max_concurrent_queries = 2
+max_result_rows = 100000
+max_export_rows = 1000000
+max_request_body_bytes = "128K"
+max_concurrent_requests = 32
+shutdown_drain_secs = 30
+max_sse_connections = 32
+schema_cache_ttl_secs = 60
+max_query_history = 1000
+query_spill_max_bytes = "4GiB"
+query_memory_limit = "2GiB"
+query_threads = 4
+[server.rate_limit]
+[2026-10-18T09:00:51.835Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-after get statefulset trawl -o json | jq -c '.spec.template.spec | {trawld_resources: (.containers[] | select(.name=="trawld") | .resources), tmp: (.volumes[] | select(.name=="tmp")), probes: (.containers[] | select(.name=="trawld") | {readiness: .readinessProbe | {periodSeconds, failureThreshold, timeoutSeconds}, liveness: .livenessProbe | {periodSeconds, failureThreshold}})}'
+{"trawld_resources":{"limits":{"cpu":"16","memory":"6Gi"},"requests":{"cpu":"250m","memory":"512Mi"}},"tmp":{"emptyDir":{"sizeLimit":"512Mi"},"name":"tmp"},"probes":{"readiness":{"periodSeconds":10,"failureThreshold":3,"timeoutSeconds":5},"liveness":{"periodSeconds":30,"failureThreshold":3}}}
+[2026-10-18T09:00:52.012Z] pod trawl-0 uid=91e6b59b-d1c6-4981-b6a4-cc7db3e5d4d3 phase=Pending reason= ready= restarts=
+[2026-10-18T09:00:55.097Z] pod trawl-0 uid=91e6b59b-d1c6-4981-b6a4-cc7db3e5d4d3 phase=Pending reason= ready= restarts=
+[2026-10-18T09:00:58.166Z] pod trawl-0 uid=91e6b59b-d1c6-4981-b6a4-cc7db3e5d4d3 phase=Running reason= ready=False restarts=0
+[2026-10-18T09:01:01.266Z] pod trawl-0 uid=91e6b59b-d1c6-4981-b6a4-cc7db3e5d4d3 phase=Running reason= ready=False restarts=0
+[2026-10-18T09:01:04.330Z] pod trawl-0 uid=91e6b59b-d1c6-4981-b6a4-cc7db3e5d4d3 phase=Running reason= ready=True restarts=0
+[2026-10-18T09:01:04.332Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE   IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-svjxd   1/1     Running   0          20s   10.244.0.93   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          13s   10.244.0.95   trawl-i304-control-plane   <none>           <none>
+
+## [2026-10-18T09:01:04.412Z] API key (query, ingest, server_manage) and trawld's certificate
+[2026-10-18T09:01:04.414Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after exec trawl-0 -c trawld -- sh -c DATABASE_URL=\"\$FLEET_DATABASE_URL\"\ exec\ fleet-admin\ roles\ create\ --name\ i304\ --perm\ trawl:query\ --perm\ trawl:ingest\ --perm\ trawl:server_manage
+created role:
+
+  name:      i304
+  rate_rpm:  (class default)
+  perms:     trawl:ingest, trawl:query, trawl:server_manage
+[2026-10-18T09:01:04.623Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name i304 --kind human --role i304 > $PRIV/token
+created API key:
+
+  name:    i304
+  kind:    human
+  roles:   i304
+  prefix:  tisXAHDX
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T09:01:05.049Z] token bytes: 48
+[2026-10-18T09:01:05.239Z] $ openssl x509 -in '$D/private/after/cert.pem' -noout -subject -ext subjectAltName
+subject=CN=rcgen self signed cert
+X509v3 Subject Alternative Name: 
+    DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1
+[2026-10-18T09:01:05.489Z] GET /api/v1/health -> 200 {"status":"ok","checks":{"auth_db":"ok","corpus":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+[2026-10-18T09:01:05.490Z] $ curl -sS --cacert '$D/private/after/cert.pem' -K '$D/private/after/curl.conf' https://localhost:15514/api/v1/whoami | jq -c .
+{"prefix":"tisXAHDX","name":"i304","kind":"human","roles":["i304"],"permissions":["query","server_manage","ingest"]}
+
+## [2026-10-18T09:01:05.734Z] ingest 800000 events of 200-character random messages
+[2026-10-18T09:01:05.737Z] $ python3 -I gen-events.py https://localhost:15514/api/v1/ingest $PRIV/cert.pem $PRIV/auth-header 800000 200 304 4000
+  ingested 4000/800000 events, 1 MiB, 0s
+  ingested 104000/800000 events, 29 MiB, 3s
+  ingested 204000/800000 events, 58 MiB, 5s
+  ingested 304000/800000 events, 86 MiB, 8s
+  ingested 404000/800000 events, 115 MiB, 11s
+  ingested 504000/800000 events, 143 MiB, 16s
+  ingested 604000/800000 events, 172 MiB, 20s
+  ingested 704000/800000 events, 200 MiB, 25s
+ingested 800000 events, 228 MiB of NDJSON in 40s
+[2026-10-18T09:01:45.527Z] waiting for the hot buffer to drain into Parquet (trawld's own telemetry keeps a few hundred events there)
+[2026-10-18T09:02:08.140Z] trawl_hot_buffer_events=5
+[2026-10-18T09:02:08.274Z] count query -> 200 0.104982 [[800000]]
+[2026-10-18T09:02:08.278Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-after exec trawl-0 -c trawld -- du -sh /var/lib/trawl/data /tmp
+333M	/var/lib/trawl/data
+0	/tmp
+
+## [2026-10-18T09:02:08.508Z] helm upgrade to the scenario values (values.yaml alone)
+[2026-10-18T09:02:08.676Z] $ helm --kubeconfig $D/kubeconfig --kube-context kind-trawl-i304 -n i304-after upgrade trawl $D/build/src-after/chart/trawl -f $D/values.yaml --set-string image.repository=trawl-i304 --set-string image.tag=after-7dc64b27f566
+Release "trawl" has been upgraded. Happy Helming!
+NAME: trawl
+LAST DEPLOYED: Sun Oct 18 02:02:08 2026
+NAMESPACE: i304-after
+STATUS: deployed
+REVISION: 2
+DESCRIPTION: Upgrade complete
+NOTES:
+Trawl has been installed.
+
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Run the guide's fleet-admin commands inside the trawld container, for example:
+
+  kubectl exec --namespace i304-after -i trawl-0 -c trawld -- fleet-admin roles list
+
+Use a personal API key to sign in to the browser and a service key for each collector.
+The init-auth container initializes the database schema; it does not create API keys.
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+
+Check the HTTPS API through a local port-forward:
+
+  kubectl port-forward --namespace i304-after svc/trawl 5514:5514
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
+[2026-10-18T09:02:09.585Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after rollout status statefulset/trawl --timeout=300s
+Waiting for partitioned roll out to finish: 0 out of 1 new pods have been updated...
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+Waiting for 1 pods to be ready...
+partitioned roll out complete: 1 new pods have been updated...
+[2026-10-18T09:02:16.761Z] $ sed -n '/^\[server\]/,/^\[server.rate_limit\]/p' '$D/private/after/work/trawld.toml'
+[server]
+http_addr = "0.0.0.0:5514"
+timeout_secs = 30
+max_concurrent_queries = 2
+max_result_rows = 100000
+max_export_rows = 1000000
+max_request_body_bytes = "128K"
+max_concurrent_requests = 32
+shutdown_drain_secs = 30
+max_sse_connections = 32
+schema_cache_ttl_secs = 60
+max_query_history = 1000
+query_spill_max_bytes = "4GiB"
+query_memory_limit = "2GiB"
+query_threads = 4
+[server.rate_limit]
+[2026-10-18T09:02:16.773Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-after get statefulset trawl -o json | jq -c '.spec.template.spec | {trawld_resources: (.containers[] | select(.name=="trawld") | .resources), tmp: (.volumes[] | select(.name=="tmp")), probes: (.containers[] | select(.name=="trawld") | {readiness: .readinessProbe | {periodSeconds, failureThreshold, timeoutSeconds}, liveness: .livenessProbe | {periodSeconds, failureThreshold}})}'
+{"trawld_resources":{"limits":{"cpu":"1","memory":"4Gi"},"requests":{"cpu":"250m","memory":"512Mi"}},"tmp":{"emptyDir":{"sizeLimit":"512Mi"},"name":"tmp"},"probes":{"readiness":{"periodSeconds":10,"failureThreshold":3,"timeoutSeconds":5},"liveness":{"periodSeconds":30,"failureThreshold":3}}}
+[2026-10-18T09:02:17.120Z] pod trawl-0 uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+[2026-10-18T09:02:17.399Z] GET /api/v1/health -> 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","storage_db":"ok","duckdb":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+[2026-10-18T09:02:17.722Z] count query -> 200 0.305259 [[800000]]
+
+## [2026-10-18T09:02:17.732Z] phase A, starvation: 4 clients send STARVE_QUERY back to back for 60s; max_concurrent_queries=2
+[2026-10-18T09:02:17.744Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pod trawl-0 -o jsonpath=\{range\ .status.conditions\[\*\]\}\{.type\}=\{.status\}\ \{end\}\{\"\\n\"\}
+PodReadyToStartContainers=True Initialized=True Ready=True ContainersReady=True PodScheduled=True 
+[2026-10-18T09:02:18.637Z] one STARVE_QUERY alone -> 200 0.754349 {"execution":{"started_at":"2026-10-18T09:02:17.889627564Z","duration_ms":732},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:02:20.660Z] workers started at 2026-10-18T09:02:18.643Z; waiting for them to finish their last query
+[2026-10-18T09:03:36.020Z] phase A ended
+
+## [2026-10-18T09:03:36.024Z] phase A: STARVE_QUERY responses (start time, worker, HTTP status, seconds, body head)
+[2026-10-18T09:03:36.032Z] $ sort '$D/private/after/work/a/workers.log'
+2026-10-18T09:02:18.649Z worker=1 -> 200 0.759556 {"execution":{"started_at":"2026-10-18T09:02:18.677185171Z","duration_ms":741},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offs
+2026-10-18T09:02:19.152Z worker=2 -> 200 1.447879 {"execution":{"started_at":"2026-10-18T09:02:19.219859982Z","duration_ms":1321},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:19.435Z worker=1 -> 200 1.296905 {"execution":{"started_at":"2026-10-18T09:02:19.468311952Z","duration_ms":1268},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:19.654Z worker=3 -> 200 2.054182 {"execution":{"started_at":"2026-10-18T09:02:19.905334457Z","duration_ms":1811},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:20.158Z worker=4 -> 200 1.848704 {"execution":{"started_at":"2026-10-18T09:02:20.219492626Z","duration_ms":1809},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:20.625Z worker=2 -> 200 2.378036 {"execution":{"started_at":"2026-10-18T09:02:20.653674392Z","duration_ms":2280},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:20.763Z worker=1 -> 200 2.450926 {"execution":{"started_at":"2026-10-18T09:02:20.825286547Z","duration_ms":2394},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:21.735Z worker=3 -> 200 2.683386 {"execution":{"started_at":"2026-10-18T09:02:21.813553066Z","duration_ms":2613},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:22.051Z worker=4 -> 200 2.590032 {"execution":{"started_at":"2026-10-18T09:02:22.071215425Z","duration_ms":2567},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:23.023Z worker=2 -> 200 2.682739 {"execution":{"started_at":"2026-10-18T09:02:23.044580978Z","duration_ms":2587},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:23.231Z worker=1 -> 200 2.888325 {"execution":{"started_at":"2026-10-18T09:02:23.252498425Z","duration_ms":2864},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:24.444Z worker=3 -> 200 2.681100 {"execution":{"started_at":"2026-10-18T09:02:24.464142034Z","duration_ms":2662},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:24.657Z worker=4 -> 200 2.749503 {"execution":{"started_at":"2026-10-18T09:02:24.720945679Z","duration_ms":2693},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:25.724Z worker=2 -> 200 2.690126 {"execution":{"started_at":"2026-10-18T09:02:25.819481958Z","duration_ms":2510},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:26.135Z worker=1 -> 200 2.777031 {"execution":{"started_at":"2026-10-18T09:02:26.222209803Z","duration_ms":2600},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:27.139Z worker=3 -> 200 2.782458 {"execution":{"started_at":"2026-10-18T09:02:27.224755982Z","duration_ms":2696},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:27.424Z worker=4 -> 200 2.601870 {"execution":{"started_at":"2026-10-18T09:02:27.452024001Z","duration_ms":2575},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:28.440Z worker=2 -> 200 2.883697 {"execution":{"started_at":"2026-10-18T09:02:28.459095065Z","duration_ms":2860},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:28.939Z worker=1 -> 200 2.574279 {"execution":{"started_at":"2026-10-18T09:02:29.025872731Z","duration_ms":2498},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:29.936Z worker=3 -> 200 2.793922 {"execution":{"started_at":"2026-10-18T09:02:30.020373120Z","duration_ms":2711},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:30.040Z worker=4 -> 200 2.886891 {"execution":{"started_at":"2026-10-18T09:02:30.055428702Z","duration_ms":2869},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:31.338Z worker=2 -> 200 3.289649 {"execution":{"started_at":"2026-10-18T09:02:31.429152124Z","duration_ms":3198},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:31.534Z worker=1 -> 200 3.507930 {"execution":{"started_at":"2026-10-18T09:02:31.551894899Z","duration_ms":3472},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:32.746Z worker=3 -> 200 3.080625 {"execution":{"started_at":"2026-10-18T09:02:32.760456937Z","duration_ms":3061},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:32.946Z worker=4 -> 200 4.091784 {"execution":{"started_at":"2026-10-18T09:02:32.968807551Z","duration_ms":4068},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:34.649Z worker=2 -> 200 3.160394 {"execution":{"started_at":"2026-10-18T09:02:34.674138905Z","duration_ms":3140},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:35.061Z worker=1 -> 200 3.040874 {"execution":{"started_at":"2026-10-18T09:02:35.102682761Z","duration_ms":3012},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:35.850Z worker=3 -> 200 3.486086 {"execution":{"started_at":"2026-10-18T09:02:35.892257078Z","duration_ms":3438},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:37.058Z worker=4 -> 200 2.445604 {"execution":{"started_at":"2026-10-18T09:02:37.098344083Z","duration_ms":2418},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:37.841Z worker=2 -> 200 2.959169 {"execution":{"started_at":"2026-10-18T09:02:37.923708277Z","duration_ms":2808},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:38.135Z worker=1 -> 200 3.376701 {"execution":{"started_at":"2026-10-18T09:02:38.225576628Z","duration_ms":3288},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:39.386Z worker=3 -> 200 2.223457 {"execution":{"started_at":"2026-10-18T09:02:39.466136088Z","duration_ms":2149},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:39.539Z worker=4 -> 200 3.384584 {"execution":{"started_at":"2026-10-18T09:02:39.584931034Z","duration_ms":3339},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:40.832Z worker=2 -> 200 2.300440 {"execution":{"started_at":"2026-10-18T09:02:40.913578173Z","duration_ms":2223},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:41.545Z worker=1 -> 200 2.974221 {"execution":{"started_at":"2026-10-18T09:02:41.613934768Z","duration_ms":2917},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:41.646Z worker=3 -> 200 3.070338 {"execution":{"started_at":"2026-10-18T09:02:41.719491563Z","duration_ms":3003},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:42.979Z worker=4 -> 200 2.924107 {"execution":{"started_at":"2026-10-18T09:02:43.046848501Z","duration_ms":2789},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:43.175Z worker=2 -> 200 3.416486 {"execution":{"started_at":"2026-10-18T09:02:43.238775079Z","duration_ms":3289},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:44.558Z worker=1 -> 200 3.049023 {"execution":{"started_at":"2026-10-18T09:02:44.623304321Z","duration_ms":3011},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:44.760Z worker=3 -> 200 3.074965 {"execution":{"started_at":"2026-10-18T09:02:44.819266968Z","duration_ms":3029},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:45.945Z worker=4 -> 200 3.378723 {"execution":{"started_at":"2026-10-18T09:02:45.977987629Z","duration_ms":3337},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:46.660Z worker=2 -> 200 2.754599 {"execution":{"started_at":"2026-10-18T09:02:46.719311890Z","duration_ms":2702},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:47.656Z worker=1 -> 200 3.051158 {"execution":{"started_at":"2026-10-18T09:02:47.703897407Z","duration_ms":3020},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:47.876Z worker=3 -> 200 3.144836 {"execution":{"started_at":"2026-10-18T09:02:47.919214567Z","duration_ms":3101},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:49.363Z worker=4 -> 200 2.769071 {"execution":{"started_at":"2026-10-18T09:02:49.462114419Z","duration_ms":2670},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:49.452Z worker=2 -> 200 3.043170 {"execution":{"started_at":"2026-10-18T09:02:49.533178407Z","duration_ms":2900},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:50.760Z worker=1 -> 200 2.760654 {"execution":{"started_at":"2026-10-18T09:02:50.825790076Z","duration_ms":2701},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:51.065Z worker=3 -> 200 2.728457 {"execution":{"started_at":"2026-10-18T09:02:51.133940867Z","duration_ms":2682},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:52.159Z worker=4 -> 200 2.766849 {"execution":{"started_at":"2026-10-18T09:02:52.213599618Z","duration_ms":2716},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:52.531Z worker=2 -> 200 2.693134 {"execution":{"started_at":"2026-10-18T09:02:52.720768862Z","duration_ms":2505},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:53.573Z worker=1 -> 200 2.749608 {"execution":{"started_at":"2026-10-18T09:02:53.631484321Z","duration_ms":2699},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:53.848Z worker=3 -> 200 2.582280 {"execution":{"started_at":"2026-10-18T09:02:53.883855687Z","duration_ms":2551},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:54.955Z worker=4 -> 200 2.846770 {"execution":{"started_at":"2026-10-18T09:02:55.014289300Z","duration_ms":2727},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:55.263Z worker=2 -> 200 2.645682 {"execution":{"started_at":"2026-10-18T09:02:55.334547328Z","duration_ms":2581},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:56.347Z worker=1 -> 200 3.166195 {"execution":{"started_at":"2026-10-18T09:02:56.377552917Z","duration_ms":3143},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:56.457Z worker=3 -> 200 3.260728 {"execution":{"started_at":"2026-10-18T09:02:56.487068702Z","duration_ms":3241},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:57.826Z worker=4 -> 200 2.493797 {"execution":{"started_at":"2026-10-18T09:02:57.913562586Z","duration_ms":2410},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:57.936Z worker=2 -> 200 3.586311 {"execution":{"started_at":"2026-10-18T09:02:57.966165115Z","duration_ms":3562},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:59.534Z worker=1 -> 200 2.198366 {"execution":{"started_at":"2026-10-18T09:02:59.617950111Z","duration_ms":2113},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:02:59.743Z worker=3 -> 200 2.968448 {"execution":{"started_at":"2026-10-18T09:02:59.757081560Z","duration_ms":2869},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:00.344Z worker=4 -> 200 3.073545 {"execution":{"started_at":"2026-10-18T09:03:00.363578946Z","duration_ms":3056},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:01.543Z worker=2 -> 200 2.300998 {"execution":{"started_at":"2026-10-18T09:03:01.624126213Z","duration_ms":2105},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:01.749Z worker=1 -> 200 2.981000 {"execution":{"started_at":"2026-10-18T09:03:01.828551414Z","duration_ms":2901},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:02.737Z worker=3 -> 200 2.192393 {"execution":{"started_at":"2026-10-18T09:03:02.828607088Z","duration_ms":2091},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:03.439Z worker=4 -> 200 2.676324 {"execution":{"started_at":"2026-10-18T09:03:03.522712105Z","duration_ms":2592},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:03.855Z worker=2 -> 200 2.860004 {"execution":{"started_at":"2026-10-18T09:03:03.927042671Z","duration_ms":2787},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:04.742Z worker=1 -> 200 2.174200 {"execution":{"started_at":"2026-10-18T09:03:04.821787367Z","duration_ms":2095},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:04.947Z worker=3 -> 200 2.961348 {"execution":{"started_at":"2026-10-18T09:03:05.022831654Z","duration_ms":2812},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:06.127Z worker=4 -> 200 2.393312 {"execution":{"started_at":"2026-10-18T09:03:06.144809366Z","duration_ms":2374},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:06.726Z worker=2 -> 200 2.008371 {"execution":{"started_at":"2026-10-18T09:03:06.813625185Z","duration_ms":1923},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:06.933Z worker=1 -> 200 2.797386 {"execution":{"started_at":"2026-10-18T09:03:07.026806998Z","duration_ms":2707},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:07.922Z worker=3 -> 200 2.092499 {"execution":{"started_at":"2026-10-18T09:03:07.940682617Z","duration_ms":2075},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:08.534Z worker=4 -> 200 2.586935 {"execution":{"started_at":"2026-10-18T09:03:08.618408558Z","duration_ms":2497},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:08.757Z worker=2 -> 200 3.259093 {"execution":{"started_at":"2026-10-18T09:03:08.788139903Z","duration_ms":3239},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:09.747Z worker=1 -> 200 2.479977 {"execution":{"started_at":"2026-10-18T09:03:09.821704638Z","duration_ms":2408},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:10.033Z worker=3 -> 200 3.475725 {"execution":{"started_at":"2026-10-18T09:03:10.052361639Z","duration_ms":3377},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:11.139Z worker=4 -> 200 2.585657 {"execution":{"started_at":"2026-10-18T09:03:11.165255168Z","duration_ms":2560},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:12.041Z worker=2 -> 200 2.780486 {"execution":{"started_at":"2026-10-18T09:03:12.057956527Z","duration_ms":2765},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:12.240Z worker=1 -> 200 2.877952 {"execution":{"started_at":"2026-10-18T09:03:12.260998038Z","duration_ms":2855},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:13.524Z worker=3 -> 200 2.597217 {"execution":{"started_at":"2026-10-18T09:03:13.549927124Z","duration_ms":2575},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:13.742Z worker=4 -> 200 2.492393 {"execution":{"started_at":"2026-10-18T09:03:13.758838670Z","duration_ms":2474},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:14.838Z worker=2 -> 200 2.679061 {"execution":{"started_at":"2026-10-18T09:03:14.923543252Z","duration_ms":2593},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:15.136Z worker=1 -> 200 2.484584 {"execution":{"started_at":"2026-10-18T09:03:15.227517633Z","duration_ms":2391},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:16.143Z worker=3 -> 200 2.882650 {"execution":{"started_at":"2026-10-18T09:03:16.222036713Z","duration_ms":2795},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:16.247Z worker=4 -> 200 3.049458 {"execution":{"started_at":"2026-10-18T09:03:16.266036508Z","duration_ms":2982},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:17.535Z worker=2 -> 200 2.389398 {"execution":{"started_at":"2026-10-18T09:03:17.618695755Z","duration_ms":2314},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+2026-10-18T09:03:17.640Z worker=1 -> 200 2.859482 {"execution":{"started_at":"2026-10-18T09:03:17.720062221Z","duration_ms":2794},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"off
+[2026-10-18T09:03:36.046Z] $ awk '{print $4}' '$D/private/after/work/a/workers.log' | sort | uniq -c
+     87 200
+
+## [2026-10-18T09:03:36.060Z] phase A: GET /api/v1/health every second (time, HTTP status, body)
+[2026-10-18T09:03:36.067Z] $ cat '$D/private/after/work/a/health.log'
+2026-10-18T09:02:18.668Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:19.764Z 200 {"status":"ok","checks":{"data_path":"ok","corpus":"ok","ingest_capacity":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:20.866Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:21.883Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:22.960Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:23.974Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:25.017Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:26.044Z 200 {"status":"ok","checks":{"corpus":"ok","storage_db":"ok","data_path":"ok","duckdb":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:27.161Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","data_path":"ok","duckdb":"ok","storage_db":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:28.224Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","duckdb":"ok","storage_db":"ok","corpus":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:29.379Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","storage_db":"ok","auth_db":"ok","corpus":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:30.462Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:31.522Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","duckdb":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:32.673Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","corpus":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:33.724Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:34.828Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","duckdb":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:35.873Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:36.965Z 200 {"status":"ok","checks":{"duckdb":"ok","corpus":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:38.034Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","duckdb":"ok","data_path":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:39.074Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:40.168Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","data_path":"ok","corpus":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:41.253Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:42.295Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:43.469Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:44.532Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:45.592Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:46.648Z 200 {"status":"ok","checks":{"corpus":"ok","data_path":"ok","duckdb":"ok","storage_db":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:47.747Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","data_path":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:48.790Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","data_path":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:49.857Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:50.964Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:52.046Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","storage_db":"ok","corpus":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:53.132Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:54.239Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:55.277Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","storage_db":"ok","auth_db":"ok","ingest_capacity":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:56.361Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","storage_db":"ok","data_path":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:57.437Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","auth_db":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:58.562Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","data_path":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:02:59.658Z 200 {"status":"ok","checks":{"corpus":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:00.731Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","duckdb":"ok","auth_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:01.752Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","auth_db":"ok","duckdb":"ok","corpus":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:02.862Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:03.926Z 200 {"status":"ok","checks":{"corpus":"ok","ingest_capacity":"ok","storage_db":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:05.060Z 200 {"status":"ok","checks":{"duckdb":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:06.162Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","corpus":"ok","storage_db":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:07.258Z 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:08.363Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","data_path":"ok","duckdb":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:09.465Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","data_path":"ok","corpus":"ok","ingest_capacity":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:10.562Z 200 {"status":"ok","checks":{"corpus":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:11.622Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","duckdb":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:12.764Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:13.828Z 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","corpus":"ok","storage_db":"ok","ingest_capacity":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:14.959Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:16.060Z 200 {"status":"ok","checks":{"data_path":"ok","corpus":"ok","ingest_capacity":"ok","duckdb":"ok","storage_db":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:17.167Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:18.253Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:19.380Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:20.512Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:21.603Z 200 {"status":"ok","checks":{"corpus":"ok","ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:22.705Z 200 {"status":"ok","checks":{"data_path":"ok","corpus":"ok","ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:23.780Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","corpus":"ok","auth_db":"ok","ingest_capacity":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:24.823Z 200 {"status":"ok","checks":{"auth_db":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok","data_path":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:25.911Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:26.996Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:28.077Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:29.109Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:30.153Z 200 {"status":"ok","checks":{"auth_db":"ok","corpus":"ok","ingest_capacity":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:31.190Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:32.224Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:33.256Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:34.310Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:03:35.388Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+[2026-10-18T09:03:36.077Z] $ awk '{print $2}' '$D/private/after/work/a/health.log' | sort | uniq -c
+     72 200
+
+## [2026-10-18T09:03:36.087Z] phase A: pool counters and held work every 5 s
+[2026-10-18T09:03:36.089Z] $ cat '$D/private/after/work/a/pool.log'
+2026-10-18T09:02:18.643Z stats={"pool_capacity":2,"pool_available":2,"active_queries":0,"pool_retained":0} queries={"active":[{"id":2,"running_ms":55}],"retained":[]}
+2026-10-18T09:02:23.774Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":12,"running_ms":573},{"id":9,"running_ms":2059},{"id":10,"running_ms":1754},{"id":11,"running_ms":780}],"retained":[]}
+2026-10-18T09:02:28.863Z stats={"pool_capacity":2,"pool_available":0,"active_queries":3,"pool_retained":0} queries={"active":[{"id":18,"running_ms":1594},{"id":17,"running_ms":1821},{"id":20,"running_ms":20},{"id":19,"running_ms":588}],"retained":[]}
+2026-10-18T09:02:34.075Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":26,"running_ms":1260},{"id":25,"running_ms":1468},{"id":23,"running_ms":2799},{"id":24,"running_ms":2677}],"retained":[]}
+2026-10-18T09:02:39.243Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":31,"running_ms":1490},{"id":32,"running_ms":1188},{"id":30,"running_ms":2315}],"retained":[]}
+2026-10-18T09:02:44.436Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":40,"running_ms":14},{"id":37,"running_ms":2917},{"id":39,"running_ms":1398},{"id":38,"running_ms":1590}],"retained":[]}
+2026-10-18T09:02:49.650Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":44,"running_ms":2074},{"id":45,"running_ms":1859},{"id":46,"running_ms":316},{"id":47,"running_ms":244}],"retained":[]}
+2026-10-18T09:02:54.833Z stats={"pool_capacity":2,"pool_available":0,"active_queries":3,"pool_retained":0} queries={"active":[{"id":52,"running_ms":1339},{"id":53,"running_ms":1088},{"id":51,"running_ms":2250}],"retained":[]}
+2026-10-18T09:03:00.014Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":60,"running_ms":438},{"id":58,"running_ms":2201},{"id":59,"running_ms":2090},{"id":61,"running_ms":299}],"retained":[]}
+2026-10-18T09:03:05.095Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":69,"running_ms":203},{"id":68,"running_ms":404},{"id":67,"running_ms":1299},{"id":66,"running_ms":1703}],"retained":[]}
+2026-10-18T09:03:10.259Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":75,"running_ms":1725},{"id":74,"running_ms":1895},{"id":77,"running_ms":461},{"id":76,"running_ms":692}],"retained":[]}
+2026-10-18T09:03:15.527Z stats={"pool_capacity":2,"pool_available":0,"active_queries":4,"pool_retained":0} queries={"active":[{"id":81,"running_ms":2127},{"id":84,"running_ms":447},{"id":82,"running_ms":1916},{"id":83,"running_ms":751}],"retained":[]}
+2026-10-18T09:03:20.724Z stats={"pool_capacity":2,"pool_available":2,"active_queries":0,"pool_retained":0} queries={"active":[],"retained":[]}
+2026-10-18T09:03:25.837Z stats={"pool_capacity":2,"pool_available":2,"active_queries":0,"pool_retained":0} queries={"active":[],"retained":[]}
+2026-10-18T09:03:30.929Z stats={"pool_capacity":2,"pool_available":2,"active_queries":0,"pool_retained":0} queries={"active":[],"retained":[]}
+
+## [2026-10-18T09:03:36.101Z] phase A: pod trawl-0 every 2 s
+[2026-10-18T09:03:36.106Z] $ cat '$D/private/after/work/a/pod.log'
+2026-10-18T09:02:18.643Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:20.820Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:22.999Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:25.084Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:27.182Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:29.281Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:31.456Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:33.540Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:35.657Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:37.843Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:40.098Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:42.403Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:44.705Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:46.948Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:49.204Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:51.616Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:53.898Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:56.174Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:02:58.367Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:00.486Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:02.573Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:04.687Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:06.778Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:08.863Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:10.957Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:13.058Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:15.164Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:17.265Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:19.490Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:21.749Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:24.021Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:26.245Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:28.501Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:30.731Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:32.943Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:35.150Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+
+## [2026-10-18T09:03:36.118Z] phase A: trawld log lines about refused, timed-out or retained work
+[2026-10-18T09:03:36.124Z] $ grep -E 'query_not_started|query_permit|reclaim|retained|outcome="timeout"|status=504|route="/api/v1/health"' '$D/private/after/work/a/trawld.log' | head -n 60
+2026-10-18T09:03:12.887795576Z 2026-10-18T09:03:12.887707Z  INFO trawl_server::stats: periodic server stats event_type="server_stats" uptime_secs=60 total_queries=81 pool_available=0 pool_max=2 pool_active=2 pool_retained=0 sse_available=32 hot_buffer_events=100 hot_buffer_bytes=102258 hot_buffer_batches=12
+[2026-10-18T09:03:36.139Z] $ grep -c 'event_type="query_not_started".*kind="ping"' '$D/private/after/work/a/trawld.log' || true
+0
+[2026-10-18T09:03:36.147Z] $ grep -oE 'outcome="[a-z_]+"' '$D/private/after/work/a/trawld.log' | sort | uniq -c
+     88 outcome="success"
+
+## [2026-10-18T09:03:36.166Z] phase A: kubelet events
+FIRST                  LAST                   COUNT    TYPE      REASON              OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-after/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-after/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           postgres-5dbf87b8f6-svjxd   Successfully assigned i304-after/postgres-5dbf87b8f6-svjxd to trawl-i304-control-plane
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    ScalingReplicaSet   postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    SuccessfulCreate    postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-svjxd
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Pulled              postgres-5dbf87b8f6-svjxd   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Created             postgres-5dbf87b8f6-svjxd   Container created
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Started             postgres-5dbf87b8f6-svjxd   Container started
+2026-10-18T09:00:44Z   2026-10-18T09:00:45Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-svjxd   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-18T09:00:47Z   2026-10-18T09:00:49Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-svjxd   Readiness probe failed: /var/run/postgresql:5432 - rejecting connections
+
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-after/data-trawl-0"
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   2        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-18T09:00:54Z   2026-10-18T09:00:54Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-9f93f573-8e9d-4519-9481-275f83a5c5fc
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:02:09Z   2026-10-18T09:02:09Z   1        Normal    Killing                 trawl-0                     Stopping container trawld
+2026-10-18T09:02:09Z   2026-10-18T09:02:09Z   1        Normal    SuccessfulDelete        trawl                       Delete Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T09:00:51Z   2026-10-18T09:02:10Z   2        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+[2026-10-18T09:03:36.399Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pod trawl-0 -o jsonpath=\{range\ .status.conditions\[\*\]\}\{.type\}=\{.status\}\ \{.lastTransitionTime\}\{\"\\n\"\}\{end\}
+PodReadyToStartContainers=True 2026-10-18T09:02:11Z
+Initialized=True 2026-10-18T09:02:12Z
+Ready=True 2026-10-18T09:02:16Z
+ContainersReady=True 2026-10-18T09:02:16Z
+PodScheduled=True 2026-10-18T09:02:10Z
+[2026-10-18T09:03:36.568Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE     IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-svjxd   1/1     Running   0          2m52s   10.244.0.93   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          86s     10.244.0.96   trawl-i304-control-plane   <none>           <none>
+[2026-10-18T09:03:36.767Z] waiting for trawl-0 to be Ready before phase B
+[2026-10-18T09:03:36.894Z] pod trawl-0 uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+
+## [2026-10-18T09:03:37.324Z] phase B, eviction: SPILL_QUERY up to 8 times, 20s apart; trawld's /tmp is a 512Mi emptyDir
+[2026-10-18T09:03:37.478Z] trawl-0 uid before phase B: df57fbca-8925-4481-8e11-a30ce65a3843
+[2026-10-18T09:03:37.737Z] query scratch /var/lib/trawl/data.query-scratch present: yes
+[2026-10-18T09:03:48.411Z] SPILL_QUERY attempt 1 at 2026-10-18T09:03:37.745Z -> 200 10.632747 {"execution":{"started_at":"2026-10-18T09:03:37.776015095Z","duration_ms":10303},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:04:16.557Z] SPILL_QUERY attempt 2 at 2026-10-18T09:04:08.799Z -> 503 7.738105 {"error":{"code":"query_resource_exhausted","message":"query could not complete with the available query resources; narrow the time range or simplify the query"}}
+[2026-10-18T09:04:49.564Z] SPILL_QUERY attempt 3 at 2026-10-18T09:04:37.083Z -> 200 12.420742 {"execution":{"started_at":"2026-10-18T09:04:37.157919113Z","duration_ms":12373},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:05:19.523Z] SPILL_QUERY attempt 4 at 2026-10-18T09:05:09.907Z -> 200 9.604438 {"execution":{"started_at":"2026-10-18T09:05:09.924685235Z","duration_ms":9572},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:05:49.133Z] SPILL_QUERY attempt 5 at 2026-10-18T09:05:39.651Z -> 200 9.471847 {"execution":{"started_at":"2026-10-18T09:05:39.668877415Z","duration_ms":9451},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:06:19.228Z] SPILL_QUERY attempt 6 at 2026-10-18T09:06:09.248Z -> 200 9.935975 {"execution":{"started_at":"2026-10-18T09:06:09.279085246Z","duration_ms":9399},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:06:52.187Z] SPILL_QUERY attempt 7 at 2026-10-18T09:06:39.842Z -> 200 12.314846 {"execution":{"started_at":"2026-10-18T09:06:39.874660561Z","duration_ms":12047},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:07:21.912Z] SPILL_QUERY attempt 8 at 2026-10-18T09:07:12.725Z -> 200 9.174671 {"execution":{"started_at":"2026-10-18T09:07:12.742732594Z","duration_ms":9105},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:07:22.075Z] attempts done (evicted=no); sampling 45 s more
+
+## [2026-10-18T09:08:07.432Z] phase B: trawld /tmp usage every 2 s (time, bytes, path)
+[2026-10-18T09:08:07.434Z] $ cat '$D/private/after/work/b/tmp.log'
+2026-10-18T09:03:37.485Z 0	/tmp
+2026-10-18T09:03:39.694Z 0	/tmp
+2026-10-18T09:03:41.968Z 0	/tmp
+2026-10-18T09:03:44.260Z 0	/tmp
+2026-10-18T09:03:46.573Z 0	/tmp
+2026-10-18T09:03:48.860Z 0	/tmp
+2026-10-18T09:03:51.141Z 0	/tmp
+2026-10-18T09:03:53.379Z 0	/tmp
+2026-10-18T09:03:55.616Z 0	/tmp
+2026-10-18T09:03:57.827Z 0	/tmp
+2026-10-18T09:04:00.086Z 0	/tmp
+2026-10-18T09:04:02.267Z 0	/tmp
+2026-10-18T09:04:04.438Z 0	/tmp
+2026-10-18T09:04:06.660Z 0	/tmp
+2026-10-18T09:04:08.808Z 0	/tmp
+2026-10-18T09:04:11.051Z 0	/tmp
+2026-10-18T09:04:13.354Z 0	/tmp
+2026-10-18T09:04:15.685Z 0	/tmp
+2026-10-18T09:04:17.992Z 0	/tmp
+2026-10-18T09:04:20.309Z 0	/tmp
+2026-10-18T09:04:22.603Z 0	/tmp
+2026-10-18T09:04:24.920Z 0	/tmp
+2026-10-18T09:04:27.391Z 0	/tmp
+2026-10-18T09:04:29.763Z 0	/tmp
+2026-10-18T09:04:32.165Z 0	/tmp
+2026-10-18T09:04:34.491Z 0	/tmp
+2026-10-18T09:04:36.783Z 0	/tmp
+2026-10-18T09:04:39.160Z 0	/tmp
+2026-10-18T09:04:41.760Z 0	/tmp
+2026-10-18T09:04:44.102Z 0	/tmp
+2026-10-18T09:04:46.356Z 0	/tmp
+2026-10-18T09:04:48.638Z 0	/tmp
+2026-10-18T09:04:50.967Z 0	/tmp
+2026-10-18T09:04:53.208Z 0	/tmp
+2026-10-18T09:04:55.434Z 0	/tmp
+2026-10-18T09:04:57.668Z 0	/tmp
+2026-10-18T09:04:59.928Z 0	/tmp
+2026-10-18T09:05:02.071Z 0	/tmp
+2026-10-18T09:05:04.201Z 0	/tmp
+2026-10-18T09:05:06.445Z 0	/tmp
+2026-10-18T09:05:08.764Z 0	/tmp
+2026-10-18T09:05:10.915Z 0	/tmp
+2026-10-18T09:05:13.128Z 0	/tmp
+2026-10-18T09:05:15.325Z 0	/tmp
+2026-10-18T09:05:17.524Z 0	/tmp
+2026-10-18T09:05:19.720Z 0	/tmp
+2026-10-18T09:05:21.825Z 0	/tmp
+2026-10-18T09:05:23.920Z 0	/tmp
+2026-10-18T09:05:26.062Z 0	/tmp
+2026-10-18T09:05:28.272Z 0	/tmp
+2026-10-18T09:05:30.481Z 0	/tmp
+2026-10-18T09:05:32.566Z 0	/tmp
+2026-10-18T09:05:34.666Z 0	/tmp
+2026-10-18T09:05:36.756Z 0	/tmp
+2026-10-18T09:05:38.845Z 0	/tmp
+2026-10-18T09:05:40.934Z 0	/tmp
+2026-10-18T09:05:43.138Z 0	/tmp
+2026-10-18T09:05:45.435Z 0	/tmp
+2026-10-18T09:05:47.632Z 0	/tmp
+2026-10-18T09:05:49.741Z 0	/tmp
+2026-10-18T09:05:51.835Z 0	/tmp
+2026-10-18T09:05:53.938Z 0	/tmp
+2026-10-18T09:05:56.026Z 0	/tmp
+2026-10-18T09:05:58.118Z 0	/tmp
+2026-10-18T09:06:00.250Z 0	/tmp
+2026-10-18T09:06:02.362Z 0	/tmp
+2026-10-18T09:06:04.455Z 0	/tmp
+2026-10-18T09:06:06.582Z 0	/tmp
+2026-10-18T09:06:08.706Z 0	/tmp
+2026-10-18T09:06:10.828Z 0	/tmp
+2026-10-18T09:06:12.944Z 0	/tmp
+2026-10-18T09:06:15.156Z 0	/tmp
+2026-10-18T09:06:17.776Z 0	/tmp
+2026-10-18T09:06:20.366Z 0	/tmp
+2026-10-18T09:06:22.624Z 0	/tmp
+2026-10-18T09:06:24.940Z 0	/tmp
+2026-10-18T09:06:27.197Z 0	/tmp
+2026-10-18T09:06:29.549Z 0	/tmp
+2026-10-18T09:06:31.904Z 0	/tmp
+2026-10-18T09:06:34.122Z 0	/tmp
+2026-10-18T09:06:36.417Z 0	/tmp
+2026-10-18T09:06:38.698Z 0	/tmp
+2026-10-18T09:06:40.974Z 0	/tmp
+2026-10-18T09:06:43.361Z 0	/tmp
+2026-10-18T09:06:46.004Z 0	/tmp
+2026-10-18T09:06:48.341Z 0	/tmp
+2026-10-18T09:06:50.778Z 0	/tmp
+2026-10-18T09:06:53.290Z 0	/tmp
+2026-10-18T09:06:55.537Z 0	/tmp
+2026-10-18T09:06:57.866Z 0	/tmp
+2026-10-18T09:07:00.125Z 0	/tmp
+2026-10-18T09:07:02.387Z 0	/tmp
+2026-10-18T09:07:04.687Z 0	/tmp
+2026-10-18T09:07:07.413Z 0	/tmp
+2026-10-18T09:07:09.689Z 0	/tmp
+2026-10-18T09:07:12.020Z 0	/tmp
+2026-10-18T09:07:14.303Z 0	/tmp
+2026-10-18T09:07:16.524Z 0	/tmp
+2026-10-18T09:07:18.855Z 0	/tmp
+2026-10-18T09:07:21.143Z 0	/tmp
+2026-10-18T09:07:23.344Z 0	/tmp
+2026-10-18T09:07:25.453Z 0	/tmp
+2026-10-18T09:07:27.542Z 0	/tmp
+2026-10-18T09:07:29.807Z 0	/tmp
+2026-10-18T09:07:32.048Z 0	/tmp
+2026-10-18T09:07:34.361Z 0	/tmp
+2026-10-18T09:07:36.643Z 0	/tmp
+2026-10-18T09:07:38.973Z 0	/tmp
+2026-10-18T09:07:41.271Z 0	/tmp
+2026-10-18T09:07:43.562Z 0	/tmp
+2026-10-18T09:07:45.872Z 0	/tmp
+2026-10-18T09:07:48.203Z 0	/tmp
+2026-10-18T09:07:50.577Z 0	/tmp
+2026-10-18T09:07:52.972Z 0	/tmp
+2026-10-18T09:07:55.240Z 0	/tmp
+2026-10-18T09:07:57.408Z 0	/tmp
+2026-10-18T09:07:59.543Z 0	/tmp
+2026-10-18T09:08:01.748Z 0	/tmp
+2026-10-18T09:08:03.927Z 0	/tmp
+2026-10-18T09:08:06.076Z 0	/tmp
+
+## [2026-10-18T09:08:07.437Z] phase B: trawld query scratch usage every 2 s (time, bytes, path)
+[2026-10-18T09:08:07.439Z] $ cat '$D/private/after/work/b/scratch.log'
+2026-10-18T09:03:37.736Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:40.061Z 362973232	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:42.379Z 1452017960	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:44.829Z 2360510820	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:47.156Z 2637924646	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:49.475Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:51.783Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:54.029Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:56.265Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:03:58.508Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:00.759Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:02.938Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:05.111Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:07.315Z 1848	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:09.489Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:11.751Z 107381891	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:13.987Z 530220407	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:16.370Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:18.684Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:21.032Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:23.368Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:25.680Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:28.083Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:30.608Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:33.041Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:35.555Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:38.020Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:40.473Z 420415718	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:43.164Z 1275169058	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:45.429Z 1902184864	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:47.660Z 2355693922	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:49.977Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:52.203Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:54.463Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:56.697Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:04:58.943Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:01.079Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:03.231Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:05.495Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:07.694Z 1846	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:09.967Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:12.234Z 211587510	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:14.347Z 1230410286	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:16.441Z 2530841260	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:18.547Z 2813465198	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:20.635Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:22.718Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:24.815Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:26.911Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:29.173Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:31.382Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:33.475Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:35.563Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:37.656Z 4224	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:39.742Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:41.921Z 410523540	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:44.128Z 1555535952	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:46.227Z 2740787340	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:48.357Z 2496960344	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:50.535Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:52.621Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:54.739Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:56.825Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:05:58.919Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:01.010Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:03.146Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:05.277Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:07.413Z 5604	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:09.530Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:11.748Z 541593964	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:13.956Z 1881805290	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:16.179Z 2838630950	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:18.686Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:21.349Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:23.923Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:26.205Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:28.606Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:30.933Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:33.243Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:35.616Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:37.946Z 4212	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:40.186Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:42.478Z 525436157	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:44.998Z 1431143865	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:47.576Z 2449671669	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:49.989Z 2630551029	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:52.415Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:54.773Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:57.065Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:06:59.364Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:02.259Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:04.569Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:07.419Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:09.689Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:12.015Z 969	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:14.289Z 30249330	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:16.526Z 1568281258	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:18.858Z 2607583974	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:21.054Z 2792329712	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:23.244Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:25.337Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:27.433Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:29.726Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:32.040Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:34.286Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:36.593Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:38.898Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:41.198Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:43.490Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:45.798Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:48.048Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:50.369Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:52.675Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:54.959Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:57.090Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:07:59.235Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:01.472Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:03.707Z 4220	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:05.905Z 4220	/var/lib/trawl/data.query-scratch
+[2026-10-18T09:08:07.443Z] $ awk '{print $2}' '$D/private/after/work/b/scratch.log' | sort -n | tail -n 1
+2838630950
+
+## [2026-10-18T09:08:07.450Z] phase B: pod trawl-0 every 2 s
+[2026-10-18T09:08:07.451Z] $ cat '$D/private/after/work/b/pod.log'
+2026-10-18T09:03:37.742Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:39.909Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:42.127Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:44.383Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:46.598Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:48.786Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:51.016Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:53.170Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:55.363Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:57.502Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:03:59.652Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:01.815Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:03.937Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:06.061Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:08.151Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:10.256Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:12.378Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:14.593Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:16.797Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:19.080Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:21.353Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:23.742Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:26.002Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:28.243Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:30.565Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:32.864Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:35.178Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:37.443Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:39.685Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:42.184Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:44.437Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:46.598Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:48.717Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:50.900Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:53.093Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:55.275Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:57.378Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:04:59.465Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:01.551Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:03.630Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:05.807Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:07.951Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:10.116Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:12.206Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:14.271Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:16.335Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:18.391Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:20.457Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:22.517Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:24.576Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:26.646Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:28.811Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:30.996Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:33.049Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:35.110Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:37.166Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:39.219Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:41.273Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:43.398Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:45.473Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:47.558Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:49.619Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:51.692Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:53.752Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:55.808Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:57.859Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:05:59.916Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:01.992Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:04.065Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:06.148Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:08.224Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:10.301Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:12.384Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:14.497Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:16.703Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:19.170Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:21.475Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:23.819Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:26.056Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:28.295Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:30.635Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:32.965Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:35.135Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:37.328Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:39.562Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:41.737Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:44.093Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:46.565Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:48.900Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:51.324Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:53.554Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:55.733Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:06:58.036Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:00.269Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:02.482Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:04.672Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:07.328Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:09.533Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:11.734Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:13.896Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:15.958Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:18.025Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:20.151Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:22.239Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:24.307Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:26.362Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:28.516Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:30.710Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:32.902Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:35.100Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:37.327Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:39.536Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:41.743Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:43.964Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:46.240Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:48.463Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:50.713Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:52.948Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:55.160Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:57.259Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:07:59.345Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:01.483Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:03.639Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:05.782Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+
+## [2026-10-18T09:08:07.457Z] phase B: GET /api/v1/health every second (time, HTTP status, body)
+[2026-10-18T09:08:07.459Z] $ awk '{print $1, $2, $3}' '$D/private/after/work/b/health.log' | uniq -f1 -c | head -n 60
+      1 2026-10-18T09:03:37.804Z 200 {"status":"ok","checks":{"corpus":"ok","ingest_capacity":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:38.899Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","duckdb":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:39.999Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","corpus":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:41.119Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:42.168Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:43.261Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:44.347Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","duckdb":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:45.422Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","duckdb":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:46.459Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","corpus":"ok","ingest_capacity":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:47.500Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:48.581Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok","duckdb":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:49.657Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:50.729Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:51.758Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:52.832Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:53.902Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","storage_db":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+      2 2026-10-18T09:03:54.933Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","data_path":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:56.993Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:58.068Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:03:59.139Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","data_path":"ok","duckdb":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:00.163Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","data_path":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:01.192Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:02.215Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","data_path":"ok","corpus":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:03.242Z 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:04.270Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:05.339Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:06.357Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","duckdb":"ok","corpus":"ok","ingest_capacity":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:07.433Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:08.449Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:09.544Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:10.658Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok","ingest_capacity":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:11.728Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","auth_db":"ok","corpus":"ok","ingest_capacity":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:12.816Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:13.888Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:14.945Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:15.985Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:17.038Z 200 {"status":"ok","checks":{"storage_db":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:18.072Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:19.178Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:20.239Z 200 {"status":"ok","checks":{"corpus":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:21.290Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","duckdb":"ok","corpus":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:22.323Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:23.373Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:24.422Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:25.471Z 200 {"status":"ok","checks":{"auth_db":"ok","corpus":"ok","duckdb":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:26.552Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:27.680Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","ingest_capacity":"ok","storage_db":"ok","data_path":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:28.749Z 200 {"status":"ok","checks":{"storage_db":"ok","corpus":"ok","ingest_capacity":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:29.845Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","storage_db":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:30.947Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:31.986Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:33.069Z 200 {"status":"ok","checks":{"auth_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:34.161Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","auth_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:35.246Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:36.280Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:37.377Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:38.447Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:39.545Z 200 {"status":"ok","checks":{"storage_db":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok","ingest_capacity":"ok","data_path":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:40.628Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+      1 2026-10-18T09:04:41.686Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+
+## [2026-10-18T09:08:07.465Z] phase B: trawld log lines about the query, errors and shutdown
+[2026-10-18T09:08:07.467Z] $ grep -E 'query_start|query_complete|query_failed|query_error_text|query_timing|http_failure|ERROR|shutdown|signal' '$D/private/after/work/b/trawld.log' | grep -v 'route="/api/v1/health"' | cut -c1-600 | head -n 80
+2026-10-18T09:03:37.776025965Z 2026-10-18T09:03:37.775945Z  INFO http_request{request_id="01M574159A9P1XQGKBS80TJ5Z1" peer_addr=127.0.0.1:45226 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=89 query_len=295 limit=100000 offset=0
+2026-10-18T09:03:48.079327254Z 2026-10-18T09:03:48.079251Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=89 kind="query" request_id="01M574159A9P1XQGKBS80TJ5Z1" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=10303233 query_other_us=418 query_dsl_check_us=192 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=63 query_source_us=1247 query_hot_snapshot_us=155 query_emit_us=607 query_bind_us=13327 query_execute_us=10285124 query_post_us=2100
+2026-10-18T09:03:48.394728052Z 2026-10-18T09:03:48.394658Z  INFO http_request{request_id="01M574159A9P1XQGKBS80TJ5Z1" peer_addr=127.0.0.1:45226 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=89 query_len=295 total_rows=1 returned_rows=1 duration_ms=10303
+2026-10-18T09:04:08.829714739Z 2026-10-18T09:04:08.829655Z  INFO http_request{request_id="01M57423KGHDGWDG0Q5D2YW283" peer_addr=127.0.0.1:52784 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=90 query_len=295 limit=100000 offset=0
+2026-10-18T09:04:16.545435586Z 2026-10-18T09:04:16.545334Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=90 kind="query" request_id="01M57423KGHDGWDG0Q5D2YW283" outcome="error" work_started=true error_class="service_unavailable" timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=7715612 query_other_us=508 query_dsl_check_us=187 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=58 query_source_us=1191 query_hot_snapshot_us=116 query_emit_us=427 query_bind_us=9751 query_execute_us=7703374
+2026-10-18T09:04:16.545480805Z 2026-10-18T09:04:16.545414Z ERROR http_request{request_id="01M57423KGHDGWDG0Q5D2YW283" peer_addr=127.0.0.1:52784 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failed: engine error event_type="query_failed" error_type="engine" error_class="service_unavailable" user=i304 query_id=90 query_len=295 duration_ms=7715
+2026-10-18T09:04:16.545486375Z 2026-10-18T09:04:16.545443Z DEBUG http_request{request_id="01M57423KGHDGWDG0Q5D2YW283" peer_addr=127.0.0.1:52784 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failure detail (DEBUG-only: never stored under the default filter) event_type="query_error_text" query_id=90 error_class="service_unavailable" error=query could not complete with the available query resources; narrow the time range or simplify the query safe_error=query could not complete with the available query resources; narrow the time range or simplify the query
+2026-10-18T09:04:16.545537465Z 2026-10-18T09:04:16.545508Z  WARN trawl_server::transport::failure: request failed event_type="http_failure" request_id="01M57423KGHDGWDG0Q5D2YW283" method="POST" route="/api/v1/query" status=503 latency_ms=7729 stage="handler_error" error_class="service_unavailable" cause_kind="duckdb_resource_exhausted" query_id=90 key_id=1
+2026-10-18T09:04:37.158467929Z 2026-10-18T09:04:37.157846Z  INFO http_request{request_id="01M5742Z8RFGAFBKZG4MVRAMWP" peer_addr=127.0.0.1:49580 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=91 query_len=295 limit=100000 offset=0
+2026-10-18T09:04:49.531778477Z 2026-10-18T09:04:49.531559Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=91 kind="query" request_id="01M5742Z8RFGAFBKZG4MVRAMWP" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=12373637 query_other_us=828 query_dsl_check_us=195 query_pool_wait_us=1 query_publication_wait_us=0 query_startup_us=17 query_source_us=3859 query_hot_snapshot_us=122 query_emit_us=313 query_bind_us=13980 query_execute_us=12353220 query_post_us=1102
+2026-10-18T09:04:49.547333398Z 2026-10-18T09:04:49.546575Z  INFO http_request{request_id="01M5742Z8RFGAFBKZG4MVRAMWP" peer_addr=127.0.0.1:49580 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=91 query_len=295 total_rows=1 returned_rows=1 duration_ms=12373
+2026-10-18T09:05:09.924679125Z 2026-10-18T09:05:09.924622Z  INFO http_request{request_id="01M5743Z8ZAZCJF01FAJT3BYTF" peer_addr=127.0.0.1:38776 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=92 query_len=295 limit=100000 offset=0
+2026-10-18T09:05:19.497269878Z 2026-10-18T09:05:19.497219Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=92 kind="query" request_id="01M5743Z8ZAZCJF01FAJT3BYTF" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=9572532 query_other_us=389 query_dsl_check_us=186 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=60 query_source_us=826 query_hot_snapshot_us=126 query_emit_us=367 query_bind_us=20051 query_execute_us=9549673 query_post_us=854
+2026-10-18T09:05:19.519218800Z 2026-10-18T09:05:19.519179Z  INFO http_request{request_id="01M5743Z8ZAZCJF01FAJT3BYTF" peer_addr=127.0.0.1:38776 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=92 query_len=295 total_rows=1 returned_rows=1 duration_ms=9572
+2026-10-18T09:05:39.668869245Z 2026-10-18T09:05:39.668823Z  INFO http_request{request_id="01M5744WABSK8GXRWVDS4G044P" peer_addr=127.0.0.1:41228 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=93 query_len=295 limit=100000 offset=0
+2026-10-18T09:05:49.120660005Z 2026-10-18T09:05:49.120589Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=93 kind="query" request_id="01M5744WABSK8GXRWVDS4G044P" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=9451709 query_other_us=318 query_dsl_check_us=144 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=12 query_source_us=1037 query_hot_snapshot_us=152 query_emit_us=306 query_bind_us=17063 query_execute_us=9432097 query_post_us=580
+2026-10-18T09:05:49.128733772Z 2026-10-18T09:05:49.128688Z  INFO http_request{request_id="01M5744WABSK8GXRWVDS4G044P" peer_addr=127.0.0.1:41228 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=93 query_len=295 total_rows=1 returned_rows=1 duration_ms=9451
+2026-10-18T09:06:09.279096136Z 2026-10-18T09:06:09.279031Z  INFO http_request{request_id="01M5745S7H288RMW3WQJ5JJVKD" peer_addr=127.0.0.1:49782 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=94 query_len=295 limit=100000 offset=0
+2026-10-18T09:06:18.678886349Z 2026-10-18T09:06:18.678677Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=94 kind="query" request_id="01M5745S7H288RMW3WQJ5JJVKD" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=9399589 query_other_us=457 query_dsl_check_us=139 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=175 query_source_us=910 query_hot_snapshot_us=187 query_emit_us=397 query_bind_us=18399 query_execute_us=9378090 query_post_us=835
+2026-10-18T09:06:19.193970339Z 2026-10-18T09:06:19.192651Z  INFO http_request{request_id="01M5745S7H288RMW3WQJ5JJVKD" peer_addr=127.0.0.1:49782 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=94 query_len=295 total_rows=1 returned_rows=1 duration_ms=9399
+2026-10-18T09:06:39.874657261Z 2026-10-18T09:06:39.874582Z  INFO http_request{request_id="01M5746Q3WJ9VSE90M23W2F6CP" peer_addr=127.0.0.1:33434 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=95 query_len=295 limit=100000 offset=0
+2026-10-18T09:06:51.922370232Z 2026-10-18T09:06:51.922263Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=95 kind="query" request_id="01M5746Q3WJ9VSE90M23W2F6CP" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=12047599 query_other_us=404 query_dsl_check_us=191 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=16 query_source_us=1120 query_hot_snapshot_us=125 query_emit_us=479 query_bind_us=11148 query_execute_us=12033472 query_post_us=644
+2026-10-18T09:06:52.175043758Z 2026-10-18T09:06:52.174742Z  INFO http_request{request_id="01M5746Q3WJ9VSE90M23W2F6CP" peer_addr=127.0.0.1:33434 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=95 query_len=295 total_rows=1 returned_rows=1 duration_ms=12047
+2026-10-18T09:07:12.742730844Z 2026-10-18T09:07:12.742664Z  INFO http_request{request_id="01M5747Q70N0DBJ5VQ3RBA820R" peer_addr=127.0.0.1:42818 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=96 query_len=295 limit=100000 offset=0
+2026-10-18T09:07:21.848622615Z 2026-10-18T09:07:21.848483Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=96 kind="query" request_id="01M5747Q70N0DBJ5VQ3RBA820R" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=9105747 query_other_us=347 query_dsl_check_us=182 query_pool_wait_us=0 query_publication_wait_us=1 query_startup_us=85 query_source_us=1135 query_hot_snapshot_us=168 query_emit_us=303 query_bind_us=17571 query_execute_us=9085409 query_post_us=546
+2026-10-18T09:07:21.907209814Z 2026-10-18T09:07:21.907133Z  INFO http_request{request_id="01M5747Q70N0DBJ5VQ3RBA820R" peer_addr=127.0.0.1:42818 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=96 query_len=295 total_rows=1 returned_rows=1 duration_ms=9105
+
+## [2026-10-18T09:08:07.473Z] phase B: kubelet events
+FIRST                  LAST                   COUNT    TYPE      REASON              OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-after/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-after/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           postgres-5dbf87b8f6-svjxd   Successfully assigned i304-after/postgres-5dbf87b8f6-svjxd to trawl-i304-control-plane
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    ScalingReplicaSet   postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    SuccessfulCreate    postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-svjxd
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Pulled              postgres-5dbf87b8f6-svjxd   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Created             postgres-5dbf87b8f6-svjxd   Container created
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Started             postgres-5dbf87b8f6-svjxd   Container started
+2026-10-18T09:00:44Z   2026-10-18T09:00:45Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-svjxd   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-18T09:00:47Z   2026-10-18T09:00:49Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-svjxd   Readiness probe failed: /var/run/postgresql:5432 - rejecting connections
+
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-after/data-trawl-0"
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   2        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-18T09:00:54Z   2026-10-18T09:00:54Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-9f93f573-8e9d-4519-9481-275f83a5c5fc
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:02:09Z   2026-10-18T09:02:09Z   1        Normal    Killing                 trawl-0                     Stopping container trawld
+2026-10-18T09:02:09Z   2026-10-18T09:02:09Z   1        Normal    SuccessfulDelete        trawl                       Delete Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T09:00:51Z   2026-10-18T09:02:10Z   2        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+[2026-10-18T09:08:07.577Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE     IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-svjxd   1/1     Running   0          7m23s   10.244.0.93   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          5m57s   10.244.0.96   trawl-i304-control-plane   <none>           <none>
+[2026-10-18T09:08:07.669Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pod trawl-0 -o jsonpath=\{.metadata.uid\}\ \{.status.phase\}\ \{.status.reason\}\ \{.status.message\}\{\"\\n\"\}
+df57fbca-8925-4481-8e11-a30ce65a3843 Running  
+[2026-10-18T09:08:07.749Z] evicted=no
+[2026-10-18T09:08:07.752Z] stopping after phase B (STOP_AFTER=b); START_AT=c runs phase C
+
+## [2026-10-18T09:08:11.802Z] resume after at phase C (START_AT=c): image trawl-i304:after-7dc64b27f566, namespace i304-after
+[2026-10-18T09:08:11.807Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pod trawl-0 -o jsonpath=\{.spec.containers\[\?\(@.name==\"trawld\"\)\].image\}\{\"\\n\"\}
+trawl-i304:after-7dc64b27f566
+[2026-10-18T09:08:12.016Z] phase B result from the transcript: evicted=no
+
+## [2026-10-18T09:08:12.020Z] phase C, over budget: SPILL_BIG_QUERY up to 4 times, 5s apart, then SMALL_QUERY
+[2026-10-18T09:08:12.428Z] pod trawl-0 uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+[2026-10-18T09:08:13.133Z] trawl-0 uid before phase C: df57fbca-8925-4481-8e11-a30ce65a3843
+[2026-10-18T09:08:13.434Z] query scratch /var/lib/trawl/data.query-scratch present: yes
+[2026-10-18T09:08:26.057Z] SPILL_BIG_QUERY attempt 1 at 2026-10-18T09:08:13.445Z -> 503 12.566654 {"error":{"code":"query_resource_exhausted","message":"query could not complete with the available query resources; narrow the time range or simplify the query"}}
+[2026-10-18T09:08:45.303Z] SPILL_BIG_QUERY attempt 2 at 2026-10-18T09:08:31.796Z -> 503 13.475592 {"error":{"code":"query_resource_exhausted","message":"query could not complete with the available query resources; narrow the time range or simplify the query"}}
+[2026-10-18T09:09:05.620Z] SPILL_BIG_QUERY attempt 3 at 2026-10-18T09:08:52.578Z -> 503 13.025827 {"error":{"code":"query_resource_exhausted","message":"query could not complete with the available query resources; narrow the time range or simplify the query"}}
+[2026-10-18T09:09:21.371Z] SPILL_BIG_QUERY attempt 4 at 2026-10-18T09:09:10.890Z -> 503 10.454595 {"error":{"code":"query_resource_exhausted","message":"query could not complete with the available query resources; narrow the time range or simplify the query"}}
+[2026-10-18T09:09:22.230Z] SMALL_QUERY at 2026-10-18T09:09:22.096Z -> 200 0.107751 {"execution":{"started_at":"2026-10-18T09:09:22.134673104Z","duration_ms":65},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T09:09:22.235Z] attempts done (evicted=no); sampling 30 s more
+
+## [2026-10-18T09:09:52.820Z] phase C: trawld /tmp usage every 2 s (time, bytes, path)
+[2026-10-18T09:09:52.824Z] $ cat '$D/private/after/work/c/tmp.log'
+2026-10-18T09:08:13.138Z 0	/tmp
+2026-10-18T09:08:15.453Z 0	/tmp
+2026-10-18T09:08:17.888Z 0	/tmp
+2026-10-18T09:08:20.375Z 0	/tmp
+2026-10-18T09:08:23.103Z 0	/tmp
+2026-10-18T09:08:28.447Z 0	/tmp
+2026-10-18T09:08:30.948Z 0	/tmp
+2026-10-18T09:08:33.437Z 0	/tmp
+2026-10-18T09:08:35.982Z 0	/tmp
+2026-10-18T09:08:38.660Z 0	/tmp
+2026-10-18T09:08:41.264Z 0	/tmp
+2026-10-18T09:08:44.240Z 0	/tmp
+2026-10-18T09:08:46.814Z 0	/tmp
+2026-10-18T09:08:49.712Z 0	/tmp
+2026-10-18T09:08:55.758Z 0	/tmp
+2026-10-18T09:08:58.158Z 0	/tmp
+2026-10-18T09:09:00.550Z 0	/tmp
+2026-10-18T09:09:02.934Z 0	/tmp
+2026-10-18T09:09:05.253Z 0	/tmp
+2026-10-18T09:09:07.477Z 0	/tmp
+2026-10-18T09:09:09.742Z 0	/tmp
+2026-10-18T09:09:11.934Z 0	/tmp
+2026-10-18T09:09:14.350Z 0	/tmp
+2026-10-18T09:09:16.657Z 0	/tmp
+2026-10-18T09:09:18.960Z 0	/tmp
+2026-10-18T09:09:21.337Z 0	/tmp
+2026-10-18T09:09:24.014Z 0	/tmp
+2026-10-18T09:09:26.290Z 0	/tmp
+2026-10-18T09:09:28.564Z 0	/tmp
+2026-10-18T09:09:30.806Z 0	/tmp
+2026-10-18T09:09:33.057Z 0	/tmp
+2026-10-18T09:09:35.266Z 0	/tmp
+2026-10-18T09:09:37.513Z 0	/tmp
+2026-10-18T09:09:39.741Z 0	/tmp
+2026-10-18T09:09:41.997Z 0	/tmp
+2026-10-18T09:09:44.249Z 0	/tmp
+2026-10-18T09:09:46.486Z 0	/tmp
+2026-10-18T09:09:48.758Z 0	/tmp
+2026-10-18T09:09:50.950Z 0	/tmp
+
+## [2026-10-18T09:09:52.835Z] phase C: trawld query scratch usage every 2 s (time, bytes, path)
+[2026-10-18T09:09:52.840Z] $ cat '$D/private/after/work/c/scratch.log'
+2026-10-18T09:08:13.435Z 3234	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:15.882Z 500895194	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:18.342Z 1958219352	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:20.844Z 3308654228	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:23.385Z 3234	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:28.405Z 3234	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:30.949Z 3234	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:33.673Z 353905746	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:36.314Z 1122708622	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:38.787Z 2436148492	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:41.668Z 3470535948	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:44.262Z 3404082382	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:46.729Z 11036	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:49.696Z 9652	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:55.764Z 457647852	/var/lib/trawl/data.query-scratch
+2026-10-18T09:08:58.092Z 1263380264	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:00.547Z 2161485734	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:02.884Z 3138201510	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:05.175Z 1076242096	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:07.436Z 9652	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:09.710Z 9652	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:11.905Z 9650	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:14.246Z 1205380902	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:16.573Z 2336761764	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:18.933Z 3404638116	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:21.257Z 9650	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:24.014Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:26.289Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:28.595Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:30.837Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:33.120Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:35.377Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:37.607Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:39.783Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:42.067Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:44.359Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:46.580Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:48.789Z 11056	/var/lib/trawl/data.query-scratch
+2026-10-18T09:09:51.018Z 11056	/var/lib/trawl/data.query-scratch
+[2026-10-18T09:09:52.856Z] query scratch peak 3470535948 bytes; budget 4294967296 + block slack 1179648 = 4296146944; within: yes
+[2026-10-18T09:09:52.861Z] $ grep -E '^query_spill_max_bytes|^query_memory_limit|^query_threads' '$D/private/after/work/trawld.toml'
+query_spill_max_bytes = "4GiB"
+query_memory_limit = "2GiB"
+query_threads = 4
+
+## [2026-10-18T09:09:52.874Z] phase C: pod trawl-0 every 2 s
+[2026-10-18T09:09:52.876Z] $ cat '$D/private/after/work/c/pod.log'
+2026-10-18T09:08:13.438Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:15.908Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:18.210Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:20.528Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:23.142Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:27.562Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:29.824Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:32.092Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:34.479Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:36.886Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:40.512Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:42.827Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:45.045Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:48.338Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:50.623Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:55.278Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:57.516Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:08:59.701Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:02.173Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:04.335Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:06.473Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:08.582Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:10.732Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:12.894Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:15.054Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:17.244Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:19.383Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:21.584Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:23.888Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:26.033Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:28.215Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:30.372Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:32.634Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:34.811Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:36.967Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:39.137Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:41.291Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:43.475Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:45.658Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:47.816Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:49.940Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+2026-10-18T09:09:52.109Z uid=df57fbca-8925-4481-8e11-a30ce65a3843 phase=Running reason= ready=True restarts=0
+
+## [2026-10-18T09:09:52.885Z] phase C: GET /api/v1/health every second (time, HTTP status, body)
+[2026-10-18T09:09:52.890Z] $ cat '$D/private/after/work/c/health.log'
+2026-10-18T09:08:13.529Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:14.604Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:15.657Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:16.761Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:17.834Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:18.970Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:20.090Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","data_path":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:21.237Z 200 {"status":"ok","checks":{"corpus":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:22.616Z 200 {"status":"ok","checks":{"data_path":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:23.723Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","auth_db":"ok","corpus":"ok","ingest_capacity":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:24.747Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:25.875Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","corpus":"ok","ingest_capacity":"ok","auth_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:27.089Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","storage_db":"ok","data_path":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:28.137Z 200 {"status":"ok","checks":{"auth_db":"ok","corpus":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:29.260Z 200 {"status":"ok","checks":{"duckdb":"ok","ingest_capacity":"ok","storage_db":"ok","data_path":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:30.303Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","storage_db":"ok","corpus":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:31.409Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:32.534Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","duckdb":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:33.626Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","corpus":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:34.750Z 200 {"status":"ok","checks":{"corpus":"ok","ingest_capacity":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:35.866Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","duckdb":"ok","corpus":"ok","data_path":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:36.988Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:38.047Z 200 {"status":"ok","checks":{"auth_db":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:39.201Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:40.299Z 200 {"status":"ok","checks":{"corpus":"ok","ingest_capacity":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:41.368Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:42.417Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:43.524Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:44.809Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:45.898Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:46.957Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","auth_db":"ok","duckdb":"ok","corpus":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:48.003Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:49.062Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:50.102Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","corpus":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:51.161Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","auth_db":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:52.217Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:53.313Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:54.388Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","auth_db":"ok","data_path":"ok","storage_db":"ok","duckdb":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:55.421Z 200 {"status":"ok","checks":{"corpus":"ok","data_path":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:56.523Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:57.665Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:58.733Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:08:59.786Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","corpus":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:00.829Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:01.925Z 200 {"status":"ok","checks":{"auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:02.972Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","data_path":"ok","storage_db":"ok","duckdb":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:03.992Z 200 {"status":"ok","checks":{"storage_db":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok","data_path":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:05.012Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:06.040Z 200 {"status":"ok","checks":{"corpus":"ok","ingest_capacity":"ok","data_path":"ok","storage_db":"ok","auth_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:07.065Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:08.132Z 200 {"status":"ok","checks":{"duckdb":"ok","ingest_capacity":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:09.146Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","duckdb":"ok","corpus":"ok","auth_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:10.222Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:11.297Z 200 {"status":"ok","checks":{"storage_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:12.365Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","data_path":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:13.470Z 200 {"status":"ok","checks":{"storage_db":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:14.507Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","auth_db":"ok","data_path":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:15.534Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:16.629Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:17.721Z 200 {"status":"ok","checks":{"duckdb":"ok","corpus":"ok","ingest_capacity":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:18.795Z 200 {"status":"ok","checks":{"storage_db":"ok","auth_db":"ok","data_path":"ok","corpus":"ok","duckdb":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:19.871Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","data_path":"ok","auth_db":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:20.902Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","corpus":"ok","ingest_capacity":"ok","storage_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:21.932Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","duckdb":"ok","storage_db":"ok","corpus":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:23.008Z 200 {"status":"ok","checks":{"duckdb":"ok","ingest_capacity":"ok","auth_db":"ok","data_path":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:24.039Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","auth_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:25.073Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:26.154Z 200 {"status":"ok","checks":{"duckdb":"ok","data_path":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:27.183Z 200 {"status":"ok","checks":{"duckdb":"ok","auth_db":"ok","corpus":"ok","data_path":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:28.258Z 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:29.296Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:30.335Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok","corpus":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:31.422Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","storage_db":"ok","auth_db":"ok","corpus":"ok","data_path":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:32.462Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok","auth_db":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:33.493Z 200 {"status":"ok","checks":{"data_path":"ok","ingest_capacity":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:34.590Z 200 {"status":"ok","checks":{"corpus":"ok","duckdb":"ok","storage_db":"ok","data_path":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:35.635Z 200 {"status":"ok","checks":{"corpus":"ok","storage_db":"ok","data_path":"ok","auth_db":"ok","ingest_capacity":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:36.666Z 200 {"status":"ok","checks":{"duckdb":"ok","storage_db":"ok","auth_db":"ok","ingest_capacity":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:37.706Z 200 {"status":"ok","checks":{"auth_db":"ok","duckdb":"ok","ingest_capacity":"ok","storage_db":"ok","data_path":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:38.733Z 200 {"status":"ok","checks":{"storage_db":"ok","ingest_capacity":"ok","corpus":"ok","data_path":"ok","auth_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:39.804Z 200 {"status":"ok","checks":{"data_path":"ok","storage_db":"ok","ingest_capacity":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:40.839Z 200 {"status":"ok","checks":{"storage_db":"ok","duckdb":"ok","corpus":"ok","data_path":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:41.905Z 200 {"status":"ok","checks":{"auth_db":"ok","ingest_capacity":"ok","data_path":"ok","duckdb":"ok","storage_db":"ok","corpus":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:42.978Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","storage_db":"ok","auth_db":"ok","corpus":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:44.010Z 200 {"status":"ok","checks":{"corpus":"ok","data_path":"ok","duckdb":"ok","storage_db":"ok","ingest_capacity":"ok","auth_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:45.040Z 200 {"status":"ok","checks":{"ingest_capacity":"ok","auth_db":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:46.071Z 200 {"status":"ok","checks":{"auth_db":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:47.140Z 200 {"status":"ok","checks":{"duckdb":"ok","corpus":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:48.171Z 200 {"status":"ok","checks":{"data_path":"ok","auth_db":"ok","ingest_capacity":"ok","storage_db":"ok","corpus":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:49.200Z 200 {"status":"ok","checks":{"corpus":"ok","auth_db":"ok","data_path":"ok","ingest_capacity":"ok","duckdb":"ok","storage_db":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:50.274Z 200 {"status":"ok","checks":{"corpus":"ok","storage_db":"ok","auth_db":"ok","duckdb":"ok","data_path":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:51.336Z 200 {"status":"ok","checks":{"auth_db":"ok","data_path":"ok","ingest_capacity":"ok","corpus":"ok","storage_db":"ok","duckdb":"ok"},"version":"0.9.3"}
+2026-10-18T09:09:52.366Z 200 {"status":"ok","checks":{"data_path":"ok","corpus":"ok","duckdb":"ok","auth_db":"ok","storage_db":"ok","ingest_capacity":"ok"},"version":"0.9.3"}
+[2026-10-18T09:09:52.900Z] $ awk '{print $2}' '$D/private/after/work/c/health.log' | sort | uniq -c
+     93 200
+[2026-10-18T09:09:52.912Z] $ grep -c '"duckdb":"ok"' '$D/private/after/work/c/health.log' || true
+93
+
+## [2026-10-18T09:09:52.918Z] phase C: trawld log lines about the query, errors and shutdown
+[2026-10-18T09:09:52.921Z] $ grep -E 'query_start|query_complete|query_failed|query_error_text|query_timing|http_failure|ERROR|shutdown|signal' '$D/private/after/work/c/trawld.log' | grep -v 'route="/api/v1/health"' | cut -c1-600 | head -n 80
+2026-10-18T09:08:13.491265399Z 2026-10-18T09:08:13.491185Z  INFO http_request{request_id="01M5749JHDHHDQK5KRNV4M303E" peer_addr=127.0.0.1:57488 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=97 query_len=535 limit=100000 offset=0
+2026-10-18T09:08:26.041740536Z 2026-10-18T09:08:26.041561Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=97 kind="query" request_id="01M5749JHDHHDQK5KRNV4M303E" outcome="error" work_started=true error_class="service_unavailable" timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=12550289 query_other_us=2034 query_dsl_check_us=316 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=99 query_source_us=1292 query_hot_snapshot_us=137 query_emit_us=392 query_bind_us=17438 query_execute_us=12528581
+2026-10-18T09:08:26.041758736Z 2026-10-18T09:08:26.041693Z ERROR http_request{request_id="01M5749JHDHHDQK5KRNV4M303E" peer_addr=127.0.0.1:57488 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failed: engine error event_type="query_failed" error_type="engine" error_class="service_unavailable" user=i304 query_id=97 query_len=535 duration_ms=12550
+2026-10-18T09:08:26.041836225Z 2026-10-18T09:08:26.041815Z DEBUG http_request{request_id="01M5749JHDHHDQK5KRNV4M303E" peer_addr=127.0.0.1:57488 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failure detail (DEBUG-only: never stored under the default filter) event_type="query_error_text" query_id=97 error_class="service_unavailable" error=query could not complete with the available query resources; narrow the time range or simplify the query safe_error=query could not complete with the available query resources; narrow the time range or simplify the query
+2026-10-18T09:08:26.042297072Z 2026-10-18T09:08:26.042260Z  WARN trawl_server::transport::failure: request failed event_type="http_failure" request_id="01M5749JHDHHDQK5KRNV4M303E" method="POST" route="/api/v1/query" status=503 latency_ms=12556 stage="handler_error" error_class="service_unavailable" cause_kind="duckdb_resource_exhausted" query_id=97 key_id=1
+2026-10-18T09:08:31.844419570Z 2026-10-18T09:08:31.843700Z  INFO http_request{request_id="01M574A4EPMQRY9ZF5CJHWPRBV" peer_addr=127.0.0.1:41220 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=98 query_len=535 limit=100000 offset=0
+2026-10-18T09:08:45.196949968Z 2026-10-18T09:08:45.196564Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=98 kind="query" request_id="01M574A4EPMQRY9ZF5CJHWPRBV" outcome="error" work_started=true error_class="service_unavailable" timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=13352789 query_other_us=964 query_dsl_check_us=282 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=172 query_source_us=4334 query_hot_snapshot_us=184 query_emit_us=1039 query_bind_us=36127 query_execute_us=13309687
+2026-10-18T09:08:45.197085247Z 2026-10-18T09:08:45.196658Z ERROR http_request{request_id="01M574A4EPMQRY9ZF5CJHWPRBV" peer_addr=127.0.0.1:41220 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failed: engine error event_type="query_failed" error_type="engine" error_class="service_unavailable" user=i304 query_id=98 query_len=535 duration_ms=13352
+2026-10-18T09:08:45.197093607Z 2026-10-18T09:08:45.196682Z DEBUG http_request{request_id="01M574A4EPMQRY9ZF5CJHWPRBV" peer_addr=127.0.0.1:41220 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failure detail (DEBUG-only: never stored under the default filter) event_type="query_error_text" query_id=98 error_class="service_unavailable" error=query could not complete with the available query resources; narrow the time range or simplify the query safe_error=query could not complete with the available query resources; narrow the time range or simplify the query
+2026-10-18T09:08:45.197098277Z 2026-10-18T09:08:45.196740Z  WARN trawl_server::transport::failure: request failed event_type="http_failure" request_id="01M574A4EPMQRY9ZF5CJHWPRBV" method="POST" route="/api/v1/query" status=503 latency_ms=13366 stage="handler_error" error_class="service_unavailable" cause_kind="duckdb_resource_exhausted" query_id=98 key_id=1
+2026-10-18T09:08:53.212544120Z 2026-10-18T09:08:53.212426Z  INFO http_request{request_id="01M574ARQDZ5M155KS9M10CR11" peer_addr=127.0.0.1:42092 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=99 query_len=535 limit=100000 offset=0
+2026-10-18T09:09:05.609331948Z 2026-10-18T09:09:05.609030Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=99 kind="query" request_id="01M574ARQDZ5M155KS9M10CR11" outcome="error" work_started=true error_class="service_unavailable" timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=12396275 query_other_us=587 query_dsl_check_us=345 query_pool_wait_us=1 query_publication_wait_us=1 query_startup_us=20 query_source_us=4014 query_hot_snapshot_us=201 query_emit_us=1053 query_bind_us=72933 query_execute_us=12317120
+2026-10-18T09:09:05.609346478Z 2026-10-18T09:09:05.609101Z ERROR http_request{request_id="01M574ARQDZ5M155KS9M10CR11" peer_addr=127.0.0.1:42092 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failed: engine error event_type="query_failed" error_type="engine" error_class="service_unavailable" user=i304 query_id=99 query_len=535 duration_ms=12396
+2026-10-18T09:09:05.609356868Z 2026-10-18T09:09:05.609125Z DEBUG http_request{request_id="01M574ARQDZ5M155KS9M10CR11" peer_addr=127.0.0.1:42092 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failure detail (DEBUG-only: never stored under the default filter) event_type="query_error_text" query_id=99 error_class="service_unavailable" error=query could not complete with the available query resources; narrow the time range or simplify the query safe_error=query could not complete with the available query resources; narrow the time range or simplify the query
+2026-10-18T09:09:05.609365408Z 2026-10-18T09:09:05.609180Z  WARN trawl_server::transport::failure: request failed event_type="http_failure" request_id="01M574ARQDZ5M155KS9M10CR11" method="POST" route="/api/v1/query" status=503 latency_ms=13019 stage="handler_error" error_class="service_unavailable" cause_kind="duckdb_resource_exhausted" query_id=99 key_id=1
+2026-10-18T09:09:10.928565627Z 2026-10-18T09:09:10.928495Z  INFO http_request{request_id="01M574BAM29T712VD4YTQNHDGS" peer_addr=127.0.0.1:50072 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=100 query_len=535 limit=100000 offset=0
+2026-10-18T09:09:21.358018026Z 2026-10-18T09:09:21.357688Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=100 kind="query" request_id="01M574BAM29T712VD4YTQNHDGS" outcome="error" work_started=true error_class="service_unavailable" timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=10429116 query_other_us=676 query_dsl_check_us=297 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=14 query_source_us=1812 query_hot_snapshot_us=178 query_emit_us=750 query_bind_us=23442 query_execute_us=10401947
+2026-10-18T09:09:21.360282878Z 2026-10-18T09:09:21.357761Z ERROR http_request{request_id="01M574BAM29T712VD4YTQNHDGS" peer_addr=127.0.0.1:50072 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failed: engine error event_type="query_failed" error_type="engine" error_class="service_unavailable" user=i304 query_id=100 query_len=535 duration_ms=10429
+2026-10-18T09:09:21.360294858Z 2026-10-18T09:09:21.357785Z DEBUG http_request{request_id="01M574BAM29T712VD4YTQNHDGS" peer_addr=127.0.0.1:50072 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query failure detail (DEBUG-only: never stored under the default filter) event_type="query_error_text" query_id=100 error_class="service_unavailable" error=query could not complete with the available query resources; narrow the time range or simplify the query safe_error=query could not complete with the available query resources; narrow the time range or simplify the query
+2026-10-18T09:09:21.360302008Z 2026-10-18T09:09:21.357844Z  WARN trawl_server::transport::failure: request failed event_type="http_failure" request_id="01M574BAM29T712VD4YTQNHDGS" method="POST" route="/api/v1/query" status=503 latency_ms=10442 stage="handler_error" error_class="service_unavailable" cause_kind="duckdb_resource_exhausted" query_id=100 key_id=1
+2026-10-18T09:09:22.134834852Z 2026-10-18T09:09:22.134606Z  INFO http_request{request_id="01M574BNJ7X6TH5M4JDTVDKE5D" peer_addr=127.0.0.1:40780 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: executing query event_type="query_start" user=i304 roles=i304 query_id=101 query_len=28 limit=100000 offset=0
+2026-10-18T09:09:22.200616264Z 2026-10-18T09:09:22.200429Z  INFO trawl_server::query_timing: query timing event_type="query_timing" query_id=101 kind="query" request_id="01M574BNJ7X6TH5M4JDTVDKE5D" outcome="success" work_started=true timing_complete=true duckdb_attempts=1 fallback="none" query_observed_us=65753 query_other_us=273 query_dsl_check_us=56 query_pool_wait_us=0 query_publication_wait_us=0 query_startup_us=16 query_source_us=1000 query_hot_snapshot_us=221 query_emit_us=181 query_bind_us=31827 query_execute_us=32029 query_post_us=150
+2026-10-18T09:09:22.219782336Z 2026-10-18T09:09:22.219543Z  INFO http_request{request_id="01M574BNJ7X6TH5M4JDTVDKE5D" peer_addr=127.0.0.1:40780 method=POST path=/api/v1/query user_agent=curl/8.22.0}: trawl_server::handlers: query complete event_type="query_complete" user=i304 query_id=101 query_len=28 total_rows=1 returned_rows=1 duration_ms=65
+
+## [2026-10-18T09:09:52.935Z] phase C: the stored http_failure events (trawld's own telemetry, service=trawld)
+[2026-10-18T09:09:53.017Z] stored http_failure query -> 200 0.057356
+[2026-10-18T09:09:53.022Z] $ jq -c '.rows[]' '$D/private/after/work/c/failures.json'
+["2026-10-18 09:01:34.494483",503,"/api/v1/ingest","service_unavailable","hot_buffer_full","01M573XCVGTFC495AC0VSWYZYY"]
+["2026-10-18 09:04:16.545524",503,"/api/v1/query","service_unavailable","duckdb_resource_exhausted","01M57423KGHDGWDG0Q5D2YW283"]
+["2026-10-18 09:08:26.042341",503,"/api/v1/query","service_unavailable","duckdb_resource_exhausted","01M5749JHDHHDQK5KRNV4M303E"]
+["2026-10-18 09:08:45.196748",503,"/api/v1/query","service_unavailable","duckdb_resource_exhausted","01M574A4EPMQRY9ZF5CJHWPRBV"]
+["2026-10-18 09:09:05.609187",503,"/api/v1/query","service_unavailable","duckdb_resource_exhausted","01M574ARQDZ5M155KS9M10CR11"]
+["2026-10-18 09:09:21.357852",503,"/api/v1/query","service_unavailable","duckdb_resource_exhausted","01M574BAM29T712VD4YTQNHDGS"]
+
+## [2026-10-18T09:09:53.035Z] phase C: kubelet events
+FIRST                  LAST                   COUNT    TYPE      REASON              OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-after/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-after/trawl-0 to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           postgres-5dbf87b8f6-svjxd   Successfully assigned i304-after/postgres-5dbf87b8f6-svjxd to trawl-i304-control-plane
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    ScalingReplicaSet   postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    SuccessfulCreate    postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-svjxd
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Pulled              postgres-5dbf87b8f6-svjxd   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Created             postgres-5dbf87b8f6-svjxd   Container created
+2026-10-18T09:00:44Z   2026-10-18T09:00:44Z   1        Normal    Started             postgres-5dbf87b8f6-svjxd   Container started
+2026-10-18T09:00:44Z   2026-10-18T09:00:45Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-svjxd   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-18T09:00:47Z   2026-10-18T09:00:49Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-svjxd   Readiness probe failed: /var/run/postgresql:5432 - rejecting connections
+
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-after/data-trawl-0"
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   2        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-18T09:00:51Z   2026-10-18T09:00:51Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-18T09:00:54Z   2026-10-18T09:00:54Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-9f93f573-8e9d-4519-9481-275f83a5c5fc
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:00:56Z   2026-10-18T09:00:56Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:00:57Z   2026-10-18T09:00:57Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:02:09Z   2026-10-18T09:02:09Z   1        Normal    Killing                 trawl-0                     Stopping container trawld
+2026-10-18T09:02:09Z   2026-10-18T09:02:09Z   1        Normal    SuccessfulDelete        trawl                       Delete Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T09:00:51Z   2026-10-18T09:02:10Z   2        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:02:11Z   2026-10-18T09:02:11Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T09:02:12Z   2026-10-18T09:02:12Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+[2026-10-18T09:09:53.227Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE     IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-svjxd   1/1     Running   0          9m9s    10.244.0.93   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          7m43s   10.244.0.96   trawl-i304-control-plane   <none>           <none>
+[2026-10-18T09:09:53.382Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-after get pod trawl-0 -o jsonpath=\{.metadata.uid\}\ \{.status.phase\}\ \{.status.reason\}\ restarts=\{.status.containerStatuses\[\?\(@.name==\"trawld\"\)\].restartCount\}\ lastState=\{.status.containerStatuses\[\?\(@.name==\"trawld\"\)\].lastState\}\{\"\\n\"\}
+df57fbca-8925-4481-8e11-a30ce65a3843 Running  restarts=0 lastState={}
+[2026-10-18T09:09:53.524Z] phase C evicted=no
+
+## [2026-10-18T09:09:53.527Z] done after

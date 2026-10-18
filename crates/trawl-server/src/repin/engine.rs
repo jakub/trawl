@@ -33,6 +33,7 @@ use trawl_core::schema::CanonicalType;
 
 use crate::catalog::FieldCatalog;
 use crate::catalog::conform::open_bounded_connection;
+use crate::deadline::{Deadline, Expired};
 use crate::error::ServerError;
 use crate::ingest::compaction::RepinReading;
 use crate::pool::ExecutorPool;
@@ -314,6 +315,46 @@ pub enum StartOutcome {
     Cancelled(RepinJob),
 }
 
+/// What [`RepinEngine::start_within`] answered.
+#[derive(Debug)]
+pub enum BoundedStart {
+    /// The request reached its verdict within the bound.
+    Decided(StartOutcome),
+    /// The bound passed first. The row is the claimed job as the claim
+    /// wrote it, and the job carries on detached.
+    Running(RepinJob),
+}
+
+/// What a bounded request answers when its bound passed before any claim
+/// did. Fixed text: it names no lock, statement or duration.
+const UNCLAIMED_AT_BOUND: &str = "the repin request could not claim a job within [server] \
+                                  timeout_secs, so no repin runs from it; retry the repin";
+
+/// The row text of a job whose request was no longer waiting when the
+/// claim landed.
+const CLAIM_OUTLIVED_REQUEST: &str = "the request that claimed this job was answered or \
+                                      abandoned before the claim landed, so the job stopped \
+                                      before its scan and changed nothing; retry the repin";
+
+/// What a bounded request hands its pre-claim task.
+#[derive(Debug)]
+struct ClaimHandoff {
+    /// Hears the claimed row. A send that fails means nobody is waiting
+    /// for it: the request answered at its bound, or its caller went away.
+    claimed: tokio::sync::oneshot::Sender<RepinJob>,
+    /// The engine's request slot, held until the claim resolves.
+    slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// The bounded request's own result, with a join failure answered as one.
+fn decided(
+    joined: Result<Result<StartOutcome, ServerError>, tokio::task::JoinError>,
+) -> Result<BoundedStart, ServerError> {
+    joined
+        .map_err(|e| ServerError::from_join("repin request", e))?
+        .map(BoundedStart::Decided)
+}
+
 /// What the REQUEST stated, carried from `start` into the detached ladder.
 ///
 /// The ceilings here are the operator's numbers, not the job's: resolution
@@ -324,10 +365,11 @@ struct RequestTerms {
     force: bool,
     /// The ceilings the request stated, each dimension separately.
     ceilings: RequestedCeilings,
-    /// The requesting key's display name, as the claim recorded it. This is
-    /// the only actor identity that reaches the engine: the handler passes
-    /// `verified.name` and no key prefix, so the audit event names what the
-    /// job row names.
+    /// The requesting key's display name, as the claim recorded it. The
+    /// handler passes the whole [`crate::store::Requester`]; its key id is
+    /// written to the job row for the status read's owner check, and only
+    /// the name travels on from the claim, so the audit event names what
+    /// the job row names.
     requested_by: Option<String>,
 }
 
@@ -367,6 +409,11 @@ pub struct RepinEngine {
     /// The job generation each job's background half enters for its disk
     /// work (see [`Self::run_job`]); the capacity samples read it.
     jobs: Arc<JobGeneration>,
+    /// One permit, held by a bounded request from before its pre-claim
+    /// task is spawned until its claim resolves (see
+    /// [`Self::start_within`]). One is enough: only one job can run, so a
+    /// second claim in flight could only 409.
+    request_slot: Arc<tokio::sync::Semaphore>,
 }
 
 impl RepinEngine {
@@ -396,6 +443,7 @@ impl RepinEngine {
             min_free_disk_bytes,
             cancel: Arc::new(CancelRegistry::default()),
             jobs,
+            request_slot: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -419,7 +467,118 @@ impl RepinEngine {
         dry_run: bool,
         force: bool,
         requested: RequestedCeilings,
-        requested_by: Option<&str>,
+        caller: Option<&crate::store::Requester>,
+    ) -> Result<StartOutcome, ServerError> {
+        self.run_request(field, to, dialect, dry_run, force, requested, caller, None)
+            .await
+    }
+
+    /// [`Self::start`], answering within `bound` of this call.
+    ///
+    /// The scan is a full-corpus pass and can run for minutes, while
+    /// trawl-web gives every upstream call `[server] timeout_secs` plus 10 s
+    /// to send its response head (ADR-0054). One deadline, stamped on entry
+    /// (ADR-0024), covers everything the answer waits on: the request slot,
+    /// validation, the claim, the scan and the decision's own reads. A
+    /// decision reached by then answers exactly as [`Self::start`] does.
+    /// Past it:
+    ///
+    /// - A claimed job answers [`BoundedStart::Running`] with the row the
+    ///   claim wrote, and nothing more is read: a store slow enough to hold
+    ///   the decision past its bound would hold a read-back as well. The
+    ///   job carries on detached, and the caller follows it by id through
+    ///   `/schema/repin/status`, as it already does for a rewrite.
+    /// - A request with no claim yet answers 503 `service_unavailable`. Its
+    ///   claim may still land, but then it finds nobody waiting and ends
+    ///   the job `blocked` before any scan, so no repin runs from a request
+    ///   that was refused.
+    ///
+    /// The pre-claim work runs in its own task, so a dropped caller cannot
+    /// split a landed claim from the in-process half that arms and detaches
+    /// the job (see `run_request`). The task is spawned only once this call
+    /// holds the engine's single request slot, and it keeps the slot until
+    /// its claim resolves. Callers that time out or disconnect before their
+    /// claim therefore leave at most one such task between them, not one
+    /// each: the wait for the slot is the caller's own and ends with it.
+    #[allow(clippy::too_many_arguments)] // one flag bundle per request field
+    pub async fn start_within(
+        self: &Arc<Self>,
+        bound: Duration,
+        field: &str,
+        to: &str,
+        dialect: Option<&str>,
+        dry_run: bool,
+        force: bool,
+        requested: RequestedCeilings,
+        caller: Option<&crate::store::Requester>,
+    ) -> Result<BoundedStart, ServerError> {
+        let deadline = Deadline::after(bound);
+        let unclaimed = || ServerError::ServiceUnavailable(UNCLAIMED_AT_BOUND.to_owned());
+        let slot = match deadline
+            .run(Arc::clone(&self.request_slot).acquire_owned())
+            .await
+        {
+            Ok(Ok(slot)) => slot,
+            // The slot is never closed, so only the deadline ends this wait.
+            Ok(Err(_)) | Err(Expired) => return Err(unclaimed()),
+        };
+        let (claimed, mut claimed_rx) = tokio::sync::oneshot::channel();
+        let handoff = ClaimHandoff { claimed, slot };
+        let engine = Arc::clone(self);
+        let field = field.to_owned();
+        let to = to.to_owned();
+        let dialect = dialect.map(str::to_owned);
+        let caller = caller.cloned();
+        let mut request = tokio::spawn(async move {
+            engine
+                .run_request(
+                    &field,
+                    &to,
+                    dialect.as_deref(),
+                    dry_run,
+                    force,
+                    requested,
+                    caller.as_ref(),
+                    Some(handoff),
+                )
+                .await
+        });
+        if let Ok(joined) = deadline.run(&mut request).await {
+            return decided(joined);
+        }
+        // Past the bound, and nothing below waits. Closing the receiver
+        // settles the race with the claim: a claim that lands from here on
+        // finds it closed and abandons its job, and one that landed first
+        // is already in the channel.
+        claimed_rx.close();
+        let claimed = claimed_rx.try_recv().ok();
+        if request.is_finished() {
+            // Decided at the bound itself, so its own answer is already
+            // there to take.
+            return decided(request.await);
+        }
+        // Dropping `request` detaches it. Past a claim everything already
+        // runs detached and terminalizes the row itself; short of one, the
+        // task can only claim a job it then abandons (see `run_request`).
+        claimed.map(BoundedStart::Running).ok_or_else(unclaimed)
+    }
+
+    /// The request half of [`Self::start`]. `handoff`, from a bounded
+    /// request, hears the claimed row once the claim has landed and the
+    /// cancel registry is armed for it.
+    // Long because the panic arm's ordering is the point, and splitting it
+    // would move the registry settlement away from the writes it precedes.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_request(
+        self: &Arc<Self>,
+        field: &str,
+        to: &str,
+        dialect: Option<&str>,
+        dry_run: bool,
+        force: bool,
+        requested: RequestedCeilings,
+        caller: Option<&crate::store::Requester>,
+        handoff: Option<ClaimHandoff>,
     ) -> Result<StartOutcome, ServerError> {
         let field = field.to_ascii_lowercase();
         let to = parse_target(to)?;
@@ -450,9 +609,9 @@ impl RepinEngine {
         }
 
         // The one-running slot: a second request 409s here.
-        let job_id = self
+        let claimed = self
             .store
-            .claim(crate::store::RepinClaim {
+            .claim_job(crate::store::RepinClaim {
                 field: &field,
                 from_type: from,
                 to_type: to,
@@ -461,9 +620,10 @@ impl RepinEngine {
                 force,
                 max_nulled_rows,
                 max_ambiguous_rows,
-                requested_by,
+                requester: caller,
             })
             .await?;
+        let job_id = claimed.id;
         // Arm the cancel registry with no `await` between it and the claim
         // that created the job. Anything awaited here would be a window in
         // which the one-running slot is held by a job nothing can cancel:
@@ -481,6 +641,37 @@ impl RepinEngine {
         // that has no id yet, then reconciling it against a claim that may
         // fail — buys a correctness property nothing here needs.
         let cancel = self.cancel.arm(job_id);
+        if let Some(ClaimHandoff {
+            claimed: answer,
+            slot,
+        }) = handoff
+        {
+            // The claim has resolved, so the next request may make its own.
+            drop(slot);
+            if answer.send(claimed).is_err() {
+                // Nobody is waiting for this job: the request answered 503
+                // at its bound, or its caller went away, before the claim
+                // landed. Nobody can follow it either, so it ends here,
+                // short of the scan, as a pre-scan refusal does.
+                tracing::warn!(
+                    event_type = "repin_claim_unanswered",
+                    job_id,
+                    "the repin request was answered or abandoned before its \
+                     claim landed; the job ends blocked before its scan"
+                );
+                self.settle_pre_cutover(
+                    job_id,
+                    STAGE_SCAN,
+                    RepinJobStatus::Blocked,
+                    Some(CLAIM_OUTLIVED_REQUEST),
+                )
+                .await;
+                self.cancel.disarm(job_id);
+                return Err(ServerError::ServiceUnavailable(
+                    UNCLAIMED_AT_BOUND.to_owned(),
+                ));
+            }
+        }
 
         tracing::info!(
             event_type = "repin_start",
@@ -515,7 +706,7 @@ impl RepinEngine {
         let req = RequestTerms {
             force,
             ceilings: requested,
-            requested_by: requested_by.map(str::to_owned),
+            requested_by: caller.map(|r| r.name.clone()),
         };
         let decided = tokio::spawn(async move {
             engine

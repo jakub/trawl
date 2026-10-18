@@ -945,8 +945,8 @@ async fn query_timing_export_formats() {
     }
 }
 
-/// Live tail, the health probe's pool ping and field sampling are not
-/// DSL queries, and open no timing account.
+/// Live tail, the health check's engine sample read and field sampling
+/// are not DSL queries, and open no timing account.
 #[tokio::test(flavor = "multi_thread")]
 async fn non_dsl_work_emits_no_query_timing() {
     let (capture, _turn) = telemetry::timing().await;
@@ -984,7 +984,7 @@ async fn non_dsl_work_emits_no_query_timing() {
             .and_then(|c| c.get("duckdb"))
             .map(String::as_str),
         Some("ok"),
-        "the probe pinged the pool: {health:?}"
+        "the engine sample answered: {health:?}"
     );
 
     let sampled = raw
@@ -1004,7 +1004,7 @@ async fn non_dsl_work_emits_no_query_timing() {
 
     for (what, request_id) in [
         ("live tail", stream_id),
-        ("pool ping", health_id),
+        ("health", health_id),
         ("field sampling", sampled_id),
     ] {
         let events = capture.timing_of(&request_id);
@@ -2510,6 +2510,61 @@ async fn validate_query_unknown_function() {
     let resp = client.validate("* | stats unknown_func()").await.unwrap();
     assert!(!resp.valid);
     assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
+}
+
+/// On a query-only node, with no hot buffer to fall back to, a binder
+/// failure answers by its diagnostic's subtype (ADR-0056): a missing
+/// column is the unknown-field 400, and summing a text field is the 500
+/// whatever the field is called.
+///
+/// Changed on purpose from b02b8acf, where summing a text field whose name
+/// says "column" was the unknown-field 400: the fallback read `DuckDB`'s
+/// text form, whose statement line then said "column".
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binder_failure_on_a_query_only_node_answers_by_its_subtype() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = common::setup_in_dir_with_ingest(dir.path(), false).await;
+    assert!(server.state.query.hot_buffer.is_none());
+    let hour = dir.path().join("data/prod/2024-01-15/10");
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT TIMESTAMP '2024-01-15 10:00:03' AS _time, \
+                    TIMESTAMP '2024-01-15 10:00:13' AS _ingested, 'raw3' AS _raw, \
+                    NULL::VARCHAR AS _repairs, 'prod' AS env, 'odd' AS service, \
+                    'web02' AS host, 9::BIGINT AS severity, 'info' AS severity_text, \
+                    'odd one' AS message, 'c1' AS column_name) \
+             TO '{}' (FORMAT PARQUET)",
+            hour.join("odd.parquet").display()
+        ))
+        .unwrap();
+    let query = |dsl: &'static str| {
+        let request = common::harness_client_builder()
+            .build()
+            .unwrap()
+            .post(format!("{}/api/v1/query", server.url))
+            .bearer_auth(&server.analyst_token)
+            .json(&serde_json::json!({ "query": dsl }));
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            (status, response.json::<serde_json::Value>().await.unwrap())
+        }
+    };
+
+    let (status, body) = query("* | stats sum(nope)").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "validation_error", "{body}");
+    assert_eq!(
+        body["error"]["message"], "unsupported operation: unknown field: nope",
+        "{body}"
+    );
+
+    for dsl in ["* | stats sum(column_name)", "* | stats sum(host)"] {
+        let (status, body) = query(dsl).await;
+        assert_eq!(status, 500, "{dsl}: {body}");
+        assert_eq!(body["error"]["code"], "execution_error", "{dsl}: {body}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

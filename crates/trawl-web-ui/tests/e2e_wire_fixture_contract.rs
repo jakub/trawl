@@ -1729,6 +1729,8 @@ const QUERY_VALIDATION_NO_HINT: &str =
 const QUERY_EXECUTION_ERROR: &str = include_str!("../e2e/harness/wire/query-execution-error.json");
 const QUERY_CORPUS_RECOVERING: &str =
     include_str!("../e2e/harness/wire/query-corpus-recovering.json");
+const QUERY_RESOURCE_EXHAUSTED: &str =
+    include_str!("../e2e/harness/wire/query-resource-exhausted.json");
 
 /// `ErrorDetail` has no `PartialEq`; compare the wire form instead.
 fn json(details: &[trawl_api::ErrorDetail]) -> serde_json::Value {
@@ -1837,4 +1839,92 @@ fn the_corpus_recovering_fixture_is_the_restart_backlog_refusal() {
         "Search is unavailable while the server finishes loading data from before its restart."
     );
     assert!(body.error.details.is_empty());
+}
+
+/// The resource notice spec's body: the code, and the server's fixed
+/// sentence for an exhausted query budget (trawl-engine's
+/// `EngineError::ResourceExhausted`), with no details. The browser shows
+/// that sentence verbatim, so a fixture carrying other text would test
+/// copy the server never writes.
+#[test]
+fn the_query_resource_exhausted_fixture_is_the_budget_refusal() {
+    let body: trawl_api::ErrorResponse =
+        decode("query-resource-exhausted.json", QUERY_RESOURCE_EXHAUSTED);
+    assert_eq!(
+        body.error.code,
+        trawl_api::ErrorCode::QueryResourceExhausted
+    );
+    assert_eq!(
+        body.error.message,
+        "query could not complete with the available query resources; narrow the time range or \
+         simplify the query"
+    );
+    assert!(body.error.details.is_empty());
+}
+
+// ---- the live aggregate cap ------------------------------------------------
+
+const LIVE_SNAPSHOT_CAPPED: &str = include_str!("../e2e/harness/wire/live-snapshot-capped.json");
+
+/// The snapshot frame `live-aggregate-capped.spec.ts` broadcasts: the
+/// shape the SPA's snapshot listener reads, with nothing it does not.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveSnapshotFrame {
+    columns: Vec<String>,
+    rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    capped: Vec<trawl_api::stream::SnapshotCap>,
+}
+
+/// The frame reports the group cap with the limit trawl-core enforces,
+/// and trawl-core does report that cap once a new group arrives past it.
+/// The second half ties the fixture to its producer: a server that
+/// stopped marking the cap would leave the spec testing a frame trawld
+/// can no longer send.
+#[test]
+fn the_live_snapshot_capped_fixture_is_what_an_overflowing_stats_reports() {
+    use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+    use trawl_core::stream::{AggregationCap, StreamPlan, compile_stream_plan};
+
+    let frame: LiveSnapshotFrame = decode("live-snapshot-capped.json", LIVE_SNAPSHOT_CAPPED);
+    let limit = AggregationCap::Groups.limit();
+    assert_eq!(
+        frame.capped,
+        vec![SnapshotCap {
+            cap: SnapshotCapKind::Groups,
+            limit: u64::try_from(limit).unwrap(),
+        }]
+    );
+    assert_eq!(frame.columns, ["service", "count"]);
+    assert!(
+        frame
+            .rows
+            .iter()
+            .all(|row| row.keys().all(|key| frame.columns.contains(key))),
+        "every row key is a declared column"
+    );
+
+    let pipeline = trawl_core::parser::parse("* | stats count() by service")
+        .expect("dsl parses")
+        .pipeline;
+    let StreamPlan::Aggregate {
+        mut aggregation, ..
+    } = compile_stream_plan(
+        &pipeline,
+        &trawl_core::pin_scope::PinScope::unpinned(),
+        None,
+    )
+    .expect("plan compiles")
+    else {
+        panic!("stats compiles to an aggregate plan");
+    };
+    let ctx = trawl_core::context::EvalContext::capture();
+    for i in 0..=limit {
+        let event = serde_json::json!({ "service": format!("svc-{i}") });
+        aggregation.feed_event(
+            &trawl_core::row::from_json(event.as_object().unwrap()),
+            &ctx,
+        );
+    }
+    assert_eq!(aggregation.capped(), vec![AggregationCap::Groups]);
 }

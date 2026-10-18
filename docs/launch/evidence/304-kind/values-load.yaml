@@ -1,0 +1,9 @@
+# Layered over values.yaml while repro.sh loads the corpus, then dropped by a
+# helm upgrade back to values.yaml before either phase runs. In calibration
+# the before build could not load a corpus at scenario-like limits: at 2Gi its
+# compaction database (memory_limit=2GB by default) was OOM-killed, and with
+# 2 CPUs ingest ran at about 1 MB/s. The load pod gets room for both.
+resources:
+  limits:
+    cpu: "16"
+    memory: 6Gi

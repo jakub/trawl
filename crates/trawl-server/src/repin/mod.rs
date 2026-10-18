@@ -50,7 +50,7 @@ pub use cancel::{
     CANCEL_LATENCY_CONTRACT, CancelActor, CancelDecision, CancelHandle, CancelRegistry,
     CancelVerdict, Settlement,
 };
-pub use engine::{RepinEngine, StartOutcome};
+pub use engine::{BoundedStart, RepinEngine, StartOutcome};
 pub use gate::{RepinCoordinator, RollupPause};
 pub use jobs::{JobGeneration, JobReading};
 pub use marker::{

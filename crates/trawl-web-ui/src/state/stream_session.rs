@@ -8,7 +8,8 @@
 //!
 //! The server emits three distinct SSE event names:
 //! - `data`  → JSON object for one log event
-//! - `snapshot` → `{columns: [...], rows: [{...}, ...]}` aggregation result
+//! - `snapshot` → `{columns: [...], rows: [{...}, ...], capped?: [...]}`
+//!   aggregation result, with the caps that dropped input (ADR-0001)
 //! - `lagged` → `{missed: N}` back-pressure notification
 //!
 //! `EventSource` auto-reconnects on network blips (cookie rides along).
@@ -20,6 +21,7 @@ use std::rc::Rc;
 
 use leptos::prelude::*;
 use serde::Deserialize;
+use trawl_api::stream::SnapshotCap;
 use trawl_api::value::{Column, QueryResult, Value};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -109,6 +111,12 @@ pub struct LiveSignals {
     pub frames: Option<RwSignal<u64>>,
     /// Records that this stream opened. Callers that never ask may omit it.
     pub opened: Option<OpenedMark>,
+    /// The caps the latest accepted snapshot reported as having dropped
+    /// input (ADR-0001). Set on every accepted snapshot and on nothing
+    /// else: a connection error or a lag notice says nothing about the
+    /// aggregation, so neither clears it. The caller clears it when it
+    /// starts a stream. Callers without a notice may omit it.
+    pub capped: Option<RwSignal<Vec<SnapshotCap>>>,
 }
 
 /// Open an SSE stream for the given query, wiring its three event types
@@ -244,6 +252,7 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
         failure,
         frames,
         opened,
+        capped,
         ..
     } = signals;
     Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
@@ -286,6 +295,14 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
         if let Some(frames) = frames {
             frames.update(|n| *n = n.wrapping_add(1));
         }
+        // Every snapshot restates the stream's whole report, so the latest
+        // one replaces it. Untracked compare, and a write only when it
+        // changes: a capped stream repeats the same report every frame.
+        if let Some(capped) = capped
+            && capped.with_untracked(|current| *current != wire.capped)
+        {
+            capped.set(wire.capped.clone());
+        }
         // Rehydrate rows in declared column order. Missing keys land as
         // Null (consistent with how the server materializes sparse rows).
         let rows: Vec<Vec<Value>> = wire
@@ -314,6 +331,9 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
 struct SnapshotWire {
     columns: Vec<String>,
     rows: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// Omitted by the server while nothing has been dropped.
+    #[serde(default)]
+    capped: Vec<SnapshotCap>,
 }
 
 #[derive(Deserialize)]

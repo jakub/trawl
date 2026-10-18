@@ -24,6 +24,16 @@ WorkingDirectory=/var/lib/trawl
 Restart=on-failure
 RestartSec=5s
 
+# Resource ceilings (ADR-0056), the chart's limits. Worst-case resident memory
+# at the defaults is about 6.1-6.6 GiB: the query database 2 GiB, two
+# maintenance databases at 1 GiB, in-flight ingest bodies, argon2, the hot
+# buffer and unaccounted RSS. MemoryMax is a ceiling, not a reservation: on a
+# host with less RAM, the host runs out before the unit does. LimitNOFILE sets
+# the hard descriptor limit; trawld raises its soft limit to it at startup and
+# logs both.
+LimitNOFILE=65536
+MemoryMax=8G
+
 # Sandboxing
 ProtectSystem=strict
 ProtectHome=true

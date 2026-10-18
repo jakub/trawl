@@ -2,5 +2,5 @@
 source: crates/trawl-core/src/emitter/mod.rs
 expression: "emit_dsl(\"* | drop message\")"
 ---
-SELECT * EXCLUDE ("message")
+SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz') NOT IN ('message'))
 FROM read_parquet('/data/**/*.parquet', union_by_name=true)

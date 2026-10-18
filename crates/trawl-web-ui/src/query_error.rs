@@ -716,6 +716,12 @@ mod tests {
                           before its restart."
                     .to_owned(),
             },
+            ApiError::ResourceExhausted {
+                status: 503,
+                message: "query could not complete with the available query resources; narrow \
+                          the time range or simplify the query"
+                    .to_owned(),
+            },
         ] {
             assert_eq!(refusal_notice(&error, SAMPLE), None, "{error}");
         }

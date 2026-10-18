@@ -39,7 +39,7 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 | `query_cancel` | Cancel the key's own running queries |
 | `server_manage` | Read server stats and the dashboard, [preview ingest](#preview-ingest), cancel any query, and see the text of system-owned retained work |
 | `ingest` | Submit events to `/api/v1/ingest` |
-| `schema_write` | Repin a field, reclaim pins, and acknowledge degraded pins |
+| `schema_write` | Repin a field, read a repin job the key requested by its id, reclaim pins, and acknowledge degraded pins |
 
 `schema_read` exposes samples of event values in conflict evidence: up to 5 values per conflict row, each cut to 256 bytes.
 
@@ -71,11 +71,11 @@ Every error that trawld itself produces has this body:
 |------|--------|---------|
 | `parse_error` | 400 | The DSL does not parse |
 | `validation_error` | 400 | The DSL parses but fails semantic checks: unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
-| `result_too_large` | 400 | The result exceeded `max_result_rows` |
+| `result_too_large` | 400 | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at a cap. The message names the cap and its limit. See [stream live events](#stream-live-events) for the caps |
 | `bad_request` | 400 | Malformed input. Also the code on every 409, which has no code of its own. |
 | `ingest_error` | 400, 413 | An ingest body that cannot be read. 413 when a gzip body decodes past `[ingest] max_body_bytes` |
 | `ingest_batch_too_large` | 413 | An ingest request holds more events or bytes than external producers may place in the hot buffer, so it can never be admitted |
-| `request_too_large` | 413 | A request body exceeds the router's body limit, `[server] max_request_body_bytes` or `[ingest] max_body_bytes`. The message names the setting and its value. See [body size limits](#body-size-limits) |
+| `request_too_large` | 413 | A request body exceeds the router's body limit, `[server] max_request_body_bytes` or `[ingest] max_body_bytes`. The message names the setting and its value. See [body size limits](#body-size-limits). Through trawl-web, also the proxy's own refusal of a body over `[server] max_request_body_bytes`, over the proxy body budget of 128 MiB when that setting is above it, or, under `/api/auth/*`, over the login body limit of 16 KiB, before trawld is contacted. The message names the limit in the same words |
 | `preview_too_large` | 413 | An ingest preview sample holds more than 500 events |
 | `unsupported_encoding` | 415 | An ingest preview body carries a `Content-Encoding` other than `identity` |
 | `auth_error` | 401 | Authentication failed |
@@ -83,13 +83,15 @@ Every error that trawld itself produces has this body:
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
 | `rate_limited` | 429 | The key's per-minute bucket is empty |
 | `too_many_streams` | 429 | `max_sse_connections` reached |
-| `execution_error` | 500 | DuckDB failed or the query was cancelled. Details are logged, never returned. |
+| `execution_error` | 500 | DuckDB failed for a reason other than its resource budgets, or the query was cancelled. Details are logged, never returned. |
 | `internal_error` | 500 | Anything else |
-| `timeout` | 504 | The query started but did not finish within `timeout_secs` |
+| `timeout` | 504 | The query started but did not finish within `timeout_secs`. Through trawl-web, also the proxy's own 504 when trawld's response head did not arrive within `timeout_secs` plus 10 s; the message says trawld may still be running the work. Open streams and bodies in flight are never cut |
+| `timeout` | 408 | trawl-web only: the request body did not arrive whole within 30 s. The request was not sent to trawld |
 | `service_unavailable` | 503 | A dependency is down, the server is at capacity, or the node cannot serve the route |
 | `hot_buffer_full` | 503 | The hot buffer has no room for an ingest request. Sent with `Retry-After` |
-| `request_limit_reached` | 503 | trawld is at its `[server] max_concurrent_requests` limit, or a health or `/metrics` request is at the probe allowance (fixed at 3), or a query list or cancel request is at the control allowance (fixed at 4). The handler did not run and nothing was ingested. No `Retry-After`. Retry with backoff. See [the request limit](/reference/configuration/#the-request-limit) |
+| `request_limit_reached` | 503 | trawld is at its `[server] max_concurrent_requests` limit, or a health or `/metrics` request is at the probe allowance (fixed at 3), or a query list or cancel request is at the control allowance (fixed at 4). The handler did not run and nothing was ingested. No `Retry-After`. Retry with backoff. See [the request limit](/reference/configuration/#the-request-limit). Through trawl-web, also the proxy's own refusal when it is at its request count (fixed at 64, `/healthz` excepted) or when its budget for buffered request bodies (fixed at 128 MiB) cannot cover the request's declared body; the message names trawl-web as the hop and the request was not sent to trawld |
 | `corpus_recovering` | 503 | The server cannot yet count every stored event exactly once, so it refuses the read. No `Retry-After`. See [corpus recovering](#corpus-recovering) |
+| `query_resource_exhausted` | 503 | The query needed more spill or memory than the query database may use. No `Retry-After`. See [query resource exhausted](#query-resource-exhausted) |
 
 #### Corpus recovering
 
@@ -105,6 +107,23 @@ When both reasons hold, the response names `rollup_pending`. The reason is the `
 A body over the size limit is refused before a handler runs, with 413 and the envelope, code `request_too_large`. Three other refusals come from the HTTP framework before a handler runs, with an empty or plain-text body instead of the envelope: 415 when a JSON route receives no `Content-Type: application/json`, 400 when the body is not valid JSON, and 422 when the JSON does not match the request shape.
 
 Every response carries an `X-Request-Id` header holding a ULID. Quote it when reporting a problem.
+
+#### Query resource exhausted
+
+A query, export, or field sample answers 503 `query_resource_exhausted` when it needs more spill or memory than the query database may use: more than `[server] query_spill_max_bytes` of spill, or more than `[server] query_memory_limit` of memory. DuckDB reports both limits with one error type, so the response does not say which one ran out. The body is fixed:
+
+```json
+{
+  "error": {
+    "code": "query_resource_exhausted",
+    "message": "query could not complete with the available query resources; narrow the time range or simplify the query"
+  }
+}
+```
+
+The message names no path, size, or DuckDB text. The response carries no `Retry-After`. The status is 503, not 500, because nothing is broken, and not a 4xx, because every query shares the budgets: the same query can finish on an idle server and fail beside a heavy one. Narrow the time range, add a filter, or drop a wide `stats ... by` before you retry. The server keeps serving, and a small query on the same server succeeds.
+
+The `http_failure` event records `error_class=service_unavailable` and `cause_kind=duckdb_resource_exhausted`. A query that timed out first keeps its 504 `timeout`, even when DuckDB then fails with the same error. The rule covers planning, execution, row fetch, and export. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets) for the settings and [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query) for the operator steps.
 
 ### Rate limiting
 
@@ -150,7 +169,7 @@ trawld sends CORS headers only when `[server] cors_allowed_origins` is not empty
 
 Permission: none. The route is unauthenticated.
 
-Probes DuckDB, the Fleet keystore, the app-state store, and the data directory.
+Reports the query engine's latest sample, and probes the Fleet keystore, the app-state store, and the data directory. The `duckdb` check reads a sample that trawld takes on its own schedule, so a health request never waits for the engine and never takes an executor permit.
 
 **Request**
 
@@ -170,11 +189,21 @@ curl --fail-with-body "$TRAWL_URL/api/v1/health"
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `status` | string | `ok` when every check passes. `degraded` when `auth_db`, `storage_db`, or `data_path` reads `error`, `ingest_capacity` reads `refusing`, or `corpus` reads anything but `ok`. `unavailable` when `duckdb` fails. |
-| `checks` | object | Exactly six keys. `duckdb`, `auth_db`, `storage_db`, and `data_path` are each `ok` or `error`. `ingest_capacity` is `ok` or `refusing`. `corpus` is `ok`, `rollup_pending`, or `restart_backlog`. No diagnostics or paths. |
+| `status` | string | `ok` when every check passes. `degraded` when `duckdb` reads `slow`, `auth_db`, `storage_db`, or `data_path` reads `error`, `ingest_capacity` reads `refusing`, or `corpus` reads anything but `ok`. `unavailable` when `duckdb` reads `error`. |
+| `checks` | object | Exactly six keys. `duckdb` is `ok`, `slow`, or `error`. `auth_db`, `storage_db`, and `data_path` are each `ok` or `error`. `ingest_capacity` is `ok` or `refusing`. `corpus` is `ok`, `rollup_pending`, or `restart_backlog`. No diagnostics or paths. |
 | `version` | string | The trawld package version |
 
 `degraded` does not prove that authenticated requests can run. An `auth_db` failure turns every authenticated route into a 503.
+
+`duckdb` reads the latest engine sample. Every 10 seconds, a dedicated thread runs `SELECT 1` on a connection of its own to the query database, with a 250 ms budget. A sample that runs past the budget is interrupted, and no new sample starts until it returns.
+
+| `duckdb` | Meaning | `status` | HTTP |
+|----------|---------|----------|------|
+| `ok` | The latest sample succeeded within its budget | `ok` unless another check differs | 200 |
+| `slow` | The latest sample ran past its budget or failed with `Out of Memory`, and a sample succeeded in the last 60 seconds | `degraded` | 200 |
+| `error` | The latest sample returned any other DuckDB error, no sample has succeeded in the last 60 seconds, or none has succeeded since boot | `unavailable` | 503 |
+
+A busy engine does not turn the check to `error` while a sample has succeeded in the last 60 seconds. A full executor pool, permits held after a timeout, and live streams do not change `duckdb` or `status`, because the sample uses no permit. The sample shares the query memory and spill budgets, so queries that exhaust them can make it read `slow`. Read saturation from `trawl_query_permits_in_use` and `trawl_query_pool_size` on [`/metrics`](#prometheus-metrics). The response adds no sample age or diagnostics; `trawl_engine_sample_age_seconds` reports the age.
 
 `ingest_capacity` reads `refusing` while the hot buffer refuses ingest for lack of space, and `ok` otherwise, including on a node with ingest disabled. Reads keep working while it refuses, so the response stays 200 and probes do not restart the server. See [hot-buffer admission](/architecture/data-flow/#hot-buffer-admission).
 
@@ -247,10 +276,11 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
 | 400 | `bad_request` | `timezone` is not `UTC`, `local`, or a fixed offset, or `offset + limit` exceeds `max_result_rows` |
-| 400 | `result_too_large` | The result exceeded `max_result_rows` |
+| 400 | `result_too_large` | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
 | 404 | `not_found` | A `from saved` stage names a saved query the key does not own, or one with no successful run |
 | 409 | `bad_request` | A `from saved` stage selects a run that has rows but no Parquet file. The message names the run route. |
 | 500 | `execution_error` | DuckDB failed or the query was cancelled |
+| 503 | `query_resource_exhausted` | The query went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the query started, or a cold file moved during the read. Retry. |
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
@@ -342,9 +372,10 @@ The body is the file. The headers name its type:
 |--------|------|------|
 | 400 | `parse_error` | The DSL does not parse |
 | 400 | `validation_error` | Semantic check failed |
-| 400 | `result_too_large` | An `extract kv` pipeline read more than `max_export_rows` input rows |
+| 400 | `result_too_large` | An `extract kv` pipeline read more than `max_export_rows` input rows, or its aggregation would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
 | 400 | none | `format` is not `csv`, `json`, or `parquet`. Plain-text body from the framework. |
 | 500 | `execution_error` | DuckDB failed |
+| 503 | `query_resource_exhausted` | The export went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the export started |
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
@@ -386,8 +417,31 @@ data: {"missed": 40}
 | Event | Data | When |
 |-------|------|------|
 | `data` | One row object | Each matching event, for a pipeline with no aggregation |
-| `snapshot` | `{"columns": [...], "rows": [...]}` | For an aggregating pipeline, every 500 ms or every 100 matching events, whichever comes first, and only when new events arrived |
+| `snapshot` | `{"columns": [...], "rows": [...], "capped": [...]}` | For an aggregating pipeline, every 500 ms or every 100 matching events, whichever comes first, and only when new events arrived. `capped` is present only when the aggregation dropped input. |
 | `lagged` | `{"missed": n}` | The subscriber fell behind the event bus and `n` ingest batches were skipped. A batch holds one or more events, so the number of missed events is unknown. |
+
+Each `snapshot` replaces the whole result. A live aggregation stops taking
+input at three caps, and a snapshot's `capped` lists each cap that dropped
+input since the stream started, with its limit:
+
+```json
+{"columns":["host","count"],"rows":[{"host":"web-01","count":12}],"capped":[{"cap":"groups","limit":10000}]}
+```
+
+| `cap` | Limit | Input it drops |
+|-------|-------|----------------|
+| `groups` | 10,000 | A new group when the aggregation already holds the limit. A `timechart` counts groups per bucket. |
+| `distinct_values` | 10,000 | An unseen value for a `dc()` or `values()` that already holds the limit in one group |
+| `exact_values` | 100,000 | A number for a `median` or percentile that already holds the limit in one group |
+
+Reaching a cap exactly drops nothing, so `capped` stays absent. Once a cap
+drops input, every later snapshot of the stream reports it, because the
+dropped input does not come back. A new stream starts with nothing dropped.
+`top`, `rare` and the number of `timechart` buckets have no cap. The batch
+lane runs the same aggregation for an `extract kv` pipeline and has no field
+to report a partial answer, so it refuses an aggregation that would drop
+input with `400 result_too_large` and a message that names the cap and its
+limit.
 
 The stream closes when the pipeline finishes, for example after `| limit 10`.
 
@@ -947,6 +1001,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" \
 |--------|------|------|
 | 400 | `bad_request` | `service` contains a character outside the allowed set |
 | 500 | `execution_error` | DuckDB failed |
+| 503 | `query_resource_exhausted` | The sample went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the sample started |
 | 503 | `corpus_recovering` | The corpus is unsettled and the values are not cached. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the sample started |
@@ -1032,7 +1087,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -X DELETE \
 
 Permission: `schema_write`
 
-Changes one field's pinned type across the stored corpus, resurrecting shelved values from `_raw` where the new type can read them. One job runs at a time, install-wide. The request stays open for the scan, and disconnecting does not cancel the job. Ingest keeps running during the rewrite, so a job that started with 202 can still end `refused_needs_force` when the finished rewrite exceeds what the request accepted. See [repin a field](/operate/catalog/#repin-a-field) and [recover a lost response](/operate/catalog/#recover-a-lost-response).
+Changes one field's pinned type across the stored corpus, resurrecting shelved values from `_raw` where the new type can read them. One job runs at a time, install-wide. trawld answers within `[server] timeout_secs` of the moment the handler starts the repin, a bound that covers waiting behind another repin request that has not yet claimed its job, the claim, and the rest of the decision: the wait for the corpus gate, the scan, the field-liveness read, the plan write, the pre-flight and the job read. The bound starts after authentication and after the JSON body is read. Authentication, including the update of the key's `last_used` row, and reading the body lie outside it. A job claimed whose decision is still pending at that bound answers 202 with the job as the claim wrote it, dry runs included, and the plan, refusal or outcome is then read from [repin status](#repin-status) by the job's `id`. A request whose claim has not landed by that bound answers 503 `service_unavailable` and starts nothing: a claim that lands later ends `blocked` before its scan, with the corpus unchanged. Disconnecting does not cancel a claimed job. Ingest keeps running during the rewrite, so a job that started with 202 can still end `refused_needs_force` when the finished rewrite exceeds what the request accepted. See [repin a field](/operate/catalog/#repin-a-field) and [recover a lost response](/operate/catalog/#recover-a-lost-response).
 
 **Parameters**
 
@@ -1088,25 +1143,33 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | Status | Code | When |
 |--------|------|------|
 | 200 | none | A dry run, or a job cancelled while the request was still scanning. Read `job.status`. |
-| 202 | none | The rewrite started. Poll [repin status](#repin-status). |
+| 202 | none | The scan and preflight decided within `[server] timeout_secs` and the rewrite started. The body is the job with its recorded plan: the scan counts and `requires_force`. Follow the rewrite through [repin status](#repin-status) with its `id`. |
+| 202 | none | The claimed job's decision was still pending at `[server] timeout_secs`. The decision waits on the corpus gate, the scan, the field-liveness read, the plan write and the job read, and any of them can outlast the bound; the scan is the usual cause. The body is the job as the claim wrote it, so it carries no plan, though the plan may already be recorded when you read it. Read [repin status](#repin-status) with its `id` for the plan, the refusal or the outcome. |
 | 409 | none | The body is a job with status `refused_needs_force`: the scan found values the new type cannot read, or ambiguous numerals under the `otel` reading, and `force` was not set, or the finished rewrite exceeded an accepted ceiling. `requires_force_reason` names which. |
 | 409 | `bad_request` | A repin job is already running |
 | 400 | `bad_request` | `field` is an envelope field or not pinned, `to` is not a catalog type, `to` equals the current pin without `force`, `dialect` is unknown or given with a target other than `SEVERITY`, a ceiling is given without `force`, the pin changed between lookup and claim, the staging directory is on a different filesystem from the data root, or free disk is below the affected bytes plus the retention floor |
-| 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, or the job could not claim the corpus before its scan and ended `blocked` |
+| 503 | `service_unavailable` | This node has ingest disabled and does not own the data root, the job could not claim the corpus before its scan and ended `blocked`, or no job was claimed within `[server] timeout_secs`. In the last case nothing runs from the request, and it can be retried. |
 | 503 | `corpus_recovering` | The corpus is unsettled. The job ends `blocked`, and its `error` names the reason. See [corpus recovering](#corpus-recovering). |
 
 ### Repin status
 
 `GET /api/v1/schema/repin/status`
 
-Permission: `schema_read`
+Permission: `schema_read`. With `id`, `schema_read` for any job, or `schema_write` for a job the key requested.
 
-Returns the running job, or else the newest job of any status. There is no lookup by job id, and a newer job hides an older one. Served on every node, including those with ingest disabled.
+Returns the running job, or else the newest job of any status, so a newer job hides an older one. With `id`, returns that job whatever has run since. A caller follows a [repin](#repin-a-field) that answered 202 this way, and the key that started the job needs no more than the `schema_write` the repin required. A key that holds `schema_write` without `schema_read` reads only the jobs it requested. Every other `id` answers the same 404 response as an `id` no job has. Job ids are sequential, so the existence of an id is not a secret. The rule protects the contents of the job rows, which carry event value samples and name other operators. Served on every node, including those with ingest disabled.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | query | integer | no | A job id, as a repin answered it |
 
 **Request**
 
 ```bash
 curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/schema/repin/status"
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/schema/repin/status?id=7"
 ```
 
 **Response**
@@ -1115,12 +1178,15 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/schema/re
 { "job": { "id": 7, "field": "status", "status": "running", "files_total": 12, "files_done": 4 } }
 ```
 
-`job` is `null` when no repin has ever run. The job shape is the one [repin a field](#repin-a-field) returns.
+Without `id`, `job` is `null` when no repin has ever run. The job shape is the one [repin a field](#repin-a-field) returns.
 
 **Errors**
 
 | Status | Code | When |
 |--------|------|------|
+| 400 | `bad_request` | `id` is not an integer |
+| 403 | `forbidden` | Without `id`, the key lacks `schema_read`. With `id`, it lacks both `schema_read` and `schema_write`. |
+| 404 | `not_found` | No job has that `id`, or the key holds `schema_write` without `schema_read` and did not request the job |
 | 503 | `service_unavailable` | The app-state store did not answer |
 
 ### Cancel a running repin
@@ -1247,7 +1313,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/queries"
 | `active[].role` | string | The key's role names, sorted and comma-joined. `none` when the key holds no roles. |
 | `recent` | array | Most recent first. At most `[server] max_query_history` (`1000`) entries are kept. |
 | `retained` | array | Work that still holds a pool permit after its request answered. Disjoint from `active`. |
-| `retained[].kind` | string | `query`, `from_saved`, `export`, `scheduled`, `ping`, or `sample` |
+| `retained[].kind` | string | `query`, `from_saved`, `export`, `scheduled`, or `sample` |
 | `retained[].started` | boolean | Whether the work passed its start transition |
 | `retained[].user`, `retained[].query` | string | Present for key-submitted work. For system work, present only for a reader with `server_manage`. |
 
@@ -2178,7 +2244,7 @@ read them.
 
 | Series | Type | Measurement |
 | --- | --- | --- |
-| `trawl_disk_total_bytes{role}` | gauge | Total bytes of each filesystem trawld writes to. `role` is `data`, `wal`, or `spill` |
+| `trawl_disk_total_bytes{role}` | gauge | Total bytes of each filesystem trawld writes to. `role` is `data`, `wal`, or `spill`. `spill` is the filesystem of `[server] query_scratch_dir` |
 | `trawl_disk_available_bytes{role}` | gauge | Bytes available to trawld on each filesystem it writes to. `role` is `data`, `wal`, or `spill` |
 | `trawl_retention_min_free_disk_bytes` | gauge | The deletion floor, `min_free_disk_bytes`, set at startup. `0` means pressure deletion is off |
 | `trawl_retention_deletions_total{trigger}` | counter | Date directories that retention removed with a successful delete. `trigger` is `age` or `disk_pressure`. Both series start at zero |
@@ -2213,6 +2279,27 @@ interval but none of the hot-buffer gauges.
 | `trawl_compaction_interval_seconds` | gauge | `[ingest] compaction_interval_secs` |
 | `trawl_syslog_events_dropped_total{reason}` | counter | Syslog events dropped before a WAL write. `backpressure` means the batcher was holding a group that hot-buffer admission refused. `queue_full` means the listener queue was full while the batcher was not blocked, or the batcher was gone |
 | `trawl_hot_buffer_duplicate_batches_total` | counter | Batches dropped because a batch with the same identity was already resident. The resident batch stays. Any increment is a writer bug. Starts at zero |
+
+#### Query engine metrics
+
+These series show the executor pool and the engine sample behind the `duckdb` health check. They carry no label and no principal-derived value. Saturation is visible here and never changes health.
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_query_permits_in_use` | gauge | Executor permits held now, by running queries, exports, field samples, and retained work |
+| `trawl_query_pool_size` | gauge | The executor pool size, `[server] max_concurrent_queries` |
+| `trawl_query_permits_retained` | gauge | Permits held by physical work whose request has already ended. A subset of `trawl_query_permits_in_use` |
+| `trawl_engine_sample_age_seconds` | gauge | Seconds since the latest probe started, or since the sampler started before the first probe. It resets every 10 seconds while probes finish, and it keeps growing while one is wedged |
+
+`trawl_query_permits_in_use` at `trawl_query_pool_size` means searches queue, not that the engine is down. Alarm on the sample age instead, or on `checks.duckdb` reading `error`. `trawl_health_check{subsystem="duckdb"}` is set each time `/api/v1/health` answers. It reads `1` for `ok` and `slow`, and `0` for `error`. See [diagnose a 503 or 504 from a query](/operate/health/#diagnose-a-503-or-504-from-a-query).
+
+#### Maintenance memory metric
+
+Compaction, rollup, conform and repin each open a DuckDB database bounded by `[ingest] compaction_memory_limit`. See [the memory arithmetic](/reference/configuration/#the-memory-arithmetic).
+
+| Series | Type | Measurement |
+| --- | --- | --- |
+| `trawl_maintenance_resource_exhausted_total` | counter | Maintenance statements that ran out of `compaction_memory_limit`. trawld logs `maintenance_resource_exhausted` and keeps the inputs. Compaction and rollup retry them on the next pass. A repin statement that runs out with no fallback ends the job `failed`, and the job is not retried. Boot conformance retries on the next boot. Optional sampling falls back and the pass completes, but the statement is still counted: compaction and conform record the conflict without samples, and the repin scan reruns its sampled measurement as a plain count. Starts at zero, carries no label |
 
 #### Restart visibility metrics
 

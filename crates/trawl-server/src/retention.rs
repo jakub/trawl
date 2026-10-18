@@ -1581,6 +1581,98 @@ mod tests {
         }
     }
 
+    /// Pressure deletion compares the filesystem's real available bytes
+    /// with the floor while the query scratch directory holds bytes
+    /// (ADR-0056). Scratch is ordinary headroom use: its bytes are not
+    /// counted back as free, so a large query can start pressure deletion
+    /// early, and the sweep never deletes from scratch itself.
+    ///
+    /// The free-space probe models one filesystem holding the whole tree:
+    /// its capacity less every byte under the root, scratch included. The
+    /// floor sits between what is free with the scratch bytes and what
+    /// would be free without them, so only a sweep that reads the real
+    /// figure deletes.
+    #[test]
+    fn pressure_deletion_reads_real_free_space_with_scratch() {
+        const CAPACITY: u64 = 2_000_000;
+        const SCRATCH_BYTES: usize = 600_000;
+        const FLOOR: u64 = 1_500_000;
+
+        /// Every byte stored under `dir`.
+        fn used(dir: &Path) -> u64 {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    let meta = entry.metadata().unwrap();
+                    if meta.is_dir() {
+                        used(&entry.path())
+                    } else {
+                        meta.len()
+                    }
+                })
+                .sum()
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let scratch = tmp
+            .path()
+            .join(format!("data{}", trawl_config::QUERY_SCRATCH_SUFFIX));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let spill = scratch.join("trawl-spill-test");
+        std::fs::create_dir_all(&spill).unwrap();
+        std::fs::write(
+            spill.join("duckdb_temp_storage_S32K-0.tmp"),
+            vec![0u8; SCRATCH_BYTES],
+        )
+        .unwrap();
+        let today = fixed_today();
+        let old = plant(&data_dir, "prod", days_before(today, 3));
+        let active = plant(&data_dir, "prod", today);
+
+        let root = tmp.path().to_path_buf();
+        let asked = Mutex::new(Vec::new());
+        let free = |path: &Path| {
+            asked.lock().unwrap().push(path.to_path_buf());
+            Ok(CAPACITY - used(&root))
+        };
+        let without_scratch = CAPACITY - (used(&root) - SCRATCH_BYTES as u64);
+        assert!(
+            CAPACITY - used(&root) < FLOOR && without_scratch >= FLOOR,
+            "the floor sits between the two readings"
+        );
+
+        let evidence = RetentionEvidence::default();
+        retention_tick_at(
+            &data_dir,
+            &no_wal(),
+            &make_config(0, FLOOR),
+            &evidence,
+            today,
+            free,
+            delete_date_dir,
+        )
+        .unwrap();
+
+        assert!(!old.exists(), "the real free space is below the floor");
+        assert!(active.exists(), "today is preserved");
+        assert_eq!(
+            std::fs::metadata(spill.join("duckdb_temp_storage_S32K-0.tmp"))
+                .unwrap()
+                .len(),
+            SCRATCH_BYTES as u64,
+            "pressure deletion never touches scratch"
+        );
+        let snapshot = evidence.snapshot(Instant::now());
+        assert_eq!(snapshot.pressure_attempts, 1);
+        assert_eq!(snapshot.removals_disk_pressure, 1);
+        assert!(
+            asked.lock().unwrap().iter().all(|path| path == &data_dir),
+            "free space is read on the data root's filesystem"
+        );
+    }
+
     /// While a repin job exists on this root — marker, shadow sibling, or
     /// aside sibling — both sweeps stand down. Age deletion would yank
     /// affected files out from under the shadow build (the catch-up diff

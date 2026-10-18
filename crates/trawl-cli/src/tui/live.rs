@@ -34,7 +34,10 @@ impl App {
 
         tracing::info!("starting live stream for query: {}", query);
 
-        // Cancel any existing stream.
+        // Cancel any existing stream. Its last snapshot's rows stay drawn
+        // until a replacement result arrives (a quiet restarted stream may
+        // send none), so the cap report stays with them; every result
+        // replaces it.
         if let Some(task) = self.live_task.take() {
             task.abort();
         }
@@ -63,6 +66,7 @@ impl App {
                             details: e.error_details().to_vec(),
                         }),
                         duration: Duration::from_secs(0),
+                        capped: Vec::new(),
                     });
                     return;
                 }
@@ -85,6 +89,7 @@ impl App {
                     Ok(StreamEvent::Snapshot {
                         ref columns,
                         ref rows,
+                        ref capped,
                     }) => {
                         let rows: Vec<_> = rows
                             .iter()
@@ -94,12 +99,13 @@ impl App {
                                 row
                             })
                             .collect();
-                        buffer.replace_with_snapshot(columns, &rows);
-                        // Snapshots are complete results — send immediately.
+                        buffer.replace_with_snapshot(columns, &rows, capped);
+                        // Each snapshot replaces the whole result — send immediately.
                         let response = buffer.to_query_response();
                         let _ = tx.send(QueryResult {
                             result: Ok(response),
                             duration: Duration::from_secs(0),
+                            capped: buffer.capped().to_vec(),
                         });
                     }
                     Ok(StreamEvent::Row(_)) => {
@@ -133,6 +139,7 @@ impl App {
                     let _ = tx.send(QueryResult {
                         result: Ok(response),
                         duration: Duration::from_secs(0),
+                        capped: buffer.capped().to_vec(),
                     });
                 }
             }
@@ -143,6 +150,7 @@ impl App {
                 let _ = tx.send(QueryResult {
                     result: Ok(response),
                     duration: Duration::from_secs(0),
+                    capped: buffer.capped().to_vec(),
                 });
             }
 

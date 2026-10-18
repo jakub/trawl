@@ -912,6 +912,32 @@ for (const [reason, label] of [['rollup_pending', 'Rollup pending'], ['restart_b
   });
 }
 
+test('a slow query engine is a named warning, not a failure', async ({ page, request }, testInfo) => {
+  await setup(request, 'health-viewer');
+  await page.route('**/api/v1/health', async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    // ADR-0056: the engine sample ran past its budget, but a sample
+    // succeeded within the last minute. The engine is busy, not broken,
+    // so the server reports degraded at 200.
+    body.status = 'degraded';
+    body.checks.duckdb = 'slow';
+    await route.fulfill({ response, json: body });
+  });
+  await page.goto('/settings/health');
+  const health = page.locator(SEL.healthSection);
+  await expect(health.getByRole('heading')).toHaveText('Server is degraded');
+  const engine = health.locator(SEL.healthCheck).filter({ hasText: 'Query engine' });
+  await expect(engine.locator('.health-check-name')).toHaveText('Query engine');
+  await expect(engine.locator('.health-check-key')).toHaveText('duckdb');
+  const badge = engine.locator('dd .bdg');
+  await expect(badge).toHaveText('Slow');
+  await expect(badge).toHaveClass(/\bwarn\b/);
+  await expect(badge).not.toHaveClass(/\bdanger\b/);
+  await expect(engine.locator('dd')).not.toHaveClass(/health-check-error/);
+  await health.screenshot({ path: testInfo.outputPath('health-duckdb-slow.png') });
+});
+
 test('the footer re-reads health every 30 s, one read at a time, and the chip clears', async ({ page, request }) => {
   await setup(request, 'health-ingest-refusing');
   await page.clock.install();

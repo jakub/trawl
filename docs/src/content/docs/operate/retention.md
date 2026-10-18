@@ -18,7 +18,7 @@ states the rules and defaults.
    ```toml
    [retention]
    max_age_days = 90
-   min_free_disk_bytes = "1G"
+   min_free_disk_bytes = "6GiB"
    retention_interval_secs = 3600
 
    [retention.env.prod]
@@ -64,6 +64,17 @@ directory closest to its environment's age limit, measures again, and repeats
 until free space is above the threshold. To keep young data, add space rather
 than a longer age limit.
 
+Pressure deletion compares real available bytes. Scratch counts as ordinary
+use of the data filesystem, the same as compaction spill, so trawld does not
+add it back to free space. A large query that spills gigabytes into the
+scratch directory can push free space below the floor and start deletion
+earlier than the data alone would. Spill is bounded by
+`[server] query_spill_max_bytes` (default `4GiB`), and its files go away when
+the query ends. The default floor of `6GiB` holds that budget, the hot-buffer
+query snapshots and some export staging. trawld does not check the floor
+against the spill budget, so raise the two together. See
+[the disk arithmetic](/reference/configuration/#the-disk-arithmetic).
+
 If free space stays below the threshold:
 
 1. Read `trawl_retention_suppressed` on `/metrics`. A value of 1 means a repin
@@ -92,11 +103,13 @@ trawld measures the filesystem under each of three roles:
   filesystem.
 - `wal`: the live WAL directory, `ingest.wal_dir`. The role exists only when
   ingest is enabled.
-- `spill`: the query engine's temporary files, in a private directory
-  trawld makes in `TMPDIR` or `/tmp`.
+- `spill`: the query scratch directory, `[server] query_scratch_dir`. It holds
+  the query engine's spill, the hot-buffer query snapshots, and export staging
+  files. By default it is a sibling of the data root, so it shares the `data`
+  row.
 
 Roles on the same device share one row, and the row lists each role it holds.
-A `wal_dir` or temporary directory on a different device gets its own row.
+A `wal_dir` or scratch directory on a different device gets its own row.
 trawld never adds available bytes across devices, because two directories on
 one device draw on the same free space.
 

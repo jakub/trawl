@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use trawl_api::{DashboardSnapshot, SchemaColumnResponse, ServiceSchema};
+use trawl_engine::scratch::{OwnedRoot, ScratchLock};
 
 use crate::bus::LocalEventBus;
 use crate::config::{Config, RateLimitConfig};
@@ -30,6 +31,9 @@ use crate::tracker::QueryTracker;
 pub struct AppState {
     /// Query execution resources.
     pub query: QueryState,
+    /// The engine sample the `duckdb` health check reads (ADR-0056): taken
+    /// on its own thread and connection, outside the executor pool.
+    pub engine_sample: crate::engine_sample::EngineSample,
     /// Authentication resources.
     pub auth: AuthState,
     /// Postgres app-state stores (history, saved queries, schedules, runs).
@@ -145,6 +149,10 @@ pub struct QueryState {
     pub dashboard_sse_semaphore: Arc<Semaphore>,
     /// Optional ndjson query debug log.
     pub query_log: Option<Arc<QueryLog>>,
+    /// The query scratch directory, locked for this process (ADR-0056).
+    /// Every clone of the state shares the one lock, which is freed when
+    /// the last clone drops.
+    pub scratch: Arc<ScratchLock>,
 }
 
 /// Authentication state: the fleet keystore and its bearer middleware state.
@@ -561,6 +569,64 @@ impl DegradedSnapshot {
     }
 }
 
+/// Lock and clear `[server] query_scratch_dir`
+/// ([`ScratchLock::open_apart_from`]), and log what an earlier trawld left
+/// there and boot removed.
+///
+/// The directory is kept apart from the data root, the WAL directory and
+/// both repin staging roots, compared as the filesystem resolves them
+/// (ADR-0056). Config validation compares the spellings; this compares the
+/// directories, which a symlink in either path can make the same.
+///
+/// trawld calls this before it waits on `PostgreSQL`: the scratch lock, not
+/// the sole-writer lock, authorizes the clearing (ADR-0056), so a second
+/// trawld on the same directory refuses here without touching the
+/// database, and nothing is removed while another process can still use it.
+pub fn open_query_scratch(
+    config: &Config,
+) -> Result<ScratchLock, trawl_engine::scratch::ScratchError> {
+    let data = config.data.base_dir();
+    let roots = [
+        OwnedRoot {
+            what: "the data root ([data] path)",
+            path: data.clone(),
+        },
+        OwnedRoot {
+            what: "the WAL directory ([ingest] wal_dir)",
+            path: config.wal_dir(),
+        },
+        OwnedRoot {
+            what: "the repin shadow root (<[data] path>.repin-next)",
+            path: crate::repin::marker::shadow_root(&data),
+        },
+        OwnedRoot {
+            what: "the repin aside root (<[data] path>.repin-aside)",
+            path: crate::repin::marker::aside_root(&data),
+        },
+    ];
+    let scratch = ScratchLock::open_apart_from(&config.query_scratch_dir(), &roots)?;
+    let reclaimed = scratch.reclaimed();
+    tracing::info!(
+        event_type = "lifecycle",
+        path = %scratch.scratch().path().display(),
+        spill_dirs = reclaimed.spill_dirs,
+        snapshots = reclaimed.snapshots,
+        exports = reclaimed.exports,
+        "query scratch directory locked"
+    );
+    Ok(scratch)
+}
+
+/// The query database's budgets from `[server]` (ADR-0056).
+#[must_use]
+pub fn query_budgets(server: &crate::config::ServerConfig) -> trawl_engine::executor::QueryBudgets {
+    trawl_engine::executor::QueryBudgets {
+        spill_max_bytes: server.query_spill_max_bytes,
+        memory_limit: server.query_memory_limit,
+        threads: server.query_threads,
+    }
+}
+
 /// Build [`AuthState`]: connect the fleet keystore (eagerly) and wrap it as
 /// a bearer-only [`fleet_auth::BearerState`].
 async fn build_auth_state(config: &Config) -> Result<AuthState, crate::error::ServerError> {
@@ -631,21 +697,26 @@ impl AppState {
 
     /// Construct app state from a validated [`Config`].
     ///
-    /// Connects to the fleet-auth Postgres keystore and the trawl app-state
-    /// database (both eagerly — trawld fails fast at startup when either
-    /// backend is unreachable; the app-state boot also takes the sole-writer
-    /// advisory lock and runs migrations).
+    /// Locks and clears the query scratch directory ([`open_query_scratch`]),
+    /// then connects to the fleet-auth Postgres keystore and the trawl
+    /// app-state database (both eagerly — trawld fails fast at startup when
+    /// either backend is unreachable; the app-state boot also takes the
+    /// sole-writer advisory lock and runs migrations).
     pub async fn from_config(
         config: &Config,
         metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
         derivation: Arc<crate::ingest::producer::Derivation>,
     ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
+        let scratch = open_query_scratch(config)
+            .map_err(|e| crate::error::ServerError::ServiceUnavailable(e.to_string()))?;
         let (auth, storage) = Self::connect_backends(config).await?;
 
-        Self::from_parts(config, metrics_handle, derivation, auth, storage).await
+        Self::from_parts(config, metrics_handle, derivation, auth, storage, scratch).await
     }
 
-    /// Assemble app state over already-connected backends.
+    /// Assemble app state over already-connected backends and the query
+    /// scratch directory [`open_query_scratch`] locked, which the state
+    /// holds for as long as any clone of it lives.
     ///
     /// Still async: it awaits the catalog pin load that hydrates the
     /// in-process pin cache.
@@ -656,6 +727,7 @@ impl AppState {
         derivation: Arc<crate::ingest::producer::Derivation>,
         auth: AuthState,
         storage: StorageState,
+        scratch: ScratchLock,
     ) -> Result<(Self, HttpConfig), crate::error::ServerError> {
         // Hydrate the in-process pin cache from the migrated catalog so the
         // first query already sees the pins (zero postgres I/O per query).
@@ -710,12 +782,16 @@ impl AppState {
         crate::metrics::init_retention_metrics(config.retention.min_free_disk_bytes);
 
         // A query engine that cannot start, as when its spill directory is
-        // refused (ADR-0052), fails the start with the engine's own message.
+        // refused (ADR-0052) or a budget does not apply (ADR-0056), fails
+        // the start with the engine's own message.
+        let scratch = Arc::new(scratch);
         let pool = ExecutorPool::new(
             config.data.base_dir().to_string_lossy().into_owned(),
             config.server.max_concurrent_queries,
             config.server.max_result_rows,
             hot_buffer.clone(),
+            Arc::clone(&scratch),
+            &query_budgets(&config.server),
         )
         .map_err(|e| {
             crate::error::ServerError::ServiceUnavailable(format!(
@@ -723,7 +799,21 @@ impl AppState {
             ))
         })?;
 
+        // The first sample is taken before the state serves anything, so
+        // health never answers `error` for want of one. Waiting is bounded
+        // by the sample budget: past it the watchdog publishes an overrun.
+        let engine_sample = crate::engine_sample::EngineSample::start(&pool).map_err(|e| {
+            crate::error::ServerError::ServiceUnavailable(format!(
+                "failed to start the engine sample: {e}"
+            ))
+        })?;
+        let first = engine_sample.clone();
+        tokio::task::spawn_blocking(move || first.wait_for_first())
+            .await
+            .map_err(|e| crate::error::ServerError::from_join("engine sample", e))?;
+
         let state = Self {
+            engine_sample,
             query: QueryState {
                 // Comparison typing: the pool snapshots the full pin set per
                 // query. The catalog is constructed unconditionally above,
@@ -745,6 +835,7 @@ impl AppState {
                 sse_semaphore: Arc::new(Semaphore::new(config.server.max_sse_connections)),
                 dashboard_sse_semaphore: Arc::new(Semaphore::new(MAX_DASHBOARD_STREAMS)),
                 query_log: None,
+                scratch,
             },
             auth,
             storage,

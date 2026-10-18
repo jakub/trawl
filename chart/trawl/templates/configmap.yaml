@@ -25,6 +25,34 @@ data:
     max_sse_connections = {{ .Values.config.server.maxSseConnections | int }}
     schema_cache_ttl_secs = {{ .Values.config.server.schemaCacheTtlSecs | int }}
     max_query_history = {{ .Values.config.server.maxQueryHistory | int }}
+    {{- /* Scratch must land on the data volume: the root filesystem is
+         read-only and the /tmp emptyDir is evicted past its sizeLimit.
+         trawld's default is the sibling <data.path>.query-scratch, which is
+         on the volume exactly when data.path is below its mount. */}}
+    {{- $mount := include "trawl.dataMountPath" . }}
+    {{- $scratch := toString .Values.config.server.queryScratchDir }}
+    {{- /* A crash-dump mount nested at, under, or above scratch wins the
+         longest-mount match, so scratch would fill the small crash-dump PVC
+         that holds the cores instead of the data volume. Compare the
+         effective path trawld resolves: the key, or <data.path>.query-scratch. */}}
+    {{- if .Values.crashDump.enabled }}
+    {{- $effective := ternary (clean $scratch) (printf "%s.query-scratch" (clean (toString .Values.config.data.path))) (ne $scratch "") }}
+    {{- $cores := clean (toString .Values.crashDump.mountPath) }}
+    {{- if or (eq $effective $cores) (hasPrefix (printf "%s/" $cores) $effective) (hasPrefix (printf "%s/" $effective) $cores) }}
+    {{- fail (printf "crashDump.mountPath %q must not be at, under, or above the query scratch directory %q (config.server.queryScratchDir, or <config.data.path>.query-scratch when it is empty): the crash-dump volume would shadow scratch and a spilling query would fill the volume that holds the cores; move one of them" $cores $effective) }}
+    {{- end }}
+    {{- end }}
+    {{- if $scratch }}
+    {{- if not (hasPrefix (printf "%s/" $mount) (clean $scratch)) }}
+    {{- fail (printf "config.server.queryScratchDir must be an absolute path below %s so scratch lands on the data volume; got %q" $mount $scratch) }}
+    {{- end }}
+    query_scratch_dir = {{ clean $scratch | quote }}
+    {{- else if not (hasPrefix (printf "%s/" $mount) (clean (toString .Values.config.data.path))) }}
+    {{- fail (printf "config.data.path %q is not below %s, so trawld's default scratch directory <data.path>.query-scratch would sit off the data volume: set config.server.queryScratchDir to a directory below %s" (toString .Values.config.data.path) $mount $mount) }}
+    {{- end }}
+    query_spill_max_bytes = {{ .Values.config.server.querySpillMaxBytes | quote }}
+    query_memory_limit = {{ .Values.config.server.queryMemoryLimit | quote }}
+    query_threads = {{ .Values.config.server.queryThreads | int }}
     {{- if .Values.config.server.corsAllowedOrigins }}
     cors_allowed_origins = [{{ range $i, $o := .Values.config.server.corsAllowedOrigins }}{{ if $i }}, {{ end }}{{ $o | quote }}{{ end }}]
     {{- end }}
@@ -63,6 +91,7 @@ data:
     wal_dir = {{ .Values.config.ingest.walDir | quote }}
     {{- end }}
     compaction_interval_secs = {{ .Values.config.ingest.compactionIntervalSecs | int }}
+    compaction_memory_limit = {{ .Values.config.ingest.compactionMemoryLimit | quote }}
     internal_telemetry = {{ .Values.config.ingest.internalTelemetry }}
     daily_rollup = {{ .Values.config.ingest.dailyRollup }}
     event_bus_capacity = {{ .Values.config.ingest.eventBusCapacity | int }}
@@ -151,7 +180,6 @@ data:
     [scheduler]
     enabled = {{ .Values.config.scheduler.enabled }}
     poll_interval_secs = {{ .Values.config.scheduler.pollIntervalSecs | int }}
-    report_max_rows = {{ .Values.config.scheduler.reportMaxRows | int }}
     max_runs_per_schedule = {{ .Values.config.scheduler.maxRunsPerSchedule | int }}
     report_retention_days = {{ .Values.config.scheduler.reportRetentionDays | int }}
     max_catchup_intervals = {{ .Values.config.scheduler.maxCatchupIntervals | int }}

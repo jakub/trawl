@@ -27,7 +27,8 @@ use fleet_auth::{
 use reqwest::Client;
 use tokio::task::JoinHandle;
 
-use crate::config::ResolvedConfig;
+use crate::body_budget::BodyBudget;
+use crate::config::{ProxyLimits, ResolvedConfig};
 use crate::error::ProxyError;
 use crate::upstream::Upstream;
 
@@ -45,6 +46,11 @@ struct Inner {
     allow_insecure_cookies: bool,
     shared_domain: Option<String>,
     public_origins: PublicOrigins,
+    limits: ProxyLimits,
+    /// The budget the forwarder reserves each buffered body from, sized
+    /// by `limits.body_budget_bytes`. Lives here so every clone of the
+    /// state, and so every route, shares the one budget.
+    body_budget: BodyBudget,
 }
 
 impl AppState {
@@ -55,7 +61,9 @@ impl AppState {
     ///
     /// The client's certificate trust comes from
     /// [`ResolvedConfig::upstream_tls`], already validated at resolution;
-    /// see [`crate::upstream`] for how a pinned CA is read again. Starts no
+    /// see [`crate::upstream`] for how a pinned CA is read again. Its
+    /// connections carry the head deadline as their `TCP_USER_TIMEOUT`, so
+    /// a request body trawld never takes is torn down after it. Starts no
     /// task: the caller starts the re-read with
     /// [`Self::spawn_upstream_ca_reread`].
     ///
@@ -64,7 +72,11 @@ impl AppState {
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let upstream = Upstream::new(cfg.upstream_tls, cfg.upstream_connect)?;
+        let upstream = Upstream::new(
+            cfg.upstream_tls,
+            cfg.upstream_connect,
+            cfg.limits.upstream_head_timeout,
+        )?;
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -75,8 +87,43 @@ impl AppState {
                 allow_insecure_cookies: cfg.allow_insecure_cookies,
                 shared_domain: cfg.shared_domain,
                 public_origins: cfg.public_origins,
+                body_budget: BodyBudget::new(cfg.limits.body_budget_bytes),
+                limits: cfg.limits,
             }),
         })
+    }
+
+    /// The bounds every request is held to: the body limit, the body
+    /// deadline and the upstream head deadline.
+    #[must_use]
+    pub fn limits(&self) -> &ProxyLimits {
+        &self.inner.limits
+    }
+
+    /// The budget every buffered request body is reserved from.
+    #[must_use]
+    pub fn body_budget(&self) -> &BodyBudget {
+        &self.inner.body_budget
+    }
+
+    /// Send `request` to trawld and wait for its response head within
+    /// [`ProxyLimits::upstream_head_timeout`]. Every call to trawld goes
+    /// through here, so no handler can wait on a silent trawld for
+    /// longer than the deadline. The returned response's body is not
+    /// under the deadline: a stream it opens runs as long as trawld
+    /// keeps it open.
+    ///
+    /// # Errors
+    /// [`ProxyError::UpstreamHeadTimeout`] past the deadline;
+    /// [`ProxyError::Network`] when the call fails before a head.
+    pub async fn send_to_upstream(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ProxyError> {
+        tokio::time::timeout(self.inner.limits.upstream_head_timeout, request.send())
+            .await
+            .map_err(|_elapsed| ProxyError::UpstreamHeadTimeout)?
+            .map_err(ProxyError::Network)
     }
 
     #[must_use]
@@ -268,6 +315,7 @@ mod tests {
             shared_domain: None,
             public_origins: PublicOrigins::parse(["http://127.0.0.1:8090"])
                 .expect("fixture origin parses"),
+            limits: ProxyLimits::from_server(None),
         }
     }
 

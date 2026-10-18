@@ -44,7 +44,10 @@ spec:
       serviceAccountName: {{ include "trawl.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      terminationGracePeriodSeconds: {{ .Values.config.server.shutdownDrainSecs }}
+      {{- /* SIGTERM starts the drain, then the runtime's 10 s shutdown and the
+           5 s telemetry flush run; 30 s covers those two with margin. A
+           sizing, not a proven exit bound (ADR-0056). */}}
+      terminationGracePeriodSeconds: {{ add (.Values.config.server.shutdownDrainSecs | int) 30 }}
       {{- if or .Values.initAuth.enabled $trust.dataSubPath }}
       initContainers:
       {{- end }}
@@ -221,8 +224,10 @@ spec:
               path: /api/v1/health
               port: https
               scheme: HTTPS
-            failureThreshold: 30
-            periodSeconds: 2
+            # Five minutes for boot: recovery, hydration and the boot
+            # conformance pass all run before the listener answers.
+            failureThreshold: 60
+            periodSeconds: 5
             timeoutSeconds: 5
           livenessProbe:
             httpGet:

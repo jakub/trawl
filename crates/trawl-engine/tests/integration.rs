@@ -272,6 +272,49 @@ fn drop_columns() {
     assert!(!col_names.contains(&"src_ip"));
 }
 
+/// `drop` of a field no event carries is a no-op: every row, every
+/// column, as the live tail answers it (ADR-0001). `DuckDB`'s
+/// `* EXCLUDE` refused the name, with no structured marker the binder
+/// fallback could read.
+#[test]
+fn drop_of_an_absent_field_keeps_every_row_and_column() {
+    let (exec, glob) = setup();
+    let names = |result: &QueryResult| -> Vec<String> {
+        result.columns.iter().map(|c| c.name.clone()).collect()
+    };
+    let all = exec.run_query_max("*", &glob).unwrap();
+    let dropped = exec.run_query_max("* | drop nope", &glob).unwrap();
+    assert_eq!(dropped.row_count(), 13);
+    assert_eq!(names(&dropped), names(&all));
+
+    let mixed = exec.run_query_max("* | drop message, nope", &glob).unwrap();
+    assert_eq!(mixed.row_count(), 13);
+    let expected: Vec<String> = names(&all)
+        .into_iter()
+        .filter(|name| name != "message")
+        .collect();
+    assert_eq!(names(&mixed), expected);
+}
+
+/// `drop` folds a field's ASCII case as `DuckDB` binds identifiers, so
+/// `drop SERVICE` removes the `service` column, as `* EXCLUDE ("SERVICE")`
+/// did, and every other column stays.
+#[test]
+fn drop_folds_ascii_case_as_duckdb_binds() {
+    let (exec, glob) = setup();
+    let all = exec.run_query_max("*", &glob).unwrap();
+    let dropped = exec.run_query_max("* | drop SERVICE", &glob).unwrap();
+    assert_eq!(dropped.row_count(), 13);
+    let names: Vec<&str> = dropped.columns.iter().map(|c| c.name.as_str()).collect();
+    let expected: Vec<&str> = all
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .filter(|name| *name != "service")
+        .collect();
+    assert_eq!(names, expected);
+}
+
 #[test]
 fn let_computed_column() {
     let (exec, glob) = setup();

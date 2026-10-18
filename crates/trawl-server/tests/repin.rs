@@ -11,7 +11,7 @@ mod common;
 use std::os::unix::fs::MetadataExt as _;
 use std::time::Duration;
 
-use common::{TestServer, setup_in_dir_with_data};
+use common::{DEFAULT_TEST_TIMEOUT_SECS, TestServer, setup_in_dir_with_data_and_timeout};
 use serde_json::json;
 use trawl_client::{HttpClient, RepinCeilings, RepinStart};
 use trawl_server::catalog::CatalogContext;
@@ -62,6 +62,12 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with_query_timeout(DEFAULT_TEST_TIMEOUT_SECS).await
+}
+
+/// A harness whose `[server] timeout_secs` is `timeout_secs`, which also
+/// bounds how long the repin trigger holds its response.
+async fn harness_with_query_timeout(timeout_secs: u64) -> Harness {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path().to_path_buf();
     let wal_dir = root.join("wal");
@@ -69,7 +75,13 @@ async fn harness() -> Harness {
     std::fs::create_dir_all(&data_dir).unwrap();
     let data_path = data_dir.to_str().unwrap().to_owned();
 
-    let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
+    let server = setup_in_dir_with_data_and_timeout(
+        &root,
+        data_path,
+        RateLimitConfig::default(),
+        timeout_secs,
+    )
+    .await;
     std::mem::forget(tmp); // outlives the server; OS cleans up
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -207,6 +219,13 @@ impl Harness {
     }
 }
 
+/// The requester every engine-level call here claims as: key row 1, named
+/// `op`. The row id is what the status read by id matches a write-only key
+/// against; the name is what the job row and the audit events show.
+fn op() -> trawl_server::store::Requester {
+    trawl_server::store::Requester::new(1, "op")
+}
+
 fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
     let mut base = json!({
         "service": service, "env": "prod", "host": "web01",
@@ -310,7 +329,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
                     dry_run,
                     false,
                     RequestedCeilings::default(),
-                    Some("op")
+                    Some(&op())
                 )
                 .await,
             Err(ServerError::CorpusRecovering(
@@ -358,7 +377,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
             true,
             false,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .unwrap();
@@ -379,7 +398,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
             false,
             false,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .unwrap()
@@ -420,7 +439,7 @@ async fn cancelling_repin_during_rollup_admission_terminalizes_the_job() {
                 false,
                 false,
                 RequestedCeilings::default(),
-                Some("op"),
+                Some(&op()),
             )
             .await
     });
@@ -956,6 +975,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         .clone()
         .expect("an ingest-enabled node owns a repin engine");
     TEST_SCAN_DELAY_MS.store(500, Ordering::Relaxed);
+    let requester = op();
     let mut start = Box::pin(engine.start(
         "status",
         "VARCHAR",
@@ -963,7 +983,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         true,
         false,
         RequestedCeilings::default(),
-        Some("op"),
+        Some(&requester),
     ));
     // Let the claim land and the scan begin, then drop the future exactly
     // as hyper drops a handler whose connection went away.
@@ -1437,7 +1457,7 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
             dialect: None,
             dry_run: false,
             force: false,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })
@@ -1568,7 +1588,7 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
             dialect: None,
             dry_run: false,
             force: false,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })
@@ -1630,7 +1650,7 @@ async fn boot_reconciliation_materialises_the_staged_evidence() {
             force: true,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
-            requested_by: None,
+            requester: None,
         })
         .await
         .unwrap();
@@ -1831,7 +1851,7 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
             dialect: Some(trawl_core::severity::Dialect::Syslog),
             dry_run: false,
             force: true,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })
@@ -2789,6 +2809,827 @@ async fn a_cancel_during_the_scan_stops_before_any_plan_is_published() {
     }
 }
 
+/// A scan that outlasts `[server] timeout_secs` does not hold the request.
+/// trawl-web gives every upstream call `timeout_secs` plus 10 s to send its
+/// response head (ADR-0054), so the trigger answers 202 with the claimed
+/// row once that bound passes, and the verdict is read from the status
+/// route. The dry run here ends `succeeded` with its plan, exactly as it
+/// would have answered 200 inside the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_past_the_answer_bound_answers_202_and_reports_through_status() {
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+
+    let answered = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.schema_admin.schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        ),
+    )
+    .await
+    .expect("the trigger must answer within its bound while the scan is held")
+    .expect("an admitted dry run answers with its row");
+    let accepted = match answered {
+        RepinStart::Started(job) => job,
+        other => panic!("expected 202 with the running row, got {other:?}"),
+    };
+    assert!(
+        TEST_SCAN_HELD.load(Ordering::SeqCst),
+        "the answer came while the scan was still held"
+    );
+    assert_eq!(accepted.status, "running");
+    assert!(accepted.dry_run);
+    assert_eq!(
+        accepted.requires_force, None,
+        "no plan is recorded yet, so there is no verdict: {accepted:?}"
+    );
+
+    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    let mut report = None;
+    for _ in 0..300 {
+        let job = h
+            .schema_admin
+            .schema_repin_status()
+            .await
+            .expect("status")
+            .job
+            .expect("the claimed job stays on the status route");
+        assert_eq!(job.id, accepted.id, "no other job can take the slot here");
+        if job.status != "running" {
+            report = Some(job);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = report.expect("the detached dry run must finish once released");
+    assert_eq!(report.status, "succeeded", "{report:?}");
+    assert_eq!(report.files_total, 2, "{report:?}");
+    assert_eq!(report.requires_force, Some(false), "{report:?}");
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+}
+
+/// The CLI half of the answer bound: `trawl schema repin --dry-run` whose
+/// scan outlasts `[server] timeout_secs` gets a 202 with the running row,
+/// follows it through the status route, and prints the report and exits 0,
+/// exactly as it does for a dry run answered inside the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_follows_a_dry_run_answered_past_the_bound_to_its_report() {
+    use trawl_cli::cli::{ConnectionParams, OutputFormat};
+    use trawl_cli::schema::{RepinFlags, run_repin};
+
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+
+    let conn = ConnectionParams {
+        url: h.server.url.clone(),
+        token: h.server.schema_admin_token.clone(),
+        trust: trawl_client::TlsTrust::AcceptInvalid,
+    };
+    let flags = RepinFlags {
+        dialect: None,
+        dry_run: true,
+        force: false,
+        yes: false,
+        wait: false,
+        max_nulled_rows: None,
+        max_ambiguous_rows: None,
+    };
+    let mut out = Vec::new();
+    // The claim precedes the scan, so holding the scan for 3 s past its
+    // first file outlasts the 1 s bound whatever the scheduler does: the
+    // request cannot decide while the scan is held, and answers 202.
+    let release = async {
+        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let running = h
+            .schema_admin
+            .schema_repin_status()
+            .await
+            .expect("status")
+            .job
+            .expect("the claimed job is on the status route");
+        assert_eq!(running.status, "running", "{running:?}");
+        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    };
+    let (result, ()) = tokio::join!(
+        run_repin(
+            &mut out,
+            conn,
+            "status",
+            "VARCHAR",
+            flags,
+            Some(OutputFormat::Table),
+        ),
+        release,
+    );
+    let text = String::from_utf8(out).unwrap();
+    result.unwrap_or_else(|e| panic!("the dry run reports and exits 0: {e:?}\n{text}"));
+    assert!(
+        text.contains("repin status: dry run"),
+        "a followed dry run prints as a report, not as started: {text}"
+    );
+    assert!(text.contains("succeeded"), "{text}");
+}
+
+/// `GET /schema/repin/status?id=<id>` with `token`, raw, so a test sees the
+/// status code and body the route gives for that id.
+async fn status_by_id(h: &Harness, token: &str, id: i64) -> (u16, serde_json::Value) {
+    status_with_query(h, token, &format!("id={id}")).await
+}
+
+/// `GET /api/v1/schema/repin/status?<query>`, for a query no well-formed
+/// id produces.
+async fn status_with_query(h: &Harness, token: &str, query: &str) -> (u16, serde_json::Value) {
+    let resp = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .get(format!(
+            "{}/api/v1/schema/repin/status?{query}",
+            h.server.url
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("status by id");
+    let status = resp.status().as_u16();
+    (status, resp.json().await.expect("a JSON body"))
+}
+
+/// A key holding `trawl:schema_write` and nothing else: the one grant the
+/// repin trigger requires.
+async fn schema_write_only_token(h: &Harness) -> String {
+    seed_schema_write_only_role(h).await;
+    mint_schema_write_only_key(h, "schema-writer").await
+}
+
+/// The role [`mint_schema_write_only_key`] mints under: `trawl:schema_write`
+/// alone. Seed it once per harness.
+async fn seed_schema_write_only_role(h: &Harness) {
+    fleet_auth::KeyStore::from_pool(h.server.fleet_pool.clone())
+        .create_role(
+            "trawl-schema-writer",
+            None,
+            &common::trawl_perms(&["schema_write"]),
+        )
+        .await
+        .expect("seed a write-only role");
+}
+
+/// Mint a key named `name` under the write-only role, and return its token.
+async fn mint_schema_write_only_key(h: &Harness, name: &str) -> String {
+    fleet_auth::KeyStore::from_pool(h.server.fleet_pool.clone())
+        .create_key(
+            name,
+            fleet_auth::PrincipalKind::Service,
+            &common::roles(&["trawl-schema-writer"]),
+            None,
+        )
+        .await
+        .expect("mint a write-only key")
+        .plaintext_token
+        .to_string()
+}
+
+/// Start a `status` → VARCHAR dry run through `client` whose scan holds at
+/// its first file, and return the 202 the trigger answers once its bound
+/// passes.
+async fn held_dry_run_past_the_bound(client: &HttpClient) -> RepinJobResponse {
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+    let answered = client
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        )
+        .await
+        .expect("an admitted dry run answers with its row");
+    match answered {
+        RepinStart::Started(job) => {
+            assert!(
+                TEST_SCAN_HELD.load(Ordering::SeqCst),
+                "the answer came while the scan was still held"
+            );
+            job
+        }
+        other => panic!("expected 202 with the running row, got {other:?}"),
+    }
+}
+
+/// A dry run answered 202 is followed by its own id. Without one the
+/// status route answers the running job, else the newest, so once the
+/// followed scan finishes and another job claims the freed slot, only the
+/// id still names the report the client is owed. An id the store never
+/// issued is the API's ordinary 404.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_answered_202_is_read_by_its_id_after_another_job_takes_the_slot() {
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+    let token = h.server.schema_admin_token.clone();
+
+    let first = held_dry_run_past_the_bound(&h.schema_admin).await;
+    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    let finished = h.wait_terminal(first.id).await;
+    assert_eq!(finished.status, "succeeded", "{finished:?}");
+
+    // Another job takes the freed slot and holds it.
+    let second = held_dry_run_past_the_bound(&h.schema_admin).await;
+    assert_ne!(second.id, first.id);
+    let unscoped = h
+        .schema_admin
+        .schema_repin_status()
+        .await
+        .expect("status")
+        .job
+        .expect("a job is running");
+    assert_eq!(
+        unscoped.id, second.id,
+        "the unscoped read names the newer job"
+    );
+
+    let (status, body) = status_by_id(&h, &token, first.id).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["job"]["id"], first.id,
+        "the read by id names the followed job, not the one now in the slot: {body}"
+    );
+    assert_eq!(body["job"]["status"], "succeeded", "{body}");
+    assert_eq!(
+        body["job"]["files_total"], 2,
+        "the report rides the row: {body}"
+    );
+
+    let (status, body) = status_by_id(&h, &token, second.id + 1000).await;
+    assert_eq!(status, 404, "an unknown id is not found: {body}");
+    assert_eq!(body["error"]["code"], "not_found", "{body}");
+
+    let (status, body) = status_with_query(&h, &token, "id=seven").await;
+    assert_eq!(
+        status, 400,
+        "an id that is not an integer is refused: {body}"
+    );
+    assert_eq!(body["error"]["code"], "bad_request", "{body}");
+
+    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    h.wait_terminal(second.id).await;
+}
+
+/// The trigger needs `schema_write` alone, so following its own job needs
+/// no more: a key holding only that grant reads a job by its id. The
+/// unscoped status read, which shows whatever job is in the slot, keeps
+/// needing `schema_read`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_write_only_key_follows_its_dry_run_by_id() {
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+    let token = schema_write_only_token(&h).await;
+    let writer = HttpClient::new_insecure(&h.server.url, &token).unwrap();
+
+    let accepted = held_dry_run_past_the_bound(&writer).await;
+    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    let mut report = None;
+    for _ in 0..300 {
+        let (status, body) = status_by_id(&h, &token, accepted.id).await;
+        assert_eq!(
+            status, 200,
+            "a write-only key reads its own job by id: {body}"
+        );
+        if body["job"]["status"] != "running" {
+            report = Some(body);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let report = report.expect("the detached dry run must finish once released");
+    assert_eq!(report["job"]["id"], accepted.id, "{report}");
+    assert_eq!(report["job"]["status"], "succeeded", "{report}");
+    assert_eq!(report["job"]["files_total"], 2, "{report}");
+
+    match writer.schema_repin_status().await {
+        Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 403),
+        other => panic!("the unscoped read still needs schema_read: {other:?}"),
+    }
+}
+
+/// A write-only key reads the jobs it requested and nothing else. A job
+/// another key requested, a job from before the key existed and an id the
+/// store never issued answer it the same 404 response, so a `schema_write`
+/// grant cannot read the durable job rows of other keys by id. Job ids are
+/// sequential, so an id's existence is not a secret; the rule protects the
+/// rows' contents. A `schema_read` key reads any job by id, and the
+/// unscoped read stays `schema_read` only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_write_only_key_reads_only_the_jobs_it_requested() {
+    let h = harness().await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+    // A job from before either write-only key existed, requested by a key
+    // that holds `schema_read` as well.
+    let historical = dry_run(&h.schema_admin, "status", "VARCHAR", None, false).await;
+    seed_schema_write_only_role(&h).await;
+    let token = mint_schema_write_only_key(&h, "writer-a").await;
+    let other_token = mint_schema_write_only_key(&h, "writer-b").await;
+    let writer = HttpClient::new_insecure(&h.server.url, &token).unwrap();
+    let other_writer = HttpClient::new_insecure(&h.server.url, &other_token).unwrap();
+    let own = dry_run(&writer, "status", "VARCHAR", None, false).await;
+    let other = dry_run(&other_writer, "status", "VARCHAR", None, false).await;
+    let unknown = own.id.max(other.id).max(historical.id) + 1000;
+
+    let (status, body) = status_by_id(&h, &token, own.id).await;
+    assert_eq!(status, 200, "a write-only key reads its own job: {body}");
+    assert_eq!(body["job"]["id"], own.id, "{body}");
+    assert_eq!(body["job"]["requested_by"], "writer-a", "{body}");
+
+    let mut refusals = Vec::new();
+    for (what, id) in [
+        ("another key's job", other.id),
+        ("a job from before the key existed", historical.id),
+        ("an id the store never issued", unknown),
+    ] {
+        let (status, body) = status_by_id(&h, &token, id).await;
+        assert_eq!(status, 404, "{what} (id {id}) reads as not found: {body}");
+        assert_eq!(body["error"]["code"], "not_found", "{what}: {body}");
+        refusals.push(body);
+    }
+    assert!(
+        refusals.windows(2).all(|pair| pair[0] == pair[1]),
+        "the refusal body must not say whether the job exists: {refusals:?}"
+    );
+
+    for id in [own.id, other.id, historical.id] {
+        let (status, body) = status_by_id(&h, &h.server.reader_token, id).await;
+        assert_eq!(status, 200, "a schema_read key reads job {id}: {body}");
+        assert_eq!(body["job"]["id"], id, "{body}");
+    }
+
+    match writer.schema_repin_status().await {
+        Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 403),
+        other => panic!("the unscoped read still needs schema_read: {other:?}"),
+    }
+}
+
+/// The CLI half of the write-only rule: `trawl schema repin --dry-run` run
+/// with a key holding only `schema_write` follows its 202 to the report and
+/// exits 0, as the same dry run answered inside the bound does.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_follows_a_late_dry_run_with_a_schema_write_only_key() {
+    use trawl_cli::cli::{ConnectionParams, OutputFormat};
+    use trawl_cli::schema::{RepinFlags, run_repin};
+
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+    let token = schema_write_only_token(&h).await;
+
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+
+    let conn = ConnectionParams {
+        url: h.server.url.clone(),
+        token,
+        trust: trawl_client::TlsTrust::AcceptInvalid,
+    };
+    let flags = RepinFlags {
+        dialect: None,
+        dry_run: true,
+        force: false,
+        yes: false,
+        wait: false,
+        max_nulled_rows: None,
+        max_ambiguous_rows: None,
+    };
+    let mut out = Vec::new();
+    // Held 3 s past the scan's first file, against a 1 s bound: the
+    // request cannot decide while the scan is held, so it answers 202.
+    let release = async {
+        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    };
+    let (result, ()) = tokio::join!(
+        run_repin(
+            &mut out,
+            conn,
+            "status",
+            "VARCHAR",
+            flags,
+            Some(OutputFormat::Table),
+        ),
+        release,
+    );
+    let text = String::from_utf8(out).unwrap();
+    result.unwrap_or_else(|e| {
+        panic!("a write-only key's dry run reports and exits 0: {e:?}\n{text}")
+    });
+    assert!(text.contains("repin status: dry run"), "{text}");
+    assert!(text.contains("succeeded"), "{text}");
+}
+
+/// The CLI follows its dry run by id, so a newer job cannot stand in for
+/// it. The followed scan is released while the CLI waits out its poll
+/// interval, and a second dry run claims the freed slot before the CLI
+/// polls again. The CLI still prints the first job's report.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cli_prints_its_own_report_after_another_job_takes_the_slot() {
+    use trawl_cli::cli::{ConnectionParams, OutputFormat};
+    use trawl_cli::schema::{RepinFlags, run_repin};
+
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+
+    let conn = ConnectionParams {
+        url: h.server.url.clone(),
+        token: h.server.schema_admin_token.clone(),
+        trust: trawl_client::TlsTrust::AcceptInvalid,
+    };
+    let flags = RepinFlags {
+        dialect: None,
+        dry_run: true,
+        force: false,
+        yes: false,
+        wait: false,
+        max_nulled_rows: None,
+        max_ambiguous_rows: None,
+    };
+    let store = h.server.state.storage.repin.clone();
+    let mut out = Vec::new();
+    let take_the_slot = async {
+        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+        let first = store
+            .running()
+            .await
+            .expect("read")
+            .expect("the first job runs");
+        // The 1 s bound answers the CLI 202 inside this sleep, and the CLI
+        // polls 2 s after that answer.
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+        for _ in 0..200 {
+            if store.running().await.expect("read").is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+        TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+        TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+        let admin = h.schema_admin.clone();
+        let second = tokio::spawn(async move {
+            admin
+                .schema_repin(
+                    "status",
+                    "VARCHAR",
+                    None,
+                    true,
+                    false,
+                    RepinCeilings::default(),
+                )
+                .await
+        });
+        await_barrier(
+            &TEST_SCAN_HELD,
+            "the second job never reached a file boundary",
+        )
+        .await;
+        let running = store
+            .running()
+            .await
+            .expect("read")
+            .expect("the second job runs");
+        assert_ne!(running.id, first.id, "a newer job holds the slot");
+        (first.id, running.id, second)
+    };
+    let (result, (first_id, second_id, second)) = tokio::join!(
+        run_repin(
+            &mut out,
+            conn,
+            "status",
+            "VARCHAR",
+            flags,
+            Some(OutputFormat::Table),
+        ),
+        take_the_slot,
+    );
+    let text = String::from_utf8(out).unwrap();
+    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    let _ = second.await;
+    h.wait_terminal(second_id).await;
+    result.unwrap_or_else(|e| panic!("the CLI prints its own job's report: {e:?}\n{text}"));
+    assert!(text.contains("repin status: dry run"), "{text}");
+    assert!(text.contains("succeeded"), "{text}");
+    assert!(
+        text.contains(&first_id.to_string()),
+        "the report is the first job's: {text}"
+    );
+}
+
+/// The answer bound covers the claim. With the claim's insert held behind
+/// a table lock past `timeout_secs`, the request answers 503 at the bound
+/// instead of waiting for the claim. The claim that lands later finds
+/// nobody waiting and ends its job `blocked` before any scan, so no repin
+/// runs from a request the server refused, and the slot frees.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_still_pending_at_the_bound_answers_503_and_its_late_job_never_scans() {
+    use sqlx::Connection as _;
+
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+    let mut blocker = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+    let mut lock = blocker.begin().await.expect("begin");
+    // SHARE conflicts with the claim's INSERT and with no read.
+    sqlx::query("LOCK TABLE repin_jobs IN SHARE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("hold the claim");
+
+    let started = std::time::Instant::now();
+    let request = async {
+        let answered = h
+            .schema_admin
+            .schema_repin(
+                "status",
+                "VARCHAR",
+                None,
+                true,
+                false,
+                RepinCeilings::default(),
+            )
+            .await;
+        (answered, started.elapsed())
+    };
+    let hold = async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        lock.rollback().await.expect("release the claim");
+    };
+    let ((answered, elapsed), ()) = tokio::join!(request, hold);
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "the request answered {elapsed:?} after it started, past its 1 s bound"
+    );
+    match answered {
+        Err(trawl_client::ClientError::Server { status, error }) => {
+            assert_eq!(status, 503, "{error:?}");
+            assert_eq!(error.code, trawl_api::ErrorCode::ServiceUnavailable);
+        }
+        other => panic!("a claim pending at the bound answers 503: {other:?}"),
+    }
+
+    let store = &h.server.state.storage.repin;
+    let mut late = None;
+    for _ in 0..200 {
+        if let Some(job) = store.latest().await.expect("read")
+            && job.status != RepinJobStatus::Running
+        {
+            late = Some(job);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let late = late.expect("the late claim lands and ends");
+    assert_eq!(late.status, RepinJobStatus::Blocked, "{late:?}");
+    assert!(
+        late.planned_at.is_none(),
+        "the late job never scanned: {late:?}"
+    );
+    assert_eq!(h.pinned_type("status").await, "BIGINT");
+
+    match h
+        .schema_admin
+        .schema_repin(
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RepinCeilings::default(),
+        )
+        .await
+        .expect("the slot is free again")
+    {
+        RepinStart::Report(job) => assert_eq!(job.status, "succeeded"),
+        other => panic!("a fresh dry run reports: {other:?}"),
+    }
+}
+
+/// Past the bound the trigger answers with the claimed row it already
+/// holds and reads nothing more. With every `repin_jobs` read held behind
+/// a table lock once the claim has landed, the 202 still arrives at the
+/// bound and names the job.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_answer_reads_no_job_row_after_its_bound() {
+    use sqlx::Connection as _;
+
+    let h = harness_with_query_timeout(1).await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+    TEST_SCAN_HELD.store(false, Ordering::SeqCst);
+    TEST_RELEASE_SCAN.store(false, Ordering::SeqCst);
+    TEST_HOLD_IN_SCAN.store(true, Ordering::SeqCst);
+
+    let started = std::time::Instant::now();
+    let request = async {
+        let answered = h
+            .schema_admin
+            .schema_repin(
+                "status",
+                "VARCHAR",
+                None,
+                true,
+                false,
+                RepinCeilings::default(),
+            )
+            .await;
+        (answered, started.elapsed())
+    };
+    let block_reads = async {
+        await_barrier(&TEST_SCAN_HELD, "the scan never reached a file boundary").await;
+        let mut conn = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+            .await
+            .expect("connect app db");
+        let mut lock = conn.begin().await.expect("begin");
+        sqlx::query("LOCK TABLE repin_jobs IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .expect("hold every read");
+        tokio::time::sleep(Duration::from_millis(3500).saturating_sub(started.elapsed())).await;
+        lock.rollback().await.expect("release the reads");
+    };
+    let ((answered, elapsed), ()) = tokio::join!(request, block_reads);
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "the request answered {elapsed:?} after it started, past its 1 s bound"
+    );
+    let accepted = match answered.expect("the late answer is a 202") {
+        RepinStart::Started(job) => job,
+        other => panic!("expected 202 with the claimed row, got {other:?}"),
+    };
+    assert_eq!(accepted.status, "running");
+    assert!(accepted.dry_run);
+    assert_eq!(accepted.field, "status");
+
+    TEST_RELEASE_SCAN.store(true, Ordering::SeqCst);
+    let report = h.wait_terminal(accepted.id).await;
+    assert_eq!(report.status, "succeeded", "{report:?}");
+}
+
+/// Requests that go away before their claim leave at most one claim in
+/// flight. Sixteen requests are dropped while the first one's claim is
+/// held behind a table lock, and postgres shows one claim waiting on the
+/// lock, not one per request. That claim lands once the lock goes, finds
+/// nobody to answer, and ends its job `blocked` before any scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
+    use sqlx::Connection as _;
+
+    let h = harness().await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+    let engine = h.engine();
+    let mut blocker = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+    let mut lock = blocker.begin().await.expect("begin");
+    sqlx::query("LOCK TABLE repin_jobs IN SHARE MODE")
+        .execute(&mut *lock)
+        .await
+        .expect("hold the claim");
+
+    let requester = op();
+    for _ in 0..16 {
+        let request = engine.start_within(
+            Duration::from_secs(60),
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RequestedCeilings::default(),
+            Some(&requester),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), request)
+                .await
+                .is_err(),
+            "the claim is held, so no request can answer yet"
+        );
+    }
+
+    let mut observer = sqlx::postgres::PgConnection::connect(&h.server.app_db_url)
+        .await
+        .expect("connect app db");
+    let mut most = 0_i64;
+    for _ in 0..20 {
+        // Every backend in this database waiting on any lock: the first
+        // claim waits on the table, and any other would wait on the
+        // catalog advisory lock that first claim holds.
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(DISTINCT pid) FROM pg_locks
+             WHERE NOT granted
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(&mut observer)
+        .await
+        .expect("count waiting claims");
+        most = most.max(waiting);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    lock.rollback().await.expect("release the claim");
+    assert_eq!(
+        most, 1,
+        "sixteen dropped requests must leave one claim in flight, not one each"
+    );
+
+    let store = &h.server.state.storage.repin;
+    let mut ended = None;
+    for _ in 0..200 {
+        if let Some(job) = store.latest().await.expect("read")
+            && job.status != RepinJobStatus::Running
+        {
+            ended = Some(job);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let ended = ended.expect("the one claim lands and ends");
+    assert_eq!(ended.status, RepinJobStatus::Blocked, "{ended:?}");
+    assert!(ended.planned_at.is_none(), "it never scanned: {ended:?}");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM repin_jobs")
+        .fetch_one(&mut observer)
+        .await
+        .expect("count jobs");
+    assert_eq!(rows, 1, "the dropped requests claimed one job between them");
+
+    match engine
+        .start_within(
+            Duration::from_secs(60),
+            "status",
+            "VARCHAR",
+            None,
+            true,
+            false,
+            RequestedCeilings::default(),
+            Some(&op()),
+        )
+        .await
+        .expect("the slot is free again")
+    {
+        trawl_server::repin::BoundedStart::Decided(StartOutcome::DryRun(job)) => {
+            assert_eq!(job.status, RepinJobStatus::Succeeded);
+        }
+        other => panic!("a fresh dry run reports: {other:?}"),
+    }
+}
+
 /// A scan that panics answers the request as a panic, not as an ordinary
 /// internal error (ADR-0040). The decision task itself completes normally
 /// around the panicked blocking step, so the request only hears "panic"
@@ -2818,7 +3659,7 @@ async fn a_scan_panic_reaches_the_request_as_a_panic() {
                 dry_run,
                 false,
                 RequestedCeilings::default(),
-                Some("op"),
+                Some(&op()),
             )
             .await
             .expect_err("a panicked scan fails the request");
@@ -2964,7 +3805,7 @@ async fn a_crash_between_a_cancel_request_and_its_effect_recovers_as_failed() {
         force: false,
         max_nulled_rows: None,
         max_ambiguous_rows: None,
-        requested_by: Some("op"),
+        requester: Some(&op()),
     };
     let job_id = store.claim(claim).await.expect("claim");
     let requested = store
@@ -3176,7 +4017,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
             force: true,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
-            requested_by: Some("op"),
+            requester: Some(&op()),
         })
         .await
         .expect("claim");
@@ -3587,7 +4428,7 @@ async fn a_forced_repin_proceeds_at_exactly_the_ceiling_it_accepted() {
                 max_nulled: Some(1),
                 max_ambiguous: None,
             },
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced start")
@@ -3635,7 +4476,7 @@ async fn a_ceiling_below_the_corpus_refuses_naming_accepted_and_actual() {
                 max_nulled: Some(1),
                 max_ambiguous: None,
             },
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("a refusal is an outcome, not an error")
@@ -3679,7 +4520,7 @@ async fn an_explicit_zero_ceiling_refuses_before_anything_is_staged() {
                 max_nulled: Some(0),
                 max_ambiguous: Some(0),
             },
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("a refusal is an outcome, not an error")
@@ -3718,7 +4559,7 @@ async fn boolean_force_resolves_the_ceiling_from_the_scan() {
             true,
             true,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced dry run")
@@ -3750,7 +4591,7 @@ async fn boolean_force_resolves_the_ceiling_from_the_scan() {
             false,
             true,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced execute")
@@ -3802,7 +4643,7 @@ async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
             false,
             true,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced execute")
@@ -3891,7 +4732,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
                 max_nulled: Some(0),
                 max_ambiguous: None,
             },
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("refusal")
@@ -3909,7 +4750,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
             false,
             true,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced execute")
@@ -3932,7 +4773,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
             false,
             false,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("unforced execute")
@@ -4023,7 +4864,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
             dialect: None,
             dry_run: false,
             force: false,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })

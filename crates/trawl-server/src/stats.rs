@@ -39,6 +39,8 @@ pub fn spawn_stats_emitter(
         .as_ref()
         .map(|w| w.dir().to_path_buf());
     let repin_jobs = Arc::clone(&state.repin_jobs);
+    let engine_sample = state.engine_sample.clone();
+    let scratch_dir = pool.scratch().path().to_path_buf();
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
@@ -61,7 +63,8 @@ pub fn spawn_stats_emitter(
                     let fallback_glob = fallback_glob.clone();
                     let wal_dir = wal_dir.clone();
                     let repin_jobs = Arc::clone(&repin_jobs);
-                    let retained_permits = pool.retained();
+                    let scratch_dir = scratch_dir.clone();
+                    let query = crate::metrics::QueryGauges::read(&pool, &engine_sample);
                     // Storage scans and competing collection attempts can block.
                     // Await completion so ticks never overlap and shutdown still
                     // waits for the current collection before leaving the loop.
@@ -71,7 +74,8 @@ pub fn spawn_stats_emitter(
                             &publication,
                             &fallback_glob,
                             wal_dir.as_deref(),
-                            retained_permits,
+                            &scratch_dir,
+                            query,
                             &repin_jobs,
                         );
                     })

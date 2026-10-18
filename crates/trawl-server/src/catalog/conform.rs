@@ -40,6 +40,10 @@
 //! operator's stray file is theirs), and since the corpus is then not proven
 //! conformant, completion is not published: the next boot re-runs the pass,
 //! so a transient read failure self-heals and a permanent one keeps warning.
+//! A file the pass runs out of `[ingest] compaction_memory_limit` on is left
+//! the same way and withholds completion too, but it is a resource failure
+//! (`maintenance_resource_exhausted`, ADR-0056), not a skipped path: the file
+//! is sound, and the limit is what needs raising.
 //!
 //! "Foreign" is decided by the path, before the file is ever read
 //! ([`layout_path`]): the pass rewrites a standing file in place, lossily
@@ -89,8 +93,8 @@ use trawl_core::schema::{CanonicalType, LADDER, TypeResolution, normalize_duckdb
 
 use super::FieldCatalog;
 use crate::ingest::compaction::{
-    AGG_CHUNK_COLS, ColInfo, ConformPlan, ConformPolicy, describe_source, is_valid_parquet,
-    quote_ident,
+    AGG_CHUNK_COLS, ColInfo, ConformPlan, ConformPolicy, StatementFailure, describe_source,
+    is_valid_parquet, quote_ident, structured_errors,
 };
 use crate::ingest::publication_marker::{PublicationClaims, scan_claims};
 use crate::store::{CatalogStore, FieldConflict, PinProposal, ServiceObservation};
@@ -545,8 +549,8 @@ async fn publish_completion(
             rewritten,
             skipped,
             "boot conformance pass skipped unreadable, foreign, \
-             publication-claimed or rollup-deferred paths; the corpus is not \
-             proven conformant \
+             publication-claimed or rollup-deferred paths, or paths it ran out \
+             of memory on; the corpus is not proven conformant \
              and the pass will re-run on the next boot — inspect the skipped \
              paths (queries touching them error)"
         );
@@ -643,9 +647,11 @@ fn publish_marker(data_dir: &Path, catalog_id: &str) -> Result<(), String> {
 
 /// Open an in-memory `DuckDB` connection bounded like compaction's: temp
 /// directory on the data root (spill-to-disk works on read-only container
-/// overlays), capped memory, two threads — and the UTC session zone every
+/// overlays), capped memory, two threads, the UTC session zone every
 /// conform depends on
-/// ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]).
+/// ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]) — and structured
+/// errors, so a statement that runs out of the memory limit reads as a
+/// resource failure ([`StatementFailure`]).
 pub(crate) fn open_bounded_connection(
     data_dir: &Path,
     memory_limit: &str,
@@ -664,6 +670,7 @@ pub(crate) fn open_bounded_connection(
     .map_err(|e| format!("SET memory_limit/threads failed: {e}"))?;
     conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
         .map_err(|e| format!("SET TimeZone failed: {e}"))?;
+    structured_errors(&conn)?;
     Ok(conn)
 }
 
@@ -796,9 +803,13 @@ fn scan_corpus(
         }
         match scan_file(&conn, path.clone(), &layout, pinned) {
             Ok(scan) => out.push(scan),
+            // Not proven conformant, so it counts against completion, but
+            // it is not an unreadable file: the failure is already reported
+            // as a resource failure.
+            Err(e) if e.is_out_of_memory() => skipped += 1,
             Err(e) => {
                 skipped += 1;
-                skip_file(&path, "scan", &e);
+                skip_file(&path, "scan", &e.to_string());
             }
         }
         progress.tick();
@@ -922,9 +933,11 @@ fn scan_file(
     path: PathBuf,
     layout: &LayoutPath,
     pinned: &HashMap<String, CanonicalType>,
-) -> Result<FileScan, String> {
+) -> Result<FileScan, StatementFailure> {
     if !is_valid_parquet(&path) {
-        return Err("not a parquet file (magic-byte sniff failed)".to_owned());
+        return Err("not a parquet file (magic-byte sniff failed)"
+            .to_owned()
+            .into());
     }
     let safe = path.to_string_lossy().replace('\'', "''");
     let schema = describe_source(conn, &format!("SELECT * FROM read_parquet('{safe}')"))?;
@@ -996,7 +1009,7 @@ fn count_non_null(
     safe_path: &str,
     schema: &[ColInfo],
     voting: &[usize],
-) -> Result<Vec<u64>, String> {
+) -> Result<Vec<u64>, StatementFailure> {
     let mut out = vec![0u64; schema.len()];
     for chunk in voting.chunks(AGG_CHUNK_COLS) {
         let sql = format!(
@@ -1015,7 +1028,7 @@ fn count_non_null(
                 }
                 Ok(counts)
             })
-            .map_err(|e| format!("non-null counts failed: {e}"))?;
+            .map_err(|e| StatementFailure::duckdb("non-null counts failed", &e))?;
         for (idx, count) in chunk.iter().zip(counts) {
             out[*idx] = count;
         }
@@ -1167,7 +1180,8 @@ fn corpus_observations(
 /// the count of files skipped because their rewrite failed, and the conflict
 /// evidence. A file whose footer described cleanly can still be unreadable
 /// further in (corrupt page, bit rot) — that is one skipped file, not a
-/// refusal to boot.
+/// refusal to boot. A rewrite that runs out of memory is skipped too, as a
+/// resource failure rather than `catalog_conform_skip`.
 fn rewrite_nonconforming(
     scan: &[FileScan],
     pins: &HashMap<String, CanonicalType>,
@@ -1192,7 +1206,11 @@ fn rewrite_nonconforming(
                 skipped += 1;
                 // Best effort: drop the staged rewrite so a retry starts clean.
                 let _ = std::fs::remove_file(file.path.with_extension("parquet.tmp"));
-                skip_file(&file.path, "rewrite", &e);
+                // Out of memory leaves the file unconformed, not unreadable,
+                // and is already reported as a resource failure.
+                if !e.is_out_of_memory() {
+                    skip_file(&file.path, "rewrite", &e.to_string());
+                }
             }
         }
         progress.tick();
@@ -1206,7 +1224,7 @@ fn rewrite_file(
     conn: &duckdb::Connection,
     file: &FileScan,
     pins: &HashMap<String, CanonicalType>,
-) -> Result<Option<Vec<FieldConflict>>, String> {
+) -> Result<Option<Vec<FieldConflict>>, StatementFailure> {
     let plan = ConformPlan::build(
         &file.schema,
         pins,
@@ -1246,7 +1264,7 @@ fn rewrite_file(
         plan.select_list.join(", "),
         tmp.to_string_lossy().replace('\'', "''"),
     ))
-    .map_err(|e| format!("conform rewrite failed: {e}"))?;
+    .map_err(|e| StatementFailure::duckdb("conform rewrite failed", &e))?;
     // Unlike every other staged rename in the tree, this one has no backing
     // copy: the source is the destination, and once the rename lands the
     // pre-conform file is gone. Compaction's `.tmp` is covered by the retained
@@ -1335,6 +1353,73 @@ mod tests {
                 .collect(),
             non_null: cols.iter().map(|(_, _, rows)| *rows).collect(),
         }
+    }
+
+    /// The shipped compaction memory limit is a string `DuckDB` takes, and
+    /// it reads as one binary gibibyte, not 10^9 bytes.
+    #[test]
+    fn the_default_compaction_memory_limit_is_one_gibibyte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = super::open_bounded_connection(
+            tmp.path(),
+            crate::config::DEFAULT_COMPACTION_MEMORY_LIMIT,
+        )
+        .unwrap();
+        let (limit, expected): (String, String) = conn
+            .query_row(
+                "SELECT current_setting('memory_limit'), format_bytes(1073741824)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(limit, expected);
+    }
+
+    /// A rewrite that runs out of memory is a resource failure, not a file
+    /// to skip as unreadable (ADR-0056). The file still counts as not
+    /// conformed, so the pass stays incomplete and re-runs, and it is left
+    /// exactly as it was.
+    #[test]
+    fn maintenance_out_of_memory_is_a_resource_failure_in_conform() {
+        use crate::ingest::compaction::oom_support;
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let path = data_dir.join("prod/2026-01-14/00/svc.parquet");
+        oom_support::big_parquet(&path);
+        let before = std::fs::read(&path).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        let safe = path.to_string_lossy().replace('\'', "''");
+        let schema =
+            describe_source(&conn, &format!("SELECT * FROM read_parquet('{safe}')")).unwrap();
+        let file = FileScan {
+            path: path.clone(),
+            service: "svc".to_owned(),
+            time_fallback: chrono::Utc::now(),
+            rows: 131_072,
+            non_null: vec![131_072; schema.len()],
+            schema,
+        };
+        // `message` is stored as text; a numeric pin makes the file
+        // nonconformant, so the pass must read the column to rewrite it.
+        let pins = HashMap::from([("message".to_owned(), CanonicalType::BigInt)]);
+
+        let (result, logs, exhausted) = oom_support::capture(|| {
+            super::rewrite_nonconforming(
+                std::slice::from_ref(&file),
+                &pins,
+                &data_dir,
+                oom_support::STARVED,
+            )
+        });
+
+        let (rewritten, skipped, conflicts) = result.unwrap();
+        assert_eq!((rewritten, skipped), (0, 1), "the file is not conformed");
+        assert!(conflicts.is_empty());
+        assert_eq!(exhausted, 1, "{logs}");
+        assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
+        assert!(!logs.contains("catalog_conform_skip"), "{logs}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the file is kept");
+        assert!(!path.with_extension("parquet.tmp").exists());
     }
 
     /// A near-empty column in a huge file must not outvote a fully populated

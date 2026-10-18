@@ -8,6 +8,7 @@
 //! and result extraction.
 
 use std::borrow::Cow;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,7 +23,8 @@ use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
-use crate::error::EngineError;
+use crate::error::{DuckDbDiagnostic, EngineError, missing_column};
+use crate::scratch::ScratchLock;
 use crate::timing::{Fallback, PhaseClock, QueryPhase};
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64};
 
@@ -274,35 +276,34 @@ impl Cancellable<'_> {
     }
 }
 
-/// The directory `DuckDB` spills query state under: the system temp dir.
-///
-/// The one source of that path: [`Executor::new`] makes each database's
-/// private spill directory in it, and the server's headroom measurement
-/// stats the filesystem under it (ADR-0042). A directory made in it is on
-/// its filesystem, so the two can never measure different devices.
+/// The directory a database [`Executor::new`] opens spills under: the
+/// system temp dir. trawld's query database spills into its query scratch
+/// directory instead ([`Executor::open_query_database`]), and the server's
+/// headroom measurement stats that (ADR-0056).
 #[must_use]
-pub fn spill_dir() -> std::path::PathBuf {
+fn spill_dir() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
 /// Make a directory in [`spill_dir`] that only this process's user can
 /// enter, with a fresh random name.
 fn private_spill_dir() -> std::io::Result<tempfile::TempDir> {
-    private_dir_in(&spill_dir(), |_| Ok(()))
+    crate::scratch::private_dir_in(&spill_dir(), crate::scratch::TMPDIR_SETTING, |_| Ok(()))
 }
 
-/// The `SET temp_directory` statement for `dir`.
+/// The `SET temp_directory` statement for `dir`. `setting` is what a
+/// refusal tells the operator to change.
 ///
 /// The path goes into SQL as text, so one that is not UTF-8 is refused
 /// rather than converted: a lossy conversion would point `DuckDB` at a
 /// different path than the private directory that was checked (ADR-0052).
-fn temp_directory_statement(dir: &Path) -> std::io::Result<String> {
+fn temp_directory_statement(dir: &Path, setting: &str) -> std::io::Result<String> {
     let text = dir.to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "the query spill directory {} is not valid UTF-8, so it cannot be \
-                 handed to the query engine; point TMPDIR at a path that is",
+                 handed to the query engine; point {setting} at a path that is",
                 dir.display()
             ),
         )
@@ -310,59 +311,208 @@ fn temp_directory_statement(dir: &Path) -> std::io::Result<String> {
     Ok(format!("SET temp_directory='{}'", text.replace('\'', "''")))
 }
 
-/// Make a private directory in `parent`, run `after_create` on it (tests
-/// stand in a filesystem that ignores the requested mode), then check it.
+/// Turn on `DuckDB`'s structured error diagnostics as the database's
+/// default. The setting is local by default, but a global value is what a
+/// connection without a local one reads, and a clone starts with none.
+const ERRORS_AS_JSON_SQL: &str = "SET GLOBAL errors_as_json = true";
+
+/// The budgets of the query database (ADR-0056): `DuckDB`'s
+/// `max_temp_directory_size`, `memory_limit` and `threads`.
 ///
-/// The directory is asked for at 0700, and a filesystem can still answer
-/// otherwise: a fixed-mode mount ignores the mode. So it is opened
-/// no-follow and its owner and mode are read from that handle: it must
-/// belong to this process's euid and carry no group or other bit, or it is
-/// refused and removed.
-fn private_dir_in(
-    parent: &Path,
-    after_create: impl FnOnce(&Path) -> std::io::Result<()>,
-) -> std::io::Result<tempfile::TempDir> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("trawl-spill-");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        builder.permissions(std::fs::Permissions::from_mode(0o700));
-    }
-    let dir = builder.tempdir_in(parent)?;
-    after_create(dir.path())?;
-    #[cfg(unix)]
-    check_private(dir.path(), rustix::process::geteuid().as_raw())?;
-    Ok(dir)
+/// All three are database-global, so every connection cloned from the
+/// database shares them: one query's spill counts against the cap of every
+/// other query on the same database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryBudgets {
+    /// Bytes the database may hold in its spill directory.
+    pub spill_max_bytes: NonZeroU64,
+    /// Bytes of memory `DuckDB` may manage for the database.
+    pub memory_limit: NonZeroU64,
+    /// Worker threads of the database.
+    pub threads: NonZeroU32,
 }
 
-/// Refuse the directory at `path` unless `euid` owns it and it has no group
-/// or other bit, read through a handle opened without following a symlink.
-#[cfg(unix)]
-fn check_private(path: &Path, euid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    use rustix::fs::{Mode, OFlags};
-    /// The group and other permission bits.
-    const GROUP_OTHER: u32 = 0o077;
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let handle = std::fs::File::from(rustix::fs::open(path, flags, Mode::empty())?);
-    let meta = handle.metadata()?;
-    let (owner, mode) = (meta.uid(), meta.mode() & 0o7777);
-    if owner == euid && mode & GROUP_OTHER == 0 {
-        return Ok(());
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
+impl QueryBudgets {
+    /// The `SET GLOBAL` statements that apply the budgets.
+    ///
+    /// Byte values go in as `'<n> bytes'`: `DuckDB` reads `M` and `MB` as
+    /// 1000-based, while trawl's byte sizes are 1024-based, so handing it the
+    /// configured spelling would set a different number.
+    fn statements(&self) -> String {
         format!(
-            "the query spill directory {} is not private to uid {euid}, the user \
-             trawld runs as (owner uid {}, mode {mode:04o}), so other users could \
-             read spilled query state; point TMPDIR at a directory on a \
-             filesystem that keeps Unix modes",
-            path.display(),
-            owner,
-        ),
-    ))
+            "SET GLOBAL max_temp_directory_size = '{} bytes'; \
+             SET GLOBAL memory_limit = '{} bytes'; \
+             SET GLOBAL threads = {};",
+            self.spill_max_bytes, self.memory_limit, self.threads
+        )
+    }
+
+    /// Refuse a connection that does not read the budgets back.
+    ///
+    /// `DuckDB` reads a byte setting back through its human-readable format
+    /// (`512.0 MiB`), so the comparison is with `format_bytes` of the
+    /// configured value, the same function over the same 1024 base, rather
+    /// than with the number. The format rounds, so this proves `DuckDB`
+    /// took the setting at the configured magnitude, not to the byte.
+    fn check_applied(&self, conn: &Connection) -> Result<(), EngineError> {
+        // `format_bytes` takes a signed count, so a budget past `i64::MAX`
+        // cannot be checked and is refused as unchecked.
+        let checkable = |setting: &'static str, bytes: NonZeroU64| {
+            i64::try_from(bytes.get()).map_err(|_| EngineError::BudgetNotApplied {
+                setting,
+                configured: format!("{bytes} bytes"),
+                applied: String::from("a value past what the readback can check"),
+            })
+        };
+        let spill = checkable("max_temp_directory_size", self.spill_max_bytes)?;
+        let memory = checkable("memory_limit", self.memory_limit)?;
+        let (spill_applied, spill_expected, memory_applied, memory_expected, threads, json) = conn
+            .query_row(
+                "SELECT current_setting('max_temp_directory_size'), format_bytes(?), \
+                        current_setting('memory_limit'), format_bytes(?), \
+                        current_setting('threads'), current_setting('errors_as_json')",
+                duckdb::params![spill, memory],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, bool>(5)?,
+                    ))
+                },
+            )?;
+        let mismatch = |setting, configured: String, applied: String| {
+            Err(EngineError::BudgetNotApplied {
+                setting,
+                configured,
+                applied,
+            })
+        };
+        if spill_applied != spill_expected {
+            return mismatch("max_temp_directory_size", spill_expected, spill_applied);
+        }
+        if memory_applied != memory_expected {
+            return mismatch("memory_limit", memory_expected, memory_applied);
+        }
+        if i64::from(self.threads.get()) != threads {
+            return mismatch("threads", self.threads.to_string(), threads.to_string());
+        }
+        // Not a budget, but without it an exhausted budget cannot classify
+        // as one: every failure would read as a generic database error.
+        if !json {
+            return mismatch("errors_as_json", "true".to_owned(), json.to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Reads of an executor's own connection for tests: the settings it runs
+/// under and the outcome of a statement the DSL cannot spell. Compiled for
+/// this crate's tests and the `test-support` feature only.
+#[cfg(any(test, feature = "test-support"))]
+impl Executor {
+    /// `current_setting(name)` on this connection, as text.
+    pub fn current_setting(&self, name: &str) -> Result<String, EngineError> {
+        Ok(self
+            .conn
+            .query_row("SELECT current_setting(?)::VARCHAR", [name], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Run `sql` on this connection and count the rows it returns. A
+    /// failure converts as every lane's does.
+    pub fn count_rows_for_test(&self, sql: &str) -> Result<u64, EngineError> {
+        Ok(self.raw_count_rows_for_test(sql)?)
+    }
+
+    /// Run `sql`, which answers one `BIGINT`, on this connection, as a
+    /// test reads a system table (`duckdb_temporary_files()`) beside the
+    /// queries it drives.
+    pub fn query_i64_for_test(&self, sql: &str) -> Result<i64, EngineError> {
+        Ok(self.conn.query_row(sql, [], |row| row.get(0))?)
+    }
+
+    /// [`Self::count_rows_for_test`] with the failure as `DuckDB` raised
+    /// it, before classification.
+    pub fn raw_count_rows_for_test(&self, sql: &str) -> Result<u64, duckdb::Error> {
+        let mut statement = self.conn.prepare(sql)?;
+        let mut rows = statement.query([])?;
+        let mut count = 0;
+        while rows.next()?.is_some() {
+            count += 1;
+        }
+        Ok(count)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl DiagnosticConnection {
+    /// `current_setting(name)` on this connection, as text.
+    pub fn current_setting(&self, name: &str) -> Result<String, EngineError> {
+        Ok(self
+            .conn
+            .query_row("SELECT current_setting(?)::VARCHAR", [name], |row| {
+                row.get(0)
+            })?)
+    }
+
+    /// Run `sql` in place of the sample's `SELECT 1`, discarding its rows,
+    /// so a test can make a probe overrun or fail in `DuckDB` itself.
+    pub fn select_for_test(&self, sql: &str) -> Result<(), EngineError> {
+        let mut statement = self.conn.prepare(sql)?;
+        let mut rows = statement.query([])?;
+        while rows.next()?.is_some() {}
+        Ok(())
+    }
+}
+
+/// A connection to a query database that runs only the engine sample's
+/// `SELECT 1` (ADR-0056).
+///
+/// Made by [`Executor::diagnostic_connection`]. It is its own type so the
+/// health sampler can hold it without holding a query executor, and so no
+/// pool can take it as one.
+#[derive(Debug)]
+pub struct DiagnosticConnection {
+    // Declared first, so it drops first, as in `Executor`.
+    conn: Connection,
+    _spill: Arc<Spill>,
+}
+
+impl DiagnosticConnection {
+    /// Run `SELECT 1` on the query database.
+    pub fn select_one(&self) -> Result<(), EngineError> {
+        self.conn
+            .query_row("SELECT 1", [], |_row| Ok(()))
+            .map_err(EngineError::from)
+    }
+
+    /// Get an interrupt handle for stopping an overrunning sample from
+    /// another thread.
+    pub fn interrupt_handle(&self) -> Arc<duckdb::InterruptHandle> {
+        self.conn.interrupt_handle()
+    }
+}
+
+/// What every connection to one database holds behind its connection: the
+/// database's private spill directory and, for the query database, the
+/// lock on the scratch directory that spill directory sits in (ADR-0056).
+///
+/// [`Executor`] and [`DiagnosticConnection`] declare their connection
+/// before it, so the connection closes first. The last connection of the
+/// database to close removes the spill directory and only then releases
+/// the lock. No other trawld can take the scratch directory, and with it
+/// reclaim this spill directory, while any connection to the database is
+/// open, whatever holds that connection: a pool, a worker that outlived
+/// its request and its pool, the engine sample or a detached executor.
+#[derive(Debug)]
+struct Spill {
+    // Declared first, so the directory is removed while the lock holds.
+    dir: tempfile::TempDir,
+    _scratch: Option<Arc<ScratchLock>>,
 }
 
 /// Query executor backed by an in-memory `DuckDB` connection.
@@ -371,9 +521,10 @@ pub struct Executor {
     // Declared first, so it drops first: `DuckDB` closes and removes its
     // spill files before the directory holding them goes.
     conn: Connection,
-    /// The database's private spill directory, shared with every clone
-    /// and removed when the last of them drops.
-    spill: Arc<tempfile::TempDir>,
+    /// The database's private spill directory, and the scratch lock over
+    /// it, shared with every clone and released when the last of them
+    /// drops ([`Spill`]).
+    spill: Arc<Spill>,
 }
 
 impl Executor {
@@ -394,14 +545,87 @@ impl Executor {
     /// that exits without dropping it, as on a wedged shutdown, leaves the
     /// empty directory behind; `DuckDB` deletes its own files when the
     /// database closes.
+    ///
+    /// It sets no budgets, so `DuckDB` sizes its memory and spill caps from
+    /// the host. trawld's query database is [`Self::open_query_database`].
     pub fn new() -> Result<Self, EngineError> {
+        Self::open(
+            Spill {
+                dir: private_spill_dir()?,
+                _scratch: None,
+            },
+            crate::scratch::TMPDIR_SETTING,
+            None,
+        )
+    }
+
+    /// Open the query database (ADR-0056): spill into a private directory
+    /// inside the scratch directory `scratch` locks, under `budgets`.
+    ///
+    /// The budgets are database-global and go on before anything clones
+    /// the database, so every later clone shares them. A clone then reads
+    /// each one back, and a setting `DuckDB` rejects or reads back
+    /// differently refuses the open. The spill directory is made and
+    /// checked as [`Self::new`] describes, inside the scratch directory
+    /// instead of the system temp dir.
+    ///
+    /// Every connection to the database, this one and each clone, holds
+    /// `scratch` until it closes ([`Spill`]), so the directory stays locked
+    /// for as long as any of them is open, and no longer than that unless
+    /// another holder keeps it.
+    pub fn open_query_database(
+        scratch: Arc<ScratchLock>,
+        budgets: &QueryBudgets,
+    ) -> Result<Self, EngineError> {
+        let dir = scratch.scratch().private_spill_dir()?;
+        let root = Self::open(
+            Spill {
+                dir,
+                _scratch: Some(scratch),
+            },
+            crate::scratch::SCRATCH_SETTING,
+            Some(budgets),
+        )?;
+        budgets.check_applied(&root.try_clone()?.conn)?;
+        Ok(root)
+    }
+
+    /// Open an in-memory database spilling into `spill`, with `budgets` if
+    /// given, then configure its first connection.
+    ///
+    /// `errors_as_json` goes on first, as the database's default, so every
+    /// error from this database and its clones carries the structured
+    /// diagnostic the error classification reads ([`DuckDbDiagnostic`]),
+    /// including a refused budget below.
+    fn open(
+        spill: Spill,
+        setting: &str,
+        budgets: Option<&QueryBudgets>,
+    ) -> Result<Self, EngineError> {
         let conn = Connection::open_in_memory()?;
-        let spill = private_spill_dir()?;
-        conn.execute_batch(&temp_directory_statement(spill.path())?)?;
+        conn.execute_batch(ERRORS_AS_JSON_SQL)?;
+        conn.execute_batch(&temp_directory_statement(spill.dir.path(), setting)?)?;
+        if let Some(budgets) = budgets {
+            conn.execute_batch(&budgets.statements())?;
+        }
         Self::configure(&conn)?;
         Ok(Self {
             conn,
             spill: Arc::new(spill),
+        })
+    }
+
+    /// Clone the connection the engine sample runs on (ADR-0056).
+    ///
+    /// It shares this database, and so its budgets and spill directory,
+    /// but it is a [`DiagnosticConnection`], not an [`Executor`]: it runs
+    /// `SELECT 1` and nothing else, so it can never join a query pool.
+    pub fn diagnostic_connection(&self) -> Result<DiagnosticConnection, EngineError> {
+        let conn = self.conn.try_clone()?;
+        Self::configure(&conn)?;
+        Ok(DiagnosticConnection {
+            conn,
+            _spill: Arc::clone(&self.spill),
         })
     }
 
@@ -460,13 +684,6 @@ impl Executor {
             cancel,
             clock: PhaseClock::off(),
         }
-    }
-
-    /// Lightweight health check: runs `SELECT 1` to verify the connection is alive.
-    pub fn ping(&self) -> Result<(), EngineError> {
-        self.conn
-            .query_row("SELECT 1", [], |_row| Ok(()))
-            .map_err(EngineError::from)
     }
 
     /// Full pipeline: parse DSL, emit SQL, execute.
@@ -1441,25 +1658,38 @@ fn value_to_json(v: &Value) -> serde_json::Value {
     }
 }
 
-/// `DuckDB`'s "no matching files" message. Matched as text, so a `DuckDB`
-/// upgrade has to re-check it; the outcome-policy tests below provoke the
-/// real error against the bundled build.
+/// `DuckDB`'s "no matching files" message, carried by a
+/// [`DUCKDB_IO_ERROR`] diagnostic. Matched as text, so a `DuckDB` upgrade has to re-check it;
+/// the outcome-policy tests below provoke the real error against the
+/// bundled build.
 const DUCKDB_NO_FILES_MSG: &str = "No files found that match the pattern";
-/// `DuckDB`'s binder-error class prefix, matched as text for the same reason.
-const DUCKDB_BINDER_ERROR_MSG: &str = "Binder Error";
+/// `DuckDB`'s exception type for a failed file operation.
+const DUCKDB_IO_ERROR: &str = "IO";
+/// `DuckDB`'s exception type for a failed cast.
+const DUCKDB_CONVERSION_ERROR: &str = "Conversion";
 
 /// Check if a `DuckDB` error is the "No files found" error from `read_parquet()`
 /// when a glob matches zero files. Semantically this means "no data" — not a
 /// server error.
+///
+/// Reads the structured diagnostic: an `IO` exception whose message is
+/// the no-files message. The same words under another type (a table named
+/// after them, say) are not this error.
 fn is_no_files_error(e: &duckdb::Error) -> bool {
-    e.to_string().contains(DUCKDB_NO_FILES_MSG)
+    DuckDbDiagnostic::of(e).is_some_and(|d| {
+        d.exception_type == DUCKDB_IO_ERROR && d.exception_message.contains(DUCKDB_NO_FILES_MSG)
+    })
 }
 
 /// Check if a `DuckDB` error is a binder error about a missing column. This is
 /// a user error (querying a nonexistent field), not a server error.
+///
+/// Read off the structured diagnostic alone ([`missing_column`]): the
+/// `Binder` type with the `COLUMN_NOT_FOUND` subtype. A type failure over a
+/// column the input has (`sum` over text, say) is the `NO_MATCHING_FUNCTION`
+/// subtype, so it is a database error whatever the column is called.
 fn is_binder_column_error(e: &duckdb::Error) -> bool {
-    let msg = e.to_string();
-    msg.contains(DUCKDB_BINDER_ERROR_MSG) && (msg.contains("column") || msg.contains("not found"))
+    missing_column(e).is_some()
 }
 
 /// The `DuckDB` types a `timechart` bucket source may have: the
@@ -1604,11 +1834,12 @@ fn validate_timechart_inputs(
 /// Rather than trust the error message (a missing `_raw` and a genuinely
 /// unknown field read the same), this asks for evidence: re-run with the
 /// `_raw` side bound to a typed NULL, and take that result only if it binds.
-/// If it fails too, the missing column was the user's, so the original error
-/// is what they see — unless the retry came back with something only it could
-/// know: a cancellation, or a refusal it proved against the relation the
-/// caller meant. The parameter list is identical between the two SQL strings
-/// (ADR-0009).
+/// If it fails to bind a column too, the missing column was the user's, so
+/// the original error is what they see. Any other outcome of the retry is
+/// its own answer, failures included: a cancellation, a refusal it proved
+/// against the relation the caller meant, an exhausted query budget
+/// (ADR-0056), a result past its cap. The parameter list is identical
+/// between the two SQL strings (ADR-0009).
 ///
 /// Costs nothing on the success path, and nothing for queries without a text
 /// search — `raw_free_sql` is `None` there.
@@ -1634,20 +1865,21 @@ fn with_raw_fallback<T>(
         raw_free_timechart_input_checks: Vec::new(),
         ..query.clone()
     };
-    attempt(&fallback).map_err(|e| match e {
-        // A cancellation the retry hit is its own answer: reporting the
-        // first attempt's missing-column error would tell the caller its
-        // query was wrong when the caller is the one who stopped it.
-        //
-        // So is a refusal, and for the same reason one level down: the
-        // retry is the attempt that bound the relation the caller meant,
-        // and it asked `DuckDB` about the column the caller named. The
-        // first attempt's error is about `_raw`, which is trawl's column
-        // and not theirs — and it is an `Emit`, so handing it back would
-        // also route a proven-wrong query into the hot lanes' benign
-        // binder policy.
-        EngineError::Cancelled | EngineError::Refused { .. } => e,
-        _ => err,
+    // Only a retry that also failed to bind a column hands back the first
+    // attempt's error. Every other failure is the retry's own answer: the
+    // first attempt's error is about `_raw`, which is trawl's column and
+    // not the caller's, and it is a missing column, which the hot lanes
+    // answer from the hot buffer alone. Handed back in place of a
+    // cancellation, it tells the caller their query was wrong when they
+    // stopped it; in place of a refusal, an exhausted budget or any other
+    // failure past the bind, it answers a 400, or a 200 without the cold
+    // rows, for a query whose real answer is that failure.
+    attempt(&fallback).map_err(|e| {
+        if is_missing_column_failure(&e) {
+            err
+        } else {
+            e
+        }
     })
 }
 
@@ -1671,23 +1903,25 @@ fn is_missing_column_failure(e: &EngineError) -> bool {
     }
 }
 
-/// Leading `"<Class> Error"` token of a `DuckDB` message — `"Conversion"`
-/// for `"Conversion Error: ..."`, `"Binder"` for `"Binder Error: ..."`.
+/// The exception type of a `DuckDB` error — `"Conversion"` for a failed
+/// cast, `"Binder"` for a statement that does not bind — read from its
+/// structured diagnostic.
 ///
-/// `DuckDB` prefixes every exception with its class, so the token is
-/// structured information carried through the message. Returns `None` when
-/// the message does not lead with a class token (e.g. non-database
-/// `duckdb::Error` variants).
-fn error_class(msg: &str) -> Option<&str> {
-    msg.split(':').next()?.strip_suffix(" Error")
+/// Returns `None` when the error carries no diagnostic: a non-database
+/// `duckdb::Error` variant, a connection without `errors_as_json`, or a
+/// message that does not parse.
+fn error_class(e: &duckdb::Error) -> Option<String> {
+    DuckDbDiagnostic::of(e).map(|d| d.exception_type)
 }
 
 /// Check if a `DuckDB` error carries the `Conversion` class — the class every
 /// failed cast reports, whether its cause is a *schema* the sources cannot
 /// reconcile or a *value* that cannot be converted.
 ///
-/// Keys off the error's class token (never a substring match anywhere in the
-/// body — ADR-0008). Every irreconcilable kind mix raises this class on the
+/// Keys off the diagnostic's `exception_type` (never a substring match
+/// anywhere in the body — ADR-0008), so the error must come from a
+/// connection with `errors_as_json` on, as every executor's is; any other
+/// answers `false`. Every irreconcilable kind mix raises this class on the
 /// bundled `DuckDB` 1.5.5, on both the `UNION ALL BY NAME` path and the
 /// `read_parquet(union_by_name)` per-file remap path (pinned by
 /// `conflicting_kind_mixes_all_carry_the_conversion_class`).
@@ -1708,7 +1942,7 @@ fn error_class(msg: &str) -> Option<&str> {
 /// file") or missing-column binder errors: those are handled by quarantine
 /// and the benign-binder carve-out respectively.
 pub fn is_conversion_error(e: &duckdb::Error) -> bool {
-    error_class(&e.to_string()) == Some("Conversion")
+    error_class(e).as_deref() == Some(DUCKDB_CONVERSION_ERROR)
 }
 
 /// Classification of a read's outcome, shared by all four entry points.
@@ -1852,7 +2086,9 @@ fn classify_query_outcome(
         // with the empty-result UX would hide it behind a 200.
         Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
-        // Refused, ResultTooLarge, parse, IO — propagate.
+        // Refused, ResultTooLarge, AggregationCapped, ResourceExhausted, parse, IO —
+        // propagate. An exhausted budget is shared by every query on the
+        // database, so a hot-only retry would only spend it again.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -1873,6 +2109,8 @@ fn classify_export_outcome(outcome: &Result<(), EngineError>) -> HotColdOutcome 
         // below — an export that swallowed it would write the file.
         Err(EngineError::Emit(_)) => HotColdOutcome::BenignBinder,
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
+        // As on the query lane, an exhausted budget is never retried
+        // hot-only.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
@@ -2080,20 +2318,16 @@ fn glob_list_items(source: &str) -> Option<Vec<&str>> {
 
 /// Remap a `DuckDB` binder error about missing columns to `EngineError::Emit`
 /// so it surfaces as HTTP 400 instead of 500.
+///
+/// Called only on an error [`is_binder_column_error`] accepted, so its
+/// diagnostic names the column, and the refusal names it too. The column is
+/// the query's own field name, so it crosses the trust boundary intact.
 fn remap_binder_error(e: &duckdb::Error) -> EngineError {
-    let msg = e.to_string();
-    // try to extract the field name from the error message
-    let user_msg = if let Some(start) = msg.find('"') {
-        if let Some(end) = msg[start + 1..].find('"') {
-            let field = &msg[start + 1..start + 1 + end];
-            format!("unknown field: {field}")
-        } else {
-            format!("unknown field in query: {msg}")
-        }
-    } else {
-        format!("unknown field in query: {msg}")
-    };
-    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message: user_msg })
+    let message = missing_column(e).map_or_else(
+        || "unknown field in query".to_owned(),
+        |field| format!("unknown field: {field}"),
+    );
+    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message })
 }
 
 /// Convert trawl-core `SqlValue` params into duckdb `ToSql` trait objects.
@@ -2493,11 +2727,13 @@ fn an_executor_spills_into_a_private_directory_of_its_own() {
 fn a_spill_path_that_is_not_utf8_is_refused() {
     use std::os::unix::ffi::OsStrExt as _;
     let dir = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/trawl-spill-\xff"));
-    let error = temp_directory_statement(dir).expect_err("a non-UTF-8 spill path");
+    let error = temp_directory_statement(dir, crate::scratch::TMPDIR_SETTING)
+        .expect_err("a non-UTF-8 spill path");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("TMPDIR"), "{error}");
     assert_eq!(
-        temp_directory_statement(Path::new("/tmp/it's")).expect("a UTF-8 path"),
+        temp_directory_statement(Path::new("/tmp/it's"), crate::scratch::TMPDIR_SETTING)
+            .expect("a UTF-8 path"),
         "SET temp_directory='/tmp/it''s'"
     );
 }
@@ -2511,11 +2747,12 @@ fn a_spill_directory_left_open_is_refused() {
     use std::os::unix::fs::PermissionsExt as _;
     let parent = tempfile::tempdir().expect("parent");
     let mut made = None;
-    let error = private_dir_in(parent.path(), |dir| {
-        made = Some(dir.to_owned());
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
-    })
-    .expect_err("a 0755 spill directory");
+    let error =
+        crate::scratch::private_dir_in(parent.path(), crate::scratch::TMPDIR_SETTING, |dir| {
+            made = Some(dir.to_owned());
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+        })
+        .expect_err("a 0755 spill directory");
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     let text = error.to_string();
     assert!(text.contains("mode 0755"), "{text}");
@@ -2531,10 +2768,12 @@ fn a_spill_directory_left_open_is_refused() {
 #[test]
 fn a_spill_directory_another_user_owns_is_refused() {
     let parent = tempfile::tempdir().expect("parent");
-    let dir = private_dir_in(parent.path(), |_| Ok(())).expect("private");
+    let setting = crate::scratch::TMPDIR_SETTING;
+    let dir = crate::scratch::private_dir_in(parent.path(), setting, |_| Ok(())).expect("private");
     let euid = rustix::process::geteuid().as_raw();
-    check_private(dir.path(), euid).expect("its own");
-    let error = check_private(dir.path(), euid.wrapping_add(1)).expect_err("another uid");
+    crate::scratch::check_private(dir.path(), euid, setting).expect("its own");
+    let error = crate::scratch::check_private(dir.path(), euid.wrapping_add(1), setting)
+        .expect_err("another uid");
     assert!(error.to_string().contains("mode 0700"), "{error}");
 }
 
@@ -2989,6 +3228,42 @@ fn raw_free_retry_still_reports_the_original_missing_column() {
     }
 }
 
+/// A retry that binds and then fails answers with its own failure. The
+/// first attempt's missing `_raw` is a column of trawl's, and handing it
+/// back for a query the retry proved binds would answer a 400 for an
+/// exhausted budget or a result past its cap, and send the hot lanes into
+/// their hot-only fallback, a 200 without the cold rows (ADR-0056).
+#[cfg(test)]
+#[test]
+fn a_failure_past_the_raw_free_bind_is_the_retry_s_answer() {
+    let emitted = raw_fallback_query();
+    for retry_error in [
+        EngineError::ResourceExhausted,
+        EngineError::ResultTooLarge(10),
+    ] {
+        let expected = retry_error.to_string();
+        let retry_error = std::cell::Cell::new(Some(retry_error));
+        let attempts = std::cell::Cell::new(0_u32);
+        let outcome: Result<(), EngineError> =
+            with_raw_fallback(&emitted, &PhaseClock::off(), |_| {
+                attempts.set(attempts.get() + 1);
+                Err(if attempts.get() == 1 {
+                    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+                        message: "unknown field: _raw".to_owned(),
+                    })
+                } else {
+                    retry_error.take().expect("one retry")
+                })
+            });
+        assert_eq!(attempts.get(), 2, "{expected}: both passes ran");
+        assert_eq!(
+            outcome.map_err(|e| e.to_string()),
+            Err(expected.clone()),
+            "the retry's own failure"
+        );
+    }
+}
+
 /// A refusal does not provoke the retry in the first place.
 ///
 /// The retry asks a question about evidence — does this query bind
@@ -3166,6 +3441,14 @@ mod tests {
     use crate::cancel::CancelLatch;
     use crate::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase, Transition};
 
+    /// A connection with `DuckDB`'s structured diagnostics on, as every
+    /// executor's is, for provoking the errors the classifiers read.
+    fn json_errors_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(super::ERRORS_AS_JSON_SQL).unwrap();
+        conn
+    }
+
     /// Write a one-row parquet file whose `meta` column has the given SQL
     /// type/value expression (e.g. `{'a': 1}` for a `STRUCT`, `'plain'` for a
     /// `VARCHAR`). Mirrors the cold-fixture shape used in `integration.rs`.
@@ -3183,7 +3466,7 @@ mod tests {
     /// reading two files where `meta` is `STRUCT` in one and `VARCHAR` in the
     /// other. Returns the raw `DuckDB` error.
     fn read_parquet_remap_error(dir: &Path) -> duckdb::Error {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = json_errors_conn();
         let struct_file = dir.join("struct.parquet");
         let varchar_file = dir.join("varchar.parquet");
         write_meta_parquet(&conn, &struct_file, "{'a': 1}");
@@ -3201,7 +3484,7 @@ mod tests {
     /// Provoke a live `UNION ALL BY NAME` Conversion error: a `STRUCT` column
     /// unioned with a `VARCHAR` column of the same name.
     fn union_conversion_error() -> duckdb::Error {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = json_errors_conn();
         conn.prepare("SELECT {'a': 1} AS meta UNION ALL BY NAME SELECT 'plain' AS meta")
             .and_then(|mut stmt| {
                 let mut rows = stmt.query([])?;
@@ -3214,7 +3497,7 @@ mod tests {
     /// Provoke a live "too small to be a Parquet file" corruption error by
     /// pointing `read_parquet` at a file with valid head magic but no trailer.
     fn corruption_error(dir: &Path) -> duckdb::Error {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = json_errors_conn();
         let bad = dir.join("truncated.parquet");
         std::fs::write(&bad, b"PAR1\x00\x00").unwrap();
         let path = format!("{}", bad.display());
@@ -3229,7 +3512,7 @@ mod tests {
 
     /// Provoke a benign binder / missing-column error.
     fn benign_binder_error() -> duckdb::Error {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = json_errors_conn();
         conn.prepare("SELECT nonexistent_col FROM (SELECT 1 AS x)")
             .and_then(|mut stmt| {
                 let mut rows = stmt.query([])?;
@@ -3242,7 +3525,7 @@ mod tests {
     /// Provoke a live *data*-conversion error: a value that cannot be
     /// converted, with no schema disagreement anywhere in sight.
     fn data_conversion_error() -> duckdb::Error {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = json_errors_conn();
         conn.prepare("SELECT CAST(x AS INTEGER) FROM (SELECT unnest(['1', 'abc']) AS x)")
             .and_then(|mut stmt| {
                 let mut rows = stmt.query([])?;
@@ -3293,7 +3576,7 @@ mod tests {
         // loud.
         let data = data_conversion_error();
         assert_eq!(
-            error_class(&data.to_string()),
+            error_class(&data).as_deref(),
             Some("Conversion"),
             "a genuine data-conversion error is Conversion-class too: {data}"
         );
@@ -3317,7 +3600,7 @@ mod tests {
         ];
         for (a, b) in mixes {
             let dir = tempfile::tempdir().unwrap();
-            let conn = Connection::open_in_memory().unwrap();
+            let conn = json_errors_conn();
             write_meta_parquet(&conn, &dir.path().join("a.parquet"), a);
             write_meta_parquet(&conn, &dir.path().join("b.parquet"), b);
             let glob = format!("{}/*.parquet", dir.path().display());
@@ -3513,8 +3796,8 @@ mod tests {
 
     #[test]
     fn duckdb_error_classes_parsed_from_live_errors() {
-        // The classifier keys off DuckDB's leading "<Class> Error" token, so
-        // pin the class each live-provoked error actually carries (verified
+        // The classifier keys off the diagnostic's exception type, so pin
+        // the class each live-provoked error actually carries (verified
         // against the bundled crate — the four ADR-0008 trigger variants all
         // produce this Conversion class, see conversion_error_class below).
         let dir = tempfile::tempdir().unwrap();
@@ -3523,32 +3806,32 @@ mod tests {
         // Conversion-class error ("failed to cast column ..."), not a Binder
         // "Struct remap" one, which is why the classifier needs no Binder
         // arm at all.
-        let remap_msg = read_parquet_remap_error(dir.path()).to_string();
+        let remap = read_parquet_remap_error(dir.path());
         assert_eq!(
-            error_class(&remap_msg),
+            error_class(&remap).as_deref(),
             Some("Conversion"),
-            "read_parquet remap error carries the Conversion class: {remap_msg}"
+            "read_parquet remap error carries the Conversion class: {remap}"
         );
 
-        let conversion_msg = union_conversion_error().to_string();
+        let conversion = union_conversion_error();
         assert_eq!(
-            error_class(&conversion_msg),
+            error_class(&conversion).as_deref(),
             Some("Conversion"),
-            "UNION ALL BY NAME conflict carries the Conversion class: {conversion_msg}"
+            "UNION ALL BY NAME conflict carries the Conversion class: {conversion}"
         );
 
-        let corrupt_msg = corruption_error(dir.path()).to_string();
+        let corrupt = corruption_error(dir.path());
         assert_ne!(
-            error_class(&corrupt_msg),
+            error_class(&corrupt).as_deref(),
             Some("Conversion"),
-            "corruption must not carry the Conversion class: {corrupt_msg}"
+            "corruption must not carry the Conversion class: {corrupt}"
         );
 
-        let benign_msg = benign_binder_error().to_string();
+        let benign = benign_binder_error();
         assert_eq!(
-            error_class(&benign_msg),
+            error_class(&benign).as_deref(),
             Some("Binder"),
-            "missing-column error carries the Binder class: {benign_msg}"
+            "missing-column error carries the Binder class: {benign}"
         );
     }
 
@@ -3562,7 +3845,7 @@ mod tests {
     #[test]
     fn trigger_variants_produce_conversion_class_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = json_errors_conn();
         let variants = [
             r#""not-a-date""#,
             r#""2026-13-45T99:99:99Z""#,
@@ -3586,11 +3869,10 @@ mod tests {
                     Ok(())
                 })
                 .expect_err("a hard CAST over a malformed timestamp must error");
-            let msg = err.to_string();
             assert_eq!(
-                error_class(&msg),
+                error_class(&err).as_deref(),
                 Some("Conversion"),
-                "variant {variant} must carry the Conversion class: {msg}"
+                "variant {variant} must carry the Conversion class: {err}"
             );
         }
     }
@@ -4656,5 +4938,453 @@ mod tests {
                 QueryPhase::Copy,
             ])
         );
+    }
+}
+
+/// The classification of `DuckDB` errors by their structured diagnostic
+/// (ADR-0056), against the bundled build: every executor connection
+/// reports diagnostics, both budgets fail as [`EngineError::ResourceExhausted`],
+/// and the ported no-files and binder-column fallbacks keep their answers.
+#[cfg(test)]
+mod structured_error_classification {
+    use std::num::{NonZeroU32, NonZeroU64};
+
+    use super::{
+        ColdAction, ColdPresence, EngineError, Executor, FieldTypes, HotColdOutcome, HotLane,
+        QueryBudgets, classify_export_outcome, classify_query_outcome, cold_action,
+        is_binder_column_error, is_no_files_error, remap_binder_error,
+    };
+    use crate::scratch::ScratchLock;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// A query database in a fresh scratch directory under these budgets.
+    fn query_database(spill: u64, memory: u64) -> (tempfile::TempDir, Executor) {
+        let parent = tempfile::tempdir().expect("scratch parent");
+        let scratch = ScratchLock::open(&parent.path().join("query-scratch")).expect("scratch");
+        let budgets = QueryBudgets {
+            spill_max_bytes: NonZeroU64::new(spill).unwrap(),
+            memory_limit: NonZeroU64::new(memory).unwrap(),
+            threads: NonZeroU32::new(2).unwrap(),
+        };
+        let exec = Executor::open_query_database(std::sync::Arc::new(scratch), &budgets)
+            .expect("the query database opens");
+        (parent, exec)
+    }
+
+    /// The raw error `sql` raises on `exec`'s own connection, rows drained.
+    fn raw_error(exec: &Executor, sql: &str) -> duckdb::Error {
+        exec.conn
+            .prepare(sql)
+            .and_then(|mut stmt| {
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {}
+                Ok(())
+            })
+            .expect_err(sql)
+    }
+
+    /// A full sort of two million 64-character keys, answered with one
+    /// row, so the sort has to spill and the result never needs memory.
+    const SPILLING_SORT: &str = "SELECT max(rn) FROM (SELECT row_number() OVER (ORDER BY s) AS rn \
+         FROM (SELECT md5(i::VARCHAR) || md5((i + 1)::VARCHAR) AS s FROM range(2000000) t(i)))";
+
+    /// One 66 MB string: an aggregate state `DuckDB` cannot spill.
+    const UNSPILLABLE_AGGREGATE: &str =
+        "SELECT length(string_agg(md5(i::VARCHAR), ',')) FROM range(2000000) t(i)";
+
+    #[test]
+    fn every_connection_reports_structured_diagnostics() {
+        let (_scratch, query_db) = query_database(64 * MIB, 64 * MIB);
+        let plain = Executor::new().expect("executor");
+        let diagnostic = query_db.diagnostic_connection().expect("diagnostic");
+        for (name, exec) in [
+            ("query database", &query_db),
+            (
+                "query database clone",
+                &query_db.try_clone().expect("clone"),
+            ),
+            ("executor", &plain),
+            ("executor clone", &plain.try_clone().expect("clone")),
+        ] {
+            assert_eq!(
+                exec.current_setting("errors_as_json").unwrap(),
+                "true",
+                "{name}"
+            );
+            let error = raw_error(exec, "SELECT nonexistent_col FROM (SELECT 1 AS x)");
+            assert!(
+                crate::error::DuckDbDiagnostic::of(&error).is_some(),
+                "{name}: {error}"
+            );
+        }
+        assert_eq!(
+            diagnostic.current_setting("errors_as_json").unwrap(),
+            "true"
+        );
+    }
+
+    #[test]
+    fn a_real_spill_cap_failure_is_resource_exhausted() {
+        let (_scratch, exec) = query_database(4 * MIB, 32 * MIB);
+        let raw = raw_error(&exec, SPILLING_SORT);
+        let shown = raw.to_string();
+        assert!(
+            shown.contains("failed to offload data block")
+                && shown.contains("max_temp_directory_size"),
+            "the spill cap, not memory, stopped it: {shown}"
+        );
+        assert!(
+            matches!(EngineError::from(raw), EngineError::ResourceExhausted),
+            "{shown}"
+        );
+        assert!(matches!(
+            exec.count_rows_for_test(SPILLING_SORT),
+            Err(EngineError::ResourceExhausted)
+        ));
+        exec.count_rows_for_test("SELECT 1")
+            .expect("the database answers a small query after the failure");
+    }
+
+    #[test]
+    fn a_real_memory_limit_failure_is_resource_exhausted() {
+        let (_scratch, exec) = query_database(512 * MIB, 8 * MIB);
+        let raw = raw_error(&exec, UNSPILLABLE_AGGREGATE);
+        let shown = raw.to_string();
+        assert!(
+            !shown.contains("offload") && shown.contains("Out of Memory"),
+            "memory, not the spill cap, stopped it: {shown}"
+        );
+        assert!(
+            matches!(EngineError::from(raw), EngineError::ResourceExhausted),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_no_files_fallback_reads_the_io_diagnostic() {
+        let exec = Executor::new().expect("executor");
+        let dir = tempfile::tempdir().expect("dir");
+        let glob = format!("{}/*.parquet", dir.path().display());
+        let no_files = raw_error(&exec, &format!("SELECT * FROM read_parquet('{glob}')"));
+        assert!(is_no_files_error(&no_files), "{no_files}");
+        // The same words as a table name are a Catalog error, not this one.
+        let named = raw_error(
+            &exec,
+            r#"SELECT * FROM "No files found that match the pattern""#,
+        );
+        assert!(
+            named
+                .to_string()
+                .contains("No files found that match the pattern")
+        );
+        assert!(!is_no_files_error(&named), "{named}");
+    }
+
+    #[test]
+    fn the_binder_column_fallback_reads_the_binder_diagnostic() {
+        let exec = Executor::new().expect("executor");
+        let binder = raw_error(&exec, "SELECT nonexistent_col FROM (SELECT 1 AS x)");
+        assert!(is_binder_column_error(&binder), "{binder}");
+        let remapped = remap_binder_error(&binder);
+        assert_eq!(
+            remapped.to_string(),
+            "emit error: unsupported operation: unknown field: nonexistent_col"
+        );
+        // A message about a column under another type is not a binder error.
+        let catalog = raw_error(&exec, r#"SELECT * FROM "Binder Error: column not found""#);
+        assert!(!is_binder_column_error(&catalog), "{catalog}");
+    }
+
+    /// A failure is the binder-column fallback only when its diagnostic is
+    /// a `Binder` exception with the `COLUMN_NOT_FOUND` subtype and the
+    /// column's `name`. Nothing reads the message text. So a diagnostic of
+    /// another type or subtype, or with no subtype, a malformed one, text
+    /// with no diagnostic and the driver's own variants never take it, live
+    /// or planted, whatever their message says. The binder failures over a
+    /// missing name that `DuckDB` 1.5.5 raises without the subtype (the
+    /// `EXCLUDE` and `REPLACE` lists, a struct key, a table) do not either.
+    #[test]
+    fn a_malformed_or_non_binder_diagnostic_is_never_the_fallback() {
+        fn failure(message: &str) -> duckdb::Error {
+            duckdb::Error::DuckDBFailure(duckdb::ffi::Error::new(1), Some(message.to_owned()))
+        }
+        let exec = Executor::new().expect("executor");
+        let found = failure(
+            r#"{"exception_type":"Binder","exception_message":"Referenced column \"nope\" not found in FROM clause!","error_subtype":"COLUMN_NOT_FOUND","name":"nope","position":"7"}"#,
+        );
+        assert!(is_binder_column_error(&found), "{found}");
+        assert_eq!(
+            remap_binder_error(&found).to_string(),
+            "emit error: unsupported operation: unknown field: nope"
+        );
+        let renamed = failure(
+            r#"{"exception_type":"Binder","exception_message":"Referenced column \"other\" not found","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}"#,
+        );
+        assert_eq!(
+            remap_binder_error(&renamed).to_string(),
+            "emit error: unsupported operation: unknown field: nope",
+            "the field is the diagnostic's name, not a quoted word of its text"
+        );
+
+        let never = [
+            raw_error(&exec, "SELECT * EXCLUDE (nope) FROM (SELECT 1 AS x)"),
+            raw_error(&exec, "SELECT * REPLACE (1 AS nope) FROM (SELECT 1 AS x)"),
+            raw_error(&exec, "SELECT struct_extract({'a': 1}, 'nope')"),
+            raw_error(&exec, "SELECT nope.x FROM (SELECT 1 AS x)"),
+            raw_error(&exec, "SELECT sum(mycolumn) FROM (SELECT 'a' AS mycolumn)"),
+            raw_error(&exec, r#"SELECT * FROM "Referenced column not found""#),
+            raw_error(
+                &exec,
+                r#"SELECT error('{"exception_type":"Binder","error_subtype":"COLUMN_NOT_FOUND"}')"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"Referenced column \"nope\" not found in FROM clause!"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"column not found","error_subtype":"NO_MATCHING_FUNCTION","name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Catalog","exception_message":"column not found","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"column_not_found","name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":["COLUMN_NOT_FOUND"],"name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND","name":7}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"NO_MATCHING_FUNCTION","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}"#,
+            ),
+            failure(
+                r#"[{"exception_type":"Binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}]"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND","name":"nope"} trailing"#,
+            ),
+            failure(r#"Binder Error: Referenced column "nope" not found in FROM clause!"#),
+            duckdb::Error::DuckDBFailure(duckdb::ffi::Error::new(1), None),
+            duckdb::Error::InvalidColumnName("Binder Error: column not found".into()),
+        ];
+        for error in never {
+            assert!(!is_binder_column_error(&error), "{error:?}");
+        }
+    }
+
+    /// The cold query lane answers a binder failure as the unknown-field
+    /// refusal only when a column is missing, and names the column the
+    /// diagnostic names.
+    ///
+    /// Changed on purpose from b02b8acf. That fallback read `DuckDB`'s text
+    /// form, which ends with the statement line, so a type failure on a line
+    /// that said "column" was the unknown-field 400, naming the first quoted
+    /// identifier (`sum(column_name) by hostname` named `hostname`), and the
+    /// same failure over another field was a 500. A type failure is now a
+    /// database error whatever its fields are called, because its diagnostic
+    /// has the `NO_MATCHING_FUNCTION` subtype.
+    #[test]
+    fn only_a_missing_column_is_an_unknown_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = super::timechart_fixture(&dir);
+        let (_scratch, exec) = query_database(64 * MIB, 64 * MIB);
+        let run = |dsl: &str| exec.run_query(dsl, &source, &FieldTypes::new(), usize::MAX, 0);
+        for (dsl, field) in [
+            ("* | stats sum(nope)", "nope"),
+            ("* | stats sum(nope) by hostname", "nope"),
+            ("* | let x = nope * 2", "nope"),
+            ("* | fields nope", "nope"),
+            ("* | sort nope", "nope"),
+            ("nope=1", "nope"),
+            ("* | stats count() by nope", "nope"),
+            ("* | timechart on nope count()", "nope"),
+            ("* | stats sum(no_column)", "no_column"),
+        ] {
+            match run(dsl) {
+                Err(EngineError::Emit(e)) => assert_eq!(
+                    e.to_string(),
+                    format!("unsupported operation: unknown field: {field}"),
+                    "{dsl}"
+                ),
+                other => panic!("{dsl}: expected the unknown-field refusal, got {other:?}"),
+            }
+        }
+        for dsl in [
+            "* | stats sum(column_name)",
+            "* | stats avg(column_name)",
+            "* | stats sum(column_name) by hostname",
+            "* | let x = column_name * 2",
+            "* | stats sum(hostname)",
+            "* | stats avg(hostname)",
+            "* | let x = hostname * 2",
+            "* | let x = lower(n)",
+            "* | where hostname > 5",
+        ] {
+            let outcome = run(dsl);
+            assert!(
+                matches!(outcome, Err(EngineError::Database(_))),
+                "{dsl}: {outcome:?}"
+            );
+        }
+    }
+
+    /// The hot lanes retry hot-only for a column the cold data lacks, and
+    /// not for a type failure over a column it has.
+    ///
+    /// Changed on purpose from b02b8acf, where summing a cold text field
+    /// whose name says "column" read as a missing column, because the
+    /// statement line said "column", and the hot-only read answered from
+    /// the hot buffer alone. It dropped the cold rows without saying so. The
+    /// type failure is now a database error, and with cold files present
+    /// the lanes return it. A field only the hot buffer carries still
+    /// reaches it.
+    #[test]
+    fn a_type_failure_over_cold_data_does_not_reach_the_hot_buffer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = super::timechart_fixture(&dir);
+        let hot = dir.path().join("hot.ndjson");
+        std::fs::write(
+            &hot,
+            "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
+             \"column_name\":5,\"hot_only\":7}\n",
+        )
+        .expect("hot buffer writes");
+        let hot = hot.to_str().expect("temp path is valid UTF-8");
+        // The shipped budgets: `read_json`'s buffers alone outgrow 64 MiB.
+        let (_scratch, exec) = query_database(512 * MIB, 256 * MIB);
+        let query = |dsl: &str| {
+            exec.run_query_with_hot(
+                dsl,
+                &source,
+                hot,
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            )
+        };
+        let export = |dsl: &str, name: &str| {
+            let out = dir.path().join(name);
+            exec.export_parquet_with_hot(
+                dsl,
+                &source,
+                hot,
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                &out,
+                usize::MAX,
+            )
+            .map(|()| out)
+        };
+
+        let typed = "* | stats sum(column_name)";
+        let outcome = query(typed);
+        assert!(
+            matches!(outcome, Err(EngineError::Database(_))),
+            "{outcome:?}"
+        );
+        let outcome = export(typed, "typed.parquet");
+        assert!(
+            matches!(outcome, Err(EngineError::Database(_))),
+            "{outcome:?}"
+        );
+
+        let missing = "* | stats sum(hot_only)";
+        let result = query(missing).expect("the hot-only read answers");
+        assert_eq!(result.rows.len(), 1, "{result:?}");
+        let out = export(missing, "missing.parquet").expect("the hot-only export answers");
+        assert!(out.is_file());
+    }
+
+    /// A type failure is an execution error whatever its field is called,
+    /// with a hot buffer that carries the field as a number.
+    ///
+    /// Changed on purpose from b02b8acf. The fallback then read the
+    /// statement line `DuckDB` puts at the end of its text form, cut to
+    /// about 60 columns either side of the error, and took the failure for
+    /// a missing column when the word "column" fell inside the cut. Where
+    /// it fell turned on grapheme clusters and their render widths: thirty
+    /// two-column characters before "column" pushed the word out, forty `e`
+    /// plus combining acute clusters kept it, and the Hangul medial vowel
+    /// U+1161 is a width the port and `DuckDB` measured differently. A short
+    /// name like `mycolumn` was always inside the cut, so its type failure
+    /// answered from the hot buffer alone. None of these is a missing
+    /// column, and the diagnostic's subtype says so.
+    #[test]
+    fn a_type_failure_stays_an_execution_error_whatever_the_field_is_called() {
+        let (_scratch, exec) = query_database(512 * MIB, 256 * MIB);
+        for field in [
+            format!("{}column", "界".repeat(30)),
+            format!("{}column", "e\u{301}".repeat(40)),
+            format!("{}column", "\u{1161}a".repeat(40)),
+            "mycolumn".to_owned(),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let source = dir.path().join("cold.parquet");
+            let source = source.to_str().expect("temp path is valid UTF-8");
+            duckdb::Connection::open_in_memory()
+                .expect("in-memory duckdb")
+                .execute_batch(&format!(
+                    "COPY (SELECT 'x' AS \"{field}\", 'web-1' AS hostname) \
+                     TO '{source}' (FORMAT PARQUET)"
+                ))
+                .expect("cold fixture writes");
+            let hot = dir.path().join("hot.ndjson");
+            std::fs::write(
+                &hot,
+                serde_json::json!({
+                    "_time": "2026-01-03T00:05:00Z",
+                    "_ingested": "2026-01-03T00:05:01Z",
+                    field.as_str(): 5,
+                })
+                .to_string()
+                    + "\n",
+            )
+            .expect("hot buffer writes");
+            let hot = hot.to_str().expect("temp path is valid UTF-8");
+            let dsl = format!("* | stats sum(`{field}`)");
+            let outcome = exec.run_query_with_hot(
+                &dsl,
+                source,
+                hot,
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                usize::MAX,
+                0,
+            );
+            let Err(EngineError::Database(duckdb::Error::DuckDBFailure(_, Some(message)))) =
+                &outcome
+            else {
+                panic!("{dsl}: {outcome:?}");
+            };
+            let diagnostic: serde_json::Value = serde_json::from_str(message).expect("diagnostic");
+            assert_eq!(
+                (&diagnostic["exception_type"], &diagnostic["error_subtype"]),
+                (&"Binder".into(), &"NO_MATCHING_FUNCTION".into()),
+                "{dsl}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_exhausted_is_fatal_not_retried() {
+        let query = classify_query_outcome(&Err(EngineError::ResourceExhausted));
+        let export = classify_export_outcome(&Err(EngineError::ResourceExhausted));
+        for outcome in [query, export] {
+            assert_eq!(outcome, HotColdOutcome::Fatal);
+            for cold in [ColdPresence::Present, ColdPresence::Absent] {
+                for hot in [HotLane::Present, HotLane::Absent] {
+                    assert_eq!(cold_action(outcome, cold, hot), ColdAction::ReturnOutcome);
+                }
+            }
+        }
     }
 }

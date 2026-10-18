@@ -49,14 +49,17 @@ fn check_name(key: &str) -> Option<&'static str> {
 /// `refusing` is a warning (ingest is pushed back while queries still
 /// serve, ADR-0043), and so are `corpus`'s `rollup_pending` and
 /// `restart_backlog` (corpus reads are refused until the corpus settles,
-/// which needs no restart, ADR-0041). Any other value is a failure shown
-/// verbatim.
+/// which needs no restart, ADR-0041), and so is `duckdb`'s `slow` (the
+/// engine sample ran past its budget but a sample succeeded within the
+/// last minute: the engine is busy, not broken, ADR-0056). Any other value
+/// is a failure shown verbatim.
 fn check_badge(key: &str, result: &str) -> (Tone, String) {
     match (key, result) {
         (_, "ok") => (Tone::Success, "Healthy".to_owned()),
         ("ingest_capacity", "refusing") => (Tone::Warn, "Refusing".to_owned()),
         ("corpus", "rollup_pending") => (Tone::Warn, "Rollup pending".to_owned()),
         ("corpus", "restart_backlog") => (Tone::Warn, "Restart backlog".to_owned()),
+        ("duckdb", "slow") => (Tone::Warn, "Slow".to_owned()),
         _ => (Tone::Danger, result.to_owned()),
     }
 }

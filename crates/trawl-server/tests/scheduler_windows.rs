@@ -224,7 +224,7 @@ async fn harness() -> Harness {
     write_fixture(&data_dir);
 
     Harness {
-        pool: ExecutorPool::new(
+        pool: ExecutorPool::for_test(
             data_dir.to_str().expect("utf-8 data dir").to_owned(),
             2,
             100_000,

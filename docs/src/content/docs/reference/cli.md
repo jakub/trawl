@@ -227,7 +227,9 @@ trawl schema <SUBCOMMAND>
 
 Schema subcommands read and change the field catalog: pinned types, per-service
 observations, and type-conflict evidence. Reads need `schema_read`. Repin,
-cancellation, pin reclamation, and acknowledgement need `schema_write`.
+cancellation, pin reclamation, and acknowledgement need `schema_write`. A repin
+follows its own job by id, which `schema_write` alone allows for a job the same
+key requested.
 
 Every subcommand takes `-f, --format` with the `table`, `json`, and `csv` values
 and the TTY auto-detection `query` uses. A `--last` window accepts `s`, `m`,
@@ -303,7 +305,7 @@ trawl schema repin <FIELD> --to TYPE [--dialect otel|syslog] [--dry-run] [--forc
 | `--dry-run` | *(flag)* | `false` | Scan and persist a report job. The corpus is not rewritten |
 | `--force` | *(flag)* | `false` | Accept a projected loss, or run a same-type resurrection pass, inside the ceilings |
 | `--yes` | *(flag)* | `false` | Skip the interactive confirmation. Required off a TTY |
-| `--wait` | *(flag)* | `false` | Poll this job to a terminal result |
+| `--wait` | *(flag)* | `false` | Follow this job by its id to a terminal result |
 | `--max-nulled-rows` | `<N>` | derived | With `--force`, the most rows the rewrite may null |
 | `--max-ambiguous-rows` | `<N>` | derived | With `--force` and `--to severity`, the most dialect-ambiguous numerals the rewrite may carry |
 
@@ -313,8 +315,8 @@ and the CLI prints the ceiling it binds. `requires_force` in the report says
 whether the same executing request would be refused.
 
 With `--wait`, the command exits `0` for a completed rewrite or a dry-run
-report. Any other terminal state exits nonzero, as does a job identity the
-status endpoint stops naming. See [the repin procedure](/operate/catalog/#repin-a-field)
+report. Any other terminal state exits nonzero, as does a job the status
+endpoint no longer holds. See [the repin procedure](/operate/catalog/#repin-a-field)
 and [severity repinning](/operate/catalog/#repin-to-severity).
 
 ```bash
@@ -328,7 +330,8 @@ trawl schema repin-status [-f FORMAT]
 ```
 
 Status needs `schema_read` and returns the running job, or the newest one when
-none is running. There is no lookup by job ID.
+none is running. It takes no job ID; `schema repin --wait` follows its own job
+by ID.
 
 ```bash
 trawl schema repin-status
@@ -489,7 +492,7 @@ The doctor runs the checks in this order. When a check's prerequisite is not
 | `api.transport` | A connection to the API origin opens. The doctor sends one `GET /api/v1/health` with no key | `connection.config` |
 | `api.tls` | The API's certificate verifies under the trust mode that the report names: system roots or the pinned CA. An `http` URL fails with `connection is not TLS`. `insecure` fails with `certificate not verified` | `api.transport` |
 | `api.health` | The health answer parses as a Trawl health response with the status `ok`, `degraded`, or `unavailable`, a `checks` map, and a `version`. `trawld` always sends all three. An answer without the map or the version fails with `not a trawl health answer`. The answer must also come with the HTTP status that `trawld` sends for its status: HTTP 200 with `ok` or `degraded`, or HTTP 503 with `unavailable`. Any other pair fails with `status and body disagree`, and any other HTTP status fails as not a health answer. HTTP 503 with the error code `request_limit_reached` is `not_sampled` with the reason `request_limit_reached`: `trawld` was at its request limit. Run the doctor again later, with backoff. No key is sent. A failed `api.health` sends no key | `api.tls` |
-| `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `api.health.corpus` with `rollup_pending` or `restart_backlog` is `not_sampled` with the reason `recovering`: `trawld` is still recovering its corpus after a restart. Wait for the recovery to finish, then run the doctor again. `error`, `refusing`, and every other value are `failed` | `api.health` |
+| `api.health.<key>` | One row for each check that the server reports, sorted by name. `ok` is `complete`. `api.health.duckdb` with `slow` is also `complete`, with the detail `reported slow` and a next action: the engine answered its latest sample past the budget, but it answered within the last minute. The server is degraded, not down, so the row warns and does not fail the run. `api.health.corpus` with `rollup_pending` or `restart_backlog` is `not_sampled` with the reason `recovering`: `trawld` is still recovering its corpus after a restart. Wait for the recovery to finish, then run the doctor again. `error`, `refusing`, and every other value are `failed` | `api.health` |
 | `api.health._invalid` | The server reported a check name that is not `[a-z][a-z0-9_]{0,63}`. This row is always `failed`, and the report does not show the names. No check name starts with `_`, so this ID cannot match a server's check | `api.health` |
 | `api.identity` | `GET /api/v1/whoami` answers HTTP 200 and accepts the key. `detail` shows the key's name, its kind, and its permissions, never the key or its prefix. The name shows at most 32 characters. The kind is `human` or `service`: any other kind fails with `the answer is not a trawl whoami response`. Only Trawl's own permission names show, such as `query` or `ingest`. Any other permission string is counted as `N unrecognized` and not shown. A rejected key (HTTP 401) and a key with no permissions (HTTP 403) fail. Any other 2xx status fails with `unexpected status` | `api.health`, and a key selected |
 | `web.transport` | `GET /healthz` on `--web-url` answers HTTP 200 with the body `ok`. HTTP 429 gives `not_sampled` with the reason `rate_limited`, and `web.origin` is then `blocked` | `--web-url` given |

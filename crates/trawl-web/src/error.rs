@@ -8,6 +8,12 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use fleet_auth::SessionError;
 use serde_json::json;
+use trawl_api::{ErrorCode, ErrorEnvelope, ErrorResponse};
+
+/// The 503 the proxy answers over its request count. It names the hop,
+/// so a caller can tell this refusal from trawld's, and no size.
+pub const REQUEST_LIMIT_MESSAGE: &str = "trawl-web is at its HTTP request limit; the request \
+                                         was not sent to trawld; retry later with backoff";
 
 /// Errors produced anywhere in the proxy, mapped to HTTP responses via
 /// [`IntoResponse`]. Error bodies are intentionally minimal — the browser
@@ -85,10 +91,124 @@ pub enum ProxyError {
     /// An optional upstream is not configured.
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// The proxy's request count is full
+    /// (`middleware::request_count`, ADR-0054 amended 2026-10-17). The
+    /// request was not sent to trawld. Answered with the `trawl_api`
+    /// envelope, as trawld answers its own, so the browser handles both
+    /// the same way; no cookie mutation, since the session is fine.
+    #[error("request limit reached")]
+    RequestLimitReached,
+
+    /// The proxy's body budget cannot cover the request's body
+    /// (`body_budget`, ADR-0054 amended 2026-10-17). Answered exactly as
+    /// [`Self::RequestLimitReached`]: the same 503, envelope and message,
+    /// because to the browser it is the same refusal, the proxy at a
+    /// fixed limit of its own; only the log line tells them apart.
+    #[error("request body budget full")]
+    BodyBudgetFull,
+
+    /// A request body over the limit the proxy buffers to. The message is
+    /// trawld's own sentence for its 413, naming the setting and the exact
+    /// value, so a caller resizes the request the same way whichever hop
+    /// refused it. Nothing was sent to trawld.
+    #[error("request body exceeds {setting} ({limit} bytes)")]
+    RequestTooLarge {
+        /// The setting's name as an operator writes it, or the fixed
+        /// login limit's name.
+        setting: &'static str,
+        /// The limit in bytes.
+        limit: usize,
+    },
+
+    /// A request body that did not arrive whole within
+    /// [`crate::config::ProxyLimits::BODY_READ_TIMEOUT`], the deadline
+    /// `middleware::body_deadline` holds every route's body to. Answered
+    /// 408 with the envelope code `timeout`; the request's count is
+    /// released with it. Nothing was sent to trawld.
+    #[error("request body not received in time")]
+    BodyTimeout,
+
+    /// trawld's response head did not arrive within
+    /// [`crate::config::ProxyLimits::upstream_head_timeout`]. Answered 504
+    /// with the envelope code `timeout`. The proxy drops its side of the
+    /// call; trawld may still be running the work it was asked for.
+    #[error("upstream response head not received in time")]
+    UpstreamHeadTimeout,
+}
+
+/// The 408 the proxy answers when a request body is not whole by the
+/// body deadline.
+pub const BODY_TIMEOUT_MESSAGE: &str = "request body was not received within trawl-web's deadline";
+
+/// The 504 the proxy answers when trawld's head is late. It says the
+/// work may still be running, because trawld only learns of the drop
+/// when it next writes.
+pub const UPSTREAM_HEAD_TIMEOUT_MESSAGE: &str =
+    "trawld did not answer within trawl-web's deadline; trawld may still be running the work";
+
+/// The envelope answers: trawld's error shape, `Cache-Control:
+/// no-store`, and no cookie.
+///
+/// The legacy `{"error": "..."}` body stays on the older variants; only
+/// the answers that mirror a trawld refusal use the envelope, so the UI
+/// reads them through the same typed contract.
+fn envelope(status: StatusCode, code: ErrorCode, message: &str) -> Response {
+    let body = axum::Json(ErrorResponse {
+        error: ErrorEnvelope::simple(code, message),
+    });
+    let mut response = (status, body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 impl IntoResponse for ProxyError {
     fn into_response(self) -> Response {
+        match &self {
+            Self::RequestLimitReached => {
+                tracing::warn!(error = %self, "proxy request limit reached");
+                return envelope(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::RequestLimitReached,
+                    REQUEST_LIMIT_MESSAGE,
+                );
+            }
+            Self::BodyBudgetFull => {
+                tracing::warn!(error = %self, "proxy body budget full");
+                return envelope(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::RequestLimitReached,
+                    REQUEST_LIMIT_MESSAGE,
+                );
+            }
+            Self::RequestTooLarge { .. } => {
+                tracing::debug!(error = %self, "proxy refused an oversized body");
+                return envelope(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    ErrorCode::RequestTooLarge,
+                    &self.to_string(),
+                );
+            }
+            Self::BodyTimeout => {
+                tracing::debug!(error = %self, "proxy body deadline passed");
+                return envelope(
+                    StatusCode::REQUEST_TIMEOUT,
+                    ErrorCode::Timeout,
+                    BODY_TIMEOUT_MESSAGE,
+                );
+            }
+            Self::UpstreamHeadTimeout => {
+                tracing::warn!(error = %self, "proxy upstream head deadline passed");
+                return envelope(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    ErrorCode::Timeout,
+                    UPSTREAM_HEAD_TIMEOUT_MESSAGE,
+                );
+            }
+            _ => {}
+        }
         let (status, message) = match &self {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::ExpiredSession { .. } => (StatusCode::UNAUTHORIZED, "session expired"),
@@ -105,6 +225,11 @@ impl IntoResponse for ProxyError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "upstream certificate not available",
             ),
+            Self::RequestLimitReached
+            | Self::BodyBudgetFull
+            | Self::RequestTooLarge { .. }
+            | Self::BodyTimeout
+            | Self::UpstreamHeadTimeout => unreachable!("answered above"),
         };
 
         // Severity per variant: network and upstream failures are outage
@@ -129,6 +254,11 @@ impl IntoResponse for ProxyError {
             Self::ServiceUnavailable(_) => {
                 tracing::warn!(error = %self, "proxy service unavailable");
             }
+            Self::RequestLimitReached
+            | Self::BodyBudgetFull
+            | Self::RequestTooLarge { .. }
+            | Self::BodyTimeout
+            | Self::UpstreamHeadTimeout => unreachable!("answered above"),
         }
 
         // Only the expired-session path clears the cookie; see the

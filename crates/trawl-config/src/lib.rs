@@ -14,7 +14,8 @@
 //! for its own modules; other crates use `trawl_config::...` directly.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::num::{NonZeroU32, NonZeroU64};
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -55,7 +56,9 @@ pub struct ServerConfig {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 
-    /// Maximum concurrent queries (bounds the executor pool).
+    /// Maximum concurrent queries (bounds the executor pool). Default: the
+    /// CPU count, at most [`MAX_DEFAULT_CONCURRENT_QUERIES`] (4 when the CPU
+    /// count is unknown).
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
 
@@ -157,6 +160,42 @@ pub struct ServerConfig {
     /// Only used when trawld runs interactively with a TTY.
     #[serde(default = "default_monitor_refresh_ms")]
     pub monitor_refresh_ms: u64,
+
+    /// Query scratch directory (ADR-0056): each query database's private
+    /// spill directory, the hot-buffer query snapshots and the Parquet
+    /// export staging files. Unset means [`Config::query_scratch_dir`]'s
+    /// default, the data root's sibling `<data.path>.query-scratch`. It may
+    /// not be the data root, the WAL directory or a repin staging root, nor
+    /// sit inside or above any of them. A value is an absolute path with no
+    /// `..` component and no glob metacharacter.
+    pub query_scratch_dir: Option<PathBuf>,
+
+    /// The query database's spill cap, `DuckDB`'s `max_temp_directory_size`,
+    /// shared by every query, export and field sample (default: 4 GiB).
+    /// Accepts human-readable sizes like `"4G"`. Zero is refused.
+    #[serde(
+        default = "default_query_spill_max_bytes",
+        deserialize_with = "deserialize_nonzero_byte_size"
+    )]
+    pub query_spill_max_bytes: NonZeroU64,
+
+    /// The query database's memory limit, `DuckDB`'s `memory_limit`
+    /// (default: 2 GiB). It bounds `DuckDB`-managed memory, not the
+    /// process. Accepts human-readable sizes like `"2G"`. Zero is refused.
+    #[serde(
+        default = "default_query_memory_limit",
+        deserialize_with = "deserialize_nonzero_byte_size"
+    )]
+    pub query_memory_limit: NonZeroU64,
+
+    /// The query database's worker threads, `DuckDB`'s `threads`
+    /// (default: 4). Independent of `max_concurrent_queries`, which counts
+    /// queries, not threads. Zero is refused.
+    #[serde(
+        default = "default_query_threads",
+        deserialize_with = "deserialize_nonzero_u32"
+    )]
+    pub query_threads: NonZeroU32,
 }
 
 impl ServerConfig {
@@ -228,8 +267,9 @@ pub struct RateLimitConfig {
 pub struct DataConfig {
     /// Directory containing parquet files (e.g. "/var/lib/trawl/data").
     ///
-    /// Must be a directory path. Glob metacharacters (`*`, `?`, `[`) are
-    /// rejected when daemon configuration is validated.
+    /// Must be a directory path. Glob metacharacters (`*`, `?`, `[`, `]`,
+    /// `{`, `}`) and a `..` component are rejected when daemon
+    /// configuration is validated.
     pub path: String,
 }
 
@@ -256,7 +296,8 @@ pub struct IngestConfig {
     )]
     pub max_body_bytes: usize,
 
-    /// WAL directory path. Defaults to `{data.base_dir}/wal/`.
+    /// WAL directory path. Defaults to `{data.base_dir}/wal/`. A `..`
+    /// component is rejected when daemon configuration is validated.
     pub wal_dir: Option<PathBuf>,
 
     /// How often the compaction task runs (seconds). Default: 10.
@@ -348,7 +389,10 @@ pub struct IngestConfig {
 
     /// `DuckDB` memory limit for compaction connections. Forces spill-to-disk
     /// earlier rather than letting `DuckDB` use 80% of container RAM.
-    /// Accepts `DuckDB` memory strings like `"2GB"`, `"512MB"`. Default: `"2GB"`.
+    /// Compaction, conform and repin each open a database with it, and they
+    /// can run at the same time. Accepts `DuckDB` memory strings like
+    /// `"2GiB"`, `"512MiB"`; `DuckDB` reads `GB` and `MB` as powers of ten.
+    /// Default: `"1GiB"`.
     #[serde(default = "default_compaction_memory_limit")]
     pub compaction_memory_limit: String,
 
@@ -540,7 +584,8 @@ pub fn is_valid_env_name(name: &str) -> bool {
 /// `read_parquet` expands it as a pattern, while the filesystem presence
 /// check at startup resolves the literal name. A directory called
 /// `trawl*data` passes the literal check and then reads the files of
-/// `trawlXdata` next door.
+/// `trawlXdata` next door. The query scratch directory is refused for the
+/// same reason: `read_json` reads the hot-buffer snapshots there by path.
 const GLOB_METACHARACTERS: &[char] = &['*', '?', '[', ']', '{', '}'];
 
 /// Maximum service name length (ADR-0009 path segment cap).
@@ -711,10 +756,6 @@ pub struct SchedulerConfig {
     #[serde(default = "default_scheduler_poll_interval_secs")]
     pub poll_interval_secs: u64,
 
-    /// Maximum rows stored in a report run result.
-    #[serde(default = "default_scheduler_report_max_rows")]
-    pub report_max_rows: usize,
-
     /// Maximum runs to keep per schedule (retention).
     #[serde(default = "default_scheduler_max_runs_per_schedule")]
     pub max_runs_per_schedule: u64,
@@ -738,7 +779,6 @@ pub struct SchedulerConfig {
 
 const DEFAULT_SCHEDULER_ENABLED: bool = true;
 const DEFAULT_SCHEDULER_POLL_INTERVAL_SECS: u64 = 10;
-const DEFAULT_SCHEDULER_REPORT_MAX_ROWS: usize = 10_000;
 const DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE: u64 = 100;
 const DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS: u64 = 30;
 /// A day of missed coverage at the common hourly cadence.
@@ -777,9 +817,6 @@ fn default_scheduler_enabled() -> bool {
 fn default_scheduler_poll_interval_secs() -> u64 {
     DEFAULT_SCHEDULER_POLL_INTERVAL_SECS
 }
-fn default_scheduler_report_max_rows() -> usize {
-    DEFAULT_SCHEDULER_REPORT_MAX_ROWS
-}
 fn default_scheduler_max_runs_per_schedule() -> u64 {
     DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE
 }
@@ -795,7 +832,6 @@ impl Default for SchedulerConfig {
         Self {
             enabled: DEFAULT_SCHEDULER_ENABLED,
             poll_interval_secs: DEFAULT_SCHEDULER_POLL_INTERVAL_SECS,
-            report_max_rows: DEFAULT_SCHEDULER_REPORT_MAX_ROWS,
             max_runs_per_schedule: DEFAULT_SCHEDULER_MAX_RUNS_PER_SCHEDULE,
             report_retention_days: DEFAULT_SCHEDULER_REPORT_RETENTION_DAYS,
             max_catchup_intervals: DEFAULT_SCHEDULER_MAX_CATCHUP_INTERVALS,
@@ -990,18 +1026,49 @@ fn parse_byte_size(s: &str) -> Result<u64, String> {
         let num: f64 = num_str
             .parse()
             .map_err(|_| format!("invalid number in byte size: {s:?}"))?;
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss
-        )]
-        Ok((num * multiplier as f64) as u64)
+        #[allow(clippy::cast_precision_loss)]
+        let bytes = num * multiplier as f64;
+        // `u64::MAX as f64` rounds up to 2^64, so `<` keeps every accepted
+        // value inside `u64`; the cast would otherwise saturate silently.
+        #[allow(clippy::cast_precision_loss)]
+        if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+            return Err(BYTE_SIZE_OVERFLOW.into());
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Ok(bytes as u64)
     } else {
-        let num: u64 = num_str
-            .parse()
-            .map_err(|_| format!("invalid number in byte size: {s:?}"))?;
-        Ok(num * multiplier)
+        let num: u64 = num_str.parse().map_err(|e: std::num::ParseIntError| {
+            if *e.kind() == std::num::IntErrorKind::PosOverflow {
+                BYTE_SIZE_OVERFLOW.to_owned()
+            } else {
+                format!("invalid number in byte size: {s:?}")
+            }
+        })?;
+        num.checked_mul(multiplier)
+            .ok_or_else(|| BYTE_SIZE_OVERFLOW.into())
     }
+}
+
+/// The error of a byte size larger than `u64` can hold.
+const BYTE_SIZE_OVERFLOW: &str = "byte size is too large";
+
+/// The error of a zero where a setting needs at least one.
+const NONZERO_REQUIRED: &str = "must be greater than zero";
+
+/// Deserialize a byte size that must not be zero, such as a query budget.
+fn deserialize_nonzero_byte_size<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<NonZeroU64, D::Error> {
+    let bytes = deserialize_byte_size_u64(de)?;
+    NonZeroU64::new(bytes).ok_or_else(|| serde::de::Error::custom(NONZERO_REQUIRED))
+}
+
+/// Deserialize a count that must not be zero, such as `query_threads`.
+fn deserialize_nonzero_u32<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<NonZeroU32, D::Error> {
+    let count = u32::deserialize(de)?;
+    NonZeroU32::new(count).ok_or_else(|| serde::de::Error::custom(NONZERO_REQUIRED))
 }
 
 /// Deserialize a byte size as either a raw number or a string with unit suffix.
@@ -1126,12 +1193,33 @@ pub const DEFAULT_COMPACTION_CHUNK_SIZE: usize = 500;
 /// a fixed size derived from this count, so a larger chunk could publish a
 /// marker that recovery then refuses to read. Eight times the default.
 pub const MAX_COMPACTION_CHUNK_SIZE: usize = 4096;
-/// Default `DuckDB` memory limit for compaction connections.
-pub const DEFAULT_COMPACTION_MEMORY_LIMIT: &str = "2GB";
+/// Default spill cap of the query database (4 GiB).
+pub const DEFAULT_QUERY_SPILL_MAX_BYTES: NonZeroU64 = NonZeroU64::new(4 << 30).unwrap();
+/// Default memory limit of the query database (2 GiB).
+pub const DEFAULT_QUERY_MEMORY_LIMIT: NonZeroU64 = NonZeroU64::new(2 << 30).unwrap();
+/// Default worker threads of the query database.
+pub const DEFAULT_QUERY_THREADS: NonZeroU32 = NonZeroU32::new(4).unwrap();
+/// Most executor permits the `max_concurrent_queries` default gives. Every
+/// permit shares the one query memory limit, so permits past this many only
+/// split it thinner. An explicit value may go higher.
+pub const MAX_DEFAULT_CONCURRENT_QUERIES: usize = 8;
+/// Suffix of the data root's sibling that [`Config::query_scratch_dir`]
+/// defaults to.
+pub const QUERY_SCRATCH_SUFFIX: &str = ".query-scratch";
+/// Suffix of the repin shadow (next-generation) sibling root.
+pub const REPIN_SHADOW_SUFFIX: &str = ".repin-next";
+/// Suffix of the repin aside (previous-generation) sibling root.
+pub const REPIN_ASIDE_SUFFIX: &str = ".repin-aside";
+/// Default `DuckDB` memory limit for compaction connections (1 GiB). A raw
+/// `DuckDB` string, so the unit is spelled `GiB`: `DuckDB` reads `GB` as
+/// 10^9 bytes.
+pub const DEFAULT_COMPACTION_MEMORY_LIMIT: &str = "1GiB";
 /// Default retention max age (days).
 pub const DEFAULT_RETENTION_MAX_AGE_DAYS: u64 = 90;
-/// Default retention minimum free disk space (bytes). 1 GiB.
-pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 1_073_741_824;
+/// Default retention minimum free disk space (bytes). 6 GiB: room for the
+/// default 4 GiB spill budget, the hot-buffer snapshots and export staging
+/// above ENOSPC. Nothing validates the floor against the spill budget.
+pub const DEFAULT_RETENTION_MIN_FREE_DISK_BYTES: u64 = 6 << 30;
 /// Default retention check interval (seconds). 1 hour.
 pub const DEFAULT_RETENTION_INTERVAL_SECS: u64 = 3600;
 /// Default per-key rate limit on the interactive API routes
@@ -1498,7 +1586,14 @@ fn default_timeout_secs() -> u64 {
 }
 
 fn default_max_concurrent_queries() -> usize {
-    num_cpus()
+    default_query_permits(num_cpus())
+}
+
+/// One executor permit per CPU, at most [`MAX_DEFAULT_CONCURRENT_QUERIES`].
+/// An unknown CPU count gives [`FALLBACK_CPU_COUNT`].
+fn default_query_permits(cpus: Option<usize>) -> usize {
+    cpus.unwrap_or(FALLBACK_CPU_COUNT)
+        .min(MAX_DEFAULT_CONCURRENT_QUERIES)
 }
 
 fn default_max_result_rows() -> usize {
@@ -1551,6 +1646,29 @@ fn default_monitor_refresh_ms() -> u64 {
     DEFAULT_MONITOR_REFRESH_MS
 }
 
+fn default_query_spill_max_bytes() -> NonZeroU64 {
+    DEFAULT_QUERY_SPILL_MAX_BYTES
+}
+
+fn default_query_memory_limit() -> NonZeroU64 {
+    DEFAULT_QUERY_MEMORY_LIMIT
+}
+
+fn default_query_threads() -> NonZeroU32 {
+    DEFAULT_QUERY_THREADS
+}
+
+/// The sibling of a data root that ends in `suffix`: the repin staging roots
+/// and the default query scratch directory. A root with no final component
+/// is treated as one named `data`.
+#[must_use]
+pub fn data_root_sibling(data_dir: &Path, suffix: &str) -> PathBuf {
+    let name = data_dir
+        .file_name()
+        .map_or_else(|| "data".to_owned(), |n| n.to_string_lossy().into_owned());
+    data_dir.with_file_name(format!("{name}{suffix}"))
+}
+
 fn default_rate_limit_rpm() -> u32 {
     DEFAULT_RATE_LIMIT_RPM
 }
@@ -1580,9 +1698,12 @@ impl Default for RateLimitConfig {
     }
 }
 
-/// Portable CPU count without pulling in the `num_cpus` crate.
-fn num_cpus() -> usize {
-    std::thread::available_parallelism().map_or(FALLBACK_CPU_COUNT, std::num::NonZero::get)
+/// Portable CPU count without pulling in the `num_cpus` crate. `None` when
+/// the platform cannot say.
+fn num_cpus() -> Option<usize> {
+    std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZero::get)
 }
 
 /// Expand a leading `~/` to `$HOME/`.
@@ -1671,10 +1792,11 @@ impl Config {
             } else {
                 without_peer_key(e.path().to_string())
             },
-            reason: if e.inner().message().starts_with("unknown field") {
-                "unknown setting"
-            } else {
-                "invalid or missing setting"
+            reason: match e.inner().message() {
+                m if m.starts_with("unknown field") => "unknown setting",
+                NONZERO_REQUIRED => NONZERO_REQUIRED,
+                BYTE_SIZE_OVERFLOW => BYTE_SIZE_OVERFLOW,
+                _ => "invalid or missing setting",
             },
             offset: e.inner().span().map(|span| span.start),
         })
@@ -1735,6 +1857,10 @@ impl Config {
         if let Some(query_log) = &self.server.query_log {
             self.server.query_log = Some(PathBuf::from(expand_tilde(&query_log.to_string_lossy())));
         }
+        if let Some(scratch) = &self.server.query_scratch_dir {
+            self.server.query_scratch_dir =
+                Some(PathBuf::from(expand_tilde(&scratch.to_string_lossy())));
+        }
     }
 
     /// Resolve the WAL directory: explicit config value or `{data.base_dir}/wal/`.
@@ -1743,6 +1869,15 @@ impl Config {
             .wal_dir
             .clone()
             .unwrap_or_else(|| self.data.base_dir().join("wal"))
+    }
+
+    /// Resolve the query scratch directory: explicit config value or the
+    /// data root's sibling `<data.path>.query-scratch` (ADR-0056).
+    pub fn query_scratch_dir(&self) -> PathBuf {
+        self.server
+            .query_scratch_dir
+            .clone()
+            .unwrap_or_else(|| data_root_sibling(&self.data.base_dir(), QUERY_SCRATCH_SUFFIX))
     }
 
     /// State directory — parent of the data directory.
@@ -1832,6 +1967,28 @@ impl Config {
             )));
         }
 
+        // The roots trawld owns by name are kept apart from the query
+        // scratch directory by comparing the directories at startup, and a
+        // root that does not exist yet is placed by the nearest directory
+        // on its path that does. A `..` after a component that is missing
+        // places `<base>/missing/../x` at `<base>` while trawld later makes
+        // it at `<base>/x`, which can be the scratch directory itself. So
+        // the data root and the WAL directory, and with them the repin
+        // roots beside the data root, carry no `..` (ADR-0056).
+        for (key, path) in [
+            ("data.path", Path::new(&self.data.path)),
+            (
+                "ingest.wal_dir",
+                self.ingest.wal_dir.as_deref().unwrap_or(Path::new("")),
+            ),
+        ] {
+            if path.components().any(|c| c == Component::ParentDir) {
+                return Err(ConfigError::Validation(format!(
+                    "{key} must not contain a '..' component"
+                )));
+            }
+        }
+
         if self.server.max_concurrent_queries == 0 {
             return Err(ConfigError::Validation(
                 "server.max_concurrent_queries must be > 0".into(),
@@ -1846,6 +2003,7 @@ impl Config {
             )));
         }
 
+        self.validate_query_scratch_dir()?;
         validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
         validate_max_catchup_intervals(self.scheduler.max_catchup_intervals)?;
 
@@ -1897,6 +2055,76 @@ impl Config {
             self.validate_syslog_service_names()?;
         }
 
+        Ok(())
+    }
+
+    /// The query scratch directory stays apart from every directory whose
+    /// contents trawld owns by name (ADR-0056): boot removes the names it
+    /// makes in scratch, and repin swaps the data root with its siblings.
+    ///
+    /// The comparison is lexical, component by component, so it needs no
+    /// filesystem and also serves `--check-config` and the doctors. A
+    /// comparison of spellings cannot see where `..` or the working
+    /// directory leads, so an explicit directory must be absolute and free
+    /// of `..`; the default follows `data.path`'s rules, which also refuse
+    /// `..`. Startup repeats the check against the opened directory, which
+    /// also sees symlinks.
+    fn validate_query_scratch_dir(&self) -> Result<(), ConfigError> {
+        const KEY: &str = "server.query_scratch_dir";
+        if let Some(dir) = &self.server.query_scratch_dir {
+            if dir.as_os_str().is_empty() {
+                return Err(ConfigError::Validation(format!("{KEY} cannot be empty")));
+            }
+            if dir.is_relative() {
+                return Err(ConfigError::Validation(format!(
+                    "{KEY} must be an absolute path"
+                )));
+            }
+            if dir.components().any(|c| c == Component::ParentDir) {
+                return Err(ConfigError::Validation(format!(
+                    "{KEY} must not contain a '..' component"
+                )));
+            }
+        }
+        let scratch = self.query_scratch_dir();
+        // The snapshot paths in the scratch directory reach `read_json`,
+        // which expands a glob as `read_parquet` does `data.path`.
+        if let Some(found) = scratch
+            .to_string_lossy()
+            .chars()
+            .find(|c| GLOB_METACHARACTERS.contains(c))
+        {
+            return Err(ConfigError::Validation(format!(
+                "{KEY} must be a directory path without glob metacharacters; found '{found}'"
+            )));
+        }
+        let data = self.data.base_dir();
+        let owned = [
+            (data.clone(), "the data root (data.path)"),
+            (self.wal_dir(), "the WAL directory (ingest.wal_dir)"),
+            (
+                data_root_sibling(&data, REPIN_SHADOW_SUFFIX),
+                "the repin shadow root (<data.path>.repin-next)",
+            ),
+            (
+                data_root_sibling(&data, REPIN_ASIDE_SUFFIX),
+                "the repin aside root (<data.path>.repin-aside)",
+            ),
+        ];
+        for (root, what) in owned {
+            let relation = if scratch == root {
+                "equal to"
+            } else if scratch.starts_with(&root) {
+                "inside"
+            } else if root.starts_with(&scratch) {
+                "above"
+            } else {
+                continue;
+            };
+            return Err(ConfigError::Validation(format!(
+                "{KEY} must not be {relation} {what}; set {KEY} to a directory of its own"
+            )));
+        }
         Ok(())
     }
 
@@ -2380,12 +2608,24 @@ path = "/data"
             "/var/lib/trawl/data/",
             "relative/data",
             "/data with spaces",
-            "/",
         ] {
             let config = Config::from_toml(&format!("[server]\n[data]\npath = '{path}'")).unwrap();
             assert_eq!(config.data.base_dir(), PathBuf::from(path));
             assert_eq!(config.wal_dir(), PathBuf::from(path).join("wal"));
         }
+    }
+
+    #[test]
+    fn query_scratch_refuses_the_filesystem_root_as_data_root() {
+        // Every directory sits inside `/`, so no query scratch directory can
+        // stay outside a data root there.
+        let err = Config::from_toml("[server]\n[data]\npath = '/'")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("server.query_scratch_dir must not be inside the data root"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2594,6 +2834,29 @@ path = "/data"
         );
     }
 
+    /// The report row cap was never applied, so it is gone rather than
+    /// documented as inert: a config that still sets it refuses to load
+    /// instead of reading as a limit. Runs stop at `max_result_rows`.
+    #[test]
+    fn scheduler_report_max_rows_is_an_unknown_key() {
+        let err = Config::from_toml(
+            r#"
+[server]
+[data]
+path = "/data"
+[auth]
+[scheduler]
+report_max_rows = 10000
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("unknown setting at scheduler.report_max_rows"),
+            "{err}"
+        );
+    }
+
     /// Both ends of the range are boot-fatal, and both refusals name both
     /// bounds: zero clamps every window to nothing, and a ceiling past the
     /// cap makes the catch-up span unrepresentable, which stops the
@@ -2745,7 +3008,7 @@ path = "/data"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.retention.max_age_days, 90);
-        assert_eq!(config.retention.min_free_disk_bytes, 1_073_741_824);
+        assert_eq!(config.retention.min_free_disk_bytes, 6_442_450_944);
         assert_eq!(config.retention.retention_interval_secs, 3600);
     }
 
@@ -3912,5 +4175,356 @@ path = "/data"
 severity_from = [7]
 "#;
         assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    /// A config of `[server]` lines on a fixed data root.
+    fn query_scratch_config(server: &str, ingest: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!(
+            "[server]\n{server}\n[data]\npath = \"/var/lib/trawl/data\"\n[ingest]\n{ingest}\n"
+        ))
+    }
+
+    #[test]
+    fn query_scratch_defaults_parse() {
+        let config = query_scratch_config("", "").unwrap();
+        assert_eq!(config.server.query_scratch_dir, None);
+        assert_eq!(
+            config.query_scratch_dir(),
+            Path::new("/var/lib/trawl/data.query-scratch")
+        );
+        assert_eq!(config.server.query_spill_max_bytes.get(), 4_294_967_296);
+        assert_eq!(config.server.query_memory_limit.get(), 2_147_483_648);
+        assert_eq!(config.server.query_threads.get(), 4);
+        assert_eq!(
+            config.server.max_concurrent_queries,
+            default_max_concurrent_queries()
+        );
+        assert_eq!(config.retention.min_free_disk_bytes, 6_442_450_944);
+        assert_eq!(config.ingest.compaction_memory_limit, "1GiB");
+    }
+
+    #[test]
+    fn query_scratch_defaults_cap_query_permits_at_eight() {
+        // One permit per core up to eight. The memory budget is shared, so a
+        // large node gains no headroom from more permits than that.
+        assert_eq!(default_query_permits(Some(1)), 1);
+        assert_eq!(default_query_permits(Some(4)), 4);
+        assert_eq!(default_query_permits(Some(8)), 8);
+        assert_eq!(default_query_permits(Some(64)), 8);
+        // An unknown count falls back to four, not to the cap.
+        assert_eq!(default_query_permits(None), 4);
+    }
+
+    #[test]
+    fn query_scratch_spill_budget_and_disk_floor_are_independent() {
+        // Nothing ties the retention floor to the spill budget: a floor
+        // below the budget, a floor of zero and a floor far above it all load.
+        for (spill, floor) in [
+            ("\"8G\"", "\"1G\""),
+            ("\"4G\"", "0"),
+            ("\"1M\"", "\"100G\""),
+        ] {
+            let config = Config::from_toml(&format!(
+                "[server]\nquery_spill_max_bytes = {spill}\n[data]\npath = \"/data\"\n\
+                 [retention]\nmin_free_disk_bytes = {floor}\n"
+            ))
+            .unwrap_or_else(|e| panic!("spill={spill} floor={floor}: {e}"));
+            assert_eq!(
+                config.server.query_spill_max_bytes.get(),
+                parse_byte_size(spill.trim_matches('"')).unwrap()
+            );
+            assert_eq!(
+                config.retention.min_free_disk_bytes,
+                parse_byte_size(floor.trim_matches('"')).unwrap()
+            );
+        }
+        // Each key keeps its own default when only the other is set.
+        let config = Config::from_toml(
+            "[server]\n[data]\npath = \"/data\"\n[retention]\nmin_free_disk_bytes = 0\n",
+        )
+        .unwrap();
+        assert_eq!(config.server.query_spill_max_bytes.get(), 4_294_967_296);
+        let config = Config::from_toml(
+            "[server]\nquery_spill_max_bytes = \"64G\"\n[data]\npath = \"/data\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.retention.min_free_disk_bytes, 6_442_450_944);
+    }
+
+    #[test]
+    fn query_scratch_keys_parse_explicit_values() {
+        let config = query_scratch_config(
+            "query_scratch_dir = \"/srv/scratch\"\nquery_spill_max_bytes = \"1G\"\n\
+             query_memory_limit = 1048576\nquery_threads = 8",
+            "",
+        )
+        .unwrap();
+        assert_eq!(config.query_scratch_dir(), Path::new("/srv/scratch"));
+        assert_eq!(
+            config.server.query_spill_max_bytes.get(),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(config.server.query_memory_limit.get(), 1024 * 1024);
+        assert_eq!(config.server.query_threads.get(), 8);
+    }
+
+    #[test]
+    fn query_scratch_default_follows_a_trailing_slash_data_root() {
+        let config =
+            Config::from_toml("[server]\n[data]\npath = \"/var/lib/trawl/data/\"\n").unwrap();
+        assert_eq!(
+            config.query_scratch_dir(),
+            Path::new("/var/lib/trawl/data.query-scratch")
+        );
+    }
+
+    #[test]
+    fn query_scratch_refuses_zero_budgets() {
+        for (key, value) in [
+            ("query_spill_max_bytes", "0"),
+            ("query_spill_max_bytes", "\"0M\""),
+            ("query_memory_limit", "0"),
+            ("query_memory_limit", "\"0B\""),
+            ("query_threads", "0"),
+        ] {
+            let err = query_scratch_config(&format!("{key} = {value}"), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("server.{key}")),
+                "{key}={value}: {err}"
+            );
+            assert!(
+                err.contains("must be greater than zero"),
+                "{key}={value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_scratch_refuses_overflowing_budgets() {
+        for (key, value) in [
+            ("query_spill_max_bytes", "\"99999999999T\""),
+            ("query_spill_max_bytes", "\"18446744073709551616\""),
+            ("query_memory_limit", "\"16777216.5T\""),
+            ("query_memory_limit", "\"99999999999999999999999.0\""),
+        ] {
+            let err = query_scratch_config(&format!("{key} = {value}"), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("server.{key}")),
+                "{key}={value}: {err}"
+            );
+            assert!(
+                err.contains("byte size is too large"),
+                "{key}={value}: {err}"
+            );
+        }
+        // A thread count past u32 is refused by the integer parse.
+        let err = query_scratch_config("query_threads = 4294967296", "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("server.query_threads"), "{err}");
+    }
+
+    #[test]
+    fn query_scratch_byte_parse_keeps_the_largest_values_it_can_hold() {
+        assert_eq!(parse_byte_size("16777215T").unwrap(), 16_777_215 << 40);
+        assert_eq!(parse_byte_size("18446744073709551615").unwrap(), u64::MAX);
+        assert_eq!(
+            parse_byte_size("16777216T").unwrap_err(),
+            BYTE_SIZE_OVERFLOW
+        );
+    }
+
+    #[test]
+    fn query_scratch_refuses_overlap_with_data_wal_and_repin_roots() {
+        let wal = "wal_dir = \"/srv/wal\"";
+        for (scratch, ingest, relation, root) in [
+            ("/var/lib/trawl/data", "", "equal to", "data root"),
+            ("/var/lib/trawl/data/", "", "equal to", "data root"),
+            ("/var/lib/trawl/data/./scratch", "", "inside", "data root"),
+            ("/var/lib/trawl", "", "above", "data root"),
+            ("/", "", "above", "data root"),
+            ("/srv/wal", wal, "equal to", "WAL directory"),
+            ("/srv/wal/scratch", wal, "inside", "WAL directory"),
+            ("/srv", wal, "above", "WAL directory"),
+            (
+                "/var/lib/trawl/data.repin-next",
+                "",
+                "equal to",
+                "repin shadow root",
+            ),
+            (
+                "/var/lib/trawl/data.repin-next/x",
+                "",
+                "inside",
+                "repin shadow root",
+            ),
+            (
+                "/var/lib/trawl/data.repin-aside",
+                "",
+                "equal to",
+                "repin aside root",
+            ),
+            (
+                "/var/lib/trawl/data.repin-aside/x",
+                "",
+                "inside",
+                "repin aside root",
+            ),
+        ] {
+            let err = query_scratch_config(&format!("query_scratch_dir = \"{scratch}\""), ingest)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("server.query_scratch_dir"), "{scratch}: {err}");
+            assert!(
+                err.contains(&format!("must not be {relation} the {root}")),
+                "{scratch}: {err}"
+            );
+            // The message names keys, never the configured paths.
+            assert!(!err.contains("/var") && !err.contains("/srv"), "{err}");
+        }
+    }
+
+    #[test]
+    fn query_scratch_accepts_siblings_and_lookalike_prefixes() {
+        for scratch in [
+            "/var/lib/trawl/data.query-scratch",
+            "/var/lib/trawl/data-scratch",
+            "/var/lib/trawl/dat",
+            "/srv/scratch",
+        ] {
+            let config = query_scratch_config(
+                &format!("query_scratch_dir = \"{scratch}\""),
+                "wal_dir = \"/srv/wal\"",
+            )
+            .unwrap_or_else(|e| panic!("{scratch}: {e}"));
+            assert_eq!(config.query_scratch_dir(), Path::new(scratch));
+        }
+    }
+
+    #[test]
+    fn query_scratch_refuses_an_empty_path() {
+        let err = query_scratch_config("query_scratch_dir = \"\"", "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("server.query_scratch_dir cannot be empty"),
+            "{err}"
+        );
+    }
+
+    /// Snapshot paths in the scratch directory reach `DuckDB`'s `read_json`,
+    /// which expands a glob, so the scratch directory carries no glob
+    /// metacharacter: `scratch[1]` would also read the snapshots of a
+    /// `scratch1` beside it. The refusal names the character, not the path.
+    #[test]
+    fn query_scratch_refuses_glob_metacharacters() {
+        for metacharacter in GLOB_METACHARACTERS {
+            let scratch = format!("/srv/private-secret{metacharacter}scratch");
+            let err = query_scratch_config(&format!("query_scratch_dir = '{scratch}'"), "")
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "config validation error: server.query_scratch_dir must be a directory \
+                     path without glob metacharacters; found '{metacharacter}'"
+                )
+            );
+        }
+        // The default inherits the data root's name, which refuses the same
+        // characters first.
+        for metacharacter in GLOB_METACHARACTERS {
+            let err = Config::from_toml(&format!(
+                "[server]\n[data]\npath = '/srv/data{metacharacter}x'\n"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!(
+                    "without glob metacharacters; found '{metacharacter}'"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// A component comparison cannot see where `..` or a working directory
+    /// leads, so an explicit scratch directory spells neither. Startup
+    /// compares the opened directories as well.
+    #[test]
+    fn query_scratch_refuses_relative_paths_and_parent_components() {
+        for (scratch, reason) in [
+            ("scratch", "must be an absolute path"),
+            ("./scratch", "must be an absolute path"),
+            ("../trawl/data/prod", "must be an absolute path"),
+            (
+                "/var/lib/trawl/x/../data/prod",
+                "must not contain a '..' component",
+            ),
+            ("/srv/scratch/..", "must not contain a '..' component"),
+        ] {
+            let err = query_scratch_config(&format!("query_scratch_dir = \"{scratch}\""), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("server.query_scratch_dir {reason}")),
+                "{scratch}: {err}"
+            );
+            assert!(!err.contains("/var") && !err.contains("/srv"), "{err}");
+        }
+        // The default beside a relative data root follows the data root's
+        // own rules.
+        let config = Config::from_toml("[server]\n[data]\npath = \"relative/data\"\n").unwrap();
+        assert_eq!(
+            config.query_scratch_dir(),
+            Path::new("relative/data.query-scratch")
+        );
+    }
+
+    /// #304 R5-1: a root spelled through `..` after a component that does
+    /// not exist yet, such as `<base>/missing/../scratch`, has no directory
+    /// to compare until trawld makes `missing`; the filesystem overlap
+    /// check at startup then falls back to `<base>` and passes a scratch
+    /// directory that the root resolves onto once it is made. The spelling
+    /// comparison here cannot see it either. So every owned root is spelled
+    /// without `..`: the data root, the WAL directory (and the repin roots,
+    /// which follow the data root). The refusal names the key, not the path.
+    #[test]
+    fn owned_roots_refuse_parent_components() {
+        for (key, data, wal) in [
+            ("data.path", "/srv/trawl/missing/../scratch", "/srv/wal"),
+            ("data.path", "/srv/trawl/data/..", "/srv/wal"),
+            ("data.path", "../trawl/data", "/srv/wal"),
+            (
+                "ingest.wal_dir",
+                "/srv/trawl/data",
+                "/srv/trawl/missing/../scratch",
+            ),
+            ("ingest.wal_dir", "/srv/trawl/data", "../wal"),
+        ] {
+            let document = format!(
+                "[server]\nquery_scratch_dir = \"/srv/trawl/scratch\"\n\
+                 [data]\npath = \"{data}\"\n[ingest]\nwal_dir = \"{wal}\"\n"
+            );
+            let err = Config::from_toml(&document)
+                .expect_err(&document)
+                .to_string();
+            assert_eq!(
+                err,
+                format!("config validation error: {key} must not contain a '..' component"),
+                "{document}"
+            );
+            assert!(!err.contains("/srv") && !err.contains("trawl/"), "{err}");
+        }
+        // A `.` component resolves where it is spelled, so it stays accepted.
+        let config = Config::from_toml(
+            "[server]\n[data]\npath = \"/srv/trawl/./data\"\n[ingest]\nwal_dir = \"/srv/./wal\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.wal_dir(), Path::new("/srv/./wal"));
     }
 }

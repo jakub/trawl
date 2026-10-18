@@ -229,7 +229,7 @@ Counted by the per-key rate limiter. A metered request is attributable to a veri
 _Avoid_: authenticated (a request can be authenticated and still refused before metering)
 
 **Request in progress**:
-One HTTP request or HTTP/2 stream that trawld has taken into its server-wide count and not yet answered. It still counts while blocking work that holds its body keeps running after the client has gone.
+One HTTP/1.1 request that trawld has taken into its server-wide count and not yet answered. It still counts while blocking work that holds its body keeps running after the client has gone.
 _Avoid_: slot (that is a declared envelope field), permit (that is the executor pool), admission (that is the hot buffer), in-flight
 
 **Probe allowance**:

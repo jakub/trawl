@@ -1117,6 +1117,20 @@ mod tests {
         assert_snapshot!(emit_dsl("* | drop message, raw, src_ip"));
     }
 
+    /// `drop` excludes through the folded `COLUMNS` lambda, as `let` and
+    /// `rename` do, so a field no incoming column carries binds and drops
+    /// nothing (ADR-0001: the live tail ignores it too). `* EXCLUDE`
+    /// refuses a name the input lacks.
+    #[test]
+    fn pipe_drop_excludes_through_the_columns_lambda() {
+        assert_eq!(
+            emit_dsl("* | drop a, b"),
+            "SELECT COLUMNS(c -> translate(c, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', \
+             'abcdefghijklmnopqrstuvwxyz') NOT IN ('a', 'b'))\n\
+             FROM read_parquet('/data/**/*.parquet', union_by_name=true)"
+        );
+    }
+
     #[test]
     fn multi_stats_then_drop() {
         assert_snapshot!(emit_dsl(

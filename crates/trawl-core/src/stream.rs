@@ -1213,6 +1213,72 @@ const MAX_DISTINCT: usize = 10_000;
 /// Maximum values stored per `Median`/`Percentile` accumulator.
 const MAX_EXACT_VALUES: usize = 100_000;
 
+/// A bound past which an aggregation stops taking input.
+///
+/// Input past a cap is dropped, so the answer no longer covers every
+/// event that fed it: a `stats` row is missing, or a `dc()` or a
+/// `median` reads a subset. The aggregation records which caps dropped
+/// something ([`CompiledAggregation::capped`]), and each lane says so:
+/// the live tail reports it on every snapshot, and the batch tail
+/// refuses (ADR-0001). Reaching a cap exactly drops nothing and records
+/// nothing.
+///
+/// `top`/`rare` counters and the timechart bucket count have no cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AggregationCap {
+    /// A new group arrived while the group map was full. For a
+    /// timechart the map is per bucket.
+    Groups,
+    /// A `dc()` or `values()` set was full and the value was unseen.
+    DistinctValues,
+    /// A `median` or percentile store was full and the event carried a
+    /// number.
+    ExactValues,
+}
+
+impl AggregationCap {
+    /// The bound itself: how many groups, or values per accumulator.
+    #[must_use]
+    pub const fn limit(self) -> usize {
+        match self {
+            Self::Groups => MAX_GROUPS,
+            Self::DistinctValues => MAX_DISTINCT,
+            Self::ExactValues => MAX_EXACT_VALUES,
+        }
+    }
+}
+
+/// Which caps have dropped input, sticky for the life of the
+/// aggregation: dropped input never comes back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CapSet {
+    groups: bool,
+    distinct_values: bool,
+    exact_values: bool,
+}
+
+impl CapSet {
+    fn mark(&mut self, cap: AggregationCap) {
+        match cap {
+            AggregationCap::Groups => self.groups = true,
+            AggregationCap::DistinctValues => self.distinct_values = true,
+            AggregationCap::ExactValues => self.exact_values = true,
+        }
+    }
+
+    /// The marked caps, each once, in declaration order.
+    fn to_vec(self) -> Vec<AggregationCap> {
+        [
+            (self.groups, AggregationCap::Groups),
+            (self.distinct_values, AggregationCap::DistinctValues),
+            (self.exact_values, AggregationCap::ExactValues),
+        ]
+        .into_iter()
+        .filter_map(|(marked, cap)| marked.then_some(cap))
+        .collect()
+    }
+}
+
 /// A compiled aggregation stage for streaming evaluation.
 pub enum CompiledAggregation {
     /// `| stats count(), avg(x) by host`
@@ -1220,6 +1286,7 @@ pub enum CompiledAggregation {
         accumulators: Vec<CompiledAcc>,
         group_by: Vec<String>,
         groups: HashMap<GroupKey, Vec<AccState>>,
+        capped: CapSet,
     },
     /// `| timechart span=5m count() by service`
     Timechart {
@@ -1227,6 +1294,7 @@ pub enum CompiledAggregation {
         accumulators: Vec<CompiledAcc>,
         group_by: Vec<String>,
         buckets: HashMap<i64, HashMap<GroupKey, Vec<AccState>>>,
+        capped: CapSet,
     },
     /// `| top 10 host by service`
     Top {
@@ -1446,6 +1514,7 @@ fn compile_aggregation(
                 accumulators,
                 group_by,
                 groups: HashMap::new(),
+                capped: CapSet::default(),
             })
         }
         PipeStage::Timechart(s) => {
@@ -1490,6 +1559,7 @@ fn compile_aggregation(
                 accumulators,
                 group_by,
                 buckets: HashMap::new(),
+                capped: CapSet::default(),
             })
         }
         PipeStage::Top(s) => Ok(CompiledAggregation::Top {
@@ -1527,16 +1597,18 @@ impl CompiledAggregation {
                 accumulators,
                 group_by,
                 groups,
+                capped,
             } => {
                 let key = make_group_key(group_by, event);
                 if groups.len() >= MAX_GROUPS && !groups.contains_key(&key) {
+                    capped.mark(AggregationCap::Groups);
                     return;
                 }
                 let states = groups
                     .entry(key)
                     .or_insert_with(|| accumulators.iter().map(new_acc_state).collect());
                 for (acc, state) in accumulators.iter().zip(states.iter_mut()) {
-                    feed_acc(acc, state, event);
+                    feed_acc(acc, state, event, capped);
                 }
             }
             Self::Timechart {
@@ -1544,18 +1616,20 @@ impl CompiledAggregation {
                 accumulators,
                 group_by,
                 buckets,
+                capped,
             } => {
                 let bucket = event_time_bucket(event, *span_secs, ctx);
                 let key = make_group_key(group_by, event);
                 let group_map = buckets.entry(bucket).or_default();
                 if group_map.len() >= MAX_GROUPS && !group_map.contains_key(&key) {
+                    capped.mark(AggregationCap::Groups);
                     return;
                 }
                 let states = group_map
                     .entry(key)
                     .or_insert_with(|| accumulators.iter().map(new_acc_state).collect());
                 for (acc, state) in accumulators.iter().zip(states.iter_mut()) {
-                    feed_acc(acc, state, event);
+                    feed_acc(acc, state, event, capped);
                 }
             }
             Self::Top {
@@ -1578,6 +1652,18 @@ impl CompiledAggregation {
         }
     }
 
+    /// The caps that have dropped input since this aggregation was
+    /// compiled, each once, in [`AggregationCap`] declaration order.
+    /// Empty when every event fed it whole, which includes reaching a cap
+    /// exactly. Always empty for `top`/`rare`, which have no cap.
+    #[must_use]
+    pub fn capped(&self) -> Vec<AggregationCap> {
+        match self {
+            Self::Stats { capped, .. } | Self::Timechart { capped, .. } => capped.to_vec(),
+            Self::Top { .. } | Self::Rare { .. } => Vec::new(),
+        }
+    }
+
     /// Take a snapshot of the current aggregation state as rows.
     ///
     /// Returns `(column_names, rows)` where each row is a [`Row`].
@@ -1587,12 +1673,14 @@ impl CompiledAggregation {
                 accumulators,
                 group_by,
                 groups,
+                ..
             } => snapshot_stats(accumulators, group_by, groups),
             Self::Timechart {
                 accumulators,
                 group_by,
                 buckets,
                 span_secs,
+                ..
             } => snapshot_timechart(accumulators, group_by, buckets, *span_secs),
             Self::Top {
                 count,
@@ -1764,7 +1852,9 @@ fn extract_f64(event: &Row, field: &str) -> Option<f64> {
     })
 }
 
-fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Row) {
+/// Feed one event into one accumulator, marking `capped` when the
+/// accumulator's store is full and drops a value it would have kept.
+fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Row, capped: &mut CapSet) {
     match state {
         AccState::Count(n) => *n += 1,
         AccState::CountField { non_null } => {
@@ -1820,7 +1910,7 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Row) {
             }
         }
         AccState::Dc(set) | AccState::Values(set) => {
-            feed_acc_string_set(acc, set, event);
+            feed_acc_string_set(acc, set, event, capped);
         }
         AccState::First(stored) => {
             if stored.is_none()
@@ -1838,7 +1928,7 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Row) {
             }
         }
         AccState::Median(values) | AccState::Percentile { values, .. } => {
-            feed_acc_f64_vec(acc, values, event, MAX_EXACT_VALUES);
+            feed_acc_f64_vec(acc, values, event, capped);
         }
         AccState::Stddev(welford) => {
             if let Some(field) = &acc.field
@@ -1850,22 +1940,38 @@ fn feed_acc(acc: &CompiledAcc, state: &mut AccState, event: &Row) {
     }
 }
 
-fn feed_acc_string_set(acc: &CompiledAcc, set: &mut HashSet<String>, event: &Row) {
+/// A full set drops only a value it does not already hold: a repeat
+/// changes neither `dc()` nor `values()`, so it marks nothing.
+fn feed_acc_string_set(
+    acc: &CompiledAcc,
+    set: &mut HashSet<String>,
+    event: &Row,
+    capped: &mut CapSet,
+) {
     if let Some(field) = &acc.field
-        && set.len() < MAX_DISTINCT
         && let Some(v) = event_value(event, field)
         && !matches!(v, EvalValue::Null)
     {
-        set.insert(row::cell_text(v));
+        let text = row::cell_text(v);
+        if set.len() < MAX_DISTINCT {
+            set.insert(text);
+        } else if !set.contains(&text) {
+            capped.mark(AggregationCap::DistinctValues);
+        }
     }
 }
 
-fn feed_acc_f64_vec(acc: &CompiledAcc, values: &mut Vec<f64>, event: &Row, max: usize) {
+/// A full store drops every further number, since each one would move
+/// the median or percentile.
+fn feed_acc_f64_vec(acc: &CompiledAcc, values: &mut Vec<f64>, event: &Row, capped: &mut CapSet) {
     if let Some(field) = &acc.field
-        && values.len() < max
         && let Some(v) = extract_f64(event, field)
     {
-        values.push(v);
+        if values.len() < MAX_EXACT_VALUES {
+            values.push(v);
+        } else {
+            capped.mark(AggregationCap::ExactValues);
+        }
     }
 }
 
@@ -3928,5 +4034,161 @@ mod tests {
         let pipeline = vec![span(PipeStage::Where(WhereStage { condition }))];
         let err = compile_stream_plan(&pipeline, &PinScope::unpinned(), None).unwrap_err();
         assert!(matches!(err, StreamPlanError::InvalidFormat(_)), "{err}");
+    }
+
+    // ── aggregation caps (ADR-0001 amendment, #304) ─────────────
+
+    /// The live aggregation one DSL line compiles to.
+    fn aggregation_for(dsl: &str) -> CompiledAggregation {
+        let pipeline = crate::parser::parse(dsl).expect("dsl parses").pipeline;
+        let StreamPlan::Aggregate { aggregation, .. } =
+            compile_stream_plan(&pipeline, &PinScope::unpinned(), None).expect("plan compiles")
+        else {
+            panic!("expected Aggregate for {dsl}");
+        };
+        aggregation
+    }
+
+    fn feed(aggregation: &mut CompiledAggregation, pairs: &Value) {
+        aggregation.feed_event(&event(pairs), &ctx());
+    }
+
+    #[test]
+    fn stats_marks_groups_cap_when_a_new_group_is_dropped() {
+        let mut aggregation = aggregation_for("* | stats count() by host");
+        for i in 0..MAX_GROUPS {
+            feed(&mut aggregation, &json!({"host": format!("h{i}")}));
+        }
+        // A known group still counts once the map is full: nothing dropped.
+        feed(&mut aggregation, &json!({"host": "h0"}));
+        assert!(aggregation.capped().is_empty());
+
+        feed(&mut aggregation, &json!({"host": "new"}));
+        assert_eq!(aggregation.capped(), vec![AggregationCap::Groups]);
+        assert_eq!(AggregationCap::Groups.limit(), 10_000);
+
+        // Sticky: the dropped group never comes back, so later input
+        // that drops nothing does not clear the report.
+        feed(&mut aggregation, &json!({"host": "h1"}));
+        assert_eq!(aggregation.capped(), vec![AggregationCap::Groups]);
+        let (_, rows) = aggregation.snapshot();
+        assert_eq!(rows.len(), MAX_GROUPS);
+    }
+
+    #[test]
+    fn stats_does_not_mark_cap_at_exactly_max_groups() {
+        let mut aggregation = aggregation_for("* | stats count() by host");
+        for i in 0..MAX_GROUPS {
+            feed(&mut aggregation, &json!({"host": format!("h{i}")}));
+        }
+        assert!(aggregation.capped().is_empty());
+        let (_, rows) = aggregation.snapshot();
+        assert_eq!(rows.len(), MAX_GROUPS);
+    }
+
+    #[test]
+    fn timechart_marks_groups_cap() {
+        let mut aggregation = aggregation_for("* | timechart span=1m count() by host");
+        let first = "2026-08-24T11:00:10Z";
+        let second = "2026-08-24T11:01:10Z";
+        for i in 0..MAX_GROUPS {
+            feed(
+                &mut aggregation,
+                &json!({"_time": first, "host": format!("h{i}")}),
+            );
+        }
+        // The cap is per bucket: a new group in another bucket is kept.
+        feed(&mut aggregation, &json!({"_time": second, "host": "new"}));
+        assert!(aggregation.capped().is_empty());
+
+        feed(&mut aggregation, &json!({"_time": first, "host": "new"}));
+        assert_eq!(aggregation.capped(), vec![AggregationCap::Groups]);
+    }
+
+    #[test]
+    fn dc_marks_distinct_cap_only_for_a_new_value() {
+        for dsl in ["* | stats dc(v)", "* | stats values(v)"] {
+            let mut aggregation = aggregation_for(dsl);
+            for i in 0..MAX_DISTINCT {
+                feed(&mut aggregation, &json!({"v": format!("v{i}")}));
+            }
+            // A value the full set already holds, a null and a missing
+            // field drop nothing.
+            feed(&mut aggregation, &json!({"v": "v0"}));
+            feed(&mut aggregation, &json!({"v": null}));
+            feed(&mut aggregation, &json!({"other": 1}));
+            assert!(aggregation.capped().is_empty(), "{dsl}");
+
+            feed(&mut aggregation, &json!({"v": "unseen"}));
+            assert_eq!(
+                aggregation.capped(),
+                vec![AggregationCap::DistinctValues],
+                "{dsl}"
+            );
+        }
+        assert_eq!(AggregationCap::DistinctValues.limit(), 10_000);
+    }
+
+    #[test]
+    fn median_marks_exact_cap() {
+        for dsl in ["* | stats median(v)", "* | stats p95(v)"] {
+            let mut aggregation = aggregation_for(dsl);
+            for i in 0..MAX_EXACT_VALUES {
+                feed(&mut aggregation, &json!({"v": i}));
+            }
+            // Exactly full, and an event with no numeric value: nothing
+            // dropped.
+            feed(&mut aggregation, &json!({"v": "text"}));
+            feed(&mut aggregation, &json!({"other": 1}));
+            assert!(aggregation.capped().is_empty(), "{dsl}");
+
+            feed(&mut aggregation, &json!({"v": 7}));
+            assert_eq!(
+                aggregation.capped(),
+                vec![AggregationCap::ExactValues],
+                "{dsl}"
+            );
+        }
+        assert_eq!(AggregationCap::ExactValues.limit(), 100_000);
+    }
+
+    #[test]
+    fn capped_lists_every_cap_once_in_a_fixed_order() {
+        let mut aggregation = aggregation_for("* | stats dc(v), median(n) by host");
+        for i in 0..MAX_DISTINCT {
+            feed(
+                &mut aggregation,
+                &json!({"host": "a", "v": format!("v{i}")}),
+            );
+        }
+        for i in 0..MAX_EXACT_VALUES {
+            feed(&mut aggregation, &json!({"host": "a", "n": i}));
+        }
+        for i in 1..MAX_GROUPS {
+            feed(&mut aggregation, &json!({"host": format!("h{i}")}));
+        }
+        feed(
+            &mut aggregation,
+            &json!({"host": "a", "v": "unseen", "n": 1}),
+        );
+        feed(&mut aggregation, &json!({"host": "dropped"}));
+        feed(&mut aggregation, &json!({"host": "dropped"}));
+        assert_eq!(
+            aggregation.capped(),
+            vec![
+                AggregationCap::Groups,
+                AggregationCap::DistinctValues,
+                AggregationCap::ExactValues
+            ]
+        );
+    }
+
+    #[test]
+    fn top_and_rare_report_no_cap() {
+        let mut aggregation = aggregation_for("* | top 5 host");
+        for i in 0..=MAX_GROUPS {
+            feed(&mut aggregation, &json!({"host": format!("h{i}")}));
+        }
+        assert!(aggregation.capped().is_empty());
     }
 }

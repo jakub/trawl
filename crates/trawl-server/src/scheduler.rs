@@ -83,7 +83,6 @@ async fn scheduler_loop(
     tracing::info!(
         event_type = "scheduler_started",
         poll_interval_secs = config.poll_interval_secs,
-        report_max_rows = config.report_max_rows,
         "scheduler started"
     );
 
@@ -284,7 +283,6 @@ pub async fn poll_and_execute(
         } = claimed;
         let store = schedule_store.clone();
         let pool = pool.clone();
-        let max_rows = config.report_max_rows;
 
         spawned.push(tokio::spawn(async move {
             execute_scheduled_query(
@@ -293,7 +291,6 @@ pub async fn poll_and_execute(
                 run_id,
                 &resolved_query,
                 &query_name,
-                max_rows,
                 timeout_secs,
             )
             .await;
@@ -371,7 +368,6 @@ pub(crate) async fn execute_scheduled_query(
     run_id: i64,
     query: &str,
     _query_name: &str,
-    _max_rows: usize,
     timeout_secs: u64,
 ) {
     let start = std::time::Instant::now();
@@ -709,7 +705,9 @@ fn write_result_parquet(
         return zstd_fallback(result);
     }
 
-    let executor = match trawl_engine::executor::Executor::new() {
+    // A clone of the query database, so the write spills into the query
+    // scratch directory under the query budgets (ADR-0056).
+    let executor = match pool.detached_executor() {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
@@ -1026,9 +1024,13 @@ mod tests {
         }
 
         let data = tempfile::tempdir().unwrap();
-        let executors =
-            crate::pool::ExecutorPool::new(data.path().to_str().unwrap().into(), 1, 100_000, None)
-                .unwrap();
+        let executors = crate::pool::ExecutorPool::for_test(
+            data.path().to_str().unwrap().into(),
+            1,
+            100_000,
+            None,
+        )
+        .unwrap();
         let (store, _, succeeded) = super::pg_tests::seed_run(&pool, "timed_ok").await;
         let (_, _, failed) = super::pg_tests::seed_run(&pool, "timed_failure").await;
 
@@ -1045,7 +1047,6 @@ mod tests {
             succeeded,
             "* | head 1",
             "timed_ok",
-            0,
             30,
         )
         .await;
@@ -1055,7 +1056,6 @@ mod tests {
             failed,
             "* | stats zz_sched_needle()",
             "timed_failure",
-            0,
             30,
         )
         .await;

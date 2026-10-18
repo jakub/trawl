@@ -5,7 +5,9 @@ description: Inspect a pinned field, acknowledge or repin a degraded pin, recove
 
 These commands address the server named by `TRAWL_PROFILE`. Set it to the server
 you intend to change. Reads need `schema_read`. Acknowledgement, repin, and pin
-reclamation need `schema_write`. Repin and pin reclamation also need an
+reclamation need `schema_write`, which is also enough for the CLI to follow its
+own repin job by id. A key with `schema_write` alone reads only the jobs it
+requested; any other job needs `schema_read`. Repin and pin reclamation also need an
 ingest-enabled node, and any other node answers 503 for those two. Command syntax is in the [CLI reference](/reference/cli/#schema-mode).
 Status codes and job fields are in the [API reference](/reference/api/#schema).
 
@@ -119,7 +121,9 @@ envelope field.
    ```
 
    The output is `repin duration: dry run`, the job row, and its case file.
-   Read `rows_carrying`, `projected_nulls`, `ambiguous_numerals`, up to five
+   A repin whose decision is still pending at the server's `[server] timeout_secs`
+   answers before it is made, usually because the scan is still running, and
+   the CLI then follows the job by its id until its report is ready. Read `rows_carrying`, `projected_nulls`, `ambiguous_numerals`, up to five
    `unmapped_samples`, and `requires_force`. `requires_force: true` means the
    same request without `--force` is refused.
 
@@ -181,7 +185,11 @@ than `level`. See
    loss. `refused: over its ceilings` means the finished rewrite exceeded the
    accepted counts. Inspect the new counts before you raise a ceiling.
 
-The server answers 409 for a refusal and 200 for a dry run.
+The server answers 409 for a refusal and 200 for a dry run. A scan that runs
+longer than `[server] timeout_secs` answers 202 instead, and the refusal then
+appears with `--wait`, or in `schema repin-status` until a newer job starts. A
+request that could not claim its job within `[server] timeout_secs` answers 503
+and starts nothing, so run it again.
 
 ### Watch the repin
 
@@ -196,9 +204,8 @@ job when none runs, or prints `no repin job has ever run`.
 
 `--wait` exits 0 only for a finished rewrite or a dry run. `cancelled`,
 `refused_needs_force`, `failed`, and `blocked` exit non-zero with the row and
-the server's error text. If another job takes the status slot before the next
-poll, `--wait` exits non-zero with `repin job <id> could not be followed to its
-end`, and the outcome is unknown.
+the server's error text. `--wait` reads its own job by id, so a job that starts
+after it cannot take its place.
 
 Every repin command takes `-f table`, `-f json`, or `-f csv`. After a finished
 rewrite, run `schema field <name>` and a bounded query on the field.
@@ -229,7 +236,8 @@ When a submission times out on the client and returns no job id:
 1. Do not submit again.
 2. Run `trawl -p "$TRAWL_PROFILE" schema repin-status`.
 3. Match the row to your request by `field`, `to`, `dialect`, and `status`.
-   The route has no lookup by id, so a newer job can hide yours.
+   Without the job id, the route shows only the running or newest job, so a
+   newer job can hide yours.
 4. When no row matches, read the server log and the job store. An ambiguous
    result stays unknown, including after `--wait` loses its job.
 

@@ -95,6 +95,10 @@ pub struct RepinJob {
     pub status: RepinJobStatus,
     /// Requesting key's display name (audit; `None` for internal callers).
     pub requested_by: Option<String>,
+    /// The requesting key's row id, which the status read by id matches on
+    /// when the caller holds `schema_write` alone (see [`Requester`]).
+    /// `None` for internal callers, whose jobs that read answers for nobody.
+    pub requested_by_key_id: Option<i64>,
     /// Claim instant.
     pub started_at: DateTime<Utc>,
     /// Terminal instant.
@@ -164,6 +168,34 @@ pub struct RepinJob {
     pub cancelled_by: Option<String>,
 }
 
+/// Who requested a repin job: both halves of the calling key's identity.
+///
+/// `key_id` is the keystore's row id for the key. It is stable for the
+/// key's lifetime and never reissued, so it is what the status read by id
+/// matches on when the caller holds `schema_write` alone: a key reads the
+/// jobs it requested and no other, and carrying another key's name buys
+/// nothing. `name` is the key's operator-chosen display label, which the
+/// row's `requested_by` and the audit events carry because it is what an
+/// operator recognises; two keys may share one, which is why it decides
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requester {
+    /// The keystore row id of the requesting key.
+    pub key_id: i64,
+    /// The requesting key's display name.
+    pub name: String,
+}
+
+impl Requester {
+    /// Build a requester from a verified key's row id and display name.
+    pub fn new(key_id: i64, name: impl Into<String>) -> Self {
+        Self {
+            key_id,
+            name: name.into(),
+        }
+    }
+}
+
 /// What a repin job is claimed for: the row's immutable half.
 ///
 /// A struct rather than seven positional arguments: `dialect` is the one
@@ -192,8 +224,10 @@ pub struct RepinClaim<'a> {
     pub max_nulled_rows: Option<i64>,
     /// The ambiguity ceiling the request asked for, if any. See above.
     pub max_ambiguous_rows: Option<i64>,
-    /// Requesting key's display name (audit).
-    pub requested_by: Option<&'a str>,
+    /// The requesting key, or `None` for an internal caller. Its name is
+    /// written as the row's `requested_by` and its id as the row's
+    /// `requested_by_key_id`, so the two can never describe different keys.
+    pub requester: Option<&'a Requester>,
 }
 
 /// Everything the scan learned, stamped onto the job row in one statement:
@@ -354,6 +388,7 @@ fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
         force: row.try_get("force")?,
         status,
         requested_by: row.try_get("requested_by")?,
+        requested_by_key_id: row.try_get("requested_by_key_id")?,
         started_at: row.try_get("started_at")?,
         finished_at: row.try_get("finished_at")?,
         error: row.try_get("error")?,
@@ -382,7 +417,8 @@ fn row_to_job(row: &PgRow) -> Result<RepinJob, sqlx::Error> {
 }
 
 const JOB_COLS: &str = "id, field, from_type, to_type, dry_run, force, status, requested_by, \
-     started_at, finished_at, error, files_total, rows_carrying, projected_nulls, \
+     requested_by_key_id, started_at, finished_at, error, files_total, rows_carrying, \
+     projected_nulls, \
      resurrectable, affected_bytes, files_done, rows_rewritten, rows_nulled, rows_resurrected, \
      dialect, ambiguous_numerals, unmapped_samples, field_last_seen, field_last_service, \
      max_nulled_rows, max_ambiguous_rows, accepted_max_nulled_rows, \
@@ -418,6 +454,15 @@ impl RepinStore {
     /// prepared against, not merely present, so a repin that flipped the
     /// field in between refuses instead of scanning under a stale `from`.
     pub async fn claim(&self, claim: RepinClaim<'_>) -> Result<i64, StoreError> {
+        Ok(self.claim_job(claim).await?.id)
+    }
+
+    /// [`Self::claim`], returning the claimed row as the insert wrote it.
+    ///
+    /// The row is the one thing a caller can answer with once it has stopped
+    /// waiting: the repin trigger past its answer bound replies with it
+    /// rather than reading the row back (see `RepinEngine::start_within`).
+    pub async fn claim_job(&self, claim: RepinClaim<'_>) -> Result<RepinJob, StoreError> {
         let mut tx = self.pool.begin().await?;
         // Bound the advisory-lock wait the same way the purge bounds its
         // own side: `lock_timeout` does not cover advisory locks, so
@@ -441,12 +486,13 @@ impl RepinStore {
             });
         }
 
-        let result = sqlx::query_scalar::<_, i64>(
+        let result = sqlx::query(AssertSqlSafe(format!(
             "INSERT INTO repin_jobs (field, from_type, to_type, dialect, dry_run, force,
-                                     max_nulled_rows, max_ambiguous_rows, requested_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             RETURNING id",
-        )
+                                     max_nulled_rows, max_ambiguous_rows, requested_by,
+                                     requested_by_key_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             RETURNING {JOB_COLS}"
+        )))
         .bind(claim.field)
         .bind(expected)
         .bind(claim.to_type.as_catalog())
@@ -455,15 +501,17 @@ impl RepinStore {
         .bind(claim.force)
         .bind(claim.max_nulled_rows)
         .bind(claim.max_ambiguous_rows)
-        .bind(claim.requested_by)
+        .bind(claim.requester.map(|r| r.name.as_str()))
+        .bind(claim.requester.map(|r| r.key_id))
         .fetch_one(&mut *tx)
         .await;
-        let id = result.map_err(|e| match classify_violation(&e) {
+        let row = result.map_err(|e| match classify_violation(&e) {
             Some(PgViolation::RepinAlreadyRunning) => StoreError::RepinAlreadyRunning,
             _ => StoreError::from(e),
         })?;
+        let job = row_to_job(&row)?;
         tx.commit().await?;
-        Ok(id)
+        Ok(job)
     }
 
     /// Stamp the scan's whole reading onto the job row.
@@ -848,6 +896,31 @@ impl RepinStore {
             "SELECT {JOB_COLS} FROM repin_jobs WHERE id = $1"
         )))
         .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref()
+            .map(row_to_job)
+            .transpose()
+            .map_err(StoreError::from)
+    }
+
+    /// Read one job row, if the key with row id `key_id` requested it.
+    ///
+    /// Existence and ownership are one predicate in one statement: nothing
+    /// is read and then checked, so there is no window in which the answer
+    /// could change under the caller, and a job another key requested
+    /// returns `None`, as an id the store never issued does. A row with no
+    /// requester matches no key.
+    pub async fn get_requested_by(
+        &self,
+        id: i64,
+        key_id: i64,
+    ) -> Result<Option<RepinJob>, StoreError> {
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {JOB_COLS} FROM repin_jobs WHERE id = $1 AND requested_by_key_id = $2"
+        )))
+        .bind(id)
+        .bind(key_id)
         .fetch_optional(&self.pool)
         .await?;
         row.as_ref()

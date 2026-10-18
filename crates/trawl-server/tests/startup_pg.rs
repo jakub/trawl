@@ -45,9 +45,14 @@ struct Fixture {
     query_log: Option<PathBuf>,
     /// `[ingest] wal_dir`, when not `wal` beside the data root.
     wal_dir: Option<PathBuf>,
-    /// The daemon's `TMPDIR`, where the query engine makes its spill
-    /// directory; unset leaves the system default.
+    /// The daemon's `TMPDIR`; unset leaves the system default.
     tmpdir: Option<PathBuf>,
+    /// `[server] query_scratch_dir`; unset leaves the default beside the
+    /// data root ([`Fixture::scratch`]).
+    query_scratch_dir: Option<PathBuf>,
+    /// The file the next spawn writes its combined output to, under the
+    /// fixture root.
+    daemon_log: &'static str,
 }
 
 /// The certificate a spawned daemon serves.
@@ -90,6 +95,8 @@ impl Fixture {
             query_log: None,
             wal_dir: None,
             tmpdir: None,
+            query_scratch_dir: None,
+            daemon_log: "daemon.log",
         }
     }
 
@@ -99,6 +106,13 @@ impl Fixture {
 
     fn data(&self) -> PathBuf {
         self.storage_root().join("data")
+    }
+
+    /// The query scratch directory the daemon uses.
+    fn scratch(&self) -> PathBuf {
+        self.query_scratch_dir
+            .clone()
+            .unwrap_or_else(|| self.storage_root().join("data.query-scratch"))
     }
 
     fn wal(&self) -> PathBuf {
@@ -258,7 +272,7 @@ impl Fixture {
         };
         let config = format!(
             "[server]\nhttp_addr = '127.0.0.1:0'\nshutdown_drain_secs = 1\n\
-             {tls}{log_file}\n{query_log}\n\
+             {tls}{log_file}\n{query_log}\n{query_scratch_dir}\n\
              [data]\npath = {}\n[auth]\ndatabase_url = {}\naudit_interval_secs = 0\n\
              [storage]\ndatabase_url = {}\n\
              [ingest]\nenabled = {ingest}\ninternal_telemetry = {telemetry}\nwal_dir = {}\n\
@@ -288,10 +302,16 @@ impl Fixture {
             query_log = self.query_log.as_ref().map_or_else(String::new, |path| {
                 format!("query_log = {}", quote(&path.to_string_lossy()))
             }),
+            query_scratch_dir = self
+                .query_scratch_dir
+                .as_ref()
+                .map_or_else(String::new, |path| {
+                    format!("query_scratch_dir = {}", quote(&path.to_string_lossy()))
+                }),
         );
         let path = self.root.path().join("trawld.toml");
         std::fs::write(&path, config).unwrap();
-        let log = self.root.path().join("daemon.log");
+        let log = self.root.path().join(self.daemon_log);
         let output = std::fs::File::create(&log).unwrap();
         command.env_clear();
         for name in ["LD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"] {
@@ -583,6 +603,19 @@ fn bytes(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
     entries
 }
 
+/// The storage root's bytes without the query scratch directory, which sits
+/// beside the data root by default. Boot locks and clears the scratch
+/// directory before PostgreSQL admission (ADR-0056), so a start the
+/// database refuses has made it; it holds no corpus, WAL or staging bytes.
+fn corpus_bytes(fixture: &Fixture) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    let root = fixture.storage_root();
+    let scratch = fixture.scratch();
+    let scratch = scratch.strip_prefix(&root).unwrap().to_owned();
+    let mut entries = bytes(&root);
+    entries.retain(|path, _| !path.starts_with(&scratch));
+    entries
+}
+
 async fn rows(pool: &PgPool) -> BTreeMap<String, Vec<String>> {
     let relations: Vec<(String, String)> = sqlx::query_as(
         "SELECT quote_ident(n.nspname)||'.'||quote_ident(c.relname), c.relkind::text
@@ -637,7 +670,7 @@ async fn refusal(owner: &str, legacy: bool) {
         1
     };
     fixture.cutover(job_id);
-    let before_files = bytes(&fixture.storage_root());
+    let before_files = corpus_bytes(&fixture);
     let before_fleet = rows(&fixture.fleet).await;
     let before_app = rows(&fixture.app).await;
     assert!(
@@ -655,7 +688,7 @@ async fn refusal(owner: &str, legacy: bool) {
     for _ in 0..2 {
         fixture.spawn().refused(diagnostic).await;
         assert!(
-            bytes(&fixture.storage_root()) == before_files,
+            corpus_bytes(&fixture) == before_files,
             "refused startup changed data/WAL/staging bytes"
         );
         assert_eq!(rows(&fixture.fleet).await, before_fleet);
@@ -695,9 +728,21 @@ async fn database_refusal_does_not_initialize_fresh_root() {
         .refused("unsupported pre-1.0 migration")
         .await;
     assert!(
-        !fixture.storage_root().exists(),
+        !fixture.data().exists(),
         "refused startup initialized storage"
     );
+    assert!(
+        !fixture.wal().exists(),
+        "refused startup initialized storage"
+    );
+    // The scratch directory is made, locked and cleared before admission,
+    // and is all a refused start leaves.
+    let left: Vec<_> = std::fs::read_dir(fixture.storage_root())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(left, [fixture.scratch()]);
+    assert_eq!(std::fs::read_dir(fixture.scratch()).unwrap().count(), 0);
     fixture.assert_lock_free().await;
 }
 
@@ -709,9 +754,9 @@ async fn epoch_refusal_preserves_storage_and_releases_admitted_lock() {
     fixture.current_app().await;
     fixture.cutover(1);
     std::fs::write(fixture.data().join("EPOCH"), "2\n").unwrap();
-    let before = bytes(&fixture.storage_root());
+    let before = corpus_bytes(&fixture);
     fixture.spawn().refused("epoch").await;
-    assert_eq!(bytes(&fixture.storage_root()), before);
+    assert_eq!(corpus_bytes(&fixture), before);
     fixture.assert_lock_free().await;
 }
 
@@ -722,7 +767,7 @@ async fn competing_writer_refuses_before_filesystem_recovery() {
     fixture.current_fleet().await;
     fixture.current_app().await;
     fixture.current_cutover().await;
-    let before = bytes(&fixture.storage_root());
+    let before = corpus_bytes(&fixture);
     let mut owner = PgConnection::connect(&fixture.app_url).await.unwrap();
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(LOCK_KEY)
@@ -731,7 +776,7 @@ async fn competing_writer_refuses_before_filesystem_recovery() {
         .unwrap();
     fixture.spawn().refused("advisory lock").await;
     assert!(
-        bytes(&fixture.storage_root()) == before,
+        corpus_bytes(&fixture) == before,
         "competing writer changed the corpus"
     );
     owner.close().await.unwrap();
@@ -839,6 +884,40 @@ async fn log_marker_collision_refuses_before_database_or_storage_mutation() {
             assert_eq!(rows(&fixture.fleet).await, before_fleet);
         }
     }
+}
+
+#[tokio::test]
+async fn soft_descriptor_limit_rises_to_the_hard_limit_at_startup() {
+    use rustix::process::{Resource, getrlimit};
+    // The test inherits the hard limit; the daemon's parent shell lowers
+    // only the soft one, the way systemd's default 1024 arrives.
+    let Some(hard) = getrlimit(Resource::Nofile)
+        .maximum
+        .filter(|&hard| hard > 1024)
+    else {
+        panic!("this test needs a finite hard RLIMIT_NOFILE above 1024");
+    };
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", r#"ulimit -Sn 1024 && exec "$@""#, "sh"])
+        .arg(env!("CARGO_BIN_EXE_trawld"));
+    let mut daemon = fixture.launch(command, false);
+    daemon.ready().await;
+    daemon.stop().await;
+    let log = daemon.log();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("descriptor limit"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(
+        lines[0].contains("descriptor limit raised to the hard limit")
+            && lines[0].contains(&format!("nofile_soft={hard}"))
+            && lines[0].contains(&format!("nofile_hard={hard}")),
+        "{log}"
+    );
 }
 
 #[tokio::test]
@@ -2447,20 +2526,39 @@ async fn a_repin_sibling_that_is_not_a_directory_refuses_the_start() {
 /// rather than a panic whose message the panic hook drops. A spill
 /// directory refused as not private takes the same path, but an
 /// unprivileged test cannot produce one: the engine asks for mode 0700,
-/// and only a mount that ignores modes answers otherwise. A `TMPDIR` that
-/// does not exist stands in for it.
+/// and only a mount that ignores modes answers otherwise.
+///
+/// The spill directory lives in the query scratch directory (ADR-0056),
+/// so a scratch path a few bytes short of `PATH_MAX` stands in: trawld can
+/// make, lock and clear the scratch directory itself, but the spill
+/// directory's longer path inside it is `ENAMETOOLONG`.
 #[tokio::test]
 async fn a_spill_directory_that_cannot_be_made_refuses_the_start() {
+    /// Linux's `PATH_MAX`, the terminating NUL included.
+    const PATH_MAX: usize = 4096;
     let mut fixture = Fixture::new().await;
     fixture.current_fleet().await;
-    let tmpdir = fixture.root.path().join("no-such-tmp");
-    fixture.tmpdir = Some(tmpdir.clone());
+    // Room for the scratch path, and too little for `/trawl-spill-XXXXXX`
+    // after it.
+    let target = PATH_MAX - 1 - 8;
+    let mut scratch = fixture.root.path().join("deep");
+    while scratch.as_os_str().len() + 1 + 200 <= target {
+        scratch.push("d".repeat(200));
+    }
+    let rest = target - scratch.as_os_str().len() - 1;
+    if rest > 0 {
+        scratch.push("s".repeat(rest));
+    }
+    assert!(scratch.as_os_str().len() < PATH_MAX);
+    assert!(scratch.as_os_str().len() + "/trawl-spill-XXXXXX".len() >= PATH_MAX);
+    std::fs::create_dir_all(scratch.parent().unwrap()).unwrap();
+    fixture.query_scratch_dir = Some(scratch.clone());
 
     let mut daemon = fixture.spawn();
     daemon.refused("failed to start the query engine").await;
     let log = daemon.log();
     assert!(
-        log.contains(&tmpdir.display().to_string()),
+        log.contains(&scratch.display().to_string()),
         "the error names the spill directory's parent: {log}"
     );
     assert!(
@@ -2468,4 +2566,422 @@ async fn a_spill_directory_that_cannot_be_made_refuses_the_start() {
         "the start failed by panicking: {log}"
     );
     fixture.assert_lock_free().await;
+}
+
+/// #304: the query engine makes nothing in `TMPDIR` (ADR-0056), so a
+/// `TMPDIR` that does not exist no longer stops trawld from starting.
+#[tokio::test]
+async fn a_missing_tmpdir_does_not_stop_the_query_engine() {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.tmpdir = Some(fixture.root.path().join("no-such-tmp"));
+
+    let mut daemon = fixture.spawn();
+    daemon.ready().await;
+    daemon.stop().await;
+}
+
+/// Every entry under `root`, `root` included, with what it is, read without
+/// following a link: a directory and its mode, a file and its bytes, or a
+/// link and its target. A refused start must leave this unchanged.
+fn scratch_tree(root: &Path) -> BTreeMap<PathBuf, String> {
+    fn walk(path: &Path, entries: &mut BTreeMap<PathBuf, String>) {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        let what = if meta.is_symlink() {
+            format!("link {}", std::fs::read_link(path).unwrap().display())
+        } else if meta.is_dir() {
+            format!("dir {:04o}", meta.mode() & 0o7777)
+        } else {
+            format!("file {:?}", std::fs::read(path).unwrap())
+        };
+        entries.insert(path.to_owned(), what);
+        if meta.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                walk(&entry.unwrap().path(), entries);
+            }
+        }
+    }
+    let mut entries = BTreeMap::new();
+    walk(root, &mut entries);
+    entries
+}
+
+/// What a trawld killed mid-query leaves in its scratch directory, made by
+/// the engine's own factories so the names are the ones trawld makes: a
+/// spill directory holding both kinds of `DuckDB` spill file, a hot-buffer
+/// snapshot, a Parquet export staging file, and the `tmp_` copy `DuckDB`'s
+/// `COPY ... TO` writes before its rename. Returns every planted path.
+fn plant_stale_scratch(scratch: &Path) -> Vec<PathBuf> {
+    let made = trawl_engine::scratch::QueryScratch::new(scratch);
+    let spill = tempfile::Builder::new()
+        .prefix(trawl_engine::scratch::SPILL_DIR_PREFIX)
+        .rand_bytes(6)
+        .tempdir_in(scratch)
+        .unwrap()
+        .keep();
+    let mut planted = vec![spill.clone()];
+    for name in [
+        "duckdb_temp_storage_DEFAULT-0.tmp",
+        "duckdb_temp_block-4611686018427388160.block",
+    ] {
+        std::fs::write(spill.join(name), b"spilled query state").unwrap();
+        planted.push(spill.join(name));
+    }
+    let (_, snapshot) = made.snapshot_file().unwrap().keep().unwrap();
+    let (_, export) = made.export_file().unwrap().keep().unwrap();
+    let copy = scratch.join(format!(
+        "tmp_{}",
+        export.file_name().unwrap().to_str().unwrap()
+    ));
+    std::fs::write(&copy, b"half a parquet copy").unwrap();
+    planted.extend([snapshot, export, copy]);
+    for path in &planted {
+        let name = path.file_name().unwrap();
+        assert!(
+            trawl_engine::scratch::is_spill_dir_name(name)
+                || trawl_engine::scratch::is_spill_file_name(name)
+                || trawl_engine::scratch::is_snapshot_file_name(name)
+                || trawl_engine::scratch::is_export_file_name(name),
+            "{} is not a name trawld makes",
+            path.display()
+        );
+    }
+    planted
+}
+
+/// AC11 (#304): a refused scratch directory refuses the start before
+/// PostgreSQL admission, with a message naming `[server] query_scratch_dir`,
+/// and leaves the tree as it found it. A scratch directory with group or
+/// other bits is closed before the lock and the preflight, as ADR-0052
+/// closes a root, so the tests that watch it make it 0700 first.
+async fn assert_scratch_refusal(fixture: &Fixture, diagnostic: &str, watched: &Path) {
+    let before = scratch_tree(watched);
+    let mut daemon = fixture.spawn();
+    daemon.refused(diagnostic).await;
+    let log = daemon.log();
+    assert!(log.contains("[server] query_scratch_dir"), "{log}");
+    assert_eq!(
+        scratch_tree(watched),
+        before,
+        "the refused start changed {}",
+        watched.display()
+    );
+    fixture.assert_lock_free().await;
+}
+
+/// AC11 (#304): a second trawld on a held scratch directory refuses to
+/// start, before PostgreSQL admission, and removes nothing, even an entry
+/// it would reclaim from a dead process. Once the first trawld stops, a
+/// start takes the lock and reclaims that entry.
+#[tokio::test]
+async fn query_scratch_second_trawld_refuses() {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let mut first = fixture.spawn();
+    first.ready().await;
+    let scratch = fixture.scratch();
+    assert_mode(&scratch, 0o700);
+    let planted = plant_stale_scratch(&scratch);
+    let before = scratch_tree(&scratch);
+
+    fixture.daemon_log = "second.log";
+    let mut second = fixture.spawn();
+    second.refused("is locked by another trawld").await;
+    let log = second.log();
+    for needle in [
+        format!("query scratch directory {}", scratch.display()),
+        "[server] query_scratch_dir".to_owned(),
+    ] {
+        assert!(log.contains(&needle), "{needle:?} missing from {log}");
+    }
+    // The scratch lock refused it, not the sole-writer lock: it never
+    // reached PostgreSQL.
+    assert!(!log.contains("sole-writer"), "{log}");
+    assert_eq!(
+        scratch_tree(&scratch),
+        before,
+        "the refused start removed something"
+    );
+    first.ready().await;
+
+    first.stop().await;
+    fixture.daemon_log = "third.log";
+    let mut third = fixture.spawn();
+    third.ready().await;
+    for path in &planted {
+        assert!(
+            std::fs::symlink_metadata(path).is_err(),
+            "{} survived the boot after the lock was freed",
+            path.display()
+        );
+    }
+    third.stop().await;
+}
+
+/// AC11 (#304): a trawld killed by SIGKILL while it holds the scratch directory
+/// leaves its spill directory, snapshot and export staging files behind,
+/// and the kernel frees its lock. The next start reclaims all of them,
+/// says so, and serves from an empty 0700 scratch directory.
+#[tokio::test]
+async fn query_scratch_boot_reclaims_stale_spill_snapshot_export() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let mut killed = fixture.spawn();
+    killed.ready().await;
+    let scratch = fixture.scratch();
+    let planted = plant_stale_scratch(&scratch);
+    killed.child.kill().unwrap();
+    killed.child.wait().unwrap();
+    for path in &planted {
+        assert!(path.exists(), "{}", path.display());
+    }
+    set_mode(&scratch, 0o755);
+
+    let mut daemon = fixture.spawn();
+    daemon.ready().await;
+    let log = daemon.log();
+    let line = log
+        .lines()
+        .find(|line| line.contains("query scratch directory locked"))
+        .unwrap_or_else(|| panic!("no reclaim line: {log}"));
+    // Two spill directories: the planted one and the killed daemon's own,
+    // which its query database made in scratch.
+    for field in ["spill_dirs=2", "snapshots=1", "exports=2"] {
+        assert!(line.contains(field), "{field} missing from {line}");
+    }
+    // What remains is the 0700 directory and the serving daemon's own
+    // empty spill directory, which no planted path names.
+    let mut tree = scratch_tree(&scratch);
+    let own: Vec<PathBuf> = tree
+        .keys()
+        .filter(|path| {
+            path.parent() == Some(scratch.as_path())
+                && trawl_engine::scratch::is_spill_dir_name(path.file_name().unwrap())
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        own.len(),
+        1,
+        "one spill directory, the daemon's own: {tree:?}"
+    );
+    assert!(
+        !planted.contains(&own[0]),
+        "a stale spill directory survived"
+    );
+    assert_eq!(tree.remove(&own[0]).as_deref(), Some("dir 0700"));
+    assert_eq!(
+        tree,
+        BTreeMap::from([(scratch.clone(), "dir 0700".to_owned())]),
+        "boot left something behind, or left the directory open"
+    );
+    daemon.stop().await;
+}
+
+/// AC11 (#304): a scratch directory that is a symlink is not followed. The
+/// start refuses, and the link and its target, stale entries and 0755 mode
+/// included, are unchanged.
+#[tokio::test]
+async fn query_scratch_symlink_refuses_the_start() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let target = fixture.root.path().join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    plant_stale_scratch(&target);
+    set_mode(&target, 0o755);
+    std::fs::create_dir_all(fixture.storage_root()).unwrap();
+    std::os::unix::fs::symlink(&target, fixture.scratch()).unwrap();
+
+    let before = scratch_tree(&fixture.scratch());
+    assert_scratch_refusal(
+        &fixture,
+        "is a symbolic link, which trawld does not follow",
+        &target,
+    )
+    .await;
+    assert_eq!(scratch_tree(&fixture.scratch()), before, "the link changed");
+    assert_mode(&target, 0o755);
+}
+
+/// #304 F1: a scratch directory whose path differs from the storage roots'
+/// paths but reaches one of them through a symlink refuses the start, and
+/// boot removes nothing there. Two spellings: an hour directory of the
+/// corpus through a link to the data root, whose one file carries an
+/// export staging file's name, and the WAL directory itself through a link
+/// to the state directory. The configured paths share no prefix with the
+/// roots', so only the opened directories show the overlap.
+#[tokio::test]
+async fn query_scratch_reached_through_a_link_refuses_the_start() {
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let data = fixture.data();
+    let hour = data.join("prod/2026-10-17/00");
+    std::fs::create_dir_all(&hour).unwrap();
+    std::fs::write(data.join("EPOCH"), b"3\n").unwrap();
+    let corpus = hour.join("trawl-export-abc123.parquet");
+    std::fs::write(&corpus, b"a corpus file").unwrap();
+    std::fs::create_dir_all(fixture.wal()).unwrap();
+    for dir in [&data, &fixture.wal()] {
+        set_mode(dir, 0o700);
+    }
+    let alias = fixture.root.path().join("alias");
+    std::os::unix::fs::symlink(&data, &alias).unwrap();
+    let state = fixture.root.path().join("state");
+    std::os::unix::fs::symlink(fixture.storage_root(), &state).unwrap();
+
+    for (scratch, diagnostic) in [
+        (alias.join("prod/2026-10-17/00"), "is inside the data root"),
+        (state.join("wal"), "is the WAL directory"),
+    ] {
+        fixture.query_scratch_dir = Some(scratch.clone());
+        assert_scratch_refusal(&fixture, diagnostic, &fixture.storage_root()).await;
+        let log = fixture_log(&fixture);
+        assert!(log.contains(&scratch.display().to_string()), "{log}");
+        assert_eq!(std::fs::read(&corpus).unwrap(), b"a corpus file");
+    }
+}
+
+/// AC11 (#304): an entry trawld does not make refuses the start, naming the
+/// entry. The preflight reads the whole tree first, so the stale entries
+/// beside it, which a clean boot would reclaim, are left too.
+#[tokio::test]
+async fn query_scratch_foreign_entry_refuses_the_start() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let scratch = fixture.scratch();
+    std::fs::create_dir_all(&scratch).unwrap();
+    set_mode(&scratch, 0o700);
+    plant_stale_scratch(&scratch);
+    let foreign = scratch.join("notes.txt");
+    std::fs::write(&foreign, b"an operator's file").unwrap();
+
+    assert_scratch_refusal(&fixture, "is not an entry trawld makes", &scratch).await;
+    let log = fixture_log(&fixture);
+    assert!(log.contains(&foreign.display().to_string()), "{log}");
+    assert!(log.contains("has removed nothing"), "{log}");
+}
+
+/// AC11 (#304): a symlink inside the scratch directory refuses the start
+/// and is never followed: one with a snapshot's name at the top, and one
+/// with a spill file's name inside a stale spill directory. Each points at
+/// a file outside the directory, which stays as it was.
+#[tokio::test]
+async fn query_scratch_symlink_entry_refuses_the_start() {
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let scratch = fixture.scratch();
+    let victim = fixture.root.path().join("victim");
+    std::fs::write(&victim, b"not trawld's").unwrap();
+    std::fs::create_dir_all(&scratch).unwrap();
+    set_mode(&scratch, 0o700);
+    let planted = plant_stale_scratch(&scratch);
+    let spill = &planted[0];
+    let links = [
+        scratch.join("trawl-snapshot-Link01.ndjson"),
+        spill.join("duckdb_temp_block-7.block"),
+    ];
+    for link in &links {
+        std::os::unix::fs::symlink(&victim, link).unwrap();
+        assert_scratch_refusal(
+            &fixture,
+            "is a symbolic link, which trawld does not follow",
+            &scratch,
+        )
+        .await;
+        let log = fixture_log(&fixture);
+        assert!(log.contains(&link.display().to_string()), "{log}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"not trawld's");
+        std::fs::remove_file(link).unwrap();
+    }
+}
+
+/// AC11 (#304): a scratch directory another user owns refuses the start
+/// before anything changes. An unprivileged test cannot make a directory
+/// another user owns, so it names `/usr`, which root owns; a test run as
+/// root skips. The refusal is judged from the directory's owner alone.
+#[tokio::test]
+async fn query_scratch_other_owner_refuses_the_start() {
+    let euid = rustix::process::geteuid().as_raw();
+    let owned_by_root = Path::new("/usr");
+    if euid == 0 {
+        eprintln!("SKIPPED: query_scratch_other_owner_refuses_the_start runs as root");
+        return;
+    }
+    assert_eq!(std::fs::metadata(owned_by_root).unwrap().uid(), 0);
+    let mut fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    fixture.query_scratch_dir = Some(owned_by_root.to_owned());
+    let mut daemon = fixture.spawn();
+    daemon
+        .refused(&format!(
+            "is owned by uid 0, not uid {euid}, the user trawld runs as"
+        ))
+        .await;
+    assert!(daemon.log().contains("[server] query_scratch_dir"));
+    fixture.assert_lock_free().await;
+}
+
+/// AC11 (#304): a stale spill directory that is a mount of its own is not
+/// crossed. In an unprivileged user and mount namespace, the spill
+/// directory is bind-mounted onto itself, so it sits on the scratch
+/// directory's filesystem in another mount. The start refuses, naming it,
+/// and its spill files stay.
+#[tokio::test]
+async fn query_scratch_mount_entry_refuses_the_start() {
+    let Some(userns) = Userns::for_test("query_scratch_mount_entry_refuses_the_start") else {
+        return;
+    };
+    let fixture = Fixture::new().await;
+    fixture.current_fleet().await;
+    let scratch = fixture.scratch();
+    std::fs::create_dir_all(&scratch).unwrap();
+    set_mode(&scratch, 0o700);
+    let planted = plant_stale_scratch(&scratch);
+    let spill = &planted[0];
+    let before = scratch_tree(&scratch);
+
+    let mut daemon = fixture.spawn_in_userns(&userns, spill);
+    daemon
+        .refused("is on another mount, which trawld does not cross")
+        .await;
+    let log = daemon.log();
+    assert!(log.contains(&spill.display().to_string()), "{log}");
+    assert!(log.contains("[server] query_scratch_dir"), "{log}");
+    assert_eq!(scratch_tree(&scratch), before);
+    fixture.assert_lock_free().await;
+}
+
+/// AC11 (#304): a query-only node whose data volume is read-only and which
+/// keeps the default scratch directory beside the data root refuses the
+/// start, and the message names the key to set. In an unprivileged user
+/// and mount namespace, the state directory is bind-mounted read-only.
+#[tokio::test]
+async fn query_scratch_read_only_default_names_the_key() {
+    let Some(userns) = Userns::for_test("query_scratch_read_only_default_names_the_key") else {
+        return;
+    };
+    let mut fixture = Fixture::new().await;
+    fixture.ingest = false;
+    fixture.current_fleet().await;
+    let data = fixture.data();
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("EPOCH"), b"3\n").unwrap();
+    set_mode(&data, 0o700);
+    let before = scratch_tree(&fixture.storage_root());
+
+    let mut daemon = fixture.spawn_in_userns(&userns, &fixture.storage_root());
+    daemon
+        .refused(&format!(
+            "the query scratch directory {} is on a read-only filesystem; point \
+             [server] query_scratch_dir at a writable directory",
+            fixture.scratch().display()
+        ))
+        .await;
+    assert_eq!(scratch_tree(&fixture.storage_root()), before);
+    fixture.assert_lock_free().await;
+}
+
+/// The combined output of the fixture's last spawn.
+fn fixture_log(fixture: &Fixture) -> String {
+    std::fs::read_to_string(fixture.root.path().join(fixture.daemon_log)).unwrap()
 }

@@ -10,8 +10,7 @@
 //! - [`listener`]: the accept loop behind the production TLS listener.
 //! - [`body_work`]: ingest and preview work that keeps its count after
 //!   the client leaves.
-//! - [`transport`]: connections and HTTP/2 streams through the production
-//!   TLS listener.
+//! - [`transport`]: connections through the production TLS listener.
 //! - [`routes`]: the production router.
 //!
 //! The listener, body-work, transport and route tests run against real

@@ -21,6 +21,10 @@ clap = { workspace = true }
 # handlers (the thin proxy validates keys via upstream /whoami instead).
 fleet-auth = { workspace = true, features = ["session"] }
 futures = { workspace = true }
+# The listener: hyper's HTTP/1 builder and the tokio timer its header
+# deadline needs. `axum::serve` exposes neither.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 mime_guess = { workspace = true }
 rust-embed = { workspace = true }
 reqwest = { workspace = true }

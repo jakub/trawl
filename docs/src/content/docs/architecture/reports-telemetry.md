@@ -50,9 +50,9 @@ and the decision is
 
 Every DSL query that reaches its DSL check gets one account, refusals at that
 check and capacity refusals included. `kind` is `query`, `from_saved`,
-`export`, or `scheduled`, which covers manual runs too. Live tail, the pool
-ping, and field sampling get none. Live tail never reaches DuckDB, and the
-other two do not run user DSL.
+`export`, or `scheduled`, which covers manual runs too. Live tail and field
+sampling get none. Live tail never reaches DuckDB, and field sampling does not
+run user DSL.
 
 Each phase is an integer number of microseconds in a field named
 `query_<phase>_us`. Milliseconds would floor the short phases of a typical

@@ -44,11 +44,12 @@ use serde::{Deserialize, Serialize};
 /// Marker filename inside the data root.
 pub const REPIN_MARKER: &str = "REPIN";
 
-/// Suffix of the shadow (next-generation) sibling root.
-pub const SHADOW_SUFFIX: &str = ".repin-next";
+/// Suffix of the shadow (next-generation) sibling root. Config owns the
+/// spelling, because its query scratch check refuses these roots too.
+pub const SHADOW_SUFFIX: &str = trawl_config::REPIN_SHADOW_SUFFIX;
 
 /// Suffix of the aside (previous-generation) sibling root.
-pub const ASIDE_SUFFIX: &str = ".repin-aside";
+pub const ASIDE_SUFFIX: &str = trawl_config::REPIN_ASIDE_SUFFIX;
 
 /// Where a repin job died, as recorded in the marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,20 +119,13 @@ impl RepinMarker {
 /// The shadow sibling root for a data root.
 #[must_use]
 pub fn shadow_root(data_dir: &Path) -> PathBuf {
-    sibling(data_dir, SHADOW_SUFFIX)
+    trawl_config::data_root_sibling(data_dir, SHADOW_SUFFIX)
 }
 
 /// The aside sibling root for a data root.
 #[must_use]
 pub fn aside_root(data_dir: &Path) -> PathBuf {
-    sibling(data_dir, ASIDE_SUFFIX)
-}
-
-fn sibling(path: &Path, suffix: &str) -> PathBuf {
-    let name = path
-        .file_name()
-        .map_or_else(|| "data".to_owned(), |n| n.to_string_lossy().into_owned());
-    path.with_file_name(format!("{name}{suffix}"))
+    trawl_config::data_root_sibling(data_dir, ASIDE_SUFFIX)
 }
 
 /// The marker path inside a data root.

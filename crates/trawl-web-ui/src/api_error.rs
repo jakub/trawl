@@ -69,6 +69,20 @@ pub enum ApiError {
         message: String,
     },
 
+    /// The server ran the query and it used up the memory or scratch space
+    /// trawld gives queries (`query_resource_exhausted`, ADR-0056). The
+    /// server is healthy and the query text is fine, so this is neither a
+    /// [query error](Kept::Query) nor a retryable failure: running it again
+    /// as sent exhausts the same budget. The message is the server's fixed
+    /// sentence, with no path, size or engine text, so it renders verbatim.
+    #[error("{message}")]
+    ResourceExhausted {
+        /// The HTTP status the refusal came with.
+        status: u16,
+        /// The envelope's human-readable summary.
+        message: String,
+    },
+
     #[error("decode: {0}")]
     Decode(String),
 
@@ -93,7 +107,8 @@ impl ApiError {
             Self::Status(status)
             | Self::Server { status, .. }
             | Self::Query { status, .. }
-            | Self::Recovering { status, .. } => Some(*status),
+            | Self::Recovering { status, .. }
+            | Self::ResourceExhausted { status, .. } => Some(*status),
             // The one status this enum spells as a word rather than a
             // number.
             Self::Unauthorized => Some(401),
@@ -122,6 +137,16 @@ impl ApiError {
             _ => None,
         }
     }
+
+    /// The server's sentence when this failure is a
+    /// `query_resource_exhausted` refusal, else `None`.
+    #[must_use]
+    pub fn resource_exhausted(&self) -> Option<&str> {
+        match self {
+            Self::ResourceExhausted { message, .. } => Some(message),
+            _ => None,
+        }
+    }
 }
 
 /// How [`decode_error_body`] keeps an envelope with a given code.
@@ -135,6 +160,11 @@ pub enum Kept {
     /// rollup (ADR-0041). Nothing is wrong with the query or the caller,
     /// and the same request can succeed once the server catches up.
     Recovering,
+    /// The query used up the memory or scratch space trawld gives queries
+    /// (ADR-0056). The server is up and the text is fine, so the underline,
+    /// the automatic retry and the empty-result claim all stay off, and the
+    /// server's sentence is shown as a notice.
+    ResourceExhausted,
     /// About the run, the caller or the server. Only the summary is kept,
     /// and it takes the generic failure copy with its Retry.
     Summary,
@@ -149,6 +179,7 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
     match code {
         ErrorCode::ParseError | ErrorCode::ValidationError => Kept::Query,
         ErrorCode::CorpusRecovering => Kept::Recovering,
+        ErrorCode::QueryResourceExhausted => Kept::ResourceExhausted,
         ErrorCode::ExecutionError
         | ErrorCode::ResultTooLarge
         | ErrorCode::AuthError
@@ -172,7 +203,9 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
 
 /// Read a non-2xx body. A query error keeps its whole envelope
 /// ([`ApiError::Query`]); a `corpus_recovering` refusal keeps its
-/// sentence as [`ApiError::Recovering`]; any other envelope keeps its
+/// sentence as [`ApiError::Recovering`]; a `query_resource_exhausted`
+/// refusal keeps its sentence as [`ApiError::ResourceExhausted`]; any other
+/// envelope keeps its
 /// summary ([`ApiError::Server`]); a body that is not the envelope at all
 /// falls back to the bare status.
 #[must_use]
@@ -189,6 +222,10 @@ pub fn decode_error_body(status: u16, body: &str) -> ApiError {
             status,
             message: error.message,
         },
+        Kept::ResourceExhausted => ApiError::ResourceExhausted {
+            status,
+            message: error.message,
+        },
         Kept::Summary => ApiError::Server {
             status,
             message: error.message,
@@ -196,15 +233,27 @@ pub fn decode_error_body(status: u16, body: &str) -> ApiError {
     }
 }
 
+/// A non-2xx export answer. The export runs the query on the same memory
+/// and scratch budget a search does, so it is refused the same way and its
+/// body is the same envelope: read through [`decode_error_body`], the
+/// `query_resource_exhausted` sentence reaches the export modal. A missing
+/// body falls back to the bare status.
+#[must_use]
+pub fn export_failure(status: u16, body: Option<&str>) -> ApiError {
+    body.map_or(ApiError::Status(status), |body| {
+        decode_error_body(status, body)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, Kept, decode_error_body, kept_as};
+    use super::{ApiError, Kept, decode_error_body, export_failure, kept_as};
     use trawl_api::ErrorCode;
 
     /// Every wire code, spelled out. The match in `kept_as` has no
     /// wildcard, so a new code already fails to compile there; this list
     /// makes the test say how each existing code is kept.
-    const EVERY_CODE: [(ErrorCode, Kept); 21] = [
+    const EVERY_CODE: [(ErrorCode, Kept); 22] = [
         (ErrorCode::ParseError, Kept::Query),
         (ErrorCode::ValidationError, Kept::Query),
         (ErrorCode::ExecutionError, Kept::Summary),
@@ -226,12 +275,50 @@ mod tests {
         (ErrorCode::RequestTooLarge, Kept::Summary),
         (ErrorCode::UnsupportedEncoding, Kept::Summary),
         (ErrorCode::RequestLimitReached, Kept::Summary),
+        (ErrorCode::QueryResourceExhausted, Kept::ResourceExhausted),
     ];
 
     #[test]
     fn every_code_is_kept_as_its_class() {
         for (code, expected) in EVERY_CODE {
             assert_eq!(kept_as(&code), expected, "{code:?}");
+        }
+    }
+
+    /// The server's fixed `query_resource_exhausted` sentence is kept as its
+    /// own failure: not a query error (no spans, no underline), not the
+    /// generic summary, and not a recovering refusal.
+    #[test]
+    fn a_resource_exhausted_refusal_keeps_its_message_as_its_own_failure() {
+        let message = "query could not complete with the available query resources; narrow the \
+                       time range or simplify the query";
+        let body = format!(
+            r#"{{"error":{{"code":"query_resource_exhausted","message":"{message}","details":[{{"message":"x","span":{{"start":0,"end":1}}}}]}}}}"#
+        );
+        let err = decode_error_body(503, &body);
+        assert!(
+            matches!(&err, ApiError::ResourceExhausted { status: 503, message: m } if m == message),
+            "{err:?}"
+        );
+        assert_eq!(err.http_status(), Some(503));
+        assert!(err.query_error().is_none());
+        assert!(err.recovering().is_none());
+        assert_eq!(err.resource_exhausted(), Some(message));
+        assert_eq!(err.to_string(), message);
+    }
+
+    /// Only the `query_resource_exhausted` refusal answers with its
+    /// sentence: a recovering refusal, a generic 503 and a query error do
+    /// not, so the search page's notice never mounts for them.
+    #[test]
+    fn only_the_resource_exhausted_refusal_reads_as_one() {
+        for body in [
+            r#"{"error":{"code":"corpus_recovering","message":"recovering"}}"#,
+            r#"{"error":{"code":"service_unavailable","message":"service unavailable"}}"#,
+            r#"{"error":{"code":"parse_error","message":"bad","details":[]}}"#,
+        ] {
+            let err = decode_error_body(503, body);
+            assert_eq!(err.resource_exhausted(), None, "{body}");
         }
     }
 
@@ -353,5 +440,43 @@ mod tests {
             assert!(matches!(err, ApiError::Status(500)), "{body:?}: {err:?}");
             assert_eq!(err.to_string(), "server returned 500");
         }
+    }
+
+    /// The export answer is the same envelope the query answer is, so a
+    /// refusal for resources reaches the export modal with the server's
+    /// sentence instead of the bare status the body used to be dropped for.
+    #[test]
+    fn an_export_refused_for_resources_keeps_the_servers_sentence() {
+        let message = "query could not complete with the available query resources; narrow the \
+                       time range or simplify the query";
+        let body =
+            format!(r#"{{"error":{{"code":"query_resource_exhausted","message":"{message}"}}}}"#);
+        let err = export_failure(503, Some(&body));
+        assert!(
+            matches!(&err, ApiError::ResourceExhausted { status: 503, message: m } if m == message),
+            "{err:?}"
+        );
+        assert_eq!(err.resource_exhausted(), Some(message));
+    }
+
+    /// Only that refusal reads as a resource failure on the export path,
+    /// and a body that is missing or is not the envelope falls back to the
+    /// bare status, as every other read does.
+    #[test]
+    fn another_export_failure_is_not_a_resource_failure() {
+        for body in [
+            Some(r#"{"error":{"code":"service_unavailable","message":"service unavailable"}}"#),
+            Some("Export unavailable"),
+            None,
+        ] {
+            let err = export_failure(503, body);
+            assert_eq!(err.resource_exhausted(), None, "{body:?}");
+            assert_eq!(err.http_status(), Some(503), "{body:?}");
+        }
+        assert!(matches!(export_failure(503, None), ApiError::Status(503)));
+        assert!(matches!(
+            export_failure(503, Some("Export unavailable")),
+            ApiError::Status(503)
+        ));
     }
 }

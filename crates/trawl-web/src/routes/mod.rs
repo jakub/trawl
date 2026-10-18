@@ -16,6 +16,8 @@ use axum::http::StatusCode;
 use axum::routing::{any, get, post};
 
 use crate::assets;
+use crate::middleware::body_deadline;
+use crate::middleware::request_count::{PROXY_MAX_REQUESTS, RequestCount};
 use crate::middleware::security_headers;
 use crate::state::AppState;
 
@@ -25,19 +27,40 @@ use crate::state::AppState;
 /// `trawl-web`.
 pub const ENV_SPA_DIR: &str = "TRAWL_WEB_SPA_DIR";
 
-/// Compose the proxy's top-level `Router` from its sub-modules.
+/// Compose the proxy's top-level `Router` from its sub-modules, under the
+/// production request count of [`PROXY_MAX_REQUESTS`].
 pub fn build(state: AppState) -> Router {
+    build_with_count(state, RequestCount::new(PROXY_MAX_REQUESTS))
+}
+
+/// [`build`] under `count` instead of the production count, so a test can
+/// fill a small one.
+///
+/// Every route, the SPA fallback included, sits inside the count; only
+/// `/healthz` is merged in outside it, so the probes are never refused
+/// (`middleware::request_count`). The body deadline sits inside the
+/// count and outside every route, so whichever extractor or handler
+/// reads a body reads it under the deadline and a stalled body gives its
+/// count back at the deadline (`middleware::body_deadline`). The
+/// security headers wrap the refusals too.
+pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
     let (csp, hsts, xcto, refp, xfo) = security_headers::layers();
 
-    let router = Router::new()
-        .route("/healthz", get(|| async { (StatusCode::OK, "ok") }))
-        // Auth endpoints live under /api/auth/ so the SPA owns the
-        // top-level /login, /logout paths as client-side routes without
-        // colliding with POST-only HTTP handlers (which would 405 on GET
-        // navigation and break deep-links to the login page).
+    // Auth endpoints live under /api/auth/ so the SPA owns the
+    // top-level /login, /logout paths as client-side routes without
+    // colliding with POST-only HTTP handlers (which would 405 on GET
+    // navigation and break deep-links to the login page). Their bodies
+    // are read and held to the login limit by the middleware, which hands
+    // the bytes to the extractor and answers an oversized one with the
+    // envelope. Their deadline is the router's, below.
+    let auth_routes = Router::new()
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
+        .layer(axum::middleware::from_fn(auth::envelope_login_body_limit));
+
+    let router = Router::new()
+        .merge(auth_routes)
         // SSE first — must outrank the generic forwarder (both are under /api/v1).
         // Like the forwarder below, these are cookie-authenticated: the
         // ADR-0016 origin guard reaches them through the `Auth` extractor
@@ -86,7 +109,19 @@ pub fn build(state: AppState) -> Router {
         })
     };
 
-    router
+    let counted = router
+        .layer(axum::middleware::from_fn_with_state(
+            state.limits().body_read_timeout,
+            body_deadline::bound_body_read,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            count,
+            crate::middleware::request_count::count_request,
+        ));
+    let probes = Router::new().route("/healthz", get(|| async { (StatusCode::OK, "ok") }));
+
+    counted
+        .merge(probes)
         .layer(csp)
         .layer(hsts)
         .layer(xcto)

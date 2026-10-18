@@ -5069,7 +5069,7 @@ mod catalog {
                     force: false,
                     max_nulled_rows: None,
                     max_ambiguous_rows: None,
-                    requested_by: Some("ops"),
+                    requester: Some(&trawl_server::store::Requester::new(1, "ops")),
                 })
                 .await
         });
@@ -5484,7 +5484,8 @@ mod repin_store {
     use sqlx::PgPool;
     use trawl_core::schema::CanonicalType;
     use trawl_server::store::{
-        CatalogStore, JobTotals, RepinClaim, RepinJobStatus, RepinPlan, RepinStore, StoreError,
+        CatalogStore, JobTotals, RepinClaim, RepinJobStatus, RepinPlan, RepinStore, Requester,
+        StoreError,
     };
 
     fn store(pool: &PgPool) -> RepinStore {
@@ -5510,6 +5511,70 @@ mod repin_store {
         .expect("seed a pin");
     }
 
+    /// The claim writes the requesting key's row id beside its name, and
+    /// the owner-scoped read matches on that id alone: another key's job,
+    /// a job no key requested and an id never issued all read as absent,
+    /// while the plain read sees every row.
+    #[sqlx::test]
+    async fn get_requested_by_matches_the_claiming_key_id_only(pool: PgPool) {
+        fn claim(requester: Option<&Requester>) -> RepinClaim<'_> {
+            RepinClaim {
+                field: "status",
+                from_type: CanonicalType::BigInt,
+                to_type: CanonicalType::Varchar,
+                dialect: None,
+                dry_run: true,
+                force: false,
+                requester,
+                max_nulled_rows: None,
+                max_ambiguous_rows: None,
+            }
+        }
+        let s = store(&pool);
+        pin(&pool, "status", CanonicalType::BigInt).await;
+        let mut ids = Vec::new();
+        // The same display name on both keys: the name must decide nothing.
+        for requester in [
+            Some(Requester::new(7, "ops")),
+            Some(Requester::new(8, "ops")),
+            None,
+        ] {
+            let id = s.claim(claim(requester.as_ref())).await.unwrap();
+            assert!(
+                s.finish_if_running(id, RepinJobStatus::Succeeded, None, None)
+                    .await
+                    .unwrap(),
+                "free the one-running slot for the next claim"
+            );
+            ids.push(id);
+        }
+        let [own, other, internal] = ids[..] else {
+            unreachable!("three claims")
+        };
+
+        let row = s.get(own).await.unwrap().expect("the claimed row");
+        assert_eq!(row.requested_by.as_deref(), Some("ops"));
+        assert_eq!(row.requested_by_key_id, Some(7));
+        let row = s.get(internal).await.unwrap().expect("the internal row");
+        assert_eq!(row.requested_by, None);
+        assert_eq!(row.requested_by_key_id, None);
+
+        let mine = s.get_requested_by(own, 7).await.unwrap().expect("own job");
+        assert_eq!(mine.id, own);
+        assert_eq!(mine.requested_by_key_id, Some(7));
+        for (what, id) in [
+            ("another key's job", other),
+            ("a job no key requested", internal),
+            ("an id never issued", internal + 1000),
+        ] {
+            assert!(
+                s.get_requested_by(id, 7).await.unwrap().is_none(),
+                "{what} must read as absent to key 7"
+            );
+        }
+        assert!(s.get(other).await.unwrap().is_some());
+    }
+
     /// One repin at a time, enforced by the partial unique index — the
     /// second claim maps the named violation, never a raw pg error.
     #[sqlx::test]
@@ -5525,7 +5590,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: false,
-                requested_by: Some("key-1"),
+                requester: Some(&Requester::new(1, "key-1")),
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -5541,7 +5606,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: false,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -5562,7 +5627,7 @@ mod repin_store {
             dialect: None,
             dry_run: false,
             force: false,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })
@@ -5585,7 +5650,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: false,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             }),
@@ -5596,7 +5661,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: false,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             }),
@@ -5623,7 +5688,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: false,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -5681,7 +5746,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: false,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -5738,7 +5803,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: true,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -6003,7 +6068,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: false,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -6039,7 +6104,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: true,
                 force: false,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -6077,7 +6142,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: false,
                 force: true,
-                requested_by: Some("key-9"),
+                requester: Some(&Requester::new(9, "key-9")),
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -6161,7 +6226,7 @@ mod repin_store {
             dialect,
             dry_run,
             force: false,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         };
@@ -6190,7 +6255,7 @@ mod repin_store {
                 dialect: None,
                 dry_run: true,
                 force: false,
-                requested_by: None,
+                requester: None,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
             })
@@ -6237,7 +6302,7 @@ mod repin_store {
                 force: true,
                 max_nulled_rows: Some(40),
                 max_ambiguous_rows: Some(0),
-                requested_by: Some("key-1"),
+                requester: Some(&Requester::new(1, "key-1")),
             })
             .await
             .unwrap();
@@ -6291,7 +6356,7 @@ mod repin_store {
                 force: true,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
-                requested_by: None,
+                requester: None,
             })
             .await
             .unwrap();
@@ -6327,7 +6392,7 @@ mod repin_store {
                 force: true,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
-                requested_by: None,
+                requester: None,
             })
             .await
             .unwrap();
@@ -6381,7 +6446,7 @@ mod repin_store {
                 force: true,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
-                requested_by: None,
+                requester: None,
             })
             .await
             .unwrap();
@@ -6470,7 +6535,7 @@ mod repin_store {
                 force: false,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
-                requested_by: None,
+                requester: None,
             })
             .await
             .unwrap();
@@ -6508,7 +6573,7 @@ mod repin_store {
                 force: true,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
-                requested_by: None,
+                requester: None,
             })
             .await
             .unwrap();
@@ -6576,7 +6641,7 @@ mod repin_store {
             force: true,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
-            requested_by: None,
+            requester: None,
         };
         let id = s.claim(claim).await.unwrap();
 
@@ -6703,7 +6768,7 @@ mod repin_store {
                 force: true,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
-                requested_by: None,
+                requester: None,
             })
             .await
             .unwrap();
@@ -6765,6 +6830,7 @@ mod repin_store {
             .await
             .expect("gc reclaims the slot");
 
+        let ops = Requester::new(1, "ops");
         let taken = |from| RepinClaim {
             field: "dur",
             from_type: from,
@@ -6774,7 +6840,7 @@ mod repin_store {
             force: false,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
-            requested_by: Some("ops"),
+            requester: Some(&ops),
         };
         let err = s
             .claim(taken(CanonicalType::BigInt))
@@ -6839,7 +6905,7 @@ mod repin_store {
             force: false,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
-            requested_by: Some("key-1"),
+            requester: Some(&Requester::new(1, "key-1")),
         })
         .await
         .unwrap()
@@ -7037,7 +7103,7 @@ mod repin_store {
                 force: true,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
-                requested_by: None,
+                requester: None,
             })
             .await
             .unwrap()
@@ -7187,7 +7253,7 @@ mod repin_store {
                 force: false,
                 max_nulled_rows: None,
                 max_ambiguous_rows: None,
-                requested_by: None,
+                requester: None,
             })
             .await
             .unwrap();

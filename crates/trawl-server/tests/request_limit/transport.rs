@@ -2,20 +2,21 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Connections and HTTP/2 streams through the production TLS listener,
-//! and the clients the body-work tests share.
+//! Connections through the production TLS listener, and the clients the
+//! body-work tests share.
 //!
-//! The clients are explicit about connections: an HTTP/1.1 request written
-//! by hand over a TLS stream of its own, and an `h2` connection whose
-//! streams the test opens and resets one by one. reqwest is used only
+//! The clients are explicit about connections: each HTTP/1.1 request is
+//! written by hand over a TLS stream of its own, and read back from it.
+//! The listener speaks HTTP/1.1 alone (ADR-0054, amended 2026-10-17), so
+//! one connection is one request in progress at most. reqwest is used only
 //! where any fresh connection will do.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::http::{self, StatusCode};
-use tokio::io::AsyncWriteExt as _;
+use axum::http::StatusCode;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use trawl_server::transport::request_limit::body_work::{BodyWork, HoldProbe};
@@ -32,60 +33,33 @@ use crate::support::{DEADLINE, REGULAR_MESSAGE};
 pub static SCRAPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// AC14: through the production TLS listener, separate connections share
-/// one count, and N+1 concurrent HTTP/2 streams on one connection at
-/// limit N meet exactly one refusal. The count recovers on the same
-/// connection afterwards.
+/// one count: N connections each holding a request at limit N meet exactly
+/// one refusal on the N+1th, and the count recovers afterwards.
 ///
 /// Each held request is ingest or preview work held at the state's seam,
 /// which reports its entry, so a request is known to hold the count
 /// before the next one is sent.
 #[tokio::test(flavor = "multi_thread")]
-async fn request_count_spans_connections_and_h2_streams() {
+async fn request_count_spans_connections() {
     const N: u8 = 2;
     let server = common::setup().await;
     let (url, task) = server
         .spawn_server_with(|http| http.max_concurrent_requests = usize::from(N), vec![])
         .await;
 
-    // Separate connections: one HTTP/1.1 and one HTTP/2 connection each
-    // hold one request, and a third connection is refused.
+    // Two connections each hold one request, and a third is refused.
     let mut parse = Held::next(&server, BodyWork::IngestParse);
     let mut report = Held::next(&server, BodyWork::Preview);
-    let first = h1_send(&url, &Post::ingest(&server, "connection one")).await;
+    let mut first = h1_send(&url, &Post::ingest(&server, "connection one")).await;
     let parse_probe = parse.entered().await;
-    let second = h2_connect(&url).await;
-    let (preview, _preview_stream) =
-        h2_send(&second, &url, &Post::preview(&server, "connection two")).await;
+    let mut second = h1_send(&url, &Post::preview(&server, "connection two")).await;
     let report_probe = report.entered().await;
     assert_fresh_refused(&url, &Post::ingest(&server, "connection three")).await;
 
-    parse.release();
-    report.release();
-    let (status, body) = h2_answer(preview).await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    until_holders(&parse_probe, 0, "the HTTP/1.1 connection's request").await;
-    until_holders(&report_probe, 0, "the HTTP/2 connection's request").await;
-    drop(first);
-
-    // One connection: N streams held, the N+1th refused.
-    let connection = h2_connect(&url).await;
-    let mut parse = Held::next(&server, BodyWork::IngestParse);
-    let mut report = Held::next(&server, BodyWork::Preview);
-    let (ingest, _ingest_stream) =
-        h2_send(&connection, &url, &Post::ingest(&server, "stream one")).await;
-    let parse_probe = parse.entered().await;
-    let (preview, _preview_stream) =
-        h2_send(&connection, &url, &Post::preview(&server, "stream two")).await;
-    let report_probe = report.entered().await;
-    let (refused, _refused_stream) =
-        h2_send_may_be_refused(&connection, &url, &Post::ingest(&server, "stream three")).await;
-    let (status, body) = h2_answer(refused).await;
-    assert_h2_refused(status, &body);
-
-    // `/metrics` is a probe request, so a scrape on the same connection
-    // passes the full regular count and reads it.
+    // `/metrics` is a probe request, so a scrape passes the full regular
+    // count and reads it.
     let scrape = SCRAPE.lock().await;
-    let (status, scrape_body) = h2_answer(h2_get(&connection, &url, "/metrics").await).await;
+    let (status, scrape_body) = h1_get(&url, "/metrics").await;
     assert_eq!(status, StatusCode::OK);
     let regular = regular_in_progress(&String::from_utf8_lossy(&scrape_body));
     drop(scrape);
@@ -97,8 +71,11 @@ async fn request_count_spans_connections_and_h2_streams() {
 
     parse.release();
     report.release();
-    for (name, answer) in [("stream one", ingest), ("stream two", preview)] {
-        let (status, body) = h2_answer(answer).await;
+    for (name, stream) in [
+        ("connection one", &mut first),
+        ("connection two", &mut second),
+    ] {
+        let (status, body) = h1_answer(stream).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -106,87 +83,58 @@ async fn request_count_spans_connections_and_h2_streams() {
             String::from_utf8_lossy(&body)
         );
     }
-    until_holders(&parse_probe, 0, "stream one").await;
-    until_holders(&report_probe, 0, "stream two").await;
+    until_holders(&parse_probe, 0, "the first connection's request").await;
+    until_holders(&report_probe, 0, "the second connection's request").await;
+    drop(first);
+    drop(second);
 
-    // The count recovers on the same connection: N streams at once are
-    // all admitted.
+    // The count recovers: N connections at once are all admitted.
     let mut answers = Vec::new();
     for n in 0..N {
         let label = format!("recovered {n}");
-        answers.push(h2_send(&connection, &url, &Post::ingest(&server, &label)).await);
+        answers.push(h1_send(&url, &Post::ingest(&server, &label)).await);
     }
-    for (answer, _stream) in answers {
-        let (status, body) = h2_answer(answer).await;
+    for mut stream in answers {
+        let (status, body) = h1_answer(&mut stream).await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     }
     task.abort();
 }
 
-/// Hold the only request the limit admits, then open a stream whose
-/// headers the server refuses, and wait until the server has closed that
-/// stream (its `RST_STREAM`, which follows the 503 head) before the body
-/// is sent. The order is forced by the stream's reset event, not by timing.
-async fn refused_stream_closed_before_body(server: &TestServer, url: &str) -> RefusedStream {
-    let mut parse = Held::next(server, BodyWork::IngestParse);
-    let held = h1_send(url, &Post::ingest(server, "held")).await;
+/// A request refused at the count is answered from its headers alone,
+/// before its body is sent, and the listener then hangs up without
+/// reading the body (ADR-0054): the refusal is the whole exchange.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_request_is_answered_before_its_body() {
+    let server = common::setup().await;
+    let (url, task) = server
+        .spawn_server_with(|http| http.max_concurrent_requests = 1, vec![])
+        .await;
+
+    let mut parse = Held::next(&server, BodyWork::IngestParse);
+    let held = h1_send(&url, &Post::ingest(&server, "held")).await;
     parse.entered().await;
 
-    let sender = h2_connect(url).await;
-    let refused = Post::ingest(server, "refused");
-    let (response, mut stream) = h2_open(&sender, url, &refused).await;
-    let reason = tokio::time::timeout(DEADLINE, std::future::poll_fn(|cx| stream.poll_reset(cx)))
-        .await
-        .expect("the server closed the refused stream before the deadline")
-        .expect("the refused stream was reset");
-    assert_eq!(reason, h2::Reason::NO_ERROR, "a refusal closes cleanly");
-    RefusedStream {
-        response,
-        stream,
-        post: refused,
-        parse,
-        _held: held,
-    }
-}
+    let mut refused = h1_open(&url, &Post::ingest(&server, "refused")).await;
+    let (status, body) = h1_answer(&mut refused).await;
+    assert_refused(status, &body);
+    let closed = tokio::time::timeout(DEADLINE, async {
+        let mut buf = [0_u8; 64];
+        loop {
+            match refused.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the listener kept the refused connection open for its body"
+    );
 
-/// A refused HTTP/2 stream the server has closed, and the held request
-/// that made it refuse.
-struct RefusedStream {
-    response: h2::client::ResponseFuture,
-    stream: h2::SendStream<Bytes>,
-    post: Post,
-    parse: Held,
-    _held: TlsStream<TcpStream>,
-}
-
-/// The refused stream's body goes out after the server closed the stream:
-/// the helper for refused streams lets it through, and the refusal is still
-/// the answer.
-#[tokio::test(flavor = "multi_thread")]
-async fn refused_h2_stream_closed_before_its_body_still_answers() {
-    let server = common::setup().await;
-    let (url, task) = server
-        .spawn_server_with(|http| http.max_concurrent_requests = 1, vec![])
-        .await;
-    let mut refused = refused_stream_closed_before_body(&server, &url).await;
-    send_body(&mut refused.stream, &refused.post, true);
-    let (status, body) = h2_answer(refused.response).await;
-    assert_h2_refused(status, &body);
-    refused.parse.release();
-    task.abort();
-}
-
-/// The strict helper, used for streams the server admits, still fails on
-/// the same closed stream: tolerance is only for the refused one.
-#[tokio::test(flavor = "multi_thread")]
-#[should_panic(expected = "send the request body")]
-async fn admitted_h2_stream_closed_before_its_body_fails() {
-    let server = common::setup().await;
-    let (url, task) = server
-        .spawn_server_with(|http| http.max_concurrent_requests = 1, vec![])
-        .await;
-    let mut refused = refused_stream_closed_before_body(&server, &url).await;
-    send_body(&mut refused.stream, &refused.post, false);
+    parse.release();
+    drop(held);
     task.abort();
 }
 
@@ -247,6 +195,23 @@ impl Post {
             body,
         }
     }
+
+    /// The request head for this post, `content-length` included.
+    fn head(&self, url: &str) -> String {
+        let host = url.strip_prefix("https://").unwrap();
+        let encoding = if self.gzip {
+            "content-encoding: gzip\r\n"
+        } else {
+            ""
+        };
+        format!(
+            "POST {path} HTTP/1.1\r\nhost: {host}\r\nauthorization: Bearer {token}\r\n\
+             content-type: application/x-ndjson\r\n{encoding}content-length: {length}\r\n\r\n",
+            path = self.path,
+            token = self.token,
+            length = self.body.len(),
+        )
+    }
 }
 
 /// A TLS connection to `url` (`https://host:port`) that trusts the fixture
@@ -288,153 +253,79 @@ pub async fn tls(url: &str, alpn: &[u8]) -> TlsStream<TcpStream> {
 /// Write `post` whole as one HTTP/1.1 request on a connection of its own,
 /// and hand back the open connection without reading the answer.
 pub async fn h1_send(url: &str, post: &Post) -> TlsStream<TcpStream> {
-    let mut stream = tls(url, b"http/1.1").await;
-    let host = url.strip_prefix("https://").unwrap();
-    let encoding = if post.gzip {
-        "content-encoding: gzip\r\n"
-    } else {
-        ""
-    };
-    let head = format!(
-        "POST {path} HTTP/1.1\r\nhost: {host}\r\nauthorization: Bearer {token}\r\n\
-         content-type: application/x-ndjson\r\n{encoding}content-length: {length}\r\n\r\n",
-        path = post.path,
-        token = post.token,
-        length = post.body.len(),
-    );
-    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut stream = h1_open(url, post).await;
     stream.write_all(&post.body).await.unwrap();
     stream.flush().await.unwrap();
     stream
 }
 
-/// One HTTP/2 connection, its driver spawned.
-pub async fn h2_connect(url: &str) -> h2::client::SendRequest<Bytes> {
-    let stream = tls(url, b"h2").await;
-    let (sender, connection) = h2::client::handshake(stream)
+/// Write `post`'s head alone, `content-length` included, on a connection
+/// of its own, and hand back the open connection: the server now waits
+/// for the body, or answers without it.
+pub async fn h1_open(url: &str, post: &Post) -> TlsStream<TcpStream> {
+    let mut stream = tls(url, b"http/1.1").await;
+    stream.write_all(post.head(url).as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    stream
+}
+
+/// A GET of `path` on a connection of its own, answered whole.
+pub async fn h1_get(url: &str, path: &str) -> (StatusCode, Bytes) {
+    let mut stream = tls(url, b"http/1.1").await;
+    let host = url.strip_prefix("https://").unwrap();
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nhost: {host}\r\n\r\n").as_bytes())
         .await
-        .expect("HTTP/2 handshake with the test server");
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    sender
-}
-
-/// Open a stream on `sender`'s connection carrying `post` whole. The stream
-/// stays open for a reset until its answer is read.
-///
-/// For a stream the server is expected to admit: it is an error if the
-/// server closes the stream before the body is sent.
-pub async fn h2_send(
-    sender: &h2::client::SendRequest<Bytes>,
-    url: &str,
-    post: &Post,
-) -> (h2::client::ResponseFuture, h2::SendStream<Bytes>) {
-    let (response, mut stream) = h2_open(sender, url, post).await;
-    send_body(&mut stream, post, false);
-    (response, stream)
-}
-
-/// Like [`h2_send`], for a stream the server is expected to refuse.
-///
-/// A refusal is answered at once and does not drain the body (ADR-0054),
-/// so the server may close the stream before the client's DATA frame goes
-/// out. That is not an error here: the caller reads the answer and asserts
-/// the refusal, which a stream that was in fact admitted cannot give.
-pub async fn h2_send_may_be_refused(
-    sender: &h2::client::SendRequest<Bytes>,
-    url: &str,
-    post: &Post,
-) -> (h2::client::ResponseFuture, h2::SendStream<Bytes>) {
-    let (response, mut stream) = h2_open(sender, url, post).await;
-    send_body(&mut stream, post, true);
-    (response, stream)
-}
-
-/// Open a stream on `sender`'s connection for `post`, headers only.
-async fn h2_open(
-    sender: &h2::client::SendRequest<Bytes>,
-    url: &str,
-    post: &Post,
-) -> (h2::client::ResponseFuture, h2::SendStream<Bytes>) {
-    let mut request = http::Request::builder()
-        .method("POST")
-        .uri(format!("{url}{}", post.path))
-        .header("authorization", format!("Bearer {}", post.token))
-        .header("content-type", "application/x-ndjson");
-    if post.gzip {
-        request = request.header("content-encoding", "gzip");
-    }
-    let mut ready = sender
-        .clone()
-        .ready()
-        .await
-        .expect("the connection takes another stream");
-    ready
-        .send_request(request.body(()).unwrap(), false)
-        .expect("open a stream")
-}
-
-/// Send `post`'s body and end `stream`. With `may_be_refused`, an error
-/// that says the server already closed the stream is let through; any
-/// other error fails.
-fn send_body(stream: &mut h2::SendStream<Bytes>, post: &Post, may_be_refused: bool) {
-    match stream.send_data(Bytes::from(post.body.clone()), true) {
-        Ok(()) => {}
-        Err(error) if may_be_refused && closed_by_peer(&error) => {}
-        Err(error) => panic!("send the request body: {error:?}"),
-    }
-}
-
-/// Whether `error` says the stream is already closed: the peer reset it,
-/// or `h2` found it no longer open for sending (`InactiveStreamId`). h2
-/// exposes no predicate for the latter, so it is matched by the text of its
-/// `UserError`; the refused-stream tests below pin that text.
-fn closed_by_peer(error: &h2::Error) -> bool {
-    error.is_reset() || error.to_string().contains("inactive stream")
-}
-
-/// Open a stream on `sender`'s connection carrying a GET of `path`.
-pub async fn h2_get(
-    sender: &h2::client::SendRequest<Bytes>,
-    url: &str,
-    path: &str,
-) -> h2::client::ResponseFuture {
-    let request = http::Request::builder()
-        .method("GET")
-        .uri(format!("{url}{path}"))
-        .body(())
         .unwrap();
-    let mut ready = sender
-        .clone()
-        .ready()
-        .await
-        .expect("the connection takes another stream");
-    ready.send_request(request, true).expect("open a stream").0
+    h1_answer(&mut stream).await
 }
 
-/// A stream's status and whole body, within the deadline.
-pub async fn h2_answer(response: h2::client::ResponseFuture) -> (StatusCode, Bytes) {
+/// The HTTP/1.1 response on `stream`: its status and whole body, within
+/// the deadline. The body must be delimited by `content-length`, as every
+/// answer here is.
+pub async fn h1_answer(stream: &mut TlsStream<TcpStream>) -> (StatusCode, Bytes) {
     tokio::time::timeout(DEADLINE, async {
-        let response = response.await.expect("the stream answered");
-        let status = response.status();
-        let mut body = response.into_body();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = body.data().await {
-            let chunk = chunk.expect("the answer's body");
-            body.flow_control()
-                .release_capacity(chunk.len())
-                .expect("release flow-control capacity");
-            bytes.extend_from_slice(&chunk);
+        let mut raw = Vec::new();
+        let head_end = loop {
+            if let Some(at) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break at + 4;
+            }
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).await.expect("read the response head");
+            assert!(n > 0, "the connection closed before a response head");
+            raw.extend_from_slice(&buf[..n]);
+        };
+        let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+        let status: u16 = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("a status line in {head:?}"));
+        assert!(
+            !head.contains("transfer-encoding: chunked"),
+            "this reader needs a content-length: {head}"
+        );
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |value| value.trim().parse().expect("a content-length"));
+        let mut body = raw[head_end..].to_vec();
+        while body.len() < length {
+            let mut buf = [0_u8; 4096];
+            let n = stream.read(&mut buf).await.expect("read the body");
+            assert!(n > 0, "the connection closed inside the body");
+            body.extend_from_slice(&buf[..n]);
         }
-        (status, Bytes::from(bytes))
+        body.truncate(length);
+        (StatusCode::from_u16(status).unwrap(), Bytes::from(body))
     })
     .await
-    .expect("the stream answered before the deadline")
+    .expect("the request was answered before the deadline")
 }
 
-/// Assert an HTTP/2 answer is the regular refusal.
-pub fn assert_h2_refused(status: StatusCode, body: &[u8]) {
+/// Assert an answer is the regular refusal.
+pub fn assert_refused(status: StatusCode, body: &[u8]) {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let body: serde_json::Value = serde_json::from_slice(body).expect("a JSON refusal");
     assert_eq!(body["error"]["code"], "request_limit_reached", "{body}");
@@ -462,7 +353,7 @@ pub async fn fresh_post(url: &str, post: &Post) -> (StatusCode, Bytes) {
 /// Assert `post` on a fresh connection is the regular refusal.
 pub async fn assert_fresh_refused(url: &str, post: &Post) {
     let (status, body) = fresh_post(url, post).await;
-    assert_h2_refused(status, &body);
+    assert_refused(status, &body);
 }
 
 /// Assert `post` on a fresh connection is admitted and answered 200.

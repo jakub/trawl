@@ -26,6 +26,14 @@ ignore = [
     { id = "RUSTSEC-2026-0347", reason = "ECH only; not enabled" },
     { id = "RUSTSEC-2026-0348", reason = "brotli certificate compression only; not enabled" },
     { id = "RUSTSEC-2026-0349", reason = "PQ-to-classical downgrade; bump to 0.23.46 after 2026-10-17" },
+    # zip 6.0.0 is a build dependency of libduckdb-sys 1.10505.0, which pins
+    # zip "6"; the fixes are in zip >= 9. libduckdb-sys extracts an archive
+    # only when it downloads the DuckDB library itself, and .cargo/config.toml
+    # sets DUCKDB_DOWNLOAD_LIB=0, so no build here extracts a zip. Delete
+    # these once libduckdb-sys moves to zip >= 9.
+    { id = "RUSTSEC-2026-0367", reason = "zip extract; libduckdb-sys download path disabled" },
+    { id = "RUSTSEC-2026-0368", reason = "zip extract; libduckdb-sys download path disabled" },
+    { id = "RUSTSEC-2026-0369", reason = "zip extract; libduckdb-sys download path disabled" },
 ]
 
 [licenses]
