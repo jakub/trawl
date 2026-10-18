@@ -34,12 +34,13 @@ impl App {
 
         tracing::info!("starting live stream for query: {}", query);
 
-        // Cancel any existing stream. Its cap report belongs to it: a new
-        // stream starts with nothing dropped.
+        // Cancel any existing stream. Its last snapshot's rows stay drawn
+        // until a replacement result arrives (a quiet restarted stream may
+        // send none), so the cap report stays with them; every result
+        // replaces it.
         if let Some(task) = self.live_task.take() {
             task.abort();
         }
-        self.active_tab_mut().live_capped.clear();
 
         // Extract field order from the DSL so the live buffer preserves it.
         let field_order = extract_field_order(&query);

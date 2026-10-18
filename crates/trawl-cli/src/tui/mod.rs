@@ -1826,6 +1826,63 @@ mod tests {
         }
     }
 
+    /// The cap mark stays with the capped rows across a live restart.
+    ///
+    /// F9 stops the stream and F9 again restarts it, but the restart keeps
+    /// the last snapshot's rows drawn until a replacement arrives, and a quiet
+    /// restarted stream may send none. The rows keep their cap with them
+    /// (the same rule as the next batch query), so the mark is never lost
+    /// while the capped table is still on screen.
+    #[tokio::test]
+    async fn live_capped_snapshot_marks_results_title_across_a_live_restart() {
+        use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+
+        const MARK: &str = " partial: groups > 10000 ";
+        let mut app = test_app();
+        app.query_tx
+            .send(QueryResult {
+                result: Ok(make_query_response(
+                    vec!["host", "count"],
+                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                )),
+                duration: Duration::from_secs(0),
+                capped: vec![SnapshotCap {
+                    cap: SnapshotCapKind::Groups,
+                    limit: 10_000,
+                }],
+            })
+            .unwrap();
+        app.poll_query_results();
+        app.tab.editor.insert_text("* | stats count() by host");
+
+        // Start, stop, restart; no replacement snapshot is ever polled.
+        app.handle_key(key(KeyCode::F(9)));
+        app.handle_key(key(KeyCode::F(9)));
+        app.handle_key(key(KeyCode::F(9)));
+        assert!(app.live_mode, "the second F9 restarted the stream");
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(&mut app, frame)).unwrap();
+        let area = app
+            .layout
+            .results
+            .expect("the query layout has a results pane");
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = (area.x..area.x + area.width)
+            .map(|x| buffer[(x, area.y)].symbol().to_owned())
+            .collect();
+        let screen = terminal.backend().to_string();
+        assert!(
+            screen.contains("web-1"),
+            "the capped rows stay drawn\n{screen}"
+        );
+        assert!(
+            text.contains(MARK),
+            "the capped rows keep their mark: {text:?}\n{screen}"
+        );
+    }
+
     #[test]
     fn poll_query_result_sets_error_status() {
         let mut app = test_app();
