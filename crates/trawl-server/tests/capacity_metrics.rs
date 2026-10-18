@@ -43,6 +43,9 @@ async fn capacity_metrics_endpoint_exposes_query_scratch_and_role_series_only() 
         "trawl_retention_deletions_total",
         "trawl_retention_pressure_attempts_total",
     ];
+    // Cargo makes this directory at build time, and CI's test jobs run
+    // binaries extracted from an archive that does not carry it.
+    std::fs::create_dir_all(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let tmp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let server = common::setup_with_query_knobs(
         tmp.path(),
