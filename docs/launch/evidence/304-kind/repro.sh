@@ -27,17 +27,28 @@
 #   4. eviction: SPILL_QUERY runs up to SPILL_ATTEMPTS times, SPILL_PAUSE
 #      seconds apart, while the transcript records the size of trawld's /tmp
 #      emptyDir every 2 s, the responses, the pod and the events, and stops
-#      at an eviction.
+#      at an eviction;
+#   5. over budget: unless (4) evicted or replaced the pod, SPILL_BIG_QUERY,
+#      whose sort needs more spill than the default query_spill_max_bytes,
+#      runs up to SPILL_BIG_ATTEMPTS times, SPILL_BIG_PAUSE seconds apart,
+#      then SMALL_QUERY once, with the same samplers as (4) plus the stored
+#      http_failure events.
 #
 # STOP_AFTER=deploy|ingest ends a run early; it was used for calibration
-# only and is never set for a recorded run.
+# only and is never set for a recorded run. STOP_AFTER=b ends a run after
+# (4), and START_AT=c then runs (5) against the same namespace, appending to
+# the same transcript. The recorded after run used this pair, because one
+# agent command may run for 10 minutes at most and the whole run takes about
+# 9.
 #
 # Expected: at b02b8acf, health answers 503 with query_not_started kind=ping
 # and the pod goes NotReady in (3), and the kubelet evicts the pod for the
-# tmp emptyDir in (4). With the fix, the pod stays Ready in (3), and in (4)
-# the spill goes to query scratch on the data volume with nothing evicted:
-# an attempt that passes the query budgets gets 503 query_resource_exhausted,
-# and one that fits them answers 200.
+# tmp emptyDir in (4), so (5) is skipped. With the fix, the pod stays Ready
+# in (3), and in (4) the spill goes to query scratch on the data volume with
+# nothing evicted: an attempt that passes the query budgets gets 503
+# query_resource_exhausted, and one that fits them answers 200. In (5) every
+# attempt gets 503 query_resource_exhausted with scratch held to the spill
+# budget, SMALL_QUERY answers 200, and nothing is evicted.
 #
 # Secrets: the PostgreSQL passwords, the API key and the curl config holding
 # its bearer header are generated into private/LABEL (0700, files 0600) and
@@ -75,13 +86,30 @@ SPILL_PAUSE=20
 # gets the process OOM-killed instead of spilling, so the query sorts.)
 K8='_raw, message, _raw, message, _raw, message, _raw, message'
 SPILL_QUERY="service=i304 | let k = concat($K8, $K8, $K8, $K8) | dedup k | stats count()"
+# Phase C. k is 64 copies, about 16 KB a row, so the dedup window sorts
+# about 12.8 GB. At the after build's defaults (query_memory_limit 2GiB,
+# query_spill_max_bytes 4GiB) SPILL_QUERY's scratch peaked at 2.9 GB and
+# mostly completed; this query's scratch reaches the 4 GiB spill budget in
+# about 12 s and the query fails there. DuckDB may hold up to one block per
+# temp-file size class past the budget on disk.
+SPILL_BIG_QUERY="service=i304 | let k = concat($K8, $K8, $K8, $K8, $K8, $K8, $K8, $K8) | dedup k | stats count()"
+SPILL_BIG_ATTEMPTS=4
+SPILL_BIG_PAUSE=5
+SPILL_BUDGET_BYTES=$((4 << 30))     # the chart's default query_spill_max_bytes; values.yaml keeps it
+SPILL_BLOCK_SLACK_BYTES=1179648     # DuckDB 1.5.5: one block of each temp-file size class
+SMALL_QUERY='service=i304 | stats count()'
 NODE=trawl-i304-control-plane
 VOLUME_STATS_PERIOD=2s
 
-rm -rf "$PRIV"
-mkdir -p "$W"
-chmod 700 "$HERE/private" "$PRIV"
-: > "$T"
+if [[ ${START_AT:-} == c ]]; then
+  [[ -s $PRIV/curl.conf && -s $T ]] || { echo "START_AT=c resumes a run stopped with STOP_AFTER=b" >&2; exit 1; }
+  mkdir -p "$W"
+else
+  rm -rf "$PRIV"
+  mkdir -p "$W"
+  chmod 700 "$HERE/private" "$PRIV"
+  : > "$T"
+fi
 
 ts() { date -u +%FT%T.%3NZ; }
 say() { printf '\n## [%s] %s\n' "$(ts)" "$*" | tee -a "$T"; }
@@ -187,6 +215,86 @@ query() {  # query OUT_BODY QUERY [MAX_TIME]: prints "code seconds"
     --data @"$1.req" "https://localhost:$PORT/api/v1/query" 2>/dev/null || true
 }
 
+# Phase C, over budget. $1 is phase B's eviction result; a pod already
+# evicted or replaced (the before build) skips the phase.
+phase_c() {
+  if [[ $1 != no ]]; then
+    say "phase C skipped: phase B already evicted or replaced trawl-0 (evicted=$1)"
+    return 0
+  fi
+  say "phase C, over budget: SPILL_BIG_QUERY up to $SPILL_BIG_ATTEMPTS times, ${SPILL_BIG_PAUSE}s apart, then SMALL_QUERY"
+  wait_ready 300 || note "trawl-0 not Ready after 300 s"
+  pf_start
+  local cuid0 C has_scratch=no i t0 r uid evicted=no peak
+  cuid0=$("${K[@]}" get pod trawl-0 -o jsonpath='{.metadata.uid}')
+  note "trawl-0 uid before phase C: $cuid0"
+  C=$W/c; mkdir -p "$C"
+  sample_tmp "$C/tmp.log" & bg_pids+=($!)
+  if "${K[@]}" exec trawl-0 -c trawld -- test -d "$SCRATCH" 2>/dev/null; then
+    has_scratch=yes; sample_scratch "$C/scratch.log" & bg_pids+=($!)
+  fi
+  note "query scratch $SCRATCH present: $has_scratch"
+  sample_pod "$C/pod.log" & bg_pids+=($!)
+  sample_health "$C/health.log" & bg_pids+=($!)
+  follow_logs "$C/trawld.log" & bg_pids+=($!)
+  for i in $(seq 1 "$SPILL_BIG_ATTEMPTS"); do
+    t0=$(ts); r=$(query "$C/big$i.json" "$SPILL_BIG_QUERY" 120)
+    note "SPILL_BIG_QUERY attempt $i at $t0 -> $r $(head -c 400 "$C/big$i.json" | tr -d '\n')"
+    if events | grep -q 'Evicted'; then evicted=yes; break; fi
+    uid=$("${K[@]}" get pod trawl-0 -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+    if [[ $uid != "$cuid0" ]]; then evicted=replaced; break; fi
+    if (( i < SPILL_BIG_ATTEMPTS )); then sleep "$SPILL_BIG_PAUSE"; fi
+  done
+  if [[ $evicted == no ]]; then
+    t0=$(ts); r=$(query "$C/small.json" "$SMALL_QUERY" 60)
+    note "SMALL_QUERY at $t0 -> $r $(head -c 400 "$C/small.json" | tr -d '\n')"
+  fi
+  note "attempts done (evicted=$evicted); sampling 30 s more"
+  sleep 30
+  if [[ $evicted == no ]] && events | grep -q 'Evicted'; then evicted=yes; fi
+  bg_stop
+  say "phase C: trawld /tmp usage every 2 s (time, bytes, path)"
+  runsh "cat '$C/tmp.log'"
+  if [[ $has_scratch == yes ]]; then
+    say "phase C: trawld query scratch usage every 2 s (time, bytes, path)"
+    runsh "cat '$C/scratch.log'"
+    peak=$(awk '$2 ~ /^[0-9]+$/ {print $2}' "$C/scratch.log" | sort -n | tail -n 1)
+    peak=${peak:-0}
+    note "query scratch peak $peak bytes; budget $SPILL_BUDGET_BYTES + block slack $SPILL_BLOCK_SLACK_BYTES = $((SPILL_BUDGET_BYTES + SPILL_BLOCK_SLACK_BYTES)); within: $( (( peak <= SPILL_BUDGET_BYTES + SPILL_BLOCK_SLACK_BYTES )) && echo yes || echo no)"
+    runsh "grep -E '^query_spill_max_bytes|^query_memory_limit|^query_threads' '$W/trawld.toml'"
+  fi
+  say "phase C: pod trawl-0 every 2 s"
+  runsh "cat '$C/pod.log'"
+  say "phase C: GET /api/v1/health every second (time, HTTP status, body)"
+  runsh "cat '$C/health.log'"
+  runsh "awk '{print \$2}' '$C/health.log' | sort | uniq -c"
+  runsh "grep -c '\"duckdb\":\"ok\"' '$C/health.log' || true"
+  say "phase C: trawld log lines about the query, errors and shutdown"
+  runsh "grep -E 'query_start|query_complete|query_failed|query_error_text|query_timing|http_failure|ERROR|shutdown|signal' '$C/trawld.log' | grep -v 'route=\"/api/v1/health\"' | cut -c1-600 | head -n 80"
+  if [[ $evicted == no ]]; then
+    say "phase C: the stored http_failure events (trawld's own telemetry, service=trawld)"
+    r=$(query "$C/failures.json" 'service=trawld event_type=http_failure | table _time, status, route, error_class, cause_kind, request_id')
+    note "stored http_failure query -> $r"
+    runsh "jq -c '.rows[]' '$C/failures.json'"
+  fi
+  say "phase C: kubelet events"
+  events | tee -a "$T" >/dev/null
+  run "${K[@]}" get pods -o wide
+  run "${K[@]}" get pod trawl-0 -o jsonpath='{.metadata.uid} {.status.phase} {.status.reason} restarts={.status.containerStatuses[?(@.name=="trawld")].restartCount} lastState={.status.containerStatuses[?(@.name=="trawld")].lastState}{"\n"}'
+  note "phase C evicted=$evicted"
+}
+
+if [[ ${START_AT:-} == c ]]; then
+  say "resume $LABEL at phase C (START_AT=c): image $IMAGE, namespace $NS"
+  run "${K[@]}" get pod trawl-0 -o jsonpath='{.spec.containers[?(@.name=="trawld")].image}{"\n"}'
+  evicted=$(sed -nE 's/^\[[^]]*\] evicted=([a-z]+)$/\1/p' "$T" | tail -n 1)
+  [[ -n $evicted ]] || { note "the transcript has no phase B result"; exit 1; }
+  note "phase B result from the transcript: evicted=$evicted"
+  phase_c "$evicted"
+  say "done $LABEL"
+  exit 0
+fi
+
 say "run $LABEL: image $IMAGE, chart $CHART, namespace $NS"
 run kind version
 run helm version --short
@@ -195,6 +303,8 @@ run kubectl --kubeconfig "$KC" --context "$CTX" get nodes -o wide
 note "workload: EVENTS=$EVENTS MSG_CHARS=$MSG_CHARS SEED=$SEED STARVE_WORKERS=$STARVE_WORKERS STARVE_SECS=$STARVE_SECS SPILL_ATTEMPTS=$SPILL_ATTEMPTS"
 note "STARVE_QUERY: $STARVE_QUERY"
 note "SPILL_QUERY: $SPILL_QUERY"
+note "SPILL_BIG_QUERY: $SPILL_BIG_QUERY (SPILL_BIG_ATTEMPTS=$SPILL_BIG_ATTEMPTS SPILL_BIG_PAUSE=$SPILL_BIG_PAUSE)"
+note "SMALL_QUERY: $SMALL_QUERY"
 runsh "docker image inspect --format '{{.Id}} {{index .Config.Labels \"org.opencontainers.image.revision\"}}' '$IMAGE'"
 
 say "cluster: the kubelet measures emptyDir usage every $VOLUME_STATS_PERIOD"
@@ -375,5 +485,8 @@ events | tee -a "$T" >/dev/null
 run "${K[@]}" get pods -o wide
 run "${K[@]}" get pod trawl-0 -o jsonpath='{.metadata.uid} {.status.phase} {.status.reason} {.status.message}{"\n"}'
 note "evicted=$evicted"
+[[ ${STOP_AFTER:-} == b ]] && { note "stopping after phase B (STOP_AFTER=b); START_AT=c runs phase C"; exit 0; }
+
+phase_c "$evicted"
 
 say "done $LABEL"
