@@ -18,7 +18,11 @@
 # the block slack are read from repro.sh, so they match the after run. The
 # script writes LABEL-fast-transcript.txt. It stops only what it started:
 # its port-forward runs in a process group of its own, and each in-pod
-# sampler ends at a stop file this script creates, or after 180 s.
+# sampler ends at a stop file this script creates, or after 180 s. The stop
+# file's name carries a run id, so a second invocation on the same pod never
+# meets the first one's marker, and the script removes the file once its
+# sampler has ended. A run whose sample log holds no sample stops the script
+# with a message.
 set -euo pipefail
 LABEL=${1:?usage: calib-fast.sh LABEL PAUSE NAME...}; PAUSE=${2:?PAUSE}; shift 2
 (( $# > 0 )) || { echo "name at least one query: SPILL_QUERY or SPILL_BIG_QUERY" >&2; exit 2; }
@@ -61,8 +65,10 @@ sampler_stop() {
   [[ -n $sampler_pid ]] || return 0
   "${K[@]}" exec trawl-0 -c trawld -- touch "$1" 2>/dev/null || kill "$sampler_pid" 2>/dev/null || true
   wait "$sampler_pid" 2>/dev/null || true
+  "${K[@]}" exec trawl-0 -c trawld -- rm -f "$1" 2>/dev/null || true
   sampler_pid=
 }
+RUN_ID=$(date -u +%s)-$$
 stop=
 trap 'sampler_stop "$stop"; pf_stop' EXIT
 
@@ -86,7 +92,7 @@ for name in "$@"; do
   i=$((i + 1))
   [[ $name == SPILL_QUERY || $name == SPILL_BIG_QUERY ]] || { note "unknown query $name"; exit 2; }
   say "run $i: $name, with scratch and memory sampled in the pod every 0.2 s"
-  stop=/tmp/calib-fast-stop-$i
+  stop=/tmp/calib-fast-stop-$RUN_ID-$i
   # One shell loop inside the container: no kubectl exec per sample.
   "${K[@]}" exec trawl-0 -c trawld -- sh -c '
     end=$(( $(date +%s) + 180 ))
@@ -103,6 +109,10 @@ for name in "$@"; do
   t1=$(ts)
   sleep 1
   sampler_stop "$stop"
+  grep -qE 'scratch=[0-9]+' "$W/fast$i.log" || {
+    note "run $i: fast$i.log holds no sample, so the sampler never ran; its output was: $(head -c 300 "$W/fast$i.log" | tr -d '\n')"
+    exit 1
+  }
   note "$name sent $t0, answered $t1 -> $r $(head -c 300 "$W/q$i.out" | tr -d '\n')"
   say "run $i: samples (UTC time, scratch bytes, cgroup anon bytes, cgroup memory.current bytes)"
   runsh "cat '$W/fast$i.log'"
