@@ -2298,7 +2298,7 @@ Compaction, rollup, conform and repin each open a DuckDB database bounded by `[i
 
 | Series | Type | Measurement |
 | --- | --- | --- |
-| `trawl_maintenance_resource_exhausted_total` | counter | Maintenance statements that ran out of `compaction_memory_limit`. trawld logs `maintenance_resource_exhausted`, keeps the inputs and retries them on the next pass. Starts at zero, carries no label |
+| `trawl_maintenance_resource_exhausted_total` | counter | Maintenance statements that ran out of `compaction_memory_limit`. trawld logs `maintenance_resource_exhausted` and keeps the inputs. Compaction and rollup retry them on the next pass. A repin ends `failed` and is not retried, and boot conformance retries on the next boot. Starts at zero, carries no label |
 
 #### Restart visibility metrics
 
