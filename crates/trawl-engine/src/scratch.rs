@@ -566,7 +566,13 @@ impl ScratchLock {
             return Err(ScratchError::ReadOnly { path });
         }
         if stat.mode & lock::GROUP_OTHER != 0 {
-            rustix::fs::fchmod(&handle, Mode::from_raw_mode(stat.mode & !lock::GROUP_OTHER))
+            #[allow(
+                clippy::unnecessary_cast,
+                clippy::cast_possible_truncation,
+                reason = "RawMode is u32 on Linux and u16 on macOS; `mode` holds only the 0o7777 bits"
+            )]
+            let private = (stat.mode & !lock::GROUP_OTHER) as rustix::fs::RawMode;
+            rustix::fs::fchmod(&handle, Mode::from_raw_mode(private))
                 .map_err(|e| io("remove the group and other bits of")(e.into()))?;
             let mode = lock::stat_handle(handle.as_fd())
                 .map_err(io("inspect"))?
