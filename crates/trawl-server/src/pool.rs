@@ -2492,7 +2492,11 @@ mod tests {
             max_events: 100,
             max_bytes: 1 << 20,
         }));
+        // The envelope columns ingest stamps on every event: written here
+        // by hand because this buffer is filled directly.
         let mut event = serde_json::Map::new();
+        event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+        event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
         event.insert("service".into(), "svc".into());
         event.insert("message".into(), "hello".into());
         hot.insert_for_test(Arc::new(IngestBatch {
@@ -2798,7 +2802,10 @@ mod tests {
             })
             .with_field_catalog(Arc::clone(&catalog)),
         );
+        // The envelope columns ingest stamps on every event.
         let mut event = serde_json::Map::new();
+        event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+        event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
         event.insert("service".into(), "svc".into());
         event.insert("lvl".into(), 17.into());
         hot.insert_for_test(Arc::new(IngestBatch {
