@@ -49,22 +49,36 @@ pub const LOGIN_BODY_LIMIT: usize = 16 * 1024;
 /// The name the login limit's 413 carries, where trawld's names a setting.
 pub const LOGIN_BODY_LIMIT_NAME: &str = "the login body limit";
 
-/// Answer the login body limit's refusal with the error envelope.
+/// Hold a login body to [`LOGIN_BODY_LIMIT`], answering every refusal with
+/// the error envelope.
 ///
-/// The `Json` extractor refuses a body over `DefaultBodyLimit` with a
-/// plain-text 413; this turns it into 413 `request_too_large` with the
-/// limit's name and value, the shape trawld's own 413 has. A 413 that is
-/// already JSON is a handler's own and passes untouched.
+/// A declared `Content-Length` over the limit is refused here, before the
+/// request reaches the `Json` extractor, whatever its content type: the
+/// extractor checks the type first and would answer a non-JSON one 415
+/// without consulting the limit. A body with no declared length is held by
+/// `DefaultBodyLimit` as the extractor reads it; its plain-text 413 is
+/// turned into 413 `request_too_large` with the limit's name and value, the
+/// shape trawld's own 413 has, and a 413 that is already JSON is a
+/// handler's own and passes untouched. A streamed body of a non-JSON type
+/// is answered 415 before any of it is read, so none of it is buffered.
 pub async fn envelope_login_body_limit(request: Request, next: Next) -> Response {
-    let response = next.run(request).await;
-    if response.status() != StatusCode::PAYLOAD_TOO_LARGE
-        || response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("application/json"))
-    {
-        return response;
+    let declared_too_large = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|len| len > LOGIN_BODY_LIMIT as u64);
+    if !declared_too_large {
+        let response = next.run(request).await;
+        if response.status() != StatusCode::PAYLOAD_TOO_LARGE
+            || response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json"))
+        {
+            return response;
+        }
     }
     ProxyError::RequestTooLarge {
         setting: LOGIN_BODY_LIMIT_NAME,

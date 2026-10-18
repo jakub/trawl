@@ -851,6 +851,111 @@ mod tests {
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
     }
 
+    /// A login whose declared `Content-Length` is over 16 KiB is answered
+    /// 413 `request_too_large` whatever its content type: the refusal
+    /// comes before the `Json` extractor, which would otherwise answer a
+    /// non-JSON type 415 without ever consulting the limit. At exactly the
+    /// limit the request is the extractor's, so a wrong type is still 415.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_login_declared_length_over_limit_is_refused_for_any_content_type() {
+        let upstream = HandUpstream::start().await;
+        let app = counted_app(&upstream, 4);
+
+        let login = |content_type: &str, len: usize| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("origin", TEST_ORIGIN)
+                .header("content-type", content_type)
+                .header("content-length", len.to_string())
+                .body(Body::from(vec![b'x'; len]))
+                .unwrap()
+        };
+
+        for content_type in ["text/plain", "application/json", "application/xml"] {
+            let resp = app
+                .clone()
+                .oneshot(login(content_type, 16 * 1024 + 1))
+                .await
+                .unwrap();
+            assert_envelope_refusal(
+                resp,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                trawl_api::ErrorCode::RequestTooLarge,
+                "request body exceeds the login body limit (16384 bytes)",
+            )
+            .await;
+        }
+
+        let at_limit = app.oneshot(login("text/plain", 16 * 1024)).await.unwrap();
+        assert_eq!(
+            at_limit.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a body at the limit is not refused for its size"
+        );
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+    }
+
+    /// A login body streamed with no declared length is held to the limit
+    /// by the body reader: over it, a JSON body is answered 413
+    /// `request_too_large`. A non-JSON type is answered 415 before any of
+    /// the body is read, so nothing is buffered and 415 is the right
+    /// answer: the size was never reached.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_login_chunked_body_over_limit_is_refused() {
+        let upstream = HandUpstream::start().await;
+        let app = counted_app(&upstream, 4);
+
+        let chunked = |content_type: &str| {
+            let chunks = (0..17).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 1024])));
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("origin", TEST_ORIGIN)
+                .header("content-type", content_type)
+                .body(Body::from_stream(futures::stream::iter(chunks)))
+                .unwrap()
+        };
+
+        let json = app
+            .clone()
+            .oneshot(chunked("application/json"))
+            .await
+            .unwrap();
+        assert_envelope_refusal(
+            json,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            trawl_api::ErrorCode::RequestTooLarge,
+            "request body exceeds the login body limit (16384 bytes)",
+        )
+        .await;
+
+        let plain = app.oneshot(chunked("text/plain")).await.unwrap();
+        assert_eq!(plain.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+    }
+
+    /// A well-formed JSON login still reaches trawld and mints the cookie.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_login_within_limit_still_succeeds() {
+        let upstream = HandUpstream::start().await;
+        let app = counted_app(&upstream, 4);
+
+        let body = r#"{"api_key":"flt_direct"}"#;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/auth/login")
+            .header("origin", TEST_ORIGIN)
+            .header("content-type", "application/json")
+            .header("content-length", body.len().to_string())
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get(header::SET_COOKIE).is_some());
+        assert_eq!(upstream.seen(), ["GET /api/v1/whoami"]);
+    }
+
     /// A forwarded body that stops arriving is answered 408 `timeout` at
     /// the body deadline, trawld is never called, and the request's count
     /// is free again for the next request.
