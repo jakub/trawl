@@ -121,7 +121,6 @@ tracing = "0.1"
 tempfile = "3"
 time = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-unicode-segmentation = "1"
 unicode-width = "0.2"
 url = "2"
 wiremock = "0.6"

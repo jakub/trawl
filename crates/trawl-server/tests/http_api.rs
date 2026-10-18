@@ -2513,12 +2513,15 @@ async fn validate_query_unknown_function() {
 }
 
 /// On a query-only node, with no hot buffer to fall back to, a binder
-/// failure answers with the status it had before `DuckDB`'s structured
-/// errors (ADR-0056): summing a text field whose name says "column" is the
-/// unknown-field 400, because the fallback reads the statement line the
-/// error sits on, and summing another text field stays the 500.
+/// failure answers by its diagnostic's subtype (ADR-0056): a missing
+/// column is the unknown-field 400, and summing a text field is the 500
+/// whatever the field is called.
+///
+/// Changed on purpose from b02b8acf, where summing a text field whose name
+/// says "column" was the unknown-field 400: the fallback read `DuckDB`'s
+/// text form, whose statement line then said "column".
 #[tokio::test(flavor = "multi_thread")]
-async fn a_binder_failure_on_a_query_only_node_keeps_its_status() {
+async fn a_binder_failure_on_a_query_only_node_answers_by_its_subtype() {
     let dir = tempfile::tempdir().unwrap();
     let server = common::setup_in_dir_with_ingest(dir.path(), false).await;
     assert!(server.state.query.hot_buffer.is_none());
@@ -2549,17 +2552,19 @@ async fn a_binder_failure_on_a_query_only_node_keeps_its_status() {
         }
     };
 
-    let (status, body) = query("* | stats sum(column_name)").await;
+    let (status, body) = query("* | stats sum(nope)").await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["error"]["code"], "validation_error", "{body}");
     assert_eq!(
-        body["error"]["message"], "unsupported operation: unknown field: column_name",
+        body["error"]["message"], "unsupported operation: unknown field: nope",
         "{body}"
     );
 
-    let (status, body) = query("* | stats sum(host)").await;
-    assert_eq!(status, 500, "{body}");
-    assert_eq!(body["error"]["code"], "execution_error", "{body}");
+    for dsl in ["* | stats sum(column_name)", "* | stats sum(host)"] {
+        let (status, body) = query(dsl).await;
+        assert_eq!(status, 500, "{dsl}: {body}");
+        assert_eq!(body["error"]["code"], "execution_error", "{dsl}: {body}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

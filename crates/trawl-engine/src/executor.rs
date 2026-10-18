@@ -23,7 +23,7 @@ use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
-use crate::error::{DuckDbDiagnostic, EngineError, locate};
+use crate::error::{DuckDbDiagnostic, EngineError, missing_column};
 use crate::scratch::ScratchLock;
 use crate::timing::{Fallback, PhaseClock, QueryPhase};
 use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64};
@@ -84,12 +84,11 @@ pub mod prepare_probe {
 
 /// One lane bind: counted and recorded for the tests, then handed to
 /// `DuckDB`. The probe sees exactly the text `DuckDB` prepares, because
-/// it is the same argument. A failure carries its place in `sql`
-/// ([`locate`]), as every lane statement's failure does.
+/// it is the same argument.
 fn prepare_statement<'c>(conn: &'c Connection, sql: &str) -> duckdb::Result<duckdb::Statement<'c>> {
     #[cfg(any(test, feature = "test-support"))]
     prepare_probe::record(sql);
-    conn.prepare(sql).map_err(|e| locate(e, sql))
+    conn.prepare(sql)
 }
 
 /// How a query lane bounds the rows it hands back.
@@ -974,10 +973,7 @@ impl Executor {
 
         // start query execution — column metadata is only available
         // after DuckDB resolves table-valued functions like read_parquet()
-        let mut result_rows = match stmt
-            .query(param_refs.as_slice())
-            .map_err(|e| locate(e, &statement))
-        {
+        let mut result_rows = match stmt.query(param_refs.as_slice()) {
             Ok(r) => r,
             Err(e) if is_no_files_error(&e) => {
                 return Ok((QueryResult::empty(), TimestampColumns::new()));
@@ -1006,7 +1002,7 @@ impl Executor {
         let mut is_timestamp = vec![false; col_count];
 
         let mut rows = Vec::new();
-        while let Some(row) = result_rows.next().map_err(|e| locate(e, &statement))? {
+        while let Some(row) = result_rows.next()? {
             match cap {
                 RowCap::Refuse(max_rows) if rows.len() >= max_rows => {
                     return Err(EngineError::ResultTooLarge(max_rows));
@@ -1472,7 +1468,7 @@ impl Executor {
                     clock.time(QueryPhase::Execute, || stmt.execute(param_refs.as_slice()));
                 if let Err(e) = staged {
                     cleanup(&self.conn);
-                    return Err(locate(e, &create_sql).into());
+                    return Err(e.into());
                 }
             }
             Err(e) => {
@@ -1499,7 +1495,7 @@ impl Executor {
             if let Err(e) = self.conn.execute_batch(&copy_sql) {
                 cleanup(&self.conn);
                 let _ = std::fs::remove_file(output_path);
-                return Err(locate(e, &copy_sql).into());
+                return Err(e.into());
             }
             cleanup(&self.conn);
             Ok(())
@@ -1669,8 +1665,6 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 const DUCKDB_NO_FILES_MSG: &str = "No files found that match the pattern";
 /// `DuckDB`'s exception type for a failed file operation.
 const DUCKDB_IO_ERROR: &str = "IO";
-/// `DuckDB`'s exception type for a statement that does not bind.
-const DUCKDB_BINDER_ERROR: &str = "Binder";
 /// `DuckDB`'s exception type for a failed cast.
 const DUCKDB_CONVERSION_ERROR: &str = "Conversion";
 
@@ -1690,17 +1684,12 @@ fn is_no_files_error(e: &duckdb::Error) -> bool {
 /// Check if a `DuckDB` error is a binder error about a missing column. This is
 /// a user error (querying a nonexistent field), not a server error.
 ///
-/// A `Binder` diagnostic whose message says "column" or "not found". The
-/// lanes put the statement line back at the end of that message
-/// ([`locate`]), as `DuckDB`'s text form has it, so a binder error over a
-/// field whose name says "column" matches as it did before the structured
-/// diagnostic, and the same error over another field does not.
+/// Read off the structured diagnostic alone ([`missing_column`]): the
+/// `Binder` type with the `COLUMN_NOT_FOUND` subtype. A type failure over a
+/// column the input has (`sum` over text, say) is the `NO_MATCHING_FUNCTION`
+/// subtype, so it is a database error whatever the column is called.
 fn is_binder_column_error(e: &duckdb::Error) -> bool {
-    DuckDbDiagnostic::of(e).is_some_and(|d| {
-        let msg = &d.exception_message;
-        d.exception_type == DUCKDB_BINDER_ERROR
-            && (msg.contains("column") || msg.contains("not found"))
-    })
+    missing_column(e).is_some()
 }
 
 /// The `DuckDB` types a `timechart` bucket source may have: the
@@ -1804,10 +1793,7 @@ fn validate_timechart_inputs(
 
         let params = bind_params(&check.params);
         let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
-        let rows = match stmt
-            .query(param_refs.as_slice())
-            .map_err(|e| locate(e, &check.sql))
-        {
+        let rows = match stmt.query(param_refs.as_slice()) {
             Ok(rows) => rows,
             Err(e) if is_no_files_error(&e) => continue,
             Err(e) if is_binder_column_error(&e) => return Err(remap_binder_error(&e)),
@@ -2333,24 +2319,15 @@ fn glob_list_items(source: &str) -> Option<Vec<&str>> {
 /// Remap a `DuckDB` binder error about missing columns to `EngineError::Emit`
 /// so it surfaces as HTTP 400 instead of 500.
 ///
-/// Called only on an error [`is_binder_column_error`] accepted, so it has
-/// a diagnostic. The field name is the first quoted identifier of its text
-/// form, statement line included ([`locate`]), as before the structured
-/// diagnostic.
+/// Called only on an error [`is_binder_column_error`] accepted, so its
+/// diagnostic names the column, and the refusal names it too. The column is
+/// the query's own field name, so it crosses the trust boundary intact.
 fn remap_binder_error(e: &duckdb::Error) -> EngineError {
-    let msg = DuckDbDiagnostic::of(e).map_or_else(|| e.to_string(), |d| d.text());
-    // try to extract the field name from the error message
-    let user_msg = if let Some(start) = msg.find('"') {
-        if let Some(end) = msg[start + 1..].find('"') {
-            let field = &msg[start + 1..start + 1 + end];
-            format!("unknown field: {field}")
-        } else {
-            format!("unknown field in query: {msg}")
-        }
-    } else {
-        format!("unknown field in query: {msg}")
-    };
-    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message: user_msg })
+    let message = missing_column(e).map_or_else(
+        || "unknown field in query".to_owned(),
+        |field| format!("unknown field: {field}"),
+    );
+    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation { message })
 }
 
 /// Convert trawl-core `SqlValue` params into duckdb `ToSql` trait objects.
@@ -5119,31 +5096,117 @@ mod structured_error_classification {
         assert!(!is_binder_column_error(&catalog), "{catalog}");
     }
 
-    /// Every binder failure of the cold query lane answers as it did before
-    /// `errors_as_json` (b02b8acf). The binder-column fallback read
-    /// `DuckDB`'s text form then, and that text ends with the statement line
-    /// the error sits on. So a field whose name says "column" made any
-    /// binder error on its line the unknown-field 400, naming the first
-    /// quoted identifier of the text, and the same error over another field
-    /// stayed a 500. The structured diagnostic drops that line and keeps
-    /// only its offset.
+    /// A failure is the binder-column fallback only when its diagnostic is
+    /// a `Binder` exception with the `COLUMN_NOT_FOUND` subtype and the
+    /// column's `name`. Nothing reads the message text. So a diagnostic of
+    /// another type or subtype, or with no subtype, a malformed one, text
+    /// with no diagnostic and the driver's own variants never take it, live
+    /// or planted, whatever their message says. The binder failures over a
+    /// missing name that `DuckDB` 1.5.5 raises without the subtype (the
+    /// `EXCLUDE` and `REPLACE` lists, a struct key, a table) do not either.
     #[test]
-    fn binder_failures_answer_as_before_structured_errors() {
+    fn a_malformed_or_non_binder_diagnostic_is_never_the_fallback() {
+        fn failure(message: &str) -> duckdb::Error {
+            duckdb::Error::DuckDBFailure(duckdb::ffi::Error::new(1), Some(message.to_owned()))
+        }
+        let exec = Executor::new().expect("executor");
+        let found = failure(
+            r#"{"exception_type":"Binder","exception_message":"Referenced column \"nope\" not found in FROM clause!","error_subtype":"COLUMN_NOT_FOUND","name":"nope","position":"7"}"#,
+        );
+        assert!(is_binder_column_error(&found), "{found}");
+        assert_eq!(
+            remap_binder_error(&found).to_string(),
+            "emit error: unsupported operation: unknown field: nope"
+        );
+        let renamed = failure(
+            r#"{"exception_type":"Binder","exception_message":"Referenced column \"other\" not found","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}"#,
+        );
+        assert_eq!(
+            remap_binder_error(&renamed).to_string(),
+            "emit error: unsupported operation: unknown field: nope",
+            "the field is the diagnostic's name, not a quoted word of its text"
+        );
+
+        let never = [
+            raw_error(&exec, "SELECT * EXCLUDE (nope) FROM (SELECT 1 AS x)"),
+            raw_error(&exec, "SELECT * REPLACE (1 AS nope) FROM (SELECT 1 AS x)"),
+            raw_error(&exec, "SELECT struct_extract({'a': 1}, 'nope')"),
+            raw_error(&exec, "SELECT nope.x FROM (SELECT 1 AS x)"),
+            raw_error(&exec, "SELECT sum(mycolumn) FROM (SELECT 'a' AS mycolumn)"),
+            raw_error(&exec, r#"SELECT * FROM "Referenced column not found""#),
+            raw_error(
+                &exec,
+                r#"SELECT error('{"exception_type":"Binder","error_subtype":"COLUMN_NOT_FOUND"}')"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"Referenced column \"nope\" not found in FROM clause!"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"column not found","error_subtype":"NO_MATCHING_FUNCTION","name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Catalog","exception_message":"column not found","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"column_not_found","name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":["COLUMN_NOT_FOUND"],"name":"nope"}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND","name":7}"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"NO_MATCHING_FUNCTION","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}"#,
+            ),
+            failure(
+                r#"[{"exception_type":"Binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND","name":"nope"}]"#,
+            ),
+            failure(
+                r#"{"exception_type":"Binder","exception_message":"x","error_subtype":"COLUMN_NOT_FOUND","name":"nope"} trailing"#,
+            ),
+            failure(r#"Binder Error: Referenced column "nope" not found in FROM clause!"#),
+            duckdb::Error::DuckDBFailure(duckdb::ffi::Error::new(1), None),
+            duckdb::Error::InvalidColumnName("Binder Error: column not found".into()),
+        ];
+        for error in never {
+            assert!(!is_binder_column_error(&error), "{error:?}");
+        }
+    }
+
+    /// The cold query lane answers a binder failure as the unknown-field
+    /// refusal only when a column is missing, and names the column the
+    /// diagnostic names.
+    ///
+    /// Changed on purpose from b02b8acf. That fallback read `DuckDB`'s text
+    /// form, which ends with the statement line, so a type failure on a line
+    /// that said "column" was the unknown-field 400, naming the first quoted
+    /// identifier (`sum(column_name) by hostname` named `hostname`), and the
+    /// same failure over another field was a 500. A type failure is now a
+    /// database error whatever its fields are called, because its diagnostic
+    /// has the `NO_MATCHING_FUNCTION` subtype.
+    #[test]
+    fn only_a_missing_column_is_an_unknown_field() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = super::timechart_fixture(&dir);
         let (_scratch, exec) = query_database(64 * MIB, 64 * MIB);
         let run = |dsl: &str| exec.run_query(dsl, &source, &FieldTypes::new(), usize::MAX, 0);
         for (dsl, field) in [
-            ("* | stats sum(column_name)", "column_name"),
-            ("* | stats avg(column_name)", "column_name"),
-            ("* | stats sum(column_name) by hostname", "hostname"),
-            ("* | let x = column_name * 2", "column_name"),
             ("* | stats sum(nope)", "nope"),
+            ("* | stats sum(nope) by hostname", "nope"),
+            ("* | let x = nope * 2", "nope"),
             ("* | fields nope", "nope"),
             ("* | sort nope", "nope"),
             ("nope=1", "nope"),
             ("* | stats count() by nope", "nope"),
             ("* | timechart on nope count()", "nope"),
+            ("* | stats sum(no_column)", "no_column"),
         ] {
             match run(dsl) {
                 Err(EngineError::Emit(e)) => assert_eq!(
@@ -5155,6 +5218,10 @@ mod structured_error_classification {
             }
         }
         for dsl in [
+            "* | stats sum(column_name)",
+            "* | stats avg(column_name)",
+            "* | stats sum(column_name) by hostname",
+            "* | let x = column_name * 2",
             "* | stats sum(hostname)",
             "* | stats avg(hostname)",
             "* | let x = hostname * 2",
@@ -5169,28 +5236,32 @@ mod structured_error_classification {
         }
     }
 
-    /// The hot lanes route the same binder failure as before too: the union
-    /// cannot sum a column the cold side stores as text, the fallback reads
-    /// it as a missing column, and the hot-only read answers. The hot buffer
-    /// holds the column as a number, so the hot-only read binds.
+    /// The hot lanes retry hot-only for a column the cold data lacks, and
+    /// not for a type failure over a column it has.
+    ///
+    /// Changed on purpose from b02b8acf, where summing a cold text field
+    /// whose name says "column" read as a missing column, because the
+    /// statement line said "column", and the hot-only read answered from
+    /// the hot buffer alone. It dropped the cold rows without saying so. The
+    /// type failure is now a database error, and with cold files present
+    /// the lanes return it. A field only the hot buffer carries still
+    /// reaches it.
     #[test]
-    fn a_binder_failure_on_its_statement_line_still_reaches_the_hot_buffer() {
+    fn a_type_failure_over_cold_data_does_not_reach_the_hot_buffer() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = super::timechart_fixture(&dir);
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
             &hot,
             "{\"_time\":\"2026-01-03T00:05:00Z\",\"_ingested\":\"2026-01-03T00:05:01Z\",\
-             \"column_name\":5}\n",
+             \"column_name\":5,\"hot_only\":7}\n",
         )
         .expect("hot buffer writes");
         let hot = hot.to_str().expect("temp path is valid UTF-8");
         // The shipped budgets: `read_json`'s buffers alone outgrow 64 MiB.
         let (_scratch, exec) = query_database(512 * MIB, 256 * MIB);
-        let dsl = "* | stats sum(column_name)";
-
-        let result = exec
-            .run_query_with_hot(
+        let query = |dsl: &str| {
+            exec.run_query_with_hot(
                 dsl,
                 &source,
                 hot,
@@ -5199,39 +5270,62 @@ mod structured_error_classification {
                 usize::MAX,
                 0,
             )
-            .expect("the hot-only read answers");
-        assert_eq!(result.rows.len(), 1, "{result:?}");
+        };
+        let export = |dsl: &str, name: &str| {
+            let out = dir.path().join(name);
+            exec.export_parquet_with_hot(
+                dsl,
+                &source,
+                hot,
+                &FieldTypes::new(),
+                &FieldTypes::new(),
+                &out,
+                usize::MAX,
+            )
+            .map(|()| out)
+        };
 
-        let out = dir.path().join("out.parquet");
-        exec.export_parquet_with_hot(
-            dsl,
-            &source,
-            hot,
-            &FieldTypes::new(),
-            &FieldTypes::new(),
-            &out,
-            usize::MAX,
-        )
-        .expect("the hot-only export answers");
+        let typed = "* | stats sum(column_name)";
+        let outcome = query(typed);
+        assert!(
+            matches!(outcome, Err(EngineError::Database(_))),
+            "{outcome:?}"
+        );
+        let outcome = export(typed, "typed.parquet");
+        assert!(
+            matches!(outcome, Err(EngineError::Database(_))),
+            "{outcome:?}"
+        );
+
+        let missing = "* | stats sum(hot_only)";
+        let result = query(missing).expect("the hot-only read answers");
+        assert_eq!(result.rows.len(), 1, "{result:?}");
+        let out = export(missing, "missing.parquet").expect("the hot-only export answers");
         assert!(out.is_file());
     }
 
-    /// The statement line put back is `DuckDB`'s own, cut where `DuckDB`
-    /// cuts it, which is by grapheme clusters and their render widths. A
-    /// cut in another place changes which binder failures the fallback
-    /// takes for a missing column, not only where the caret sits.
+    /// A type failure is an execution error whatever its field is called,
+    /// with a hot buffer that carries the field as a number.
     ///
-    /// Thirty two-column characters before "column" reach the cut before
-    /// the word, so `DuckDB`'s text form never said "column" and the cold
-    /// type failure stays a database error. Forty `e` + combining acute
-    /// clusters are forty columns, so the text form kept the word and the
-    /// hot-only read answers.
+    /// Changed on purpose from b02b8acf. The fallback then read the
+    /// statement line `DuckDB` puts at the end of its text form, cut to
+    /// about 60 columns either side of the error, and took the failure for
+    /// a missing column when the word "column" fell inside the cut. Where
+    /// it fell turned on grapheme clusters and their render widths: thirty
+    /// two-column characters before "column" pushed the word out, forty `e`
+    /// plus combining acute clusters kept it, and the Hangul medial vowel
+    /// U+1161 is a width the port and `DuckDB` measured differently. A short
+    /// name like `mycolumn` was always inside the cut, so its type failure
+    /// answered from the hot buffer alone. None of these is a missing
+    /// column, and the diagnostic's subtype says so.
     #[test]
-    fn the_binder_fallback_cuts_the_statement_line_where_duckdb_does() {
+    fn a_type_failure_stays_an_execution_error_whatever_the_field_is_called() {
         let (_scratch, exec) = query_database(512 * MIB, 256 * MIB);
-        for (field, cold_failure_stays) in [
-            (format!("{}column", "界".repeat(30)), true),
-            (format!("{}column", "e\u{301}".repeat(40)), false),
+        for field in [
+            format!("{}column", "界".repeat(30)),
+            format!("{}column", "e\u{301}".repeat(40)),
+            format!("{}column", "\u{1161}a".repeat(40)),
+            "mycolumn".to_owned(),
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let source = dir.path().join("cold.parquet");
@@ -5266,15 +5360,17 @@ mod structured_error_classification {
                 usize::MAX,
                 0,
             );
-            if cold_failure_stays {
-                assert!(
-                    matches!(outcome, Err(EngineError::Database(_))),
-                    "{dsl}: {outcome:?}"
-                );
-            } else {
-                let result = outcome.unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
-                assert_eq!(result.rows.len(), 1, "{dsl}: {result:?}");
-            }
+            let Err(EngineError::Database(duckdb::Error::DuckDBFailure(_, Some(message)))) =
+                &outcome
+            else {
+                panic!("{dsl}: {outcome:?}");
+            };
+            let diagnostic: serde_json::Value = serde_json::from_str(message).expect("diagnostic");
+            assert_eq!(
+                (&diagnostic["exception_type"], &diagnostic["error_subtype"]),
+                (&"Binder".into(), &"NO_MATCHING_FUNCTION".into()),
+                "{dsl}: {message}"
+            );
         }
     }
 
