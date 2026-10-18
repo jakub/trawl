@@ -63,6 +63,8 @@ Set `D` to this directory's copy of the kit, which also holds the cluster's `kub
    kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 delete namespace i304-spill-calib
    ```
 
+   Each `calib-fast.sh` run names its in-pod stop file with a run id, removes it after the sampler ends, and stops with a message when a query's sample log holds no sample. The first version reused `/tmp/calib-fast-stop-N` and left it behind, so a second invocation on the same prepared pod sampled nothing and then aborted at the peak pipeline. The committed calibration transcript came from the first version, in a single invocation on a fresh pod, so the fault did not touch it. Both versions were run against a stub `kubectl` that executes the in-pod commands locally (not committed): the first version failed its second invocation, and this version passed two in a row, left no marker, and stopped with the message when the sampler produced no sample.
+
    The after run takes about 9 minutes, and each agent command had a 10-minute limit, so it ran as two commands. `STOP_AFTER=b` stops after phase B. `START_AT=c` runs phase C against the same namespace and appends to the same transcript. Without either variable, one command runs every phase. At `b02b8acf`, phase B evicts the pod, so the script skips phase C and says so in the transcript. The committed before transcript was recorded before phase C existed.
 
 4. Run AC19. Each part is one command, and each command finished within 10 minutes. Run `run` until the chunks add up to at least 900 s. `report` exits 0 only on PASS.
