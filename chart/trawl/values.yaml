@@ -454,8 +454,11 @@ web:
       cpu: 50m
       memory: 64Mi
     limits:
-      # ADR-0056. The proxy counts at most 64 requests in progress, each
-      # body capped at config.server.maxRequestBodyBytes.
+      # ADR-0054 (amended 2026-10-17) and ADR-0056. The proxy admits at
+      # most 64 requests in progress and buffers at most 128 MiB of
+      # request bodies across them, whatever
+      # config.server.maxRequestBodyBytes is; the other 384 MiB is
+      # headroom for the runtime, TLS, response buffers and the SPA.
       memory: 512Mi
   extraEnv: []
   # The sidecar's own uid. In tls.mode=auto it mounts trawld's tls
