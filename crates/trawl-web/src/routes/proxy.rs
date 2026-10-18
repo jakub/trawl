@@ -1585,6 +1585,95 @@ mod tests {
         drop(wedged);
     }
 
+    /// A send trawld never takes ends at the head deadline (R8-7): every
+    /// connection the proxy opens to trawld carries `TCP_USER_TIMEOUT` at
+    /// [`ProxyLimits::upstream_head_timeout`], so the kernel closes a
+    /// connection whose queued bytes trawld has not taken for that long.
+    /// hyper drops the connection's write queue with it, which frees the
+    /// body and its reservation, and the browser's held response ends in
+    /// an error instead of hanging. The teardown comes no earlier than
+    /// the deadline and within a few seconds of it. Linux, Android and
+    /// Fuchsia only: the option exists nowhere else.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_wedged_send_is_torn_down_at_the_head_deadline() {
+        const BODY: usize = 16 * 1024 * 1024;
+        const DEADLINE: Duration = Duration::from_secs(2);
+        let upstream = HandUpstream::start_narrow().await;
+        let state = limited_state(&upstream, |cfg| {
+            cfg.limits.request_body_bytes = BODY;
+            cfg.limits.body_budget_bytes = BODY;
+            cfg.limits.upstream_head_timeout = DEADLINE;
+        });
+        let budget = state.body_budget().clone();
+        let app = routes::build_with_count(state, RequestCount::new(PROXY_MAX_REQUESTS));
+
+        let wedged = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.clone().oneshot(bearer_post(
+                HandUpstream::FLOOD_PATH,
+                Body::from(vec![b'x'; BODY]),
+            )),
+        )
+        .await
+        .expect("the head arrived")
+        .unwrap();
+        let head_at = std::time::Instant::now();
+        assert_eq!(wedged.status(), StatusCode::OK);
+        assert_eq!(
+            budget.available(),
+            0,
+            "the body is still queued, yet the budget shows it released"
+        );
+
+        while budget.available() < BODY {
+            assert!(
+                head_at.elapsed() < Duration::from_secs(8),
+                "the wedged connection kept its body {:?} after the head, past the {DEADLINE:?} deadline",
+                head_at.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            head_at.elapsed() >= Duration::from_millis(1_800),
+            "the body was freed {:?} after the head, before the deadline could have run out",
+            head_at.elapsed()
+        );
+
+        let mut body = wedged.into_body().into_data_stream();
+        let ending = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match body.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Some(error),
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("the held response ended");
+        assert!(
+            ending.is_some(),
+            "the held response ended cleanly, as if trawld had finished it"
+        );
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; BODY]))),
+        )
+        .await
+        .expect("the request after the teardown was answered")
+        .unwrap();
+        assert_eq!(next.status(), StatusCode::OK, "the budget was not released");
+        assert_eq!(
+            upstream.seen(),
+            [
+                format!("POST {}", HandUpstream::FLOOD_PATH),
+                "POST /api/v1/search".to_owned()
+            ]
+        );
+    }
+
     /// At the default limit the count fills before the budget: sixty-four
     /// stalled bodies take the whole count and an eighth of the budget,
     /// and the sixty-fifth request is the count's refusal. The defaults

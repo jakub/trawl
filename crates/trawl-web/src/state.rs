@@ -61,7 +61,9 @@ impl AppState {
     ///
     /// The client's certificate trust comes from
     /// [`ResolvedConfig::upstream_tls`], already validated at resolution;
-    /// see [`crate::upstream`] for how a pinned CA is read again. Starts no
+    /// see [`crate::upstream`] for how a pinned CA is read again. Its
+    /// connections carry the head deadline as their `TCP_USER_TIMEOUT`, so
+    /// a request body trawld never takes is torn down after it. Starts no
     /// task: the caller starts the re-read with
     /// [`Self::spawn_upstream_ca_reread`].
     ///
@@ -70,7 +72,11 @@ impl AppState {
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let upstream = Upstream::new(cfg.upstream_tls, cfg.upstream_connect)?;
+        let upstream = Upstream::new(
+            cfg.upstream_tls,
+            cfg.upstream_connect,
+            cfg.limits.upstream_head_timeout,
+        )?;
 
         Ok(Self {
             inner: Arc::new(Inner {
