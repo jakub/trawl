@@ -27,6 +27,7 @@ use fleet_auth::{
 use reqwest::Client;
 use tokio::task::JoinHandle;
 
+use crate::body_budget::BodyBudget;
 use crate::config::{ProxyLimits, ResolvedConfig};
 use crate::error::ProxyError;
 use crate::upstream::Upstream;
@@ -46,6 +47,10 @@ struct Inner {
     shared_domain: Option<String>,
     public_origins: PublicOrigins,
     limits: ProxyLimits,
+    /// The budget the forwarder reserves each buffered body from, sized
+    /// by `limits.body_budget_bytes`. Lives here so every clone of the
+    /// state, and so every route, shares the one budget.
+    body_budget: BodyBudget,
 }
 
 impl AppState {
@@ -76,6 +81,7 @@ impl AppState {
                 allow_insecure_cookies: cfg.allow_insecure_cookies,
                 shared_domain: cfg.shared_domain,
                 public_origins: cfg.public_origins,
+                body_budget: BodyBudget::new(cfg.limits.body_budget_bytes),
                 limits: cfg.limits,
             }),
         })
@@ -86,6 +92,12 @@ impl AppState {
     #[must_use]
     pub fn limits(&self) -> &ProxyLimits {
         &self.inner.limits
+    }
+
+    /// The budget every buffered request body is reserved from.
+    #[must_use]
+    pub fn body_budget(&self) -> &BodyBudget {
+        &self.inner.body_budget
     }
 
     /// Send `request` to trawld and wait for its response head within

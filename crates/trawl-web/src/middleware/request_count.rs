@@ -6,7 +6,9 @@
 //! 2026-10-17).
 //!
 //! trawl-web buffers each request body before it calls trawld, so the
-//! number of requests in progress is what bounds its memory. The count is
+//! number of requests in progress bounds its memory, together with the
+//! body budget (`crate::body_budget`) that bounds the bytes those
+//! requests hold. The count is
 //! [`PROXY_MAX_REQUESTS`], fixed, and covers every route except
 //! `/healthz`, which the probes must always reach. It is taken with a
 //! try-acquire and never waited for: a request over the count is refused
@@ -18,7 +20,8 @@
 //!
 //! The constant is twice trawld's default `max_concurrent_requests`, so
 //! browser traffic meets trawld's own refusal first at the defaults, and
-//! this count is the proxy's memory backstop.
+//! this count is the proxy's memory backstop for everything a request
+//! holds besides its body.
 
 use std::sync::Arc;
 

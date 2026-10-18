@@ -100,6 +100,14 @@ pub enum ProxyError {
     #[error("request limit reached")]
     RequestLimitReached,
 
+    /// The proxy's body budget cannot cover the request's body
+    /// (`body_budget`, ADR-0054 amended 2026-10-17). Answered exactly as
+    /// [`Self::RequestLimitReached`]: the same 503, envelope and message,
+    /// because to the browser it is the same refusal, the proxy at a
+    /// fixed limit of its own; only the log line tells them apart.
+    #[error("request body budget full")]
+    BodyBudgetFull,
+
     /// A request body over the limit the proxy buffers to. The message is
     /// trawld's own sentence for its 413, naming the setting and the exact
     /// value, so a caller resizes the request the same way whichever hop
@@ -167,6 +175,14 @@ impl IntoResponse for ProxyError {
                     REQUEST_LIMIT_MESSAGE,
                 );
             }
+            Self::BodyBudgetFull => {
+                tracing::warn!(error = %self, "proxy body budget full");
+                return envelope(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ErrorCode::RequestLimitReached,
+                    REQUEST_LIMIT_MESSAGE,
+                );
+            }
             Self::RequestTooLarge { .. } => {
                 tracing::debug!(error = %self, "proxy refused an oversized body");
                 return envelope(
@@ -210,6 +226,7 @@ impl IntoResponse for ProxyError {
                 "upstream certificate not available",
             ),
             Self::RequestLimitReached
+            | Self::BodyBudgetFull
             | Self::RequestTooLarge { .. }
             | Self::BodyTimeout
             | Self::UpstreamHeadTimeout => unreachable!("answered above"),
@@ -238,6 +255,7 @@ impl IntoResponse for ProxyError {
                 tracing::warn!(error = %self, "proxy service unavailable");
             }
             Self::RequestLimitReached
+            | Self::BodyBudgetFull
             | Self::RequestTooLarge { .. }
             | Self::BodyTimeout
             | Self::UpstreamHeadTimeout => unreachable!("answered above"),

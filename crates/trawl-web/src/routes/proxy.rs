@@ -19,12 +19,13 @@
 //! - An upstream 3xx becomes the proxy's own 502, and `Location` never
 //!   reaches the browser; see `refuse_redirect`.
 
-use axum::body::{Body, Bytes};
+use axum::body::{Body, Bytes, HttpBody as _};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt as _;
 
+use crate::body_budget::{BODY_BUDGET_NAME, BodyBudget, BodyReservation};
 use crate::config::ProxyLimits;
 use crate::error::ProxyError;
 use crate::middleware::body_deadline::BodyDeadlineElapsed;
@@ -90,7 +91,10 @@ async fn do_forward(
     // rule hold for every cookie route, including the next one.
     let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
 
-    let body_bytes = collect_body(&parts.headers, body, state.limits()).await?;
+    // The reservation is held, with the count, until the response head:
+    // the buffered body is alive until trawld has read it.
+    let (body_bytes, _reservation) =
+        collect_body(&parts.headers, body, state.limits(), state.body_budget()).await?;
 
     // After every local check, so a request refused here never waits on
     // the pin file. This one client carries the request and its streamed
@@ -199,40 +203,72 @@ pub(crate) fn refuse_redirect(status: reqwest::StatusCode) -> Result<(), ProxyEr
     Ok(())
 }
 
-/// Buffer a request body whole, within the proxy's body limit.
+/// Buffer a request body whole, within the proxy's body limit and its
+/// body budget.
 ///
 /// A `Content-Length` past the limit is refused before a byte is read,
 /// and a body found over the limit while it streams in is refused at the
 /// byte that crosses it: 413 `request_too_large`, with trawld's sentence.
-/// The body deadline is the router's (`middleware::body_deadline`); a
-/// read that fails because it passed is 408 `timeout` here, the answer
-/// the layer gives whatever a handler makes of it. Neither refusal
-/// contacts trawld. The count the request holds is released with the
+/// Before a byte is read the body's worst case is reserved from the
+/// budget (`body_budget`): its declared length, or the whole limit when
+/// it declares none. A body the budget cannot cover now is refused 503
+/// `request_limit_reached`, and a body larger than the whole budget,
+/// which only a limit above the budget allows, is refused 413 naming
+/// the budget. The buffer is allocated at the reservation and never
+/// grows past it, so the reservation is the memory. One copy is made,
+/// from each chunk as it arrives into that buffer, and the buffer goes
+/// to reqwest as the `Bytes` it is frozen into. The body deadline is the
+/// router's (`middleware::body_deadline`); a read that fails because it
+/// passed is 408 `timeout` here, the answer the layer gives whatever a
+/// handler makes of it. None of these refusals contacts trawld. The
+/// count and the reservation the request holds are released with the
 /// refusal, as with any response head.
 ///
 /// # Errors
-/// [`ProxyError::RequestTooLarge`], [`ProxyError::BodyTimeout`], or
-/// [`ProxyError::BadRequest`] when the body cannot be read.
+/// [`ProxyError::RequestTooLarge`], [`ProxyError::BodyBudgetFull`],
+/// [`ProxyError::BodyTimeout`], or [`ProxyError::BadRequest`] when the
+/// body cannot be read or is longer than the length it declared.
 async fn collect_body(
     headers: &HeaderMap,
     body: Body,
     limits: &ProxyLimits,
-) -> Result<Bytes, ProxyError> {
+    budget: &BodyBudget,
+) -> Result<(Bytes, BodyReservation), ProxyError> {
     let limit = limits.request_body_bytes;
-    let too_large = || ProxyError::RequestTooLarge {
-        setting: BODY_LIMIT_SETTING,
-        limit,
+    // What one body may hold: the limit, or the budget when the limit is
+    // the larger of the two, since the budget could never cover more.
+    // The 413 names whichever bound was crossed first.
+    let (cap, cap_name) = if limits.body_budget_bytes < limit {
+        (limits.body_budget_bytes, BODY_BUDGET_NAME)
+    } else {
+        (limit, BODY_LIMIT_SETTING)
     };
+    let too_large = |setting, limit| ProxyError::RequestTooLarge { setting, limit };
     let announced: Option<usize> = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse().ok());
     if announced.is_some_and(|length| length > limit) {
-        return Err(too_large());
+        return Err(too_large(BODY_LIMIT_SETTING, limit));
     }
+    // The length hyper framed the body with: exact for a `Content-Length`
+    // body and for no body at all, unknown for a chunked one. hyper never
+    // yields more than it framed.
+    let hint = body.size_hint();
+    let framed = hint
+        .exact()
+        .or(hint.upper())
+        .map(|length| usize::try_from(length).unwrap_or(usize::MAX));
+    let reserved = framed.or(announced).unwrap_or(cap);
+    if reserved > cap {
+        return Err(too_large(cap_name, cap));
+    }
+    let reservation = budget
+        .try_reserve(reserved)
+        .ok_or(ProxyError::BodyBudgetFull)?;
+
     let mut stream = body.into_data_stream();
-    let mut chunks: Vec<Bytes> = Vec::new();
-    let mut total = 0_usize;
+    let mut buffer: Vec<u8> = Vec::with_capacity(reserved);
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
             let e = e.into_inner();
@@ -242,19 +278,21 @@ async fn collect_body(
                 ProxyError::BadRequest(format!("request body: {e}"))
             }
         })?;
-        total = total.saturating_add(chunk.len());
-        if total > limit {
-            return Err(too_large());
+        if buffer.len().saturating_add(chunk.len()) > reserved {
+            // Past the reservation, so past the buffer. A body of unknown
+            // length was reserved the cap, so this is the byte that
+            // crosses it; a declared body that runs past its declaration
+            // is malformed.
+            return Err(if reserved == cap {
+                too_large(cap_name, cap)
+            } else {
+                ProxyError::BadRequest("request body longer than its declared length".into())
+            });
         }
-        chunks.push(chunk);
+        buffer.extend_from_slice(&chunk);
     }
-    // One chunk, the common case, goes on as it arrived; several are
-    // joined once.
-    Ok(match chunks.len() {
-        0 => Bytes::new(),
-        1 => chunks.remove(0),
-        _ => Bytes::from(chunks.concat()),
-    })
+    // `Bytes` takes the vector's allocation as it is: no copy.
+    Ok((Bytes::from(buffer), reservation))
 }
 
 /// Compose the upstream URL: the configured base followed by the
@@ -312,6 +350,7 @@ mod tests {
     use wiremock::matchers::{bearer_token, body_bytes, method, path, query_param};
     use wiremock::{Mock, ResponseTemplate};
 
+    use crate::body_budget::PROXY_BODY_BUDGET;
     use crate::config::ResolvedConfig;
     use crate::middleware::request_count::{PROXY_MAX_REQUESTS, RequestCount};
     use crate::routes;
@@ -376,6 +415,30 @@ mod tests {
         let mut cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
         adjust(&mut cfg);
         routes::build_with_count(AppState::from_config(cfg).unwrap(), count)
+    }
+
+    /// A state over the hand upstream with `adjust` applied to its
+    /// resolved config, kept by the test so it can watch the body budget.
+    fn limited_state(
+        upstream: &HandUpstream,
+        adjust: impl FnOnce(&mut ResolvedConfig),
+    ) -> AppState {
+        let web = WebConfig {
+            allow_insecure_cookies: true,
+            public_origins: vec![TEST_ORIGIN.to_owned()],
+            ..upstream.web_config()
+        };
+        let mut cfg = ResolvedConfig::from_parsed(&web, None).unwrap();
+        adjust(&mut cfg);
+        AppState::from_config(cfg).unwrap()
+    }
+
+    /// A bearer POST to `path` whose body starts and never finishes: one
+    /// byte, then nothing, forever, with no length declared.
+    fn stalled_post(path: &str) -> Request<Body> {
+        let stalled = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from("{")) })
+            .chain(futures::stream::pending());
+        bearer_post(path, Body::from_stream(stalled))
     }
 
     /// A login whose body starts and never finishes: one byte, then
@@ -947,6 +1010,291 @@ mod tests {
         assert_eq!(next.status(), StatusCode::OK, "the count was not released");
     }
 
+    /// The bodies the proxy buffers share one budget of
+    /// [`PROXY_BODY_BUDGET`] bytes, whatever the body limit. At an 8 MiB
+    /// limit the budget admits sixteen bodies of unknown length, each
+    /// reserved at the limit; the seventeenth is refused at once with the
+    /// proxy's 503, as is a two-byte body, because nothing is left. A
+    /// request with no body reserves nothing and is served while the
+    /// budget is full. At the deadline the stalled bodies give the
+    /// budget back whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_body_budget_bounds_buffered_bodies_at_an_8_mib_limit() {
+        const LIMIT: usize = 8 * 1024 * 1024;
+        const ADMITTED: usize = PROXY_BODY_BUDGET / LIMIT;
+        assert_eq!(ADMITTED, 16);
+        let upstream = HandUpstream::start().await;
+        let count = RequestCount::new(PROXY_MAX_REQUESTS);
+        let state = limited_state(&upstream, |cfg| {
+            cfg.limits.request_body_bytes = LIMIT;
+            cfg.limits.body_read_timeout = Duration::from_millis(500);
+        });
+        let budget = state.body_budget().clone();
+        let app = routes::build_with_count(state, count.clone());
+
+        let stalled: Vec<_> = (0..ADMITTED)
+            .map(|_| tokio::spawn(app.clone().oneshot(stalled_post("/api/v1/search"))))
+            .collect();
+        let started = std::time::Instant::now();
+        while budget.available() > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{} bytes of the budget were never reserved",
+                budget.available()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            count.available(),
+            PROXY_MAX_REQUESTS - ADMITTED,
+            "the count still has room: the budget is what is full"
+        );
+
+        // Full: one more body of unknown length is refused at once, and
+        // so is a declared two-byte body.
+        for request in [
+            stalled_post("/api/v1/search"),
+            bearer_post("/api/v1/search", Body::from("{}")),
+        ] {
+            let refused =
+                tokio::time::timeout(Duration::from_secs(5), app.clone().oneshot(request))
+                    .await
+                    .expect("the refusal is immediate")
+                    .unwrap();
+            assert_proxy_request_limit_refusal(refused).await;
+        }
+        // A request without a body reserves nothing.
+        let bodiless = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone().oneshot(bearer_get("/api/v1/schema")),
+        )
+        .await
+        .expect("the bodiless request was answered")
+        .unwrap();
+        assert_eq!(
+            bodiless.status(),
+            StatusCode::OK,
+            "a bodiless request was charged"
+        );
+
+        // The deadline answers every stalled body and frees its reservation.
+        for post in stalled {
+            let resp = tokio::time::timeout(Duration::from_secs(5), post)
+                .await
+                .expect("the deadline answered the stalled body")
+                .unwrap()
+                .unwrap();
+            assert_envelope_refusal(
+                resp,
+                StatusCode::REQUEST_TIMEOUT,
+                trawl_api::ErrorCode::Timeout,
+                crate::error::BODY_TIMEOUT_MESSAGE,
+            )
+            .await;
+        }
+        assert_eq!(
+            budget.available(),
+            PROXY_BODY_BUDGET,
+            "a stalled body kept its reservation"
+        );
+        assert_eq!(count.available(), PROXY_MAX_REQUESTS);
+
+        let next = app
+            .oneshot(bearer_post(
+                "/api/v1/search",
+                Body::from(vec![b'x'; 1024 * 1024]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(next.status(), StatusCode::OK, "the budget was not released");
+        assert_eq!(
+            upstream.seen(),
+            ["GET /api/v1/schema", "POST /api/v1/search"],
+            "trawld saw a refused body"
+        );
+    }
+
+    /// A declared body is charged its own length, no more, and gives it
+    /// back at the response head: with 600 of a 1024-byte budget held by
+    /// a body trawld has not answered, a 500-byte body is refused at once
+    /// and a 400-byte one is admitted. Both reservations return when
+    /// trawld answers.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_body_budget_charges_the_declared_length_until_the_response_head() {
+        let upstream = HandUpstream::start().await;
+        upstream.hold();
+        let state = limited_state(&upstream, |cfg| {
+            cfg.limits.request_body_bytes = 1024;
+            cfg.limits.body_budget_bytes = 1024;
+        });
+        let budget = state.body_budget().clone();
+        let app = routes::build_with_count(state, RequestCount::new(PROXY_MAX_REQUESTS));
+
+        let first = tokio::spawn(
+            app.clone()
+                .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; 600]))),
+        );
+        upstream.wait_for_requests(1).await;
+        assert_eq!(
+            budget.available(),
+            1024 - 600,
+            "a declared body reserved its length"
+        );
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone()
+                .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; 500]))),
+        )
+        .await
+        .expect("the refusal is immediate")
+        .unwrap();
+        assert_proxy_request_limit_refusal(refused).await;
+        assert_eq!(
+            budget.available(),
+            1024 - 600,
+            "a refused body kept a reservation"
+        );
+
+        let second = tokio::spawn(
+            app.clone()
+                .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; 400]))),
+        );
+        upstream.wait_for_requests(2).await;
+        assert_eq!(budget.available(), 24);
+
+        upstream.release();
+        for held in [first, second] {
+            assert_eq!(held.await.unwrap().unwrap().status(), StatusCode::OK);
+        }
+        assert_eq!(
+            budget.available(),
+            1024,
+            "a reservation outlived its response head"
+        );
+        assert_eq!(
+            upstream.seen(),
+            ["POST /api/v1/search", "POST /api/v1/search"]
+        );
+    }
+
+    /// At the default limit the count fills before the budget: sixty-four
+    /// stalled bodies take the whole count and an eighth of the budget,
+    /// and the sixty-fifth request is the count's refusal. The defaults
+    /// behave as they did before the budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_body_budget_never_refuses_before_the_count_at_the_default_limit() {
+        let upstream = HandUpstream::start().await;
+        let count = RequestCount::new(PROXY_MAX_REQUESTS);
+        let state = limited_state(&upstream, |cfg| {
+            cfg.limits.body_read_timeout = Duration::from_millis(500);
+        });
+        let limit = state.limits().request_body_bytes;
+        assert_eq!(limit, trawl_config::DEFAULT_MAX_REQUEST_BODY_BYTES);
+        assert_eq!(state.limits().body_budget_bytes, PROXY_BODY_BUDGET);
+        assert!(
+            PROXY_BODY_BUDGET / limit >= PROXY_MAX_REQUESTS,
+            "the budget admits fewer full bodies than the count does"
+        );
+        let budget = state.body_budget().clone();
+        let app = routes::build_with_count(state, count.clone());
+
+        let stalled: Vec<_> = (0..PROXY_MAX_REQUESTS)
+            .map(|_| tokio::spawn(app.clone().oneshot(stalled_post("/api/v1/search"))))
+            .collect();
+        let started = std::time::Instant::now();
+        while count.available() > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{} of the stalled bodies never took a count",
+                count.available()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            budget.available(),
+            PROXY_BODY_BUDGET - PROXY_MAX_REQUESTS * limit,
+            "each body of unknown length reserved the limit"
+        );
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone().oneshot(bearer_get("/api/v1/schema")),
+        )
+        .await
+        .expect("the refusal is immediate")
+        .unwrap();
+        assert_proxy_request_limit_refusal(refused).await;
+
+        for post in stalled {
+            let resp = tokio::time::timeout(Duration::from_secs(5), post)
+                .await
+                .expect("the deadline answered the stalled body")
+                .unwrap()
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
+        }
+        assert_eq!(budget.available(), PROXY_BODY_BUDGET);
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+    }
+
+    /// A limit above the budget leaves the budget as the most one body
+    /// can hold, since the budget could never cover more: a body past it
+    /// is refused 413 naming the proxy body budget, announced or found
+    /// while it streams in, and a body at it goes through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_body_past_the_budget_gets_413_naming_the_budget() {
+        let upstream = HandUpstream::start().await;
+        let app = limited_app(&upstream, 4, |cfg| {
+            cfg.limits.request_body_bytes = 1024;
+            cfg.limits.body_budget_bytes = 64;
+        });
+        let sentence = "request body exceeds the proxy body budget (64 bytes)";
+
+        let announced = Request::builder()
+            .method("POST")
+            .uri("/api/v1/search")
+            .header("authorization", "Bearer flt_direct")
+            .header("content-type", "application/json")
+            .header("content-length", "65")
+            .body(Body::from(vec![b'x'; 65]))
+            .unwrap();
+        let resp = app.clone().oneshot(announced).await.unwrap();
+        assert_envelope_refusal(
+            resp,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            trawl_api::ErrorCode::RequestTooLarge,
+            sentence,
+        )
+        .await;
+
+        let chunks = futures::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 60])),
+            Ok(Bytes::from(vec![b'x'; 5])),
+        ]);
+        let resp = app
+            .clone()
+            .oneshot(bearer_post("/api/v1/search", Body::from_stream(chunks)))
+            .await
+            .unwrap();
+        assert_envelope_refusal(
+            resp,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            trawl_api::ErrorCode::RequestTooLarge,
+            sentence,
+        )
+        .await;
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+
+        let resp = app
+            .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; 64])))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        upstream.wait_for_requests(1).await;
+        assert_eq!(upstream.seen(), ["POST /api/v1/search"]);
+    }
+
     #[tokio::test]
     async fn retired_api_namespace_is_not_routed_or_served_by_the_spa() {
         // Bare `/api` is here on purpose: the catch-all `/api/{*path}`
@@ -1034,6 +1382,42 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A body that arrives in several chunks reaches trawld whole and in
+    /// order: the chunks are collected into the one buffer the forwarder
+    /// hands reqwest.
+    #[tokio::test]
+    async fn forward_sends_a_chunked_body_whole() {
+        let upstream = TlsUpstream::start().await;
+        let app = build_app(state_pointing_at(&upstream));
+        let expected: Vec<u8> = (0..3_000_u32).flat_map(u32::to_le_bytes).collect();
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/search"))
+            .and(bearer_token("flt_direct"))
+            .and(body_bytes(expected.clone()))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(upstream.mock())
+            .await;
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = expected
+            .chunks(1_000)
+            .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+            .collect();
+        let resp = app
+            .oneshot(bearer_post(
+                "/api/v1/search",
+                Body::from_stream(futures::stream::iter(chunks)),
+            ))
+            .await
+            .unwrap();
+        // wiremock answers 404 to a body that matches no mock.
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the body did not arrive whole"
+        );
     }
 
     #[tokio::test]

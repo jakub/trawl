@@ -17,7 +17,10 @@
 //! envelope whatever the extractor or handler made of the failed read.
 //! The count the request holds is released with that response head, as
 //! with any other answer. A body nobody reads never fires the deadline,
-//! and a handler that has its body whole is not timed by it.
+//! and a handler that has its body whole is not timed by it. The wrapped
+//! body keeps the size hint hyper framed the original with, so the
+//! forwarder's body budget (`crate::body_budget`) still sees a declared
+//! length, and no body at all, through the layer.
 //!
 //! Without this, a client needs no token to hold one of the proxy's
 //! counts for as long as it likes: it sends a login head, which is
@@ -31,11 +34,11 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use axum::BoxError;
-use axum::body::{Body, BodyDataStream, Bytes};
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse as _, Response};
-use futures::Stream;
+use hyper::body::{Frame, SizeHint};
 use tokio::time::Sleep;
 
 use crate::error::ProxyError;
@@ -64,8 +67,8 @@ pub async fn bound_body_read(
 ) -> Response {
     let (parts, body) = request.into_parts();
     let elapsed = Arc::new(AtomicBool::new(false));
-    let body = Body::from_stream(DeadlineStream {
-        inner: body.into_data_stream(),
+    let body = Body::new(DeadlineBody {
+        inner: body,
         deadline: Box::pin(tokio::time::sleep(deadline)),
         elapsed: Arc::clone(&elapsed),
     });
@@ -79,26 +82,31 @@ pub async fn bound_body_read(
     response
 }
 
-/// The request body's data, until the deadline passes.
-struct DeadlineStream {
-    inner: BodyDataStream,
+/// The request body, frame for frame, until the deadline passes. Its
+/// size hint and end-of-stream are the wrapped body's own.
+struct DeadlineBody {
+    inner: Body,
     deadline: Pin<Box<Sleep>>,
     elapsed: Arc<AtomicBool>,
 }
 
-impl Stream for DeadlineStream {
-    type Item = Result<Bytes, BoxError>;
+impl HttpBody for DeadlineBody {
+    type Data = Bytes;
+    type Error = BoxError;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         if this.elapsed.load(Ordering::Relaxed) {
             return Poll::Ready(Some(Err(BodyDeadlineElapsed.into())));
         }
         // The body first, so bytes that are ready at the deadline are not
         // refused for arriving with it.
-        match Pin::new(&mut this.inner).poll_next(cx) {
+        match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(next) => {
-                Poll::Ready(next.map(|chunk| chunk.map_err(axum::Error::into_inner)))
+                Poll::Ready(next.map(|frame| frame.map_err(axum::Error::into_inner)))
             }
             Poll::Pending => match this.deadline.as_mut().poll(cx) {
                 Poll::Ready(()) => {
@@ -108,6 +116,14 @@ impl Stream for DeadlineStream {
                 Poll::Pending => Poll::Pending,
             },
         }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -183,6 +199,38 @@ mod tests {
             axum::body::to_bytes(whole.into_body(), 16).await.unwrap(),
             "3"
         );
+    }
+
+    /// The body under the layer keeps the size hint it came with: a
+    /// declared length stays exact and no body stays zero, so the
+    /// forwarder's budget reserves what the body declares and nothing
+    /// for a request without one.
+    #[tokio::test]
+    async fn the_body_under_the_deadline_keeps_its_size_hint() {
+        let app = Router::new()
+            .route(
+                "/hint",
+                post(|request: Request| async move {
+                    format!("{:?}", request.body().size_hint().exact())
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Duration::from_secs(5),
+                bound_body_read,
+            ));
+
+        for (body, hint) in [
+            (Body::from("abc"), "Some(3)"),
+            (Body::empty(), "Some(0)"),
+            (stalled_after("ab"), "None"),
+        ] {
+            let resp = app.clone().oneshot(post_to("/hint", body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(resp.into_body(), 16).await.unwrap(),
+                hint
+            );
+        }
     }
 
     /// The deadline is on the body, not the handler: a handler that
