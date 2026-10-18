@@ -75,10 +75,12 @@ pub enum Permission {
     /// exist without server administration, and read-only surfaces can
     /// show repin state without offering the trigger.
     ///
-    /// It also reads one repin job by its id, so the caller that started
-    /// a job can follow it without [`Self::SchemaRead`]. A job row's
-    /// `unmapped_samples` are event values, but the same ones a dry run
-    /// this key may start would report.
+    /// It also reads a repin job this key requested, by its id, so the
+    /// caller that started a job can follow it without
+    /// [`Self::SchemaRead`]. Its own jobs only: the rows are durable, carry
+    /// event values in `unmapped_samples` and name other operators, so a
+    /// job another key requested answers the 404 an unknown id answers, and
+    /// the grant alone cannot learn which jobs exist.
     SchemaWrite,
 }
 

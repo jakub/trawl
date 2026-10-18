@@ -219,6 +219,13 @@ impl Harness {
     }
 }
 
+/// The requester every engine-level call here claims as: key row 1, named
+/// `op`. The row id is what the status read by id matches a write-only key
+/// against; the name is what the job row and the audit events show.
+fn op() -> trawl_server::store::Requester {
+    trawl_server::store::Requester::new(1, "op")
+}
+
 fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
     let mut base = json!({
         "service": service, "env": "prod", "host": "web01",
@@ -322,7 +329,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
                     dry_run,
                     false,
                     RequestedCeilings::default(),
-                    Some("op")
+                    Some(&op())
                 )
                 .await,
             Err(ServerError::CorpusRecovering(
@@ -370,7 +377,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
             true,
             false,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .unwrap();
@@ -391,7 +398,7 @@ async fn pending_rollup_blocks_repin_before_scan_and_preserves_recovery() {
             false,
             false,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .unwrap()
@@ -432,7 +439,7 @@ async fn cancelling_repin_during_rollup_admission_terminalizes_the_job() {
                 false,
                 false,
                 RequestedCeilings::default(),
-                Some("op"),
+                Some(&op()),
             )
             .await
     });
@@ -968,6 +975,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         .clone()
         .expect("an ingest-enabled node owns a repin engine");
     TEST_SCAN_DELAY_MS.store(500, Ordering::Relaxed);
+    let requester = op();
     let mut start = Box::pin(engine.start(
         "status",
         "VARCHAR",
@@ -975,7 +983,7 @@ async fn a_disconnected_caller_does_not_strand_the_running_slot() {
         true,
         false,
         RequestedCeilings::default(),
-        Some("op"),
+        Some(&requester),
     ));
     // Let the claim land and the scan begin, then drop the future exactly
     // as hyper drops a handler whose connection went away.
@@ -1449,7 +1457,7 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
             dialect: None,
             dry_run: false,
             force: false,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })
@@ -1580,7 +1588,7 @@ async fn boot_reconciliation_completes_a_recovered_cutover() {
             dialect: None,
             dry_run: false,
             force: false,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })
@@ -1642,7 +1650,7 @@ async fn boot_reconciliation_materialises_the_staged_evidence() {
             force: true,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
-            requested_by: None,
+            requester: None,
         })
         .await
         .unwrap();
@@ -1843,7 +1851,7 @@ async fn boot_reconciliation_replays_a_severity_cutover() {
             dialect: Some(trawl_core::severity::Dialect::Syslog),
             dry_run: false,
             force: true,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })
@@ -2969,8 +2977,14 @@ async fn status_with_query(h: &Harness, token: &str, query: &str) -> (u16, serde
 /// A key holding `trawl:schema_write` and nothing else: the one grant the
 /// repin trigger requires.
 async fn schema_write_only_token(h: &Harness) -> String {
-    let store = fleet_auth::KeyStore::from_pool(h.server.fleet_pool.clone());
-    store
+    seed_schema_write_only_role(h).await;
+    mint_schema_write_only_key(h, "schema-writer").await
+}
+
+/// The role [`mint_schema_write_only_key`] mints under: `trawl:schema_write`
+/// alone. Seed it once per harness.
+async fn seed_schema_write_only_role(h: &Harness) {
+    fleet_auth::KeyStore::from_pool(h.server.fleet_pool.clone())
         .create_role(
             "trawl-schema-writer",
             None,
@@ -2978,9 +2992,13 @@ async fn schema_write_only_token(h: &Harness) -> String {
         )
         .await
         .expect("seed a write-only role");
-    store
+}
+
+/// Mint a key named `name` under the write-only role, and return its token.
+async fn mint_schema_write_only_key(h: &Harness, name: &str) -> String {
+    fleet_auth::KeyStore::from_pool(h.server.fleet_pool.clone())
         .create_key(
-            "schema-writer",
+            name,
             fleet_auth::PrincipalKind::Service,
             &common::roles(&["trawl-schema-writer"]),
             None,
@@ -3115,6 +3133,64 @@ async fn a_schema_write_only_key_follows_its_dry_run_by_id() {
     assert_eq!(report["job"]["id"], accepted.id, "{report}");
     assert_eq!(report["job"]["status"], "succeeded", "{report}");
     assert_eq!(report["job"]["files_total"], 2, "{report}");
+
+    match writer.schema_repin_status().await {
+        Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 403),
+        other => panic!("the unscoped read still needs schema_read: {other:?}"),
+    }
+}
+
+/// A write-only key reads the jobs it requested and nothing else. A job
+/// another key requested, a job from before the key existed and an id the
+/// store never issued are one and the same 404 to it, so a `schema_write`
+/// grant cannot walk the durable job rows by id and learn which exist. A
+/// `schema_read` key reads any job by id, and the unscoped read stays
+/// `schema_read` only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_write_only_key_reads_only_the_jobs_it_requested() {
+    let h = harness().await;
+    for svc in ["api", "web"] {
+        h.ingest_and_compact(&[event(svc, &json!({"status": 200}))])
+            .await;
+    }
+    // A job from before either write-only key existed, requested by a key
+    // that holds `schema_read` as well.
+    let historical = dry_run(&h.schema_admin, "status", "VARCHAR", None, false).await;
+    seed_schema_write_only_role(&h).await;
+    let token = mint_schema_write_only_key(&h, "writer-a").await;
+    let other_token = mint_schema_write_only_key(&h, "writer-b").await;
+    let writer = HttpClient::new_insecure(&h.server.url, &token).unwrap();
+    let other_writer = HttpClient::new_insecure(&h.server.url, &other_token).unwrap();
+    let own = dry_run(&writer, "status", "VARCHAR", None, false).await;
+    let other = dry_run(&other_writer, "status", "VARCHAR", None, false).await;
+    let unknown = own.id.max(other.id).max(historical.id) + 1000;
+
+    let (status, body) = status_by_id(&h, &token, own.id).await;
+    assert_eq!(status, 200, "a write-only key reads its own job: {body}");
+    assert_eq!(body["job"]["id"], own.id, "{body}");
+    assert_eq!(body["job"]["requested_by"], "writer-a", "{body}");
+
+    let mut refusals = Vec::new();
+    for (what, id) in [
+        ("another key's job", other.id),
+        ("a job from before the key existed", historical.id),
+        ("an id the store never issued", unknown),
+    ] {
+        let (status, body) = status_by_id(&h, &token, id).await;
+        assert_eq!(status, 404, "{what} (id {id}) reads as not found: {body}");
+        assert_eq!(body["error"]["code"], "not_found", "{what}: {body}");
+        refusals.push(body);
+    }
+    assert!(
+        refusals.windows(2).all(|pair| pair[0] == pair[1]),
+        "the refusal body must not say whether the job exists: {refusals:?}"
+    );
+
+    for id in [own.id, other.id, historical.id] {
+        let (status, body) = status_by_id(&h, &h.server.reader_token, id).await;
+        assert_eq!(status, 200, "a schema_read key reads job {id}: {body}");
+        assert_eq!(body["job"]["id"], id, "{body}");
+    }
 
     match writer.schema_repin_status().await {
         Err(trawl_client::ClientError::Server { status, .. }) => assert_eq!(status, 403),
@@ -3467,6 +3543,7 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
         .await
         .expect("hold the claim");
 
+    let requester = op();
     for _ in 0..16 {
         let request = engine.start_within(
             Duration::from_secs(60),
@@ -3476,7 +3553,7 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
             true,
             false,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&requester),
         );
         assert!(
             tokio::time::timeout(Duration::from_millis(100), request)
@@ -3540,7 +3617,7 @@ async fn requests_dropped_before_their_claim_leave_one_claim_in_flight() {
             true,
             false,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("the slot is free again")
@@ -3581,7 +3658,7 @@ async fn a_scan_panic_reaches_the_request_as_a_panic() {
                 dry_run,
                 false,
                 RequestedCeilings::default(),
-                Some("op"),
+                Some(&op()),
             )
             .await
             .expect_err("a panicked scan fails the request");
@@ -3727,7 +3804,7 @@ async fn a_crash_between_a_cancel_request_and_its_effect_recovers_as_failed() {
         force: false,
         max_nulled_rows: None,
         max_ambiguous_rows: None,
-        requested_by: Some("op"),
+        requester: Some(&op()),
     };
     let job_id = store.claim(claim).await.expect("claim");
     let requested = store
@@ -3939,7 +4016,7 @@ async fn cancel_audit_events_name_the_actor_the_stage_and_the_refusal() {
             force: true,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
-            requested_by: Some("op"),
+            requester: Some(&op()),
         })
         .await
         .expect("claim");
@@ -4350,7 +4427,7 @@ async fn a_forced_repin_proceeds_at_exactly_the_ceiling_it_accepted() {
                 max_nulled: Some(1),
                 max_ambiguous: None,
             },
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced start")
@@ -4398,7 +4475,7 @@ async fn a_ceiling_below_the_corpus_refuses_naming_accepted_and_actual() {
                 max_nulled: Some(1),
                 max_ambiguous: None,
             },
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("a refusal is an outcome, not an error")
@@ -4442,7 +4519,7 @@ async fn an_explicit_zero_ceiling_refuses_before_anything_is_staged() {
                 max_nulled: Some(0),
                 max_ambiguous: Some(0),
             },
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("a refusal is an outcome, not an error")
@@ -4481,7 +4558,7 @@ async fn boolean_force_resolves_the_ceiling_from_the_scan() {
             true,
             true,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced dry run")
@@ -4513,7 +4590,7 @@ async fn boolean_force_resolves_the_ceiling_from_the_scan() {
             false,
             true,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced execute")
@@ -4565,7 +4642,7 @@ async fn mid_build_growth_past_the_default_ceiling_refuses_the_cutover() {
             false,
             true,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced execute")
@@ -4654,7 +4731,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
                 max_nulled: Some(0),
                 max_ambiguous: None,
             },
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("refusal")
@@ -4672,7 +4749,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
             false,
             true,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("forced execute")
@@ -4695,7 +4772,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
             false,
             false,
             RequestedCeilings::default(),
-            Some("op"),
+            Some(&op()),
         )
         .await
         .expect("unforced execute")
@@ -4786,7 +4863,7 @@ async fn the_repin_audit_records_forced_cutovers_and_recovered_ack_clears() {
             dialect: None,
             dry_run: false,
             force: false,
-            requested_by: None,
+            requester: None,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
         })

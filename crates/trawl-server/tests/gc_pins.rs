@@ -741,7 +741,7 @@ async fn a_repin_in_flight_refuses_gc_four_ways() {
             force: false,
             max_nulled_rows: None,
             max_ambiguous_rows: None,
-            requested_by: Some("test"),
+            requester: Some(&trawl_server::store::Requester::new(1, "test")),
         })
         .await
         .expect("claim a repin job");

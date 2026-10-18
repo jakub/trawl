@@ -365,10 +365,11 @@ struct RequestTerms {
     force: bool,
     /// The ceilings the request stated, each dimension separately.
     ceilings: RequestedCeilings,
-    /// The requesting key's display name, as the claim recorded it. This is
-    /// the only actor identity that reaches the engine: the handler passes
-    /// `verified.name` and no key prefix, so the audit event names what the
-    /// job row names.
+    /// The requesting key's display name, as the claim recorded it. The
+    /// handler passes the whole [`crate::store::Requester`]; its key id is
+    /// written to the job row for the status read's owner check, and only
+    /// the name travels on from the claim, so the audit event names what
+    /// the job row names.
     requested_by: Option<String>,
 }
 
@@ -466,19 +467,10 @@ impl RepinEngine {
         dry_run: bool,
         force: bool,
         requested: RequestedCeilings,
-        requested_by: Option<&str>,
+        caller: Option<&crate::store::Requester>,
     ) -> Result<StartOutcome, ServerError> {
-        self.run_request(
-            field,
-            to,
-            dialect,
-            dry_run,
-            force,
-            requested,
-            requested_by,
-            None,
-        )
-        .await
+        self.run_request(field, to, dialect, dry_run, force, requested, caller, None)
+            .await
     }
 
     /// [`Self::start`], answering within `bound` of this call.
@@ -518,7 +510,7 @@ impl RepinEngine {
         dry_run: bool,
         force: bool,
         requested: RequestedCeilings,
-        requested_by: Option<&str>,
+        caller: Option<&crate::store::Requester>,
     ) -> Result<BoundedStart, ServerError> {
         let deadline = Deadline::after(bound);
         let unclaimed = || ServerError::ServiceUnavailable(UNCLAIMED_AT_BOUND.to_owned());
@@ -536,7 +528,7 @@ impl RepinEngine {
         let field = field.to_owned();
         let to = to.to_owned();
         let dialect = dialect.map(str::to_owned);
-        let requested_by = requested_by.map(str::to_owned);
+        let caller = caller.cloned();
         let mut request = tokio::spawn(async move {
             engine
                 .run_request(
@@ -546,7 +538,7 @@ impl RepinEngine {
                     dry_run,
                     force,
                     requested,
-                    requested_by.as_deref(),
+                    caller.as_ref(),
                     Some(handoff),
                 )
                 .await
@@ -585,7 +577,7 @@ impl RepinEngine {
         dry_run: bool,
         force: bool,
         requested: RequestedCeilings,
-        requested_by: Option<&str>,
+        caller: Option<&crate::store::Requester>,
         handoff: Option<ClaimHandoff>,
     ) -> Result<StartOutcome, ServerError> {
         let field = field.to_ascii_lowercase();
@@ -628,7 +620,7 @@ impl RepinEngine {
                 force,
                 max_nulled_rows,
                 max_ambiguous_rows,
-                requested_by,
+                requester: caller,
             })
             .await?;
         let job_id = claimed.id;
@@ -714,7 +706,7 @@ impl RepinEngine {
         let req = RequestTerms {
             force,
             ceilings: requested,
-            requested_by: requested_by.map(str::to_owned),
+            requested_by: caller.map(|r| r.name.clone()),
         };
         let decided = tokio::spawn(async move {
             engine

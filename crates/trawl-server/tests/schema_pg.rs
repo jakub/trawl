@@ -22,6 +22,8 @@ ALTER TABLE report_runs
     ADD COLUMN origin TEXT,
     ADD CONSTRAINT report_runs_origin
     CHECK (origin IS NULL OR origin IN ('scheduled', 'manual'));
+ALTER TABLE repin_jobs
+    ADD COLUMN requested_by_key_id BIGINT;
 ";
 async fn seed_old(pool: &PgPool) {
     sqlx::query("INSERT INTO saved_queries(key_id,name,query,created_at,updated_at) VALUES (1,'retained query','service=test',now(),now())")

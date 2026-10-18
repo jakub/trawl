@@ -2412,6 +2412,10 @@ pub async fn schema_repin(
         ));
     };
 
+    // Both halves of the caller's identity go on the job row: the display
+    // name an operator reads, and the key's row id, which is what a status
+    // read by id with `schema_write` alone is matched against.
+    let requester = crate::store::Requester::new(verified.id, verified.name.clone());
     let outcome = engine
         .start_within(
             std::time::Duration::from_secs(state.query.timeout_secs),
@@ -2427,7 +2431,7 @@ pub async fn schema_repin(
                 max_nulled: req.max_nulled_rows,
                 max_ambiguous: req.max_ambiguous_rows,
             },
-            Some(&verified.name),
+            Some(&requester),
         )
         .await?;
     let outcome = match outcome {
@@ -2534,11 +2538,15 @@ pub struct RepinStatusParams {
 /// surfaces show state without offering the trigger). A read by id also
 /// accepts `SchemaWrite`, because it is how a trigger caller follows its
 /// own job: the trigger needs `SchemaWrite` alone, and a dry run it started
-/// can answer 202 and leave its report here. Any id answers, not only the
-/// caller's own: a write key can produce the same scan report by starting
-/// a dry run of that field, so the read shows it no corpus data it could
-/// not already reach. An id the store never issued is a 404, and one that
-/// is not an integer a 400.
+/// can answer 202 and leave its report here. Its own job only, though: with
+/// `SchemaWrite` and no `SchemaRead`, the read matches the id against the
+/// key's row id the claim recorded, and any other id answers the 404 an id
+/// the store never issued answers, body and all. The job rows are durable,
+/// carry event values in `unmapped_samples`, and name other operators, so
+/// the write grant alone must not be able to walk them and learn which
+/// exist. With `SchemaRead`, any id answers. The store decides existence
+/// and ownership in one statement (`RepinStore::get_requested_by`), so no
+/// row is read and then checked. An id that is not an integer is a 400.
 pub async fn schema_repin_status(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2559,12 +2567,16 @@ pub async fn schema_repin_status(
             job: job.map(repin_job_to_wire),
         }));
     };
-    let job = state
-        .storage
-        .repin
-        .get(id)
-        .await?
-        .ok_or_else(|| ServerError::NotFound("repin job not found".into()))?;
+    let job = if reads {
+        state.storage.repin.get(id).await?
+    } else {
+        state
+            .storage
+            .repin
+            .get_requested_by(id, verified.id)
+            .await?
+    };
+    let job = job.ok_or_else(|| ServerError::NotFound("repin job not found".into()))?;
     Ok(Json(trawl_api::RepinStatusResponse {
         job: Some(repin_job_to_wire(job)),
     }))

@@ -20,7 +20,8 @@ const SERVER_MANAGE: &str = "server_manage";
 /// The permission the catalog read surfaces are gated on server-side
 /// (`/schema/fields`, `/schema/field`, `/schema/conflicts`,
 /// `/schema/services`, `/schema/repin/status`). A repin job read by its
-/// id (`/schema/repin/status?id=`) accepts it or [`SCHEMA_WRITE`].
+/// id (`/schema/repin/status?id=`) accepts it, or [`SCHEMA_WRITE`] for a
+/// job the same key requested.
 const SCHEMA_READ: &str = "schema_read";
 
 /// The permission `POST /api/v1/schema/repin` is gated on. The server is
