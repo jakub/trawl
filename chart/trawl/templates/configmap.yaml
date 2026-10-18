@@ -31,6 +31,17 @@ data:
          on the volume exactly when data.path is below its mount. */}}
     {{- $mount := include "trawl.dataMountPath" . }}
     {{- $scratch := toString .Values.config.server.queryScratchDir }}
+    {{- /* A crash-dump mount nested at, under, or above scratch wins the
+         longest-mount match, so scratch would fill the small crash-dump PVC
+         that holds the cores instead of the data volume. Compare the
+         effective path trawld resolves: the key, or <data.path>.query-scratch. */}}
+    {{- if .Values.crashDump.enabled }}
+    {{- $effective := ternary (clean $scratch) (printf "%s.query-scratch" (clean (toString .Values.config.data.path))) (ne $scratch "") }}
+    {{- $cores := clean (toString .Values.crashDump.mountPath) }}
+    {{- if or (eq $effective $cores) (hasPrefix (printf "%s/" $cores) $effective) (hasPrefix (printf "%s/" $effective) $cores) }}
+    {{- fail (printf "crashDump.mountPath %q must not be at, under, or above the query scratch directory %q (config.server.queryScratchDir, or <config.data.path>.query-scratch when it is empty): the crash-dump volume would shadow scratch and a spilling query would fill the volume that holds the cores; move one of them" $cores $effective) }}
+    {{- end }}
+    {{- end }}
     {{- if $scratch }}
     {{- if not (hasPrefix (printf "%s/" $mount) (clean $scratch)) }}
     {{- fail (printf "config.server.queryScratchDir must be an absolute path below %s so scratch lands on the data volume; got %q" $mount $scratch) }}

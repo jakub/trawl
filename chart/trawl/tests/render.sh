@@ -216,6 +216,30 @@ if grep -Fq 'TRAWL_CRASH_DUMP_' "$disabled" || grep -Eq '^[[:space:]]*(- )?name:
   exit 1
 fi
 
+# The crash-dump volume must not shadow query scratch (ADR-0056): a mount at,
+# under, or above the effective scratch directory is refused, and a neighbour
+# renders. The default scratch is <data.path>.query-scratch.
+scratch_overlap_stderr="$work_dir/scratch-overlap.err"
+scratch_overlap() {
+  if render_only configmap.yaml --set persistence.enabled=true --set crashDump.enabled=true \
+    "$@" >"$work_dir/scratch-overlap.yaml" 2>"$scratch_overlap_stderr"; then
+    echo "expected crashDump.mountPath overlapping query scratch to fail: $*" >&2
+    exit 1
+  fi
+  for key in config.server.queryScratchDir crashDump.mountPath; do
+    if ! grep -Fq -- "$key" "$scratch_overlap_stderr"; then
+      echo "expected the scratch overlap failure to name ${key}, found: $(cat "$scratch_overlap_stderr")" >&2
+      exit 1
+    fi
+  done
+}
+scratch_overlap --set-string crashDump.mountPath=/var/lib/trawl/data.query-scratch
+scratch_overlap --set-string config.server.queryScratchDir=/var/lib/trawl/cores/scratch
+scratch_overlap --set-string config.server.queryScratchDir=/var/lib/trawl/scratch \
+  --set-string crashDump.mountPath=/var/lib/trawl/scratch/cores
+render_only configmap.yaml --set persistence.enabled=true --set crashDump.enabled=true \
+  --set-string crashDump.mountPath=/var/lib/trawl/data.query-scratch-cores >"$work_dir/scratch-beside.yaml"
+
 # -- ADR-0023 ruling 7, amended: the capability is trawld's alone ------
 
 # The added SYS_PTRACE is the whole grant. containerd hands it to the

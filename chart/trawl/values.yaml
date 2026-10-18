@@ -155,7 +155,10 @@ config:
     # whenever data.path sits below /var/lib/trawl. A value must be an
     # absolute path below /var/lib/trawl, outside the data root, the WAL
     # directory and the repin staging roots. Not the /tmp emptyDir: the
-    # kubelet evicts a pod whose emptyDir passes its sizeLimit.
+    # kubelet evicts a pod whose emptyDir passes its sizeLimit. With
+    # crashDump.enabled the render also refuses a crashDump.mountPath at,
+    # under, or above the effective scratch directory: that mount would put
+    # scratch on the crash-dump volume.
     queryScratchDir: ""
     # Ceiling on the spill one trawld holds in the scratch directory, shared
     # by every query. DuckDB overshoots it on disk by part of a block per

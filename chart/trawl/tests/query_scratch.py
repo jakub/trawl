@@ -193,5 +193,52 @@ class QueryScratch(unittest.TestCase):
                 self.assertIn("config.server.queryScratchDir", result.stderr)
 
 
+    def test_scratch_under_or_at_the_crash_dump_mount_is_refused(self):
+        # The longer nested mount wins in Kubernetes, so scratch would land on
+        # the small crash-dump PVC instead of the data volume.
+        cases = {
+            "default scratch is the mount": (
+                {}, f"{DATA_MOUNT}/data.query-scratch"),
+            "explicit scratch is the mount": (
+                {"queryScratchDir": f"{DATA_MOUNT}/cores"}, f"{DATA_MOUNT}/cores"),
+            "scratch below the mount": (
+                {"queryScratchDir": f"{DATA_MOUNT}/cores/scratch"}, f"{DATA_MOUNT}/cores"),
+            "mount below scratch": (
+                {"queryScratchDir": f"{DATA_MOUNT}/scratch"}, f"{DATA_MOUNT}/scratch/cores"),
+            "unclean spellings": (
+                {"queryScratchDir": f"{DATA_MOUNT}/cores/./scratch/"}, f"{DATA_MOUNT}//cores/"),
+        }
+        for name, (server, mount) in cases.items():
+            with self.subTest(name):
+                result = render({
+                    "config": {"server": server},
+                    "crashDump": {"enabled": True, "mountPath": mount},
+                })
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("config.server.queryScratchDir", result.stderr)
+                self.assertIn("crashDump.mountPath", result.stderr)
+
+    def test_scratch_beside_the_crash_dump_mount_renders_on_the_data_volume(self):
+        cases = {
+            "default layout": ({}, f"{DATA_MOUNT}/cores"),
+            "sibling sharing a name prefix": (
+                {"queryScratchDir": f"{DATA_MOUNT}/cores-scratch"}, f"{DATA_MOUNT}/cores"),
+            "default scratch beside a longer name": ({}, f"{DATA_MOUNT}/data.query-scratch-cores"),
+        }
+        for name, (server, mount) in cases.items():
+            with self.subTest(name):
+                rendered = objects({
+                    "config": {"server": server},
+                    "crashDump": {"enabled": True, "mountPath": mount},
+                })
+                scratch = effective_scratch(server_config(rendered))
+                self.assertEqual(mount_covering(trawld(rendered), scratch)["name"], "data")
+
+    def test_disabled_crash_dumps_leave_the_mount_path_unchecked(self):
+        rendered = objects({"crashDump": {"enabled": False, "mountPath": f"{DATA_MOUNT}/data.query-scratch"}})
+        scratch = effective_scratch(server_config(rendered))
+        self.assertEqual(mount_covering(trawld(rendered), scratch)["name"], "data")
+
+
 if __name__ == "__main__":
     unittest.main()
