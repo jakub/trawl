@@ -11,7 +11,7 @@ pub mod stream;
 use std::path::PathBuf;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request};
+use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::routing::{any, get, post};
 
@@ -50,13 +50,13 @@ pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
     // top-level /login, /logout paths as client-side routes without
     // colliding with POST-only HTTP handlers (which would 405 on GET
     // navigation and break deep-links to the login page). Their bodies
-    // are held to the login limit, innermost, and its refusal gets the
-    // envelope outside it. Their deadline is the router's, below.
+    // are read and held to the login limit by the middleware, which hands
+    // the bytes to the extractor and answers an oversized one with the
+    // envelope. Their deadline is the router's, below.
     let auth_routes = Router::new()
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
-        .layer(DefaultBodyLimit::max(auth::LOGIN_BODY_LIMIT))
         .layer(axum::middleware::from_fn(auth::envelope_login_body_limit));
 
     let router = Router::new()

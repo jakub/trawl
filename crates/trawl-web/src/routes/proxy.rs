@@ -897,10 +897,10 @@ mod tests {
     }
 
     /// A login body streamed with no declared length is held to the limit
-    /// by the body reader: over it, a JSON body is answered 413
-    /// `request_too_large`. A non-JSON type is answered 415 before any of
-    /// the body is read, so nothing is buffered and 415 is the right
-    /// answer: the size was never reached.
+    /// by the middleware's own read: over it, the body is answered 413
+    /// `request_too_large` whatever its content type. A non-JSON type no
+    /// longer hides the size, since the extractor would answer it 415
+    /// before reading any of it.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_chunked_body_over_limit_is_refused() {
         let upstream = HandUpstream::start().await;
@@ -917,22 +917,213 @@ mod tests {
                 .unwrap()
         };
 
-        let json = app
-            .clone()
-            .oneshot(chunked("application/json"))
+        for content_type in ["application/json", "text/plain"] {
+            let resp = app.clone().oneshot(chunked(content_type)).await.unwrap();
+            assert_envelope_refusal(
+                resp,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                trawl_api::ErrorCode::RequestTooLarge,
+                "request body exceeds the login body limit (16384 bytes)",
+            )
+            .await;
+        }
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+    }
+
+    /// Serve `app` through the production listener on a loopback port, so
+    /// a request reaches it through hyper's HTTP/1.1 parser as a real
+    /// client's does: `Router::oneshot` skips the framing rules that
+    /// decide which headers the router sees.
+    async fn serve_on_loopback(
+        app: Router,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .unwrap();
-        assert_envelope_refusal(
-            json,
-            StatusCode::PAYLOAD_TOO_LARGE,
-            trawl_api::ErrorCode::RequestTooLarge,
-            "request body exceeds the login body limit (16384 bytes)",
+            .expect("bind a loopback port");
+        let addr = listener.local_addr().expect("the bound address");
+        let (shutdown, stop) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(crate::listener::serve(
+            listener,
+            app,
+            crate::listener::ConnectionTimeouts::DEFAULT,
+            async {
+                let _ = stop.await;
+            },
+        ));
+        (addr, shutdown, task)
+    }
+
+    /// One HTTP/1.1 login POST written to `addr` as `head_lines` (each
+    /// without its CRLF) and the chunked `chunks`, then read to the
+    /// close: the status code and the body of the answer.
+    async fn raw_chunked_login(
+        addr: std::net::SocketAddr,
+        head_lines: &[&str],
+        chunks: &[&[u8]],
+    ) -> (u16, String) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut request = format!(
+            "POST /api/auth/login HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\
+             origin: {TEST_ORIGIN}\r\n"
+        );
+        for line in head_lines {
+            request.push_str(line);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        let mut bytes = request.into_bytes();
+        for chunk in chunks {
+            bytes.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            bytes.extend_from_slice(chunk);
+            bytes.extend_from_slice(b"\r\n");
+        }
+        bytes.extend_from_slice(b"0\r\n\r\n");
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(&bytes).await.expect("write the request");
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+            .await
+            .expect("the answer before the timeout")
+            .expect("read the answer");
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+        let (head, body) = raw.split_once("\r\n\r\n").expect("a complete head");
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status in {head:?}"));
+        (status, body.to_owned())
+    }
+
+    /// A chunked login body over 16 KiB is answered 413 `request_too_large`
+    /// through the production listener, whatever its content type, and
+    /// trawld is never contacted: with no `Content-Length` to read, the
+    /// size is only known by reading the body, and a `text/plain` one
+    /// used to be answered 415 before any of it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_login_chunked_plain_text_over_limit_is_413_on_the_wire() {
+        let upstream = HandUpstream::start().await;
+        let (addr, _shutdown, task) = serve_on_loopback(counted_app(&upstream, 4)).await;
+
+        let chunk = vec![b'x'; 1024];
+        let chunks: Vec<&[u8]> = (0..17).map(|_| chunk.as_slice()).collect();
+        for content_type in ["text/plain", "application/json"] {
+            let (status, body) = raw_chunked_login(
+                addr,
+                &[
+                    &format!("content-type: {content_type}"),
+                    "transfer-encoding: chunked",
+                ],
+                &chunks,
+            )
+            .await;
+            assert_eq!(status, 413, "{content_type}: {body}");
+            assert!(body.contains("request_too_large"), "{content_type}: {body}");
+            assert!(
+                body.contains("the login body limit (16384 bytes)"),
+                "{content_type}: {body}"
+            );
+        }
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+        task.abort();
+    }
+
+    /// A login that carries both `Transfer-Encoding: chunked` and a
+    /// `Content-Length` over 16 KiB is answered 413 in either header
+    /// order. hyper gives the chunked framing precedence and hands the
+    /// router no `Content-Length`, so the declared length cannot be what
+    /// refuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_login_chunked_with_content_length_over_limit_is_413_in_either_order() {
+        let upstream = HandUpstream::start().await;
+        let (addr, _shutdown, task) = serve_on_loopback(counted_app(&upstream, 4)).await;
+
+        let chunk = vec![b'x'; 1024];
+        let chunks: Vec<&[u8]> = (0..17).map(|_| chunk.as_slice()).collect();
+        let orders: [[&str; 3]; 2] = [
+            [
+                "content-type: text/plain",
+                "transfer-encoding: chunked",
+                "content-length: 16385",
+            ],
+            [
+                "content-type: text/plain",
+                "content-length: 16385",
+                "transfer-encoding: chunked",
+            ],
+        ];
+        for head in orders {
+            let (status, body) = raw_chunked_login(addr, &head, &chunks).await;
+            assert_eq!(status, 413, "{head:?}: {body}");
+            assert!(body.contains("request_too_large"), "{head:?}: {body}");
+        }
+        assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+        task.abort();
+    }
+
+    /// A chunked JSON login within the limit still reaches trawld and
+    /// mints the cookie, through the production listener.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_login_chunked_json_within_limit_succeeds_on_the_wire() {
+        let upstream = HandUpstream::start().await;
+        let (addr, _shutdown, task) = serve_on_loopback(counted_app(&upstream, 4)).await;
+
+        let (status, body) = raw_chunked_login(
+            addr,
+            &[
+                "content-type: application/json",
+                "transfer-encoding: chunked",
+            ],
+            &[br#"{"api_key":"#, br#""flt_direct"}"#],
         )
         .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(upstream.seen(), ["GET /api/v1/whoami"]);
+        task.abort();
+    }
 
-        let plain = app.oneshot(chunked("text/plain")).await.unwrap();
-        assert_eq!(plain.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    /// A login whose body stalls after its head is still answered 408
+    /// `timeout` at the body deadline through the production listener,
+    /// although the login middleware now reads the body itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_login_stalled_body_is_408_on_the_wire() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let upstream = HandUpstream::start().await;
+        let app = limited_app(&upstream, 4, |cfg| {
+            cfg.limits.body_read_timeout = Duration::from_millis(300);
+        });
+        let (addr, _shutdown, task) = serve_on_loopback(app).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let head = format!(
+            "POST /api/auth/login HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\
+             origin: {TEST_ORIGIN}\r\ncontent-type: text/plain\r\n\
+             transfer-encoding: chunked\r\n\r\n5\r\nhello\r\n"
+        );
+        stream.write_all(head.as_bytes()).await.expect("write");
+        let started = std::time::Instant::now();
+        let mut raw = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+            .await
+            .expect("the deadline answered the stalled login")
+            .expect("read the answer");
+        let raw = String::from_utf8_lossy(&raw);
+        assert!(raw.starts_with("HTTP/1.1 408"), "{raw}");
+        assert!(raw.contains("\"timeout\""), "{raw}");
+        assert!(
+            started.elapsed() >= Duration::from_millis(240),
+            "answered before the deadline: {:?}",
+            started.elapsed()
+        );
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
+        task.abort();
     }
 
     /// A well-formed JSON login still reaches trawld and mints the cookie.

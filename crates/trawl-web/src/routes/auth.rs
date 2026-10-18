@@ -28,22 +28,25 @@
 //! cross-site request would sign the user out of every fleet app.
 
 use axum::Json;
+use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use fleet_auth::{SessionExpiry, SessionPayload, session};
+use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::ProxyError;
+use crate::middleware::body_deadline::BodyDeadlineElapsed;
 use crate::middleware::session_extractor::Session;
 use crate::state::AppState;
 
 /// The most a body under `/api/auth/*` may hold. An API key is about 50
 /// bytes; without this bound an unauthenticated caller could make the
 /// proxy buffer axum's default 2 MiB per login (ADR-0054, amended
-/// 2026-10-17).
+/// 2026-10-17). [`envelope_login_body_limit`] enforces it.
 pub const LOGIN_BODY_LIMIT: usize = 16 * 1024;
 
 /// The name the login limit's 413 carries, where trawld's names a setting.
@@ -52,39 +55,64 @@ pub const LOGIN_BODY_LIMIT_NAME: &str = "the login body limit";
 /// Hold a login body to [`LOGIN_BODY_LIMIT`], answering every refusal with
 /// the error envelope.
 ///
-/// A declared `Content-Length` over the limit is refused here, before the
-/// request reaches the `Json` extractor, whatever its content type: the
-/// extractor checks the type first and would answer a non-JSON one 415
-/// without consulting the limit. A body with no declared length is held by
-/// `DefaultBodyLimit` as the extractor reads it; its plain-text 413 is
-/// turned into 413 `request_too_large` with the limit's name and value, the
-/// shape trawld's own 413 has, and a 413 that is already JSON is a
-/// handler's own and passes untouched. A streamed body of a non-JSON type
-/// is answered 415 before any of it is read, so none of it is buffered.
+/// The body is read here, up to one byte past the limit, and the bytes
+/// are handed on to the `Json` extractor, so the limit holds whatever the
+/// request's framing or content type. A declared `Content-Length` over
+/// the limit is refused before any of it is read. Nothing else can be
+/// trusted to declare the size: hyper gives `Transfer-Encoding: chunked`
+/// precedence over `Content-Length` and removes the latter from the
+/// headers the router sees, and the extractor answers a non-JSON type 415
+/// without reading the body. A body that crosses the limit as it arrives
+/// is refused 413 `request_too_large` naming the limit and its value, the
+/// shape trawld's own 413 has; nothing reaches the extractor, and trawld
+/// is never asked. The memory a login can hold is the limit, and the
+/// proxy's request count bounds how many are at once.
+///
+/// The read is under the router's body deadline
+/// (`middleware::body_deadline`), the outer layer: a body that stalls
+/// fails its read, and the deadline layer answers the request 408
+/// `timeout` whatever this function returns for it.
 pub async fn envelope_login_body_limit(request: Request, next: Next) -> Response {
+    let too_large = || {
+        ProxyError::RequestTooLarge {
+            setting: LOGIN_BODY_LIMIT_NAME,
+            limit: LOGIN_BODY_LIMIT,
+        }
+        .into_response()
+    };
     let declared_too_large = request
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
         .is_some_and(|len| len > LOGIN_BODY_LIMIT as u64);
-    if !declared_too_large {
-        let response = next.run(request).await;
-        if response.status() != StatusCode::PAYLOAD_TOO_LARGE
-            || response
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.starts_with("application/json"))
-        {
-            return response;
+    if declared_too_large {
+        return too_large();
+    }
+
+    let (parts, body) = request.into_parts();
+    let mut stream = body.into_data_stream();
+    let mut buffer: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(e) => {
+                let e = e.into_inner();
+                return if e.is::<BodyDeadlineElapsed>() {
+                    ProxyError::BodyTimeout
+                } else {
+                    ProxyError::BadRequest(format!("request body: {e}"))
+                }
+                .into_response();
+            }
+        };
+        if buffer.len().saturating_add(chunk.len()) > LOGIN_BODY_LIMIT {
+            return too_large();
         }
+        buffer.extend_from_slice(&chunk);
     }
-    ProxyError::RequestTooLarge {
-        setting: LOGIN_BODY_LIMIT_NAME,
-        limit: LOGIN_BODY_LIMIT,
-    }
-    .into_response()
+    next.run(Request::from_parts(parts, Body::from(buffer)))
+        .await
 }
 
 /// Request body for `POST /api/auth/login`.
