@@ -110,9 +110,11 @@ pub enum RepinStart {
     /// untouched and the pin unchanged, so this is never a report.
     Cancelled(trawl_api::RepinJobResponse),
     /// 202: the job is claimed; follow it with `schema_repin_job`. Usually
-    /// the rewrite, but a scan that outlasts the server's `[server]
-    /// timeout_secs` answers 202 too, dry runs included, and the plan or
-    /// refusal is then read by the job's id. The row is normally
+    /// the rewrite, but a job whose decision is still pending at the
+    /// server's `[server] timeout_secs` answers 202 too, dry runs included
+    /// (usually the scan, but the corpus-gate wait, the plan write and the
+    /// pre-flight can also outlast it), and the plan or refusal is then read
+    /// by the job's id. The row is normally
     /// `running`, but a job that finished as the answer was built can be
     /// terminal already, and is then its own verdict.
     Started(trawl_api::RepinJobResponse),
@@ -722,7 +724,8 @@ impl HttpClient {
     /// The HTTP status carries the verdict, so this returns a three-way
     /// outcome instead of flattening 409-with-plan into an opaque error:
     /// 200 = dry-run report or a cancelled job, 202 = the job is running
-    /// (the rewrite, or a scan that outlasted the server's answer bound),
+    /// (the rewrite, or a decision still pending at the server's answer
+    /// bound),
     /// 409 with a job body = lossy without force (the plan rides back). The 200
     /// pair is told apart by the row's own status, never by the code alone
     /// (see [`decode_repin_start`]). Every other failure —

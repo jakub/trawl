@@ -121,9 +121,9 @@ envelope field.
    ```
 
    The output is `repin duration: dry run`, the job row, and its case file.
-   A scan that runs longer than the server's `[server] timeout_secs` answers
-   before it finishes, and the CLI then follows the job by its id until its
-   report is ready. Read `rows_carrying`, `projected_nulls`, `ambiguous_numerals`, up to five
+   A repin whose decision is still pending at the server's `[server] timeout_secs`
+   answers before it is made, usually because the scan is still running, and
+   the CLI then follows the job by its id until its report is ready. Read `rows_carrying`, `projected_nulls`, `ambiguous_numerals`, up to five
    `unmapped_samples`, and `requires_force`. `requires_force: true` means the
    same request without `--force` is refused.
 
