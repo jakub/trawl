@@ -3091,8 +3091,10 @@ pub(crate) fn structured_errors(conn: &duckdb::Connection) -> Result<(), String>
 /// and leaves its inputs alone. What happens next belongs to the operation:
 /// compaction and rollup retry on the compaction task's next pass, boot
 /// conformance leaves the file incomplete until the next boot, and a repin
-/// ends `failed` and abandons its shadow generation, so an operator submits
-/// a new job.
+/// statement with no fallback ends the job `failed` and abandons its shadow
+/// generation, so an operator submits a new job. Optional sampling falls
+/// back instead (conform's misfit samples, and the repin scan's sampled
+/// count in `repin::rewrite`), and the statement is still counted.
 ///
 /// The text is `DuckDB`'s own wording behind the caller's context, as the
 /// connection would word it without `errors_as_json`. Every other failure,

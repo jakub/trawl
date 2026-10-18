@@ -175,7 +175,8 @@ pub const COMPACTION_OPERATION_FAILURES_TOTAL: &str = "trawl_compaction_operatio
 /// ([`crate::ingest::compaction::StatementFailure`]). The inputs stay where
 /// they are; whether the operation is retried is its own outcome (compaction
 /// and rollup on the next pass, boot conformance on the next boot, never a
-/// failed repin job).
+/// failed repin job). Optional sampling falls back and its pass completes,
+/// but the statement is still counted.
 pub const MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL: &str = "trawl_maintenance_resource_exhausted_total";
 pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
 /// Publication markers recovery looked at, by `outcome`
@@ -614,7 +615,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL,
-        "Compaction, rollup, conform and repin statements that ran out of ingest.compaction_memory_limit; the inputs are kept, and whether the operation is retried depends on it (compaction and rollup retry on the next pass, boot conformance on the next boot, a failed repin job is not retried)"
+        "Compaction, rollup, conform and repin statements that ran out of ingest.compaction_memory_limit; the inputs are kept, and whether the operation is retried depends on it (compaction and rollup retry on the next pass, boot conformance on the next boot, a failed repin job is not retried); optional sampling falls back and its pass completes, but the statement is still counted"
     );
     describe_counter!(
         PUBLICATION_RECOVERY_TOTAL,
