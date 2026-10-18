@@ -1,0 +1,1114 @@
+
+## [2026-10-18T08:20:58.350Z] mixed run setup: image trawl-i304:after-7dc64b27f566, chart $D/build/src-after/chart/trawl, namespace i304-mixed
+[2026-10-18T08:20:58.356Z] $ kind version
+kind v0.33.0 go1.27.0-X:nodwarf5 linux/amd64
+[2026-10-18T08:20:58.362Z] $ helm version --short
+v4.2.2+gb05881c
+[2026-10-18T08:20:58.456Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 version
+Client Version: v1.36.4
+Kustomize Version: v5.8.1
+Server Version: v1.37.0
+[2026-10-18T08:20:58.567Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 get nodes -o wide
+NAME                       STATUS   ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                       KERNEL-VERSION            CONTAINER-RUNTIME
+trawl-i304-control-plane   Ready    control-plane   28h   v1.37.0   172.20.0.2    <none>        Debian GNU/Linux 13 (trixie)   7.2.5-3-omarchy (amd64)   containerd://2.3.4
+[2026-10-18T08:20:58.671Z] $ docker image inspect --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}' 'trawl-i304:after-7dc64b27f566'
+sha256:9dd5d5dd8c26e6a674adeb8f8621a96323784d6202ad03c32c258d90976ec067 7dc64b27f566bc3c1052865d4261eb6e1ee3997d
+[2026-10-18T08:20:58.742Z] workload: PRELOAD_RATE=10000 PRELOAD_SECS=80 INGEST_RATE=500 SEARCH_CLIENTS=6 SEARCH_MIN_SECS=1
+[2026-10-18T08:20:58.743Z] SEARCH: service=i304 last=5m | stats count() by host
+[2026-10-18T08:20:58.745Z] SEARCH: service=i304 last=1h | top 10 host
+[2026-10-18T08:20:58.746Z] SEARCH: service=i304 host=gen-3 last=15m | head 100
+[2026-10-18T08:20:58.748Z] SEARCH: service=i304 last=1h | timechart span=1m count()
+[2026-10-18T08:20:58.749Z] SEARCH: service=i304 status>=500 last=30m | stats count() by status
+[2026-10-18T08:20:58.751Z] SEARCH: service=i304 | stats count()
+[2026-10-18T08:20:58.752Z] SEARCH: service=i304 last=1d "QQ" | stats count() by host
+[2026-10-18T08:20:58.753Z] SEARCH: service=i304 last=10m | stats count(), dc(host) by status
+[2026-10-18T08:20:58.755Z] TAIL_QUERY: service=i304 | stats count() by status
+[2026-10-18T08:20:58.756Z] $ docker exec trawl-i304-control-plane grep -E \^\(volumeStatsAggPeriod\|evictionHard\|\ \ nodefs\|\ \ imagefs\) /var/lib/kubelet/config.yaml
+evictionHard:
+  imagefs.available: 0%
+  nodefs.available: 0%
+  nodefs.inodesFree: 0%
+volumeStatsAggPeriod: 2s
+
+## [2026-10-18T08:20:58.797Z] namespace and disposable PostgreSQL
+[2026-10-18T08:20:58.890Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 delete namespace i304-mixed --wait=true --timeout=180s
+namespace "i304-mixed" deleted
+[2026-10-18T08:21:14.584Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 create namespace i304-mixed
+namespace/i304-mixed created
+[2026-10-18T08:21:14.677Z] $ kubectl create secret generic pg-init|fleet-db|trawl-db --from-file=... (values from $PRIV, not printed)
+secret/pg-init created
+secret/fleet-db created
+secret/trawl-db created
+[2026-10-18T08:21:14.925Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-mixed apply -f $D/postgres.yaml
+deployment.apps/postgres created
+service/postgres created
+[2026-10-18T08:21:15.198Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-mixed rollout status deployment/postgres --timeout=180s
+Waiting for deployment "postgres" rollout to finish: 0 of 1 updated replicas are available...
+deployment "postgres" successfully rolled out
+
+## [2026-10-18T08:21:27.113Z] helm install at the chart defaults (values-mixed.yaml: image pull policy, DB secrets, no web sidecar)
+[2026-10-18T08:21:27.116Z] $ helm --kubeconfig $D/kubeconfig --kube-context kind-trawl-i304 -n i304-mixed install trawl $D/build/src-after/chart/trawl -f $D/values-mixed.yaml --set-string image.repository=trawl-i304 --set-string image.tag=after-7dc64b27f566
+NAME: trawl
+LAST DEPLOYED: Sun Oct 18 01:21:27 2026
+NAMESPACE: i304-mixed
+STATUS: deployed
+REVISION: 1
+DESCRIPTION: Install complete
+NOTES:
+Trawl has been installed.
+
+Create roles and API keys against the Fleet database:
+  https://trawl.sh/operate/access/#create-roles-and-keys
+Run the guide's fleet-admin commands inside the trawld container, for example:
+
+  kubectl exec --namespace i304-mixed -i trawl-0 -c trawld -- fleet-admin roles list
+
+Use a personal API key to sign in to the browser and a service key for each collector.
+The init-auth container initializes the database schema; it does not create API keys.
+
+The daemon generates a self-signed certificate. For trusted remote API access, choose tls.mode=secret or certManager:
+  https://trawl.sh/operate/deployment/#configure-the-daemon-api-certificate
+
+Check the HTTPS API through a local port-forward:
+
+  kubectl port-forward --namespace i304-mixed svc/trawl 5514:5514
+
+Keep the port-forward running. In another terminal on this machine:
+
+  curl --fail-with-body --insecure https://localhost:5514/api/v1/health
+
+Expect status "ok" and every entry in "checks" to be "ok". HTTP 200 alone can
+report degraded dependencies. --insecure is only for this local check.
+[2026-10-18T08:21:27.771Z] $ grep -E '^\[|max_concurrent|query_|compaction_memory|min_free|_rpm|hot_buffer_max|timeout_secs' '$D/private/mixed/work/trawld.toml'
+[server]
+timeout_secs = 30
+max_concurrent_requests = 32
+max_query_history = 1000
+query_spill_max_bytes = "4GiB"
+query_memory_limit = "2GiB"
+query_threads = 4
+[server.rate_limit]
+default_rpm = 100
+ingest_rpm = 1000
+[data]
+[auth]
+[ingest]
+compaction_memory_limit = "1GiB"
+hot_buffer_max_events = 100000
+hot_buffer_max_bytes = "100M"
+[retention]
+min_free_disk_bytes = "6GiB"
+[syslog]
+[scheduler]
+[2026-10-18T08:21:27.778Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-mixed get statefulset trawl -o json | jq -c '.spec.template.spec | {terminationGracePeriodSeconds, trawld_resources: (.containers[] | select(.name=="trawld") | .resources), tmp: (.volumes[] | select(.name=="tmp")), probes: (.containers[] | select(.name=="trawld") | {startup: .startupProbe | {periodSeconds, failureThreshold}, readiness: .readinessProbe | {periodSeconds, failureThreshold, timeoutSeconds}, liveness: .livenessProbe | {periodSeconds, failureThreshold}}), log: (.containers[] | select(.name=="trawld") | .env[] | select(.name=="RUST_LOG") | .value)}'
+{"terminationGracePeriodSeconds":60,"trawld_resources":{"limits":{"memory":"8Gi"},"requests":{"cpu":"250m","memory":"1Gi"}},"tmp":{"emptyDir":{"sizeLimit":"512Mi"},"name":"tmp"},"probes":{"startup":{"periodSeconds":5,"failureThreshold":60},"readiness":{"periodSeconds":10,"failureThreshold":3,"timeoutSeconds":5},"liveness":{"periodSeconds":30,"failureThreshold":3}},"log":"trawl_server=info,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info"}
+[2026-10-18T08:21:28.077Z] pod trawl-0 uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Pending reason= ready= restarts=
+[2026-10-18T08:21:31.213Z] pod trawl-0 uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Pending reason= ready= restarts=
+[2026-10-18T08:21:34.326Z] pod trawl-0 uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Running reason= ready=False restarts=0
+[2026-10-18T08:21:37.468Z] pod trawl-0 uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Running reason= ready=False restarts=0
+[2026-10-18T08:21:40.597Z] pod trawl-0 uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Running reason= ready=True restarts=0
+[2026-10-18T08:21:40.605Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-mixed get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE   IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-mf85b   1/1     Running   0          25s   10.244.0.79   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          13s   10.244.0.81   trawl-i304-control-plane   <none>           <none>
+
+## [2026-10-18T08:21:40.732Z] NodePort Service to trawld (publishes NotReady addresses)
+service/trawl-mixed-nodeport created
+[2026-10-18T08:21:41.266Z] trawld at 172.20.0.2:32489 (TLS name localhost)
+
+## [2026-10-18T08:21:41.271Z] roles, keys and trawld's certificate
+[2026-10-18T08:21:41.274Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-mixed exec trawl-0 -c trawld -- sh -c DATABASE_URL=\"\$FLEET_DATABASE_URL\"\ exec\ fleet-admin\ roles\ create\ --name\ mixed-ingest\ --perm\ trawl:ingest
+created role:
+
+  name:      mixed-ingest
+  rate_rpm:  (class default)
+  perms:     trawl:ingest
+[2026-10-18T08:21:41.523Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-mixed exec trawl-0 -c trawld -- sh -c DATABASE_URL=\"\$FLEET_DATABASE_URL\"\ exec\ fleet-admin\ roles\ create\ --name\ mixed-search\ --perm\ trawl:query\ --perm\ trawl:stream
+created role:
+
+  name:      mixed-search
+  rate_rpm:  (class default)
+  perms:     trawl:query, trawl:stream
+[2026-10-18T08:21:41.806Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-mixed exec trawl-0 -c trawld -- sh -c DATABASE_URL=\"\$FLEET_DATABASE_URL\"\ exec\ fleet-admin\ roles\ create\ --name\ mixed-ops\ --perm\ trawl:query\ --perm\ trawl:schema_read\ --perm\ trawl:schema_write\ --perm\ trawl:server_manage
+created role:
+
+  name:      mixed-ops
+  rate_rpm:  (class default)
+  perms:     trawl:query, trawl:schema_read, trawl:schema_write, trawl:server_manage
+[2026-10-18T08:21:42.085Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name ingest --kind human --role mixed-ingest > $PRIV/ingest.token
+created API key:
+
+  name:    ingest
+  kind:    human
+  roles:   mixed-ingest
+  prefix:  V7y2wIO_
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:42.494Z] key ingest: token bytes 48
+[2026-10-18T08:21:42.497Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name ops --kind human --role mixed-ops > $PRIV/ops.token
+created API key:
+
+  name:    ops
+  kind:    human
+  roles:   mixed-ops
+  prefix:  lBQJtdBj
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:42.889Z] key ops: token bytes 48
+[2026-10-18T08:21:42.893Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name tail --kind human --role mixed-search > $PRIV/tail.token
+created API key:
+
+  name:    tail
+  kind:    human
+  roles:   mixed-search
+  prefix:  SZf4MwLJ
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:43.284Z] key tail: token bytes 48
+[2026-10-18T08:21:43.290Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name s1 --kind human --role mixed-search > $PRIV/s1.token
+created API key:
+
+  name:    s1
+  kind:    human
+  roles:   mixed-search
+  prefix:  i_Sz5lXn
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:43.685Z] key s1: token bytes 48
+[2026-10-18T08:21:43.690Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name s2 --kind human --role mixed-search > $PRIV/s2.token
+created API key:
+
+  name:    s2
+  kind:    human
+  roles:   mixed-search
+  prefix:  epJQmLN7
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:44.063Z] key s2: token bytes 48
+[2026-10-18T08:21:44.066Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name s3 --kind human --role mixed-search > $PRIV/s3.token
+created API key:
+
+  name:    s3
+  kind:    human
+  roles:   mixed-search
+  prefix:  KTasHwPZ
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:44.467Z] key s3: token bytes 48
+[2026-10-18T08:21:44.469Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name s4 --kind human --role mixed-search > $PRIV/s4.token
+created API key:
+
+  name:    s4
+  kind:    human
+  roles:   mixed-search
+  prefix:  s_2_SgSl
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:44.885Z] key s4: token bytes 48
+[2026-10-18T08:21:44.888Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name s5 --kind human --role mixed-search > $PRIV/s5.token
+created API key:
+
+  name:    s5
+  kind:    human
+  roles:   mixed-search
+  prefix:  qCwYjISo
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:45.311Z] key s5: token bytes 48
+[2026-10-18T08:21:45.315Z] $ kubectl exec trawl-0 -c trawld -- fleet-admin keys create --name s6 --kind human --role mixed-search > $PRIV/s6.token
+created API key:
+
+  name:    s6
+  kind:    human
+  roles:   mixed-search
+  prefix:  5Y_WlRhM
+  expires: never
+
+
+WARNING: this token will not be shown again. store it securely.
+[2026-10-18T08:21:45.685Z] key s6: token bytes 48
+[2026-10-18T08:21:45.852Z] $ openssl x509 -in '$D/private/mixed/cert.pem' -noout -subject -ext subjectAltName
+subject=CN=rcgen self signed cert
+X509v3 Subject Alternative Name: 
+    DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1
+[2026-10-18T08:21:45.898Z] GET /api/v1/health -> 200 {"status":"ok","checks":{"duckdb":"ok","ingest_capacity":"ok","data_path":"ok","storage_db":"ok","corpus":"ok","auth_db":"ok"},"version":"0.9.3"}
+[2026-10-18T08:21:46.075Z] whoami (ops) -> {"prefix":"lBQJtdBj","name":"ops","kind":"human","roles":["mixed-ops"],"permissions":["query","schema_read","server_manage","schema_write"]}
+[2026-10-18T08:21:46.747Z] trawld container: pid 1 is trawld, nproc 16, memory.max 8589934592, cpu.max max 100000
+[2026-10-18T08:21:46.764Z] pool and engine metrics: trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 2.6774958509999998 trawl_hot_buffer_events 25 trawl_query_permits_retained 0 trawl_query_permits_in_use 0 trawl_query_pool_size 8 
+
+## [2026-10-18T08:21:46.767Z] preload: service i304 at 10000 events/s for 80s, then 5000 events of service i304-repin carrying the integer field code
+[2026-10-18T08:21:46.770Z] $ python3 -I mixed-ingest.py 172.20.0.2:32489 $PRIV/cert.pem $PRIV/ingest.header 10000 80 304 i304 > $W/preload.log
+[2026-10-18T08:23:06.929Z] $ awk '{print $2}' '$D/private/mixed/work/preload.log' | sort | uniq -c; tail -n 1 '$D/private/mixed/work/preload.log'
+     40 200
+      1 done
+2026-10-18T08:23:06.901Z done sent=800000 accepted=800000 secs=80
+[2026-10-18T08:23:06.956Z] $ python3 -I mixed-ingest.py 172.20.0.2:32489 $PRIV/cert.pem $PRIV/ingest.header 2500 2 305 i304-repin code > $W/preload-repin.log
+[2026-10-18T08:23:09.112Z] $ cat '$D/private/mixed/work/preload-repin.log'
+2026-10-18T08:23:07.186Z 200 5000 62ms
+2026-10-18T08:23:09.093Z done sent=5000 accepted=5000 secs=2
+[2026-10-18T08:23:09.121Z] waiting for the hot buffer to drain into Parquet
+[2026-10-18T08:23:29.377Z] trawl_hot_buffer_events=3
+[2026-10-18T08:23:29.448Z] service=i304 | stats count() -> 200 0.036731 [[800000]]
+[2026-10-18T08:23:29.512Z] service=i304-repin | stats count(), min(code), max(code) -> 200 0.039514 [[5000,0,999]]
+[2026-10-18T08:23:29.517Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-mixed exec trawl-0 -c trawld -- sh -c 'du -sh /var/lib/trawl/data /var/lib/trawl/data.query-scratch /tmp; ls /var/lib/trawl/data'
+322M	/var/lib/trawl/data
+4.0K	/var/lib/trawl/data.query-scratch
+0	/tmp
+CATALOG
+EPOCH
+prod
+wal
+
+## [2026-10-18T08:23:29.743Z] each search once (client s1)
+[2026-10-18T08:23:30.033Z] search 1 -> 200 0.262129 {"execution":{"started_at":"2026-10-18T08:23:29.999400129Z","duration_ms":24},"columns":[{"name":"host"},{"name":"count"}],"rows":[["gen-0",50000],["gen-3",50000],["gen-5",50000],["gen-8",50000],["gen
+[2026-10-18T08:23:30.093Z] search 2 -> 200 0.042420 {"execution":{"started_at":"2026-10-18T08:23:30.049008803Z","duration_ms":26},"columns":[{"name":"host"},{"name":"count"}],"rows":[["gen-0",50000],["gen-3",50000],["gen-5",50000],["gen-8",50000],["gen
+[2026-10-18T08:23:30.260Z] search 3 -> 200 0.138980 {"execution":{"started_at":"2026-10-18T08:23:30.121613548Z","duration_ms":122},"columns":[{"name":"_time"},{"name":"env"},{"name":"service"},{"name":"host"},{"name":"_severity"},{"name":"message"},{"n
+[2026-10-18T08:23:30.342Z] search 4 -> 200 0.064473 {"execution":{"started_at":"2026-10-18T08:23:30.277109381Z","duration_ms":45},"columns":[{"name":"_time"},{"name":"count"}],"rows":[["2026-10-18 08:21:00",140000],["2026-10-18 08:22:00",600000],["2026
+[2026-10-18T08:23:30.413Z] search 5 -> 200 0.051727 {"execution":{"started_at":"2026-10-18T08:23:30.358506054Z","duration_ms":39},"columns":[{"name":"status"},{"name":"count"}],"rows":[[500,72727],[503,72727]],"pagination":{"limit":100000,"offset":0,"r
+[2026-10-18T08:23:30.483Z] search 6 -> 200 0.052437 {"execution":{"started_at":"2026-10-18T08:23:30.433181547Z","duration_ms":37},"columns":[{"name":"count"}],"rows":[[800000]],"pagination":{"limit":100000,"offset":0,"returned":1,"total":1}}
+[2026-10-18T08:23:31.333Z] search 7 -> 200 0.822398 {"execution":{"started_at":"2026-10-18T08:23:30.509719922Z","duration_ms":806},"columns":[{"name":"host"},{"name":"count"}],"rows":[["gen-2",8606],["gen-4",8598],["gen-7",8625],["gen-11",8631],["gen-9
+[2026-10-18T08:23:31.443Z] search 8 -> 200 0.073787 {"execution":{"started_at":"2026-10-18T08:23:31.368042036Z","duration_ms":57},"columns":[{"name":"status"},{"name":"count"},{"name":"dc_host"}],"rows":[[204,72727,16],[301,72727,16],[500,72727,16],[40
+[2026-10-18T08:23:31.572Z] trawl-0 uid at setup: 6bf364aa-2626-4e53-a801-701a358621d5
+[2026-10-18T08:23:31.816Z] cgroup and scratch: current=1134891008 anon=726855680 file=341553152 peak=2852954112 rss_kib=765472 hwm_kib=1788048 scratch=29860
+
+## [2026-10-18T08:23:31.820Z] setup done
+
+## [2026-10-18T08:23:37.840Z] chunk 1: the mixed workload for 500s (6s since the previous part ended)
+[2026-10-18T08:23:37.925Z] pod trawl-0 uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Running reason= ready=True restarts=0
+[2026-10-18T08:23:38.076Z] cgroup and scratch: current=747728896 anon=334499840 file=341565440 peak=2852954112 rss_kib=382320 hwm_kib=1788048 scratch=29860
+[2026-10-18T08:23:38.084Z] workers started: ingest, live tail, 6 search clients, repin driver; running 500s
+[2026-10-18T08:32:04.434Z] chunk 1 workers finished
+
+## [2026-10-18T08:32:04.470Z] chunk 1: search responses (HTTP status, error code) per search
+[2026-10-18T08:32:04.473Z] $ awk '{print $3, $5, $7}' '$D/private/mixed/work/c1/searches.log' | sort | uniq -c
+    356 search=1 200 -
+    357 search=2 200 -
+    356 search=3 200 -
+    356 search=4 200 -
+    356 search=5 200 -
+    356 search=6 200 -
+    355 search=7 200 -
+    355 search=8 200 -
+[2026-10-18T08:32:04.499Z] $ awk '{print $5, $7}' '$D/private/mixed/work/c1/searches.log' | sort | uniq -c
+   2847 200 -
+[2026-10-18T08:32:04.516Z] $ grep -vE ' -> 200 [0-9.]+ -$' '$D/private/mixed/work/c1/searches.log' | head -n 40 || true
+[2026-10-18T08:32:04.530Z] $ grep -c query_resource_exhausted '$D/private/mixed/work/c1/searches.log' || true
+0
+[2026-10-18T08:32:04.540Z] $ awk '{print $6}' '$D/private/mixed/work/c1/searches.log' | sort -n | awk '{a[NR]=$1} END {print "search seconds: n=" NR, "p50=" a[int(NR*0.5)+1], "p95=" a[int(NR*0.95)+1], "max=" a[NR]}'
+search seconds: n=2847 p50=0.285239 p95=1.314032 max=2.908842
+
+## [2026-10-18T08:32:04.557Z] chunk 1: ingest responses
+[2026-10-18T08:32:04.560Z] $ awk '{print $2, ($3 ~ /^[0-9]+$/ ? "accepted" : $3)}' '$D/private/mixed/work/c1/ingest.log' | sort | uniq -c
+    250 200 accepted
+      1 done sent=250000
+[2026-10-18T08:32:04.578Z] $ grep -vE ' 200 [0-9]+ ' '$D/private/mixed/work/c1/ingest.log' | head -n 20 || true
+2026-10-18T08:31:58.298Z done sent=250000 accepted=250000 secs=500
+
+## [2026-10-18T08:32:04.592Z] chunk 1: live tail
+[2026-10-18T08:32:04.596Z] $ cat '$D/private/mixed/work/c1/tail.status'; cat '$D/private/mixed/work/c1/tail.stderr'; grep -c '^event: snapshot' '$D/private/mixed/work/c1/tail.sse' || true; grep -E '^event: ' '$D/private/mixed/work/c1/tail.sse' | sort | uniq -c; grep '^data: ' '$D/private/mixed/work/c1/tail.sse' | tail -n 1 | cut -c1-400
+200curl: (28) Operation timed out after 500000 milliseconds with 76881 bytes received
+250
+    250 event: snapshot
+data: {"columns":["status","count"],"rows":[{"count":90911,"status":"200"},{"count":22727,"status":"304"},{"count":22727,"status":"201"},{"count":22727,"status":"204"},{"count":22727,"status":"301"},{"count":22727,"status":"500"},{"count":22727,"status":"503"},{"count":22727,"status":"404"}]}
+
+## [2026-10-18T08:32:04.628Z] chunk 1: repins
+[2026-10-18T08:32:04.631Z] $ cat '$D/private/mixed/work/c1/repin.log'
+2026-10-18T08:24:38.217Z POST /api/v1/schema/repin {"field":"seq","to":"VARCHAR","dry_run":true}
+2026-10-18T08:24:38.232Z -> 400 0.007527 {"error":{"code":"bad_request","message":"\"seq\" is not a pinned field, so there is nothing to repin"}}
+2026-10-18T08:26:58.568Z POST /api/v1/schema/repin {"field":"code","to":"VARCHAR"}
+2026-10-18T08:26:58.777Z -> 202 0.185227 {"id":1,"field":"code","from_type":"BIGINT","to_type":"VARCHAR","dry_run":false,"force":false,"status":"running","requested_by":"ops","started_at":"2026-10-18T08:26:58.603599Z","finished_at":null,"error":null,"files_total":1,"rows_carrying":5000,"projected_nulls":0,"resurrectable":0,"affected_bytes":2138952,"files_done":0,"rows_rewritten":0,"rows_nulled":0,"rows_resurrected":0,"ambiguous_numerals":0,"liveness":{"last_seen":"2026-10-18T08:23:28.995490Z","service":"i304-repin"},"requires_force":false}
+2026-10-18T08:27:03.854Z status id=1 -> {"id":1,"field":"code","from_type":"BIGINT","to_type":"VARCHAR","dry_run":false,"force":false,"status":"succeeded","requested_by":"ops","started_at":"2026-10-18T08:26:58.603599Z","finished_at":"2026-10-18T08:26:59.199466Z","error":null,"files_total":1,"rows_carrying":5000,"projected_nulls":0,"resurrectable":0,"affected_bytes":2138952,"files_done":1,"rows_rewritten":5000,"rows_nulled":0,"rows_resurrected":0,"ambiguous_numerals":0,"liveness":{"last_seen":"2026-10-18T08:23:28.995490Z","service":"i304-repin"},"requires_force":false}
+
+## [2026-10-18T08:32:04.641Z] chunk 1: trawld cgroup memory, RSS (KiB) and query scratch bytes every 2 s
+[2026-10-18T08:32:04.645Z] $ cat '$D/private/mixed/work/c1/cgroup.log'
+2026-10-18T08:23:38.078Z current=1090174976 anon=674676736 file=343027712 peak=2852954112 rss_kib=673616 hwm_kib=1788048 scratch=762562
+2026-10-18T08:23:40.400Z current=1348804608 anon=932118528 file=343822336 peak=2852954112 rss_kib=966080 hwm_kib=1788048 scratch=789383
+2026-10-18T08:23:42.706Z current=1473347584 anon=1056120832 file=345358336 peak=2852954112 rss_kib=1087100 hwm_kib=1788048 scratch=1555162
+2026-10-18T08:23:44.877Z current=1640120320 anon=1222545408 file=346894336 peak=2852954112 rss_kib=1245232 hwm_kib=1788048 scratch=2320977
+2026-10-18T08:23:47.132Z current=1166872576 anon=755712000 file=349200384 peak=2852954112 rss_kib=831656 hwm_kib=1788048 scratch=3831320
+2026-10-18T08:23:49.374Z current=969129984 anon=539127808 file=350789632 peak=2852954112 rss_kib=582220 hwm_kib=1788048 scratch=4597173
+2026-10-18T08:23:51.666Z current=3223678976 anon=2309996544 file=841129984 peak=3224338432 rss_kib=2315364 hwm_kib=2322300 scratch=10673751
+2026-10-18T08:23:53.908Z current=1224028160 anon=844836864 file=335908864 peak=3487473664 rss_kib=915348 hwm_kib=2494548 scratch=10749566
+2026-10-18T08:23:56.144Z current=1566142464 anon=1150185472 file=352956416 peak=3487473664 rss_kib=1172048 hwm_kib=2494548 scratch=11301270
+2026-10-18T08:23:58.287Z current=1548709888 anon=1132056576 file=352108544 peak=3487473664 rss_kib=1161240 hwm_kib=2494548 scratch=7656507
+2026-10-18T08:24:00.468Z current=1772523520 anon=1349120000 file=353644544 peak=3487473664 rss_kib=1370420 hwm_kib=2494548 scratch=8422410
+2026-10-18T08:24:02.661Z current=1838477312 anon=1416630272 file=355180544 peak=3487473664 rss_kib=1439148 hwm_kib=2494548 scratch=9190691
+2026-10-18T08:24:04.794Z current=2538278912 anon=1870749696 file=607903744 peak=3487473664 rss_kib=1882628 hwm_kib=2494548 scratch=18562376
+2026-10-18T08:24:07.073Z current=1533030400 anon=767451136 file=700268544 peak=3487473664 rss_kib=805192 hwm_kib=2494548 scratch=10406128
+2026-10-18T08:24:09.331Z current=1467305984 anon=1046941696 file=355930112 peak=3487473664 rss_kib=1081416 hwm_kib=2494548 scratch=6118789
+2026-10-18T08:24:11.613Z current=1543610368 anon=1124139008 file=357494784 peak=3487473664 rss_kib=1154544 hwm_kib=2494548 scratch=6885621
+2026-10-18T08:24:13.863Z current=1699151872 anon=1279438848 file=359030784 peak=3487473664 rss_kib=1305176 hwm_kib=2494548 scratch=7649154
+2026-10-18T08:24:16.105Z current=1823457280 anon=1407954944 file=369733632 peak=3487473664 rss_kib=1440072 hwm_kib=2494548 scratch=16854548
+2026-10-18T08:24:18.393Z current=1856077824 anon=1412128768 file=363003904 peak=3487473664 rss_kib=1443992 hwm_kib=2494548 scratch=9638427
+2026-10-18T08:24:20.604Z current=1290375168 anon=863424512 file=361914368 peak=3487473664 rss_kib=898936 hwm_kib=2494548 scratch=5331997
+2026-10-18T08:24:22.772Z current=1743261696 anon=1314291712 file=358891520 peak=3487473664 rss_kib=1339400 hwm_kib=2494548 scratch=6111734
+2026-10-18T08:24:24.918Z current=1732640768 anon=1307373568 file=360427520 peak=3487473664 rss_kib=1332640 hwm_kib=2494548 scratch=6878576
+2026-10-18T08:24:27.122Z current=1649491968 anon=1222148096 file=361963520 peak=3487473664 rss_kib=1242516 hwm_kib=2494548 scratch=7646849
+2026-10-18T08:24:29.251Z current=1714577408 anon=1281429504 file=371892224 peak=3487473664 rss_kib=1307312 hwm_kib=2494548 scratch=16804129
+2026-10-18T08:24:31.529Z current=2842296320 anon=1828515840 file=951046144 peak=3487473664 rss_kib=1841580 hwm_kib=2494548 scratch=9176383
+2026-10-18T08:24:34.803Z current=743272448 anon=317050880 file=360984576 peak=3487473664 rss_kib=365536 hwm_kib=2494548 scratch=5595658
+2026-10-18T08:24:36.960Z current=1468915712 anon=1038807040 file=368009216 peak=3487473664 rss_kib=1070452 hwm_kib=2494548 scratch=12248415
+2026-10-18T08:24:39.225Z current=1776803840 anon=1341673472 file=370307072 peak=3487473664 rss_kib=1366280 hwm_kib=2494548 scratch=13773179
+2026-10-18T08:24:41.370Z current=1912602624 anon=1488269312 file=364982272 peak=3487473664 rss_kib=1509388 hwm_kib=2494548 scratch=7661785
+2026-10-18T08:24:43.658Z current=1682993152 anon=1248235520 file=366526464 peak=3487473664 rss_kib=1274964 hwm_kib=2494548 scratch=8430068
+2026-10-18T08:24:45.843Z current=1284956160 anon=852299776 file=368222208 peak=3487473664 rss_kib=883940 hwm_kib=2494548 scratch=9195040
+2026-10-18T08:24:48.029Z current=1363836928 anon=589459456 file=712626176 peak=3601551360 rss_kib=633704 hwm_kib=2494548 scratch=9705788
+2026-10-18T08:24:50.322Z current=1621553152 anon=1200234496 file=364142592 peak=3601551360 rss_kib=1228092 hwm_kib=2494548 scratch=5404130
+2026-10-18T08:24:52.512Z current=1495375872 anon=1076641792 file=366428160 peak=3601551360 rss_kib=1103040 hwm_kib=2494548 scratch=6917858
+2026-10-18T08:24:54.648Z current=1507155968 anon=1088557056 file=367964160 peak=3601551360 rss_kib=1119028 hwm_kib=2494548 scratch=7683765
+2026-10-18T08:24:56.791Z current=1625366528 anon=1204064256 file=369500160 peak=3601551360 rss_kib=1232092 hwm_kib=2494548 scratch=8448881
+2026-10-18T08:24:59.053Z current=721235968 anon=281821184 file=371073024 peak=3601551360 rss_kib=331200 hwm_kib=2494548 scratch=9212452
+2026-10-18T08:25:01.264Z current=2018955264 anon=1192919040 file=723705856 peak=3601551360 rss_kib=1137984 hwm_kib=2494548 scratch=12431762
+2026-10-18T08:25:03.523Z current=1442967552 anon=1010466816 file=368459776 peak=3601551360 rss_kib=1042768 hwm_kib=2494548 scratch=9205538
+2026-10-18T08:25:05.825Z current=1626619904 anon=1200484352 file=367861760 peak=3601551360 rss_kib=1228324 hwm_kib=2494548 scratch=6136480
+2026-10-18T08:25:08.021Z current=1659129856 anon=1233383424 file=369422336 peak=3601551360 rss_kib=1260460 hwm_kib=2494548 scratch=6925466
+2026-10-18T08:25:10.175Z current=1810571264 anon=1379176448 file=380071936 peak=3601551360 rss_kib=1407496 hwm_kib=2494548 scratch=20075104
+2026-10-18T08:25:12.447Z current=1845420032 anon=1364025344 file=382390272 peak=3601551360 rss_kib=1349372 hwm_kib=2494548 scratch=17632642
+2026-10-18T08:25:14.816Z current=2644660224 anon=1794621440 file=746930176 peak=3601551360 rss_kib=1794752 hwm_kib=2494548 scratch=28279785
+2026-10-18T08:25:17.181Z current=1195290624 anon=772218880 file=369295360 peak=3601551360 rss_kib=806080 hwm_kib=2494548 scratch=5379991
+2026-10-18T08:25:19.312Z current=1589854208 anon=1167691776 file=370823168 peak=3601551360 rss_kib=1191940 hwm_kib=2494548 scratch=6143538
+2026-10-18T08:25:21.445Z current=1652228096 anon=1230196736 file=372359168 peak=3601551360 rss_kib=1257344 hwm_kib=2494548 scratch=6907091
+2026-10-18T08:25:23.602Z current=1678974976 anon=1255882752 file=373895168 peak=3601551360 rss_kib=1282428 hwm_kib=2494548 scratch=7672996
+2026-10-18T08:25:25.813Z current=1147547648 anon=604241920 file=375742464 peak=3601551360 rss_kib=553076 hwm_kib=2494548 scratch=8443625
+2026-10-18T08:25:28.099Z current=3071246336 anon=2276913152 file=732356608 peak=3601551360 rss_kib=2258196 hwm_kib=2494548 scratch=8948218
+2026-10-18T08:25:30.401Z current=1551499264 anon=1116438528 file=378642432 peak=3601551360 rss_kib=1146256 hwm_kib=2494548 scratch=11446622
+2026-10-18T08:25:32.650Z current=1783107584 anon=1355714560 file=374853632 peak=3601551360 rss_kib=1377116 hwm_kib=2494548 scratch=6885258
+2026-10-18T08:25:34.822Z current=1876094976 anon=1449029632 file=376393728 peak=3601551360 rss_kib=1466780 hwm_kib=2494548 scratch=7652573
+2026-10-18T08:25:36.990Z current=2242727936 anon=1825796096 file=386322432 peak=3601551360 rss_kib=1862048 hwm_kib=2494548 scratch=16810851
+2026-10-18T08:25:39.270Z current=1949696000 anon=1509634048 file=388628480 peak=3601551360 rss_kib=1530228 hwm_kib=2494548 scratch=18345027
+2026-10-18T08:25:41.505Z current=1677889536 anon=827428864 file=748965888 peak=3601551360 rss_kib=797112 hwm_kib=2494548 scratch=19347108
+2026-10-18T08:25:44.363Z current=1770688512 anon=1341165568 file=375533568 peak=3601551360 rss_kib=1365760 hwm_kib=2494548 scratch=5370480
+2026-10-18T08:25:46.617Z current=1790717952 anon=1354280960 file=383942656 peak=3601551360 rss_kib=1378592 hwm_kib=2494548 scratch=13010216
+2026-10-18T08:25:48.893Z current=1570312192 anon=1137102848 file=379355136 peak=3601551360 rss_kib=1159620 hwm_kib=2494548 scratch=7649198
+2026-10-18T08:25:51.064Z current=1625391104 anon=1194164224 file=380887040 peak=3601551360 rss_kib=1222460 hwm_kib=2494548 scratch=8412723
+2026-10-18T08:25:53.281Z current=1284444160 anon=840314880 file=382779392 peak=3601551360 rss_kib=876684 hwm_kib=2494548 scratch=9177669
+2026-10-18T08:25:55.526Z current=3545636864 anon=2253926400 file=1221517312 peak=3719483392 rss_kib=2222832 hwm_kib=2494548 scratch=9687729
+2026-10-18T08:25:57.815Z current=1065787392 anon=632356864 file=372826112 peak=3719483392 rss_kib=673532 hwm_kib=2494548 scratch=5383721
+2026-10-18T08:25:59.963Z current=1616932864 anon=1181048832 file=374398976 peak=3719483392 rss_kib=1209352 hwm_kib=2494548 scratch=6167993
+2026-10-18T08:26:02.235Z current=1590116352 anon=1153720320 file=377393152 peak=3719483392 rss_kib=1182664 hwm_kib=2494548 scratch=7661022
+2026-10-18T08:26:04.409Z current=1638064128 anon=1205932032 file=378920960 peak=3719483392 rss_kib=1233644 hwm_kib=2494548 scratch=8424591
+2026-10-18T08:26:06.685Z current=1084981248 anon=658857984 file=384811008 peak=3719483392 rss_kib=716024 hwm_kib=2494548 scratch=9192840
+2026-10-18T08:26:08.987Z current=2750644224 anon=1964355584 file=751316992 peak=3719483392 rss_kib=1930144 hwm_kib=2502384 scratch=19166334
+2026-10-18T08:26:11.377Z current=1216593920 anon=826908672 file=377507840 peak=3719483392 rss_kib=863500 hwm_kib=2502384 scratch=5648139
+2026-10-18T08:26:13.620Z current=1552605184 anon=1165303808 file=378109952 peak=3719483392 rss_kib=1193980 hwm_kib=2502384 scratch=6137009
+2026-10-18T08:26:15.840Z current=1476280320 anon=1087172608 file=379686912 peak=3719483392 rss_kib=1117760 hwm_kib=2502384 scratch=6925080
+2026-10-18T08:26:18.089Z current=1946349568 anon=1547841536 file=388890624 peak=3719483392 rss_kib=1569456 hwm_kib=2502384 scratch=15357458
+2026-10-18T08:26:20.352Z current=1908793344 anon=1515851776 file=383488000 peak=3719483392 rss_kib=1536308 hwm_kib=2502384 scratch=8460213
+2026-10-18T08:26:22.617Z current=2280353792 anon=1514647552 file=744996864 peak=3719483392 rss_kib=1519472 hwm_kib=2502384 scratch=9945253
+2026-10-18T08:26:25.067Z current=1614770176 anon=850644992 file=754110464 peak=3719483392 rss_kib=886536 hwm_kib=2502384 scratch=20693852
+2026-10-18T08:26:27.394Z current=1229991936 anon=844398592 file=375762944 peak=3719483392 rss_kib=880416 hwm_kib=2502384 scratch=6092499
+2026-10-18T08:26:29.707Z current=1630142464 anon=1209090048 file=377339904 peak=3719483392 rss_kib=1196832 hwm_kib=2502384 scratch=6878069
+2026-10-18T08:26:32.017Z current=1515270144 anon=1126236160 file=378851328 peak=3719483392 rss_kib=1155616 hwm_kib=2502384 scratch=7646408
+2026-10-18T08:26:34.277Z current=2067398656 anon=1666535424 file=390254592 peak=3719483392 rss_kib=1683220 hwm_kib=2502384 scratch=17530594
+2026-10-18T08:26:36.555Z current=1824202752 anon=1430683648 file=383410176 peak=3719483392 rss_kib=1452908 hwm_kib=2502384 scratch=9918913
+2026-10-18T08:26:38.745Z current=3109462016 anon=2115825664 file=971988992 peak=3719483392 rss_kib=2126476 hwm_kib=2502384 scratch=19891644
+2026-10-18T08:26:41.763Z current=1249460224 anon=837193728 file=383266816 peak=3719483392 rss_kib=866452 hwm_kib=2502384 scratch=5637697
+2026-10-18T08:26:43.953Z current=1752023040 anon=1340432384 file=389963776 peak=3719483392 rss_kib=1364824 hwm_kib=2502384 scratch=12268418
+2026-10-18T08:26:46.247Z current=1761718272 anon=1359306752 file=386080768 peak=3719483392 rss_kib=1383224 hwm_kib=2502384 scratch=6888222
+2026-10-18T08:26:48.427Z current=1459085312 anon=1051254784 file=388370432 peak=3719483392 rss_kib=1082480 hwm_kib=2502384 scratch=8403037
+2026-10-18T08:26:50.576Z current=1844637696 anon=1429098496 file=398331904 peak=3719483392 rss_kib=1451388 hwm_kib=2502384 scratch=17593382
+2026-10-18T08:26:52.864Z current=740257792 anon=321368064 file=390856704 peak=3719483392 rss_kib=371800 hwm_kib=2502384 scratch=9636561
+2026-10-18T08:26:55.023Z current=1098530816 anon=312430592 file=766316544 peak=3895300096 rss_kib=374952 hwm_kib=2715516 scratch=10396845
+2026-10-18T08:26:57.309Z current=1375993856 anon=966148096 file=390324224 peak=3895300096 rss_kib=999352 hwm_kib=2715516 scratch=9689997
+2026-10-18T08:26:59.600Z current=1440444416 anon=1017110528 file=398491648 peak=3895300096 rss_kib=1049364 hwm_kib=2715516 scratch=13748708
+2026-10-18T08:27:01.872Z current=1768931328 anon=1356558336 file=393175040 peak=3895300096 rss_kib=1381012 hwm_kib=2715516 scratch=7660137
+2026-10-18T08:27:04.175Z current=1793003520 anon=1379786752 file=395431936 peak=3895300096 rss_kib=1403608 hwm_kib=2715516 scratch=8425167
+2026-10-18T08:27:06.367Z current=3019276288 anon=2376134656 file=622993408 peak=3895300096 rss_kib=2376648 hwm_kib=2715516 scratch=11785555
+2026-10-18T08:27:08.903Z current=3677188096 anon=2475249664 file=841609216 peak=3895300096 rss_kib=2473388 hwm_kib=2715516 scratch=20626760
+2026-10-18T08:27:11.194Z current=1402208256 anon=973955072 file=399679488 peak=3895300096 rss_kib=1007348 hwm_kib=2715516 scratch=11985851
+2026-10-18T08:27:13.466Z current=1385172992 anon=966381568 file=394567680 peak=3895300096 rss_kib=999884 hwm_kib=2715516 scratch=6878572
+2026-10-18T08:27:15.609Z current=1695338496 anon=1270562816 file=403779584 peak=3895300096 rss_kib=1296940 hwm_kib=2715516 scratch=15304140
+2026-10-18T08:27:17.910Z current=1920233472 anon=1490579456 file=406081536 peak=3895300096 rss_kib=1511804 hwm_kib=2715516 scratch=16836124
+2026-10-18T08:27:20.154Z current=1721532416 anon=1303322624 file=399216640 peak=3895300096 rss_kib=1322112 hwm_kib=2715516 scratch=9198721
+2026-10-18T08:27:22.312Z current=2689966080 anon=1922605056 file=694788096 peak=3895300096 rss_kib=1979856 hwm_kib=2715516 scratch=20649392
+2026-10-18T08:27:24.730Z current=1476038656 anon=671891456 file=783921152 peak=3917623296 rss_kib=712296 hwm_kib=2715516 scratch=11447438
+2026-10-18T08:27:27.031Z current=1475878912 anon=1046872064 file=396087296 peak=3917623296 rss_kib=1078552 hwm_kib=2715516 scratch=5671804
+2026-10-18T08:27:29.182Z current=1661767680 anon=1236209664 file=397910016 peak=3917623296 rss_kib=1259372 hwm_kib=2715516 scratch=6858049
+2026-10-18T08:27:31.316Z current=1725427712 anon=1292541952 file=407121920 peak=3917623296 rss_kib=1318404 hwm_kib=2715516 scratch=15272738
+2026-10-18T08:27:33.585Z current=1639059456 anon=1226809344 file=401027072 peak=3917623296 rss_kib=1254752 hwm_kib=2715516 scratch=8412365
+2026-10-18T08:27:35.755Z current=1892831232 anon=1458544640 file=411734016 peak=3917623296 rss_kib=1480692 hwm_kib=2715516 scratch=18342034
+2026-10-18T08:27:38.022Z current=2189025280 anon=1756770304 file=403521536 peak=3917623296 rss_kib=1776976 hwm_kib=2715516 scratch=9648107
+2026-10-18T08:27:40.218Z current=1882632192 anon=1052942336 file=799014912 peak=3917623296 rss_kib=1084504 hwm_kib=2715516 scratch=20809965
+2026-10-18T08:27:42.532Z current=1692114944 anon=1267597312 file=399826944 peak=3917623296 rss_kib=1294040 hwm_kib=2715516 scratch=6118168
+2026-10-18T08:27:44.812Z current=1635831808 anon=1213960192 file=401354752 peak=3917623296 rss_kib=1234488 hwm_kib=2715516 scratch=6880882
+2026-10-18T08:27:46.953Z current=1751908352 anon=1328062464 file=402923520 peak=3917623296 rss_kib=1353092 hwm_kib=2715516 scratch=7650144
+2026-10-18T08:27:49.104Z current=1826820096 anon=1392340992 file=412893184 peak=3917623296 rss_kib=1415860 hwm_kib=2715516 scratch=16850318
+2026-10-18T08:27:51.320Z current=2134171648 anon=1696444416 file=415191040 peak=3917623296 rss_kib=1720564 hwm_kib=2715516 scratch=18381357
+2026-10-18T08:27:53.622Z current=1104404480 anon=284643328 file=794030080 peak=3917623296 rss_kib=335148 hwm_kib=2776788 scratch=9965342
+2026-10-18T08:27:55.762Z current=1450729472 anon=1021677568 file=401309696 peak=3917623296 rss_kib=1053900 hwm_kib=2776788 scratch=5377723
+2026-10-18T08:27:58.046Z current=1663205376 anon=1239633920 file=402866176 peak=3917623296 rss_kib=1266748 hwm_kib=2776788 scratch=6143684
+2026-10-18T08:28:00.333Z current=2156453888 anon=1721245696 file=412790784 peak=3917623296 rss_kib=1737060 hwm_kib=2776788 scratch=14565249
+2026-10-18T08:28:02.611Z current=1803141120 anon=1376526336 file=407420928 peak=3917623296 rss_kib=1393516 hwm_kib=2776788 scratch=8422558
+2026-10-18T08:28:04.755Z current=2147049472 anon=1713782784 file=417378304 peak=3917623296 rss_kib=1746700 hwm_kib=2776788 scratch=17620634
+2026-10-18T08:28:07.006Z current=1473347584 anon=644677632 file=809095168 peak=3917623296 rss_kib=685804 hwm_kib=2776788 scratch=19142721
+2026-10-18T08:28:09.272Z current=1398468608 anon=952176640 file=410288128 peak=3917623296 rss_kib=982092 hwm_kib=2776788 scratch=10487490
+2026-10-18T08:28:11.460Z current=1431265280 anon=988942336 file=407990272 peak=3917623296 rss_kib=1021924 hwm_kib=2776788 scratch=10027576
+2026-10-18T08:28:13.612Z current=1969610752 anon=1540206592 file=407363584 peak=3917623296 rss_kib=1560264 hwm_kib=2776788 scratch=6911555
+2026-10-18T08:28:15.900Z current=2228944896 anon=1785638912 file=416559104 peak=3917623296 rss_kib=1799992 hwm_kib=2776788 scratch=15334267
+2026-10-18T08:28:18.145Z current=2051448832 anon=1622913024 file=410435584 peak=3917623296 rss_kib=1634128 hwm_kib=2776788 scratch=8445941
+2026-10-18T08:28:20.257Z current=1377476608 anon=926134272 file=412672000 peak=3917623296 rss_kib=960640 hwm_kib=2776788 scratch=9211934
+2026-10-18T08:28:22.434Z current=3472195584 anon=2450800640 file=987906048 peak=3917623296 rss_kib=2449556 hwm_kib=2776788 scratch=29398004
+2026-10-18T08:28:24.821Z current=1555636224 anon=1109073920 file=414072832 peak=3917623296 rss_kib=1140720 hwm_kib=2776788 scratch=11461178
+2026-10-18T08:28:27.039Z current=1542520832 anon=1102516224 file=410271744 peak=3917623296 rss_kib=1126008 hwm_kib=2776788 scratch=6883738
+2026-10-18T08:28:29.218Z current=1811177472 anon=1368346624 file=411811840 peak=3917623296 rss_kib=1392432 hwm_kib=2776788 scratch=7649745
+2026-10-18T08:28:31.494Z current=1758961664 anon=1320759296 file=413343744 peak=3917623296 rss_kib=1345964 hwm_kib=2776788 scratch=8413362
+2026-10-18T08:28:33.791Z current=2062147584 anon=1612865536 file=424038400 peak=3917623296 rss_kib=1631260 hwm_kib=2776788 scratch=18337277
+2026-10-18T08:28:36.009Z current=2992078848 anon=2063716352 file=905773056 peak=3917623296 rss_kib=2073444 hwm_kib=2776788 scratch=19324929
+2026-10-18T08:28:38.406Z current=1480007680 anon=1039736832 file=415236096 peak=3917623296 rss_kib=1079600 hwm_kib=2776788 scratch=9980044
+2026-10-18T08:28:40.635Z current=1979187200 anon=1529556992 file=417562624 peak=3917623296 rss_kib=1549864 hwm_kib=2776788 scratch=11532497
+2026-10-18T08:28:42.928Z current=2061381632 anon=1617440768 file=413708288 peak=3917623296 rss_kib=1635748 hwm_kib=2776788 scratch=6906545
+2026-10-18T08:28:45.071Z current=1978920960 anon=1532424192 file=422912000 peak=3917623296 rss_kib=1554280 hwm_kib=2776788 scratch=15327896
+2026-10-18T08:28:47.350Z current=2153492480 anon=1714270208 file=416796672 peak=3917623296 rss_kib=1730248 hwm_kib=2776788 scratch=8446582
+2026-10-18T08:28:49.598Z current=1812590592 anon=1366581248 file=426655744 peak=3917623296 rss_kib=1404132 hwm_kib=2776788 scratch=17824351
+2026-10-18T08:28:51.901Z current=1205669888 anon=299577344 file=817942528 peak=3917623296 rss_kib=340460 hwm_kib=2776788 scratch=9695077
+2026-10-18T08:28:54.071Z current=1669324800 anon=1219428352 file=419012608 peak=3917623296 rss_kib=1247040 hwm_kib=2776788 scratch=10775472
+2026-10-18T08:28:56.349Z current=1917169664 anon=1465274368 file=425443328 peak=3917623296 rss_kib=1487172 hwm_kib=2776788 scratch=17219009
+2026-10-18T08:28:58.567Z current=2319572992 anon=1866989568 file=425095168 peak=3917623296 rss_kib=1879396 hwm_kib=2776788 scratch=14583958
+2026-10-18T08:29:00.928Z current=1861255168 anon=1416048640 file=419704832 peak=3917623296 rss_kib=1439016 hwm_kib=2776788 scratch=8418502
+2026-10-18T08:29:03.191Z current=2721304576 anon=2102243328 file=591659008 peak=3917623296 rss_kib=2116072 hwm_kib=2776788 scratch=9181649
+2026-10-18T08:29:05.454Z current=1878327296 anon=1010024448 file=833912832 peak=4012957696 rss_kib=1050748 hwm_kib=2776788 scratch=19913922
+2026-10-18T08:29:07.743Z current=1532166144 anon=1061232640 file=422842368 peak=4012957696 rss_kib=1087668 hwm_kib=2776788 scratch=6119913
+2026-10-18T08:29:09.872Z current=1984172032 anon=1518014464 file=419164160 peak=4012957696 rss_kib=1553672 hwm_kib=2776788 scratch=6883536
+2026-10-18T08:29:12.046Z current=2049323008 anon=1576415232 file=428339200 peak=4012957696 rss_kib=1595704 hwm_kib=2776788 scratch=15282497
+2026-10-18T08:29:14.329Z current=2052612096 anon=1592770560 file=423706624 peak=4012957696 rss_kib=1586376 hwm_kib=2776788 scratch=9137924
+2026-10-18T08:29:16.531Z current=807563264 anon=342433792 file=426094592 peak=4012957696 rss_kib=383660 hwm_kib=2776788 scratch=9926783
+2026-10-18T08:29:18.701Z current=3611901952 anon=2463141888 file=1107472384 peak=4012957696 rss_kib=2383824 hwm_kib=2776788 scratch=20062180
+2026-10-18T08:29:21.087Z current=1732894720 anon=1279983616 file=419520512 peak=4012957696 rss_kib=1306200 hwm_kib=2776788 scratch=5368117
+2026-10-18T08:29:23.356Z current=1887973376 anon=1434222592 file=421089280 peak=4012957696 rss_kib=1456992 hwm_kib=2776788 scratch=6149844
+2026-10-18T08:29:25.586Z current=1680711680 anon=1220501504 file=429592576 peak=4012957696 rss_kib=1248224 hwm_kib=2776788 scratch=13857105
+2026-10-18T08:29:27.832Z current=1817120768 anon=1367138304 file=424189952 peak=4012957696 rss_kib=1404216 hwm_kib=2776788 scratch=7682761
+2026-10-18T08:29:30.122Z current=2119602176 anon=1657810944 file=434200576 peak=4012957696 rss_kib=1675696 hwm_kib=2776788 scratch=16922985
+2026-10-18T08:29:32.411Z current=3339071488 anon=2243276800 file=1061744640 peak=4012957696 rss_kib=2246860 hwm_kib=2776788 scratch=9231784
+2026-10-18T08:29:34.715Z current=1169682432 anon=698609664 file=423915520 peak=4012957696 rss_kib=738480 hwm_kib=2776788 scratch=5653079
+2026-10-18T08:29:37.014Z current=1702014976 anon=1234280448 file=424038400 peak=4012957696 rss_kib=1261560 hwm_kib=2776788 scratch=6142902
+2026-10-18T08:29:39.298Z current=1831809024 anon=1369071616 file=425578496 peak=4012957696 rss_kib=1393132 hwm_kib=2776788 scratch=6911277
+2026-10-18T08:29:41.595Z current=1891532800 anon=1427779584 file=427114496 peak=4012957696 rss_kib=1450516 hwm_kib=2776788 scratch=7677282
+2026-10-18T08:29:43.773Z current=1756983296 anon=1288048640 file=437137408 peak=4012957696 rss_kib=1314112 hwm_kib=2776788 scratch=16904925
+2026-10-18T08:29:46.031Z current=1975783424 anon=1507897344 file=439435264 peak=4012957696 rss_kib=1541540 hwm_kib=2776788 scratch=18431266
+2026-10-18T08:29:48.318Z current=1547915264 anon=670797824 file=852836352 peak=4102668288 rss_kib=712680 hwm_kib=2776788 scratch=19959080
+2026-10-18T08:29:50.560Z current=1500303360 anon=1032028160 file=431542272 peak=4102668288 rss_kib=1057092 hwm_kib=2776788 scratch=10718065
+2026-10-18T08:29:52.727Z current=1793355776 anon=1326673920 file=434593792 peak=4102668288 rss_kib=1351816 hwm_kib=2776788 scratch=13004450
+2026-10-18T08:29:55.011Z current=2133573632 anon=1639088128 file=430010368 peak=4102668288 rss_kib=1656992 hwm_kib=2776788 scratch=7628240
+2026-10-18T08:29:57.320Z current=1973153792 anon=1519341568 file=431575040 peak=4102668288 rss_kib=1539884 hwm_kib=2776788 scratch=8419439
+2026-10-18T08:29:59.473Z current=1077264384 anon=646074368 file=442273792 peak=4102668288 rss_kib=689316 hwm_kib=2776788 scratch=18346565
+2026-10-18T08:30:01.750Z current=3701112832 anon=2409656320 file=1258852352 peak=4102668288 rss_kib=2409348 hwm_kib=2776788 scratch=19151461
+2026-10-18T08:30:04.184Z current=1121628160 anon=664510464 file=429883392 peak=4102668288 rss_kib=705096 hwm_kib=2776788 scratch=5635703
+2026-10-18T08:30:06.492Z current=1850671104 anon=1389125632 file=437538816 peak=4102668288 rss_kib=1412720 hwm_kib=2776788 scratch=12980918
+2026-10-18T08:30:08.799Z current=1478455296 anon=1033687040 file=427294720 peak=4102668288 rss_kib=1065604 hwm_kib=2776788 scratch=7631009
+2026-10-18T08:30:11.069Z current=2051829760 anon=1587650560 file=444944384 peak=4102668288 rss_kib=1606584 hwm_kib=2776788 scratch=24484842
+2026-10-18T08:30:13.663Z current=1900257280 anon=1456123904 file=429875200 peak=4102668288 rss_kib=1486428 hwm_kib=2776788 scratch=9182576
+2026-10-18T08:30:16.178Z current=2724065280 anon=2039881728 file=653627392 peak=4102668288 rss_kib=2048516 hwm_kib=2776788 scratch=9947650
+2026-10-18T08:30:18.603Z current=3917488128 anon=2599735296 file=1287921664 peak=4102668288 rss_kib=2595252 hwm_kib=2776788 scratch=22158214
+2026-10-18T08:30:21.199Z current=902160384 anon=444977152 file=431448064 peak=4102668288 rss_kib=498332 hwm_kib=2776788 scratch=12077271
+2026-10-18T08:30:23.676Z current=1545793536 anon=1085247488 file=435437568 peak=4102668288 rss_kib=1110424 hwm_kib=2776788 scratch=13740150
+2026-10-18T08:30:26.020Z current=1812131840 anon=1354141696 file=436887552 peak=4102668288 rss_kib=1380312 hwm_kib=2776788 scratch=15279000
+2026-10-18T08:30:28.380Z current=1770471424 anon=1307631616 file=440909824 peak=4102668288 rss_kib=1333108 hwm_kib=2776788 scratch=17549500
+2026-10-18T08:30:30.740Z current=2090127360 anon=1624715264 file=443219968 peak=4102668288 rss_kib=1642872 hwm_kib=2776788 scratch=19074956
+2026-10-18T08:30:33.091Z current=985391104 anon=512643072 file=446812160 peak=4102668288 rss_kib=557156 hwm_kib=2776788 scratch=20630803
+2026-10-18T08:30:35.474Z current=3512684544 anon=2475339776 file=1020866560 peak=4102668288 rss_kib=2478184 hwm_kib=2776788 scratch=21496766
+2026-10-18T08:30:38.042Z current=1896751104 anon=1007800320 file=869056512 peak=4102668288 rss_kib=1044788 hwm_kib=2776788 scratch=23733285
+2026-10-18T08:30:40.482Z current=1886117888 anon=1432756224 file=431472640 peak=4102668288 rss_kib=1455328 hwm_kib=2776788 scratch=8857097
+2026-10-18T08:30:42.835Z current=1590063104 anon=1141215232 file=428560384 peak=4102668288 rss_kib=1170568 hwm_kib=2776788 scratch=7630848
+2026-10-18T08:30:45.124Z current=2024538112 anon=1568972800 file=433762304 peak=4102668288 rss_kib=1588308 hwm_kib=2776788 scratch=8394489
+2026-10-18T08:30:47.499Z current=2104786944 anon=1645158400 file=439709696 peak=4102668288 rss_kib=1662696 hwm_kib=2776788 scratch=18292467
+2026-10-18T08:30:49.823Z current=2235805696 anon=1789968384 file=448786432 peak=4102668288 rss_kib=1821636 hwm_kib=2776788 scratch=19875790
+2026-10-18T08:30:52.328Z current=3067449344 anon=2327187456 file=722042880 peak=4102668288 rss_kib=2329200 hwm_kib=2776788 scratch=22092876
+2026-10-18T08:30:54.882Z current=1985835008 anon=1091936256 file=870174720 peak=4102668288 rss_kib=1122524 hwm_kib=2776788 scratch=22897908
+2026-10-18T08:30:57.169Z current=1197551616 anon=740724736 file=436477952 peak=4102668288 rss_kib=780336 hwm_kib=2776788 scratch=7129252
+2026-10-18T08:30:59.441Z current=1719365632 anon=1259737088 file=436420608 peak=4102668288 rss_kib=1286396 hwm_kib=2776788 scratch=7617209
+2026-10-18T08:31:01.756Z current=1690816512 anon=1231982592 file=437964800 peak=4102668288 rss_kib=1259260 hwm_kib=2776788 scratch=8385628
+2026-10-18T08:31:03.991Z current=2142797824 anon=1672056832 file=448606208 peak=4102668288 rss_kib=1688968 hwm_kib=2776788 scratch=18281771
+2026-10-18T08:31:06.308Z current=2274959360 anon=1802940416 file=452349952 peak=4102668288 rss_kib=1816808 hwm_kib=2776788 scratch=20560038
+2026-10-18T08:31:08.642Z current=1185886208 anon=726142976 file=442220544 peak=4102668288 rss_kib=781888 hwm_kib=2776788 scratch=11422313
+2026-10-18T08:31:11.005Z current=2689433600 anon=1762766848 file=899674112 peak=4102668288 rss_kib=1788456 hwm_kib=2776788 scratch=11848632
+2026-10-18T08:31:13.662Z current=1611612160 anon=793436160 file=799903744 peak=4102668288 rss_kib=840476 hwm_kib=2776788 scratch=24452888
+2026-10-18T08:31:15.894Z current=1892597760 anon=1423097856 file=443449344 peak=4102668288 rss_kib=1445844 hwm_kib=2776788 scratch=12934573
+2026-10-18T08:31:18.189Z current=2008625152 anon=1536348160 file=447799296 peak=4102668288 rss_kib=1556444 hwm_kib=2776788 scratch=15976566
+2026-10-18T08:31:20.449Z current=1784479744 anon=1311617024 file=450318336 peak=4102668288 rss_kib=1337056 hwm_kib=2776788 scratch=17515182
+2026-10-18T08:31:22.775Z current=2087559168 anon=1615376384 file=452648960 peak=4102668288 rss_kib=1645988 hwm_kib=2776788 scratch=19059643
+2026-10-18T08:31:25.066Z current=2019504128 anon=1541423104 file=458121216 peak=4102668288 rss_kib=1561396 hwm_kib=2776788 scratch=26435833
+2026-10-18T08:31:27.324Z current=2828906496 anon=2206228480 file=601899008 peak=4102668288 rss_kib=2210692 hwm_kib=2776788 scratch=11422472
+2026-10-18T08:31:29.774Z current=2959380480 anon=2195505152 file=747483136 peak=4102668288 rss_kib=2204120 hwm_kib=2776788 scratch=24353669
+2026-10-18T08:31:32.217Z current=916701184 anon=456962048 file=441405440 peak=4102668288 rss_kib=503568 hwm_kib=2776788 scratch=6405184
+2026-10-18T08:31:34.524Z current=1651470336 anon=1188753408 file=443277312 peak=4102668288 rss_kib=1216852 hwm_kib=2776788 scratch=7149972
+2026-10-18T08:31:36.753Z current=1539256320 anon=1080328192 file=444596224 peak=4102668288 rss_kib=1110984 hwm_kib=2776788 scratch=8360866
+2026-10-18T08:31:38.960Z current=1472872448 anon=1011482624 file=446132224 peak=4102668288 rss_kib=1040656 hwm_kib=2776788 scratch=9129251
+2026-10-18T08:31:41.140Z current=2008535040 anon=1535090688 file=457601024 peak=4102668288 rss_kib=1548948 hwm_kib=2776788 scratch=19805706
+2026-10-18T08:31:43.755Z current=2389864448 anon=1914613760 file=459153408 peak=4102668288 rss_kib=1925796 hwm_kib=2776788 scratch=20586058
+2026-10-18T08:31:46.315Z current=2918682624 anon=2029707264 file=847511552 peak=4102668288 rss_kib=2038092 hwm_kib=2776788 scratch=11418006
+2026-10-18T08:31:48.845Z current=1528537088 anon=634433536 file=883482624 peak=4102668288 rss_kib=643028 hwm_kib=2776788 scratch=12940527
+2026-10-18T08:31:51.287Z current=1549389824 anon=1092251648 file=446398464 peak=4102668288 rss_kib=1122612 hwm_kib=2776788 scratch=5716288
+2026-10-18T08:31:53.748Z current=2287792128 anon=1821745152 file=460283904 peak=4102668288 rss_kib=1841628 hwm_kib=2776788 scratch=19858430
+2026-10-18T08:31:56.146Z current=1988972544 anon=1528160256 file=449622016 peak=4102668288 rss_kib=1548292 hwm_kib=2776788 scratch=7647432
+2026-10-18T08:31:58.441Z current=1632428032 anon=1169223680 file=450408448 peak=4102668288 rss_kib=1193792 hwm_kib=2776788 scratch=8393605
+2026-10-18T08:32:00.757Z current=1628708864 anon=1165447168 file=450412544 peak=4102668288 rss_kib=1194088 hwm_kib=2776788 scratch=8393605
+2026-10-18T08:32:03.047Z current=2223403008 anon=1433698304 file=792461312 peak=4102668288 rss_kib=1456144 hwm_kib=2776788 scratch=8393605
+[2026-10-18T08:32:04.749Z] chunk 1 peaks: memory.current 3917488128, anon 2599735296, file 1287921664, memory.peak 4102668288, VmRSS 2595252 KiB, VmHWM 2776788 KiB, scratch 29398004 bytes
+
+## [2026-10-18T08:32:04.757Z] chunk 1: pod trawl-0 every 5 s
+[2026-10-18T08:32:04.795Z] $ awk '{$1=""; print}' '$D/private/mixed/work/c1/pod.log' | sort | uniq -c
+     98  uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Running reason= ready=True restarts=0
+
+## [2026-10-18T08:32:04.808Z] chunk 1: GET /api/v1/health every 2 s (HTTP status, duckdb check)
+[2026-10-18T08:32:04.812Z] $ awk '{s=$2; d="-"; if (match($0, /"duckdb":"[a-z]+"/)) d=substr($0, RSTART, RLENGTH); print s, d}' '$D/private/mixed/work/c1/health.log' | sort | uniq -c
+    249 200 "duckdb":"ok"
+[2026-10-18T08:32:04.829Z] $ grep -v ' 200 ' '$D/private/mixed/work/c1/health.log' | head -n 20 || true
+
+## [2026-10-18T08:32:04.840Z] chunk 1: /metrics every 10 s
+[2026-10-18T08:32:04.843Z] $ cat '$D/private/mixed/work/c1/metrics.log'
+2026-10-18T08:23:38.080Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 4.028871873 trawl_hot_buffer_events 35 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_query_permits_in_use 0 
+2026-10-18T08:23:48.139Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_hot_buffer_events 5209 trawl_query_permits_retained 0 trawl_query_permits_in_use 1 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.067858418 
+2026-10-18T08:23:58.157Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_query_permits_retained 0 trawl_query_permits_in_use 1 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.083840099 trawl_hot_buffer_events 9369 
+2026-10-18T08:24:08.171Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_query_pool_size 8 trawl_query_permits_in_use 2 trawl_engine_sample_age_seconds 4.106310292 trawl_query_permits_retained 0 trawl_hot_buffer_events 7259 
+2026-10-18T08:24:18.198Z trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 1 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.132390965 trawl_query_permits_retained 0 trawl_hot_buffer_events 12195 
+2026-10-18T08:24:28.224Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_query_pool_size 8 trawl_hot_buffer_events 10377 trawl_query_permits_in_use 5 trawl_engine_sample_age_seconds 4.160846015 trawl_query_permits_retained 0 
+2026-10-18T08:24:38.253Z trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 4.178093057 trawl_query_permits_in_use 0 trawl_query_pool_size 8 trawl_hot_buffer_events 8316 
+2026-10-18T08:24:48.266Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_query_permits_in_use 2 trawl_hot_buffer_events 13274 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.210636222 trawl_query_permits_retained 0 
+2026-10-18T08:24:58.302Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_hot_buffer_events 11447 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.238170378 trawl_query_permits_in_use 4 
+2026-10-18T08:25:08.329Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_engine_sample_age_seconds 4.254750091 trawl_hot_buffer_events 10362 trawl_query_pool_size 8 trawl_query_permits_in_use 0 trawl_query_permits_retained 0 
+2026-10-18T08:25:18.342Z trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 4.278519893 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_hot_buffer_events 8289 trawl_query_permits_in_use 3 
+2026-10-18T08:25:28.375Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_query_permits_in_use 2 trawl_hot_buffer_events 12242 trawl_engine_sample_age_seconds 4.310383331 trawl_query_pool_size 8 trawl_query_permits_retained 0 
+2026-10-18T08:25:38.404Z trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 4.337854552 trawl_query_permits_in_use 1 trawl_query_pool_size 8 trawl_hot_buffer_events 12420 trawl_query_permits_retained 0 
+2026-10-18T08:25:48.426Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_query_permits_in_use 0 trawl_hot_buffer_events 10362 trawl_engine_sample_age_seconds 4.350940525 trawl_query_permits_retained 0 trawl_query_pool_size 8 
+2026-10-18T08:25:58.439Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_query_permits_in_use 3 trawl_hot_buffer_events 8298 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.373013408 trawl_query_permits_retained 0 
+2026-10-18T08:26:08.463Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_permits_in_use 2 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_hot_buffer_events 13479 trawl_engine_sample_age_seconds 4.409883664 
+2026-10-18T08:26:18.504Z trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_hot_buffer_events 11397 trawl_engine_sample_age_seconds 4.435825566 trawl_query_pool_size 8 trawl_query_permits_in_use 1 trawl_query_permits_retained 0 
+2026-10-18T08:26:28.529Z trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 1 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 4.463456121 trawl_hot_buffer_events 9300 trawl_query_pool_size 8 
+2026-10-18T08:26:38.552Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_hot_buffer_events 13465 trawl_query_permits_retained 0 trawl_query_permits_in_use 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.478702254 
+2026-10-18T08:26:48.568Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_query_pool_size 8 trawl_query_permits_in_use 2 trawl_engine_sample_age_seconds 4.493146325 trawl_hot_buffer_events 11387 trawl_query_permits_retained 0 
+2026-10-18T08:26:58.582Z trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_hot_buffer_events 9304 trawl_query_permits_retained 0 trawl_query_permits_in_use 2 trawl_engine_sample_age_seconds 4.513813804 trawl_query_pool_size 8 
+2026-10-18T08:27:08.606Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_query_permits_in_use 4 trawl_engine_sample_age_seconds 4.540436899 trawl_hot_buffer_events 14478 
+2026-10-18T08:27:18.632Z trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_hot_buffer_events 12412 trawl_engine_sample_age_seconds 4.556680462 trawl_query_pool_size 8 trawl_query_permits_in_use 2 
+2026-10-18T08:27:28.646Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_query_permits_in_use 2 trawl_hot_buffer_events 9301 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.569893098 
+2026-10-18T08:27:38.660Z trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_query_permits_in_use 4 trawl_hot_buffer_events 14203 trawl_engine_sample_age_seconds 4.582443849 
+2026-10-18T08:27:48.677Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_query_permits_in_use 3 trawl_hot_buffer_events 11397 trawl_engine_sample_age_seconds 4.615344113 trawl_query_permits_retained 0 trawl_query_pool_size 8 
+2026-10-18T08:27:58.714Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_query_pool_size 8 trawl_hot_buffer_events 9325 trawl_engine_sample_age_seconds 4.644994308 trawl_query_permits_retained 0 trawl_query_permits_in_use 1 
+2026-10-18T08:28:08.743Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_permits_retained 0 trawl_hot_buffer_events 7488 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.6828992750000005 trawl_query_permits_in_use 5 
+2026-10-18T08:28:18.785Z trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 4.709866793 trawl_query_pool_size 8 trawl_query_permits_in_use 3 trawl_query_permits_retained 0 trawl_hot_buffer_events 12444 
+2026-10-18T08:28:28.805Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.72646547 trawl_query_permits_in_use 1 trawl_hot_buffer_events 10339 trawl_query_permits_retained 0 
+2026-10-18T08:28:38.820Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.749018868 trawl_query_permits_in_use 1 trawl_hot_buffer_events 7261 
+2026-10-18T08:28:48.849Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_permits_retained 0 trawl_query_permits_in_use 4 trawl_engine_sample_age_seconds 4.775783346 trawl_hot_buffer_events 12444 trawl_query_pool_size 8 
+2026-10-18T08:28:58.883Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 4.806550317 trawl_query_pool_size 8 trawl_hot_buffer_events 10376 trawl_query_permits_in_use 6 trawl_query_permits_retained 0 
+2026-10-18T08:29:08.907Z trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 4.826814303 trawl_query_permits_in_use 2 trawl_query_pool_size 8 trawl_hot_buffer_events 9309 trawl_query_permits_retained 0 
+2026-10-18T08:29:18.925Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_permits_retained 0 trawl_query_permits_in_use 3 trawl_hot_buffer_events 14246 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.848442326 
+2026-10-18T08:29:28.945Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_query_permits_retained 0 trawl_query_permits_in_use 1 trawl_hot_buffer_events 11433 trawl_engine_sample_age_seconds 4.873388277 trawl_query_pool_size 8 
+2026-10-18T08:29:38.973Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_query_permits_in_use 3 trawl_hot_buffer_events 9349 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.900808675 
+2026-10-18T08:29:48.998Z trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_hot_buffer_events 14510 trawl_engine_sample_age_seconds 4.920045657 trawl_query_pool_size 8 trawl_query_permits_in_use 2 
+2026-10-18T08:29:59.016Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_hot_buffer_events 12418 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_query_permits_in_use 2 trawl_engine_sample_age_seconds 4.93576479 
+2026-10-18T08:30:09.038Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_hot_buffer_events 10345 trawl_query_permits_in_use 0 trawl_engine_sample_age_seconds 4.981475026 
+2026-10-18T08:30:19.114Z trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 5 trawl_query_permits_retained 0 trawl_hot_buffer_events 15522 trawl_engine_sample_age_seconds 5.051551967 trawl_query_pool_size 8 
+2026-10-18T08:30:29.179Z trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.14216001 trawl_query_permits_in_use 6 trawl_hot_buffer_events 12411 trawl_query_pool_size 8 
+2026-10-18T08:30:39.255Z trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 6 trawl_hot_buffer_events 16249 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 5.175436631 
+2026-10-18T08:30:49.287Z trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 5.212894482 trawl_query_permits_in_use 3 trawl_hot_buffer_events 13454 trawl_query_pool_size 8 trawl_query_permits_retained 0 
+2026-10-18T08:30:59.321Z trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 3 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.246934154 trawl_hot_buffer_events 10331 trawl_query_pool_size 8 
+2026-10-18T08:31:09.350Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_hot_buffer_events 15493 trawl_query_permits_in_use 2 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.274165687 trawl_query_pool_size 8 
+2026-10-18T08:31:19.384Z trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_query_permits_in_use 4 trawl_engine_sample_age_seconds 5.309784575 trawl_hot_buffer_events 11360 
+2026-10-18T08:31:29.422Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_query_permits_in_use 4 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.348973978 trawl_query_pool_size 8 trawl_hot_buffer_events 16529 
+2026-10-18T08:31:39.456Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 5.379108723 trawl_query_permits_retained 0 trawl_hot_buffer_events 12407 trawl_query_permits_in_use 3 
+2026-10-18T08:31:49.486Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_query_permits_in_use 2 trawl_query_permits_retained 0 trawl_hot_buffer_events 17555 trawl_engine_sample_age_seconds 5.413215182 trawl_query_pool_size 8 
+2026-10-18T08:31:59.520Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_engine_sample_age_seconds 5.44393035 trawl_query_permits_in_use 0 trawl_hot_buffer_events 11395 trawl_query_pool_size 8 trawl_query_permits_retained 0 
+
+## [2026-10-18T08:32:04.860Z] chunk 1: trawld log: compaction, maintenance, repin, warnings and errors
+[2026-10-18T08:32:04.864Z] $ grep -c 'event_type="compaction_complete"' '$D/private/mixed/work/c1/trawld.log' || true
+68
+[2026-10-18T08:32:04.888Z] $ grep 'event_type="compaction_complete"' '$D/private/mixed/work/c1/trawld.log' | grep -oE 'merged=[a-z]+' | sort | uniq -c
+     68 merged=true
+[2026-10-18T08:32:04.902Z] $ grep 'event_type="compaction_complete"' '$D/private/mixed/work/c1/trawld.log' | grep 'service="i304"' | tail -n 3 | cut -c1-500
+[2026-10-18T08:32:04.918Z] $ grep -E 'repin' '$D/private/mixed/work/c1/trawld.log' | grep -vE 'route="/api/v1/schema/repin/status"' | cut -c1-500 | head -n 30
+2026-10-18T08:26:58.625072890Z 2026-10-18T08:26:58.624984Z  INFO trawl_server::repin::engine: repin job claimed; scanning the corpus event_type="repin_start" job_id=1 field=code from="BIGINT" to="VARCHAR" dry_run=false force=false
+2026-10-18T08:26:58.919390962Z 2026-10-18T08:26:58.919331Z  INFO trawl_server::repin::engine: repin build pass complete event_type="repin_pass" job_id=1 pass=0 changed=3 files_done=1
+2026-10-18T08:26:58.943063663Z 2026-10-18T08:26:58.943022Z  INFO trawl_server::repin::engine: repin build pass complete event_type="repin_pass" job_id=1 pass=1 changed=0 files_done=1
+2026-10-18T08:26:59.268323216Z 2026-10-18T08:26:59.268262Z  INFO trawl_server::repin::engine: repin job complete: the corpus and the pin now agree event_type="repin_complete" job_id=1 field=code to="VARCHAR" duration_ms=501
+[2026-10-18T08:32:04.946Z] $ grep -E ' (WARN|ERROR) ' '$D/private/mixed/work/c1/trawld.log' | grep -oE 'event_type="[a-z_]+"' | sort | uniq -c
+      4 event_type="pool_pressure"
+[2026-10-18T08:32:04.991Z] $ grep -E ' ERROR |resource_exhausted|catalog_invariant_violation|rollup_unreadable|catalog_conform_skip|compaction_error' '$D/private/mixed/work/c1/trawld.log' | cut -c1-500 | head -n 30
+
+## [2026-10-18T08:32:05.021Z] chunk 1: kubelet events
+FIRST                  LAST                   COUNT    TYPE      REASON              OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled           postgres-5dbf87b8f6-mf85b   Successfully assigned i304-mixed/postgres-5dbf87b8f6-mf85b to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-mixed/trawl-0 to trawl-i304-control-plane
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    SuccessfulCreate    postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-mf85b
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    Created             postgres-5dbf87b8f6-mf85b   Container created
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    ScalingReplicaSet   postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    Pulled              postgres-5dbf87b8f6-mf85b   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-18T08:21:16Z   2026-10-18T08:21:16Z   1        Normal    Started             postgres-5dbf87b8f6-mf85b   Container started
+2026-10-18T08:21:16Z   2026-10-18T08:21:16Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-mf85b   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-18T08:21:18Z   2026-10-18T08:21:24Z   4        Warning   Unhealthy           postgres-5dbf87b8f6-mf85b   Readiness probe failed: /var/run/postgresql:5432 - rejecting connections
+
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-mixed/data-trawl-0"
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T08:21:31Z   2026-10-18T08:21:31Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-902796b2-8e7d-4740-9c86-fa1ebbf728c0
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Started                 trawl-0                     Container started
+
+## [2026-10-18T08:32:05.592Z] chunk 1 done
+
+## [2026-10-18T08:32:28.421Z] chunk 2: the mixed workload for 500s (23s since the previous part ended)
+[2026-10-18T08:32:28.665Z] pod trawl-0 uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Running reason= ready=True restarts=0
+[2026-10-18T08:32:28.972Z] cgroup and scratch: current=709279744 anon=261402624 file=440569856 peak=4102668288 rss_kib=310840 hwm_kib=2776788 scratch=8393605
+[2026-10-18T08:32:28.990Z] workers started: ingest, live tail, 6 search clients, repin driver; running 500s
+[2026-10-18T08:40:55.496Z] chunk 2 workers finished
+
+## [2026-10-18T08:40:55.563Z] chunk 2: search responses (HTTP status, error code) per search
+[2026-10-18T08:40:55.565Z] $ awk '{print $3, $5, $7}' '$D/private/mixed/work/c2/searches.log' | sort | uniq -c
+    308 search=1 200 -
+    309 search=2 200 -
+    309 search=3 200 -
+    310 search=4 200 -
+    311 search=5 200 -
+    310 search=6 200 -
+    310 search=7 200 -
+    307 search=8 200 -
+[2026-10-18T08:40:55.577Z] $ awk '{print $5, $7}' '$D/private/mixed/work/c2/searches.log' | sort | uniq -c
+   2474 200 -
+[2026-10-18T08:40:55.587Z] $ grep -vE ' -> 200 [0-9.]+ -$' '$D/private/mixed/work/c2/searches.log' | head -n 40 || true
+[2026-10-18T08:40:55.601Z] $ grep -c query_resource_exhausted '$D/private/mixed/work/c2/searches.log' || true
+0
+[2026-10-18T08:40:55.612Z] $ awk '{print $6}' '$D/private/mixed/work/c2/searches.log' | sort -n | awk '{a[NR]=$1} END {print "search seconds: n=" NR, "p50=" a[int(NR*0.5)+1], "p95=" a[int(NR*0.95)+1], "max=" a[NR]}'
+search seconds: n=2474 p50=0.438378 p95=2.263467 max=4.565377
+
+## [2026-10-18T08:40:55.624Z] chunk 2: ingest responses
+[2026-10-18T08:40:55.625Z] $ awk '{print $2, ($3 ~ /^[0-9]+$/ ? "accepted" : $3)}' '$D/private/mixed/work/c2/ingest.log' | sort | uniq -c
+    250 200 accepted
+      1 done sent=250000
+[2026-10-18T08:40:55.652Z] $ grep -vE ' 200 [0-9]+ ' '$D/private/mixed/work/c2/ingest.log' | head -n 20 || true
+2026-10-18T08:40:49.444Z done sent=250000 accepted=250000 secs=500
+
+## [2026-10-18T08:40:55.664Z] chunk 2: live tail
+[2026-10-18T08:40:55.668Z] $ cat '$D/private/mixed/work/c2/tail.status'; cat '$D/private/mixed/work/c2/tail.stderr'; grep -c '^event: snapshot' '$D/private/mixed/work/c2/tail.sse' || true; grep -E '^event: ' '$D/private/mixed/work/c2/tail.sse' | sort | uniq -c; grep '^data: ' '$D/private/mixed/work/c2/tail.sse' | tail -n 1 | cut -c1-400
+200curl: (28) Operation timed out after 500000 milliseconds with 76881 bytes received
+250
+    250 event: snapshot
+data: {"columns":["status","count"],"rows":[{"count":22727,"status":"204"},{"count":22727,"status":"404"},{"count":22727,"status":"500"},{"count":22727,"status":"304"},{"count":90911,"status":"200"},{"count":22727,"status":"301"},{"count":22727,"status":"503"},{"count":22727,"status":"201"}]}
+
+## [2026-10-18T08:40:55.736Z] chunk 2: repins
+[2026-10-18T08:40:55.744Z] $ cat '$D/private/mixed/work/c2/repin.log'
+2026-10-18T08:33:28.277Z POST /api/v1/schema/repin {"field":"status","to":"VARCHAR","dry_run":true}
+2026-10-18T08:33:28.949Z -> 200 0.633383 {"id":2,"field":"status","from_type":"BIGINT","to_type":"VARCHAR","dry_run":true,"force":false,"status":"succeeded","requested_by":"ops","started_at":"2026-10-18T08:33:28.314417Z","finished_at":"2026-10-18T08:33:28.924436Z","error":null,"files_total":2,"rows_carrying":1073000,"projected_nulls":0,"resurrectable":0,"affected_bytes":449837798,"files_done":0,"rows_rewritten":0,"rows_nulled":0,"rows_resurrected":0,"ambiguous_numerals":0,"liveness":{"last_seen":"2026-10-18T08:33:22.345483Z","service":"i304"},"requires_force":false}
+2026-10-18T08:35:48.575Z POST /api/v1/schema/repin {"field":"code","to":"BIGINT"}
+2026-10-18T08:35:55.033Z -> 202 6.438767 {"id":3,"field":"code","from_type":"VARCHAR","to_type":"BIGINT","dry_run":false,"force":false,"status":"running","requested_by":"ops","started_at":"2026-10-18T08:35:48.596794Z","finished_at":null,"error":null,"files_total":1,"rows_carrying":5000,"projected_nulls":0,"resurrectable":0,"affected_bytes":2138838,"files_done":0,"rows_rewritten":0,"rows_nulled":0,"rows_resurrected":0,"ambiguous_numerals":0,"liveness":{"last_seen":"2026-10-18T08:23:28.995490Z","service":"i304-repin"},"requires_force":false}
+2026-10-18T08:36:00.092Z status id=3 -> {"id":3,"field":"code","from_type":"VARCHAR","to_type":"BIGINT","dry_run":false,"force":false,"status":"succeeded","requested_by":"ops","started_at":"2026-10-18T08:35:48.596794Z","finished_at":"2026-10-18T08:35:58.480590Z","error":null,"files_total":1,"rows_carrying":5000,"projected_nulls":0,"resurrectable":0,"affected_bytes":2138838,"files_done":1,"rows_rewritten":5000,"rows_nulled":0,"rows_resurrected":0,"ambiguous_numerals":0,"liveness":{"last_seen":"2026-10-18T08:23:28.995490Z","service":"i304-repin"},"requires_force":false}
+
+## [2026-10-18T08:40:55.752Z] chunk 2: trawld cgroup memory, RSS (KiB) and query scratch bytes every 2 s
+[2026-10-18T08:40:55.757Z] $ cat '$D/private/mixed/work/c2/cgroup.log'
+2026-10-18T08:32:28.979Z current=1061617664 anon=610279424 file=442159104 peak=4102668288 rss_kib=651644 hwm_kib=2776788 scratch=2743
+2026-10-18T08:32:31.445Z current=1368686592 anon=912822272 file=445177856 peak=4102668288 rss_kib=947028 hwm_kib=2776788 scratch=1534482
+2026-10-18T08:32:33.918Z current=1828917248 anon=1364664320 file=448987136 peak=4102668288 rss_kib=1388312 hwm_kib=2776788 scratch=4548722
+2026-10-18T08:32:36.472Z current=1980092416 anon=1526366208 file=442159104 peak=4102668288 rss_kib=1546388 hwm_kib=2776788 scratch=3048291
+2026-10-18T08:32:38.751Z current=1548681216 anon=1094873088 file=443695104 peak=4102668288 rss_kib=1124788 hwm_kib=2776788 scratch=3814276
+2026-10-18T08:32:41.047Z current=1746599936 anon=1261092864 file=448647168 peak=4102668288 rss_kib=1251112 hwm_kib=2776788 scratch=4577933
+2026-10-18T08:32:43.338Z current=2582171648 anon=2127388672 file=457310208 peak=4102668288 rss_kib=2160540 hwm_kib=2776788 scratch=10569302
+2026-10-18T08:32:45.705Z current=3747000320 anon=2237591552 file=1493262336 peak=4102668288 rss_kib=2244736 hwm_kib=2776788 scratch=6787646
+2026-10-18T08:32:48.021Z current=1506045952 anon=1036853248 file=452378624 peak=4102668288 rss_kib=1068052 hwm_kib=2776788 scratch=12875482
+2026-10-18T08:32:50.268Z current=2000687104 anon=1518481408 file=466194432 peak=4102668288 rss_kib=1538348 hwm_kib=2776788 scratch=22086618
+2026-10-18T08:32:52.691Z current=2062561280 anon=1588338688 file=461623296 peak=4102668288 rss_kib=1616848 hwm_kib=2776788 scratch=16745701
+2026-10-18T08:32:55.043Z current=1551212544 anon=1078689792 file=461365248 peak=4102668288 rss_kib=1108712 hwm_kib=2776788 scratch=17475507
+2026-10-18T08:32:57.342Z current=2683158528 anon=2217512960 file=468058112 peak=4102668288 rss_kib=2243824 hwm_kib=2776788 scratch=19835044
+2026-10-18T08:32:59.753Z current=4122980352 anon=2735013888 file=1357586432 peak=4187656192 rss_kib=2726148 hwm_kib=2776788 scratch=22081493
+2026-10-18T08:33:02.344Z current=2019188736 anon=1071718400 file=917282816 peak=4497113088 rss_kib=1101752 hwm_kib=2847976 scratch=23595180
+2026-10-18T08:33:04.617Z current=1343520768 anon=859738112 file=455933952 peak=4497113088 rss_kib=894740 hwm_kib=2847976 scratch=6865545
+2026-10-18T08:33:06.914Z current=1884553216 anon=1405100032 file=457490432 peak=4497113088 rss_kib=1427332 hwm_kib=2847976 scratch=7630129
+2026-10-18T08:33:09.204Z current=2055454720 anon=1568243712 file=463814656 peak=4497113088 rss_kib=1578332 hwm_kib=2847976 scratch=16810176
+2026-10-18T08:33:11.665Z current=2261856256 anon=1791148032 file=447827968 peak=4497113088 rss_kib=1791688 hwm_kib=2847976 scratch=28224397
+2026-10-18T08:33:14.062Z current=1091497984 anon=608518144 file=461512704 peak=4497113088 rss_kib=636332 hwm_kib=2847976 scratch=10661952
+2026-10-18T08:33:16.512Z current=3332132864 anon=2396577792 file=913403904 peak=4497113088 rss_kib=2380048 hwm_kib=2847976 scratch=30159708
+2026-10-18T08:33:19.469Z current=3333693440 anon=2122493952 file=1174261760 peak=4497113088 rss_kib=2116740 hwm_kib=2847976 scratch=36399686
+2026-10-18T08:33:22.040Z current=1769578496 anon=1295814656 file=456921088 peak=4497113088 rss_kib=1303320 hwm_kib=2847976 scratch=6131881
+2026-10-18T08:33:24.444Z current=2084855808 anon=1599041536 file=466128896 peak=4497113088 rss_kib=1599452 hwm_kib=2847976 scratch=14514889
+2026-10-18T08:33:26.899Z current=2076233728 anon=1597657088 file=460795904 peak=4497113088 rss_kib=1597916 hwm_kib=2847976 scratch=8419136
+2026-10-18T08:33:29.289Z current=1433649152 anon=943943680 file=471126016 peak=4497113088 rss_kib=959532 hwm_kib=2847976 scratch=9182557
+2026-10-18T08:33:31.654Z current=1916264448 anon=1425698816 file=472670208 peak=4497113088 rss_kib=1429996 hwm_kib=2847976 scratch=9934876
+2026-10-18T08:33:34.086Z current=3099013120 anon=2196480000 file=885850112 peak=4497113088 rss_kib=2182432 hwm_kib=2847976 scratch=11447602
+2026-10-18T08:33:36.582Z current=3891900416 anon=2683719680 file=1191555072 peak=4497113088 rss_kib=2659304 hwm_kib=2847976 scratch=23656964
+2026-10-18T08:33:39.093Z current=1966456832 anon=1019207680 file=929402880 peak=4497113088 rss_kib=1029408 hwm_kib=2847976 scratch=12975457
+2026-10-18T08:33:41.502Z current=870957056 anon=294834176 file=474488832 peak=4497113088 rss_kib=331976 hwm_kib=2847976 scratch=7919697
+2026-10-18T08:33:43.964Z current=1846726656 anon=1342140416 file=481660928 peak=4497113088 rss_kib=1344864 hwm_kib=2847976 scratch=15946788
+2026-10-18T08:33:46.432Z current=1654034432 anon=1347440640 file=278818816 peak=4497113088 rss_kib=1354220 hwm_kib=2847976 scratch=9123458
+2026-10-18T08:33:48.809Z current=2091819008 anon=1606901760 file=473042944 peak=4497113088 rss_kib=1601604 hwm_kib=2847976 scratch=19777207
+2026-10-18T08:33:51.395Z current=2304884736 anon=1815732224 file=466169856 peak=4497113088 rss_kib=1804756 hwm_kib=2847976 scratch=11405953
+2026-10-18T08:33:53.904Z current=2290688000 anon=1816190976 file=474951680 peak=4497113088 rss_kib=1822296 hwm_kib=2847976 scratch=12168703
+2026-10-18T08:33:56.312Z current=3573538816 anon=2468122624 file=1100951552 peak=4497113088 rss_kib=2459424 hwm_kib=2847976 scratch=38036136
+2026-10-18T08:33:59.022Z current=2680262656 anon=1689993216 file=956747776 peak=4497113088 rss_kib=1631272 hwm_kib=2900332 scratch=39562750
+2026-10-18T08:34:01.390Z current=1744068608 anon=1260851200 file=467763200 peak=4497113088 rss_kib=1262368 hwm_kib=2900332 scratch=17530914
+2026-10-18T08:34:03.724Z current=1539514368 anon=1041833984 file=470048768 peak=4497113088 rss_kib=1049568 hwm_kib=2900332 scratch=8318810
+2026-10-18T08:34:06.016Z current=1419685888 anon=924618752 file=471625728 peak=4497113088 rss_kib=941064 hwm_kib=2900332 scratch=9105313
+2026-10-18T08:34:08.271Z current=2054676480 anon=1556447232 file=482287616 peak=4497113088 rss_kib=1563956 hwm_kib=2900332 scratch=9868972
+2026-10-18T08:34:10.526Z current=2160885760 anon=1646731264 file=487862272 peak=4497113088 rss_kib=1639188 hwm_kib=2900332 scratch=24548933
+2026-10-18T08:34:12.899Z current=1939472384 anon=1432281088 file=476250112 peak=4497113088 rss_kib=1429760 hwm_kib=2900332 scratch=11406731
+2026-10-18T08:34:15.294Z current=2382176256 anon=1856233472 file=506675200 peak=4497113088 rss_kib=1853980 hwm_kib=2900332 scratch=36188262
+2026-10-18T08:34:17.766Z current=3875086336 anon=2645377024 file=1188777984 peak=4497113088 rss_kib=2614512 hwm_kib=2900332 scratch=34126723
+2026-10-18T08:34:20.112Z current=2024968192 anon=1044041728 file=953856000 peak=4585197568 rss_kib=1050684 hwm_kib=2958164 scratch=27398400
+2026-10-18T08:34:22.509Z current=1564946432 anon=1080365056 file=464650240 peak=4585197568 rss_kib=1086096 hwm_kib=2958164 scratch=6844278
+2026-10-18T08:34:24.791Z current=1644036096 anon=1152147456 file=471216128 peak=4585197568 rss_kib=1156196 hwm_kib=2958164 scratch=7633219
+2026-10-18T08:34:27.063Z current=2157297664 anon=1655209984 file=480415744 peak=4585197568 rss_kib=1647520 hwm_kib=2958164 scratch=16047485
+2026-10-18T08:34:29.334Z current=2296266752 anon=1790083072 file=484184064 peak=4585197568 rss_kib=1779180 hwm_kib=2958164 scratch=18325204
+2026-10-18T08:34:31.681Z current=1666830336 anon=1167065088 file=476561408 peak=4585197568 rss_kib=1170760 hwm_kib=2958164 scratch=9935958
+2026-10-18T08:34:33.837Z current=2781601792 anon=1928978432 file=821366784 peak=4585197568 rss_kib=1914828 hwm_kib=2958164 scratch=10378588
+2026-10-18T08:34:36.115Z current=4215799808 anon=2630696960 file=1557794816 peak=4585197568 rss_kib=2602748 hwm_kib=2958164 scratch=25774523
+2026-10-18T08:34:38.446Z current=2243694592 anon=1272553472 file=952053760 peak=4585197568 rss_kib=1266876 hwm_kib=2958164 scratch=12599042
+2026-10-18T08:34:40.781Z current=1926057984 anon=1421357056 file=486371328 peak=4585197568 rss_kib=1419100 hwm_kib=2958164 scratch=12948799
+2026-10-18T08:34:43.257Z current=1604833280 anon=1106272256 file=482582528 peak=4585197568 rss_kib=1112160 hwm_kib=2958164 scratch=7645939
+2026-10-18T08:34:45.597Z current=2140770304 anon=1631686656 file=493236224 peak=4585197568 rss_kib=1624580 hwm_kib=2958164 scratch=17526366
+2026-10-18T08:34:48.153Z current=2479349760 anon=1960095744 file=504868864 peak=4585197568 rss_kib=1945284 hwm_kib=2958164 scratch=28933815
+2026-10-18T08:34:50.508Z current=997814272 anon=498343936 file=489295872 peak=4585197568 rss_kib=530644 hwm_kib=2958164 scratch=10331261
+2026-10-18T08:34:52.900Z current=3641958400 anon=2240737280 file=1382629376 peak=4585197568 rss_kib=2219324 hwm_kib=2958164 scratch=11123988
+2026-10-18T08:34:55.265Z current=2031169536 anon=1046417408 file=965824512 peak=4585197568 rss_kib=1054728 hwm_kib=2958164 scratch=22996505
+2026-10-18T08:34:57.695Z current=2046119936 anon=1526767616 file=500043776 peak=4585197568 rss_kib=1522148 hwm_kib=2958164 scratch=20477431
+2026-10-18T08:35:00.109Z current=2376536064 anon=1841852416 file=488660992 peak=4585197568 rss_kib=1833940 hwm_kib=2958164 scratch=8340607
+2026-10-18T08:35:02.441Z current=1836244992 anon=1327099904 file=492888064 peak=4585197568 rss_kib=1327108 hwm_kib=2958164 scratch=11771400
+2026-10-18T08:35:05.151Z current=1865142272 anon=1357172736 file=491773952 peak=4585197568 rss_kib=1356936 hwm_kib=2958164 scratch=9893906
+2026-10-18T08:35:07.490Z current=2882170880 anon=2287329280 file=578461696 peak=4585197568 rss_kib=2264968 hwm_kib=2958164 scratch=21295254
+2026-10-18T08:35:09.854Z current=3210555392 anon=2484645888 file=714625024 peak=4585197568 rss_kib=2457572 hwm_kib=2958164 scratch=11406614
+2026-10-18T08:35:13.066Z current=1243914240 anon=340242432 file=891817984 peak=4585197568 rss_kib=364728 hwm_kib=2958164 scratch=25797106
+2026-10-18T08:35:15.584Z current=1491820544 anon=984645632 file=492519424 peak=4585197568 rss_kib=999136 hwm_kib=2958164 scratch=14978962
+2026-10-18T08:35:17.913Z current=1661673472 anon=1144918016 file=493891584 peak=4585197568 rss_kib=1125240 hwm_kib=2958164 scratch=15886804
+2026-10-18T08:35:20.227Z current=2133262336 anon=1613795328 file=496250880 peak=4585197568 rss_kib=1607084 hwm_kib=2958164 scratch=17461363
+2026-10-18T08:35:22.516Z current=1829994496 anon=1334984704 file=483995648 peak=4585197568 rss_kib=1334808 hwm_kib=2958164 scratch=9868641
+2026-10-18T08:35:24.982Z current=2287742976 anon=1785311232 file=491446272 peak=4585197568 rss_kib=1774424 hwm_kib=2958164 scratch=19626787
+2026-10-18T08:35:27.402Z current=1973526528 anon=1432014848 file=497672192 peak=4585197568 rss_kib=1421804 hwm_kib=2958164 scratch=22793353
+2026-10-18T08:35:29.804Z current=2108559360 anon=1587949568 file=509169664 peak=4585197568 rss_kib=1594080 hwm_kib=2958164 scratch=24345711
+2026-10-18T08:35:32.250Z current=3443392512 anon=2346614784 file=1079492608 peak=4585197568 rss_kib=2321840 hwm_kib=2958164 scratch=13312389
+2026-10-18T08:35:34.607Z current=3743600640 anon=2473435136 file=1252581376 peak=4585197568 rss_kib=2461560 hwm_kib=2958164 scratch=27420491
+2026-10-18T08:35:36.960Z current=3315433472 anon=2290995200 file=994050048 peak=4585197568 rss_kib=2236672 hwm_kib=2958164 scratch=43797268
+2026-10-18T08:35:39.301Z current=1762689024 anon=1257594880 file=487821312 peak=4585197568 rss_kib=1258292 hwm_kib=2958164 scratch=9273165
+2026-10-18T08:35:41.628Z current=1900171264 anon=1387446272 file=498311168 peak=4585197568 rss_kib=1385060 hwm_kib=2958164 scratch=17575300
+2026-10-18T08:35:43.935Z current=2013454336 anon=1498181632 file=501362688 peak=4585197568 rss_kib=1493172 hwm_kib=2958164 scratch=19837527
+2026-10-18T08:35:46.262Z current=2079997952 anon=1562636288 file=502927360 peak=4585197568 rss_kib=1556176 hwm_kib=2958164 scratch=20633985
+2026-10-18T08:35:48.569Z current=1512833024 anon=999403520 file=499589120 peak=4585197568 rss_kib=1021852 hwm_kib=2958164 scratch=11454943
+2026-10-18T08:35:50.883Z current=3449200640 anon=2293116928 file=1151754240 peak=4585197568 rss_kib=2272008 hwm_kib=2958164 scratch=24416666
+2026-10-18T08:35:53.280Z current=1855709184 anon=871477248 file=971300864 peak=4585197568 rss_kib=881152 hwm_kib=2958164 scratch=12975931
+2026-10-18T08:35:55.522Z current=1452122112 anon=909967360 file=513810432 peak=4585197568 rss_kib=919084 hwm_kib=2958164 scratch=12208493
+2026-10-18T08:35:57.856Z current=1832763392 anon=1304735744 file=510144512 peak=4585197568 rss_kib=1297360 hwm_kib=2958164 scratch=6096262
+2026-10-18T08:36:00.094Z current=1482072064 anon=958074880 file=509489152 peak=4585197568 rss_kib=966068 hwm_kib=2958164 scratch=8373931
+2026-10-18T08:36:02.300Z current=1845248000 anon=1318834176 file=511016960 peak=4585197568 rss_kib=1319180 hwm_kib=2958164 scratch=9136635
+2026-10-18T08:36:04.585Z current=2077597696 anon=1549983744 file=512548864 peak=4585197568 rss_kib=1539764 hwm_kib=2958164 scratch=9900302
+2026-10-18T08:36:06.862Z current=1083015168 anon=545660928 file=524271616 peak=4585197568 rss_kib=564516 hwm_kib=2958164 scratch=20585504
+2026-10-18T08:36:09.149Z current=2800750592 anon=1921400832 file=854179840 peak=4585197568 rss_kib=1907184 hwm_kib=2958164 scratch=11099190
+2026-10-18T08:36:11.431Z current=4249759744 anon=2773450752 file=1449914368 peak=4585197568 rss_kib=2739264 hwm_kib=2958164 scratch=36341366
+2026-10-18T08:36:13.978Z current=2179751936 anon=1165533184 file=992583680 peak=4585197568 rss_kib=1169112 hwm_kib=2958164 scratch=12625758
+2026-10-18T08:36:16.244Z current=2067816448 anon=1534705664 file=514813952 peak=4585197568 rss_kib=1537508 hwm_kib=2958164 scratch=14459983
+2026-10-18T08:36:18.584Z current=1773400064 anon=1237614592 file=516702208 peak=4585197568 rss_kib=1239496 hwm_kib=2958164 scratch=8399198
+2026-10-18T08:36:20.803Z current=2158559232 anon=1622056960 file=520212480 peak=4585197568 rss_kib=1620748 hwm_kib=2958164 scratch=18301090
+2026-10-18T08:36:23.063Z current=2067517440 anon=1538871296 file=512589824 peak=4585197568 rss_kib=1533688 hwm_kib=2958164 scratch=9916595
+2026-10-18T08:36:25.318Z current=1139212288 anon=614359040 file=520454144 peak=4585197568 rss_kib=641768 hwm_kib=2958164 scratch=10350111
+2026-10-18T08:36:27.656Z current=3788980224 anon=2362540032 file=1411424256 peak=4585197568 rss_kib=2345920 hwm_kib=2958164 scratch=25513390
+2026-10-18T08:36:31.608Z current=2348068864 anon=1332649984 file=1000022016 peak=4585197568 rss_kib=1332228 hwm_kib=2958164 scratch=12606164
+2026-10-18T08:36:33.936Z current=2011992064 anon=1476710400 file=520101888 peak=4585197568 rss_kib=1472972 hwm_kib=2958164 scratch=17468746
+2026-10-18T08:36:36.247Z current=2049212416 anon=1480273920 file=513286144 peak=4585197568 rss_kib=1474280 hwm_kib=2958164 scratch=8361261
+2026-10-18T08:36:38.448Z current=1943068672 anon=1414066176 file=514822144 peak=4585197568 rss_kib=1411820 hwm_kib=2958164 scratch=9129128
+2026-10-18T08:36:40.737Z current=2354876416 anon=1816965120 file=521609216 peak=4585197568 rss_kib=1805188 hwm_kib=2958164 scratch=19760772
+2026-10-18T08:36:43.009Z current=1234284544 anon=691564544 file=529612800 peak=4585197568 rss_kib=717648 hwm_kib=2958164 scratch=21280548
+2026-10-18T08:36:45.347Z current=3365810176 anon=2340044800 file=1007693824 peak=4585197568 rss_kib=2315996 hwm_kib=2958164 scratch=11409262
+2026-10-18T08:36:48.130Z current=3748900864 anon=2400059392 file=1324879872 peak=4585197568 rss_kib=2380032 hwm_kib=2958164 scratch=37993116
+2026-10-18T08:36:50.479Z current=1838510080 anon=788635648 file=1008234496 peak=4585197568 rss_kib=785032 hwm_kib=2958164 scratch=40257739
+2026-10-18T08:36:52.878Z current=1033568256 anon=506839040 file=507936768 peak=4585197568 rss_kib=526040 hwm_kib=2958164 scratch=7736814
+2026-10-18T08:36:55.268Z current=1652654080 anon=1116917760 file=518873088 peak=4585197568 rss_kib=1122540 hwm_kib=2958164 scratch=16664593
+2026-10-18T08:36:57.575Z current=1786212352 anon=1251241984 file=518758400 peak=4585197568 rss_kib=1252672 hwm_kib=2958164 scratch=17457556
+2026-10-18T08:36:59.719Z current=1950453760 anon=1435926528 file=514387968 peak=4585197568 rss_kib=1443544 hwm_kib=2958164 scratch=10623661
+2026-10-18T08:37:02.045Z current=1936396288 anon=1391726592 file=526569472 peak=4585197568 rss_kib=1389856 hwm_kib=2958164 scratch=22030630
+2026-10-18T08:37:04.386Z current=2353025024 anon=1817280512 file=517459968 peak=4585197568 rss_kib=1805444 hwm_kib=2958164 scratch=12145946
+2026-10-18T08:37:06.683Z current=3195625472 anon=2138898432 file=1049444352 peak=4585197568 rss_kib=2133508 hwm_kib=2958164 scratch=23492355
+2026-10-18T08:37:08.977Z current=3322716160 anon=2273054720 file=1028730880 peak=4585197568 rss_kib=2232036 hwm_kib=2958164 scratch=27361121
+2026-10-18T08:37:11.380Z current=1333211136 anon=809275392 file=512167936 peak=4585197568 rss_kib=839160 hwm_kib=2958164 scratch=6463830
+2026-10-18T08:37:13.653Z current=1741086720 anon=1203826688 file=513675264 peak=4585197568 rss_kib=1187896 hwm_kib=2958164 scratch=7580054
+2026-10-18T08:37:15.934Z current=1850834944 anon=1308172288 file=515252224 peak=4585197568 rss_kib=1308256 hwm_kib=2958164 scratch=8367111
+2026-10-18T08:37:18.246Z current=2071109632 anon=1530281984 file=516792320 peak=4585197568 rss_kib=1525144 hwm_kib=2958164 scratch=9134049
+2026-10-18T08:37:20.534Z current=2332839936 anon=1790369792 file=518340608 peak=4585197568 rss_kib=1793204 hwm_kib=2958164 scratch=9892968
+2026-10-18T08:37:22.842Z current=2314743808 anon=1790676992 file=519876608 peak=4585197568 rss_kib=1784064 hwm_kib=2958164 scratch=10660412
+2026-10-18T08:37:25.098Z current=3369447424 anon=2358239232 file=993419264 peak=4585197568 rss_kib=2333712 hwm_kib=2958164 scratch=22861398
+2026-10-18T08:37:27.417Z current=4456235008 anon=2770227200 file=1705873408 peak=4585197568 rss_kib=2759048 hwm_kib=2958164 scratch=37318779
+2026-10-18T08:37:29.824Z current=2332262400 anon=1292603392 file=1023086592 peak=4737486848 rss_kib=1293056 hwm_kib=2958164 scratch=12949597
+2026-10-18T08:37:32.125Z current=1671454720 anon=1131466752 file=518053888 peak=4737486848 rss_kib=1135780 hwm_kib=2958164 scratch=6450941
+2026-10-18T08:37:34.441Z current=1950113792 anon=1413701632 file=518651904 peak=4737486848 rss_kib=1413224 hwm_kib=2958164 scratch=7643686
+2026-10-18T08:37:36.741Z current=2094915584 anon=1555099648 file=520208384 peak=4737486848 rss_kib=1549400 hwm_kib=2958164 scratch=8412038
+2026-10-18T08:37:39.038Z current=2316017664 anon=1767550976 file=530939904 peak=4737486848 rss_kib=1756876 hwm_kib=2958164 scratch=18368780
+2026-10-18T08:37:41.308Z current=2090520576 anon=1552039936 file=521924608 peak=4737486848 rss_kib=1546492 hwm_kib=2958164 scratch=9936978
+2026-10-18T08:37:43.485Z current=2982584320 anon=2388320256 file=565035008 peak=4737486848 rss_kib=2365308 hwm_kib=2958164 scratch=32874877
+2026-10-18T08:37:45.867Z current=3734999040 anon=2488647680 file=1231994880 peak=4737486848 rss_kib=2488404 hwm_kib=2958164 scratch=23649632
+2026-10-18T08:37:48.171Z current=2205011968 anon=1139904512 file=1046020096 peak=4737486848 rss_kib=1145672 hwm_kib=2958164 scratch=25198836
+2026-10-18T08:37:50.487Z current=1899499520 anon=1340911616 file=531599360 peak=4737486848 rss_kib=1313796 hwm_kib=2958164 scratch=13625691
+2026-10-18T08:37:52.781Z current=1919295488 anon=1362657280 file=524238848 peak=4737486848 rss_kib=1361548 hwm_kib=2958164 scratch=7628071
+2026-10-18T08:37:55.064Z current=2186285056 anon=1637355520 file=525774848 peak=4737486848 rss_kib=1629808 hwm_kib=2958164 scratch=8394076
+2026-10-18T08:37:57.283Z current=2189471744 anon=1629790208 file=536432640 peak=4737486848 rss_kib=1618420 hwm_kib=2958164 scratch=18332882
+2026-10-18T08:37:59.575Z current=2327306240 anon=1768841216 file=540217344 peak=4737486848 rss_kib=1758156 hwm_kib=2958164 scratch=20576486
+2026-10-18T08:38:01.889Z current=2296225792 anon=1776910336 file=536711168 peak=4737486848 rss_kib=1802968 hwm_kib=2958164 scratch=11427771
+2026-10-18T08:38:04.172Z current=3588362240 anon=2533449728 file=1039294464 peak=4737486848 rss_kib=2487248 hwm_kib=2958164 scratch=35081792
+2026-10-18T08:38:06.579Z current=1606520832 anon=781021184 file=808529920 peak=4737486848 rss_kib=793632 hwm_kib=2958164 scratch=12950578
+2026-10-18T08:38:08.921Z current=2595291136 anon=1525129216 file=1047711744 peak=4737486848 rss_kib=1520160 hwm_kib=2958164 scratch=26674076
+2026-10-18T08:38:11.203Z current=1576652800 anon=1014427648 file=529530880 peak=4737486848 rss_kib=1021480 hwm_kib=2958164 scratch=7912954
+2026-10-18T08:38:13.506Z current=1721212928 anon=1171177472 file=538411008 peak=4737486848 rss_kib=1179408 hwm_kib=2958164 scratch=17462474
+2026-10-18T08:38:15.839Z current=2188775424 anon=1633390592 file=531587072 peak=4737486848 rss_kib=1625972 hwm_kib=2958164 scratch=9874471
+2026-10-18T08:38:18.204Z current=2369208320 anon=1792372736 file=552869888 peak=4737486848 rss_kib=1781220 hwm_kib=2958164 scratch=30395979
+2026-10-18T08:38:20.513Z current=2076569600 anon=1519513600 file=534630400 peak=4737486848 rss_kib=1514684 hwm_kib=2958164 scratch=11394274
+2026-10-18T08:38:22.798Z current=1588269056 anon=1021726720 file=538357760 peak=4737486848 rss_kib=1028552 hwm_kib=2958164 scratch=12163594
+2026-10-18T08:38:25.058Z current=2936098816 anon=2357035008 file=571957248 peak=4737486848 rss_kib=2332344 hwm_kib=2958164 scratch=24354698
+2026-10-18T08:38:27.328Z current=4274085888 anon=2949812224 file=1308786688 peak=4737486848 rss_kib=2911232 hwm_kib=2958164 scratch=32839087
+2026-10-18T08:38:31.575Z current=1556758528 anon=1017208832 file=523669504 peak=4737486848 rss_kib=1023936 hwm_kib=2989160 scratch=6819788
+2026-10-18T08:38:34.213Z current=1530916864 anon=982388736 file=533225472 peak=4737486848 rss_kib=985900 hwm_kib=2989160 scratch=16341847
+2026-10-18T08:38:36.377Z current=1917931520 anon=1372708864 file=527552512 peak=4737486848 rss_kib=1372128 hwm_kib=2989160 scratch=9112456
+2026-10-18T08:38:38.639Z current=2098532352 anon=1542918144 file=538210304 peak=4737486848 rss_kib=1537400 hwm_kib=2989160 scratch=19003613
+2026-10-18T08:38:40.958Z current=2206892032 anon=1647550464 file=551116800 peak=4737486848 rss_kib=1647512 hwm_kib=2989160 scratch=31135299
+2026-10-18T08:38:43.303Z current=3475140608 anon=2339069952 file=1117933568 peak=4737486848 rss_kib=2308376 hwm_kib=2989160 scratch=22789946
+2026-10-18T08:38:46.847Z current=1740660736 anon=815075328 file=901521408 peak=4737486848 rss_kib=827116 hwm_kib=2989160 scratch=25784059
+2026-10-18T08:38:50.586Z current=1128898560 anon=605028352 file=527286272 peak=4737486848 rss_kib=638008 hwm_kib=2989160 scratch=7135965
+2026-10-18T08:38:52.846Z current=1848291328 anon=1301118976 file=531927040 peak=4737486848 rss_kib=1301188 hwm_kib=2989160 scratch=7135965
+2026-10-18T08:38:55.187Z current=1866792960 anon=1320112128 file=531640320 peak=4737486848 rss_kib=1319992 hwm_kib=2989160 scratch=8351781
+2026-10-18T08:38:57.408Z current=2019061760 anon=1468055552 file=543277056 peak=4737486848 rss_kib=1509564 hwm_kib=2989160 scratch=18963118
+2026-10-18T08:38:59.706Z current=2224394240 anon=1676017664 file=536150016 peak=4737486848 rss_kib=1667292 hwm_kib=2989160 scratch=10603847
+2026-10-18T08:39:01.934Z current=2495397888 anon=1933213696 file=548335616 peak=4737486848 rss_kib=1918560 hwm_kib=2989160 scratch=22002178
+2026-10-18T08:39:04.234Z current=2469933056 anon=1896267776 file=556453888 peak=4737486848 rss_kib=1892912 hwm_kib=2989160 scratch=24275783
+2026-10-18T08:39:06.577Z current=3386208256 anon=2206449664 file=1162076160 peak=4737486848 rss_kib=2185296 hwm_kib=2989160 scratch=13109147
+2026-10-18T08:39:08.894Z current=4079923200 anon=2736160768 file=1328832512 peak=4737486848 rss_kib=2702596 hwm_kib=2989160 scratch=13675799
+2026-10-18T08:39:11.148Z current=2228473856 anon=1140649984 file=1068638208 peak=4737486848 rss_kib=1140456 hwm_kib=2989160 scratch=28076306
+2026-10-18T08:39:13.347Z current=1866059776 anon=1298366464 file=542420992 peak=4737486848 rss_kib=1298500 hwm_kib=2989160 scratch=13640076
+2026-10-18T08:39:15.556Z current=2185412608 anon=1629446144 file=535613440 peak=4737486848 rss_kib=1621900 hwm_kib=2989160 scratch=7926860
+2026-10-18T08:39:17.858Z current=1774903296 anon=1282752512 file=479633408 peak=4737486848 rss_kib=1282628 hwm_kib=2989160 scratch=9150245
+2026-10-18T08:39:20.206Z current=2023174144 anon=1466961920 file=542851072 peak=4737486848 rss_kib=1462524 hwm_kib=2989160 scratch=19089098
+2026-10-18T08:39:22.456Z current=2094923776 anon=1545826304 file=535203840 peak=4737486848 rss_kib=1539692 hwm_kib=2989160 scratch=10676120
+2026-10-18T08:39:24.759Z current=3026464768 anon=2388049920 file=622563328 peak=4737486848 rss_kib=2362092 hwm_kib=2989160 scratch=22860939
+2026-10-18T08:39:27.138Z current=3475386368 anon=2330890240 file=1084239872 peak=4737486848 rss_kib=2279264 hwm_kib=2989160 scratch=24371143
+2026-10-18T08:39:29.480Z current=3923689472 anon=2465980416 file=1440227328 peak=4737486848 rss_kib=2442548 hwm_kib=2989160 scratch=12954927
+2026-10-18T08:39:31.880Z current=2557005824 anon=1447931904 file=1090019328 peak=4737486848 rss_kib=1443996 hwm_kib=2989160 scratch=40346498
+2026-10-18T08:39:34.183Z current=1597337600 anon=1035546624 file=540389376 peak=4737486848 rss_kib=1041232 hwm_kib=2989160 scratch=7204350
+2026-10-18T08:39:36.472Z current=2071748608 anon=1498230784 file=548343808 peak=4737486848 rss_kib=1493108 hwm_kib=2989160 scratch=15992716
+2026-10-18T08:39:38.789Z current=1912315904 anon=1352404992 file=542289920 peak=4737486848 rss_kib=1351756 hwm_kib=2989160 scratch=9165806
+2026-10-18T08:39:40.994Z current=2425294848 anon=1846689792 file=562876416 peak=4737486848 rss_kib=1833348 hwm_kib=2989160 scratch=28991118
+2026-10-18T08:39:43.298Z current=2208366592 anon=1649311744 file=544534528 peak=4737486848 rss_kib=1640612 hwm_kib=2989160 scratch=10681307
+2026-10-18T08:39:45.747Z current=3129708544 anon=2478112768 file=640331776 peak=4737486848 rss_kib=2413720 hwm_kib=2989160 scratch=12186971
+2026-10-18T08:39:48.454Z current=3194118144 anon=1986510848 file=1194835968 peak=4737486848 rss_kib=1971072 hwm_kib=2989160 scratch=25117542
+2026-10-18T08:39:51.505Z current=4134232064 anon=2564792320 file=1535799296 peak=4737486848 rss_kib=2515748 hwm_kib=2989160 scratch=27369378
+2026-10-18T08:39:54.297Z current=2526318592 anon=1418936320 file=1088745472 peak=4737486848 rss_kib=1415540 hwm_kib=2989160 scratch=28127126
+2026-10-18T08:39:56.725Z current=1607192576 anon=1031811072 file=555061248 peak=4737486848 rss_kib=1037676 hwm_kib=2989160 scratch=8651234
+2026-10-18T08:39:59.256Z current=1925537792 anon=1345921024 file=561033216 peak=4737486848 rss_kib=1344424 hwm_kib=2989160 scratch=9095046
+2026-10-18T08:40:01.563Z current=1684021248 anon=1108676608 file=556855296 peak=4737486848 rss_kib=1112796 hwm_kib=2989160 scratch=10588195
+2026-10-18T08:40:03.929Z current=2327842816 anon=1739374592 file=568975360 peak=4737486848 rss_kib=1728648 hwm_kib=2989160 scratch=21948657
+2026-10-18T08:40:06.293Z current=2488971264 anon=1898659840 file=571240448 peak=4737486848 rss_kib=1884288 hwm_kib=2989160 scratch=23433953
+2026-10-18T08:40:08.596Z current=2836877312 anon=2088755200 file=723554304 peak=4737486848 rss_kib=2069848 hwm_kib=2989160 scratch=25729931
+2026-10-18T08:40:10.833Z current=4088709120 anon=2496884736 file=1590386688 peak=4737486848 rss_kib=2468420 hwm_kib=2989160 scratch=25306390
+2026-10-18T08:40:13.848Z current=2053849088 anon=945360896 file=1090203648 peak=4737486848 rss_kib=953244 hwm_kib=2989160 scratch=16787723
+2026-10-18T08:40:16.327Z current=2566557696 anon=1458049024 file=1088262144 peak=4737486848 rss_kib=1453884 hwm_kib=2989160 scratch=15131497
+2026-10-18T08:40:18.634Z current=1665830912 anon=1087610880 file=558235648 peak=4737486848 rss_kib=1092288 hwm_kib=2989160 scratch=8626433
+2026-10-18T08:40:20.926Z current=1871790080 anon=1294241792 file=557023232 peak=4737486848 rss_kib=1294084 hwm_kib=2989160 scratch=9085975
+2026-10-18T08:40:23.132Z current=1631256576 anon=1052106752 file=558559232 peak=4737486848 rss_kib=1057568 hwm_kib=2989160 scratch=9852899
+2026-10-18T08:40:25.385Z current=2285608960 anon=1693257728 file=571400192 peak=4737486848 rss_kib=1683668 hwm_kib=2989160 scratch=21206630
+2026-10-18T08:40:27.868Z current=2509750272 anon=1903833088 file=584282112 peak=4737486848 rss_kib=1889540 hwm_kib=2989160 scratch=33324491
+2026-10-18T08:40:30.158Z current=1329471488 anon=700100608 file=569630720 peak=4737486848 rss_kib=679276 hwm_kib=2989160 scratch=12845559
+2026-10-18T08:40:32.566Z current=3313057792 anon=2172297216 file=1120894976 peak=4737486848 rss_kib=2151608 hwm_kib=2989160 scratch=13276789
+2026-10-18T08:40:35.713Z current=3864322048 anon=2337587200 file=1510678528 peak=4737486848 rss_kib=2313252 hwm_kib=2989160 scratch=28796564
+2026-10-18T08:40:39.003Z current=2407858176 anon=1276887040 file=1116450816 peak=4737486848 rss_kib=1277336 hwm_kib=2989160 scratch=29558873
+2026-10-18T08:40:41.458Z current=2118479872 anon=1534611456 file=569180160 peak=4737486848 rss_kib=1529020 hwm_kib=2989160 scratch=15121949
+2026-10-18T08:40:43.758Z current=1916297216 anon=1338785792 file=563916800 peak=4737486848 rss_kib=1337788 hwm_kib=2989160 scratch=9092241
+2026-10-18T08:40:46.004Z current=1845239808 anon=1272127488 file=565452800 peak=4737486848 rss_kib=1287040 hwm_kib=2989160 scratch=9855878
+2026-10-18T08:40:48.264Z current=2312847360 anon=1710837760 file=587464704 peak=4737486848 rss_kib=1701112 hwm_kib=2989160 scratch=31097959
+2026-10-18T08:40:50.592Z current=1094369280 anon=512671744 file=569450496 peak=4737486848 rss_kib=532660 hwm_kib=2989160 scratch=10617143
+2026-10-18T08:40:52.783Z current=2806558720 anon=1489563648 file=1297539072 peak=4737486848 rss_kib=1485080 hwm_kib=2989160 scratch=10617143
+[2026-10-18T08:40:55.890Z] chunk 2 peaks: memory.current 4456235008, anon 2949812224, file 1705873408, memory.peak 4737486848, VmRSS 2911232 KiB, VmHWM 2989160 KiB, scratch 43797268 bytes
+
+## [2026-10-18T08:40:55.893Z] chunk 2: pod trawl-0 every 5 s
+[2026-10-18T08:40:55.896Z] $ awk '{$1=""; print}' '$D/private/mixed/work/c2/pod.log' | sort | uniq -c
+     97  uid=6bf364aa-2626-4e53-a801-701a358621d5 phase=Running reason= ready=True restarts=0
+
+## [2026-10-18T08:40:55.924Z] chunk 2: GET /api/v1/health every 2 s (HTTP status, duckdb check)
+[2026-10-18T08:40:55.928Z] $ awk '{s=$2; d="-"; if (match($0, /"duckdb":"[a-z]+"/)) d=substr($0, RSTART, RLENGTH); print s, d}' '$D/private/mixed/work/c2/health.log' | sort | uniq -c
+    248 200 "duckdb":"ok"
+[2026-10-18T08:40:55.945Z] $ grep -v ' 200 ' '$D/private/mixed/work/c2/health.log' | head -n 20 || true
+
+## [2026-10-18T08:40:55.956Z] chunk 2: /metrics every 10 s
+[2026-10-18T08:40:55.960Z] $ cat '$D/private/mixed/work/c2/metrics.log'
+2026-10-18T08:32:28.982Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_query_permits_retained 0 trawl_hot_buffer_events 3 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 4.910530234 trawl_query_permits_in_use 0 
+2026-10-18T08:32:39.019Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_query_pool_size 8 trawl_query_permits_in_use 2 trawl_hot_buffer_events 5172 trawl_engine_sample_age_seconds 4.946710052 trawl_query_permits_retained 0 
+2026-10-18T08:32:49.056Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_query_permits_retained 0 trawl_query_permits_in_use 3 trawl_engine_sample_age_seconds 4.979966275 trawl_hot_buffer_events 9295 trawl_query_pool_size 8 
+2026-10-18T08:32:59.083Z trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 2 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.003423786 trawl_query_pool_size 8 trawl_hot_buffer_events 14470 
+2026-10-18T08:33:09.112Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_hot_buffer_events 11397 trawl_query_permits_in_use 2 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.050396066 trawl_query_pool_size 8 
+2026-10-18T08:33:19.185Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_query_permits_in_use 5 trawl_query_permits_retained 0 trawl_hot_buffer_events 16266 trawl_engine_sample_age_seconds 5.107578924 trawl_query_pool_size 8 
+2026-10-18T08:33:29.220Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 5.153109297 trawl_query_permits_in_use 4 trawl_hot_buffer_events 12435 trawl_query_permits_retained 0 
+2026-10-18T08:33:39.267Z trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_query_permits_in_use 4 trawl_hot_buffer_events 17587 trawl_engine_sample_age_seconds 5.190271504 
+2026-10-18T08:33:49.300Z trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_hot_buffer_events 13429 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_query_permits_in_use 4 trawl_engine_sample_age_seconds 5.229179255 
+2026-10-18T08:33:59.347Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_query_permits_in_use 5 trawl_engine_sample_age_seconds 5.2853855020000005 trawl_hot_buffer_events 18584 
+2026-10-18T08:34:09.398Z trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 5.3164558920000005 trawl_query_pool_size 8 trawl_hot_buffer_events 13416 trawl_query_permits_retained 0 trawl_query_permits_in_use 4 
+2026-10-18T08:34:19.423Z trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 5.377503586 trawl_query_pool_size 8 trawl_hot_buffer_events 18250 trawl_query_permits_in_use 4 trawl_query_permits_retained 0 
+2026-10-18T08:34:29.494Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_permits_in_use 4 trawl_hot_buffer_events 12425 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.416673234 trawl_query_pool_size 8 
+2026-10-18T08:34:39.525Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 5.452018606 trawl_query_pool_size 8 trawl_query_permits_in_use 5 trawl_hot_buffer_events 9279 trawl_query_permits_retained 0 
+2026-10-18T08:34:49.572Z trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 5.510624571 trawl_query_permits_retained 0 trawl_hot_buffer_events 14444 trawl_query_permits_in_use 5 
+2026-10-18T08:34:59.630Z trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 4 trawl_query_pool_size 8 trawl_hot_buffer_events 11312 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.550263385 
+2026-10-18T08:35:09.663Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 5.582229854 trawl_query_pool_size 8 trawl_hot_buffer_events 15467 trawl_query_permits_in_use 1 trawl_query_permits_retained 0 
+2026-10-18T08:35:19.690Z trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_hot_buffer_events 12345 trawl_engine_sample_age_seconds 5.611418198 trawl_query_permits_in_use 3 
+2026-10-18T08:35:29.742Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_query_permits_in_use 5 trawl_hot_buffer_events 17200 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 5.663772658 
+2026-10-18T08:35:39.782Z trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_query_permits_in_use 2 trawl_engine_sample_age_seconds 5.702406178 trawl_hot_buffer_events 11369 
+2026-10-18T08:35:49.808Z trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_query_permits_in_use 0 trawl_hot_buffer_events 16542 trawl_engine_sample_age_seconds 5.718743965 trawl_query_pool_size 8 
+2026-10-18T08:35:59.821Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_engine_sample_age_seconds 5.732154133 trawl_query_permits_in_use 0 trawl_query_permits_retained 0 trawl_hot_buffer_events 11342 trawl_query_pool_size 8 
+2026-10-18T08:36:09.837Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_engine_sample_age_seconds 5.757987144 trawl_query_permits_in_use 1 trawl_hot_buffer_events 15230 trawl_query_permits_retained 0 trawl_query_pool_size 8 
+2026-10-18T08:36:19.867Z trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_query_permits_in_use 3 trawl_engine_sample_age_seconds 5.80025453 trawl_hot_buffer_events 12401 
+2026-10-18T08:36:29.909Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 5 trawl_engine_sample_age_seconds 5.827812164 trawl_hot_buffer_events 17238 trawl_query_permits_retained 0 trawl_query_pool_size 8 
+2026-10-18T08:36:39.938Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.858786718 trawl_hot_buffer_events 13404 trawl_query_permits_in_use 2 trawl_query_pool_size 8 
+2026-10-18T08:36:49.976Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_hot_buffer_events 18550 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_query_permits_in_use 2 trawl_engine_sample_age_seconds 5.894320103 
+2026-10-18T08:37:00.012Z trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_hot_buffer_events 14427 trawl_query_pool_size 8 trawl_query_permits_in_use 3 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.925494054 
+2026-10-18T08:37:10.045Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.951844767 trawl_query_permits_in_use 4 trawl_query_pool_size 8 trawl_hot_buffer_events 19579 
+2026-10-18T08:37:20.072Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 5.984847351 trawl_query_permits_in_use 2 trawl_hot_buffer_events 13422 trawl_query_pool_size 8 
+2026-10-18T08:37:30.098Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_hot_buffer_events 17563 trawl_query_permits_in_use 6 trawl_query_pool_size 8 trawl_engine_sample_age_seconds 6.015258908 trawl_query_permits_retained 0 
+2026-10-18T08:37:40.128Z trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 6.042465972 trawl_hot_buffer_events 13462 trawl_query_permits_in_use 3 trawl_query_pool_size 8 trawl_query_permits_retained 0 
+2026-10-18T08:37:50.162Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_query_pool_size 8 trawl_query_permits_in_use 5 trawl_query_permits_retained 0 trawl_hot_buffer_events 9595 trawl_engine_sample_age_seconds 6.074906761 
+2026-10-18T08:38:00.186Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 1 trawl_hot_buffer_events 14483 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 6.098602734 
+2026-10-18T08:38:10.211Z trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_in_use 4 trawl_engine_sample_age_seconds 6.13636802 trawl_hot_buffer_events 10596 trawl_query_permits_retained 0 trawl_query_pool_size 8 
+2026-10-18T08:38:20.259Z trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 6.171892335 trawl_query_permits_retained 0 trawl_query_permits_in_use 3 trawl_query_pool_size 8 trawl_hot_buffer_events 15468 
+2026-10-18T08:38:30.287Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_query_pool_size 8 trawl_hot_buffer_events 19257 trawl_query_permits_in_use 4 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 6.229920382 
+2026-10-18T08:38:40.374Z trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 6.294420523 trawl_hot_buffer_events 14428 trawl_query_permits_retained 0 trawl_query_pool_size 8 trawl_query_permits_in_use 3 
+2026-10-18T08:38:50.413Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_hot_buffer_events 8527 trawl_engine_sample_age_seconds 6.326581431 trawl_query_permits_in_use 5 trawl_query_pool_size 8 trawl_query_permits_retained 0 
+2026-10-18T08:39:00.444Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_pool_size 8 trawl_query_permits_in_use 1 trawl_hot_buffer_events 14436 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 6.36560233 
+2026-10-18T08:39:10.482Z trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_hot_buffer_events 19580 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 6.396181491 trawl_query_permits_in_use 4 
+2026-10-18T08:39:20.516Z trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_hot_buffer_events 13442 trawl_query_permits_in_use 2 trawl_engine_sample_age_seconds 6.425322614 trawl_query_permits_retained 0 trawl_query_pool_size 8 
+2026-10-18T08:39:30.542Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 6.451458933 trawl_query_pool_size 8 trawl_query_permits_in_use 5 trawl_hot_buffer_events 18596 
+2026-10-18T08:39:40.572Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_query_permits_retained 0 trawl_query_permits_in_use 3 trawl_hot_buffer_events 13435 trawl_engine_sample_age_seconds 6.486136327 trawl_query_pool_size 8 
+2026-10-18T08:39:50.611Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_engine_sample_age_seconds 6.608972038 trawl_query_pool_size 8 trawl_query_permits_retained 0 trawl_query_permits_in_use 4 trawl_hot_buffer_events 18563 
+2026-10-18T08:40:00.790Z trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_engine_sample_age_seconds 6.707002741 trawl_query_permits_in_use 2 trawl_query_permits_retained 0 trawl_hot_buffer_events 13377 trawl_query_pool_size 8 
+2026-10-18T08:40:10.833Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_query_pool_size 8 trawl_query_permits_in_use 3 trawl_hot_buffer_events 18507 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 6.753529105 
+2026-10-18T08:40:20.878Z trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_hot_buffer_events 12347 trawl_query_permits_in_use 1 trawl_engine_sample_age_seconds 6.778204915 trawl_query_permits_retained 0 trawl_query_pool_size 8 
+2026-10-18T08:40:30.898Z trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_permits_retained 0 trawl_hot_buffer_events 17188 trawl_engine_sample_age_seconds 6.817123444 trawl_query_pool_size 8 trawl_query_permits_in_use 3 
+2026-10-18T08:40:40.943Z trawl_maintenance_resource_exhausted_total 0 trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_hot_buffer_events 10290 trawl_engine_sample_age_seconds 6.849528025 trawl_query_permits_in_use 4 trawl_query_pool_size 8 trawl_query_permits_retained 0 
+2026-10-18T08:40:50.972Z trawl_compaction_operation_failures_total{operation="daily_rollup_unit"} 0 trawl_compaction_operation_failures_total{operation="wal_root_scan"} 0 trawl_compaction_operation_failures_total{operation="consumed_wal_removal"} 0 trawl_compaction_operation_failures_total{operation="daily_rollup_scan"} 0 trawl_compaction_operation_failures_total{operation="wal_environment_scan"} 0 trawl_compaction_operation_failures_total{operation="chunk"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_recovery"} 0 trawl_compaction_operation_failures_total{operation="pending_rollup_scan"} 0 trawl_maintenance_resource_exhausted_total 0 trawl_query_pool_size 8 trawl_query_permits_in_use 0 trawl_hot_buffer_events 14145 trawl_query_permits_retained 0 trawl_engine_sample_age_seconds 6.870481424 
+
+## [2026-10-18T08:40:55.969Z] chunk 2: trawld log: compaction, maintenance, repin, warnings and errors
+[2026-10-18T08:40:55.974Z] $ grep -c 'event_type="compaction_complete"' '$D/private/mixed/work/c2/trawld.log' || true
+52
+[2026-10-18T08:40:55.994Z] $ grep 'event_type="compaction_complete"' '$D/private/mixed/work/c2/trawld.log' | grep -oE 'merged=[a-z]+' | sort | uniq -c
+     52 merged=true
+[2026-10-18T08:40:56.008Z] $ grep 'event_type="compaction_complete"' '$D/private/mixed/work/c2/trawld.log' | grep 'service="i304"' | tail -n 3 | cut -c1-500
+[2026-10-18T08:40:56.018Z] $ grep -E 'repin' '$D/private/mixed/work/c2/trawld.log' | grep -vE 'route="/api/v1/schema/repin/status"' | cut -c1-500 | head -n 30
+2026-10-18T08:33:28.333660192Z 2026-10-18T08:33:28.333573Z  INFO trawl_server::repin::engine: repin job claimed; scanning the corpus event_type="repin_start" job_id=2 field=status from="BIGINT" to="VARCHAR" dry_run=true force=false
+2026-10-18T08:35:48.608249777Z 2026-10-18T08:35:48.608171Z  INFO trawl_server::repin::engine: repin job claimed; scanning the corpus event_type="repin_start" job_id=3 field=code from="VARCHAR" to="BIGINT" dry_run=false force=false
+2026-10-18T08:35:55.492493179Z 2026-10-18T08:35:55.492401Z  INFO trawl_server::repin::engine: repin build pass complete event_type="repin_pass" job_id=3 pass=0 changed=3 files_done=1
+2026-10-18T08:35:55.527297895Z 2026-10-18T08:35:55.527234Z  INFO trawl_server::repin::engine: repin build pass complete event_type="repin_pass" job_id=3 pass=1 changed=0 files_done=1
+2026-10-18T08:35:56.941681845Z 2026-10-18T08:35:56.941571Z  INFO trawl_server::ingest::compaction: daily rollup suppressed for the duration of the running repin job (the catch-up diff must stay additive); hourly files consolidate on the first tick after the job ends event_type="rollup_suppressed"
+2026-10-18T08:35:58.527893896Z 2026-10-18T08:35:58.527832Z  INFO trawl_server::repin::engine: repin job complete: the corpus and the pin now agree event_type="repin_complete" job_id=3 field=code to="BIGINT" duration_ms=3501
+[2026-10-18T08:40:56.027Z] $ grep -E ' (WARN|ERROR) ' '$D/private/mixed/work/c2/trawld.log' | grep -oE 'event_type="[a-z_]+"' | sort | uniq -c
+      6 event_type="pool_pressure"
+[2026-10-18T08:40:56.040Z] $ grep -E ' ERROR |resource_exhausted|catalog_invariant_violation|rollup_unreadable|catalog_conform_skip|compaction_error' '$D/private/mixed/work/c2/trawld.log' | cut -c1-500 | head -n 30
+
+## [2026-10-18T08:40:56.058Z] chunk 2: kubelet events
+FIRST                  LAST                   COUNT    TYPE      REASON              OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled           postgres-5dbf87b8f6-mf85b   Successfully assigned i304-mixed/postgres-5dbf87b8f6-mf85b to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-mixed/trawl-0 to trawl-i304-control-plane
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    SuccessfulCreate    postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-mf85b
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    Created             postgres-5dbf87b8f6-mf85b   Container created
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    ScalingReplicaSet   postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    Pulled              postgres-5dbf87b8f6-mf85b   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-18T08:21:16Z   2026-10-18T08:21:16Z   1        Normal    Started             postgres-5dbf87b8f6-mf85b   Container started
+2026-10-18T08:21:16Z   2026-10-18T08:21:16Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-mf85b   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-18T08:21:18Z   2026-10-18T08:21:24Z   4        Warning   Unhealthy           postgres-5dbf87b8f6-mf85b   Readiness probe failed: /var/run/postgresql:5432 - rejecting connections
+
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-mixed/data-trawl-0"
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T08:21:31Z   2026-10-18T08:21:31Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-902796b2-8e7d-4740-9c86-fa1ebbf728c0
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Started                 trawl-0                     Container started
+
+## [2026-10-18T08:40:56.233Z] chunk 2 done
+
+## [2026-10-18T08:41:02.979Z] report over 2 chunks
+FIRST                  LAST                   COUNT    TYPE      REASON              OBJECT                      MESSAGE
+<nil>                  <nil>                  <none>   Normal    Scheduled           postgres-5dbf87b8f6-mf85b   Successfully assigned i304-mixed/postgres-5dbf87b8f6-mf85b to trawl-i304-control-plane
+<nil>                  <nil>                  <none>   Normal    Scheduled           trawl-0                     Successfully assigned i304-mixed/trawl-0 to trawl-i304-control-plane
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    SuccessfulCreate    postgres-5dbf87b8f6         Created pod: postgres-5dbf87b8f6-mf85b
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    Created             postgres-5dbf87b8f6-mf85b   Container created
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    ScalingReplicaSet   postgres                    Scaled up replica set postgres-5dbf87b8f6 from 0 to 1
+2026-10-18T08:21:15Z   2026-10-18T08:21:15Z   1        Normal    Pulled              postgres-5dbf87b8f6-mf85b   Container image "postgres:18-alpine@sha256:d3e1620b530c944afa6e887d22eb899824da68e19c52024bf98f5220c88a65b2" already present on machine and can be accessed by the pod
+2026-10-18T08:21:16Z   2026-10-18T08:21:16Z   1        Normal    Started             postgres-5dbf87b8f6-mf85b   Container started
+2026-10-18T08:21:16Z   2026-10-18T08:21:16Z   2        Warning   Unhealthy           postgres-5dbf87b8f6-mf85b   Readiness probe failed: /var/run/postgresql:5432 - no response
+
+2026-10-18T08:21:18Z   2026-10-18T08:21:24Z   4        Warning   Unhealthy           postgres-5dbf87b8f6-mf85b   Readiness probe failed: /var/run/postgresql:5432 - rejecting connections
+
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    SuccessfulCreate        trawl                       Create Claim data-trawl-0 Pod trawl-0 in StatefulSet trawl success
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    WaitForFirstConsumer    data-trawl-0                waiting for first consumer to be created before binding
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    Provisioning            data-trawl-0                External provisioner is provisioning volume for claim "i304-mixed/data-trawl-0"
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    ExternalProvisioning    data-trawl-0                Waiting for a volume to be created either by the external provisioner 'rancher.io/local-path' or manually by the system administrator. If volume creation is delayed, please verify that the provisioner is running and correctly registered.
+2026-10-18T08:21:27Z   2026-10-18T08:21:27Z   1        Normal    SuccessfulCreate        trawl                       Create Pod trawl-0 in StatefulSet trawl successful
+2026-10-18T08:21:31Z   2026-10-18T08:21:31Z   1        Normal    ProvisioningSucceeded   data-trawl-0                Successfully provisioned volume pvc-902796b2-8e7d-4740-9c86-fa1ebbf728c0
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Started                 trawl-0                     Container started
+2026-10-18T08:21:32Z   2026-10-18T08:21:32Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Pulled                  trawl-0                     Container image "trawl-i304:after-7dc64b27f566" already present on machine and can be accessed by the pod
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Created                 trawl-0                     Container created
+2026-10-18T08:21:33Z   2026-10-18T08:21:33Z   1        Normal    Started                 trawl-0                     Container started
+[2026-10-18T08:41:03.131Z] $ kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 -n i304-mixed get pods -o wide
+NAME                        READY   STATUS    RESTARTS   AGE   IP            NODE                       NOMINATED NODE   READINESS GATES
+postgres-5dbf87b8f6-mf85b   1/1     Running   0          19m   10.244.0.79   trawl-i304-control-plane   <none>           <none>
+trawl-0                     1/1     Running   0          19m   10.244.0.81   trawl-i304-control-plane   <none>           <none>
+[2026-10-18T08:41:03.239Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-mixed get pod trawl-0 -o json | jq -c '{uid: .metadata.uid, phase: .status.phase, reason: .status.reason, trawld: (.status.containerStatuses[] | select(.name=="trawld") | {ready, restartCount, state, lastState})}'
+{"uid":"6bf364aa-2626-4e53-a801-701a358621d5","phase":"Running","reason":null,"trawld":{"ready":true,"restartCount":0,"state":{"running":{"startedAt":"2026-10-18T08:21:33Z"}},"lastState":{}}}
+[2026-10-18T08:41:03.370Z] $ kubectl --kubeconfig '$D/kubeconfig' --context kind-trawl-i304 -n i304-mixed exec trawl-0 -c trawld -- sh -c 'echo memory.peak $(cat /sys/fs/cgroup/memory.peak); echo memory.max $(cat /sys/fs/cgroup/memory.max); cat /sys/fs/cgroup/memory.events; grep -E "^Vm(HWM|RSS):" /proc/1/status'
+memory.peak 4737486848
+memory.max 8589934592
+low 0
+high 0
+max 0
+oom 0
+oom_kill 0
+oom_group_kill 0
+sock_throttled 378
+VmHWM:	 2989160 kB
+VmRSS:	  364156 kB
+
+## [2026-10-18T08:41:04.393Z] summary
+[2026-10-18T08:41:04.394Z] workload sampled for 1009s over 2 chunks (the gaps between chunks excluded)
+[2026-10-18T08:41:04.395Z] trawl-0 uid at setup 6bf364aa-2626-4e53-a801-701a358621d5, now 6bf364aa-2626-4e53-a801-701a358621d5; trawld restarts 0; cgroup oom_kill 0
+[2026-10-18T08:41:04.397Z] kubelet events naming Evicted, OOMKilling or OOMKilled: 0
+[2026-10-18T08:41:04.398Z] searches: 5321 responses, 0 not 200, 0 query_resource_exhausted
+[2026-10-18T08:41:04.400Z] $ awk '{print $5, $7}' '$D/private/mixed/work/all-searches.log' | sort | uniq -c
+   5321 200 -
+[2026-10-18T08:41:04.407Z] $ cat '$D/private/mixed/work'/c*/ingest.log | awk '{print $2, ($3 ~ /^[0-9]+$/ ? "accepted" : $3)}' | sort | uniq -c
+    500 200 accepted
+      2 done sent=250000
+[2026-10-18T08:41:04.416Z] $ cat '$D/private/mixed/work'/c*/ingest.log | awk '$2==200 && $3 ~ /^[0-9]+$/ {s+=$3} END {print "events accepted in chunks:", s}'
+events accepted in chunks: 500000
+[2026-10-18T08:41:04.425Z] $ cat '$D/private/mixed/work'/c*/health.log | awk '{print $2}' | sort | uniq -c
+    497 200
+[2026-10-18T08:41:04.431Z] $ cat '$D/private/mixed/work'/c*/pod.log | grep -oE 'ready=[A-Za-z]+ restarts=[0-9]+' | sort | uniq -c
+    195 ready=True restarts=0
+[2026-10-18T08:41:04.437Z] $ cat '$D/private/mixed/work'/c*/trawld.log | grep -c 'event_type="compaction_complete"'; cat '$D/private/mixed/work'/c*/trawld.log | grep 'event_type="compaction_complete"' | grep -oE 'merged=[a-z]+' | sort | uniq -c
+120
+    120 merged=true
+[2026-10-18T08:41:04.451Z] $ grep -hE ' -> [0-9]+ ' '$D/private/mixed/work'/c*/repin.log | cut -c1-300; grep -h 'status id=' '$D/private/mixed/work'/c*/repin.log | grep -v '"status":"running"' | cut -c1-300
+2026-10-18T08:24:38.232Z -> 400 0.007527 {"error":{"code":"bad_request","message":"\"seq\" is not a pinned field, so there is nothing to repin"}}
+2026-10-18T08:26:58.777Z -> 202 0.185227 {"id":1,"field":"code","from_type":"BIGINT","to_type":"VARCHAR","dry_run":false,"force":false,"status":"running","requested_by":"ops","started_at":"2026-10-18T08:26:58.603599Z","finished_at":null,"error":null,"files_total":1,"rows_carrying":5000,"projected_nu
+2026-10-18T08:33:28.949Z -> 200 0.633383 {"id":2,"field":"status","from_type":"BIGINT","to_type":"VARCHAR","dry_run":true,"force":false,"status":"succeeded","requested_by":"ops","started_at":"2026-10-18T08:33:28.314417Z","finished_at":"2026-10-18T08:33:28.924436Z","error":null,"files_total":2,"rows_
+2026-10-18T08:35:55.033Z -> 202 6.438767 {"id":3,"field":"code","from_type":"VARCHAR","to_type":"BIGINT","dry_run":false,"force":false,"status":"running","requested_by":"ops","started_at":"2026-10-18T08:35:48.596794Z","finished_at":null,"error":null,"files_total":1,"rows_carrying":5000,"projected_nu
+2026-10-18T08:27:03.854Z status id=1 -> {"id":1,"field":"code","from_type":"BIGINT","to_type":"VARCHAR","dry_run":false,"force":false,"status":"succeeded","requested_by":"ops","started_at":"2026-10-18T08:26:58.603599Z","finished_at":"2026-10-18T08:26:59.199466Z","error":null,"files_total":1,"rows_ca
+2026-10-18T08:36:00.092Z status id=3 -> {"id":3,"field":"code","from_type":"VARCHAR","to_type":"BIGINT","dry_run":false,"force":false,"status":"succeeded","requested_by":"ops","started_at":"2026-10-18T08:35:48.596794Z","finished_at":"2026-10-18T08:35:58.480590Z","error":null,"files_total":1,"rows_ca
+[2026-10-18T08:41:04.475Z] peak memory.current 4456235008 bytes; peak anon 2949812224 bytes; peak file 1705873408 bytes
+[2026-10-18T08:41:04.477Z] cgroup memory.peak 4737486848 bytes (includes page cache); trawld VmHWM 2989160 KiB (peak RSS since start)
+[2026-10-18T08:41:04.483Z] peak query scratch 43797268 bytes (du -sb of /var/lib/trawl/data.query-scratch every 2 s)
+[2026-10-18T08:41:04.484Z] verdict: PASS (no OOM kill, no eviction, no query_resource_exhausted for ordinary searches)
+
+## [2026-10-18T08:41:04.486Z] report done
