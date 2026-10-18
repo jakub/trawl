@@ -608,7 +608,7 @@ CLI's `trawl query --data` option instead.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `path` | string | *(required)* | Parquet data directory. Glob metacharacters (`*`, `?`, `[`, `]`, `{`, `}`) are not accepted |
+| `path` | string | *(required)* | Parquet data directory. Glob metacharacters (`*`, `?`, `[`, `]`, `{`, `}`) and a `..` component are not accepted |
 
 Notes:
 
@@ -646,7 +646,7 @@ Notes:
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Enable `POST /api/v1/ingest` |
 | `max_body_bytes` | byte size | `"16M"` | Request body limit for ingest, as sent and once gzip is decoded. A gzip request can hold its wire body and its decoded body at once, up to twice this value. A key without the `ingest` permission is refused before its body is read |
-| `wal_dir` | path | `{data.path}/wal/` | Write-ahead log directory |
+| `wal_dir` | path | `{data.path}/wal/` | Write-ahead log directory. A `..` component is not accepted |
 | `compaction_interval_secs` | integer | `10` | How often the WAL-to-parquet compaction task runs. Must be greater than `0` when ingest is enabled |
 | `internal_telemetry` | bool | `true` | Write server events into the ingest pipeline as `service=trawld` |
 | `daily_rollup` | bool | `true` | Merge hourly parquet files into daily files for older dates |
