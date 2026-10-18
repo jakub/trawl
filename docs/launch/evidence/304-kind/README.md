@@ -5,7 +5,7 @@ These runs took place on `fractal`, on the local kind cluster `trawl-i304`, on 2
 - **AC1.** At `b02b8acf`, a workload that holds every executor permit gets readiness 503 with `query_not_started kind=ping`, and a query that spills past 512Mi gets the pod evicted for the `tmp` emptyDir. On the PR head, the same workload keeps the pod Ready, answers 503 `query_resource_exhausted` to the spilling query, and evicts nothing.
 - **AC19.** A mixed run of ingest, queries, compaction and repin at the new defaults, in the chart's 8Gi limit, finishes with no OOM kill, no eviction and no `query_resource_exhausted` for ordinary searches. The run records peak RSS and peak scratch bytes.
 
-The before run shows both failures. The after run keeps the pod Ready and evicts nothing. The incident's spilling query (phase B) needs less spill than the head's 4 GiB budget, and it answered 200 in seven attempts of eight. A wider query that needs more spill than the budget (phase C) answered 503 `query_resource_exhausted` in all four attempts, and a small query then answered 200. The mixed run passed.
+The before run shows both failures. The after run keeps the pod Ready and evicts nothing. The incident's spilling query (phase B) needs less spill than the head's 4 GiB budget, and it answered 200 in seven attempts of eight. A wider query built to need more spill than the budget (phase C) answered 503 `query_resource_exhausted` in all four attempts, and a small query then answered 200. The public answer does not say which budget stopped it. A supplementary calibration, committed beside the after run, shows the spill budget doing so. The mixed run passed.
 
 ## Files
 
@@ -20,8 +20,11 @@ The before run shows both failures. The after run keeps the pod Ready and evicts
 | `mixed-ingest.py` | Steady ingest for the mixed run, at a fixed rate, with `_time` set to the moment each batch is built. |
 | `values-mixed.yaml` | The mixed run's only overrides: image pull policy, the two DSN Secrets, and no web sidecar. |
 | `postgres.yaml` | A disposable in-cluster PostgreSQL for each namespace. |
+| `calib-fast.sh LABEL PAUSE NAME...` | Supplementary calibration for phase C. It runs the named `repro.sh` queries once each in a namespace that `STOP_AFTER=ingest repro.sh` set up, while a loop in the trawld container samples query scratch bytes and cgroup memory every 0.2 s. It writes `LABEL-fast-transcript.txt`. |
 | `before-transcript.txt` | The AC1 before run, image `trawl-i304:before-b02b8acfb8a2`, 2026-10-17. |
 | `after-transcript.txt` | The AC1 after run, phases A to C, image `trawl-i304:after-7dc64b27f566`, 2026-10-18. It replaces an earlier after run with phases A and B only (see AC1 after). |
+| `spill-calib-transcript.txt` | The calibration setup, `STOP_AFTER=ingest` in the throwaway namespace `i304-spill-calib`, image `trawl-i304:after-7dc64b27f566`, 2026-10-18. |
+| `spill-calib-fast-transcript.txt` | The calibration runs in that namespace: SPILL_BIG_QUERY three times, then SPILL_QUERY once. |
 | `mixed-transcript.txt` | The AC19 mixed run on the same after image, 2026-10-18. |
 
 ## What ran
@@ -49,6 +52,14 @@ Set `D` to this directory's copy of the kit, which also holds the cluster's `kub
    $D/repro.sh trawl-i304:before-b02b8acfb8a2 before $D/build/src-before/chart/trawl
    STOP_AFTER=b $D/repro.sh trawl-i304:after-7dc64b27f566 after $D/build/src-after/chart/trawl
    START_AT=c $D/repro.sh trawl-i304:after-7dc64b27f566 after $D/build/src-after/chart/trawl
+   ```
+
+   The supplementary calibration for phase C runs in a throwaway namespace, which you delete afterwards:
+
+   ```bash
+   STOP_AFTER=ingest $D/repro.sh trawl-i304:after-7dc64b27f566 spill-calib $D/build/src-after/chart/trawl
+   $D/calib-fast.sh spill-calib 5 SPILL_BIG_QUERY SPILL_BIG_QUERY SPILL_BIG_QUERY SPILL_QUERY
+   kubectl --kubeconfig $D/kubeconfig --context kind-trawl-i304 delete namespace i304-spill-calib
    ```
 
    The after run takes about 9 minutes, and each agent command had a 10-minute limit, so it ran as two commands. `STOP_AFTER=b` stops after phase B. `START_AT=c` runs phase C against the same namespace and appends to the same transcript. Without either variable, one command runs every phase. At `b02b8acf`, phase B evicts the pod, so the script skips phase C and says so in the transcript. The committed before transcript was recorded before phase C existed.
@@ -87,16 +98,22 @@ The run took two commands on one pod (see Rerun): setup through phase B from 09:
 | Pod stays Ready throughout | Yes. The pod watcher shows `ready=True restarts=0` on one uid in all 36 samples of phase A, all 124 of phase B and all 42 of phase C. Health answered 200 with `"duckdb":"ok"` all 72 times in phase A and all 93 times in phase C. The kubelet logged no probe failure for `trawl-0` in any phase. All 87 STARVE_QUERY responses were 200. | 410–445, 764–887, 1131–1172, 315–388, 1176–1272, 455–488, 981–1014, 1310–1343, 311 |
 | No `query_not_started kind=ping` | Yes. The count is 0, and all 88 outcomes are `success`. | 451, 453 |
 | Phase B: the incident's spill query, under budget, completes with `/tmp` at 0 | Yes. Attempts 1 and 3–8 answered 200 in 9.2–12.4 s. Query scratch peaked at 2,838,630,950 bytes, under the 4 GiB budget. `/tmp` was 0 bytes in all 120 samples. Attempt 2 answered 503 `query_resource_exhausted` after 7.7 s, with scratch at 530,220,407 bytes in its last sample (see below). | 505–512, 640–760, 517–636, 506, 656, 961 |
-| Phase C: the over-budget query answers 503 `query_resource_exhausted` | Yes, all 4 attempts, in 10.5–13.5 s, each with the fixed message. trawld logged each one as `http_failure status=503 cause_kind="duckdb_resource_exhausted"`. The stored `http_failure` events (`service=trawld`) carry the same status and cause for the same four request IDs. | 1033–1036, 1280, 1285, 1290, 1295, 1305–1308 |
-| Phase C: scratch stays at or under the budget plus slack | Yes. The 2 s sampler's peak was 3,470,535,948 bytes. The budget plus DuckDB's block slack is 4,294,967,296 + 1,179,648 = 4,296,146,944 bytes. | 1084–1122, 1123 |
+| Phase C: the over-budget query answers 503 `query_resource_exhausted` | Yes, all 4 attempts, in 10.5–13.5 s, each with the fixed message. This shows that a query resource budget stopped each attempt, with nothing evicted and the pod Ready. It does not show which budget (see below). trawld logged each one as `http_failure status=503 cause_kind="duckdb_resource_exhausted"`. The stored `http_failure` events (`service=trawld`) carry the same status and cause for the same four request IDs. | 1033–1036, 1280, 1285, 1290, 1295, 1305–1308 |
+| Phase C: scratch stays at or under the budget plus slack | Yes, in every 2 s sample. The largest was 3,470,535,948 bytes. The budget plus DuckDB's block slack is 4,294,967,296 + 1,179,648 = 4,296,146,944 bytes. | 1084–1122, 1123 |
 | Phase C: a small query then succeeds | Yes. `service=i304 \| stats count()` answered 200 in 0.11 s with 800,000. | 1037 |
 | Evicts nothing | Yes. `/tmp` was 0 bytes in every sample of phases B and C, because spill goes to `/var/lib/trawl/data.query-scratch` on the PVC. The transcript has no `Evicted` event. The pod kept uid `df57fbca…` with restart count 0 and an empty `lastState`. The script printed `evicted=no` after phase B and again after phase C. | 517–636, 1042–1080, 1349, 1021, 1350 |
 
 Phase B's health section prints only its first 60 samples (lines 891–950), all 200. The full sampler file held 255 samples, all 200 with `"duckdb":"ok"`. It is not committed. The pod watcher is the committed readiness evidence for phase B. Phase C prints its whole health log.
 
-**Which budget stops each query.** The head logs only the safe message, even at debug (lines 960, 1279), so the transcript names no budget. The scratch samples tell them apart:
+**Which budget stops each query.** ADR-0056 gives memory exhaustion and spill exhaustion the same public answer, and the head logs only the safe message, even at debug (lines 960, 1279). So the after transcript establishes the AC1 clause, 503 `query_resource_exhausted` with nothing evicted and the pod Ready, but it does not name the budget. A query that ran out of the 2 GiB memory limit first would leave the same transcript. In phase C the 2 s sampler's largest sample was 3,470,535,948 bytes (lines 1094, 1123), under the 4 GiB spill budget. Near the end, scratch grows by 100–200 MB every 0.2 s, so a 2 s sampler misses the last seconds before a failure.
 
-- Phase C: the 2 s sampler misses the last moments before each failure, because scratch grows by 300–500 MB a second. Before the run, in throwaway namespaces with the same image, values and corpus, SPILL_BIG_QUERY ran 10 times. All 10 answered 503 `query_resource_exhausted` in 9.6–14.0 s. In two of them, an in-pod sampler every 0.2 s saw scratch climb steadily to 4,294,968,827 bytes (1,531 bytes past the budget, inside the slack) and to 4,267,680,306 bytes in the last sample before the failure. In the four runs where it was sampled, trawld's anon memory peaked at 2.41–2.66 GB. So the 4 GiB spill budget stops this query, not the 2 GiB memory limit. The same calibration ran SPILL_QUERY once: it answered 200 in 11.2 s with a sampled scratch peak of 2,478,998,783 bytes.
+- Phase C: a supplementary calibration supports the attribution to the spill budget. `STOP_AFTER=ingest repro.sh` set up the throwaway namespace `i304-spill-calib` with the after image, the same `values.yaml` (4Gi, 1 CPU, `query_spill_max_bytes = "4GiB"`, `query_memory_limit = "2GiB"`) and the same 800,000-event corpus, and stopped before phase A (`spill-calib-transcript.txt` lines 19–20, 203–208, 211–212). `calib-fast.sh` then ran SPILL_BIG_QUERY three times and SPILL_QUERY once, sampling every 0.2 s inside the trawld container (`spill-calib-fast-transcript.txt`):
+  - All three SPILL_BIG_QUERY runs answered 503 `query_resource_exhausted`, in 8.7–9.7 s (lines 22, 82, 138).
+  - In each run, scratch climbed steadily to 4,277,062,003, 4,278,756,507 and 4,237,671,326 bytes in the last sample before DuckDB freed it. That is 16–57 MB short of the 4,294,967,296-byte budget, less than the 100–200 MB that scratch grew between samples (lines 66–71, 125–128, 181–184, and the peak lines 78, 134, 191).
+  - The cgroup's anon memory peaked at 2.46–2.57 GB in those runs (lines 79, 135, 192). SPILL_QUERY answered 200 in 16.1 s with a scratch peak of 2,398,535,696 bytes and an anon peak of 2,833,387,520 bytes, more anon memory than any failing run used (lines 195, 281–282).
+  - The pod kept its uid, restart count 0 and `oom_kill 0` (lines 286, 291–292).
+
+  So each failing run stopped with scratch at the spill budget, and with less anon memory than a run that succeeded. This points to the 4 GiB spill budget, not the 2 GiB memory limit. It is still an inference, for two reasons. Anon memory counts more than DuckDB's buffer pool. The calibration ran on a fresh pod, not after phases A and B.
 - Phase B attempt 2 failed with 530 MB of scratch, far under the spill budget, so it most likely ran out of the 2 GiB memory limit. The run does not prove it.
 
 After the run, the trawld cgroup read `memory.peak` 4294967296 (the 4Gi limit), `memory.events` `max 0`, `oom 0` and `oom_kill 0`, with restart count 0 and an empty `lastState`. Page cache from the scratch writes filled the cgroup up to its limit, and the kernel reclaimed it. These values were read with `kubectl exec` after the script ended, so they are not in the transcript.
