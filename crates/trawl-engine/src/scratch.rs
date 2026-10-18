@@ -174,10 +174,16 @@ const SPILL_SIZE_CLASSES: [&str; 8] = [
 /// an `idx_t` (`uint64_t`). The files of buffers larger than a block are
 /// `duckdb_temp_block-<id>.block` (`standard_buffer_manager.cpp`,
 /// `GetTemporaryPath`: `"duckdb_temp_block-" + to_string(id) + ".block"`),
-/// where `<id>` is a `block_id_t` (`int64_t`) counted up from
-/// `MAXIMUM_BLOCK`, so never negative. Each number is accepted only as the
-/// C++ library prints it: no sign, no leading zero, within its type's
-/// width. A `DuckDB` upgrade has to re-check both shapes and the classes.
+/// where `<id>` is a `block_id_t` (`int64_t`). The buffer manager starts
+/// its temporary-id counter at `MAXIMUM_BLOCK`
+/// (`storage_info.hpp`: `4611686018427388000`) and pre-increments it
+/// before it names a block (`standard_buffer_manager.cpp`: `++temporary_id`
+/// at both allocation sites), so the first id a file can carry is
+/// `MAXIMUM_BLOCK + 1` and every id from `0` through `MAXIMUM_BLOCK` is
+/// one `DuckDB` cannot have made. Each number is accepted only as the C++
+/// library prints it: no sign, no leading zero, within its type's width
+/// (and, for a block id, above that floor). A `DuckDB` upgrade has to
+/// re-check both shapes, the classes and the floor.
 #[must_use]
 pub fn is_spill_file_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
@@ -193,8 +199,15 @@ pub fn is_spill_file_name(name: &OsStr) -> bool {
     }
     name.strip_prefix("duckdb_temp_block-")
         .and_then(|rest| rest.strip_suffix(".block"))
-        .is_some_and(is_printed_integer::<i64>)
+        .is_some_and(|id| {
+            is_printed_integer::<i64>(id) && id.parse::<i64>().is_ok_and(|id| id > MAXIMUM_BLOCK)
+        })
 }
+
+/// `DuckDB` 1.5.5's `MAXIMUM_BLOCK` (`storage_info.hpp`): the temporary
+/// block-id counter starts here and is incremented before use, so a spill
+/// block file's id is strictly above it.
+const MAXIMUM_BLOCK: i64 = 4_611_686_018_427_388_000;
 
 /// Whether `digits` is a non-negative integer of type `T` exactly as C++
 /// prints one: ASCII digits only, no sign, no leading zero but `0` itself,
@@ -1232,7 +1245,8 @@ mod tests {
             "duckdb_temp_storage_S192K-0.tmp",
             "duckdb_temp_storage_S224K-3.tmp",
             "duckdb_temp_storage_DEFAULT-18446744073709551615.tmp",
-            "duckdb_temp_block-0.block",
+            // The first id DuckDB can name is MAXIMUM_BLOCK + 1.
+            "duckdb_temp_block-4611686018427388001.block",
             "duckdb_temp_block-4611686018427388160.block",
             "duckdb_temp_block-9223372036854775807.block",
         ] {
@@ -1259,6 +1273,13 @@ mod tests {
             "duckdb_temp_block--1.block",
             "duckdb_temp_block-+1.block",
             "duckdb_temp_block-007.block",
+            // At or below MAXIMUM_BLOCK: DuckDB counts up from it, and
+            // names a file only after incrementing, so none of these is
+            // a name it can have made.
+            "duckdb_temp_block-0.block",
+            "duckdb_temp_block-1.block",
+            "duckdb_temp_block-4611686018427387999.block",
+            "duckdb_temp_block-4611686018427388000.block",
             // Over the width of an int64_t.
             "duckdb_temp_block-9223372036854775808.block",
             "duckdb_temp_block-18446744073709551615.block",
