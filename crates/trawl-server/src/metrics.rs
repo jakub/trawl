@@ -173,7 +173,9 @@ pub const COMPACTION_OPERATION_FAILURES_TOTAL: &str = "trawl_compaction_operatio
 /// out of `[ingest] compaction_memory_limit`: `DuckDB` raised `Out of
 /// Memory` (ADR-0056). Counted once per failed statement, where it fails
 /// ([`crate::ingest::compaction::StatementFailure`]). The inputs stay where
-/// they are for the next pass.
+/// they are; whether the operation is retried is its own outcome (compaction
+/// and rollup on the next pass, boot conformance on the next boot, never a
+/// failed repin job).
 pub const MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL: &str = "trawl_maintenance_resource_exhausted_total";
 pub const FILES_QUARANTINED_TOTAL: &str = "trawl_files_quarantined_total";
 /// Publication markers recovery looked at, by `outcome`
@@ -612,7 +614,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL,
-        "Compaction, rollup, conform and repin statements that ran out of ingest.compaction_memory_limit; the inputs are kept and retried"
+        "Compaction, rollup, conform and repin statements that ran out of ingest.compaction_memory_limit; the inputs are kept, and whether the operation is retried depends on it (compaction and rollup retry on the next pass, boot conformance on the next boot, a failed repin job is not retried)"
     );
     describe_counter!(
         PUBLICATION_RECOVERY_TOTAL,

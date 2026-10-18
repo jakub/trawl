@@ -3088,7 +3088,11 @@ pub(crate) fn structured_errors(conn: &duckdb::Connection) -> Result<(), String>
 /// the failed statement. A caller that would otherwise read the failure as
 /// bad input (a corrupt WAL file to quarantine, a nonconformant parquet
 /// file, a file the boot pass skips) asks [`Self::is_out_of_memory`] first
-/// and leaves its inputs alone for the next pass.
+/// and leaves its inputs alone. What happens next belongs to the operation:
+/// compaction and rollup retry on the compaction task's next pass, boot
+/// conformance leaves the file incomplete until the next boot, and a repin
+/// ends `failed` and abandons its shadow generation, so an operator submits
+/// a new job.
 ///
 /// The text is `DuckDB`'s own wording behind the caller's context, as the
 /// connection would word it without `errors_as_json`. Every other failure,
@@ -3115,8 +3119,9 @@ impl StatementFailure {
                 event_type = "maintenance_resource_exhausted",
                 error = %text,
                 "maintenance work ran out of ingest.compaction_memory_limit; its \
-                 inputs are kept and retried, and it fails the same way until \
-                 the limit is raised or the input shrinks"
+                 inputs are kept, and it fails the same way until the limit is \
+                 raised or the input shrinks; see the operation's own outcome \
+                 for whether it is retried"
             );
         }
         Self {
