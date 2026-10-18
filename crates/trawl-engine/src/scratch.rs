@@ -277,7 +277,13 @@ pub struct OwnedRoot {
     /// What the root is, with the setting it comes from, such as `the data
     /// root ([data] path)`.
     pub what: &'static str,
-    /// Its configured path. It need not exist yet.
+    /// Its configured path. It need not exist yet, but it must carry no
+    /// `..` component: a root that does not exist yet is placed by the
+    /// nearest directory on its path that does, and a `..` after a missing
+    /// component would name a directory other than the one trawld makes
+    /// (`<base>/missing/../x` is placed at `<base>` but made at
+    /// `<base>/x`). Config validation refuses such a spelling for every
+    /// root trawld passes here.
     pub path: PathBuf,
 }
 

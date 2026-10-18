@@ -268,7 +268,8 @@ pub struct DataConfig {
     /// Directory containing parquet files (e.g. "/var/lib/trawl/data").
     ///
     /// Must be a directory path. Glob metacharacters (`*`, `?`, `[`, `]`,
-    /// `{`, `}`) are rejected when daemon configuration is validated.
+    /// `{`, `}`) and a `..` component are rejected when daemon
+    /// configuration is validated.
     pub path: String,
 }
 
@@ -295,7 +296,8 @@ pub struct IngestConfig {
     )]
     pub max_body_bytes: usize,
 
-    /// WAL directory path. Defaults to `{data.base_dir}/wal/`.
+    /// WAL directory path. Defaults to `{data.base_dir}/wal/`. A `..`
+    /// component is rejected when daemon configuration is validated.
     pub wal_dir: Option<PathBuf>,
 
     /// How often the compaction task runs (seconds). Default: 10.
@@ -1965,6 +1967,28 @@ impl Config {
             )));
         }
 
+        // The roots trawld owns by name are kept apart from the query
+        // scratch directory by comparing the directories at startup, and a
+        // root that does not exist yet is placed by the nearest directory
+        // on its path that does. A `..` after a component that is missing
+        // places `<base>/missing/../x` at `<base>` while trawld later makes
+        // it at `<base>/x`, which can be the scratch directory itself. So
+        // the data root and the WAL directory, and with them the repin
+        // roots beside the data root, carry no `..` (ADR-0056).
+        for (key, path) in [
+            ("data.path", Path::new(&self.data.path)),
+            (
+                "ingest.wal_dir",
+                self.ingest.wal_dir.as_deref().unwrap_or(Path::new("")),
+            ),
+        ] {
+            if path.components().any(|c| c == Component::ParentDir) {
+                return Err(ConfigError::Validation(format!(
+                    "{key} must not contain a '..' component"
+                )));
+            }
+        }
+
         if self.server.max_concurrent_queries == 0 {
             return Err(ConfigError::Validation(
                 "server.max_concurrent_queries must be > 0".into(),
@@ -2042,8 +2066,9 @@ impl Config {
     /// filesystem and also serves `--check-config` and the doctors. A
     /// comparison of spellings cannot see where `..` or the working
     /// directory leads, so an explicit directory must be absolute and free
-    /// of `..`; the default follows `data.path`'s rules. Startup repeats the
-    /// check against the opened directory, which also sees symlinks.
+    /// of `..`; the default follows `data.path`'s rules, which also refuse
+    /// `..`. Startup repeats the check against the opened directory, which
+    /// also sees symlinks.
     fn validate_query_scratch_dir(&self) -> Result<(), ConfigError> {
         const KEY: &str = "server.query_scratch_dir";
         if let Some(dir) = &self.server.query_scratch_dir {
@@ -4458,5 +4483,48 @@ severity_from = [7]
             config.query_scratch_dir(),
             Path::new("relative/data.query-scratch")
         );
+    }
+
+    /// #304 R5-1: a root spelled through `..` after a component that does
+    /// not exist yet, such as `<base>/missing/../scratch`, has no directory
+    /// to compare until trawld makes `missing`; the filesystem overlap
+    /// check at startup then falls back to `<base>` and passes a scratch
+    /// directory that the root resolves onto once it is made. The spelling
+    /// comparison here cannot see it either. So every owned root is spelled
+    /// without `..`: the data root, the WAL directory (and the repin roots,
+    /// which follow the data root). The refusal names the key, not the path.
+    #[test]
+    fn owned_roots_refuse_parent_components() {
+        for (key, data, wal) in [
+            ("data.path", "/srv/trawl/missing/../scratch", "/srv/wal"),
+            ("data.path", "/srv/trawl/data/..", "/srv/wal"),
+            ("data.path", "../trawl/data", "/srv/wal"),
+            (
+                "ingest.wal_dir",
+                "/srv/trawl/data",
+                "/srv/trawl/missing/../scratch",
+            ),
+            ("ingest.wal_dir", "/srv/trawl/data", "../wal"),
+        ] {
+            let document = format!(
+                "[server]\nquery_scratch_dir = \"/srv/trawl/scratch\"\n\
+                 [data]\npath = \"{data}\"\n[ingest]\nwal_dir = \"{wal}\"\n"
+            );
+            let err = Config::from_toml(&document)
+                .expect_err(&document)
+                .to_string();
+            assert_eq!(
+                err,
+                format!("config validation error: {key} must not contain a '..' component"),
+                "{document}"
+            );
+            assert!(!err.contains("/srv") && !err.contains("trawl/"), "{err}");
+        }
+        // A `.` component resolves where it is spelled, so it stays accepted.
+        let config = Config::from_toml(
+            "[server]\n[data]\npath = \"/srv/trawl/./data\"\n[ingest]\nwal_dir = \"/srv/./wal\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.wal_dir(), Path::new("/srv/./wal"));
     }
 }
