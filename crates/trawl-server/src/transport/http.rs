@@ -725,6 +725,9 @@ impl Incoming {
     }
 
     /// Report how many connection tasks the loop holds.
+    // The probe lives on `self` only under `test-support`; the signature stays
+    // the same in every build so the accept loop's call sites carry no cfg.
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(clippy::unused_self))]
     fn note_tracked(&self, tracked: usize) {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(probe) = &self.probe {
