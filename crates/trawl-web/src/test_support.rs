@@ -62,9 +62,44 @@ pub const LOOPBACK_SANS: [&str; 2] = ["localhost", "127.0.0.1"];
 /// own write queue fills. With the fixture's sockets locked here, that is
 /// the proxy's send buffer, which the fixture does not own and which
 /// autotunes to at most `net.ipv4.tcp_wmem`'s maximum, 4 MiB on stock
-/// Linux, plus under 1 MiB of fixture buffers. A body of 16 MiB is well
-/// past both.
+/// Linux, plus under 1 MiB of fixture buffers. [`wedge_body_bytes`] sizes
+/// a body well past both on the host the test runs on.
 pub const NARROW_SOCKET_BUFFER: u32 = 64 * 1024;
+
+/// The smallest body [`wedge_body_bytes`] returns, and the one it returns
+/// where the host's send-buffer maximum cannot be read: four times the
+/// stock Linux maximum of 4 MiB.
+pub const WEDGE_BODY_FLOOR: usize = 16 * 1024 * 1024;
+
+/// The size of a request body that no socket between the proxy and a
+/// [`NARROW_SOCKET_BUFFER`] fixture can absorb: four times the host's
+/// `net.ipv4.tcp_wmem` maximum, the most the proxy's autotuned send
+/// buffer grows to, rounded up to a whole MiB and never under
+/// [`WEDGE_BODY_FLOOR`]. Where `/proc/sys/net/ipv4/tcp_wmem` does not exist
+/// or does not parse, which is every host but Linux, it is the floor.
+pub fn wedge_body_bytes() -> usize {
+    wedge_body_bytes_for(
+        std::fs::read_to_string("/proc/sys/net/ipv4/tcp_wmem")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// [`wedge_body_bytes`] for the given content of `tcp_wmem`: three
+/// whitespace-separated byte counts, minimum, default and maximum.
+pub fn wedge_body_bytes_for(tcp_wmem: Option<&str>) -> usize {
+    const MIB: usize = 1024 * 1024;
+    let maximum = tcp_wmem
+        .and_then(|text| text.split_whitespace().nth(2))
+        .and_then(|field| field.parse::<usize>().ok());
+    maximum.map_or(WEDGE_BODY_FLOOR, |maximum| {
+        maximum
+            .saturating_mul(4)
+            .div_ceil(MIB)
+            .saturating_mul(MIB)
+            .max(WEDGE_BODY_FLOOR)
+    })
+}
 
 /// A listener on `127.0.0.1:0`, its kernel buffers locked at `buffer`
 /// bytes when one is given. Accepted sockets inherit the lock.

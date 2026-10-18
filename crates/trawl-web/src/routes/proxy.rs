@@ -388,7 +388,7 @@ mod tests {
     use crate::config::ResolvedConfig;
     use crate::middleware::request_count::{PROXY_MAX_REQUESTS, RequestCount};
     use crate::routes;
-    use crate::test_support::{HandUpstream, TlsUpstream};
+    use crate::test_support::{HandUpstream, TlsUpstream, wedge_body_bytes, wedge_body_bytes_for};
 
     /// The browser origin these fixtures answer on. The CSRF tests below
     /// send it verbatim; anything else is a foreign origin by definition,
@@ -1508,6 +1508,31 @@ mod tests {
         );
     }
 
+    /// The body that wedges is sized from the host's `tcp_wmem` maximum
+    /// (R9-8): four times it, rounded up to a whole MiB, never under
+    /// 16 MiB, and 16 MiB where the file cannot be read or parsed.
+    #[test]
+    fn wedge_body_is_sized_from_the_hosts_send_buffer_maximum() {
+        const MIB: usize = 1024 * 1024;
+        // Stock Linux: a 4 MiB maximum, 4 x 4 MiB is the floor itself.
+        assert_eq!(
+            wedge_body_bytes_for(Some("4096\t16384\t4194304\n")),
+            16 * MIB
+        );
+        // A host that autotunes further gets a body four times as big.
+        assert_eq!(wedge_body_bytes_for(Some("4096 131072 6291456")), 24 * MIB);
+        assert_eq!(wedge_body_bytes_for(Some("4096 87380 33554432")), 128 * MIB);
+        // Rounded up to a whole MiB, never down.
+        assert_eq!(wedge_body_bytes_for(Some("4096 87380 5242881")), 21 * MIB);
+        // A small maximum still gets the floor.
+        assert_eq!(wedge_body_bytes_for(Some("4096 16384 1048576")), 16 * MIB);
+        // Anything unreadable is the floor, the non-Linux path included.
+        for unreadable in [None, Some(""), Some("4096 16384"), Some("4096 16384 many")] {
+            assert_eq!(wedge_body_bytes_for(unreadable), 16 * MIB, "{unreadable:?}");
+        }
+        assert!(wedge_body_bytes() >= 16 * MIB);
+    }
+
     /// The budget is held as long as the body allocation lives, not until
     /// the response head (R8-7). The flood route answers its head before
     /// it reads a byte of the body and never reads it, as trawld leaves a
@@ -1515,18 +1540,19 @@ mod tests {
     /// response, so both ends block on their writes and most of the body
     /// stays in hyper's write queue, zero-copy, behind the sockets. The
     /// fixture's sockets are locked at 128 KiB and the proxy's send
-    /// buffer autotunes to `tcp_wmem`'s 4 MiB at most, so a 16 MiB body
-    /// can never be absorbed. After the head the budget still shows the
+    /// buffer autotunes to the host's `tcp_wmem` maximum at most, so the
+    /// body, sized at four times that maximum with a 16 MiB floor
+    /// ([`wedge_body_bytes`]), can never be absorbed. After the head the budget still shows the
     /// body charged: a second body the remainder cannot cover is refused
     /// at once and never reaches trawld, and one it covers is served.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_budget_is_held_while_the_sent_body_is_still_queued() {
-        const BODY: usize = 16 * 1024 * 1024;
-        const BUDGET: usize = BODY + BODY / 2;
+        let size = wedge_body_bytes();
+        let budget_bytes = size + size / 2;
         let upstream = HandUpstream::start_narrow().await;
         let state = limited_state(&upstream, |cfg| {
-            cfg.limits.request_body_bytes = BODY;
-            cfg.limits.body_budget_bytes = BUDGET;
+            cfg.limits.request_body_bytes = size;
+            cfg.limits.body_budget_bytes = budget_bytes;
         });
         let budget = state.body_budget().clone();
         let app = routes::build_with_count(state, RequestCount::new(PROXY_MAX_REQUESTS));
@@ -1535,7 +1561,7 @@ mod tests {
             Duration::from_secs(10),
             app.clone().oneshot(bearer_post(
                 HandUpstream::FLOOD_PATH,
-                Body::from(vec![b'x'; BODY]),
+                Body::from(vec![b'x'; size]),
             )),
         )
         .await
@@ -1544,14 +1570,14 @@ mod tests {
         assert_eq!(wedged.status(), StatusCode::OK);
         assert_eq!(
             budget.available(),
-            BUDGET - BODY,
+            budget_bytes - size,
             "the body is still queued, yet the budget shows it released"
         );
 
         let refused = tokio::time::timeout(
             Duration::from_secs(5),
             app.clone()
-                .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; BODY]))),
+                .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; size]))),
         )
         .await
         .expect("the refusal is immediate")
@@ -1562,7 +1588,7 @@ mod tests {
             Duration::from_secs(10),
             app.clone().oneshot(bearer_post(
                 "/api/v1/search",
-                Body::from(vec![b'x'; BODY / 2]),
+                Body::from(vec![b'x'; size / 2]),
             )),
         )
         .await
@@ -1579,7 +1605,7 @@ mod tests {
         );
         assert_eq!(
             budget.available(),
-            BUDGET - BODY,
+            budget_bytes - size,
             "the wedged body gave its reservation back, or the sent one kept it"
         );
         drop(wedged);
@@ -1597,12 +1623,12 @@ mod tests {
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_wedged_send_is_torn_down_at_the_head_deadline() {
-        const BODY: usize = 16 * 1024 * 1024;
         const DEADLINE: Duration = Duration::from_secs(2);
+        let size = wedge_body_bytes();
         let upstream = HandUpstream::start_narrow().await;
         let state = limited_state(&upstream, |cfg| {
-            cfg.limits.request_body_bytes = BODY;
-            cfg.limits.body_budget_bytes = BODY;
+            cfg.limits.request_body_bytes = size;
+            cfg.limits.body_budget_bytes = size;
             cfg.limits.upstream_head_timeout = DEADLINE;
         });
         let budget = state.body_budget().clone();
@@ -1612,7 +1638,7 @@ mod tests {
             Duration::from_secs(10),
             app.clone().oneshot(bearer_post(
                 HandUpstream::FLOOD_PATH,
-                Body::from(vec![b'x'; BODY]),
+                Body::from(vec![b'x'; size]),
             )),
         )
         .await
@@ -1626,7 +1652,7 @@ mod tests {
             "the body is still queued, yet the budget shows it released"
         );
 
-        while budget.available() < BODY {
+        while budget.available() < size {
             assert!(
                 head_at.elapsed() < Duration::from_secs(8),
                 "the wedged connection kept its body {:?} after the head, past the {DEADLINE:?} deadline",
@@ -1659,7 +1685,7 @@ mod tests {
 
         let next = tokio::time::timeout(
             Duration::from_secs(10),
-            app.oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; BODY]))),
+            app.oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; size]))),
         )
         .await
         .expect("the request after the teardown was answered")
