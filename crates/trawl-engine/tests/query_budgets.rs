@@ -6,6 +6,8 @@
 //! they read back from a clone, and a spill past the cap fails as
 //! [`EngineError::ResourceExhausted`] without the spill directory ever
 //! holding more than the cap plus one block of each temp-file size class.
+//! That bound holds while each class stays within one temp file, which is
+//! true at the small caps these tests use (see [`CLASS_SLACK`]).
 
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -27,9 +29,14 @@ const BLOCK: u64 = 262_144;
 /// `DuckDB` accounts a temp file as its highest block index in use, but
 /// truncates a shrinking file one block past that
 /// (`TemporaryFileManager::RemoveTempBlockIndex`), and keeps one file per
-/// size class until a class passes 4000 blocks, about 1000 MiB. So each
-/// class's file can hold one block it does not count. The spill probe
-/// measured up to 1.9 blocks past the cap.
+/// size class until a class passes 4000 blocks, about 1000 MiB at 256 KiB
+/// blocks, then adds files of 4000 × 2^n blocks (`TemporaryFileHandle`,
+/// `TemporaryFileMap`). So each live file can hold one block it does not
+/// count. This figure is one block per class, which is the bound only while
+/// every class stays within one file. These tests run at caps of tens of
+/// MiB, where it does; at the 4 GiB default a class can hold several files
+/// and the bound is one block per live file. The spill probe measured up to
+/// 1.9 blocks past the cap.
 const CLASS_SLACK: u64 = 1_179_648;
 
 fn budgets(spill: u64, memory: u64, threads: u32) -> QueryBudgets {

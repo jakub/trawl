@@ -397,7 +397,10 @@ const MIB: u64 = 1024 * 1024;
 
 /// What the spill directory may hold past the cap on `DuckDB` 1.5.5: one
 /// block of each temp-file size class, 32 KiB to 256 KiB in 32 KiB steps
-/// (ADR-0056; `CLASS_SLACK` in trawl-engine's `query_budgets` tests).
+/// (ADR-0056; `CLASS_SLACK` in trawl-engine's `query_budgets` tests). That
+/// is one block per class only while each class stays within one temp file,
+/// which holds at the small caps these tests use; at the 4 GiB default a
+/// class can hold several files, each overshooting by up to one block.
 const CLASS_SLACK: u64 = 1_179_648;
 
 /// Rows in [`spill_corpus`]. With 128 MiB of memory and two threads,
@@ -780,7 +783,8 @@ const SPILL_CAP: u64 = 24 * MIB;
 /// A query that spills past `[server] query_spill_max_bytes` answers 503
 /// `query_resource_exhausted` with cause `duckdb_resource_exhausted` and
 /// the fixed sentence (ADR-0056). The spill directory never holds more
-/// than the cap plus one block of each temp-file size class, the usage
+/// than the cap plus one block of each temp-file size class (one file per
+/// class, which holds at this test's small cap), the usage
 /// `DuckDB` accounts never passes the cap, and a small query on the same
 /// server then succeeds.
 #[test]

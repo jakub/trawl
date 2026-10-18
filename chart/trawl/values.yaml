@@ -161,9 +161,11 @@ config:
     # scratch on the crash-dump volume.
     queryScratchDir: ""
     # Ceiling on the spill one trawld holds in the scratch directory, shared
-    # by every query. DuckDB overshoots it on disk by part of a block per
-    # temp-file size class while it writes. Keep retention.minFreeDiskBytes
-    # above it: nothing checks the two against each other.
+    # by every query. DuckDB overshoots it on disk by up to one block (32 to
+    # 256 KiB) per live temp file while it writes. A size class adds a file
+    # each time it passes 4000 blocks, so at 4GiB it can hold several. Keep
+    # retention.minFreeDiskBytes above it: nothing checks the two against
+    # each other.
     querySpillMaxBytes: "4GiB"
     # DuckDB memory_limit for the query database, shared by every query.
     # Compaction, rollup, conform and repin have their own,
