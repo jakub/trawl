@@ -43,7 +43,7 @@ use rcgen::{
     KeyPair, KeyUsagePurpose,
 };
 use rustls::pki_types::PrivatePkcs8KeyDer;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 use trawl_config::WebConfig;
@@ -52,6 +52,52 @@ use wiremock::MockServer;
 /// The names a loopback upstream answers to: its certificate covers both,
 /// so a test may dial either spelling.
 pub const LOOPBACK_SANS: [&str; 2] = ["localhost", "127.0.0.1"];
+
+/// The kernel buffer, send and receive, asked for on every socket a
+/// narrow fixture owns ([`TlsFront::narrow`], [`HandUpstream::start_narrow`]).
+/// Linux doubles it to 128 KiB and, since it was set, never autotunes it.
+///
+/// A test that needs a connection to wedge must know how many bytes the
+/// sockets between the proxy and the fixture absorb before the proxy's
+/// own write queue fills. With the fixture's sockets locked here, that is
+/// the proxy's send buffer, which the fixture does not own and which
+/// autotunes to at most `net.ipv4.tcp_wmem`'s maximum, 4 MiB on stock
+/// Linux, plus under 1 MiB of fixture buffers. A body of 16 MiB is well
+/// past both.
+pub const NARROW_SOCKET_BUFFER: u32 = 64 * 1024;
+
+/// A listener on `127.0.0.1:0`, its kernel buffers locked at `buffer`
+/// bytes when one is given. Accepted sockets inherit the lock.
+async fn listen_loopback(buffer: Option<u32>) -> TcpListener {
+    let Some(bytes) = buffer else {
+        return TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+    };
+    let socket = TcpSocket::new_v4().expect("a loopback socket");
+    socket.set_send_buffer_size(bytes).expect("SO_SNDBUF");
+    socket.set_recv_buffer_size(bytes).expect("SO_RCVBUF");
+    socket
+        .bind("127.0.0.1:0".parse().expect("loopback address"))
+        .expect("bind a loopback listener");
+    socket.listen(128).expect("listen on loopback")
+}
+
+/// A connection to `target`, its kernel buffers locked at `buffer` bytes
+/// when one is given.
+async fn connect_loopback(target: SocketAddr, buffer: Option<u32>) -> std::io::Result<TcpStream> {
+    let Some(bytes) = buffer else {
+        return TcpStream::connect(target).await;
+    };
+    let socket = if target.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    socket.set_send_buffer_size(bytes)?;
+    socket.set_recv_buffer_size(bytes)?;
+    socket.connect(target).await
+}
 
 /// A self-signed CA, with its certificate written to `ca.pem` in a
 /// directory it owns. The directory lives as long as the CA does.
@@ -180,10 +226,31 @@ impl TlsFront {
     /// A front for `target` whose leaf names `sans` and is issued by `ca`.
     /// Fronts that share a CA are all trusted by one pin.
     pub async fn issued_by(ca: &Arc<TestCa>, target: SocketAddr, sans: &[&str]) -> Self {
+        Self::build(ca, target, sans, None).await
+    }
+
+    /// A front for `target` under a fresh CA, answering to
+    /// [`LOOPBACK_SANS`], whose sockets, the listener's and each relay's
+    /// connection to `target`, hold [`NARROW_SOCKET_BUFFER`] bytes each
+    /// way and never grow.
+    pub async fn narrow(target: SocketAddr) -> Self {
+        Self::build(
+            &TestCa::generate(),
+            target,
+            &LOOPBACK_SANS,
+            Some(NARROW_SOCKET_BUFFER),
+        )
+        .await
+    }
+
+    async fn build(
+        ca: &Arc<TestCa>,
+        target: SocketAddr,
+        sans: &[&str],
+        buffer: Option<u32>,
+    ) -> Self {
         let acceptor = TlsAcceptor::from(Arc::new(ca.server_config(sans)));
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the TLS front");
+        let listener = listen_loopback(buffer).await;
         let addr = listener.local_addr().expect("TLS front address");
         let counts = Arc::new(FrontCounts::default());
         let seen = Arc::clone(&counts);
@@ -203,7 +270,7 @@ impl TlsFront {
                         open.0.handshake_failures.fetch_add(1, Ordering::SeqCst);
                         return;
                     };
-                    let Ok(mut plain) = TcpStream::connect(target).await else {
+                    let Ok(mut plain) = connect_loopback(target, buffer).await else {
                         return;
                     };
                     let _ = tokio::io::copy_bidirectional(&mut tls, &mut plain).await;
@@ -227,6 +294,12 @@ impl TlsFront {
     /// completed, such as a client refusing the front's certificate.
     pub fn handshake_failures(&self) -> usize {
         self.counts.handshake_failures.load(Ordering::SeqCst)
+    }
+
+    /// How many accepted connections are still open: in their handshake
+    /// or being relayed.
+    pub fn open_connections(&self) -> usize {
+        self.counts.open.load(Ordering::SeqCst)
     }
 
     /// Wait until every connection the front accepted has finished, its
@@ -420,10 +493,15 @@ pub fn captured_logs<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
 /// - `/api/v1/stream` and `/api/v1/dashboard/stream`: a 200
 ///   `text/event-stream` head at once, then one event every
 ///   [`HandUpstream::EVENT_INTERVAL`] until the connection closes.
+/// - [`HandUpstream::FLOOD_PATH`]: a 200 chunked head at once, before any
+///   byte of the request body is read, then response bytes as fast as the
+///   connection takes them until it closes. The request body is never
+///   read, as trawld leaves a body its handler ignores.
 /// - anything else: a 200 `{}` body, after the hold if one is set.
 ///
-/// A request is recorded, as `METHOD path`, as soon as its head is read,
-/// before any hold, so a test can wait until the proxy has sent it.
+/// A request is recorded, as `METHOD path`, as soon as its head and, on
+/// the routes that read it, its body are read, before any hold, so a
+/// test can wait until the proxy has sent it.
 pub struct HandUpstream {
     front: TlsFront,
     seen: Arc<std::sync::Mutex<Vec<String>>>,
@@ -435,13 +513,26 @@ impl HandUpstream {
     /// How often an open stream sends an event.
     pub const EVENT_INTERVAL: Duration = Duration::from_millis(25);
 
+    /// The route that never reads its request body and floods its
+    /// response.
+    pub const FLOOD_PATH: &'static str = "/api/v1/flood";
+
     /// Start the upstream under a fresh CA, answering at once.
     pub async fn start() -> Self {
-        let plain = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the hand upstream");
+        Self::start_with(None).await
+    }
+
+    /// [`Self::start`] with every socket the fixture owns, the front's and
+    /// its own, holding [`NARROW_SOCKET_BUFFER`] bytes each way and never
+    /// growing, so a test knows how much a stalled connection absorbs.
+    pub async fn start_narrow() -> Self {
+        Self::start_with(Some(NARROW_SOCKET_BUFFER)).await
+    }
+
+    async fn start_with(buffer: Option<u32>) -> Self {
+        let plain = listen_loopback(buffer).await;
         let plain_addr = plain.local_addr().expect("hand upstream address");
-        let front = TlsFront::start(plain_addr).await;
+        let front = TlsFront::build(&TestCa::generate(), plain_addr, &LOOPBACK_SANS, buffer).await;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (hold, holding) = tokio::sync::watch::channel(false);
         let log = Arc::clone(&seen);
@@ -522,6 +613,16 @@ impl HandUpstream {
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or_default().to_owned();
         let path = parts.next().unwrap_or_default().to_owned();
+        let bare = path.split('?').next().unwrap_or_default().to_owned();
+
+        if bare == Self::FLOOD_PATH {
+            log.lock()
+                .expect("hand upstream log")
+                .push(format!("{method} {bare}"));
+            Self::flood(stream).await;
+            return;
+        }
+
         let length: usize = lines
             .filter_map(|line| line.split_once(':'))
             .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
@@ -535,12 +636,10 @@ impl HandUpstream {
                 Ok(n) => body_read += n,
             }
         }
-        log.lock().expect("hand upstream log").push(format!(
-            "{method} {}",
-            path.split('?').next().unwrap_or_default()
-        ));
+        log.lock()
+            .expect("hand upstream log")
+            .push(format!("{method} {bare}"));
 
-        let bare = path.split('?').next().unwrap_or_default();
         if bare == "/api/v1/whoami" {
             let body =
                 r#"{"name":"alice","roles":["trawl-analyst"],"permissions":["query","stream"]}"#;
@@ -591,6 +690,32 @@ impl HandUpstream {
                 .as_bytes(),
             )
             .await;
+    }
+}
+
+impl HandUpstream {
+    /// Answer [`Self::FLOOD_PATH`]: the head goes out before the request
+    /// body is read, and the body is never read. The flood then runs until
+    /// the connection takes no more: each write waits for room and ends
+    /// on an error.
+    async fn flood(mut stream: TcpStream) {
+        use tokio::io::AsyncWriteExt as _;
+
+        if stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                  transfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let data = vec![b'x'; 64 * 1024];
+        let mut chunk = format!("{:x}\r\n", data.len()).into_bytes();
+        chunk.extend_from_slice(&data);
+        chunk.extend_from_slice(b"\r\n");
+        while stream.write_all(&chunk).await.is_ok() {}
     }
 }
 

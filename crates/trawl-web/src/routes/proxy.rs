@@ -91,9 +91,11 @@ async fn do_forward(
     // rule hold for every cookie route, including the next one.
     let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
 
-    // The reservation is held, with the count, until the response head:
-    // the buffered body is alive until trawld has read it.
-    let (body_bytes, _reservation) =
+    // The body carries its budget reservation inside the `Bytes`: it is
+    // released when the last reference to the allocation drops, wherever
+    // that is. For a body trawld reads, that is before its response head.
+    // For one trawld leaves unread, it is when the connection ends.
+    let body_bytes =
         collect_body(&parts.headers, body, state.limits(), state.body_budget()).await?;
 
     // After every local check, so a request refused here never waits on
@@ -217,12 +219,15 @@ pub(crate) fn refuse_redirect(status: reqwest::StatusCode) -> Result<(), ProxyEr
 /// the budget. The buffer is allocated at the reservation and never
 /// grows past it, so the reservation is the memory. One copy is made,
 /// from each chunk as it arrives into that buffer, and the buffer goes
-/// to reqwest as the `Bytes` it is frozen into. The body deadline is the
+/// to reqwest as the `Bytes` it is frozen into, with the reservation
+/// inside ([`ReservedBody`]): the budget is given back when the last
+/// reference to the allocation drops, reqwest's retry copy and hyper's
+/// write queue included, and not before. The body deadline is the
 /// router's (`middleware::body_deadline`); a read that fails because it
 /// passed is 408 `timeout` here, the answer the layer gives whatever a
 /// handler makes of it. None of these refusals contacts trawld. The
-/// count and the reservation the request holds are released with the
-/// refusal, as with any response head.
+/// count the request holds is released with the refusal, as with any
+/// response head, and so is the reservation, since no body outlives one.
 ///
 /// # Errors
 /// [`ProxyError::RequestTooLarge`], [`ProxyError::BodyBudgetFull`],
@@ -233,7 +238,7 @@ async fn collect_body(
     body: Body,
     limits: &ProxyLimits,
     budget: &BodyBudget,
-) -> Result<(Bytes, BodyReservation), ProxyError> {
+) -> Result<Bytes, ProxyError> {
     let limit = limits.request_body_bytes;
     // What one body may hold: the limit, or the budget when the limit is
     // the larger of the two, since the budget could never cover more.
@@ -291,8 +296,37 @@ async fn collect_body(
         }
         buffer.extend_from_slice(&chunk);
     }
-    // `Bytes` takes the vector's allocation as it is: no copy.
-    Ok((Bytes::from(buffer), reservation))
+    // `Bytes` takes the vector's allocation as it is, no copy, and the
+    // reservation with it.
+    Ok(Bytes::from_owner(ReservedBody {
+        bytes: buffer,
+        _reservation: reservation,
+    }))
+}
+
+/// A buffered request body and the budget it was charged, as one owner
+/// for the `Bytes` reqwest sends.
+///
+/// `Bytes::from_owner` drops the owner when the last `Bytes` that refers
+/// to it drops, so the reservation lives exactly as long as the
+/// allocation. Every reference counts: reqwest keeps one for a retry
+/// until the response head, and hyper keeps the body queued, zero-copy,
+/// until the connection has written it. A body trawld never reads, on a
+/// route that ignores it, therefore keeps its budget until the connection
+/// is torn down, where a reservation dropped at the response head let a
+/// caller hold many such bodies while the budget showed them free
+/// (ADR-0054, amended 2026-10-18). A stream body that owned the
+/// reservation would not do: hyper drops the body object once its queue
+/// has taken the chunks, while the queue still holds the allocation.
+struct ReservedBody {
+    bytes: Vec<u8>,
+    _reservation: BodyReservation,
+}
+
+impl AsRef<[u8]> for ReservedBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// Compose the upstream URL: the configured base followed by the
@@ -1411,12 +1445,12 @@ mod tests {
     }
 
     /// A declared body is charged its own length, no more, and gives it
-    /// back at the response head: with 600 of a 1024-byte budget held by
-    /// a body trawld has not answered, a 500-byte body is refused at once
-    /// and a 400-byte one is admitted. Both reservations return when
-    /// trawld answers.
+    /// back once trawld has taken it and answered: with 600 of a 1024-byte
+    /// budget held by a body trawld has not answered, a 500-byte body is
+    /// refused at once and a 400-byte one is admitted. Both reservations
+    /// return when trawld answers, since it read both bodies first.
     #[tokio::test(flavor = "multi_thread")]
-    async fn proxy_body_budget_charges_the_declared_length_until_the_response_head() {
+    async fn proxy_body_budget_charges_the_declared_length_until_the_body_is_sent_and_answered() {
         let upstream = HandUpstream::start().await;
         upstream.hold();
         let state = limited_state(&upstream, |cfg| {
@@ -1472,6 +1506,83 @@ mod tests {
             upstream.seen(),
             ["POST /api/v1/search", "POST /api/v1/search"]
         );
+    }
+
+    /// The budget is held as long as the body allocation lives, not until
+    /// the response head (R8-7). The flood route answers its head before
+    /// it reads a byte of the body and never reads it, as trawld leaves a
+    /// body its handler ignores, and the browser here never reads the
+    /// response, so both ends block on their writes and most of the body
+    /// stays in hyper's write queue, zero-copy, behind the sockets. The
+    /// fixture's sockets are locked at 128 KiB and the proxy's send
+    /// buffer autotunes to `tcp_wmem`'s 4 MiB at most, so a 16 MiB body
+    /// can never be absorbed. After the head the budget still shows the
+    /// body charged: a second body the remainder cannot cover is refused
+    /// at once and never reaches trawld, and one it covers is served.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn proxy_body_budget_is_held_while_the_sent_body_is_still_queued() {
+        const BODY: usize = 16 * 1024 * 1024;
+        const BUDGET: usize = BODY + BODY / 2;
+        let upstream = HandUpstream::start_narrow().await;
+        let state = limited_state(&upstream, |cfg| {
+            cfg.limits.request_body_bytes = BODY;
+            cfg.limits.body_budget_bytes = BUDGET;
+        });
+        let budget = state.body_budget().clone();
+        let app = routes::build_with_count(state, RequestCount::new(PROXY_MAX_REQUESTS));
+
+        let wedged = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.clone().oneshot(bearer_post(
+                HandUpstream::FLOOD_PATH,
+                Body::from(vec![b'x'; BODY]),
+            )),
+        )
+        .await
+        .expect("the head arrived")
+        .unwrap();
+        assert_eq!(wedged.status(), StatusCode::OK);
+        assert_eq!(
+            budget.available(),
+            BUDGET - BODY,
+            "the body is still queued, yet the budget shows it released"
+        );
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.clone()
+                .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; BODY]))),
+        )
+        .await
+        .expect("the refusal is immediate")
+        .unwrap();
+        assert_proxy_request_limit_refusal(refused).await;
+
+        let admitted = tokio::time::timeout(
+            Duration::from_secs(10),
+            app.clone().oneshot(bearer_post(
+                "/api/v1/search",
+                Body::from(vec![b'x'; BODY / 2]),
+            )),
+        )
+        .await
+        .expect("the admitted body was answered")
+        .unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK);
+        assert_eq!(
+            upstream.seen(),
+            [
+                format!("POST {}", HandUpstream::FLOOD_PATH),
+                "POST /api/v1/search".to_owned()
+            ],
+            "trawld saw the refused body"
+        );
+        assert_eq!(
+            budget.available(),
+            BUDGET - BODY,
+            "the wedged body gave its reservation back, or the sent one kept it"
+        );
+        drop(wedged);
     }
 
     /// At the default limit the count fills before the budget: sixty-four

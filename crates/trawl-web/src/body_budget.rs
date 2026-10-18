@@ -21,8 +21,11 @@
 //! The reservation is taken with a try-acquire and never waited for: a
 //! body the budget cannot cover is refused at once with the same 503
 //! `request_limit_reached` the count gives, and trawld is not contacted.
-//! It is held until the response head, like the count, because the
-//! buffered body is alive until trawld has read it.
+//! It travels inside the `Bytes` the forwarder sends and is released
+//! when the last reference to that allocation drops, so it is held
+//! exactly as long as the buffered body is alive: until trawld has read
+//! the body, or, for a body trawld leaves unread, until the connection
+//! ends. The count, by contrast, is released at the response head.
 //!
 //! At the default 128 KiB limit the count fills first: 64 × 128 KiB is
 //! 8 MiB, a sixteenth of the budget, so the defaults behave as before.
