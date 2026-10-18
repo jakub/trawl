@@ -1,0 +1,19 @@
+# Helm values for the #304 mixed run (mixed.sh, AC19). Everything else is
+# the chart's default: the 8Gi trawld limit and 1Gi request, no CPU limit,
+# the query budgets, max_concurrent_queries, compaction_memory_limit,
+# min_free_disk_bytes, rate limits and log filter. mixed.sh adds only
+# image.repository/tag.
+image:
+  pullPolicy: Never          # the image is kind-loaded, never pulled
+
+auth:
+  database:
+    existingSecret: fleet-db
+storage:
+  database:
+    existingSecret: trawl-db
+
+# trawld's probes call trawld's own /api/v1/health, and the workload talks
+# to trawld directly, so the browser sidecar plays no part.
+web:
+  enabled: false

@@ -1,0 +1,57 @@
+# Helm values for the #304 kind reproduction. The before and after runs
+# install with this same file; repro.sh adds only image.repository/tag. Every
+# key here exists in the chart at b02b8acf and is left alone by the fix.
+image:
+  pullPolicy: Never          # the image is kind-loaded, never pulled
+
+auth:
+  database:
+    existingSecret: fleet-db
+storage:
+  database:
+    existingSecret: trawl-db
+
+# trawld's readiness, liveness and startup probes call /api/v1/health on
+# trawld itself, so the browser sidecar plays no part in either failure.
+web:
+  enabled: false
+
+persistence:
+  size: 20Gi
+
+config:
+  server:
+    # Two executor permits. The homelab pool had 4 (one per CPU); two make
+    # the pool easy to fill with a small, fixed workload.
+    maxConcurrentQueries: 2
+    # The chart default, as in the incident: a query that runs past it is
+    # answered 504 and keeps its permit until DuckDB honours the interrupt.
+    timeoutSecs: 30
+    # The workload sends a few hundred searches a minute from one key;
+    # per-key rate limiting would answer 429 instead of queueing for permits.
+    rateLimit:
+      defaultRpm: 0
+      ingestRpm: 0
+
+# Scenario limits for both runs. b02b8acf ships 2Gi and the fix's chart
+# defaults to 8Gi; 4Gi was the fix's default when the before run was
+# recorded, and both runs keep it. At 2Gi the before build is OOM-killed by the spill query instead
+# of spilling: DuckDB defaults its memory_limit to 80% of the cgroup limit, and
+# allocations outside its buffer manager overrun the remaining 400 MiB. At 4Gi
+# the same build spills. One CPU stands in for the homelab's small shared
+# node: DuckDB reads the cgroup's cpu.max and runs one thread, while trawld's
+# pool keeps the 2 permits set above. values-load.yaml lifts both limits while
+# the corpus loads.
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 4Gi
+
+# The chart's filter plus trawl_server::handlers at debug, which logs each
+# failed query's error text (event_type="query_error_text"). At b02b8acf that
+# is DuckDB's text, which the HTTP answer does not carry. The fix logs only
+# the same safe message the answer carries.
+logLevel: "trawl_server=info,trawl_server::handlers=debug,trawld=info,fleet_auth=info,auth.backend=info,storage.backend=info,preauth.transport=info"
