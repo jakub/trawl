@@ -170,7 +170,8 @@ When the server answers 503 `query_resource_exhausted`, the page shows the
 server's sentence as a notice with no syntax underline, because the text is
 fine. It does not retry on its own and offers no **Retry**, because the same
 request spends the same budget again, and it does not claim the result is
-empty. Narrow the time range or simplify the query. See
+empty. Narrow the time range or simplify the query. The export dialog shows
+the same notice when an export is refused this way, and stays open. See
 [query resource exhausted](/reference/api/#query-resource-exhausted).
 
 For every other failure, **Events** shows `Couldn't load results:` with the

@@ -506,7 +506,7 @@ The spill cap counts the bytes DuckDB accounts. On disk, DuckDB can hold a littl
 
 | Install | Scratch directory | Notes |
 |---------|-------------------|-------|
-| Helm | `/var/lib/trawl/data.query-scratch`, on the PVC | `config.server.queryScratchDir` must be an absolute path below `/var/lib/trawl`. The chart refuses to render a path or a `config.data.path` that would put scratch off the data volume. The `/tmp` emptyDir is never used |
+| Helm | `/var/lib/trawl/data.query-scratch`, on the PVC | `config.server.queryScratchDir` must be an absolute path below `/var/lib/trawl`. The chart refuses to render a path or a `config.data.path` that would put scratch off the data volume. With `crashDump.enabled`, it also refuses a `crashDump.mountPath` at, under, or above the scratch directory. The `/tmp` emptyDir is never used |
 | Debian | `/var/lib/trawl/data.query-scratch` | Inside the unit's `StateDirectory` and `ReadWritePaths`. A path elsewhere needs `ReadWritePaths=` extended in a drop-in |
 | `trawl trial` | `/var/lib/trawl/data.query-scratch`, on the `trawld` volume | The trial config pins it |
 | Tarball | `<data.path>.query-scratch` | trawld creates it. The service user needs write access to the data root's parent |

@@ -175,7 +175,7 @@ Capture is Linux-only.
 | `/usr/lib/tmpfiles.d/trawl.conf` | Debian | Creates `/var/lib/trawl/cores` as `0700 trawl:trawl` on every configure and boot, replacing anything there that is not a directory. |
 | `/var/lib/trawl/cores` | Both | The default dump directory. |
 | `/usr/bin/trawld` in the image | Helm | Carries the file capability `cap_sys_ptrace=p`. |
-| `cores` PVC | Helm | Mounted at `crashDump.mountPath` in the trawld container only. Separate from the data PVC. |
+| `cores` PVC | Helm | Mounted at `crashDump.mountPath` in the trawld container only. Separate from the data PVC. The chart refuses a `crashDump.mountPath` at, under, or above the query scratch directory. |
 
 The chart values are `crashDump.enabled`, `crashDump.size`,
 `crashDump.storageClass`, `crashDump.mountPath`, and `crashDump.retain`. Their
