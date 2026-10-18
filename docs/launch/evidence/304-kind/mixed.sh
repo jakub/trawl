@@ -30,6 +30,29 @@
 #   - samplers: trawld's cgroup memory and /proc/1 RSS plus the query scratch
 #     directory every 2 s, the pod every 5 s, /api/v1/health every 2 s,
 #     /metrics every 10 s, and trawld's log.
+# Each worker exits nonzero when its own work failed, and the chunk records
+# every worker's exit status.
+#
+# The report's verdict is PASS only when every check holds, and report then
+# exits 0; otherwise it prints FAIL with the failed checks and exits 1:
+#   - the samplers covered at least 900 s of workload;
+#   - no OOM kill (cgroup oom_kill 0), no trawld restart, the same pod uid
+#     as at setup, and no Evicted, OOMKilling or OOMKilled event;
+#   - searches: at least one response; every response 200 with at least one
+#     row; each of the SEARCHES answered; no query_resource_exhausted;
+#   - ingest: in every chunk the worker ran to its end, no batch was
+#     dropped, and the events accepted equal the events sent; more than zero
+#     events overall (hot_buffer_full answers carry Retry-After and are
+#     retried, so they do not fail the run);
+#   - live tail: in every chunk HTTP 200, at least one snapshot, and the
+#     stream open until curl's time limit (curl exit 28);
+#   - compaction: at least one compaction_complete in every chunk, and no
+#     trawld ERROR line and no resource_exhausted, compaction_error,
+#     catalog_invariant_violation, rollup_unreadable or catalog_conform_skip
+#     line in trawld's log;
+#   - repin: every repin the driver sent ended succeeded, including at least
+#     one dry run and one real repin;
+#   - every worker of every chunk exited 0.
 #
 # trawld is reached through a NodePort Service on the kind node, not a
 # port-forward: kubectl port-forward restarts drop every open connection,
@@ -236,10 +259,12 @@ EOF
 
   say "preload: service i304 at $PRELOAD_RATE events/s for ${PRELOAD_SECS}s, then 5000 events of service i304-repin carrying the integer field code"
   note "\$ python3 -I mixed-ingest.py $ADDR \$PRIV/cert.pem \$PRIV/ingest.header $PRELOAD_RATE $PRELOAD_SECS 304 i304 > \$W/preload.log"
-  python3 -I "$HERE/mixed-ingest.py" "$ADDR" "$PRIV/cert.pem" "$PRIV/ingest.header" "$PRELOAD_RATE" "$PRELOAD_SECS" 304 i304 > "$W/preload.log" 2>&1
+  python3 -I "$HERE/mixed-ingest.py" "$ADDR" "$PRIV/cert.pem" "$PRIV/ingest.header" "$PRELOAD_RATE" "$PRELOAD_SECS" 304 i304 > "$W/preload.log" 2>&1 \
+    || { runsh "tail -n 5 '$W/preload.log'"; note "preload failed"; exit 1; }
   runsh "awk '{print \$2}' '$W/preload.log' | sort | uniq -c; tail -n 1 '$W/preload.log'"
   note "\$ python3 -I mixed-ingest.py $ADDR \$PRIV/cert.pem \$PRIV/ingest.header 2500 2 305 i304-repin code > \$W/preload-repin.log"
-  python3 -I "$HERE/mixed-ingest.py" "$ADDR" "$PRIV/cert.pem" "$PRIV/ingest.header" 2500 2 305 i304-repin code > "$W/preload-repin.log" 2>&1
+  python3 -I "$HERE/mixed-ingest.py" "$ADDR" "$PRIV/cert.pem" "$PRIV/ingest.header" 2500 2 305 i304-repin code > "$W/preload-repin.log" 2>&1 \
+    || { runsh "cat '$W/preload-repin.log'"; note "preload of i304-repin failed"; exit 1; }
   runsh "cat '$W/preload-repin.log'"
   note "waiting for the hot buffer to drain into Parquet"
   local hb=
@@ -283,21 +308,28 @@ sample_health() {
 sample_metrics() { while :; do printf '%s %s\n' "$(ts)" "$(metrics_line)" >> "$1"; sleep 10; done; }
 follow_logs() { "${K[@]}" logs -f trawl-0 -c trawld --timestamps --since=1s 2>&1 | nocolor >> "$1"; }
 
+# A search succeeds when it answers 200, with no error code and at least one
+# row. Each log line ends "-> HTTP SECONDS ERROR_CODE rows=N".
+SEARCH_OK=' -> 200 [0-9.]+ - rows=[1-9][0-9]*$'
 search_client() {  # search_client N END OUT_LOG: SEARCHES round-robin from offset N until END
-  local n=$1 end=$2 out=$3 i=$(( $1 - 1 )) q t0 s0 r code
+  local n=$1 end=$2 out=$3 i=$(( $1 - 1 )) q t0 s0 r code failed=0
   while (( SECONDS < end )); do
     q=${SEARCHES[$(( i % ${#SEARCHES[@]} ))]}
     t0=$(ts); s0=$EPOCHREALTIME
+    : > "$out.body"
     r=$(query "s$n" "$out.body" "$q" 60)
-    code=$(jq -r '.error.code // "-"' "$out.body" 2>/dev/null || echo unparsed)
+    code=$(jq -r '"\(.error.code // "-") rows=\((.rows // []) | length)"' "$out.body" 2>/dev/null || echo "unparsed rows=-")
     printf '%s client=%s search=%s -> %s %s\n' "$t0" "$n" "$(( i % ${#SEARCHES[@]} + 1 ))" "$r" "$code" >> "$out"
+    tail -n 1 "$out" | grep -qE "$SEARCH_OK" || failed=1
     i=$((i + 1))
     sleep "$(awk -v a="$s0" -v b="$EPOCHREALTIME" -v m="$SEARCH_MIN_SECS" 'BEGIN { d = m - (b - a); print (d > 0 ? d : 0) }')"
   done
+  return "$failed"
 }
-repin() {  # repin OUT_LOG JSON_BODY END: POST a repin, then follow a 202 to its end
-  local out=$1 body=$2 end=$3 r id st
+repin() {  # repin OUT_LOG JSON_BODY END: POST a repin, follow a 202 to its end; 0 when it succeeded
+  local out=$1 body=$2 end=$3 r id st dry
   printf '%s POST /api/v1/schema/repin %s\n' "$(ts)" "$body" >> "$out"
+  : > "$out.body"
   r=$(api ops --max-time 60 -o "$out.body" -w '%{http_code} %{time_total}' -H 'Content-Type: application/json' \
     --data "$body" "$(url /api/v1/schema/repin)" 2>/dev/null || true)
   printf '%s -> %s %s\n' "$(ts)" "$r" "$(jq -c '.job // .' "$out.body" 2>/dev/null | head -c 900)" >> "$out"
@@ -309,20 +341,22 @@ repin() {  # repin OUT_LOG JSON_BODY END: POST a repin, then follow a 202 to its
     st=$(jq -r '.job.status // empty' "$out.body" 2>/dev/null || true)
     printf '%s status id=%s -> %s\n' "$(ts)" "$id" "$(jq -c '.job // .' "$out.body" 2>/dev/null | head -c 900)" >> "$out"
   done
+  dry=$(jq -r '.dry_run // false' <<< "$body")
+  printf '%s result id=%s dry_run=%s status=%s\n' "$(ts)" "${id:--}" "$dry" "${st:-none}" >> "$out"
+  [[ $st == succeeded ]]
 }
-repin_driver() {  # repin_driver CHUNK START END OUT_LOG
-  local chunk=$1 start=$2 end=$3 out=$4 to
+repin_driver() {  # repin_driver CHUNK START END OUT_LOG: 0 when both repins succeeded
+  local chunk=$1 start=$2 end=$3 out=$4 to failed=0
   # The real repin flips code between VARCHAR and BIGINT; each chunk reads the
-  # current pin from the previous job, so a rerun keeps alternating.
+  # current pin from the previous job, so a rerun keeps alternating. The dry
+  # run asks what pinning status, an integer field of every event, as text
+  # would do.
   to=BIGINT; (( chunk % 2 == 1 )) && to=VARCHAR
   while (( SECONDS < start + 60 )); do sleep 1; done
-  if (( chunk % 2 == 1 )); then
-    repin "$out" '{"field":"seq","to":"VARCHAR","dry_run":true}' "$end"
-  else
-    repin "$out" '{"field":"status","to":"VARCHAR","dry_run":true}' "$end"
-  fi
+  repin "$out" '{"field":"status","to":"VARCHAR","dry_run":true}' "$end" || failed=1
   while (( SECONDS < start + 200 )); do sleep 1; done
-  repin "$out" "{\"field\":\"code\",\"to\":\"$to\"}" "$end"
+  repin "$out" "{\"field\":\"code\",\"to\":\"$to\"}" "$end" || failed=1
+  return "$failed"
 }
 
 chunk() {
@@ -341,28 +375,38 @@ chunk() {
   follow_logs "$c/trawld.log" & bg_pids+=($!)
   start=$SECONDS
   end=$((SECONDS + secs))
-  local work=()
+  local work=() names=() p rc k
   python3 -I "$HERE/mixed-ingest.py" "$ADDR" "$PRIV/cert.pem" "$PRIV/ingest.header" "$INGEST_RATE" "$secs" "$((400 + n))" i304 > "$c/ingest.log" 2>&1 &
-  work+=($!)
-  ( api tail -N --max-time "$secs" -o "$c/tail.sse" -w '%{http_code}' -G --data-urlencode "query=$TAIL_QUERY" "$(url /api/v1/stream)" > "$c/tail.status" 2>"$c/tail.stderr"; echo " exit=$?" >> "$c/tail.status" ) &
-  work+=($!)
+  work+=($!); names+=(ingest)
+  # The tail succeeds when it answers 200 and stays open until curl's limit.
+  ( rc=0
+    api tail -N --max-time "$secs" -o "$c/tail.sse" -w '%{http_code}' -G --data-urlencode "query=$TAIL_QUERY" "$(url /api/v1/stream)" > "$c/tail.status" 2>"$c/tail.stderr" || rc=$?
+    echo " exit=$rc" >> "$c/tail.status"
+    [[ $(cat "$c/tail.status") == "200 exit=28" ]] ) &
+  work+=($!); names+=(tail)
   for s in $(seq 1 "$SEARCH_CLIENTS"); do
     search_client "$s" "$end" "$c/search-$s.log" &
-    work+=($!)
+    work+=($!); names+=("search-$s")
   done
   repin_driver "$n" "$start" "$end" "$c/repin.log" &
-  work+=($!)
+  work+=($!); names+=(repin)
   note "workers started: ingest, live tail, $SEARCH_CLIENTS search clients, repin driver; running ${secs}s"
-  for p in "${work[@]}"; do wait "$p" || true; done
+  : > "$c/workers.log"
+  for k in "${!work[@]}"; do
+    p=${work[$k]}
+    if wait "$p"; then rc=0; else rc=$?; fi
+    echo "${names[$k]} exit=$rc" >> "$c/workers.log"
+  done
   sleep 5
   bg_stop
   note "chunk $n workers finished"
+  runsh "cat '$c/workers.log'"
   cat "$c"/search-*.log | sort > "$c/searches.log"
 
   say "chunk $n: search responses (HTTP status, error code) per search"
-  runsh "awk '{print \$3, \$5, \$7}' '$c/searches.log' | sort | uniq -c"
-  runsh "awk '{print \$5, \$7}' '$c/searches.log' | sort | uniq -c"
-  runsh "grep -vE ' -> 200 [0-9.]+ -\$' '$c/searches.log' | head -n 40 || true"
+  runsh "awk '{print \$3, \$5, \$7, (\$8 ~ /^rows=[1-9]/ ? \"rows>0\" : \$8)}' '$c/searches.log' | sort | uniq -c"
+  runsh "awk '{print \$5, \$7, (\$8 ~ /^rows=[1-9]/ ? \"rows>0\" : \$8)}' '$c/searches.log' | sort | uniq -c"
+  runsh "grep -vE '$SEARCH_OK' '$c/searches.log' | head -n 40 || true"
   runsh "grep -c query_resource_exhausted '$c/searches.log' || true"
   runsh "awk '{print \$6}' '$c/searches.log' | sort -n | awk '{a[NR]=\$1} END {print \"search seconds: n=\" NR, \"p50=\" a[int(NR*0.5)+1], \"p95=\" a[int(NR*0.95)+1], \"max=\" a[NR]}'"
   say "chunk $n: ingest responses"
@@ -420,7 +464,7 @@ report() {
   restarts=$("${K[@]}" get pod trawl-0 -o jsonpath='{.status.containerStatuses[?(@.name=="trawld")].restartCount}')
   evict=$(events | grep -cE 'Evicted|OOMKilling|OOMKilled' || true)
   searches=$(wc -l < "$W/all-searches.log")
-  nok=$(grep -cvE ' -> 200 [0-9.]+ -$' "$W/all-searches.log" || true)
+  nok=$(grep -cvE "$SEARCH_OK" "$W/all-searches.log" || true)
   rex=$(grep -c query_resource_exhausted "$W/all-searches.log" || true)
   peak=$("${K[@]}" exec trawl-0 -c trawld -- cat /sys/fs/cgroup/memory.peak)
   hwm=$("${K[@]}" exec trawl-0 -c trawld -- sh -c 'grep "^VmHWM:" /proc/1/status | tr -s " " | cut -d" " -f2')
@@ -428,22 +472,71 @@ report() {
   note "workload sampled for ${secs}s over $n chunks (the gaps between chunks excluded)"
   note "trawl-0 uid at setup $uid0, now $uid; trawld restarts $restarts; cgroup oom_kill $oomk"
   note "kubelet events naming Evicted, OOMKilling or OOMKilled: $evict"
-  note "searches: $searches responses, $nok not 200, $rex query_resource_exhausted"
-  runsh "awk '{print \$5, \$7}' '$W/all-searches.log' | sort | uniq -c"
+  note "searches: $searches responses, $nok not 200 with rows, $rex query_resource_exhausted"
+  runsh "awk '{print \$5, \$7, (\$8 ~ /^rows=[1-9]/ ? \"rows>0\" : \$8)}' '$W/all-searches.log' | sort | uniq -c"
   runsh "cat '$W'/c*/ingest.log | awk '{print \$2, (\$3 ~ /^[0-9]+\$/ ? \"accepted\" : \$3)}' | sort | uniq -c"
   runsh "cat '$W'/c*/ingest.log | awk '\$2==200 && \$3 ~ /^[0-9]+\$/ {s+=\$3} END {print \"events accepted in chunks:\", s}'"
+  runsh "grep -h ' done ' '$W'/c*/ingest.log"
   runsh "cat '$W'/c*/health.log | awk '{print \$2}' | sort | uniq -c"
   runsh "cat '$W'/c*/pod.log | grep -oE 'ready=[A-Za-z]+ restarts=[0-9]+' | sort | uniq -c"
   runsh "cat '$W'/c*/trawld.log | grep -c 'event_type=\"compaction_complete\"'; cat '$W'/c*/trawld.log | grep 'event_type=\"compaction_complete\"' | grep -oE 'merged=[a-z]+' | sort | uniq -c"
   runsh "grep -hE ' -> [0-9]+ ' '$W'/c*/repin.log | cut -c1-300; grep -h 'status id=' '$W'/c*/repin.log | grep -v '\"status\":\"running\"' | cut -c1-300"
+  runsh "grep -h ' result ' '$W'/c*/repin.log"
+  runsh "grep -H . '$W'/c*/workers.log"
   note "peak memory.current $(field_max "$all" current) bytes; peak anon $(field_max "$all" anon) bytes; peak file $(field_max "$all" file) bytes"
   note "cgroup memory.peak $peak bytes (includes page cache); trawld VmHWM $hwm KiB (peak RSS since start)"
   note "peak query scratch $(field_max "$all" scratch) bytes (du -sb of $SCRATCH every 2 s)"
+
+  say "verdict checks"
+  local failed=() d
+  check() {  # check NAME VALUE CONDITION...: CONDITION is a command; a failure joins the verdict
+    local name=$1 value=$2; shift 2
+    if "$@"; then note "check $name: $value ok"; else note "check $name: $value FAIL"; failed+=("$name"); fi
+  }
+  # Per-chunk facts, gathered from the chunk files.
+  local chunks_ingest_done=0 ingest_sent=0 ingest_acc=0 ingest_dropped=0 tail_ok=0 compact_chunks=0
+  local compactions=0 trawld_errors=0 repin_total=0 repin_ok=0 repin_dry_ok=0 repin_real_ok=0 workers_bad=0 asked k
+  for c in "$W"/c*/; do
+    d=$(grep ' done sent=' "$c/ingest.log" | tail -n 1 || true)
+    if [[ -n $d ]]; then
+      chunks_ingest_done=$((chunks_ingest_done + 1))
+      ingest_sent=$(( ingest_sent + $(sed -E 's/.* sent=([0-9]+).*/\1/' <<< "$d") ))
+      ingest_acc=$(( ingest_acc + $(sed -E 's/.* accepted=([0-9]+).*/\1/' <<< "$d") ))
+    fi
+    ingest_dropped=$(( ingest_dropped + $(grep -cE '^[^ ]+ [0-9]{3} dropped' "$c/ingest.log" || true) ))
+    [[ $(cat "$c/tail.status" 2>/dev/null) == "200 exit=28" ]] && (( $(grep -c '^event: snapshot' "$c/tail.sse" 2>/dev/null || true) > 0 )) && tail_ok=$((tail_ok + 1))
+    k=$(grep -c 'event_type="compaction_complete"' "$c/trawld.log" || true)
+    compactions=$((compactions + k)); (( k > 0 )) && compact_chunks=$((compact_chunks + 1))
+    trawld_errors=$(( trawld_errors + $(grep -cE ' ERROR |resource_exhausted|compaction_error|catalog_invariant_violation|rollup_unreadable|catalog_conform_skip' "$c/trawld.log" || true) ))
+    repin_total=$(( repin_total + $(grep -c ' result ' "$c/repin.log" || true) ))
+    repin_ok=$(( repin_ok + $(grep -c ' result .* status=succeeded$' "$c/repin.log" || true) ))
+    repin_dry_ok=$(( repin_dry_ok + $(grep -c ' result .* dry_run=true status=succeeded$' "$c/repin.log" || true) ))
+    repin_real_ok=$(( repin_real_ok + $(grep -c ' result .* dry_run=false status=succeeded$' "$c/repin.log" || true) ))
+    workers_bad=$(( workers_bad + $(grep -cv ' exit=0$' "$c/workers.log" || true) ))
+  done
+  asked=$(awk '{print $3}' "$W/all-searches.log" | sort -u | wc -l)
+  check workload_seconds "$secs (need >= 900)" test "$secs" -ge 900
+  check oom_kill "$oomk" test "$oomk" = 0
+  check restarts "$restarts" test "$restarts" = 0
+  check same_pod "$uid0 -> $uid" test "$uid" = "$uid0"
+  check evict_or_oom_events "$evict" test "$evict" = 0
+  check search_responses "$searches" test "$searches" -gt 0
+  check searches_not_200_with_rows "$nok" test "$nok" = 0
+  check searches_answered "$asked of ${#SEARCHES[@]}" test "$asked" = "${#SEARCHES[@]}"
+  check query_resource_exhausted "$rex" test "$rex" = 0
+  check ingest_ran_to_end "$chunks_ingest_done of $n chunks" test "$chunks_ingest_done" = "$n"
+  check ingest_dropped_batches "$ingest_dropped" test "$ingest_dropped" = 0
+  check ingest_accepted "$ingest_acc of $ingest_sent sent" eval '(( ingest_acc > 0 && ingest_acc == ingest_sent ))'
+  check live_tail "$tail_ok of $n chunks with 200, snapshots and the stream open to the end" test "$tail_ok" = "$n"
+  check compaction "$compactions compaction_complete, in $compact_chunks of $n chunks" test "$compact_chunks" = "$n"
+  check trawld_error_lines "$trawld_errors" test "$trawld_errors" = 0
+  check repin "$repin_ok of $repin_total succeeded ($repin_dry_ok dry, $repin_real_ok real)" eval '(( repin_total > 0 && repin_ok == repin_total && repin_dry_ok > 0 && repin_real_ok > 0 ))'
+  check workers "$workers_bad nonzero exits" test "$workers_bad" = 0
   local verdict=PASS
-  [[ $oomk == 0 && $restarts == 0 && $evict == 0 && $uid == "$uid0" && $rex == 0 ]] || verdict=FAIL
-  (( secs >= 900 )) || verdict="$verdict (workload under 15 minutes)"
-  note "verdict: $verdict (no OOM kill, no eviction, no query_resource_exhausted for ordinary searches)"
+  (( n > 0 && ${#failed[@]} == 0 )) || verdict="FAIL (${failed[*]:-no chunks})"
+  note "verdict: $verdict (no OOM kill, no eviction, no query_resource_exhausted for ordinary searches, and every workload part succeeded)"
   say "report done"
+  [[ $verdict == PASS ]]
 }
 
 case $PART in

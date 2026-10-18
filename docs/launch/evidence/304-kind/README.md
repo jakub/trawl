@@ -16,8 +16,8 @@ The before run shows both failures. The after run keeps the pod Ready and evicts
 | `values.yaml` | AC1 scenario values, the same for both runs: 2 permits, rate limits off, 4Gi and 1 CPU, no web sidecar. |
 | `values-load.yaml` | Layered over `values.yaml` only while the AC1 corpus loads (16 CPU, 6Gi), then removed by a `helm upgrade`. |
 | `gen-events.py` | The seeded AC1 corpus and its NDJSON ingest client. |
-| `mixed.sh setup IMAGE CHART_DIR`, `mixed.sh run SECS`, `mixed.sh report` | The AC19 mixed run in the namespace `i304-mixed`. It writes `mixed-transcript.txt`. |
-| `mixed-ingest.py` | Steady ingest for the mixed run, at a fixed rate, with `_time` set to the moment each batch is built. |
+| `mixed.sh setup IMAGE CHART_DIR`, `mixed.sh run SECS`, `mixed.sh report` | The AC19 mixed run in the namespace `i304-mixed`. It writes `mixed-transcript.txt`. `report` prints the verdict checks, and exits 1 on FAIL. |
+| `mixed-ingest.py` | Steady ingest for the mixed run, at a fixed rate, with `_time` set to the moment each batch is built. It exits 1 when it sent nothing, dropped a batch, or had fewer events accepted than sent. |
 | `values-mixed.yaml` | The mixed run's only overrides: image pull policy, the two DSN Secrets, and no web sidecar. |
 | `postgres.yaml` | A disposable in-cluster PostgreSQL for each namespace. |
 | `calib-fast.sh LABEL PAUSE NAME...` | Supplementary calibration for phase C. It runs the named `repro.sh` queries once each in a namespace that `STOP_AFTER=ingest repro.sh` set up, while a loop in the trawld container samples query scratch bytes and cgroup memory every 0.2 s. It writes `LABEL-fast-transcript.txt`. |
@@ -64,7 +64,7 @@ Set `D` to this directory's copy of the kit, which also holds the cluster's `kub
 
    The after run takes about 9 minutes, and each agent command had a 10-minute limit, so it ran as two commands. `STOP_AFTER=b` stops after phase B. `START_AT=c` runs phase C against the same namespace and appends to the same transcript. Without either variable, one command runs every phase. At `b02b8acf`, phase B evicts the pod, so the script skips phase C and says so in the transcript. The committed before transcript was recorded before phase C existed.
 
-4. Run AC19. Each part is one command, and each command finished within 10 minutes. Run `run` until the chunks add up to at least 900 s.
+4. Run AC19. Each part is one command, and each command finished within 10 minutes. Run `run` until the chunks add up to at least 900 s. `report` exits 0 only on PASS.
 
    ```bash
    $D/mixed.sh setup trawl-i304:after-7dc64b27f566 $D/build/src-after/chart/trawl
@@ -122,30 +122,47 @@ After the run, the trawld cgroup read `memory.peak` 4294967296 (the 4Gi limit), 
 
 `mixed.sh` installed the head chart at its defaults. It overrode only the image, the pull policy, the two DSN Secrets and the web sidecar (`values-mixed.yaml`). The rendered config shows `query_spill_max_bytes = "4GiB"`, `query_memory_limit = "2GiB"`, `query_threads = 4`, `compaction_memory_limit = "1GiB"`, `min_free_disk_bytes = "6GiB"`, and the default rate limits of 100 and 1000 a minute (lines 87–100). The StatefulSet has an 8Gi limit, a 1Gi request, no CPU limit and a 60 s grace period (line 104). trawld sees 16 CPUs, so `max_concurrent_queries` defaults to 8 (line 252).
 
-Setup preloaded 800,000 events into service `i304` and 5,000 events into `i304-repin`, which carries the integer field `code` (lines 255–268). Each of the two chunks then ran these for 500 s, all at once:
+Setup preloaded 800,000 events into service `i304` and 5,000 events into `i304-repin`, which carries the integer field `code`, with no batch dropped (lines 255–268). Each of the two chunks then ran these for 500 s, all at once:
 
 - steady ingest of 500 events a second, one batch every 2 s;
 - 6 search clients, each with its own key, at most one search a second each, over 8 typical searches (lines 17–24): `stats count() by` small keys, `top 10 host`, `timechart`, time-ranged filters, a full-corpus count, and a full-text scan;
 - one live tail, `service=i304 | stats count() by status`;
-- a repin dry run at +60 s and a real repin of `code` at +200 s.
+- a dry run of pinning `status` as VARCHAR at +60 s, and a real repin of `code` at +200 s.
 
-The gap between chunks was 23 s (line 670). The samplers covered 1009 s of workload (line 1084).
+The gaps before the chunks were 3 s and 5 s (lines 292, 681). The samplers covered 1011 s of workload (line 1122).
+
+**Verdict.** `mixed.sh report` prints PASS, and exits 0, only when every check below holds. Otherwise it prints FAIL with the names of the failed checks, and exits 1. Each worker also exits nonzero when its own work failed, and each chunk records every worker's exit status. The checks follow AC19: the run must exercise ingest, queries, compaction and repin, each of them must succeed, and none of them may end in an OOM kill, an eviction or `query_resource_exhausted`.
+
+| Check | Threshold |
+| --- | --- |
+| `workload_seconds` | The samplers covered at least 900 s. |
+| `oom_kill`, `restarts`, `same_pod`, `evict_or_oom_events` | cgroup `oom_kill` 0, trawld restart count 0, the pod uid from setup, and no `Evicted`, `OOMKilling` or `OOMKilled` event. |
+| `search_responses`, `searches_not_200_with_rows`, `searches_answered`, `query_resource_exhausted` | At least one search. Every response is 200 with at least one row. Each of the 8 searches answered. No `query_resource_exhausted`. |
+| `ingest_ran_to_end`, `ingest_dropped_batches`, `ingest_accepted` | In every chunk, the ingest worker ran to its end. No batch was dropped. The events accepted equal the events sent, and are more than 0. A 503 `hot_buffer_full` carries `Retry-After` and is retried, so it does not fail the run. |
+| `live_tail` | In every chunk: HTTP 200, at least one snapshot, and the stream open until curl's time limit (curl exit 28). |
+| `compaction`, `trawld_error_lines` | At least one `compaction_complete` in every chunk. No trawld `ERROR` line, and no `resource_exhausted`, `compaction_error`, `catalog_invariant_violation`, `rollup_unreadable` or `catalog_conform_skip` line. |
+| `repin` | Every repin the driver sent ended `succeeded`, with at least one dry run and one real repin among them. |
+| `workers` | Every worker of every chunk exited 0. |
+
+Before this run, the checks were tried against the failure the review described. In a short throwaway run, with the search, tail and ingest keys revoked between two chunks, the report printed `verdict: FAIL (workload_seconds searches_not_200_with_rows ingest_dropped_batches ingest_accepted live_tail workers)` and exited 1. That run is not committed.
 
 | Measure | Result | Lines |
 | --- | --- | --- |
-| Searches | 5321 responses, all 200, 0 `query_resource_exhausted`. Chunk 1 p95 was 1.31 s and max 2.91 s. Chunk 2 p95 was 2.26 s and max 4.57 s. | 300–314, 678–692, 1087–1089 |
-| Ingest | 500 batches, all 200: 500,000 events, no `hot_buffer_full` retries. | 318, 696, 1091–1094 |
-| Live tail | 200, 250 snapshots in each chunk. The stream ran until curl's 500 s limit. | 324–327, 702–705 |
-| Compaction | 120 `compaction_complete` events, all `merged=true`. No `compaction_error`, no maintenance resource failure, no `catalog_invariant_violation`. | 629–641, 996–1010 |
-| Repins | Real repin of `code` BIGINT→VARCHAR: succeeded. Dry run of `status` BIGINT→VARCHAR over 1,073,000 rows: succeeded. Real repin of `code` VARCHAR→BIGINT: succeeded. | 1103–1106, 330–337, 708–715 |
-| Health and readiness | Health answered 200 497 times. The pod watcher shows `ready=True restarts=0` 195 times, on one uid. | 1096–1098, 566, 933 |
-| OOM kills and evictions | None. cgroup `oom_kill 0`, `max 0`. Restart count 0, empty `lastState`. No `Evicted`, `OOMKilling` or `OOMKilled` event. | 1069–1077, 1085–1086 |
-| Peak RSS | trawld `VmHWM` 2,989,160 KiB (2.85 GiB) since process start, preload included. Peak sampled anon 2,949,812,224 bytes. | 1080, 1109–1110 |
-| Peak cgroup memory | `memory.peak` 4,737,486,848 bytes, page cache included. Peak sampled `memory.current` 4,456,235,008 bytes. | 1071, 1109–1110 |
-| Peak query scratch | 43,797,268 bytes (`du -sb` every 2 s). | 1111 |
-| Verdict | PASS | 1112 |
+| Verdict | PASS. All 17 checks hold. | 1179–1197 |
+| Searches | 5577 responses, all 200 with at least one row, each of the 8 searches about 350 times per chunk. 0 `query_resource_exhausted`. Chunk 1 p95 was 1.42 s and max 3.41 s. Chunk 2 p95 was 1.50 s and max 3.26 s. | 308–324, 697–713, 1125–1127 |
+| Ingest | 500 batches, all 200: 500,000 events sent and accepted, no batch dropped, no `hot_buffer_full` retries. Every ingest worker exited 0. | 326–331, 715–720, 1128–1135, 1157–1174 |
+| Live tail | HTTP 200 and 250 snapshots in each chunk. The stream stayed open until curl's 500 s limit (exit 28). | 333–339, 722–728 |
+| Compaction | 143 `compaction_complete` events, 64 in chunk 1 and 79 in chunk 2. 141 merged into an existing hourly file. 2 started the new hour's files at 10:00:01 and 10:00:13 UTC, one for trawld's own telemetry and one for `i304`. No `ERROR`, `compaction_error`, maintenance resource failure or `catalog_invariant_violation` line. | 637–652, 1031–1048, 1140–1143 |
+| Repins | Dry run of `status` BIGINT→VARCHAR: succeeded in both chunks. Real repin of `code` BIGINT→VARCHAR, then VARCHAR→BIGINT: both succeeded. | 341–349, 730–738, 1144–1155 |
+| Health and readiness | Health answered 200 498 times. The pod watcher shows `ready=True restarts=0` 195 times, on one uid. | 1136–1139, 576, 970 |
+| OOM kills and evictions | None. cgroup `oom_kill 0`, `max 0`. Restart count 0, same uid. No `Evicted`, `OOMKilling` or `OOMKilled` event. | 1107, 1113–1115, 1123–1124 |
+| Peak RSS | trawld `VmHWM` 2,870,012 KiB (2.74 GiB) since process start, preload included. Peak sampled anon 2,786,488,320 bytes. | 1118, 1175–1176 |
+| Peak cgroup memory | `memory.peak` 4,413,730,816 bytes, page cache included, under the 8Gi `memory.max` of 8,589,934,592. Peak sampled `memory.current` 4,287,647,744 bytes. | 1109–1110, 1175–1176 |
+| Peak query scratch | 32,662,780 bytes (`du -sb` every 2 s). | 1177 |
 
-The executor pool reached all 8 permits briefly during each repin cutover. trawld logged `pool_pressure` 4 times in chunk 1 and 6 times in chunk 2 (lines 639, 1008). The waiting queries ran and answered 200.
+trawld logged `pool_pressure` (WARN) 5 times in chunk 1 and once in chunk 2, each within a second of a real repin starting (lines 650, 1046; repins at lines 346–347 and 735–736). Every search still answered 200.
+
+This transcript replaces an earlier mixed run on the same image and values. That run's report checked only OOM kills, restarts, evictions, the pod uid and `query_resource_exhausted`, so it could print PASS for a run whose workload failed. Its first dry run asked for `seq`, a field the mixed corpus does not carry, and answered 400. The earlier transcript is not committed.
 
 ## Deviations
 
@@ -156,8 +173,7 @@ The executor pool reached all 8 permits briefly during each repin cutover. trawl
 - **The incident's spilling query mostly fits the head's budgets, so phase C adds a wider one.** At the head defaults of 2 GiB memory and 4 GiB spill, SPILL_QUERY needs about 2.8–2.9 GB of scratch, and it completed in 7 of 8 attempts in both after runs. The budgets stay at the chart defaults; none was lowered. Instead, phase C's SPILL_BIG_QUERY widens the same `dedup` key from 32 to 64 copies of the event text, about 16 KB a row and a 12.8 GB sort, so it needs more spill than the budget. Like SPILL_QUERY, it is synthetic. The budget-exhaustion contract with a small configured budget is also covered by `cargo nextest run -p trawl-server --test query_resources spill_budget`.
 - **The after run ran as two commands.** It takes about 9 minutes, and each agent command had a 10-minute limit. `STOP_AFTER=b` ended the first command after phase B at 09:08:07, and `START_AT=c` started phase C on the same pod at 09:08:11 (lines 1022–1024). Phase C reads phase B's result from the transcript (line 1027).
 - **The after run's load hit one 503 `hot_buffer_full`.** The stored `http_failure` list shows one ingest 503 at 09:01:34 (line 1303), while the corpus loaded in the roomy load pod. `gen-events.py` retries a 503 after its `Retry-After`, and all 800,000 events landed (lines 143, 146).
-- **The mixed run's first dry run failed.** In chunk 1, `mixed.sh` asked for a dry run of `seq`, a field the mixed corpus does not carry. trawld answered 400 `"seq" is not a pinned field` (line 333). The chunk 2 dry run of `status` succeeded. The script still names `seq` for odd chunks, because it is the script that produced this transcript.
-- **The mixed run ran in chunks.** Each agent command had a 10-minute limit, so the 1009 s workload ran as two chunks on the same pod, with a 23 s gap. The pod, its data, its cgroup counters and its compaction state carried across the gap.
+- **The mixed run ran in chunks.** Each agent command had a 10-minute limit, so the 1011 s workload ran as two chunks on the same pod, with a 5 s gap. The pod, its data, its cgroup counters and its compaction state carried across the gap.
 - **The mixed run reached trawld through a NodePort.** It did not use a port-forward, which drops every open connection when it restarts. The Service publishes NotReady addresses, so health samples would still reach a NotReady pod. TLS verifies trawld's pinned certificate as `localhost`.
-- **The mixed workload does not cross an hour boundary.** Every compaction merged into the current hourly file (`merged=true`). The file grew from 800,000 rows to about 1.3 million.
+- **The mixed workload crossed one hour boundary.** It ran from 09:50 to 10:07 UTC. Compaction merged into the 09:00 files until 10:00. It then started one 10:00 file for `i304` and one for trawld's own telemetry (`merged=false`), and merged into those after that.
 - **The kubelet refreshes volume stats every 2 s, not 1m.** `repro.sh` step 0 sets `volumeStatsAggPeriod: 2s` on the kind node. It is a cluster setting, and it makes "nothing evicted" a stronger result.

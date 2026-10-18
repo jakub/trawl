@@ -13,8 +13,10 @@ ADDR is HOST:PORT of trawld's NodePort. The TLS name checked against trawld's
 pinned certificate stays "localhost", which its SAN carries. A 503
 hot_buffer_full is retried after its Retry-After; any other status is logged
 and the batch is dropped. Each POST prints one line: the time, the HTTP
-status, the events accepted and the latency. The bearer header (a
-"Name: value" line) is read from a file and never printed.
+status, the events accepted and the latency. The last line counts the events
+sent and accepted and the batches dropped. The script exits 1 when it sent
+nothing, dropped a batch, or had fewer events accepted than it sent. The
+bearer header (a "Name: value" line) is read from a file and never printed.
 """
 
 import base64
@@ -81,7 +83,7 @@ def post(body):
 
 per_batch = int(rate * PERIOD)
 raw_bytes = 150
-sent = accepted = seq = 0
+sent = accepted = dropped = seq = 0
 began = time.monotonic()
 next_at = began
 while time.monotonic() - began < secs:
@@ -96,7 +98,10 @@ while time.monotonic() - began < secs:
         lines.append(json.dumps(ev, separators=(",", ":")))
         seq += 1
     sent += per_batch
-    accepted += post(("\n".join(lines) + "\n").encode())[1]
+    status, n = post(("\n".join(lines) + "\n").encode())
+    accepted += n
+    dropped += status != 200
     next_at += PERIOD
     time.sleep(max(0.0, next_at - time.monotonic()))
-print(f"{ts()} done sent={sent} accepted={accepted} secs={time.monotonic() - began:.0f}", flush=True)
+print(f"{ts()} done sent={sent} accepted={accepted} dropped={dropped} secs={time.monotonic() - began:.0f}", flush=True)
+sys.exit(0 if sent > 0 and dropped == 0 and accepted == sent else 1)
