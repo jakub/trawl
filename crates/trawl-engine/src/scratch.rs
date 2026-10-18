@@ -154,35 +154,59 @@ pub fn is_export_file_name(name: &OsStr) -> bool {
     name.is_some_and(|name| is_made_name(OsStr::new(name), EXPORT_FILE_PREFIX, EXPORT_FILE_SUFFIX))
 }
 
-/// Whether `name` is one `DuckDB` 1.5.5 gives a file in a spill directory.
+/// The size classes `DuckDB` 1.5.5 names a grouped spill file by: every
+/// `TemporaryBufferSize` but `INVALID`, as `EnumUtil::ToString` prints it
+/// (`enum_util.cpp`, `GetTemporaryBufferSizeValues`). `INVALID` is left
+/// out because no file is ever made for it: `CreateTemporaryFileName`
+/// asserts a valid identifier.
+const SPILL_SIZE_CLASSES: [&str; 8] = [
+    "S32K", "S64K", "S96K", "S128K", "S160K", "S192K", "S224K", "DEFAULT",
+];
+
+/// Whether `name` is one `DuckDB` 1.5.5 gives a file in a spill directory,
+/// and nothing else: the preflight unlinks what this accepts, so a name
+/// `DuckDB` cannot have made must refuse the start instead.
 ///
-/// Two shapes, both from the bundled source: the grouped block files
-/// `duckdb_temp_storage_<size>-<n>.tmp`, where `<size>` is a
-/// `TemporaryBufferSize` name such as `DEFAULT` or `S32K`
-/// (`temporary_file_manager.cpp`), and the files of buffers larger than a
-/// block, `duckdb_temp_block-<id>.block` (`standard_buffer_manager.cpp`).
-/// A `DuckDB` upgrade has to re-check both.
+/// Two shapes, both from the bundled source. The grouped block files are
+/// `duckdb_temp_storage_<size>-<n>.tmp` (`temporary_file_manager.cpp`,
+/// `CreateTemporaryFileName`: `"duckdb_temp_storage_%s-%llu.tmp"`), where
+/// `<size>` is one of [`SPILL_SIZE_CLASSES`] and `<n>` is the file index,
+/// an `idx_t` (`uint64_t`). The files of buffers larger than a block are
+/// `duckdb_temp_block-<id>.block` (`standard_buffer_manager.cpp`,
+/// `GetTemporaryPath`: `"duckdb_temp_block-" + to_string(id) + ".block"`),
+/// where `<id>` is a `block_id_t` (`int64_t`) counted up from
+/// `MAXIMUM_BLOCK`, so never negative. Each number is accepted only as the
+/// C++ library prints it: no sign, no leading zero, within its type's
+/// width. A `DuckDB` upgrade has to re-check both shapes and the classes.
 #[must_use]
 pub fn is_spill_file_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     if let Some(rest) = name
         .strip_prefix("duckdb_temp_storage_")
         .and_then(|rest| rest.strip_suffix(".tmp"))
     {
         return rest.split_once('-').is_some_and(|(size, index)| {
-            !size.is_empty()
-                && size
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-                && digits(index)
+            SPILL_SIZE_CLASSES.contains(&size) && is_printed_integer::<u64>(index)
         });
     }
     name.strip_prefix("duckdb_temp_block-")
         .and_then(|rest| rest.strip_suffix(".block"))
-        .is_some_and(digits)
+        .is_some_and(is_printed_integer::<i64>)
+}
+
+/// Whether `digits` is a non-negative integer of type `T` exactly as C++
+/// prints one: ASCII digits only, no sign, no leading zero but `0` itself,
+/// and a value `T` holds. Rust's `parse` accepts a `+` sign, so the first
+/// byte is checked by hand.
+fn is_printed_integer<T: std::str::FromStr>(digits: &str) -> bool {
+    let canonical = match digits.as_bytes() {
+        [b'0'] => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    canonical && digits.parse::<T>().is_ok()
 }
 
 /// Make a private spill directory in `parent`, run `after_create` on it
@@ -1186,13 +1210,25 @@ mod tests {
         }
     }
 
+    /// The recognizer accepts exactly what `DuckDB` 1.5.5 prints: one of
+    /// its eight size-class names and a `uint64_t` file index, or an
+    /// `int64_t` block id, each as the C++ library prints it, so a name
+    /// `DuckDB` cannot have made is foreign however spill-like it looks.
     #[test]
     fn spill_file_names_are_recognized_exactly() {
         for name in [
             "duckdb_temp_storage_DEFAULT-0.tmp",
             "duckdb_temp_storage_S32K-12.tmp",
+            "duckdb_temp_storage_S64K-0.tmp",
+            "duckdb_temp_storage_S96K-0.tmp",
+            "duckdb_temp_storage_S128K-0.tmp",
+            "duckdb_temp_storage_S160K-0.tmp",
+            "duckdb_temp_storage_S192K-0.tmp",
             "duckdb_temp_storage_S224K-3.tmp",
+            "duckdb_temp_storage_DEFAULT-18446744073709551615.tmp",
+            "duckdb_temp_block-0.block",
             "duckdb_temp_block-4611686018427388160.block",
+            "duckdb_temp_block-9223372036854775807.block",
         ] {
             assert!(is_spill_file_name(OsStr::new(name)), "{name}");
         }
@@ -1202,8 +1238,24 @@ mod tests {
             "duckdb_temp_storage_default-0.tmp",
             "duckdb_temp_storage_DEFAULT-0.tmp.x",
             "duckdb_temp_storage_DEFAULT-0-1.tmp",
+            // Size classes DuckDB does not have, or never names a file by.
+            "duckdb_temp_storage_NOTTRAWLDS-0.tmp",
+            "duckdb_temp_storage_INVALID-0.tmp",
+            "duckdb_temp_storage_S48K-0.tmp",
+            "duckdb_temp_storage_S256K-0.tmp",
+            "duckdb_temp_storage_S32K2-0.tmp",
+            // Over the width of a uint64_t, or not how one is printed.
+            "duckdb_temp_storage_DEFAULT-18446744073709551616.tmp",
+            "duckdb_temp_storage_DEFAULT-00.tmp",
+            "duckdb_temp_storage_DEFAULT-01.tmp",
+            "duckdb_temp_storage_DEFAULT-+1.tmp",
             "duckdb_temp_block-.block",
             "duckdb_temp_block--1.block",
+            "duckdb_temp_block-+1.block",
+            "duckdb_temp_block-007.block",
+            // Over the width of an int64_t.
+            "duckdb_temp_block-9223372036854775808.block",
+            "duckdb_temp_block-18446744073709551615.block",
             "duckdb_temp_block-1.tmp",
             "trawl-spill-abc123",
             "evil",
@@ -1764,7 +1816,7 @@ mod tests {
     /// Each entry the preflight refuses: what it is, how to plant it, and
     /// the reason the refusal gives.
     #[cfg(unix)]
-    fn foreign_entries() -> [(&'static str, Plant, &'static str); 7] {
+    fn foreign_entries() -> [(&'static str, Plant, &'static str); 9] {
         [
             (
                 "an unknown file",
@@ -1817,6 +1869,24 @@ mod tests {
                 |_, spill, _| {
                     let entry = spill.join("core");
                     std::fs::write(&entry, b"dump").expect("write");
+                    entry
+                },
+                "is not a spill file DuckDB makes",
+            ),
+            (
+                "a spill-like file of a size class DuckDB does not have",
+                |_, spill, _| {
+                    let entry = spill.join("duckdb_temp_storage_NOTTRAWLDS-0.tmp");
+                    std::fs::write(&entry, b"not DuckDB's").expect("write");
+                    entry
+                },
+                "is not a spill file DuckDB makes",
+            ),
+            (
+                "a spill-like file with an index wider than DuckDB's",
+                |_, spill, _| {
+                    let entry = spill.join("duckdb_temp_storage_DEFAULT-18446744073709551616.tmp");
+                    std::fs::write(&entry, b"not DuckDB's").expect("write");
                     entry
                 },
                 "is not a spill file DuckDB makes",
