@@ -132,3 +132,8 @@ Considered and rejected:
   scheduled reports a wrong number.
 - **Raising the caps or making them configuration.** They bound per-stream
   memory, and nobody asked for a key.
+
+The same review found that `drop` of a field that no event carries refused in
+batch and passed every event live. Batch now ignores the field too
+([ADR-0056](0056-queries-spill-into-a-bounded-scratch-directory-and-health-samples-the-engine.md)'s
+amendment of 2026-10-17).
