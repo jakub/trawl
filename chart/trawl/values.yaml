@@ -207,8 +207,11 @@ config:
     compactionIntervalSecs: 10
     # DuckDB memory_limit of each compaction, rollup, conform and repin
     # database, as a DuckDB string (GiB is binary; DuckDB reads GB as 10^9).
-    # At most two run at once. A pass that runs out logs
-    # maintenance_resource_exhausted and keeps its inputs for the next pass.
+    # At most two run at once. A statement that runs out logs
+    # maintenance_resource_exhausted. Compaction and rollup retry on the next
+    # pass. A repin that runs out ends failed and needs a new job. Boot
+    # conformance retries at the next boot. Misfit sample capture is optional:
+    # the conflict is recorded without samples and the pass completes.
     compactionMemoryLimit: "1GiB"
     internalTelemetry: true
     dailyRollup: true

@@ -2299,7 +2299,7 @@ Compaction, rollup, conform and repin each open a DuckDB database bounded by `[i
 
 | Series | Type | Measurement |
 | --- | --- | --- |
-| `trawl_maintenance_resource_exhausted_total` | counter | Maintenance statements that ran out of `compaction_memory_limit`. trawld logs `maintenance_resource_exhausted` and keeps the inputs. Compaction and rollup retry them on the next pass. A repin ends `failed` and is not retried, and boot conformance retries on the next boot. Starts at zero, carries no label |
+| `trawl_maintenance_resource_exhausted_total` | counter | Maintenance statements that ran out of `compaction_memory_limit`. trawld logs `maintenance_resource_exhausted` and keeps the inputs. Compaction and rollup retry them on the next pass. A repin ends `failed` and is not retried, and boot conformance retries on the next boot. Misfit sample capture is optional: when it runs out, the conflict is recorded without samples and the pass completes with no retry, but the statement is still counted. Starts at zero, carries no label |
 
 #### Restart visibility metrics
 
