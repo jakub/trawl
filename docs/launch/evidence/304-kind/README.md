@@ -17,6 +17,7 @@ The before run shows both failures. The after run keeps the pod Ready and evicts
 | `values-load.yaml` | Layered over `values.yaml` only while the AC1 corpus loads (16 CPU, 6Gi), then removed by a `helm upgrade`. |
 | `gen-events.py` | The seeded AC1 corpus and its NDJSON ingest client. |
 | `mixed.sh setup IMAGE CHART_DIR`, `mixed.sh run SECS`, `mixed.sh report` | The AC19 mixed run in the namespace `i304-mixed`. It writes `mixed-transcript.txt`. `report` prints the verdict checks, and exits 1 on FAIL. |
+| `mixed.sh window CHUNK_DIR...` | The report's per-chunk window check alone, over saved chunk directories. It needs no cluster and exits 1 when any chunk has a problem. |
 | `mixed-ingest.py` | Steady ingest for the mixed run, at a fixed rate, with `_time` set to the moment each batch is built. It exits 1 when it sent nothing, dropped a batch, or had fewer events accepted than sent. |
 | `values-mixed.yaml` | The mixed run's only overrides: image pull policy, the two DSN Secrets, and no web sidecar. |
 | `postgres.yaml` | A disposable in-cluster PostgreSQL for each namespace. |
@@ -72,6 +73,8 @@ Set `D` to this directory's copy of the kit, which also holds the cluster's `kub
    $D/mixed.sh run 500
    $D/mixed.sh report
    ```
+
+   `run` writes each chunk's `SECS` to `private/mixed/work/cN/secs`. `report` needs it to check the chunk's window. `$D/mixed.sh window $D/private/mixed/work/c*` repeats that check on saved chunks without a cluster.
 
 Secrets go to `$D/private/<label>/`, which is mode 0700 with files at 0600: the PostgreSQL passwords, the API keys, the bearer-header files and the curl configs. The scripts never print them or put them on a command line.
 
@@ -129,28 +132,39 @@ Setup preloaded 800,000 events into service `i304` and 5,000 events into `i304-r
 - one live tail, `service=i304 | stats count() by status`;
 - a dry run of pinning `status` as VARCHAR at +60 s, and a real repin of `code` at +200 s.
 
-The gaps before the chunks were 3 s and 5 s (lines 292, 681). The samplers covered 1011 s of workload (line 1122).
+The gaps before the chunks were 3 s and 5 s (lines 292, 681). The samplers spanned 1011 s (line 1122).
 
 **Verdict.** `mixed.sh report` prints PASS, and exits 0, only when every check below holds. Otherwise it prints FAIL with the names of the failed checks, and exits 1. Each worker also exits nonzero when its own work failed, and each chunk records every worker's exit status. The checks follow AC19: the run must exercise ingest, queries, compaction and repin, each of them must succeed, and none of them may end in an OOM kill, an eviction or `query_resource_exhausted`.
 
 | Check | Threshold |
 | --- | --- |
-| `workload_seconds` | The samplers covered at least 900 s. |
+| `workload_seconds`, `chunk_windows` | A chunk's window is the `SECS` it was asked to run. It counts only when the workers overlapped for all of it, as `chunk_window` checks from the chunk's logs. The ingest worker's `secs` is at least `SECS` and at most `SECS` + 5 s. It sent the full steady rate, 500 events a second times `SECS`. It logged no `503 retry hot_buffer_full` more than 1 s after its deadline, which is its `done` line's time minus its `secs` plus `SECS`. Each of the 6 search clients logged requests, its first one started within 15 s of the chunk's start, and its last one started within 15 s of the deadline. The windows of passing chunks add up to at least 900 s, and no chunk may have a problem. The samplers' span is printed but does not count, because they run until the last worker exits. |
+| `ingest_hot_buffer_full_retries` | The report counts every `503 retry hot_buffer_full` and fails the run on one after a deadline. |
 | `oom_kill`, `restarts`, `same_pod`, `evict_or_oom_events` | cgroup `oom_kill` 0, trawld restart count 0, the pod uid from setup, and no `Evicted`, `OOMKilling` or `OOMKilled` event. |
 | `search_responses`, `searches_not_200_with_rows`, `searches_answered`, `query_resource_exhausted` | At least one search. Every response is 200 with at least one row. Each of the 8 searches answered. No `query_resource_exhausted`. |
-| `ingest_ran_to_end`, `ingest_dropped_batches`, `ingest_accepted` | In every chunk, the ingest worker ran to its end. No batch was dropped. The events accepted equal the events sent, and are more than 0. A 503 `hot_buffer_full` carries `Retry-After` and is retried, so it does not fail the run. |
+| `ingest_ran_to_end`, `ingest_dropped_batches`, `ingest_accepted` | In every chunk, the ingest worker ran to its end. No batch was dropped. The events accepted equal the events sent, and are more than 0. A 503 `hot_buffer_full` carries `Retry-After` and is retried, so a retry inside the deadline does not fail the run by itself. |
 | `live_tail` | In every chunk: HTTP 200, at least one snapshot, and the stream open until curl's time limit (curl exit 28). |
 | `compaction`, `trawld_error_lines` | At least one `compaction_complete` in every chunk. No trawld `ERROR` line, and no `resource_exhausted`, `compaction_error`, `catalog_invariant_violation`, `rollup_unreadable` or `catalog_conform_skip` line. |
 | `repin` | Every repin the driver sent ended `succeeded`, with at least one dry run and one real repin among them. |
 | `workers` | Every worker of every chunk exited 0. |
 
+**Retries.** AC19 asks for ingest at the new defaults with no failure. The report fails the run on a `hot_buffer_full` retry after the deadline, and only on that. The 503 with `Retry-After` is the server's documented backpressure, and `mixed-ingest.py` retries it without losing the batch, so a retry inside the window is not a failed ingest: `ingest_dropped_batches` and `ingest_accepted` still require every event to land. A retry inside the window that cost the worker its rate fails the full-rate test in `chunk_windows`. A retry after the deadline means a batch was still stalled when the workload should have ended, so the window was not concurrent work. If AC19 is read as allowing no 503 at all, change the `hb_late` check in `report` to `hb_retries`. The committed run had none, so it passes either way.
+
+**Which version produced the transcript.** `mixed-transcript.txt` was produced by the previous version of `mixed.sh`, before the window check above. That version is the commit `eb4a1789`, `docs(evidence): make the #304 mixed verdict require a successful workload and rerun it`, the last commit that changed `mixed.sh` before this fix. It took `workload_seconds` from the first and last cgroup samples of each chunk (1011 s, line 1122), and it printed 17 checks. The new version prints 19.
+
+That derivation could have counted a stall. The samplers run until every worker exits, and `mixed-ingest.py` retries a `hot_buffer_full` 503 without limit, so a chunk that stalled for 500 s past its deadline would have counted about 1000 s and could have passed. This run had no such stall:
+
+- Each ingest worker finished in 500 s with every event accepted: `done sent=250000 accepted=250000 dropped=0 secs=500` (`mixed-transcript.txt:331` and `:720`).
+- The transcript has 0 `retry hot_buffer_full` lines. The `grep -vE ' 200 [0-9]+ '` over each chunk's ingest log printed only the `done` line (lines 330–331 and 719–720).
+- Run on the saved chunk logs, with `secs` set to 500 for each, `mixed.sh window` reports `window_secs=500 retries=0 late_retries=0 sent=250000 problems=none` for both chunks. Driven through `report` with a stub `kubectl` (not committed), the new version prints `workload verified for 1000s over 2 chunks`, `chunk_windows: 0 of 2`, `ingest_hot_buffer_full_retries: 0 retried, 0 after a deadline`, and PASS. The new predicate passes this run, and the run needs no rerun.
+
 Before this run, the checks were tried against the failure the review described. In a short throwaway run, with the search, tail and ingest keys revoked between two chunks, the report printed `verdict: FAIL (workload_seconds searches_not_200_with_rows ingest_dropped_batches ingest_accepted live_tail workers)` and exited 1. That run is not committed.
 
 | Measure | Result | Lines |
 | --- | --- | --- |
-| Verdict | PASS. All 17 checks hold. | 1179–1197 |
+| Verdict | PASS. All 17 checks of that version hold (see "Which version produced the transcript"). | 1179–1197 |
 | Searches | 5577 responses, all 200 with at least one row, each of the 8 searches about 350 times per chunk. 0 `query_resource_exhausted`. Chunk 1 p95 was 1.42 s and max 3.41 s. Chunk 2 p95 was 1.50 s and max 3.26 s. | 308–324, 697–713, 1125–1127 |
-| Ingest | 500 batches, all 200: 500,000 events sent and accepted, no batch dropped, no `hot_buffer_full` retries. Every ingest worker exited 0. | 326–331, 715–720, 1128–1135, 1157–1174 |
+| Ingest | 500 batches, all 200: 500,000 events sent and accepted, no batch dropped, no `hot_buffer_full` retries (0 `retry hot_buffer_full` lines in the transcript). Every ingest worker exited 0. | 326–331, 715–720, 1128–1135, 1157–1174 |
 | Live tail | HTTP 200 and 250 snapshots in each chunk. The stream stayed open until curl's 500 s limit (exit 28). | 333–339, 722–728 |
 | Compaction | 143 `compaction_complete` events, 64 in chunk 1 and 79 in chunk 2. 141 merged into an existing hourly file. 2 started the new hour's files at 10:00:01 and 10:00:13 UTC, one for trawld's own telemetry and one for `i304`. No `ERROR`, `compaction_error`, maintenance resource failure or `catalog_invariant_violation` line. | 637–652, 1031–1048, 1140–1143 |
 | Repins | Dry run of `status` BIGINT→VARCHAR: succeeded in both chunks. Real repin of `code` BIGINT→VARCHAR, then VARCHAR→BIGINT: both succeeded. | 341–349, 730–738, 1144–1155 |

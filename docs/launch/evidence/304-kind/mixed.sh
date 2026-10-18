@@ -11,6 +11,10 @@
 #                                    the chunks add up to at least 15 minutes
 #   mixed.sh report                  kubelet events, container state, peaks
 #                                    over all chunks, and the verdict
+#   mixed.sh window CHUNK_DIR...     the per-chunk window check of the report
+#                                    alone, over saved chunk directories; it
+#                                    needs no cluster and exits 1 when any
+#                                    chunk has a problem
 #
 # Each part is one foreground command that must finish within 10 minutes, so
 # the workload runs in chunks on the same pod. The pod, its data, its cgroup
@@ -35,15 +39,26 @@
 #
 # The report's verdict is PASS only when every check holds, and report then
 # exits 0; otherwise it prints FAIL with the failed checks and exits 1:
-#   - the samplers covered at least 900 s of workload;
+#   - the chunks' verified workload windows add up to at least 900 s, and no
+#     chunk has a window problem. A chunk's window is the SECS it was asked to
+#     run, and it counts only when the workers overlapped for all of it (see
+#     chunk_window): the ingest worker ran its full SECS, finished within
+#     INGEST_OVERRUN seconds of it, sent the full steady rate and logged no
+#     503 retry after its deadline, and every search client's first request
+#     started near the chunk's start and its last near the deadline. The
+#     samplers' span is printed but does not count: they keep running until
+#     every worker has exited, so a worker that stalls past its deadline would
+#     lengthen it;
 #   - no OOM kill (cgroup oom_kill 0), no trawld restart, the same pod uid
 #     as at setup, and no Evicted, OOMKilling or OOMKilled event;
 #   - searches: at least one response; every response 200 with at least one
 #     row; each of the SEARCHES answered; no query_resource_exhausted;
 #   - ingest: in every chunk the worker ran to its end, no batch was
 #     dropped, and the events accepted equal the events sent; more than zero
-#     events overall (hot_buffer_full answers carry Retry-After and are
-#     retried, so they do not fail the run);
+#     events overall. A hot_buffer_full answer carries Retry-After and is
+#     retried, so a retry inside the deadline does not fail the run by itself;
+#     the report counts them, and fails the run on one after a deadline. A
+#     retry that cost the ingest worker its rate fails the full-rate check;
 #   - live tail: in every chunk HTTP 200, at least one snapshot, and the
 #     stream open until curl's time limit (curl exit 28);
 #   - compaction: at least one compaction_complete in every chunk, and no
@@ -65,7 +80,7 @@
 # generated into private/mixed (0700, files 0600), never printed or put on a
 # command line.
 set -euo pipefail
-PART=${1:?usage: mixed.sh setup IMAGE CHART_DIR | run SECS | report}
+PART=${1:?usage: mixed.sh setup IMAGE CHART_DIR | run SECS | report | window CHUNK_DIR...}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 KC=$HERE/kubeconfig
 CTX=kind-trawl-i304
@@ -84,6 +99,13 @@ PRELOAD_SECS=80
 INGEST_RATE=500
 SEARCH_CLIENTS=6
 SEARCH_MIN_SECS=1
+# Window tolerances, in seconds. The ingest worker stops starting batches at
+# its deadline but finishes the batch in flight and sleeps to the next 2 s
+# tick, so it ends up to about 2 s late plus one request. A search client stops
+# issuing at the deadline, so its last request began at most one search plus
+# its 1 s pause before it; the slowest search of the committed run took 3.4 s.
+INGEST_OVERRUN=5
+SEARCH_EDGE=15
 SEARCHES=(
   'service=i304 last=5m | stats count() by host'
   'service=i304 last=1h | top 10 host'
@@ -171,6 +193,54 @@ cgroup_line() {  # one exec: cgroup memory, trawld's RSS and high-water mark, sc
 # Pick key=value N from a sampler line, as a number (0 when absent).
 field_max() {  # field_max FILE KEY: the largest KEY=<n> in FILE
   grep -oE "(^| )$2=[0-9]+" "$1" | cut -d= -f2 | sort -n | tail -n 1
+}
+
+# chunk_window DIR: check that the workers of one saved chunk overlapped for
+# the SECS it was asked to run (DIR/secs, written by chunk). It prints one line,
+#   window_secs=N retries=N late_retries=N sent=N problems=NAME,NAME|none
+# where window_secs is SECS when there is no problem and 0 otherwise, and it
+# returns 1 when there is a problem. It reads only DIR/secs, DIR/ingest.log
+# and DIR/search-N.log. Their lines start with a UTC timestamp of fixed width,
+# so they compare as strings. The deadline is the ingest worker's done time
+# minus its secs plus SECS; secs is rounded to whole seconds, so it is exact
+# within 0.5 s.
+chunk_window() {
+  local c=${1%/} req d s done_ts dl dl_iso late_iso lo_iso hi_iso
+  local retries late sent first last client i problems=()
+  local LC_ALL=C
+  req=$(cat "$c/secs")
+  d=$(grep ' done sent=' "$c/ingest.log" | tail -n 1 || true)
+  retries=$(grep -c ' 503 retry hot_buffer_full' "$c/ingest.log" || true)
+  late=0; sent=0
+  if [[ -z $d ]]; then
+    problems+=(ingest_no_end)
+  else
+    s=$(sed -E 's/.* secs=([0-9]+).*/\1/' <<< "$d")
+    sent=$(sed -E 's/.* sent=([0-9]+).*/\1/' <<< "$d")
+    done_ts=${d%% *}
+    dl=$(awk -v e="$(date -ud "$done_ts" +%s.%N)" -v s="$s" -v r="$req" 'BEGIN { printf "%.3f", e - s + r }')
+    dl_iso=$(date -ud "@$dl" +%FT%T.%3NZ)
+    late_iso=$(date -ud "@$(awk -v d="$dl" 'BEGIN { printf "%.3f", d + 1 }')" +%FT%T.%3NZ)
+    lo_iso=$(date -ud "@$(awk -v d="$dl" -v m="$SEARCH_EDGE" 'BEGIN { printf "%.3f", d - m }')" +%FT%T.%3NZ)
+    hi_iso=$(date -ud "@$(awk -v d="$dl" -v r="$req" -v m="$SEARCH_EDGE" 'BEGIN { printf "%.3f", d - r + m }')" +%FT%T.%3NZ)
+    (( s >= req )) || problems+=("ingest_ran_${s}s_of_${req}s")
+    (( s <= req + INGEST_OVERRUN )) || problems+=("ingest_ran_${s}s_for_a_${req}s_window")
+    late=$(awk -v t="$late_iso" '$3 == "retry" && $1 > t' "$c/ingest.log" | wc -l)
+    (( late == 0 )) || problems+=("ingest_${late}_retries_after_deadline_${dl_iso}")
+    (( sent >= INGEST_RATE * req )) || problems+=("ingest_sent_${sent}_below_the_rate")
+    for i in $(seq 1 "$SEARCH_CLIENTS"); do
+      client=$c/search-$i.log
+      if [[ ! -s $client ]]; then problems+=("search_${i}_no_requests"); continue; fi
+      first=$(head -n 1 "$client" | cut -d' ' -f1); last=$(tail -n 1 "$client" | cut -d' ' -f1)
+      [[ ! $first > $hi_iso ]] || problems+=("search_${i}_first_request_${first}_after_${hi_iso}")
+      [[ ! $last < $lo_iso ]] || problems+=("search_${i}_last_request_${last}_before_${lo_iso}")
+    done
+  fi
+  local list=none
+  (( ${#problems[@]} == 0 )) || list=$(IFS=,; echo "${problems[*]}")
+  printf 'window_secs=%s retries=%s late_retries=%s sent=%s problems=%s\n' \
+    "$(( ${#problems[@]} == 0 ? req : 0 ))" "$retries" "$late" "$sent" "$list"
+  (( ${#problems[@]} == 0 ))
 }
 
 setup() {
@@ -365,6 +435,7 @@ chunk() {
   n=$(( $(cat "$PRIV/chunks") + 1 ))
   last=$(cat "$PRIV/last-end")
   c=$W/c$n; mkdir -p "$c"
+  echo "$secs" > "$c/secs"
   say "chunk $n: the mixed workload for ${secs}s ($(( $(date -u +%s) - last ))s since the previous part ended)"
   note "pod trawl-0 $(pod_line)"
   note "cgroup and scratch: $(cgroup_line)"
@@ -454,10 +525,17 @@ report() {
   all=$W/all-cgroup.log
   cat "$W"/c*/cgroup.log > "$all"
   cat "$W"/c*/searches.log > "$W/all-searches.log"
-  local secs=0 c s0 s1
+  # The workload counts only where the workers overlapped (chunk_window); the
+  # samplers' span, which runs until the last worker exits, is only printed.
+  local secs=0 sampled=0 c s0 s1 w ws bad_windows=0 hb_retries=0 hb_late=0 f
   for c in "$W"/c*/; do
     s0=$(head -n 1 "$c/cgroup.log" | cut -d' ' -f1); s1=$(tail -n 1 "$c/cgroup.log" | cut -d' ' -f1)
-    secs=$(( secs + $(date -ud "$s1" +%s) - $(date -ud "$s0" +%s) ))
+    sampled=$(( sampled + $(date -ud "$s1" +%s) - $(date -ud "$s0" +%s) ))
+    w=$(chunk_window "$c") || bad_windows=$((bad_windows + 1))
+    note "chunk $(basename "$c") window: $w"
+    ws=$(sed -E 's/^window_secs=([0-9]+) .*/\1/' <<< "$w"); secs=$(( secs + ws ))
+    f=$(sed -E 's/.* retries=([0-9]+) .*/\1/' <<< "$w"); hb_retries=$(( hb_retries + f ))
+    f=$(sed -E 's/.* late_retries=([0-9]+) .*/\1/' <<< "$w"); hb_late=$(( hb_late + f ))
   done
   local oomk evict searches nok rex peak hwm restarts
   oomk=$("${K[@]}" exec trawl-0 -c trawld -- sh -c 'grep "^oom_kill " /sys/fs/cgroup/memory.events | cut -d" " -f2')
@@ -469,7 +547,7 @@ report() {
   peak=$("${K[@]}" exec trawl-0 -c trawld -- cat /sys/fs/cgroup/memory.peak)
   hwm=$("${K[@]}" exec trawl-0 -c trawld -- sh -c 'grep "^VmHWM:" /proc/1/status | tr -s " " | cut -d" " -f2')
   say "summary"
-  note "workload sampled for ${secs}s over $n chunks (the gaps between chunks excluded)"
+  note "workload verified for ${secs}s over $n chunks (the gaps between chunks excluded); the samplers spanned ${sampled}s"
   note "trawl-0 uid at setup $uid0, now $uid; trawld restarts $restarts; cgroup oom_kill $oomk"
   note "kubelet events naming Evicted, OOMKilling or OOMKilled: $evict"
   note "searches: $searches responses, $nok not 200 with rows, $rex query_resource_exhausted"
@@ -515,7 +593,9 @@ report() {
     workers_bad=$(( workers_bad + $(grep -cv ' exit=0$' "$c/workers.log" || true) ))
   done
   asked=$(awk '{print $3}' "$W/all-searches.log" | sort -u | wc -l)
-  check workload_seconds "$secs (need >= 900)" test "$secs" -ge 900
+  check workload_seconds "$secs verified (need >= 900)" test "$secs" -ge 900
+  check chunk_windows "$bad_windows of $n chunks with a window problem" test "$bad_windows" = 0
+  check ingest_hot_buffer_full_retries "$hb_retries retried, $hb_late after a deadline" test "$hb_late" = 0
   check oom_kill "$oomk" test "$oomk" = 0
   check restarts "$restarts" test "$restarts" = 0
   check same_pod "$uid0 -> $uid" test "$uid" = "$uid0"
@@ -543,5 +623,14 @@ case $PART in
   setup) setup "${2:?IMAGE}" "${3:?CHART_DIR}" ;;
   run) chunk "${2:?SECS}" ;;
   report) report ;;
+  window)
+    shift
+    (( $# > 0 )) || { echo "usage: mixed.sh window CHUNK_DIR..." >&2; exit 2; }
+    bad=0
+    for c in "$@"; do
+      w=$(chunk_window "$c") || bad=1
+      echo "$c: $w"
+    done
+    exit "$bad" ;;
   *) echo "unknown part $PART" >&2; exit 2 ;;
 esac
