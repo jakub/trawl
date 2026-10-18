@@ -100,7 +100,7 @@ The `duckdb` check reads the **engine sample**, not a live probe. Every 10 secon
 
 Saturation never fails health on its own. A full executor pool, permits held after a timeout, and live streams leave `duckdb` at `ok`, because the sample does not use the pool. The sample does share the query memory and spill budgets, so queries that fill them can make it fail with `Out of Memory`. That reads `slow`, not `error`, until 60 seconds pass with no sample succeeding. The pool is visible elsewhere: read `trawl_query_permits_in_use` against `trawl_query_pool_size`, and `trawl_engine_sample_age_seconds`, on `/metrics`. `trawl_engine_sample_age_seconds` counts the seconds since the latest probe started, or since the sampler started before the first probe. It resets every 10 seconds while probes finish, and it keeps growing while one is wedged. An age past a few multiples of 10 seconds means a probe is wedged. A sample that reads `error` answers 503 and records an `http_failure` event with `error_class=service_unavailable` and `cause_kind=engine_sample_failed`. The gauge `trawl_health_check{subsystem="duckdb"}` reads `1` for `ok` and `slow`, and `0` only for `error`.
 
-The sample exists so that a busy node does not look dead to its probes. Kubernetes readiness, liveness, and startup probes keep calling `/api/v1/health`. A node that is only busy stays ready. A node whose engine is broken goes 503, fails readiness, and, after the liveness threshold, restarts. Acknowledged ingest survives that restart in the WAL.
+The sample exists so that a busy node does not look dead to its probes. Kubernetes readiness, liveness, and startup probes keep calling `/api/v1/health`. A node that is only busy stays ready while a sample has succeeded within the last 60 seconds. If queries hold the memory or spill budgets so long that no sample succeeds for 60 seconds, the sample reads `error` and the node answers 503 like a broken engine. The test `engine_sample_reads_error_after_sixty_seconds_of_exhausted_budgets` pins that rule. A node whose engine is broken goes 503, fails readiness, and, after the liveness threshold, restarts. Acknowledged ingest survives that restart in the WAL.
 
 ## Inspect capacity
 
@@ -112,7 +112,8 @@ The sample exists so that a busy node does not look dead to its probes. Kubernet
 
    Compare `pool_capacity`, `pool_available`, `active_queries`, and
    `pool_retained`. `pool_capacity` is `max_concurrent_queries`, which defaults
-   to the CPU count. `pool_retained` counts permits held by work whose request
+   to the CPU count, capped at 8. It defaults to 4 when the CPU count is
+   unavailable. `pool_retained` counts permits held by work whose request
    has already ended. Retained permits are a subset of the held permits, not an
    extra count.
 

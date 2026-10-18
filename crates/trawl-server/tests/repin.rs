@@ -3142,10 +3142,11 @@ async fn a_schema_write_only_key_follows_its_dry_run_by_id() {
 
 /// A write-only key reads the jobs it requested and nothing else. A job
 /// another key requested, a job from before the key existed and an id the
-/// store never issued are one and the same 404 to it, so a `schema_write`
-/// grant cannot walk the durable job rows by id and learn which exist. A
-/// `schema_read` key reads any job by id, and the unscoped read stays
-/// `schema_read` only.
+/// store never issued answer it the same 404 response, so a `schema_write`
+/// grant cannot read the durable job rows of other keys by id. Job ids are
+/// sequential, so an id's existence is not a secret; the rule protects the
+/// rows' contents. A `schema_read` key reads any job by id, and the
+/// unscoped read stays `schema_read` only.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schema_write_only_key_reads_only_the_jobs_it_requested() {
     let h = harness().await;

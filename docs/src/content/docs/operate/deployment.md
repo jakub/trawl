@@ -929,8 +929,11 @@ ServiceMonitor creation; neither option installs a monitoring system.
    `api.health.duckdb`, `api.health.auth_db`, `api.health.storage_db`,
    `api.health.data_path`, and `api.health.ingest_capacity` are `complete`.
    `api.identity` is `complete` and shows the key's name, kind, and
-   permissions. A `degraded` server fails the run, because the failing check
-   has its own `failed` line. Each failed line names its next action. The
+   permissions. A `degraded` server fails the run when a check reports a failing
+   value, because that check has its own `failed` line. The one exception is
+   `duckdb: slow`, an engine that is slow but has answered within the last
+   minute: that row is `complete`, carries a next action, and does not fail the
+   run. Each failed line names its next action. The
    [CLI reference](/reference/cli/#doctor-mode) lists every check.
 
    `web.origin` shows that `trawl-web` accepts the origin. Together, the three
