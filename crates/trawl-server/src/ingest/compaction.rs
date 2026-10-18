@@ -4185,7 +4185,7 @@ impl ConformPlan {
         conn: &duckdb::Connection,
         source: &str,
         lossy: &[usize],
-    ) -> Result<HashMap<usize, Vec<String>>, String> {
+    ) -> Result<HashMap<usize, Vec<String>>, StatementFailure> {
         if lossy.is_empty() {
             return Ok(HashMap::new());
         }
@@ -4209,14 +4209,11 @@ impl ConformPlan {
                 }
                 Ok(out)
             })
-            .map_err(|e| {
-                // Best effort, so never a maintenance failure: the caller
-                // records the capture's own failure.
-                format!(
-                    "conform sample query failed: {}",
-                    trawl_engine::error::render_duckdb_error(&e)
-                )
-            })?;
+            // Best effort, so never a maintenance failure: the caller
+            // records the capture's own failure. An out-of-memory capture is
+            // still logged and counted as a maintenance resource failure
+            // here, like every other maintenance statement.
+            .map_err(|e| StatementFailure::duckdb("conform sample query failed", &e))?;
 
         let mut out = HashMap::with_capacity(sampled.len());
         for (i, json) in sampled.into_iter().zip(rendered) {
@@ -8790,6 +8787,49 @@ mod tests {
             conflicts[0].samples.is_empty(),
             "evidence degrades to counts, and the values remain in _raw"
         );
+    }
+
+    /// A sample capture that runs out of memory is still a maintenance
+    /// resource failure (ADR-0056), even though sampling is best-effort: the
+    /// conflict counts survive, `catalog_sample_capture_failed` is counted,
+    /// and the same `maintenance_resource_exhausted` event and counter the
+    /// other maintenance statements raise fire once, so an operator sizing
+    /// `ingest.compaction_memory_limit` sees the pressure.
+    #[test]
+    fn an_out_of_memory_sample_capture_is_counted_as_a_resource_failure() {
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE wal_batch AS \
+             SELECT 'v' || repeat('x', 200) || i::VARCHAR AS v FROM range(200000) s(i)",
+        )
+        .unwrap();
+        // The production connection shape: structured diagnostics on, so the
+        // failure carries the `exception_type` the classification reads.
+        structured_errors(&conn).unwrap();
+        conn.execute_batch("SET threads=1").unwrap();
+        conn.execute_batch("SET temp_directory=''").unwrap();
+        conn.execute_batch("SET memory_limit='64MB'").unwrap();
+
+        let schema = describe_source(&conn, "wal_batch").unwrap();
+        let pins: HashMap<String, CanonicalType> = [("v".to_owned(), CanonicalType::BigInt)]
+            .into_iter()
+            .collect();
+        let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
+
+        let (conflicts, logs, exhausted) = oom_support::capture(|| {
+            plan.tally_conflicts(&conn, "wal_batch", "svc")
+                .expect("a capture failure must not fail the conform")
+        });
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].rows_nulled, 200_000, "the counts are exact");
+        assert!(
+            conflicts[0].samples.is_empty(),
+            "evidence degrades to counts"
+        );
+        assert_eq!(exhausted, 1, "{logs}");
+        assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
+        assert!(logs.contains("catalog_sample_capture_failed"), "{logs}");
     }
 
     /// A batch that conflicts on nothing runs no sample query at all — the
