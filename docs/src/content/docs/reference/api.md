@@ -1143,7 +1143,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 | Status | Code | When |
 |--------|------|------|
 | 200 | none | A dry run, or a job cancelled while the request was still scanning. Read `job.status`. |
-| 202 | none | The job was claimed and was still running at `[server] timeout_secs`: the rewrite started, or the scan outlasted the bound. The body is the job as the claim wrote it. Read [repin status](#repin-status) with its `id` for the plan, the refusal or the outcome. |
+| 202 | none | The scan and preflight decided within `[server] timeout_secs` and the rewrite started. The body is the job with its recorded plan: the scan counts and `requires_force`. Follow the rewrite through [repin status](#repin-status) with its `id`. |
+| 202 | none | The scan outlasted `[server] timeout_secs`. The body is the job as the claim wrote it, with no plan yet. Read [repin status](#repin-status) with its `id` for the plan, the refusal or the outcome. |
 | 409 | none | The body is a job with status `refused_needs_force`: the scan found values the new type cannot read, or ambiguous numerals under the `otel` reading, and `force` was not set, or the finished rewrite exceeded an accepted ceiling. `requires_force_reason` names which. |
 | 409 | `bad_request` | A repin job is already running |
 | 400 | `bad_request` | `field` is an envelope field or not pinned, `to` is not a catalog type, `to` equals the current pin without `force`, `dialect` is unknown or given with a target other than `SEVERITY`, a ceiling is given without `force`, the pin changed between lookup and claim, the staging directory is on a different filesystem from the data root, or free disk is below the affected bytes plus the retention floor |
