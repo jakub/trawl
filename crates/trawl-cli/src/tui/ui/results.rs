@@ -363,20 +363,19 @@ fn render_table(
     } else {
         String::new()
     };
+    // A running query leaves the last result drawn until its answer
+    // arrives, so the cap mark covers every arm, "Running..." included.
     let title = match tab.status {
         TabStatus::Running { .. } | TabStatus::Error { .. } => pane_title(&tab.status, theme),
         _ => {
             let scroll_start = pinned_count + h_scroll + 1;
             let scroll_end = (pinned_count + h_scroll + visible_scrollable).min(visible_count);
-            capped_title(
-                format!(
-                    " Results ({total_rows} rows, cols {scroll_start}-{scroll_end}/{visible_count}{pinned_info}{hidden_info}) "
-                ),
-                &tab.live_capped,
-                theme,
-            )
+            Line::from(format!(
+                " Results ({total_rows} rows, cols {scroll_start}-{scroll_end}/{visible_count}{pinned_info}{hidden_info}) "
+            ))
         }
     };
+    let title = capped_title(title, &tab.live_capped, theme);
 
     let block = Block::default()
         .borders(Borders::ALL)

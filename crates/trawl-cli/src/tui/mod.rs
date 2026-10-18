@@ -1759,6 +1759,73 @@ mod tests {
         assert_marked(&mut app, "all columns hidden", "All columns hidden");
     }
 
+    /// The cap mark stays with the capped rows while the next query runs.
+    ///
+    /// Running a batch query stops the live stream and titles the pane
+    /// "Running..." until the answer arrives, but the last snapshot's rows
+    /// stay drawn meanwhile, so their cap stays disclosed with them.
+    #[tokio::test]
+    async fn live_capped_snapshot_marks_results_title_while_the_next_query_runs() {
+        use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+
+        const MARK: &str = " partial: groups > 10000 ";
+        let mut app = test_app();
+        app.query_tx
+            .send(QueryResult {
+                result: Ok(make_query_response(
+                    vec!["host", "count"],
+                    vec![vec![Value::String("web-1".into()), Value::Integer(42)]],
+                )),
+                duration: Duration::from_secs(0),
+                capped: vec![SnapshotCap {
+                    cap: SnapshotCapKind::Groups,
+                    limit: 10_000,
+                }],
+            })
+            .unwrap();
+        app.poll_query_results();
+        app.live_mode = true;
+        app.tab.editor.insert_text("* | stats count() by host");
+
+        // The answer is never polled, so the query stays pending.
+        app.execute_query();
+        assert!(!app.live_mode, "the batch query stops the live stream");
+        assert!(
+            matches!(app.tab.status, TabStatus::Running { .. }),
+            "{:?}",
+            app.tab.status
+        );
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| ui::render(&mut app, frame)).unwrap();
+        let area = app
+            .layout
+            .results
+            .expect("the query layout has a results pane");
+        let buffer = terminal.backend().buffer().clone();
+        let cells: Vec<_> = (area.x..area.x + area.width)
+            .map(|x| buffer[(x, area.y)].clone())
+            .collect();
+        let screen = terminal.backend().to_string();
+        let text: String = cells.iter().map(ratatui::buffer::Cell::symbol).collect();
+        assert!(
+            screen.contains("web-1"),
+            "the capped rows stay drawn\n{screen}"
+        );
+        assert!(text.contains("Running..."), "{text:?}");
+        let at = text
+            .find(MARK)
+            .unwrap_or_else(|| panic!("no mark in {text:?}\n{screen}"));
+        let start = text[..at].chars().count();
+        for cell in &cells[start..start + MARK.chars().count()] {
+            assert_eq!(
+                cell.fg, app.theme.status_warning,
+                "the mark is a warning: {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn poll_query_result_sets_error_status() {
         let mut app = test_app();
