@@ -686,6 +686,24 @@ const CONTRACTS: &[Contract] = &[
         hook: "class=\"m-refusal\"",
     },
     Contract {
+        assignment: "modalResourceNotice: '.modal .resource-notice[role=\"alert\"]',",
+        source_path: "../fleet-ui/src/modal/shell.rs",
+        source: MODAL_SHELL_RS,
+        hook: "else { \"modal\" };",
+    },
+    Contract {
+        assignment: "modalResourceNotice: '.modal .resource-notice[role=\"alert\"]',",
+        source_path: "src/components/export_modal.rs",
+        source: EXPORT_MODAL_RS,
+        hook: "<ResourceNotice message=",
+    },
+    Contract {
+        assignment: "modalResourceNotice: '.modal .resource-notice[role=\"alert\"]',",
+        source_path: "src/components/resource_notice.rs",
+        source: RESOURCE_NOTICE_RS,
+        hook: "<div class=\"resource-notice\" role=\"alert\">",
+    },
+    Contract {
         assignment: "emptyQueryRefusal: 'Nothing to export: the query is empty.',",
         source_path: "src/search_url.rs",
         source: SEARCH_URL_RS,

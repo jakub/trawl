@@ -204,6 +204,11 @@ export const SEL = {
   /// crates/trawl-web-ui/src/components/export_modal.rs — what the modal
   /// says when it refuses its own query rather than posting it.
   modalRefusal: '.m-refusal',
+  /// crates/trawl-web-ui/src/components/export_modal.rs — the resource
+  /// notice the modal shows in its body when the server answers an
+  /// export with `query_resource_exhausted` (ADR-0056). Its parts are
+  /// the search page's `resourceNoticeTitle` and `resourceNoticeText`.
+  modalResourceNotice: '.modal .resource-notice[role="alert"]',
   /// crates/fleet-ui/src/toast/runtime.rs Toasts, whose class is
   /// `toast {kind}` from crates/fleet-ui/src/toast/kinds.rs. An error
   /// toast is what a producer refusal raises.

@@ -233,9 +233,21 @@ pub fn decode_error_body(status: u16, body: &str) -> ApiError {
     }
 }
 
+/// A non-2xx export answer. The export runs the query on the same memory
+/// and scratch budget a search does, so it is refused the same way and its
+/// body is the same envelope: read through [`decode_error_body`], the
+/// `query_resource_exhausted` sentence reaches the export modal. A missing
+/// body falls back to the bare status.
+#[must_use]
+pub fn export_failure(status: u16, body: Option<&str>) -> ApiError {
+    body.map_or(ApiError::Status(status), |body| {
+        decode_error_body(status, body)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, Kept, decode_error_body, kept_as};
+    use super::{ApiError, Kept, decode_error_body, export_failure, kept_as};
     use trawl_api::ErrorCode;
 
     /// Every wire code, spelled out. The match in `kept_as` has no
@@ -428,5 +440,43 @@ mod tests {
             assert!(matches!(err, ApiError::Status(500)), "{body:?}: {err:?}");
             assert_eq!(err.to_string(), "server returned 500");
         }
+    }
+
+    /// The export answer is the same envelope the query answer is, so a
+    /// refusal for resources reaches the export modal with the server's
+    /// sentence instead of the bare status the body used to be dropped for.
+    #[test]
+    fn an_export_refused_for_resources_keeps_the_servers_sentence() {
+        let message = "query could not complete with the available query resources; narrow the \
+                       time range or simplify the query";
+        let body =
+            format!(r#"{{"error":{{"code":"query_resource_exhausted","message":"{message}"}}}}"#);
+        let err = export_failure(503, Some(&body));
+        assert!(
+            matches!(&err, ApiError::ResourceExhausted { status: 503, message: m } if m == message),
+            "{err:?}"
+        );
+        assert_eq!(err.resource_exhausted(), Some(message));
+    }
+
+    /// Only that refusal reads as a resource failure on the export path,
+    /// and a body that is missing or is not the envelope falls back to the
+    /// bare status, as every other read does.
+    #[test]
+    fn another_export_failure_is_not_a_resource_failure() {
+        for body in [
+            Some(r#"{"error":{"code":"service_unavailable","message":"service unavailable"}}"#),
+            Some("Export unavailable"),
+            None,
+        ] {
+            let err = export_failure(503, body);
+            assert_eq!(err.resource_exhausted(), None, "{body:?}");
+            assert_eq!(err.http_status(), Some(503), "{body:?}");
+        }
+        assert!(matches!(export_failure(503, None), ApiError::Status(503)));
+        assert!(matches!(
+            export_failure(503, Some("Export unavailable")),
+            ApiError::Status(503)
+        ));
     }
 }

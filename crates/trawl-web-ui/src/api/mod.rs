@@ -34,7 +34,7 @@ pub const RUNS_PAGE_SIZE: std::num::NonZeroUsize = std::num::NonZeroUsize::new(2
 /// The failure type lives in a pure module so its body decoder is tested
 /// natively; the transport below is the only part that needs a browser.
 pub use crate::api_error::ApiError;
-use crate::api_error::decode_error_body;
+use crate::api_error::{decode_error_body, export_failure};
 
 impl From<gloo_net::Error> for ApiError {
     fn from(e: gloo_net::Error) -> Self {
@@ -617,7 +617,7 @@ pub async fn export(
             Ok((bytes, filename))
         }
         401 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Status(s)),
+        s => Err(export_failure(s, resp.text().await.ok().as_deref())),
     }
 }
 
