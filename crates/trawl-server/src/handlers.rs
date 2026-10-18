@@ -2389,9 +2389,10 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 /// non-`SEVERITY` target) are 400s; a query-only node answers 503 — it owns
 /// nothing under the data root.
 ///
-/// The request answers within `[server] timeout_secs` of reaching this
-/// handler, so its response head always reaches trawl-web inside the
-/// proxy's deadline (ADR-0054). A job still running at that bound answers
+/// The request answers within `[server] timeout_secs` of this handler's
+/// call to `RepinEngine::start_within`, inside trawl-web's head deadline
+/// of `timeout_secs + 10 s` unless authentication or body reading before
+/// the handler takes the rest (ADR-0054). A job still running at that bound answers
 /// 202 with the row its claim wrote, dry runs included, and the caller
 /// follows it with `/schema/repin/status?id=`. A request whose claim has
 /// not landed by then answers 503, and a claim that lands later ends its

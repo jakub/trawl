@@ -908,8 +908,8 @@ impl RepinStore {
     ///
     /// Existence and ownership are one predicate in one statement: nothing
     /// is read and then checked, so there is no window in which the answer
-    /// could change under the caller, and a job another key requested is
-    /// indistinguishable from an id the store never issued. A row with no
+    /// could change under the caller, and a job another key requested
+    /// returns `None`, as an id the store never issued does. A row with no
     /// requester matches no key.
     pub async fn get_requested_by(
         &self,
