@@ -2968,6 +2968,62 @@ mod tests {
         (dir, hot, pool)
     }
 
+    /// `drop` of a field no event carries is a no-op on the hot lanes too,
+    /// as the live tail answers it (ADR-0001): over cold and hot data, and
+    /// over a hot buffer with no cold data, every row comes back with every
+    /// column. `* EXCLUDE` answered both with an empty result: its refusal
+    /// read as a missing column, and the hot-only retry refused the same way.
+    #[tokio::test]
+    async fn drop_of_an_absent_field_keeps_every_row_on_the_hot_lanes() {
+        use crate::bus::IngestBatch;
+        use crate::hot_buffer::HotBufferConfig;
+
+        async fn columns_and_rows(pool: &ExecutorPool, dsl: &str) -> (Vec<String>, usize) {
+            let result = pool
+                .execute(
+                    pool.allocate_query_id(),
+                    dsl,
+                    Deadline::after(Duration::from_secs(30)),
+                    false,
+                    0,
+                    TEST_WORK,
+                )
+                .await
+                .result
+                .unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
+            let mut names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+            names.sort();
+            (names, result.row_count())
+        }
+
+        let (_dir, _hot, hot_and_cold) = cold_and_hot_pool().await;
+        let all = columns_and_rows(&hot_and_cold, "*").await;
+        assert_eq!(all.1, 2, "one cold row and one hot row");
+        assert_eq!(columns_and_rows(&hot_and_cold, "* | drop nope").await, all);
+
+        let hot = Arc::new(HotBuffer::new(HotBufferConfig {
+            max_events: 100,
+            max_bytes: 1 << 20,
+        }));
+        let mut event = serde_json::Map::new();
+        event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
+        event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
+        event.insert("service".into(), "svc".into());
+        event.insert("message".into(), "hello".into());
+        hot.insert_for_test(Arc::new(IngestBatch {
+            batch_id: "b1".into(),
+            service: "svc".into(),
+            byte_size: 64,
+            events: vec![event],
+        }));
+        let hot_only =
+            ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, Some(hot)).unwrap();
+        let all = columns_and_rows(&hot_only, "*").await;
+        assert_eq!(all.1, 1, "the one hot row");
+        assert!(all.0.contains(&"message".to_owned()), "{all:?}");
+        assert_eq!(columns_and_rows(&hot_only, "* | drop nope").await, all);
+    }
+
     /// Rows in a Parquet export's bytes.
     fn parquet_rows(bytes: &[u8]) -> i64 {
         let file = tempfile::Builder::new()

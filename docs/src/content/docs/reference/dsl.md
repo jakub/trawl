@@ -585,6 +585,8 @@ drop message
 drop host, raw
 ```
 
+A field that no event carries is ignored, so `drop` of a misspelled name returns every column.
+
 ### let / eval
 
 ```text
