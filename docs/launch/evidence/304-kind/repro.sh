@@ -134,11 +134,15 @@ events() {
 # A supervised port-forward to the pod, not the Service: the Service drops a
 # NotReady pod from its endpoints, and the transcript needs the 503 health
 # answers a NotReady pod gives. kubectl port-forward exits when trawld hangs up
-# mid-upload or the pod goes away, so a loop restarts it.
+# mid-upload or the pod goes away, so a loop restarts it. setsid puts the loop
+# in a process group of its own, led by pf_pid (a background job of this
+# script never leads a group, so setsid does not fork): pf_stop signals that
+# group and nothing else, so other port-forwards on the host are left alone.
 pf_pid=
 pf_start() {
   pf_stop
-  ( while :; do "${K[@]}" port-forward pod/trawl-0 "$PORT:5514" >> "$W/port-forward.log" 2>&1; sleep 0.5; done ) &
+  setsid bash -c 'log=$1; shift; while :; do "$@" >> "$log" 2>&1; sleep 0.5; done' pf \
+    "$W/port-forward.log" "${K[@]}" port-forward pod/trawl-0 "$PORT:5514" &
   pf_pid=$!
   for _ in $(seq 1 50); do
     [[ $(health /dev/null) != 000 ]] && return 0
@@ -148,10 +152,8 @@ pf_start() {
 }
 pf_stop() {
   [[ -n $pf_pid ]] || return 0
-  pkill -P "$pf_pid" 2>/dev/null || true
-  kill "$pf_pid" 2>/dev/null || true
+  kill -TERM -- "-$pf_pid" 2>/dev/null || true
   wait "$pf_pid" 2>/dev/null || true
-  pkill -f "port-forward pod/trawl-0 $PORT:5514" 2>/dev/null || true
   pf_pid=
 }
 bg_pids=()
