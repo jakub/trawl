@@ -39,7 +39,7 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 | `query_cancel` | Cancel the key's own running queries |
 | `server_manage` | Read server stats and the dashboard, [preview ingest](#preview-ingest), cancel any query, and see the text of system-owned retained work |
 | `ingest` | Submit events to `/api/v1/ingest` |
-| `schema_write` | Repin a field, read a repin job by its id, reclaim pins, and acknowledge degraded pins |
+| `schema_write` | Repin a field, read a repin job the key requested by its id, reclaim pins, and acknowledge degraded pins |
 
 `schema_read` exposes samples of event values in conflict evidence: up to 5 values per conflict row, each cut to 256 bytes.
 
@@ -1154,9 +1154,9 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 
 `GET /api/v1/schema/repin/status`
 
-Permission: `schema_read`. With `id`, `schema_read` or `schema_write`.
+Permission: `schema_read`. With `id`, `schema_read` for any job, or `schema_write` for a job the key requested.
 
-Returns the running job, or else the newest job of any status, so a newer job hides an older one. With `id`, returns that job whatever has run since. A caller follows a [repin](#repin-a-field) that answered 202 this way, and the key that started the job needs no more than the `schema_write` the repin required. Served on every node, including those with ingest disabled.
+Returns the running job, or else the newest job of any status, so a newer job hides an older one. With `id`, returns that job whatever has run since. A caller follows a [repin](#repin-a-field) that answered 202 this way, and the key that started the job needs no more than the `schema_write` the repin required. A key that holds `schema_write` without `schema_read` reads only the jobs it requested. Every other `id` answers the same 404 as an `id` no job has, so the write permission alone does not reveal which jobs exist. Served on every node, including those with ingest disabled.
 
 **Parameters**
 
@@ -1185,7 +1185,7 @@ Without `id`, `job` is `null` when no repin has ever run. The job shape is the o
 |--------|------|------|
 | 400 | `bad_request` | `id` is not an integer |
 | 403 | `forbidden` | Without `id`, the key lacks `schema_read`. With `id`, it lacks both `schema_read` and `schema_write`. |
-| 404 | `not_found` | No job has that `id` |
+| 404 | `not_found` | No job has that `id`, or the key holds `schema_write` without `schema_read` and did not request the job |
 | 503 | `service_unavailable` | The app-state store did not answer |
 
 ### Cancel a running repin

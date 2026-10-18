@@ -228,7 +228,8 @@ trawl schema <SUBCOMMAND>
 Schema subcommands read and change the field catalog: pinned types, per-service
 observations, and type-conflict evidence. Reads need `schema_read`. Repin,
 cancellation, pin reclamation, and acknowledgement need `schema_write`. A repin
-follows its own job by id, which `schema_write` alone allows.
+follows its own job by id, which `schema_write` alone allows for a job the same
+key requested.
 
 Every subcommand takes `-f, --format` with the `table`, `json`, and `csv` values
 and the TTY auto-detection `query` uses. A `--last` window accepts `s`, `m`,

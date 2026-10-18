@@ -6,7 +6,8 @@ description: Inspect a pinned field, acknowledge or repin a degraded pin, recove
 These commands address the server named by `TRAWL_PROFILE`. Set it to the server
 you intend to change. Reads need `schema_read`. Acknowledgement, repin, and pin
 reclamation need `schema_write`, which is also enough for the CLI to follow its
-own repin job by id. Repin and pin reclamation also need an
+own repin job by id. A key with `schema_write` alone reads only the jobs it
+requested; any other job needs `schema_read`. Repin and pin reclamation also need an
 ingest-enabled node, and any other node answers 503 for those two. Command syntax is in the [CLI reference](/reference/cli/#schema-mode).
 Status codes and job fields are in the [API reference](/reference/api/#schema).
 
