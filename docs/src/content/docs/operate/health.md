@@ -379,6 +379,11 @@ and the other fields.
    - An absent field means the query never entered that phase. A query without
      `from saved` has no `query_saved_lookup_us`, only a `timechart` query
      has `query_probe_us`, and only a capture has `query_write_us`.
+   - A [captured result](/reference/api/#captured-results) that is refused
+     before it runs still writes its event. A bounds refusal has
+     `outcome=error` and `work_started=false`, with `query_dsl_check_us` and
+     no `query_pool_wait_us`. A refusal at the admission gates has
+     `outcome=capacity_refused` and `work_started=false`.
    - A present `0` is a measurement: the phase ran for less than one
      microsecond.
    - `query_observed_us` is the whole window. It starts at the same instant as

@@ -36,7 +36,7 @@ Considered and rejected:
 
 Building #307 settled ten points the decision left open. The decision stands; these refine it.
 
-- **HTTP/2.** trawld's listener stays HTTP/1.1, as ADR-0054 records. The abort evidence runs over HTTP/1.1 against the real listener, and over HTTP/2 only in a test that serves the real router behind a test listener. Enabling HTTP/2 in production is a separate decision.
+- **HTTP/2.** trawld's listener stays HTTP/1.1, as ADR-0054 records. The abort evidence runs over HTTP/1.1 against the real listener, and over HTTP/2 only in a test that serves the real router behind a test listener. The HTTP/2 leg is evidenced by `crates/trawl-server/tests/results_abort.rs`, through the test-only listener `serve_with_listener_h2_for_tests`; `trawld` itself stays HTTP/1.1 (ADR-0054). Enabling HTTP/2 in production is a separate decision.
 - **Read permission.** Every read, the list included, needs the trawl `query` permission and ownership of the capture. A key without `query` gets 403, and another key's capture answers 404, as an unknown id does.
 - **Operator visibility.** No route shows another key's captures in this release, not even to `server_manage`.
 - **`latest=` alone is refused**, in the query and in the window, because it names no start. A 15-minute span ending at `latest` was rejected: it guesses a start the caller never gave.

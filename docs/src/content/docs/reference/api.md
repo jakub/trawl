@@ -86,7 +86,7 @@ Every error that trawld itself produces has this body:
 | `result_gone` | 410 | A captured result expired, or was removed to fit a lowered quota. The message says which. See [captured result outcomes](#captured-result-outcomes) |
 | `rate_limited` | 429 | The key's per-minute bucket is empty. Sent with `Retry-After` |
 | `too_many_streams` | 429 | `max_sse_connections` reached |
-| `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the capture's deadline passed while it waited. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
+| `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the capture's deadline passed during admission. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
 | `capture_quota_exceeded` | 429 | The key's or the installation's capture quota has no room for one more result. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
 | `execution_error` | 500 | DuckDB failed for a reason other than its resource budgets, or the query was cancelled. Details are logged, never returned. |
 | `execution_error` | 400 | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. See [Result columns](#result-columns). |
@@ -587,7 +587,7 @@ A result with columns and no rows is stored as a file that holds only its column
 
 #### Admission and quotas
 
-A capture is admitted before it takes a query id, an executor permit, or the publication guard. A refusal leaves nothing taken, and the capture appears in neither `/api/v1/queries` nor history. The checks run in this order:
+A capture is admitted before it takes a query id, an executor permit, or the publication guard. A refusal leaves nothing taken, and the capture appears in neither `/api/v1/queries` nor history. It still writes one [`query_timing` event](/architecture/reports-telemetry/#query-timing) with the kind `capture`. A [bounds](#bounds) refusal has `outcome=error` and `work_started=false`, and carries `query_dsl_check_us` but no `query_pool_wait_us`. A refusal at the gates below has `outcome=capacity_refused` and `work_started=false`. The checks run in this order:
 
 1. **The key's quota, read ahead.** A key that is already full is refused before it waits.
 2. **The key's lane.** One capture per key runs at a time, `[capture] per_key_running`. Up to 4 more wait in the key's queue, `[capture] queue_depth`, inside their own deadline. The next one is refused with 429 `capture_busy`.
@@ -603,7 +603,7 @@ A capture is admitted before it takes a query id, an executor permit, or the pub
 
 A capture needs `max_file_bytes` of free quota to start, even when its file turns out small. When its row commits, the reservation becomes the file's real size.
 
-Both 429 answers carry `Retry-After`, in whole seconds and never less than 1. For `capture_busy` it is the time until the first running capture's deadline. For `capture_quota_exceeded` it is the time until the first temporary result in the full quota expires, at most `[capture] ttl_secs`, and `ttl_secs` when none will expire. A capture whose deadline passes while it waits in its queue gets `capture_busy` with `Retry-After: 1`.
+Both 429 answers carry `Retry-After`, in whole seconds and never less than 1. For `capture_busy` it is the time until the first running capture's deadline. For `capture_quota_exceeded` it is the time until the first temporary result in the full quota expires, at most `[capture] ttl_secs`, and `ttl_secs` when none will expire. A capture whose deadline passes during admission, in the key's queue or in the store calls that expire due captures and reserve quota, gets `capture_busy` with `Retry-After: 1`. A deadline that passes later is a 503 or a 504, as the outcomes table says.
 
 Before it scans, the server measures the stored files the window selects, under the publication guard. A selection larger than 1 GiB, `[capture] source_max_bytes`, is refused with 400 `capture_source_too_large`. The message gives both byte counts and nothing else. The hot buffer is not counted. A `from saved` capture measures its run's files against the same limit, and counts a missing file as 0 bytes.
 
@@ -624,13 +624,14 @@ A capture writes its file to the [results root](/reference/configuration/#the-re
 | 403 | `forbidden` | The key lacks `query` |
 | 404 | `not_found` | A `from saved` stage names a saved query the key does not own, or one with no successful run |
 | 409 | `bad_request` | A `from saved` stage selects a run that has columns but no Parquet file |
-| 429 | `capture_busy` | The key's queue is full, two captures already run, or the deadline passed in the queue. Sent with `Retry-After` |
+| 429 | `capture_busy` | The key's queue is full, two captures already run, or the deadline passed during admission: in the key's queue, or in the store reads and writes that expire due captures and reserve quota. Sent with `Retry-After`, which is `1` for the deadline case |
 | 429 | `capture_quota_exceeded` | The key's or the installation's quota cannot take one more result. Sent with `Retry-After` |
 | 500 | `execution_error` | DuckDB failed or the capture was cancelled |
 | 503 | `query_resource_exhausted` | The query went over the spill or memory budget |
-| 503 | `service_unavailable` | The deadline passed before the query started, or the metadata store did not answer |
+| 503 | `service_unavailable` | The deadline passed after admission and before the work started: in the wait for an executor permit or the publication guard, or in the hand-off to the worker. The message is `server at capacity: the query was not started`. Nothing stays charged |
+| 503 | `service_unavailable` | The metadata store did not answer |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering) |
-| 504 | `timeout` | The deadline passed after the query started |
+| 504 | `timeout` | The deadline passed after the work started, including while the file was being written. The work keeps its slots and its reservation until it stops, and a file it had not yet published is removed |
 
 ### List captured results
 
@@ -678,11 +679,11 @@ Returns rows of a capture by row number, from the stored file. It runs no query 
 | Name | In | Type | Required | Description |
 |------|----|------|----------|-------------|
 | `id` | path | string | yes | The result id |
-| `offset` | query | integer | no | The first row number, 0-based. Default `0`. At most `captured_rows`, where the page is empty |
-| `limit` | query | integer | no | Rows in the page. Default and cap: `[capture] page_max_rows` (`200`) |
+| `offset` | query | integer | no | The first row number, 0-based. Default `0`. At most `captured_rows`; an `offset` equal to `captured_rows` is accepted and returns a page with no rows |
+| `limit` | query | integer | no | Rows in the page. Default and cap: `[capture] page_max_rows` (`200`). `0` is accepted and returns a page with no rows |
 | `columns` | query | string | no | Column names separated by commas. Default: every column |
 
-A name in `columns` selects every column with that name, so a duplicate name returns each of its columns. The page carries the selected columns in stored order, whatever order `columns` names them in. A name that the result does not have is 400 `bad_request`. A name that holds a comma cannot be selected on its own; leave `columns` out to read every column.
+A name in `columns` selects every column with that name, so a duplicate name returns each of its columns. The page carries the selected columns in stored order, whatever order `columns` names them in. A name that the result does not have is 400 `bad_request`. An empty `columns=` names one column called `''`, so it is refused the same way unless the result has a column with an empty name. A name that holds a comma cannot be selected on its own; leave `columns` out to read every column.
 
 **Request**
 
