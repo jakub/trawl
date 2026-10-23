@@ -2558,6 +2558,16 @@ pub mod captured {
         );
     }
 
+    /// The fleet key id `token` authenticates as: the key a capture
+    /// belongs to.
+    pub async fn key_id(server: &TestServer, token: &str) -> i64 {
+        fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
+            .verify_key(token)
+            .await
+            .expect("a fixture token verifies")
+            .id
+    }
+
     /// Every name in the server's results root, sorted: published results
     /// (`<id>.parquet`) and stages (`.stage-*`).
     pub fn root_names(server: &TestServer) -> Vec<String> {
