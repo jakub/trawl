@@ -108,6 +108,10 @@ pub struct NetworkError {
     pub kind: NetworkKind,
     /// The sanitized, human-readable message.
     pub message: String,
+    /// The `X-Request-Id` of the response whose body failed, when the
+    /// failure struck after the headers arrived and they carried one.
+    /// `None` for a failure with no response behind it.
+    pub request_id: Option<String>,
 }
 
 impl NetworkError {
@@ -116,7 +120,16 @@ impl NetworkError {
         Self {
             kind,
             message: message.into(),
+            request_id: None,
         }
+    }
+
+    /// This failure, naming `id` as the request id of the response whose
+    /// body it struck.
+    #[must_use]
+    pub(crate) fn answered_by(mut self, id: Option<String>) -> Self {
+        self.request_id = id;
+        self
     }
 }
 
@@ -154,7 +167,8 @@ impl ClientError {
     /// (ADR-0040): quoting it lets an operator find the request's failure
     /// event. The client never generates one. Present for every error that
     /// saw response headers carrying it ([`Self::Server`], a response body
-    /// that did not parse, [`Self::TooLarge`]); `None` for
+    /// that did not parse, [`Self::TooLarge`], and a [`Self::Network`] that
+    /// struck the body after the headers arrived); `None` for any other
     /// [`Self::Network`], [`Self::InvalidCa`] and [`Self::InvalidUrl`],
     /// which have no response.
     pub fn request_id(&self) -> Option<&str> {
@@ -162,7 +176,8 @@ impl ClientError {
             Self::Server { request_id, .. }
             | Self::Parse { request_id, .. }
             | Self::TooLarge { request_id, .. } => request_id.as_deref(),
-            Self::Network(_) | Self::InvalidCa(_) | Self::InvalidUrl(_) => None,
+            Self::Network(error) => error.request_id.as_deref(),
+            Self::InvalidCa(_) | Self::InvalidUrl(_) => None,
         }
     }
 

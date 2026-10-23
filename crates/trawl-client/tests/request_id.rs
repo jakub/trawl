@@ -39,6 +39,9 @@ enum Answer {
     Reset,
     /// Write this response and close cleanly.
     Respond(Vec<u8>),
+    /// Write these bytes, then hold the connection open and silent until
+    /// the client gives up.
+    Stall(Vec<u8>),
 }
 
 /// A self-signed certificate for `127.0.0.1`: its PEM, for the client to
@@ -60,6 +63,15 @@ fn self_signed() -> (
 /// Serve one connection with `answer`. Returns a client that trusts the
 /// listener's certificate as its pinned CA, and the serving task.
 async fn serve_one(answer: Answer) -> (HttpClient, JoinHandle<()>) {
+    serve_one_within(answer, None).await
+}
+
+/// [`serve_one`], with `timeout` bounding each of the client's requests in
+/// place of its long default when given.
+async fn serve_one_within(
+    answer: Answer,
+    timeout: Option<Duration>,
+) -> (HttpClient, JoinHandle<()>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (pem, chain, key) = self_signed();
     let config = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -90,6 +102,14 @@ async fn serve_one(answer: Answer) -> (HttpClient, JoinHandle<()>) {
         }
         match answer {
             Answer::Reset => drop(tls),
+            Answer::Stall(bytes) => {
+                if tls.write_all(&bytes).await.is_ok() && tls.flush().await.is_ok() {
+                    // The client's deadline ends the wait: it drops the
+                    // connection, and this read returns.
+                    let mut rest = Vec::new();
+                    let _ = tls.read_to_end(&mut rest).await;
+                }
+            }
             Answer::Respond(response) => {
                 // A client that stops at its body cap hangs up under the
                 // rest, so a failed write is the test's subject, not a
@@ -100,11 +120,12 @@ async fn serve_one(answer: Answer) -> (HttpClient, JoinHandle<()>) {
             }
         }
     });
-    let client = HttpClient::with_trust(
-        format!("https://{address}"),
-        TOKEN,
-        &TlsTrust::PinnedCa(pem),
-    )
+    let url = format!("https://{address}");
+    let trust = TlsTrust::PinnedCa(pem);
+    let client = match timeout {
+        Some(timeout) => HttpClient::with_trust_timeout(url, TOKEN, &trust, timeout),
+        None => HttpClient::with_trust(url, TOKEN, &trust),
+    }
     .expect("client");
     (client, served)
 }
@@ -368,4 +389,72 @@ async fn a_reset_names_no_request_id() {
     assert_ne!(error.network_kind(), None);
     assert_ne!(error.network_kind(), Some(NetworkKind::UploadCutOff));
     assert_eq!(error.request_id(), None);
+}
+
+/// Headers that carry the id and declare `100` body bytes, then `10` of
+/// them. Written whole by a listener that then closes, or held open by one
+/// that stalls.
+fn cut_short_response() -> Vec<u8> {
+    let mut head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-request-id: {REQUEST_ID}\r\n\
+         content-length: 100\r\nconnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    head.extend_from_slice(b"{\"status\":");
+    head
+}
+
+/// A 200 whose body closes before its declared length is a body-read
+/// network error, and still names the response's id, on the capped path
+/// (`whoami`) and the uncapped one (`list_results`, a parse failure).
+#[tokio::test]
+async fn a_body_cut_short_after_the_headers_carries_the_request_id() {
+    let (client, served) = serve_one(Answer::Respond(cut_short_response())).await;
+    let error = exchange(client.whoami(), served)
+        .await
+        .expect_err("a short body is an error");
+    assert_eq!(
+        error.network_kind(),
+        Some(NetworkKind::BodyRead),
+        "{error:?}"
+    );
+    assert_eq!(error.request_id(), Some(REQUEST_ID), "{error:?}");
+
+    let (client, served) = serve_one(Answer::Respond(cut_short_response())).await;
+    let error = exchange(client.list_results(), served)
+        .await
+        .expect_err("a short body is an error");
+    assert_eq!(error.request_id(), Some(REQUEST_ID), "{error:?}");
+}
+
+/// A body that stalls past the client's deadline after the headers is a
+/// body timeout, and still names the response's id, on the capped path
+/// (`whoami`) and the uncapped one (`list_results`).
+#[tokio::test]
+async fn a_body_timeout_after_the_headers_carries_the_request_id() {
+    for capped in [true, false] {
+        let (client, served) = serve_one_within(
+            Answer::Stall(cut_short_response()),
+            Some(Duration::from_millis(500)),
+        )
+        .await;
+        let error = if capped {
+            exchange(client.whoami(), served).await
+        } else {
+            exchange(client.list_results(), served)
+                .await
+                .map(|_| unreachable!())
+        }
+        .expect_err("a stalled body is an error");
+        assert_eq!(
+            error.network_kind(),
+            Some(NetworkKind::BodyTimeout),
+            "capped={capped}: {error:?}"
+        );
+        assert_eq!(
+            error.request_id(),
+            Some(REQUEST_ID),
+            "capped={capped}: {error:?}"
+        );
+    }
 }

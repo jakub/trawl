@@ -1313,13 +1313,13 @@ fn decode_frame<T: serde::de::DeserializeOwned>(
 /// reqwest reports every failure collecting a body as a decode error, a
 /// stall past the request's deadline included. A timeout is a transport
 /// failure, not a malformed answer, so it is a [`NetworkKind::BodyTimeout`]
-/// with the same sanitized message as a timeout before the headers. Anything
-/// else stays [`ClientError::Parse`], carrying the answering response's
-/// `request_id`.
+/// with the same sanitized message as a timeout before the headers, and the
+/// answering response's `request_id`. Anything else stays
+/// [`ClientError::Parse`], carrying the same id.
 #[allow(clippy::needless_pass_by_value)] // the error is consumed on the timeout path
 fn body_read_error(e: reqwest::Error, request_id: Option<String>) -> ClientError {
     if e.is_timeout() {
-        body_timeout(e)
+        body_timeout(e, request_id)
     } else {
         ClientError::Parse {
             message: e.to_string(),
@@ -1332,10 +1332,11 @@ fn body_read_error(e: reqwest::Error, request_id: Option<String>) -> ClientError
 /// the deadline is a [`NetworkKind::BodyTimeout`], anything else is a
 /// [`NetworkKind::BodyRead`]. Either way the headers arrived, so the
 /// server answered; the connection itself is not in doubt. The message
-/// names the origin at most, never the transport library's reason.
-fn body_chunk_error(e: reqwest::Error) -> ClientError {
+/// names the origin at most, never the transport library's reason. Both
+/// carry the answering response's `request_id`.
+fn body_chunk_error(e: reqwest::Error, request_id: Option<String>) -> ClientError {
     if e.is_timeout() {
-        return body_timeout(e);
+        return body_timeout(e, request_id);
     }
     let message = e.url().map_or_else(
         || "response body broken".to_owned(),
@@ -1346,17 +1347,17 @@ fn body_chunk_error(e: reqwest::Error) -> ClientError {
             )
         },
     );
-    ClientError::Network(NetworkError::new(NetworkKind::BodyRead, message))
+    ClientError::Network(NetworkError::new(NetworkKind::BodyRead, message).answered_by(request_id))
 }
 
 /// A timeout that struck after the headers arrived: the sanitized timeout,
 /// retyped as [`NetworkKind::BodyTimeout`] so a caller can tell that the
-/// server answered.
-fn body_timeout(e: reqwest::Error) -> ClientError {
+/// server answered. It carries that response's `request_id`.
+fn body_timeout(e: reqwest::Error, request_id: Option<String>) -> ClientError {
     match sanitize_reqwest_error(e) {
-        ClientError::Network(error) if error.kind == NetworkKind::Timeout => {
-            ClientError::Network(NetworkError::new(NetworkKind::BodyTimeout, error.message))
-        }
+        ClientError::Network(error) if error.kind == NetworkKind::Timeout => ClientError::Network(
+            NetworkError::new(NetworkKind::BodyTimeout, error.message).answered_by(request_id),
+        ),
         other => other,
     }
 }
@@ -1456,7 +1457,7 @@ async fn read_bounded(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>
     while let Some(chunk) = resp
         .chunk()
         .await
-        .map_err(|e| body_chunk_error(e.with_url(url.clone())))?
+        .map_err(|e| body_chunk_error(e.with_url(url.clone()), request_id.clone()))?
     {
         if chunk.len() > cap - body.len() {
             return Err(ClientError::TooLarge { cap, request_id });
