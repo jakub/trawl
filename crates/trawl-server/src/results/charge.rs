@@ -406,6 +406,19 @@ impl CaptureGate {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+impl CaptureGate {
+    /// Callers of `key_id` waiting in its lane for a running slot, so a
+    /// test can fill the queue before it sends the caller the queue
+    /// refuses.
+    #[must_use]
+    pub fn queued(&self, key_id: i64) -> u64 {
+        self.lanes
+            .get(&key_id)
+            .map_or(0, |lane| lane.waiting.load(Ordering::Acquire))
+    }
+}
+
 /// The quota a refusal names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Scope {
