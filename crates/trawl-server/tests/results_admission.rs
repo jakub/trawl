@@ -58,6 +58,20 @@ fn telemetry() -> &'static Capture {
 /// deadline must decide nothing.
 const UNHURRIED_SECS: u64 = 300;
 
+/// [`boot`], with `capture`'s deadline and the query timeout both
+/// [`UNHURRIED_SECS`]: for a test that holds a seam or a queue while the
+/// deadline runs and asserts nothing about the deadline itself.
+async fn boot_unhurried(capture: CaptureConfig) -> Arc<TestServer> {
+    boot_with_timeout(
+        CaptureConfig {
+            deadline_secs: UNHURRIED_SECS,
+            ..capture
+        },
+        UNHURRIED_SECS,
+    )
+    .await
+}
+
 /// A fixture over the capture corpus with `capture`, its clock at
 /// [`CAPTURED_AT`], and a recorded report for the analyst and the admin.
 async fn boot(capture: CaptureConfig) -> Arc<TestServer> {
@@ -208,14 +222,7 @@ async fn timing_of(request_id: &str) -> Captured {
 /// and only the queue decides the answers.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_key_queue_refuses_the_next_capture() {
-    let server = boot_with_timeout(
-        CaptureConfig {
-            deadline_secs: UNHURRIED_SECS,
-            ..CaptureConfig::default()
-        },
-        UNHURRIED_SECS,
-    )
-    .await;
+    let server = boot_unhurried(CaptureConfig::default()).await;
     let key = captured::key_id(&server, &server.analyst_token).await;
     let gate = &server.state.results.gate;
     let seams = server.state.query.pool.seams();
@@ -259,10 +266,11 @@ async fn a_full_key_queue_refuses_the_next_capture() {
 
 /// With two keys each running a capture, the installation's two slots are
 /// taken and a third key is refused at once with `capture_busy`, taking
-/// no permit and no guard.
+/// no permit and no guard. The two running captures are held while the
+/// refusal is made, so they get [`UNHURRIED_SECS`].
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_installation_refuses_a_third_key() {
-    let server = boot(CaptureConfig::default()).await;
+    let server = boot_unhurried(CaptureConfig::default()).await;
     let seams = server.state.query.pool.seams();
     let started = seams.hold(Seam::Started);
     let running = [
@@ -321,10 +329,11 @@ async fn a_full_key_quota_names_its_earliest_expiry() {
 /// A capture whose client goes away while its work is held keeps its lane
 /// slot, its installation slot and its quota reservation until the work
 /// stops. Then all three are free, no row and no file remain, and the
-/// key's next capture is admitted at once.
+/// key's next capture is admitted at once. The work is held while the
+/// refusals are made, so the captures get [`UNHURRIED_SECS`].
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_capture_stays_charged_until_its_work_stops() {
-    let server = boot(CaptureConfig {
+    let server = boot_unhurried(CaptureConfig {
         per_key_results: 1,
         installation_running: 1,
         ..CaptureConfig::default()
@@ -442,11 +451,12 @@ async fn a_write_that_fails_past_its_deadline_removes_its_stage() {
 /// A refused capture still accounts its timing, once (ADR-0046): a busy
 /// refusal as `capacity_refused` with its admission wait booked, a bounds
 /// refusal as `error` with its DSL check booked, neither with work
-/// started.
+/// started. The first capture is held while the refusals are made, so it
+/// gets [`UNHURRIED_SECS`].
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_capture_accounts_its_timing_once() {
     telemetry();
-    let server = boot(CaptureConfig {
+    let server = boot_unhurried(CaptureConfig {
         installation_running: 1,
         ..CaptureConfig::default()
     })
