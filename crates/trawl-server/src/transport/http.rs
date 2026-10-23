@@ -59,6 +59,7 @@ use crate::handlers;
 use crate::ingest;
 use crate::policy::{normalize_auth_errors, require_trawl_grant};
 use crate::rate_limit::{RateLimitState, rate_limit_middleware};
+use crate::results::routes;
 use crate::shutdown::{ShutdownRx, shutdown_observed, shutdown_signal};
 use crate::state::{AppState, HttpConfig};
 use crate::tls;
@@ -122,7 +123,12 @@ pub fn router(state: AppState, http: &HttpConfig) -> Router {
         .route("/saved/{id}/runs", get(handlers::list_report_runs))
         .route("/saved/{id}/runs/{run_id}", get(handlers::get_report_run))
         .route("/export", post(handlers::export))
-        .route("/stream", get(handlers::stream_query));
+        .route("/stream", get(handlers::stream_query))
+        // Captured results (ADR-0057): the regular request count, no
+        // control allowance.
+        .route("/results", post(routes::capture).get(routes::list))
+        .route("/results/{id}", get(routes::page))
+        .route("/results/{id}/cells/{row}/{column}", get(routes::cell));
     // The ingest preview lives here, not beside `/ingest`: it spends the
     // interactive bucket and body limit, and exists only where ingest does
     // (ADR-0049). Its no-store header is set by `no_store_on_preview`

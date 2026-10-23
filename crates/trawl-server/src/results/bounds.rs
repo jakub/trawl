@@ -30,14 +30,6 @@
 //! `/query` runs such a query unbounded. A capture refuses that clause
 //! instead of guessing ([`BoundsError::ClauseNotTopLevel`]).
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the capture service (ADR-0057) calls this module; it lands in a later #307 checkpoint"
-    )
-)]
-
 use std::ops::Range;
 use std::time::Duration;
 

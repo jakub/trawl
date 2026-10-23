@@ -12,7 +12,9 @@
 //! file is staged and published. [`sweep`] keeps the root and the rows in
 //! agreement: once at boot, and on the scheduler's hourly retention tick.
 //! [`charge`] admits each capture: per-key and installation-wide running
-//! slots, and the binding quota reservations. [`ResultsState`] is what
+//! slots, and the binding quota reservations. [`service`] is the
+//! capability itself, transport-free: capture, list, page and cell.
+//! `routes` adapts it to the four HTTP routes. [`ResultsState`] is what
 //! every part of the capability shares: the root, the metadata store, the
 //! limits, the clock every lifecycle decision reads, and the gate.
 
@@ -28,6 +30,8 @@ use crate::store::ResultsStore;
 pub(crate) mod bounds;
 pub mod charge;
 pub mod root;
+pub(crate) mod routes;
+pub mod service;
 pub mod sweep;
 
 /// The clock every lifecycle decision about captured results reads:

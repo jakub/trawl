@@ -2645,7 +2645,7 @@ fn cleanup_run_parquet_files(state: &AppState, relative_paths: &[String]) {
 /// Returns `Ok(Some(resolved))` if the query starts with `| from saved`,
 /// `Ok(None)` if it's a normal query, or `Err(...)` if resolution fails
 /// (e.g. saved query not found, no successful runs).
-async fn try_resolve_from_saved(
+pub(crate) async fn try_resolve_from_saved(
     state: &AppState,
     verified: &VerifiedKey,
     dsl: &str,

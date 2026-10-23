@@ -718,6 +718,14 @@ pub fn wire_cell_len(column: &str, ty: &ColumnType, value: &Value) -> serde_json
     Ok(counter.0)
 }
 
+/// One cell's #214 wire JSON under `ty`, as text: the bytes
+/// [`wire_cell_len`] counts and a result body carries for the cell. A
+/// captured result's cell route serves byte ranges of it (ADR-0057). A
+/// cell that does not fit `ty` is refused as [`wire_cell_len`] refuses it.
+pub fn wire_cell_text(column: &str, ty: &ColumnType, value: &Value) -> serde_json::Result<String> {
+    serde_json::to_string(&CellRef { column, ty, value })
+}
+
 /// Serialize one cell under `ty` with the encoder [`QueryResult`] uses,
 /// for a wire type in this crate that carries a cell outside a result body.
 pub(crate) fn serialize_cell<S: Serializer>(
@@ -1659,6 +1667,8 @@ mod wire_tests {
             types_seen.insert(ty.name());
             let len = wire_cell_len("c", ty, value).expect("fits its type");
             assert_eq!(len, cell_len_in_body(ty, value), "{ty} {value:?}");
+            let text = wire_cell_text("c", ty, value).expect("fits its type");
+            assert_eq!(text.len(), len, "{ty} {value:?}");
         }
         assert_eq!(
             types_seen.len(),
@@ -1698,6 +1708,14 @@ mod wire_tests {
             .sum();
         // `[` `]` around the row and one `,` between each pair of cells.
         assert_eq!(one - empty, cells + 2 + (columns.len() - 1));
+        // And the texts are those very bytes.
+        let body = serde_json::to_string(&result(columns.clone(), vec![row.clone()])).unwrap();
+        let texts: Vec<String> = columns
+            .iter()
+            .zip(&row)
+            .map(|(column, value)| wire_cell_text(&column.name, &column.ty, value).unwrap())
+            .collect();
+        assert!(body.contains(&format!("[[{}]]", texts.join(","))), "{body}");
     }
 
     #[test]

@@ -93,6 +93,10 @@ pub enum TimingKind {
     Export(ExportFormat),
     /// A scheduled or manual report run.
     Scheduled,
+    /// `POST /api/v1/results`: a query whose result is written once as a
+    /// capture (ADR-0057), `from saved` ones included. Its file write is
+    /// the `write` phase.
+    Capture,
 }
 
 impl TimingKind {
@@ -104,6 +108,7 @@ impl TimingKind {
             Self::FromSaved => "from_saved",
             Self::Export(_) => "export",
             Self::Scheduled => "scheduled",
+            Self::Capture => "capture",
         }
     }
 
@@ -112,7 +117,7 @@ impl TimingKind {
     pub const fn format(self) -> Option<&'static str> {
         match self {
             Self::Export(format) => Some(format.as_str()),
-            Self::Query | Self::FromSaved | Self::Scheduled => None,
+            Self::Query | Self::FromSaved | Self::Scheduled | Self::Capture => None,
         }
     }
 }
