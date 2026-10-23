@@ -148,6 +148,7 @@ fn a_tail_column_with_no_evidence_is_string() {
         .iter()
         .position(|column| column.name == "nothing")
         .unwrap();
+    assert_eq!(result.rows.len(), 1, "{result:?}");
     assert_eq!(
         serde_json::to_value(&result).unwrap()["rows"][0][index],
         serde_json::Value::Null
@@ -205,6 +206,43 @@ fn a_kv_tail_with_mixed_cells_is_a_mixed_column_that_round_trips() {
     );
     let back: QueryResult = serde_json::from_str(&wire.to_string()).unwrap();
     assert_eq!(back, result);
+}
+
+/// A timestamp a stage after `extract kv` computes is text in the shared
+/// value model, so a `mixed` column tags it `string`: the limit api.md
+/// names. A column holding only such timestamps is `timestamp`, because
+/// the column fold reads the pipeline cell, which is where the two part.
+#[test]
+fn a_computed_timestamp_in_a_mixed_column_is_tagged_string() {
+    let (_dir, source) = ndjson(&[r#"{"message":"n=1"}"#, r#"{"message":"n=2"}"#]);
+
+    let result = run(
+        r#"* | extract kv | let x = if(n == 1, now(), "unknown") | table x"#,
+        &source,
+    )
+    .expect("the kv tail runs");
+    assert_eq!(type_of(&result, "x"), ColumnType::Mixed);
+
+    let wire = serde_json::to_value(&result).unwrap();
+    let cells: Vec<serde_json::Value> = wire["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[0].clone())
+        .collect();
+    assert_eq!(cells[0]["type"], "string");
+    let instant = cells[0]["value"].as_str().unwrap();
+    assert!(
+        instant.ends_with('Z') && instant.len() == "2026-10-22T12:34:56.123456Z".len(),
+        "the computed instant is RFC 3339 in UTC: {instant}"
+    );
+    assert_eq!(
+        cells[1],
+        serde_json::json!({"type": "string", "value": "unknown"})
+    );
+
+    let alone = run("* | extract kv | let x = now() | table x", &source).expect("the kv tail runs");
+    assert_eq!(type_of(&alone, "x"), ColumnType::Timestamp);
 }
 
 /// The tail types its columns from the cells it emits, and a stored

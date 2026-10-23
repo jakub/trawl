@@ -378,12 +378,12 @@ mod tests {
             .run_query("* | stats count()", ZERO_COLUMN_SOURCE, &pins, 100, 0)
             .unwrap();
         assert_eq!(counted.rows[0][0].to_string(), "0");
+        let refused = executor
+            .run_query("* | table n", ZERO_COLUMN_SOURCE, &pins, 100, 0)
+            .expect_err("a run that recorded no schema has no field to project");
         assert!(
-            executor
-                .run_query("* | table n", ZERO_COLUMN_SOURCE, &pins, 100, 0)
-                .map_or(true, |r| r.rows.is_empty()
-                    && r.columns.iter().all(|c| c.name != "n")),
-            "a run that recorded no schema has no field to project"
+            refused.to_string().contains("unknown field: n"),
+            "the refusal names the missing field: {refused}"
         );
     }
 

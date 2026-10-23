@@ -415,6 +415,20 @@ async fn run_all_unions_a_bigint_run_and_a_ubigint_run_exactly() {
 async fn a_failed_parquet_write_records_a_readable_typed_blob() {
     use std::os::unix::fs::PermissionsExt as _;
 
+    let uid = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:").map(str::to_owned))
+        })
+        .and_then(|line| line.split_whitespace().next().map(str::to_owned));
+    assert_ne!(
+        uid.as_deref(),
+        Some("0"),
+        "root writes into a mode-555 directory anyway, so this test cannot run as root"
+    );
+
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let scheduled = Path::new(server.state.query.pool.base_dir()).join("scheduled");

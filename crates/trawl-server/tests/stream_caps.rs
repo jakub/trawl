@@ -132,7 +132,7 @@ fn count_of(payload: &Value, host: &str) -> Option<u64> {
         .and_then(|row| match row[count_at] {
             Cell::Integer(n) => u64::try_from(n).ok(),
             Cell::UInt(n) => Some(n),
-            _ => None,
+            ref other => panic!("count is not an integer cell: {other:?}"),
         })
 }
 
