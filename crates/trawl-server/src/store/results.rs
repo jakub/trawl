@@ -210,18 +210,102 @@ pub struct ExpiredFile {
     pub file_bytes: u64,
 }
 
+/// Faults a test injects into a capture's row commit, so the capture
+/// service's answer to an insert whose outcome it cannot learn is proven
+/// rather than reasoned about (ADR-0057; the service's `commit`), the way
+/// the pool's seams prove its orderings.
+///
+/// Compiled for this crate's unit tests and, via the `test-support`
+/// feature, its integration tests. No production consumer enables it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fault {
+    use parking_lot::Mutex;
+
+    use super::StoreError;
+
+    /// How the next [`super::ResultsStore::insert`] fails. Each answers an
+    /// error, as a connection lost mid-statement does; they differ in what
+    /// the table holds afterwards and in what reading the row back finds.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum InsertFault {
+        /// The row commits and the answer is lost: reading it back finds it.
+        Committed,
+        /// Nothing commits: reading the row back finds nothing.
+        Lost,
+        /// Nothing commits, and the next read of that row fails too.
+        Unreadable,
+    }
+
+    /// One store's injected faults, shared by every clone of it.
+    #[derive(Debug, Default)]
+    pub struct Faults {
+        next_insert: Mutex<Option<InsertFault>>,
+        /// The id whose next [`super::ResultsStore::get`] fails.
+        unreadable: Mutex<Option<String>>,
+    }
+
+    impl Faults {
+        /// Fail the next insert as `fault` says. One insert only; the one
+        /// after it runs as usual.
+        pub fn fail_next_insert(&self, fault: InsertFault) {
+            *self.next_insert.lock() = Some(fault);
+        }
+
+        /// The fault the insert of row `id` meets, arming the read fault
+        /// of an [`InsertFault::Unreadable`] one for that row.
+        pub(super) fn take_insert(&self, id: &str) -> Option<InsertFault> {
+            let fault = self.next_insert.lock().take();
+            if fault == Some(InsertFault::Unreadable) {
+                *self.unreadable.lock() = Some(id.to_owned());
+            }
+            fault
+        }
+
+        /// Whether this read of row `id` fails, disarming it if so.
+        pub(super) fn take_unreadable(&self, id: &str) -> bool {
+            let mut unreadable = self.unreadable.lock();
+            let fails = unreadable.as_deref() == Some(id);
+            if fails {
+                *unreadable = None;
+            }
+            fails
+        }
+    }
+
+    /// What an injected fault answers: the store unavailable, as a dropped
+    /// connection leaves it.
+    pub(super) fn injected() -> StoreError {
+        StoreError::Unavailable(sqlx::Error::Protocol("injected store fault".into()))
+    }
+}
+
 /// Postgres-backed storage for captured-result metadata. Cheap to clone
 /// (shared pool).
 #[derive(Debug, Clone)]
 pub struct ResultsStore {
     pool: PgPool,
+    /// Faults a test injected ([`fault`]); clones share them.
+    #[cfg(any(test, feature = "test-support"))]
+    faults: std::sync::Arc<fault::Faults>,
 }
 
 impl ResultsStore {
     /// Wrap the shared app-state pool, which must point at a migrated trawl
     /// app-state database.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(any(test, feature = "test-support"))]
+            faults: std::sync::Arc::default(),
+        }
+    }
+
+    /// This store's fault table, shared by its clones: the one the server's
+    /// captured-results state reads through.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn faults(&self) -> &fault::Faults {
+        &self.faults
     }
 
     /// Record a new temporary capture.
@@ -241,6 +325,15 @@ impl ResultsStore {
             .map_err(|e| StoreError::Validation(format!("columns do not encode: {e}")))?;
         let column_facts = serde_json::to_string(&row.column_facts)
             .map_err(|e| StoreError::Validation(format!("column facts do not encode: {e}")))?;
+        #[cfg(any(test, feature = "test-support"))]
+        let fault = self.faults.take_insert(&row.id);
+        #[cfg(any(test, feature = "test-support"))]
+        if matches!(
+            fault,
+            Some(fault::InsertFault::Lost | fault::InsertFault::Unreadable)
+        ) {
+            return Err(fault::injected());
+        }
         let inserted = sqlx::query(
             "INSERT INTO captured_results (
                  id, key_id, created_at, expires_at, state, query, executed_query,
@@ -269,6 +362,10 @@ impl ResultsStore {
         .bind(format_version)
         .execute(&self.pool)
         .await;
+        #[cfg(any(test, feature = "test-support"))]
+        if fault == Some(fault::InsertFault::Committed) && inserted.is_ok() {
+            return Err(fault::injected());
+        }
         match inserted {
             Ok(_) => Ok(CaptureInsert::Inserted),
             Err(e) if classify_violation(&e) == Some(PgViolation::ResultIdTaken) => {
@@ -281,6 +378,10 @@ impl ResultsStore {
     /// The row `id` owned by `key_id`, in any state. Another key's result
     /// reads as absent.
     pub async fn get(&self, id: &str, key_id: i64) -> Result<Option<CaptureRow>, StoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.faults.take_unreadable(id) {
+            return Err(fault::injected());
+        }
         let row = sqlx::query(select_rows!("WHERE id = $1 AND key_id = $2"))
             .bind(id)
             .bind(key_id)
