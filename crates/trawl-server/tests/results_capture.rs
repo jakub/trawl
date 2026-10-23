@@ -562,10 +562,12 @@ fn rows(result: trawl_api::value::QueryResult) -> Vec<Row> {
         .collect()
 }
 
-/// A capture of the 20-event corpus keeps every row, reads back as
-/// `/query` answers its recorded text, shows in history and the query
-/// list as the caller's, and books exactly one `query_timing` of kind
-/// `capture` with its file write timed.
+/// A capture of the 20-event corpus keeps every row, shows in history and
+/// the query list as the caller's, reads back as `/query` answers its
+/// recorded text, and books exactly one `query_timing` of kind `capture`
+/// with its file write timed. History and the query list are read before
+/// the comparison `/query`, which records the same text, and the list's
+/// entry is the capture's own query id.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_reads_back_as_query_answers_and_is_accounted_once() {
     let (handle, telemetry) = install_telemetry();
@@ -598,6 +600,41 @@ async fn a_capture_reads_back_as_query_answers_and_is_accounted_once() {
         "a live capture reports its run"
     );
 
+    // History and the query list record the text that ran, as the
+    // caller's, once each. Read before anything else runs that text: the
+    // comparison `/query` below records the same text, rows and owner.
+    let (status, _, history) = captured::get(&server, &server.analyst_token, "/history").await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    let history: trawl_api::HistoryResponse = serde_json::from_value(history).unwrap();
+    let entries: Vec<_> = history
+        .entries
+        .iter()
+        .filter(|e| e.query == result.executed_query)
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the capture is in history once: {history:?}"
+    );
+    assert_eq!(entries[0].row_count, captured::ROWS);
+    assert_eq!(entries[0].status, trawl_api::QueryStatus::Success);
+    let (status, _, queries) = captured::get(&server, &server.analyst_token, "/queries").await;
+    assert_eq!(status, StatusCode::OK, "{queries}");
+    let queries: trawl_api::QueriesResponse = serde_json::from_value(queries).unwrap();
+    let recent: Vec<_> = queries
+        .recent
+        .iter()
+        .filter(|q| q.snapshot.query == result.executed_query)
+        .collect();
+    assert_eq!(
+        recent.len(),
+        1,
+        "the capture is a recent query once: {queries:?}"
+    );
+    assert!(recent[0].own, "the caller's own capture");
+    assert_eq!(recent[0].snapshot.rows, Some(captured::ROWS));
+    let capture_query_id = recent[0].snapshot.id;
+
     // The page is what `/query` answers for the recorded text.
     let (status, _, page) = captured::page(&server, &server.analyst_token, &result.id, "").await;
     assert_eq!(status, StatusCode::OK, "{page}");
@@ -608,35 +645,15 @@ async fn a_capture_reads_back_as_query_answers_and_is_accounted_once() {
     assert_eq!(page.page.columns, live.columns);
     assert_eq!(page.page.rows, live.rows);
 
-    // History and the query list record the text that ran, as the caller's.
-    let (status, _, history) = captured::get(&server, &server.analyst_token, "/history").await;
-    assert_eq!(status, StatusCode::OK, "{history}");
-    let history: trawl_api::HistoryResponse = serde_json::from_value(history).unwrap();
-    let entry = history
-        .entries
-        .iter()
-        .find(|e| e.query == result.executed_query)
-        .unwrap_or_else(|| panic!("the capture is in history: {history:?}"));
-    assert_eq!(entry.row_count, captured::ROWS);
-    let (status, _, queries) = captured::get(&server, &server.analyst_token, "/queries").await;
-    assert_eq!(status, StatusCode::OK, "{queries}");
-    let queries: trawl_api::QueriesResponse = serde_json::from_value(queries).unwrap();
-    let recent = queries
-        .recent
-        .iter()
-        .find(|q| q.snapshot.query == result.executed_query)
-        .unwrap_or_else(|| panic!("the capture is a recent query: {queries:?}"));
-    assert!(recent.own, "the caller's own capture");
-    assert_eq!(recent.snapshot.rows, Some(captured::ROWS));
-
-    // One timing account, of kind capture, with the write phase booked.
+    // One timing account, of kind capture, with the write phase booked,
+    // under the query id the list showed.
     telemetry.flush_cycle().await;
     let found = rows(
         query(
             &server,
             &format!(
                 "service=trawld _producer=trawld event_type=query_timing \
-                 request_id=\"{request_id}\" | table kind, query_write_us"
+                 request_id=\"{request_id}\" | table kind, query_id, query_write_us"
             ),
         )
         .await,
@@ -646,6 +663,11 @@ async fn a_capture_reads_back_as_query_answers_and_is_accounted_once() {
         found[0].get("kind"),
         Some(&Value::String("capture".into())),
         "{found:?}"
+    );
+    assert_eq!(
+        found[0].get("query_id"),
+        Some(&trawl_api::value::land_u64(capture_query_id)),
+        "the recent entry is the capture's own: {found:?}"
     );
     assert!(
         matches!(
