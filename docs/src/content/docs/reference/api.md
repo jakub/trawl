@@ -140,9 +140,48 @@ A key without `ingest` spends its interactive bucket when it posts to `/api/v1/i
 
 Query results page with `limit` and `offset` in the request. The response echoes them in `pagination` with `returned`, the number of rows in this page, and `total`, the number of rows the execution produced before the page was cut from them. History and run listings take `limit` and `offset` as query parameters and return `total`. Catalog listings take `limit` and return `truncated`. The field detail route pages its service rows with an opaque `services_cursor`.
 
+### Result columns
+
+A result is `columns` and `rows`. The query response, a report run's `result`, and the stream's `data` and `snapshot` frames all carry one. Each column is an object with a `name` and a required `type`:
+
+```json
+{ "name": "codes", "type": "list", "items": { "type": "integer" } }
+```
+
+`type` comes from a closed set: `boolean`, `integer`, `float`, `string`, `timestamp`, `date`, `time`, `list`, and `mixed`. A `list` column also has `items`, the type of its elements, in the same object shape. A client must refuse a column whose `type` it does not know. The type comes from execution, not from the catalog, so a zero-row result is typed too.
+
+Each cell is encoded under its column's type. A null cell is JSON `null` under every type.
+
+| `type` | Cell |
+|--------|------|
+| `boolean` | `true` or `false` |
+| `integer` | A decimal string, for example `"9007199254740993"` |
+| `float` | A JSON number, or one of the strings `"NaN"`, `"Infinity"` and `"-Infinity"` |
+| `string` | A string |
+| `timestamp` | RFC 3339 with six fraction digits and an explicit offset, for example `"2026-10-22T12:34:56.123456Z"`, or `"infinity"` or `"-infinity"` |
+| `date` | `YYYY-MM-DD`, for example `"2026-10-22"` |
+| `time` | `HH:MM:SS`, with a fraction when it has one, for example `"12:34:56.123456"` |
+| `list` | An array of cells, each encoded under `items` |
+| `mixed` | An object that tags the cell with its own type, for example `{"type": "integer", "value": "200"}` |
+
+An integer cell is a string so that a JavaScript client keeps every digit past 2^53. The spelling is canonical: `-?(0|[1-9][0-9]*)`. A decimal string has no plus sign, no leading zero, no `-0`, and no whitespace. The value is in the signed or the unsigned 64-bit range, from `-9223372036854775808` to `18446744073709551615`. A decoder refuses any other spelling and any value outside that range. It also refuses a JSON number under `integer`, and a string under `float` other than the three spellings in the table. A query whose result has an integer outside the range, for example a `sum` past `18446744073709551615`, is refused with 400 `execution_error`. The message names the column. Cast the column with `tonumber()` or `tostring()`.
+
+A timestamp cell uses `Z` at offset zero and `+HH:MM` or `-HH:MM` otherwise. A query response writes timestamps in the request's `timezone`. Report runs and stream frames write them in UTC. A year outside 0000 to 9999 uses the ISO 8601 expanded form, a sign and at least four digits, for example `+10000-01-01T00:00:00.000000Z`. `infinity` and `-infinity` are DuckDB's infinite timestamps.
+
+A `mixed` column holds cells of more than one type. Only a column that an `extract kv` stage computes, or a merge of live frames, can be `mixed`. Each non-null cell carries its own `type` and `value`, and a `list` tag also carries `items`. A decoder reads the cell from its tag, never from its spelling.
+
+A column with no evidence of its type is `string`. That is an all-null column that a stage after `extract kv` computes when no input column has its name, or a field that is null in a live `data` frame. When you merge live frames, treat an all-null `string` column as no evidence.
+
+These limits apply:
+
+- DuckDB `DECIMAL`, `INTERVAL`, `STRUCT`, `MAP`, and `UNION` values arrive as null cells in a `string` column.
+- A timestamp that a stage after `extract kv` computes is written in UTC, not in the request's `timezone`.
+
+The schema routes keep DuckDB type names, such as `BIGINT` and `VARCHAR`. The lowercase `type` vocabulary is for result columns only.
+
 ### Timestamps
 
-Every instant is RFC 3339 in UTC. Catalog, repin, pin reclamation, and schedule window instants carry microseconds and a `Z` suffix, for example `2026-08-01T10:00:00.000000Z`. History, saved query, schedule `created_at` and `updated_at`, and run `started_at` and `finished_at` carry a `+00:00` offset, for example `2026-03-14T02:00:00+00:00`.
+Every instant is RFC 3339 in UTC, except result cells, which [Result columns](#result-columns) describes. Catalog, repin, pin reclamation, and schedule window instants carry microseconds and a `Z` suffix, for example `2026-08-01T10:00:00.000000Z`. History, saved query, schedule `created_at` and `updated_at`, and run `started_at` and `finished_at` carry a `+00:00` offset, for example `2026-03-14T02:00:00+00:00`.
 
 ### Body size limits
 
@@ -238,7 +277,7 @@ Runs a DSL query and returns one page of rows. A query whose first stage is `fro
 
 ```bash
 curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
-  -d '{"query": "_severity>=error last=1h | stats count() by service"}' \
+  -d '{"query": "_severity>=error last=1h | stats count(), max(bytes) as bytes by service"}' \
   "$TRAWL_URL/api/v1/query"
 ```
 
@@ -246,8 +285,12 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 
 ```json
 {
-  "columns": [{ "name": "service" }, { "name": "count" }],
-  "rows": [["nginx", 12], ["api", 3]],
+  "columns": [
+    { "name": "service", "type": "string" },
+    { "name": "count", "type": "integer" },
+    { "name": "bytes", "type": "integer" }
+  ],
+  "rows": [["nginx", "12", "18446744073709551615"], ["api", "3", "9007199254740993"]],
   "execution": { "started_at": "2026-09-15T12:34:56.123Z", "duration_ms": 80 },
   "pagination": { "limit": 100000, "offset": 0, "returned": 2, "total": 2 },
   "degraded_fields": ["duration"],
@@ -257,8 +300,8 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: applicatio
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `columns` | array | Column names in result order |
-| `rows` | array | One array per row. Values are JSON null, booleans, numbers, strings, or arrays. |
+| `columns` | array | The columns in result order, each with its `name` and `type`. See [Result columns](#result-columns). |
+| `rows` | array | One array per row, one cell per column, each encoded under its column's type |
 | `pagination` | object | `limit`, `offset`, `returned`, and `total` for this page |
 | `pagination.total` | integer | Rows this execution produced, before the response window was cut from them. Compare it with `returned` to tell a whole result from a page of one. |
 | `execution` | object | Optional execution metadata. Present on successful server query responses, including zero-row results. Absent on synthetic client results. |
@@ -277,8 +320,9 @@ The server captures `execution.started_at` beside its monotonic timer. The durat
 | 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
 | 400 | `bad_request` | `timezone` is not `UTC`, `local`, or a fixed offset, or `offset + limit` exceeds `max_result_rows` |
 | 400 | `result_too_large` | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at its group, distinct-value or exact-value cap. The message names the cap and its limit. |
+| 400 | `execution_error` | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. |
 | 404 | `not_found` | A `from saved` stage names a saved query the key does not own, or one with no successful run |
-| 409 | `bad_request` | A `from saved` stage selects a run that has rows but no Parquet file. The message names the run route. |
+| 409 | `bad_request` | A `from saved` stage selects a run that has columns but no Parquet file. The message names the run route. |
 | 500 | `execution_error` | DuckDB failed or the query was cancelled |
 | 503 | `query_resource_exhausted` | The query went over the spill or memory budget. See [query resource exhausted](#query-resource-exhausted). |
 | 503 | `service_unavailable` | The deadline passed before the query started, or a cold file moved during the read. Retry. |
@@ -366,6 +410,12 @@ The body is the file. The headers name its type:
 | `json` | `application/x-ndjson` | `attachment; filename="export.ndjson"` |
 | `parquet` | `application/vnd.apache.parquet` | `attachment; filename="export.parquet"` |
 
+An export file is not the [result wire](#result-columns). Each format keeps its own conventions:
+
+- `json` writes one object per row. Integers are JSON numbers with every digit. A float that is not finite is `null`. Timestamps are RFC 3339 text.
+- `csv` writes every cell as text. Integers keep every digit.
+- `parquet` keeps DuckDB's column types. A stored `BIGINT` past 2^53 exports exactly. DuckDB writes a `HUGEINT` column as `DOUBLE`, which is exact only up to 2^53. A `sum` of integers is a `HUGEINT`.
+
 **Errors**
 
 | Status | Code | When |
@@ -408,7 +458,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -N \
 
 ```
 event: data
-data: {"_time":"...","service":"nginx","message":"GET /"}
+data: {"columns":[{"name":"_time","type":"timestamp"},{"name":"message","type":"string"},{"name":"service","type":"string"},{"name":"status","type":"integer"}],"rows":[["2026-10-22T12:00:00.000000Z","GET /","nginx","200"]]}
 
 event: lagged
 data: {"missed": 40}
@@ -416,8 +466,18 @@ data: {"missed": 40}
 
 | Event | Data | When |
 |-------|------|------|
-| `data` | One row object | Each matching event, for a pipeline with no aggregation |
-| `snapshot` | `{"columns": [...], "rows": [...], "capped": [...]}` | For an aggregating pipeline, every 500 ms or every 100 matching events, whichever comes first, and only when new events arrived. `capped` is present only when the aggregation dropped input. |
+| `data` | A result with one row, `{"columns": [...], "rows": [[...]]}` | Each matching event, for a pipeline with no aggregation |
+| `snapshot` | A result with `capped` beside it, `{"columns": [...], "rows": [...], "capped": [...]}` | For an aggregating pipeline, every 500 ms or every 100 matching events, whichever comes first, and only when new events arrived. `capped` is present only when the aggregation dropped input. |
+
+Both result frames use the [result column](#result-columns) encoding. A `data` frame's columns are the event's fields in byte order of their names, so `_time` comes before `host`. Each frame carries its own columns, because events differ in their fields. `_time` and `_ingested` are `timestamp`. A field the catalog pins `BIGINT`, `DOUBLE`, `BOOLEAN`, or `TIMESTAMP` is converted to that type the way a pinned `| where` reads it, so a pinned `BIGINT` field arrives as an `integer` decimal string. Any other field is typed by its own value. In a `timechart` snapshot, the `_time` bucket is a `timestamp`.
+
+A `data` or `snapshot` frame that does not decode under its column types is a parse error in the client. If trawld cannot encode a frame, it drops the frame and logs `stream_frame_unencodable`.
+
+A `data` frame:
+
+```json
+{"columns":[{"name":"_time","type":"timestamp"},{"name":"message","type":"string"},{"name":"service","type":"string"},{"name":"status","type":"integer"}],"rows":[["2026-10-22T12:00:00.000000Z","GET /","nginx","200"]]}
+```
 | `lagged` | `{"missed": n}` | The subscriber fell behind the event bus and `n` ingest batches were skipped. A batch holds one or more events, so the number of missed events is unknown. |
 
 Each `snapshot` replaces the whole result. A live aggregation stops taking
@@ -425,7 +485,7 @@ input at three caps, and a snapshot's `capped` lists each cap that dropped
 input since the stream started, with its limit:
 
 ```json
-{"columns":["host","count"],"rows":[{"host":"web-01","count":12}],"capped":[{"cap":"groups","limit":10000}]}
+{"columns":[{"name":"host","type":"string"},{"name":"count","type":"integer"}],"rows":[["web-01","12"]],"capped":[{"cap":"groups","limit":10000}]}
 ```
 
 | `cap` | Limit | Input it drops |
@@ -1823,12 +1883,23 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/saved/7/r
 
 ```json
 {
-  "id": 42, "query": "...", "status": "success", "started_at": "2026-09-11T08:00:00+00:00", "finished_at": "2026-09-11T08:00:01+00:00", "duration_ms": 900, "row_count": 4, "result_path": "scheduled/errors-by-service/run_42.parquet",
-  "result": { "columns": [{ "name": "service" }, { "name": "count" }], "rows": [["nginx", 3]] }
+  "id": 42, "query": "...", "status": "success", "started_at": "2026-09-11T08:00:00+00:00", "finished_at": "2026-09-11T08:00:01+00:00", "duration_ms": 900, "row_count": 1, "result_path": "scheduled/errors-by-service/run_42.parquet",
+  "result": { "columns": [{ "name": "service", "type": "string" }, { "name": "count", "type": "integer" }], "rows": [["nginx", "3"]] }
 }
 ```
 
-`result` is absent for a run with status `running` or `error`.
+`result` uses the [result column](#result-columns) encoding. It is absent for a run with status `running` or `error`.
+
+A run whose window held no events returns its typed columns and no rows:
+
+```json
+{
+  "id": 43, "query": "...", "status": "success", "started_at": "2026-09-11T09:00:00+00:00", "finished_at": "2026-09-11T09:00:01+00:00", "duration_ms": 850, "row_count": 0, "result_path": "scheduled/errors-by-service/run_43.parquet",
+  "result": { "columns": [{ "name": "service", "type": "string" }, { "name": "count", "type": "integer" }], "rows": [] }
+}
+```
+
+The stored Parquet file keeps the run's types. An `integer` column is stored as `BIGINT`, or as `UBIGINT` when a value is above the signed 64-bit range, and a `timestamp` column as a UTC `TIMESTAMP`.
 
 **Errors**
 
