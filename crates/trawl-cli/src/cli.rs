@@ -733,6 +733,54 @@ mod tests {
         );
     }
 
+    /// AC 2: integers past 2^53 reach the table with every digit. The
+    /// response is decoded from its wire text, decimal strings under an
+    /// `integer` column, so this is the path a daemon answer takes; a
+    /// reader that went through `f64` would print 9007199254740992.
+    #[test]
+    fn the_table_prints_big_integers_from_the_wire_exactly() {
+        let response: trawl_client::QueryResponse = serde_json::from_str(
+            r#"{
+                "columns": [{"name": "host", "type": "string"},
+                            {"name": "id", "type": "integer"}],
+                "rows": [["a", "9007199254740993"],
+                         ["b", "9223372036854775808"],
+                         ["c", "18446744073709551615"],
+                         ["d", "-9223372036854775808"]],
+                "pagination": {"limit": 100, "offset": 0, "returned": 4, "total": 4}
+            }"#,
+        )
+        .expect("the typed wire decodes");
+        let (result, degraded, severity) = daemon_outcome(response);
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| row[1].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Integer(9_007_199_254_740_993),
+                Value::UInt(9_223_372_036_854_775_808),
+                Value::UInt(u64::MAX),
+                Value::Integer(i64::MIN),
+            ]
+        );
+
+        let mut out = Vec::new();
+        render_table(&result, &severity, &mut out).unwrap();
+        let table = String::from_utf8(out).unwrap();
+        for digits in [
+            "9007199254740993",
+            "9223372036854775808",
+            "18446744073709551615",
+            "-9223372036854775808",
+        ] {
+            assert!(table.contains(digits), "{digits} missing from:\n{table}");
+        }
+        assert!(!table.contains("9007199254740992"), "{table}");
+        assert!(degraded.is_empty());
+    }
+
     /// A mocked daemon response carrying the note channel beside one
     /// result row.
     fn mocked_response() -> trawl_client::QueryResponse {

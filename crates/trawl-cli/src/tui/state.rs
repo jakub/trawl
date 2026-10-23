@@ -2880,6 +2880,44 @@ mod tests {
         assert_eq!(buf.capped(), caps);
     }
 
+    /// AC 2 on the live lane: data frames decoded from their wire text
+    /// land 2^53+1 and the unsigned range exactly, and the buffer serves
+    /// them under one `integer` column. So does a decoded snapshot.
+    #[test]
+    fn live_buffer_keeps_big_integers_from_the_wire_exactly() {
+        let mut buf = LiveBuffer::new(10);
+        for id in [
+            "9007199254740993",
+            "9223372036854775808",
+            "18446744073709551615",
+        ] {
+            let frame: QueryResult = serde_json::from_str(&format!(
+                r#"{{"columns":[{{"name":"id","type":"integer"}}],"rows":[["{id}"]]}}"#
+            ))
+            .expect("a data frame decodes");
+            buf.push_frame(&frame);
+        }
+        let exact = vec![
+            vec![Value::Integer(9_007_199_254_740_993)],
+            vec![Value::UInt(9_223_372_036_854_775_808)],
+            vec![Value::UInt(u64::MAX)],
+        ];
+        let resp = buf.to_query_response();
+        assert_eq!(
+            resp.result.columns,
+            vec![Column::new("id", ColumnType::Integer)]
+        );
+        assert_eq!(resp.result.rows, exact);
+
+        let snapshot: trawl_api::stream::SnapshotFrame = serde_json::from_str(
+            r#"{"columns":[{"name":"id","type":"integer"}],
+                "rows":[["9007199254740993"],["9223372036854775808"],["18446744073709551615"]]}"#,
+        )
+        .expect("a snapshot frame decodes");
+        buf.replace_with_snapshot(&snapshot.result, &snapshot.capped);
+        assert_eq!(buf.to_query_response().result.rows, exact);
+    }
+
     // --- compute_common_fields tests ---
 
     fn make_service(name: &str, columns: &[(&str, &str)]) -> trawl_api::ServiceSchema {

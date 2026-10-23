@@ -1664,6 +1664,65 @@ fn bar_chart_renders_uint_metric() {
     );
 }
 
+/// AC 2 in the TUI: a response decoded from its wire text shows every
+/// digit of 2^53+1, 2^63 and `u64::MAX` in the grid, and the bar chart
+/// orders the three by magnitude. The TUI has no client-side row sort, so
+/// the bar lengths are where it compares the numbers: a reader that went
+/// through `f64` would print 9007199254740992 and could not tell the two
+/// largest apart.
+#[cfg(test)]
+#[test]
+fn big_integers_from_the_wire_render_exactly_and_in_order() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let response: trawl_client::QueryResponse = serde_json::from_str(
+        r#"{
+            "columns": [{"name": "host", "type": "string"},
+                        {"name": "id", "type": "integer"}],
+            "rows": [["a", "9007199254740993"],
+                     ["b", "9223372036854775808"],
+                     ["c", "18446744073709551615"]],
+            "pagination": {"limit": 100, "offset": 0, "returned": 3, "total": 3}
+        }"#,
+    )
+    .expect("the typed wire decodes");
+
+    let draw = |view| {
+        let mut app = crate::tui::tests::test_app();
+        app.tab.result = Some(response.clone());
+        app.tab.chart_view = view;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        terminal.backend().to_string()
+    };
+
+    let grid = draw(ChartView::Table);
+    for digits in [
+        "9007199254740993",
+        "9223372036854775808",
+        "18446744073709551615",
+    ] {
+        assert!(grid.contains(digits), "{digits} missing from:\n{grid}");
+    }
+    assert!(!grid.contains("9007199254740992"), "{grid}");
+
+    // One bar per host; its length is its share of the largest value.
+    let bars = draw(ChartView::BarChart);
+    let length = |host: &str| {
+        bars.lines()
+            .find(|line| line.contains(&format!("{host} ")) && line.contains("  "))
+            .map_or_else(
+                || panic!("no bar for {host}:\n{bars}"),
+                |line| line.matches('\u{2588}').count(),
+            )
+    };
+    let (a, b, c) = (length("a"), length("b"), length("c"));
+    assert!(a < b && b < c, "bars out of order ({a}, {b}, {c}):\n{bars}");
+}
+
 #[cfg(test)]
 mod severity_tests {
     use super::severity_cell_text;
