@@ -1239,6 +1239,59 @@ mod tests {
     }
 
     #[test]
+    fn an_ancient_window_selects_only_the_directories_on_disk() {
+        // Year 1 to now is some 17 million hours; none is built.
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let held = write_times(
+            tmp.path(),
+            "prod/2026-10-23/09/nginx.parquet",
+            "TIMESTAMP",
+            &["2026-10-23 09:10:00"],
+        );
+        write_times(
+            tmp.path(),
+            "prod/2026-10-22/nginx.parquet",
+            "TIMESTAMP",
+            &["2026-10-22 12:00:00"],
+        );
+        let text = executed(
+            "service=nginx",
+            "0001-01-01T00:00:00Z",
+            "0001-01-01T01:00:00Z",
+        );
+
+        let begun = std::time::Instant::now();
+        let selection = select(base, &text);
+        let ancient = selection_bytes(
+            &selection,
+            at("0001-01-01T00:00:00Z"),
+            at("0001-01-01T01:00:00Z"),
+            &running(),
+        )
+        .unwrap();
+        let elapsed = begun.elapsed();
+
+        assert_eq!(
+            rel_dirs(&selection, tmp.path()),
+            ["prod/2026-10-22", "prod/2026-10-23"]
+        );
+        assert_eq!(ancient, 0, "no stored event is that old");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {elapsed:?}"
+        );
+        let today = selection_bytes(
+            &selection,
+            at("2026-10-23T09:00:00Z"),
+            at("2026-10-23T10:00:00Z"),
+            &running(),
+        )
+        .unwrap();
+        assert_eq!(today, held);
+    }
+
+    #[test]
     fn selection_bytes_counts_the_files_that_can_hold_the_window() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();

@@ -763,6 +763,42 @@ async fn a_capture_reads_what_query_reads_whatever_partition_holds_the_event() {
     }
 }
 
+/// A one-hour window in year 1 is selected from the partitions on disk,
+/// never by walking every hour of the calendar from then to now: the
+/// capture answers well inside its deadline and finds nothing, and so does
+/// `/query` of the recorded text.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ancient_window_is_selected_from_the_partitions_on_disk() {
+    let server = boot().await;
+    let body = json!({
+        "query": corpus_query(),
+        "window": {
+            "earliest": "0001-01-01T00:00:00Z",
+            "latest": "0001-01-01T01:00:00Z",
+        },
+    });
+
+    let started = std::time::Instant::now();
+    let (status, _, answer) = captured::capture(&server, &server.analyst_token, &body).await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "after {elapsed:?}: {answer}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the capture took {elapsed:?}"
+    );
+    let result: trawl_api::results::CaptureResponse = serde_json::from_value(answer).unwrap();
+    assert_eq!(result.result.captured_rows, 0);
+
+    let started = std::time::Instant::now();
+    let live = query(&server, &result.result.executed_query).await;
+    let elapsed = started.elapsed();
+    assert!(live.rows.is_empty(), "{live:?}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "`/query` took {elapsed:?}"
+    );
+}
+
 /// A window with no events, over a corpus that knows no field yet,
 /// captures no columns: 200, no file, and an empty page.
 #[tokio::test(flavor = "multi_thread")]
