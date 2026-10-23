@@ -220,6 +220,7 @@ pub struct ExpiredFile {
 #[cfg(any(test, feature = "test-support"))]
 pub mod fault {
     use parking_lot::Mutex;
+    use tokio::sync::oneshot;
 
     use super::StoreError;
 
@@ -236,12 +237,26 @@ pub mod fault {
         Unreadable,
     }
 
+    /// The next [`super::ResultsStore::insert`], held before its
+    /// statement runs: a commit slowed past the capture deadline.
+    #[derive(Debug)]
+    pub struct InsertHold {
+        /// Answers once the insert is parked.
+        pub parked: oneshot::Receiver<()>,
+        /// Send, or drop, to let the insert run.
+        pub release: oneshot::Sender<()>,
+    }
+
+    /// The insert's half of an [`InsertHold`].
+    type HeldInsert = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
     /// One store's injected faults, shared by every clone of it.
     #[derive(Debug, Default)]
     pub struct Faults {
         next_insert: Mutex<Option<InsertFault>>,
         /// The id whose next [`super::ResultsStore::get`] fails.
         unreadable: Mutex<Option<String>>,
+        held_insert: Mutex<Option<HeldInsert>>,
     }
 
     impl Faults {
@@ -259,6 +274,25 @@ pub mod fault {
                 *self.unreadable.lock() = Some(id.to_owned());
             }
             fault
+        }
+
+        /// Park the next insert before its statement until the hold's
+        /// `release` is sent or dropped. One insert only; it then runs as
+        /// usual, meeting any [`Self::fail_next_insert`] fault.
+        pub fn hold_next_insert(&self) -> InsertHold {
+            let (parked_tx, parked) = oneshot::channel();
+            let (release, release_rx) = oneshot::channel();
+            *self.held_insert.lock() = Some((parked_tx, release_rx));
+            InsertHold { parked, release }
+        }
+
+        /// Wait out a held insert, if this one is held.
+        pub(super) async fn wait_if_held(&self) {
+            let held = self.held_insert.lock().take();
+            if let Some((parked, release)) = held {
+                let _ = parked.send(());
+                let _ = release.await;
+            }
         }
 
         /// Whether this read of row `id` fails, disarming it if so.
@@ -325,6 +359,8 @@ impl ResultsStore {
             .map_err(|e| StoreError::Validation(format!("columns do not encode: {e}")))?;
         let column_facts = serde_json::to_string(&row.column_facts)
             .map_err(|e| StoreError::Validation(format!("column facts do not encode: {e}")))?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.wait_if_held().await;
         #[cfg(any(test, feature = "test-support"))]
         let fault = self.faults.take_insert(&row.id);
         #[cfg(any(test, feature = "test-support"))]

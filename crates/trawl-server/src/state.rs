@@ -889,6 +889,7 @@ impl AppState {
             store: storage.results.clone(),
             capture: config.capture.clone(),
             clock: results_clock,
+            in_flight: Arc::default(),
         });
 
         let state = Self {

@@ -15,9 +15,9 @@
 //! prunes report runs (ADR-0018, amended by ADR-0057), or, with the
 //! scheduler disabled, on the standalone tick described below. It expires due
 //! temporary captures and unlinks their files, deletes tombstones past
-//! their lifetime, and removes published files no live row names once the
-//! capture deadline has passed. A failure is logged and counted, never
-//! fatal: the next tick tries again.
+//! their lifetime, and removes published files that no live row names and
+//! no capture in flight owns, once the capture deadline has passed. A
+//! failure is logged and counted, never fatal: the next tick tries again.
 //!
 //! An installation with `[scheduler] enabled = false` has no retention
 //! tick, so [`spawn_sweep`] runs the same sweep on its own cadence
@@ -205,12 +205,15 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
 /// Retire what is due at `now`: expire every temporary capture past its
 /// deadline and unlink its file, delete the tombstones that became
 /// unreadable `tombstone_secs` or more before `now`, and unlink every
-/// published file that no `temporary` or `kept` row names and that was last
-/// written `deadline_secs` or more before `now`.
+/// published file that no `temporary` or `kept` row names, that no capture
+/// in flight owns ([`super::InFlight`]), and that was last written
+/// `deadline_secs` or more before `now`.
 ///
-/// The age floor on that last step keeps a capture between its publish and
-/// its row's commit safe: the capture deadline covers the whole capture, so
-/// a file older than it with no row lost its commit. A file whose row is a
+/// A capture between its publish and its row's commit is in flight, and
+/// its insert runs past the capture deadline when the store is slow, so no
+/// age makes its file an orphan; the in-flight set does. The age floor
+/// gives the rest, a file whose capture could not learn its commit's
+/// outcome, the deadline before it is judged. A file whose row is a
 /// tombstone goes too, since nothing can read it.
 ///
 /// A failed step or unlink is logged at warn, counted in
@@ -239,16 +242,21 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
         Err(e) => outcome.errors += warn("deleting capture tombstones", &e),
     }
 
-    // List the files before reading the rows: a capture that publishes in
-    // between has a row by the time it is read, or a file younger than the
-    // deadline.
+    // List the files, then the captures in flight, then the rows. A
+    // capture enters before its publish and leaves once its insert is
+    // decided, so a listed file whose capture is not in the snapshot had
+    // its insert decided before the rows are read: its row is there, or
+    // it has none.
     match on_root(&results.root, ResultsRoot::list_ids).await {
         Err(e) => outcome.errors += warn("listing the results root", &e),
-        Ok(files) => match store.live_ids().await {
-            Err(e) => outcome.errors += warn("reading the live captures", &e),
-            Ok(live) => {
+        Ok(files) => match (results.in_flight.snapshot(), store.live_ids().await) {
+            (_, Err(e)) => outcome.errors += warn("reading the live captures", &e),
+            (in_flight, Ok(live)) => {
                 let live: HashSet<String> = live.into_iter().map(|(id, _)| id).collect();
-                let unnamed = files.into_iter().filter(|id| !live.contains(id)).collect();
+                let unnamed = files
+                    .into_iter()
+                    .filter(|id| !live.contains(id) && !in_flight.contains(id))
+                    .collect();
                 let cutoff = before(now, capture.deadline_secs);
                 let (orphans, errors) = remove_orphans(&results.root, unnamed, cutoff).await;
                 outcome.orphans = orphans;

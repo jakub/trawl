@@ -18,8 +18,10 @@
 //! capability itself, transport-free: capture, list, page and cell.
 //! `routes` adapts it to the four HTTP routes. [`ResultsState`] is what
 //! every part of the capability shares: the root, the metadata store, the
-//! limits, the clock every lifecycle decision reads, and the gate.
+//! limits, the clock every lifecycle decision reads, the gate, and the
+//! captures in flight between their file and their row.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -95,6 +97,50 @@ pub struct ResultsState {
     /// Capture admission, built from the same limits, store, root and
     /// clock.
     pub gate: charge::CaptureGate,
+    /// The captures between their file and their row.
+    pub in_flight: Arc<InFlight>,
+}
+
+/// The ids of the captures whose file is published, or about to be, and
+/// whose row's insert has not been decided (ADR-0057). The sweep never
+/// unlinks the file of one, however long its insert takes
+/// ([`sweep::sweep`]).
+///
+/// A capture enters before it publishes and leaves once its insert is
+/// decided: committed, failed with the file unlinked, or unknown with the
+/// file left for boot and the sweep. Boot reconciliation runs before any
+/// capture can enter.
+#[derive(Debug, Default)]
+pub struct InFlight(Mutex<HashSet<String>>);
+
+impl InFlight {
+    /// Hold `id` in flight until the returned registration drops.
+    pub(crate) fn enter(self: &Arc<Self>, id: &str) -> Entered {
+        self.0.lock().insert(id.to_owned());
+        Entered {
+            set: Arc::clone(self),
+            id: id.to_owned(),
+        }
+    }
+
+    /// The ids in flight now.
+    #[must_use]
+    pub fn snapshot(&self) -> HashSet<String> {
+        self.0.lock().clone()
+    }
+}
+
+/// One capture's place in [`InFlight`]; dropping it leaves.
+#[derive(Debug)]
+pub(crate) struct Entered {
+    set: Arc<InFlight>,
+    id: String,
+}
+
+impl Drop for Entered {
+    fn drop(&mut self) {
+        self.set.0.lock().remove(&self.id);
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +167,21 @@ mod tests {
             ResultsClock::System.now().timestamp_subsec_nanos() % 1_000,
             0
         );
+    }
+
+    #[test]
+    fn a_capture_is_in_flight_until_its_registration_drops() {
+        let in_flight = Arc::new(InFlight::default());
+        let first = in_flight.enter("a");
+        let second = in_flight.enter("b");
+        assert_eq!(
+            in_flight.snapshot(),
+            HashSet::from(["a".to_owned(), "b".to_owned()])
+        );
+        drop(first);
+        assert_eq!(in_flight.snapshot(), HashSet::from(["b".to_owned()]));
+        drop(second);
+        assert!(in_flight.snapshot().is_empty());
     }
 
     #[test]

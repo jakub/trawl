@@ -55,10 +55,12 @@
 //!    capture succeeded.
 //!
 //! The file reaches its final name before its row commits, ADR-0057's
-//! order. A capture that ends without its row unlinks the file it
-//! published (`Uncommitted`); one whose commit outcome cannot be learned
-//! leaves the file, and boot or the sweep removes it once no live row
-//! names it ([`super::sweep`]).
+//! order. From before the publish until the insert is decided the capture
+//! is in flight ([`super::InFlight`]), and the sweep leaves its file
+//! alone however long the insert takes. A capture that ends without its
+//! row unlinks the file it published (`Uncommitted`); one whose commit
+//! outcome cannot be learned leaves the file, and boot or the sweep
+//! removes it once no live row names it ([`super::sweep`]).
 //!
 //! # The cut
 //!
@@ -113,10 +115,10 @@ use trawl_engine::error::EngineError;
 use trawl_engine::executor::{RowCap, StoredAs as FileStoredAs};
 use trawl_engine::timing::QueryPhase;
 
-use super::ResultsState;
 use super::bounds::{self, Limits, Shape, Source, WindowInput};
 use super::charge::{Refusal, Reservation};
 use super::root::{self, Published, ResultsRoot, Verified};
+use super::{Entered, InFlight, ResultsState};
 use crate::deadline::{Deadline, Expired};
 use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::from_saved::RunFile;
@@ -290,6 +292,7 @@ pub async fn capture(
     let id = new_result_id();
     let keep = Keep {
         root: Arc::clone(&results.root),
+        in_flight: Arc::clone(&results.in_flight),
         id: id.clone(),
         shape: plan.resolved.shape,
         max_rows: limits.max_rows,
@@ -704,6 +707,7 @@ fn new_result_id() -> String {
 /// What the lane's `finish` needs: where the file goes and the cap.
 struct Keep {
     root: Arc<ResultsRoot>,
+    in_flight: Arc<InFlight>,
     id: String,
     shape: Shape,
     max_rows: u64,
@@ -765,6 +769,9 @@ impl Keep {
         if cancel.latched() {
             return Err(ServerError::Engine(EngineError::Cancelled));
         }
+        // In flight before the file can reach its final name, so no sweep
+        // sees it published and unregistered.
+        let entered = self.in_flight.enter(&self.id);
         let (stored_as, published) = clock.time(QueryPhase::Write, || {
             let staged = self.root.stage().map_err(EngineError::Io)?;
             #[cfg(any(test, feature = "test-support"))]
@@ -786,6 +793,7 @@ impl Keep {
             root: self.root,
             id: self.id,
             armed: true,
+            _in_flight: entered,
         };
         let columns = result
             .columns
@@ -1064,11 +1072,14 @@ fn new_capture(
 ///
 /// Dropped armed, it unlinks the file: the capture ended without its row.
 /// The publish refused to replace anything, so the name is this capture's
-/// own and nothing else is removed.
+/// own and nothing else is removed. However it is dropped, the capture
+/// leaves [`InFlight`] after that, never before.
 struct Uncommitted {
     root: Arc<ResultsRoot>,
     id: String,
     armed: bool,
+    /// Dropped after [`Drop::drop`] has run: fields drop after the body.
+    _in_flight: Entered,
 }
 
 impl Uncommitted {

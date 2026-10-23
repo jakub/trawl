@@ -15,9 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use common::captured;
+use reqwest::StatusCode;
+use serde_json::json;
 use trawl_api::results::{ColumnFacts, ResultColumn, ResultShape, ResultSource, StoredAs};
 use trawl_api::value::ColumnType;
-use trawl_server::config::CaptureConfig;
+use trawl_server::config::{CaptureConfig, RateLimitConfig};
 use trawl_server::results::ResultsState;
 use trawl_server::results::charge::CaptureGate;
 use trawl_server::results::root::{Published, ResultsRoot};
@@ -121,6 +124,7 @@ fn with_limits(results: &ResultsState, capture: CaptureConfig) -> ResultsState {
         ),
         capture,
         clock: results.clock.clone(),
+        in_flight: Arc::clone(&results.in_flight),
     }
 }
 
@@ -446,6 +450,54 @@ async fn sweep_removes_unnamed_files_only_past_the_capture_deadline() {
         staged.path().exists(),
         "an in-flight stage is not the sweep's"
     );
+}
+
+/// A capture whose row is still committing keeps its file through a sweep:
+/// the file is published, the row's insert is held, and a sweep past the
+/// capture deadline by the file's own age runs meanwhile. The insert then
+/// commits, the capture answers, and its first page reads its rows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sweep_leaves_the_file_of_a_capture_whose_row_is_committing() {
+    let server = captured::boot(RateLimitConfig::default(), CaptureConfig::default()).await;
+    server
+        .results_clock
+        .set(captured::at("2024-01-16T10:30:00Z"));
+    let results = &server.state.results;
+    let hold = results.store.faults().hold_next_insert();
+    let body = json!({
+        "query": format!("service={}", captured::SERVICE),
+        "window": { "last": "1h" },
+    });
+    // Past the deadline by the file's modification time, which the system
+    // clock stamps: the age floor alone would let the sweep unlink it.
+    let late = Utc::now() + seconds(results.capture.deadline_secs) + TimeDelta::hours(1);
+
+    let fixture = &server;
+    let ((status, _, answer), (published, swept)) = tokio::join!(
+        captured::capture(fixture, &fixture.analyst_token, &body),
+        async move {
+            hold.parked
+                .await
+                .expect("the capture reaches its row's insert");
+            let published = captured::root_names(fixture);
+            let swept = sweep(results, late).await;
+            hold.release.send(()).unwrap();
+            (published, swept)
+        }
+    );
+
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let id = answer["result"]["id"].as_str().unwrap();
+    assert_eq!(
+        published,
+        [format!("{id}.parquet")],
+        "the file was published before its row"
+    );
+    assert_eq!(swept, Sweep::default(), "the sweep left the capture alone");
+    assert!(exists(&results.root, id), "the file is still there");
+    let (status, _, page) = captured::page(&server, &server.analyst_token, id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["pagination"]["returned"], json!(captured::ROWS));
 }
 
 /// A failed unlink is logged and counted, and the sweep's other steps

@@ -793,6 +793,7 @@ async fn scheduler_runs_after(
         store: storage.results.clone(),
         capture: trawl_server::config::CaptureConfig::default(),
         clock: trawl_server::results::ResultsClock::System,
+        in_flight: std::sync::Arc::default(),
     });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
