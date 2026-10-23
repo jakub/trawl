@@ -286,7 +286,7 @@ pub fn resolve(
     };
     let (earliest, latest) = requested.bounds(truncate_to_micros(now), limits)?;
 
-    let stripped = strip_time_clauses(dsl)?;
+    let stripped = strip_time_clauses(dsl, &original)?;
     // `truncated` and `kind` are a report run's bookkeeping; the splice
     // reads only the two bounds.
     let window = ReportWindow {
@@ -619,79 +619,99 @@ fn is_time_only(token: &SearchToken) -> bool {
     }
 }
 
-/// One lifted clause and its span, if the search stage still carries one.
-fn lifted_clause(search: &SearchStage) -> Option<(TimeClause, Range<usize>)> {
-    search
-        .time_filter
-        .as_ref()
-        .map(|tf| (TimeClause::Last, tf.span.clone()))
-        .or_else(|| {
-            search
-                .earliest
-                .as_ref()
-                .map(|e| (TimeClause::Earliest, e.span.clone()))
-        })
-        .or_else(|| {
-            search
-                .latest
-                .as_ref()
-                .map(|l| (TimeClause::Latest, l.span.clone()))
-        })
-}
-
-/// The bytes to cut so the clause at `clause` leaves the text: the clause
-/// itself, or the outermost token around it that holds nothing else.
+/// Append to `cuts`, in text order, the bytes to cut so every clause in
+/// `clauses` leaves the text: the clause itself, or the outermost token
+/// around it that holds nothing else. Returns whether every token in
+/// `groups` holds nothing once its clauses are gone.
 ///
 /// Cutting only `last=1h` out of `NOT last=1h` would leave `NOT`, which
 /// parses as a search for the word, and cutting it out of `(last=1h)`
 /// would leave `()`, which does not parse.
-fn cut_range(groups: &[Vec<Spanned<SearchToken>>], clause: &Range<usize>) -> Range<usize> {
-    let holder = groups
-        .iter()
-        .flatten()
-        .find(|t| t.span.start <= clause.start && clause.end <= t.span.end);
-    let Some(holder) = holder else {
-        // The clause sat at this level and the parser lifted it out.
-        return clause.clone();
-    };
-    if is_time_only(&holder.node) {
-        return holder.span.clone();
+///
+/// `clauses` are the sorted spans the parser hoisted from `groups`. Each
+/// sits between two tokens, where the parser lifted it out of this level,
+/// or inside exactly one token. A token gets its own clauses as a slice and
+/// is walked once, so the walk is linear in the tree.
+fn collect_cuts(
+    groups: &[Vec<Spanned<SearchToken>>],
+    mut clauses: &[Range<usize>],
+    cuts: &mut Vec<Range<usize>>,
+) -> bool {
+    let mut time_only = true;
+    for token in groups.iter().flatten() {
+        let before = clauses.partition_point(|c| c.start < token.span.start);
+        cuts.extend_from_slice(&clauses[..before]);
+        let inside = clauses[before..].partition_point(|c| c.end <= token.span.end);
+        let held = &clauses[before..before + inside];
+        clauses = &clauses[before + inside..];
+
+        let mark = cuts.len();
+        let holds_only_time = match &token.node {
+            SearchToken::Group(inner) => collect_cuts(inner, held, cuts),
+            // `NOT last=1h`: lifted, and the `NOT` stays behind empty.
+            SearchToken::Not(inner) => direct_clause(&inner.node).is_some(),
+            SearchToken::TimeFilter(_)
+            | SearchToken::EarliestFilter(_)
+            | SearchToken::LatestFilter(_) => true,
+            SearchToken::FieldFilter(_)
+            | SearchToken::TextSearch(_)
+            | SearchToken::QuotedSearch(_) => false,
+        };
+        if !held.is_empty() {
+            if holds_only_time {
+                cuts.truncate(mark);
+                cuts.push(token.span.clone());
+            } else if !matches!(token.node, SearchToken::Group(_)) {
+                // A lifted span never sits inside any other token; if one
+                // ever did, the proof refuses whatever this cut leaves.
+                cuts.extend_from_slice(held);
+            }
+        }
+        time_only &= holds_only_time;
     }
-    match &holder.node {
-        SearchToken::Group(inner) => cut_range(inner, clause),
-        // A lifted span never sits inside any other token; if one ever
-        // did, the proof refuses whatever this cut leaves.
-        SearchToken::TimeFilter(_)
-        | SearchToken::EarliestFilter(_)
-        | SearchToken::LatestFilter(_)
-        | SearchToken::FieldFilter(_)
-        | SearchToken::TextSearch(_)
-        | SearchToken::QuotedSearch(_)
-        | SearchToken::Not(_) => clause.clone(),
-    }
+    cuts.extend_from_slice(clauses);
+    time_only
 }
 
-/// The caller's text with every `last=`, `earliest=` and `latest=` cut out.
+/// The caller's text, parsed as `query`, with every `last=`, `earliest=`
+/// and `latest=` cut out.
 ///
-/// One clause per pass, reparsing between passes: the parser keeps only
-/// the last clause of each kind, so the earlier ones surface one at a
-/// time. Each pass removes at least one byte, which bounds the passes by
-/// the text's length.
-fn strip_time_clauses(dsl: &str) -> Result<String, BoundsError> {
-    let mut text = dsl.to_owned();
-    let mut query = parse(&text).map_err(|_| BoundsError::SpliceMismatch)?;
-    for _ in 0..=dsl.len() {
-        let Some((clause, span)) = lifted_clause(&query.search) else {
-            return match clause_in_groups(&query.search.groups) {
-                Some(clause) => Err(BoundsError::ClauseNotTopLevel { clause }),
-                None => Ok(text),
-            };
+/// The parse already found every clause: the search stage records each one
+/// it hoisted ([`SearchStage::hoisted`]), the ones the last of each kind
+/// displaced included. They are cut out together and the rest is parsed
+/// once more, to prove no clause is left. The work grows with the text and
+/// not with its clauses, which matters because nothing bounds it: a
+/// capture resolves before admission.
+fn strip_time_clauses(dsl: &str, query: &Query) -> Result<String, BoundsError> {
+    let search = &query.search;
+    let mut hoisted: Vec<&Spanned<TimeClause>> = search.hoisted.iter().collect();
+    hoisted.sort_unstable_by_key(|clause| clause.span.start);
+    let Some(first) = hoisted.first().map(|clause| clause.node) else {
+        return match clause_in_groups(&search.groups) {
+            Some(clause) => Err(BoundsError::ClauseNotTopLevel { clause }),
+            None => Ok(dsl.to_owned()),
         };
-        let cut = cut_range(&query.search.groups, &span);
-        text.replace_range(cut, "");
-        query = parse(&text).map_err(|_| BoundsError::ClauseNotTopLevel { clause })?;
+    };
+    let clauses: Vec<Range<usize>> = hoisted.iter().map(|clause| clause.span.clone()).collect();
+    let mut cuts = Vec::new();
+    collect_cuts(&search.groups, &clauses, &mut cuts);
+
+    // The cuts are in text order; overlapping or adjacent ones merge.
+    let mut text = String::with_capacity(dsl.len());
+    let mut kept = 0;
+    for cut in &cuts {
+        if cut.start > kept {
+            text.push_str(&dsl[kept..cut.start]);
+        }
+        kept = kept.max(cut.end);
     }
-    Err(BoundsError::SpliceMismatch)
+    text.push_str(&dsl[kept..]);
+
+    let stripped = parse(&text).map_err(|_| BoundsError::ClauseNotTopLevel { clause: first })?;
+    match any_clause(&stripped) {
+        Some(clause) => Err(BoundsError::ClauseNotTopLevel { clause }),
+        None => Ok(text),
+    }
 }
 
 /// A query with every time clause gone: the lifted fields cleared and the
@@ -707,12 +727,16 @@ fn without_time(mut query: Query) -> Query {
 
 fn prune_time_only(groups: &mut Vec<Vec<Spanned<SearchToken>>>) {
     for group in groups.iter_mut() {
-        for token in group.iter_mut() {
-            if let SearchToken::Group(inner) = &mut token.node {
+        group.retain_mut(|token| match &mut token.node {
+            // Pruned first, a group that held only time clauses is empty.
+            // Reading that, rather than walking the group again, keeps the
+            // prune linear in the nesting depth.
+            SearchToken::Group(inner) => {
                 prune_time_only(inner);
+                !inner.is_empty()
             }
-        }
-        group.retain(|token| !is_time_only(&token.node));
+            node => !is_time_only(node),
+        });
     }
     groups.retain(|group| !group.is_empty());
 }
@@ -1233,6 +1257,94 @@ mod tests {
                 resolved.executed
             );
         }
+    }
+
+    /// A query of thousands of clauses resolves in one pass over its text,
+    /// in every position the parser lifts a clause from, and the last
+    /// clause still wins. The resolution runs before admission, where no
+    /// lane limit or deadline bounds it, so its work must grow with the
+    /// text alone: cutting one clause per parse took minutes here.
+    #[test]
+    fn thousands_of_clauses_resolve_in_one_pass() {
+        /// The parser's input limit (`trawl_core::parser::MAX_QUERY_LEN`).
+        const MAX_QUERY_LEN: usize = 65_536;
+        /// Far above one pass over 64 KiB in an unoptimized build under
+        /// load, far below a pass per clause in an optimized one.
+        const BUDGET: Duration = Duration::from_secs(5);
+
+        let hour_ago = "2026-10-23T09:20:30.123456Z";
+        let single = resolve_dsl("last=1h").unwrap();
+        assert_eq!(window_of(&single), (hour_ago.to_owned(), T.to_owned()));
+        for (earlier, last) in [
+            ("last=2h ", "last=1h "),
+            ("NOT last=2h ", "last=1h "),
+            ("(last=2h) ", "last=1h "),
+            ("a OR last=2h ", "last=1h "),
+            ("(b NOT last=2h) ", "last=1h "),
+        ] {
+            let count = (MAX_QUERY_LEN - last.len()) / earlier.len();
+            let dsl = format!("{}{last}", earlier.repeat(count));
+            assert!(dsl.len() <= MAX_QUERY_LEN, "{earlier}: {}", dsl.len());
+
+            let started = std::time::Instant::now();
+            let resolved = resolve_dsl(&dsl).unwrap_or_else(|e| panic!("{earlier}: {e}"));
+            let elapsed = started.elapsed();
+
+            assert_eq!(
+                (window_of(&resolved), resolved.source, resolved.shape),
+                (window_of(&single), single.source, single.shape),
+                "{earlier}: the last clause wins, as alone"
+            );
+            let after = parse(&resolved.executed).unwrap();
+            assert!(
+                after.time_clause() == Some(TimeClause::Earliest)
+                    && clause_in_groups(&after.search.groups).is_none(),
+                "{earlier}: only the spliced window is left"
+            );
+            assert!(
+                elapsed < BUDGET,
+                "{earlier}: {count} clauses resolved in {elapsed:?}"
+            );
+        }
+
+        // Every clause is cut, and every byte between them kept.
+        let dsl = format!("{}last=1h ", "last=2h ".repeat(8190));
+        assert_eq!(
+            resolve_dsl(&dsl).unwrap().executed,
+            format!(
+                "{}{}\n{IMPOSED_ORDER}",
+                prefix(hour_ago, T),
+                " ".repeat(8191)
+            )
+        );
+    }
+
+    /// A clause under thousands of nested parentheses resolves in time
+    /// that grows with the text, not with the depth times the text. The
+    /// test runs on a stack sized for the depth: an unoptimized parser
+    /// spends about a kilobyte of it per level.
+    #[test]
+    fn deeply_nested_groups_resolve_in_linear_time() {
+        const DEPTH: usize = 16_384;
+        /// Far above a linear pass over 32 KiB of parentheses in an
+        /// unoptimized build under load, far below a walk per level.
+        const BUDGET: Duration = Duration::from_secs(5);
+
+        let dsl = format!("{}a last=1h{}", "(".repeat(DEPTH), ")".repeat(DEPTH));
+        let (resolved, elapsed) = std::thread::Builder::new()
+            .stack_size(512 << 20)
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let resolved = resolve_dsl(&dsl);
+                (resolved, started.elapsed())
+            })
+            .expect("spawn the resolving thread")
+            .join()
+            .expect("the resolution finishes");
+
+        let resolved = resolved.unwrap();
+        assert_eq!(window_of(&resolved).0, "2026-10-23T09:20:30.123456Z");
+        assert!(elapsed < BUDGET, "{DEPTH} levels resolved in {elapsed:?}");
     }
 
     #[test]

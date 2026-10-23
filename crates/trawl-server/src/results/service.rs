@@ -32,8 +32,10 @@
 //!    `saved_lookup`, refuses a run whose file is gone, and measures the
 //!    run's files against `source_max_bytes`, as a window's selection is
 //!    measured inside the lane. A refusal ends the account with
-//!    `outcome=error`; a deadline that expires during the lookup ends it
-//!    with `outcome=capacity_refused`, as on `/query`.
+//!    `outcome=error`. A deadline that passes during the resolution or the
+//!    lookup refuses the capture before admission, 503 with
+//!    `outcome=capacity_refused`, as `/query` refuses work its deadline
+//!    never let start.
 //! 5. **Admission** ([`super::charge::CaptureGate::admit`]), booked as
 //!    `pool_wait`: the key's lane, the installation's slots and the quota
 //!    reservation, else 429 with `Retry-After` and the account ended with
@@ -581,8 +583,10 @@ struct Plan {
 /// stored run and its budget, booking the work on `timing`. Takes nothing
 /// a refusal must give back.
 ///
-/// Writes the account itself only for a lookup the deadline cut, which
-/// is a capacity refusal; every other refusal is the caller's to write.
+/// Writes the account itself only when the deadline passed during the
+/// resolution or the lookup, which is a capacity refusal; every other
+/// refusal is the caller's to write.
+#[allow(clippy::too_many_lines)]
 async fn plan(
     state: &AppState,
     verified: &VerifiedKey,
@@ -623,6 +627,16 @@ async fn plan(
         }
         Ok(resolved)
     })?;
+    // Resolution is work on this worker that no wait interrupts. However
+    // short, it may outlast what was left of the deadline, and a capture
+    // the deadline never let start is refused here, before it takes an
+    // admission, as an expired lookup is below.
+    if deadline.expired() {
+        timing.emit_complete(Outcome::CapacityRefused, Instant::now());
+        return Err(ServerError::ServiceUnavailable(
+            CAPACITY_NOT_STARTED.to_owned(),
+        ));
+    }
 
     match resolved.source {
         Source::Live { earliest, latest } => Ok(Plan {

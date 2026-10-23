@@ -20,6 +20,7 @@
 mod common;
 
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -32,6 +33,7 @@ use trawl_api::value::Value;
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 use trawl_server::pool::seam::Seam;
+use trawl_server::results::ResultsClock;
 use trawl_server::store::{FinishOutcome, RunClaim, RunStatus};
 
 /// Where the clock stands when a test captures.
@@ -464,4 +466,75 @@ async fn a_refused_capture_accounts_its_timing_once() {
     started.release();
     let (status, _, body) = running.await.unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A capture whose deadline passes while its bounds resolve is refused
+/// before admission with 503, as `/query` refuses work its deadline never
+/// let start, and accounts as `capacity_refused` with no admission wait.
+///
+/// Resolution reads the results clock, so a thread holding the fixture
+/// clock's lock parks the capture there, its deadline already stamped.
+/// The capture blocks its tokio worker meanwhile, as a slow resolution
+/// would, and that can stall the runtime's timers. So the holder times
+/// the hold on its own thread, and the test's tasks wait only for the
+/// answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deadline_spent_resolving_refuses_before_admission() {
+    telemetry();
+    let server = boot(CaptureConfig {
+        deadline_secs: 1,
+        ..CaptureConfig::default()
+    })
+    .await;
+    let key = captured::key_id(&server, &server.analyst_token).await;
+    let permits = server.state.query.pool.available_permits();
+    let ResultsClock::Fixed(clock) = &server.results_clock else {
+        panic!("the fixture's results clock is fixed");
+    };
+    let clock = Arc::clone(clock);
+    let counted = Arc::clone(&server.state.total_queries);
+    let entered = counted.load(Ordering::Relaxed);
+    let (locked, on_locked) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _held = clock.lock();
+        locked.send(()).unwrap();
+        // A capture counts itself once its deadline is stamped, before it
+        // resolves; from then on its one second is running.
+        let give_up = std::time::Instant::now() + Duration::from_mins(1);
+        while counted.load(Ordering::Relaxed) == entered {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the capture never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(1_500));
+    });
+    on_locked.recv().unwrap();
+
+    let capture = spawn_capture(&server, &server.analyst_token, events_body());
+    let answer = capture.await.unwrap();
+    holder.join().expect("the holder saw the capture arrive");
+    let (status, _, body) = &answer;
+    assert_eq!(*status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], "service_unavailable", "{body}");
+    let timing = timing_of(&request_id(&answer)).await;
+    assert!(
+        timing.field("outcome").contains("capacity_refused"),
+        "{timing:?}"
+    );
+    assert_eq!(timing.field("work_started"), "false", "{timing:?}");
+    timing.field("query_dsl_check_us");
+    assert!(
+        !timing.fields.contains_key("query_pool_wait_us"),
+        "the refusal came before admission: {timing:?}"
+    );
+    captured::assert_nothing_held(&server, permits, "a capture refused after resolving").await;
+    assert_eq!(server.state.results.gate.queued(key), 0);
+    assert!(
+        captured::listed(&server, &server.analyst_token)
+            .await
+            .is_empty(),
+        "no row"
+    );
 }
