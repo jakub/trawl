@@ -129,9 +129,11 @@ fn count_of(payload: &Value, host: &str) -> Option<u64> {
         .rows
         .iter()
         .find(|row| row[host_at] == Cell::String(host.to_owned()))
-        .and_then(|row| match row[count_at] {
-            Cell::Integer(n) => u64::try_from(n).ok(),
-            Cell::UInt(n) => Some(n),
+        .map(|row| match row[count_at] {
+            Cell::Integer(n) => {
+                u64::try_from(n).unwrap_or_else(|_| panic!("count is negative: {n}"))
+            }
+            Cell::UInt(n) => n,
             ref other => panic!("count is not an integer cell: {other:?}"),
         })
 }
