@@ -577,6 +577,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
             state.storage.schedule.clone(),
             state.auth.key_store.clone(),
             state.query.pool.clone(),
+            Arc::clone(&state.results),
             config.scheduler.clone(),
             config.server.timeout_secs,
             shutdown_rx,

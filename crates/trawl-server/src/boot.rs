@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The boot steps that make the corpus ready to serve (ADR-0041 slice 2).
+//! The boot steps that make the corpus ready to serve (ADR-0041 slice 2),
+//! and the captured results with it (ADR-0057).
 //!
 //! They run after publication recovery and state construction, and before
 //! self-telemetry, compaction, the other workers, the scheduler and the
@@ -18,9 +19,15 @@ use crate::config::Config;
 use crate::error::join_failure_text;
 use crate::state::AppState;
 
-/// Prepare the corpus for serving.
+/// Prepare the corpus and the captured results for serving.
 ///
-/// An ingest node runs these steps in order:
+/// Every node first reconciles the results root with the captured-result
+/// rows ([`crate::results::sweep::reconcile_at_boot`]): staged files and
+/// files no capture names go, rows whose files are gone are marked, and
+/// captures over a lowered quota are pruned. Both node types hold a
+/// results root, so this runs before either door below.
+///
+/// An ingest node then runs these steps in order:
 ///
 /// 1. Recover the rollup markers the gate's boot scan registered. A failure
 ///    does not stop the boot: reads stay refused as `rollup_pending` until
@@ -42,11 +49,13 @@ use crate::state::AppState;
 ///
 /// # Errors
 ///
-/// Each stops the boot: a failed conformance pass (a per-path failure is
-/// skipped inside the pass, not an error), an archive that names another
-/// catalog, a hydration error, or a gate that was not born starting. The
-/// last two are boot bugs, never properties of the WAL.
+/// Each stops the boot: a failed reconciliation of the results root, a
+/// failed conformance pass (a per-path failure is skipped inside the pass,
+/// not an error), an archive that names another catalog, a hydration
+/// error, or a gate that was not born starting. The last two are boot
+/// bugs, never properties of the WAL.
 pub async fn prepare_corpus(state: &AppState, config: &Config) -> Result<(), String> {
+    crate::results::sweep::reconcile_at_boot(&state.results).await?;
     if !config.ingest.enabled {
         return prepare_query_only(state, config).await;
     }

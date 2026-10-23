@@ -614,7 +614,7 @@ pub fn open_query_scratch(
 /// filesystem resolves them (ADR-0057). Config validation compares the
 /// spellings; this compares the directories. Nothing in the root is
 /// removed: boot reconciles it against the metadata rows once the database
-/// is admitted.
+/// is admitted ([`crate::results::sweep::reconcile_at_boot`]).
 ///
 /// trawld calls this right after [`open_query_scratch`], before it waits on
 /// `PostgreSQL`, so a second trawld on the same root refuses before it

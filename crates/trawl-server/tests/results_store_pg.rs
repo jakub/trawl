@@ -547,6 +547,72 @@ async fn prune_oldest_never_prunes_kept_or_due_rows(pool: PgPool) {
     );
 }
 
+/// Boot walks the keys holding live results: kept and in-deadline
+/// temporary rows count, a past-deadline or expired row does not.
+#[sqlx::test]
+async fn live_keys_names_each_key_holding_a_live_result_once(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let rows = [
+        capture(110, 9, Duration::minutes(1), 10),
+        capture(111, 7, Duration::minutes(2), 10),
+        capture(112, 9, Duration::minutes(3), 10),
+        capture(113, 11, Duration::hours(2), 0),
+        capture(114, 12, Duration::minutes(20), 10),
+        capture(115, 13, Duration::minutes(30), 10),
+    ];
+    for row in &rows {
+        insert(&store, row).await;
+    }
+    keep(&pool, &rows[3].id).await;
+    assert!(store.mark_expired(&rows[5].id, now()).await.unwrap());
+
+    assert_eq!(store.live_keys(now()).await.unwrap(), [7, 9, 11]);
+}
+
+/// The installation prune takes the oldest temporary rows across keys
+/// until both installation limits fit, and leaves kept rows alone.
+#[sqlx::test]
+async fn prune_oldest_installation_prunes_across_keys_until_both_limits_fit(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let kept = capture(120, 9, Duration::hours(3), 1000);
+    let oldest = capture(121, 7, Duration::minutes(9), 100);
+    let older = capture(122, 8, Duration::minutes(8), 200);
+    let newer = capture(123, 7, Duration::minutes(7), 300);
+    for row in [&kept, &oldest, &older, &newer] {
+        insert(&store, row).await;
+    }
+    keep(&pool, &kept.id).await;
+
+    // Four live rows and 1600 bytes: three rows fit, 1300 bytes do not.
+    let pruned = store
+        .prune_oldest_installation(3, 1300, now())
+        .await
+        .unwrap();
+    assert_eq!(ids(&pruned), [oldest.id.as_str(), older.id.as_str()]);
+    for row in [&oldest, &older] {
+        assert_eq!(
+            state_of(&pool, &row.id).await,
+            ("pruned".to_owned(), Some(now()))
+        );
+    }
+    assert_eq!(state_of(&pool, &newer.id).await.0, "temporary");
+    assert_eq!(state_of(&pool, &kept.id).await.0, "kept");
+    assert_eq!(
+        store.installation_usage(now()).await.unwrap(),
+        Usage {
+            results: 2,
+            bytes: 1300
+        }
+    );
+    assert!(
+        store
+            .prune_oldest_installation(3, 1300, now())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[sqlx::test]
 async fn a_digest_without_a_file_or_a_file_without_a_digest_is_refused(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());

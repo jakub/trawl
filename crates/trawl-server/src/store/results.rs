@@ -418,6 +418,19 @@ impl ResultsStore {
             .map_err(StoreError::from)
     }
 
+    /// The keys holding a live result at `now`, ascending, for boot's
+    /// per-key quota pass.
+    pub async fn live_keys(&self, now: DateTime<Utc>) -> Result<Vec<i64>, StoreError> {
+        Ok(sqlx::query_scalar(concat!(
+            "SELECT DISTINCT key_id FROM captured_results WHERE ",
+            live_at!("$1"),
+            " ORDER BY key_id"
+        ))
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Prune the key's oldest temporary results until its live usage at
     /// `now` is at most `keep_results` results and at most `keep_bytes`
     /// file bytes (ADR-0057: reached when an operator lowers a quota below
@@ -439,17 +452,60 @@ impl ResultsStore {
         keep_bytes: u64,
         now: DateTime<Utc>,
     ) -> Result<Vec<ExpiredFile>, StoreError> {
+        self.prune(Some(key_id), keep_results, keep_bytes, now)
+            .await
+    }
+
+    /// [`Self::prune_oldest`] across every key: prune the installation's
+    /// oldest temporary results, whoever owns them, until its live usage at
+    /// `now` is at most `keep_results` results and `keep_bytes` file bytes.
+    /// Kept results count and are never pruned, as for one key.
+    ///
+    /// Every live row is read `FOR UPDATE`; boot runs this after the
+    /// per-key pass and before the server takes captures.
+    pub async fn prune_oldest_installation(
+        &self,
+        keep_results: u64,
+        keep_bytes: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ExpiredFile>, StoreError> {
+        self.prune(None, keep_results, keep_bytes, now).await
+    }
+
+    /// Prune the oldest temporary results of `key_id`, or of the whole
+    /// installation for `None`, down to the limits.
+    async fn prune(
+        &self,
+        key_id: Option<i64>,
+        keep_results: u64,
+        keep_bytes: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ExpiredFile>, StoreError> {
         let mut tx = self.pool.begin().await?;
-        let rows = sqlx::query(concat!(
-            "SELECT id, state, file_bytes FROM captured_results
-             WHERE key_id = $1 AND ",
-            live_at!("$2"),
-            " ORDER BY created_at, id FOR UPDATE"
-        ))
-        .bind(key_id)
-        .bind(now)
-        .fetch_all(&mut *tx)
-        .await?;
+        let rows = match key_id {
+            Some(key_id) => {
+                sqlx::query(concat!(
+                    "SELECT id, state, file_bytes FROM captured_results
+                     WHERE key_id = $1 AND ",
+                    live_at!("$2"),
+                    " ORDER BY created_at, id FOR UPDATE"
+                ))
+                .bind(key_id)
+                .bind(now)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+            None => {
+                sqlx::query(concat!(
+                    "SELECT id, state, file_bytes FROM captured_results WHERE ",
+                    live_at!("$1"),
+                    " ORDER BY created_at, id FOR UPDATE"
+                ))
+                .bind(now)
+                .fetch_all(&mut *tx)
+                .await?
+            }
+        };
 
         let mut results = 0_u64;
         let mut bytes = 0_u64;

@@ -18,7 +18,7 @@
 //! directory, a repin staging root or the query scratch directory, closed
 //! to its owner, and locked. Unlike query scratch it is never cleared: what
 //! it holds outlives a restart. Boot reconciles it against the metadata
-//! rows instead.
+//! rows instead ([`super::sweep::reconcile_at_boot`]).
 //!
 //! Every entry is reached through the held handle, by `openat`,
 //! `renameat2` and `unlinkat`, so no link in the configured path can

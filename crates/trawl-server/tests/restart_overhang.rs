@@ -877,6 +877,7 @@ async fn nets_scheduler_loop_logs_each_corpus_transition_once() {
         server.state.storage.schedule.clone(),
         fleet_auth::KeyStore::from_pool(server.fleet_pool.clone()),
         server.state.query.pool.clone(),
+        std::sync::Arc::clone(&server.state.results),
         trawl_server::config::SchedulerConfig {
             poll_interval_secs: 1,
             ..trawl_server::config::SchedulerConfig::default()

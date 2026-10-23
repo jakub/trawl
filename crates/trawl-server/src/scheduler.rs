@@ -8,7 +8,12 @@
 //! tasks on the [`ExecutorPool`]. Results are written as exact-typed parquet
 //! files (with a typed zstd-JSON blob for what parquet cannot hold and for a
 //! failed write) and recorded as report runs in the app-state database.
+//!
+//! The hourly retention tick that prunes report runs also sweeps captured
+//! results ([`crate::results::sweep::sweep`], ADR-0018 as amended by
+//! ADR-0057).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -23,16 +28,19 @@ use crate::pool::ExecutorPool;
 use crate::publication::CorpusUnsettled;
 use crate::query_timing::{Outcome, TimingGuard};
 use crate::report_window::{ReportWindow, format_window_bound, truncate_to_micros};
+use crate::results::ResultsState;
 use crate::store::{ClaimedRun, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore};
 
 /// Spawn the scheduler background task.
 ///
 /// The task exits on the first change to `shutdown_rx`, or when its sender
-/// is dropped; the value itself is never read.
+/// is dropped; the value itself is never read. Its retention tick sweeps
+/// `results` with the report runs.
 pub fn spawn_scheduler(
     schedule_store: ScheduleStore,
     key_store: KeyStore,
     pool: ExecutorPool,
+    results: Arc<ResultsState>,
     config: SchedulerConfig,
     timeout_secs: u64,
     shutdown_rx: watch::Receiver<bool>,
@@ -41,6 +49,7 @@ pub fn spawn_scheduler(
         schedule_store,
         key_store,
         pool,
+        results,
         config,
         timeout_secs,
         shutdown_rx,
@@ -51,6 +60,7 @@ async fn scheduler_loop(
     schedule_store: ScheduleStore,
     key_store: KeyStore,
     pool: ExecutorPool,
+    results: Arc<ResultsState>,
     config: SchedulerConfig,
     timeout_secs: u64,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -146,6 +156,9 @@ async fn scheduler_loop(
                     );
                 }
             }
+            // Captured results retire on their own clock, which tests
+            // move; the sweep logs its counts and its failures.
+            crate::results::sweep::sweep(&results, results.clock.now()).await;
         }
     }
 }

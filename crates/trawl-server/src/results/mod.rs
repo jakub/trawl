@@ -9,7 +9,9 @@
 //! `bounds` decides what a capture executes: the one window it covers,
 //! the text with that window spliced in, and whether the result is
 //! event-shaped. [`root`] holds the results root, where each capture's
-//! file is staged and published. [`ResultsState`] is what every part of
+//! file is staged and published. [`sweep`] keeps the root and the rows in
+//! agreement: once at boot, and on the scheduler's hourly retention tick.
+//! [`ResultsState`] is what every part of
 //! the capability shares: the root, the metadata store, the limits and the
 //! clock every lifecycle decision reads.
 
@@ -24,6 +26,7 @@ use crate::store::ResultsStore;
 
 pub(crate) mod bounds;
 pub mod root;
+pub mod sweep;
 
 /// The clock every lifecycle decision about captured results reads:
 /// expiry, tombstone age, quota usage, the sweep and boot reconciliation.
