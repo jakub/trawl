@@ -2557,6 +2557,23 @@ pub mod captured {
             "{what}: a publication writer acquires, so no reader guard is held"
         );
     }
+
+    /// Every name in the server's results root, sorted: published results
+    /// (`<id>.parquet`) and stages (`.stage-*`).
+    pub fn root_names(server: &TestServer) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(server.state.results.root.path())
+            .expect("read the results root")
+            .map(|entry| {
+                entry
+                    .expect("a root entry")
+                    .file_name()
+                    .into_string()
+                    .expect("a UTF-8 name")
+            })
+            .collect();
+        names.sort();
+        names
+    }
 }
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
