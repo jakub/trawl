@@ -29,7 +29,9 @@
 //!    `admission::check_dsl`, so a parse error points into the text the
 //!    caller wrote. Then `bounds::resolve` fixes the window at the results
 //!    clock's instant and splices it in, and the executed text passes the
-//!    same check; a failure there is the server's own splice, so a 500. A
+//!    same check; a failure there is the server's own splice, so a 500. An
+//!    event-shaped query leaves one stage of the cap for the order the
+//!    server appends, so one at the cap is the bounds' 400. A
 //!    `from saved` capture resolves its stored run here, booked as
 //!    `saved_lookup`, refuses a run whose file is gone, and measures the
 //!    run's files against `source_max_bytes`, as a window's selection is

@@ -980,3 +980,86 @@ async fn a_value_holding_nul_is_captured_listed_and_read_back() {
         Value::String(MESSAGE.to_owned())
     );
 }
+
+/// A stage that keeps every corpus event and keeps the result events.
+const KEEP_STAGE: &str = " | where severity >= 0";
+
+/// The corpus query with `stages` copies of [`KEEP_STAGE`], then `tail`.
+fn staged(stages: usize, tail: &str) -> String {
+    format!("{}{}{tail}", corpus_query(), KEEP_STAGE.repeat(stages))
+}
+
+/// A capture of `query` over the last hour.
+fn last_hour(query: &str) -> serde_json::Value {
+    json!({ "query": query, "window": { "last": "1h" } })
+}
+
+/// `/api/v1/query` over `dsl`, answered with a refusal: its status and body.
+async fn query_refusal(server: &TestServer, dsl: &str) -> (StatusCode, serde_json::Value) {
+    let response = common::harness_client_builder()
+        .build()
+        .unwrap()
+        .post(format!("{}/api/v1/query", server.url))
+        .bearer_auth(&server.analyst_token)
+        .json(&json!({ "query": dsl }))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response.json().await.unwrap())
+}
+
+/// The stage cap (ADR-0024, 128 stages) counts the text that runs, and an
+/// events capture runs its query with the server's order appended, so the
+/// query may carry 127 stages. One with 128 is the capture's own 400,
+/// naming its limit, and one with 129 is the refusal `/query` gives it,
+/// from the check of the text as sent. A whole-shaped capture appends
+/// nothing and takes 128. No refusal takes a permit.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_events_capture_keeps_one_stage_for_its_order() {
+    let server = boot().await;
+    server.results_clock.set(at("2024-01-16T10:30:00Z"));
+    let analyst = &server.analyst_token;
+
+    let fits = captured::captured(&server, analyst, &last_hour(&staged(127, "")))
+        .await
+        .result;
+    assert_eq!(fits.shape, ResultShape::Events);
+    assert!(fits.executed_query.ends_with(IMPOSED_ORDER));
+    assert_eq!(fits.captured_rows, captured::ROWS as u64);
+
+    let before = permits(&server);
+    let (status, _, answer) =
+        captured::capture(&server, analyst, &last_hour(&staged(128, ""))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(code(&answer), "bad_request", "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "this query has 128 pipeline stages, over the limit of 127 for a capture of events, \
+         which ends with its own `| sort -_time, -_ingested` stage; shorten the pipeline",
+    );
+    captured::assert_nothing_held(&server, before, "128 stages of events").await;
+
+    let over = staged(129, "");
+    let (status, _, answer) = captured::capture(&server, analyst, &last_hour(&over)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(code(&answer), "validation_error", "{answer}");
+    let (query_status, query_answer) = query_refusal(&server, &over).await;
+    assert_eq!(query_status, StatusCode::BAD_REQUEST, "{query_answer}");
+    assert_eq!(
+        answer["error"]["message"], query_answer["error"]["message"],
+        "the refusal /query gives"
+    );
+    captured::assert_nothing_held(&server, before, "129 stages of events").await;
+
+    let whole = captured::captured(
+        &server,
+        analyst,
+        &last_hour(&staged(127, " | stats count()")),
+    )
+    .await
+    .result;
+    assert_eq!(whole.shape, ResultShape::Whole);
+    assert!(!whole.executed_query.ends_with(IMPOSED_ORDER));
+    assert_eq!(whole.captured_rows, 1);
+}

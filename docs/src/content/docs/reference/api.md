@@ -577,7 +577,7 @@ A query whose first stage is `from saved` reads a stored report run, not the cor
 
 A capture keeps at most 5,000 rows, `[capture] max_rows`, and at most 4 MiB of cells, `[capture] max_wire_bytes`. The byte cap counts each cell as the [result columns](#result-columns) encoding writes it, without the commas and brackets between cells. The engine's own `max_result_rows` refusal applies first, with 400 `result_too_large`.
 
-A result has the `events` shape when every stage after the search only filters events or adds fields: `where`, `extract`, `let`, `drop`, and `rename`, where no `let`, `drop`, or `rename` writes, removes, or renames `_time` or `_ingested`. The result must also carry both columns. The server appends `| sort -_time, -_ingested` to the executed text of every `events` capture, so the rows are newest first. When the rows pass a cap, the capture keeps the rows before the first one that does not fit, and `total_rows` counts every row. A first row larger than the byte cap leaves zero rows.
+A result has the `events` shape when every stage after the search only filters events or adds fields: `where`, `extract`, `let`, `drop`, and `rename`, where no `let`, `drop`, or `rename` writes, removes, or renames `_time` or `_ingested`. The result must also carry both columns. The server appends `| sort -_time, -_ingested` to the executed text of every `events` capture, so the rows are newest first. That stage counts against the stage cap of 128, so the query of an `events` capture may carry at most 127 stages. A query with 128 is refused with 400 `bad_request` before the capture takes anything. When the rows pass a cap, the capture keeps the rows before the first one that does not fit, and `total_rows` counts every row. A first row larger than the byte cap leaves zero rows.
 
 Every other result has the `whole` shape: one that aggregates, projects, orders, limits, deduplicates, or samples, such as `stats`, `table`, `sort`, `head`, `top`, or `dedup`, and every `from saved` result. A prefix of such a result answers a different question, so a `whole` result past either cap is refused with 400 `result_too_large`. The message names the cap and says to aggregate further or narrow the window.
 
@@ -617,7 +617,7 @@ A capture writes its file to the [results root](/reference/configuration/#the-re
 |--------|------|------|
 | 400 | `parse_error` | The query does not parse. The spans point into the text as sent |
 | 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
-| 400 | `bad_request` | A [bounds](#bounds) refusal: a window and a time clause together, `latest=` alone, an empty window, a span over `max_span_secs`, a value that names no instant, a nested time clause, or a window or time clause on `from saved` |
+| 400 | `bad_request` | A [bounds](#bounds) refusal: a window and a time clause together, `latest=` alone, an empty window, a span over `max_span_secs`, a value that names no instant, a nested time clause, or a window or time clause on `from saved`. Also an `events` query of 128 stages, which leaves no stage for the [imposed order](#shapes-and-caps) |
 | 400 | `result_too_large` | The result exceeded `max_result_rows`, a `whole` result exceeded `max_rows` or `max_wire_bytes`, or the file exceeded `max_file_bytes` |
 | 400 | `capture_source_too_large` | The window, or the `from saved` run, selects more than `source_max_bytes` of stored data |
 | 400 | `execution_error` | A result cell is an integer outside the signed and unsigned 64-bit range |

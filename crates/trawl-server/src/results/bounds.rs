@@ -39,6 +39,7 @@ use trawl_core::ast::{
     TimeClause,
 };
 use trawl_core::compare::{Instant, literal_timestamp};
+use trawl_core::complexity::MAX_PIPELINE_STAGES;
 use trawl_core::format::format_query;
 use trawl_core::schema::{INGESTED, TIME, catalog_key};
 
@@ -52,6 +53,13 @@ use crate::report_window::{
 /// It goes on its own line, so a `#` comment at the end of the caller's
 /// text cannot swallow it.
 const IMPOSED_ORDER: &str = "| sort -_time, -_ingested";
+
+/// The most pipeline stages an event-shaped capture's query may carry: one
+/// fewer than any query ([`MAX_PIPELINE_STAGES`]), because the executed text
+/// adds [`IMPOSED_ORDER`] and every door that checks the stage cap, the
+/// engine's included, counts the text it runs. The executed text stays a
+/// query any door admits, as `/query` would run it from history.
+pub const MAX_EVENT_STAGES: usize = MAX_PIPELINE_STAGES - 1;
 
 /// What [`BoundsError::InvalidWindow`] names for a window instant.
 const RFC3339_GRAMMAR: &str = "an RFC 3339 instant such as 2026-10-23T09:00:00Z";
@@ -221,6 +229,16 @@ pub enum BoundsError {
         /// The nested clause.
         clause: TimeClause,
     },
+    /// An event-shaped query with no stage to spare for [`IMPOSED_ORDER`]
+    /// under the stage cap.
+    #[error(
+        "this query has {stages} pipeline stages, over the limit of {MAX_EVENT_STAGES} for a \
+         capture of events, which ends with its own `{IMPOSED_ORDER}` stage; shorten the pipeline"
+    )]
+    TooManyStages {
+        /// The stages the query carries.
+        stages: usize,
+    },
     /// The spliced text is not provably the caller's query with a new
     /// window. This is a limit of the server's splice, not of the query.
     #[error(
@@ -245,7 +263,9 @@ pub enum BoundsError {
 /// literal (`compare::literal_timestamp`, which drops a spelled offset), so
 /// the bound is the one `/query` would apply. A window's values are RFC
 /// 3339 instants, offsets applied. A window and a query clause together are
-/// refused, as are an empty window and one longer than `max_span`.
+/// refused, as are an empty window and one longer than `max_span`. An
+/// event-shaped query of more than [`MAX_EVENT_STAGES`] stages is refused,
+/// since its executed text would pass the stage cap.
 ///
 /// A `from saved` query passes through unchanged as a [`Source::Stored`],
 /// whole-shaped capture. It is refused with a window or a clause, since
@@ -302,6 +322,10 @@ pub fn resolve(
     let shape = classify(&original);
     let executed = match shape {
         Shape::Events => {
+            let stages = original.pipeline.len();
+            if stages > MAX_EVENT_STAGES {
+                return Err(BoundsError::TooManyStages { stages });
+            }
             let ordered = format!("{spliced}\n{IMPOSED_ORDER}");
             prove_order_appended(&spliced, &ordered)?;
             ordered
@@ -870,6 +894,37 @@ mod tests {
             format!("{}service=nginx\n{IMPOSED_ORDER}", prefix(start, T))
         );
         assert_eq!(resolved.shape, Shape::Events);
+    }
+
+    #[test]
+    fn an_event_query_leaves_one_stage_of_the_cap_for_the_order() {
+        let staged = |stages: usize, tail: &str| {
+            format!(
+                "service=nginx{}{tail}",
+                " | where status >= 0".repeat(stages)
+            )
+        };
+        let fits = resolve_dsl(&staged(MAX_EVENT_STAGES, "")).unwrap();
+        assert_eq!(fits.shape, Shape::Events);
+        let executed = trawl_core::parser::parse(&fits.executed).unwrap();
+        assert_eq!(executed.pipeline.len(), MAX_PIPELINE_STAGES);
+
+        let refused = resolve_dsl(&staged(MAX_PIPELINE_STAGES, "")).unwrap_err();
+        assert_eq!(
+            refused,
+            BoundsError::TooManyStages {
+                stages: MAX_PIPELINE_STAGES
+            }
+        );
+        assert_eq!(
+            refused.to_string(),
+            "this query has 128 pipeline stages, over the limit of 127 for a capture of events, \
+             which ends with its own `| sort -_time, -_ingested` stage; shorten the pipeline"
+        );
+
+        // A whole-shaped query appends nothing and keeps the whole cap.
+        let whole = resolve_dsl(&staged(MAX_EVENT_STAGES, " | stats count()")).unwrap();
+        assert_eq!(whole.shape, Shape::Whole);
     }
 
     #[test]
