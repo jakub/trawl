@@ -36,7 +36,9 @@ use crate::drawer_query::{decode_cardinality, value_as_u64};
 use crate::fetch_plan::FetchPlan;
 use crate::histogram::{Slot, align_buckets, parse_bucket_ms};
 use crate::interop::uplot::{ChartHandle, ChartKind, Opts, create_chart};
-use crate::state::stream_session::{LiveSignals, RingBuffer, StreamLifecycle, start_stream};
+use crate::state::stream_session::{
+    LiveSignals, RingBuffer, StreamLifecycle, event_field, event_object, start_stream,
+};
 use fleet_ui::{
     Badge, Btn, Drawer, Icon, IconView, LoadState, Loaded, TabItem, ToastBus, ToastKind, Tone,
     Variant, effective_active,
@@ -668,16 +670,18 @@ fn TailPane(svc: ServiceSchema, bus: ToastBus) -> impl IntoView {
                     }
                     let skip = total.saturating_sub(TAIL_DISPLAY_MAX);
                     rb.events.iter().skip(skip).map(|ev| {
-                        let ts = ev.get("_time")
-                            .or_else(|| ev.get("time"))
-                            .or_else(|| ev.get("timestamp"))
-                            .and_then(|v| v.as_str().map(ToString::to_string))
+                        let text = |name: &str| match event_field(ev, name) {
+                            Some(trawl_api::value::Value::String(s)) => Some(s.clone()),
+                            _ => None,
+                        };
+                        let ts = text("_time")
+                            .or_else(|| text("time"))
+                            .or_else(|| text("timestamp"))
                             .map_or_else(|| "—".to_string(), |s| short_time(&s));
-                        let msg = ev.get("message")
-                            .or_else(|| ev.get("_raw"))
-                            .or_else(|| ev.get("msg"))
-                            .and_then(|v| v.as_str().map(ToString::to_string))
-                            .unwrap_or_else(|| serde_json::to_string(ev).unwrap_or_default());
+                        let msg = text("message")
+                            .or_else(|| text("_raw"))
+                            .or_else(|| text("msg"))
+                            .unwrap_or_else(|| serde_json::to_string(&event_object(ev)).unwrap_or_default());
                         view! {
                             <div class="tl-row">
                                 <span class="ts">{ts}</span>

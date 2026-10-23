@@ -956,19 +956,18 @@ where
 /// A live event carrying a number past `i64::MAX` reaches the results
 /// buffer as that exact number.
 ///
-/// The buffer decodes each field with `serde_json::from_value::<Value>`,
-/// so this is `trawl_api::value`'s landing rule seen from the TUI: before
-/// it existed the cell arrived as a rounded double. The `unwrap_or` on
-/// that call is the other half — a number the decoder refused would have
-/// shown the reader an empty cell instead of a wrong one.
+/// The frame's `integer` column carries the digits as a decimal string,
+/// so this is `trawl_api::value`'s landing rule seen from the TUI: the
+/// cell must arrive as the number, never a rounded double or a null.
 #[cfg(test)]
 #[test]
 fn live_event_large_unsigned_exact() {
-    let event: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(r#"{"service":"nginx","request_id":18446744073709551615}"#)
-            .expect("valid event JSON");
+    let frame: trawl_engine::value::QueryResult = serde_json::from_str(
+        r#"{"columns":[{"name":"request_id","type":"integer"},{"name":"service","type":"string"}],"rows":[["18446744073709551615","nginx"]]}"#,
+    )
+    .expect("a valid data frame");
     let mut buffer = state::LiveBuffer::new(10);
-    buffer.push_event(&event);
+    buffer.push_frame(&frame);
 
     let response = buffer.to_query_response();
     let idx = response
@@ -977,6 +976,10 @@ fn live_event_large_unsigned_exact() {
         .iter()
         .position(|c| c.name == "request_id")
         .expect("request_id column");
+    assert_eq!(
+        response.result.columns[idx].ty,
+        trawl_engine::value::ColumnType::Integer
+    );
     assert_eq!(
         response.result.rows[0][idx],
         trawl_engine::value::Value::UInt(u64::MAX),
@@ -989,11 +992,12 @@ fn live_event_large_unsigned_exact() {
 #[cfg(test)]
 #[test]
 fn snapshot_large_unsigned_exact() {
-    let rows: Vec<serde_json::Map<String, serde_json::Value>> =
-        serde_json::from_str(r#"[{"service":"nginx","total":18446744073709551615}]"#)
-            .expect("valid snapshot JSON");
+    let frame: trawl_api::stream::SnapshotFrame = serde_json::from_str(
+        r#"{"columns":[{"name":"service","type":"string"},{"name":"total","type":"integer"}],"rows":[["nginx","18446744073709551615"]]}"#,
+    )
+    .expect("a valid snapshot frame");
     let mut buffer = state::LiveBuffer::new(10);
-    buffer.replace_with_snapshot(&["service".to_owned(), "total".to_owned()], &rows, &[]);
+    buffer.replace_with_snapshot(&frame.result, &frame.capped);
 
     let response = buffer.to_query_response();
     assert_eq!(

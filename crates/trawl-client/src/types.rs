@@ -64,16 +64,13 @@ pub(crate) struct SetScheduleRequestRef<'a> {
 /// A single event from a live query stream.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    /// A log event as a named-field map (from SSE stream).
-    Event(serde_json::Map<String, serde_json::Value>),
-    /// A result row (columnar, for non-streaming use).
-    Row(Vec<trawl_engine::value::Value>),
+    /// One event a pass-through stream emitted: a one-row result whose
+    /// typed columns are the fields that event carries.
+    Event(trawl_api::value::QueryResult),
     /// An aggregation snapshot replacing the entire result set.
     Snapshot {
-        /// Column names for the snapshot rows.
-        columns: Vec<String>,
-        /// Each row is a field map of column→value.
-        rows: Vec<serde_json::Map<String, serde_json::Value>>,
+        /// The aggregation's rows so far, typed.
+        result: trawl_api::value::QueryResult,
         /// The caps that dropped input since the stream started, so the
         /// rows are partial. Empty when nothing was dropped (ADR-0001).
         capped: Vec<trawl_api::stream::SnapshotCap>,

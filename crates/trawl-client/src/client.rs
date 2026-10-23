@@ -1000,7 +1000,11 @@ impl HttpClient {
     /// Stream live query results as typed events.
     ///
     /// Returns a stream of [`StreamEvent`] values parsed from the SSE
-    /// connection. Handles event framing and JSON deserialization.
+    /// connection. Handles event framing and decodes each result frame
+    /// through the result wire's codec. A `data`, `snapshot` or `lagged`
+    /// frame that does not decode ends the stream with
+    /// [`ClientError::Parse`], since its rows would otherwise vanish
+    /// without a trace.
     pub async fn stream_events(
         &self,
         query: &str,
@@ -1034,13 +1038,9 @@ impl HttpClient {
 
                     match event_type.as_deref() {
                         Some("data") => {
-                            if let Some(data) = event_data {
-                                let event: serde_json::Map<String, serde_json::Value> =
-                                    serde_json::from_str(&data).map_err(|e| {
-                                        ClientError::Parse(format!("invalid stream event: {e}"))
-                                    })?;
-                                yield StreamEvent::Event(event);
-                            }
+                            let event: trawl_api::value::QueryResult =
+                                decode_frame("event", event_data.as_deref())?;
+                            yield StreamEvent::Event(event);
                         }
                         Some("error") => {
                             if let Some(data) = event_data {
@@ -1048,35 +1048,21 @@ impl HttpClient {
                             }
                         }
                         Some("snapshot") => {
-                            if let Some(data) = event_data {
-                                // Parse {"columns":[...],"rows":[...],"capped":[...]}
-                                // payload; `capped` is omitted when nothing
-                                // was dropped.
-                                #[derive(serde::Deserialize)]
-                                struct SnapshotPayload {
-                                    columns: Vec<String>,
-                                    rows: Vec<serde_json::Map<String, serde_json::Value>>,
-                                    #[serde(default)]
-                                    capped: Vec<trawl_api::stream::SnapshotCap>,
-                                }
-                                if let Ok(s) = serde_json::from_str::<SnapshotPayload>(&data) {
-                                    yield StreamEvent::Snapshot {
-                                        columns: s.columns,
-                                        rows: s.rows,
-                                        capped: s.capped,
-                                    };
-                                }
-                            }
+                            let frame: trawl_api::stream::SnapshotFrame =
+                                decode_frame("snapshot", event_data.as_deref())?;
+                            yield StreamEvent::Snapshot {
+                                result: frame.result,
+                                capped: frame.capped,
+                            };
                         }
                         Some("lagged") => {
-                            if let Some(data) = event_data {
-                                // Parse {"missed": N} payload.
-                                let missed = serde_json::from_str::<serde_json::Value>(&data)
-                                    .ok()
-                                    .and_then(|v| v.get("missed")?.as_u64())
-                                    .unwrap_or(0);
-                                yield StreamEvent::Lagged(missed);
+                            #[derive(serde::Deserialize)]
+                            struct LaggedFrame {
+                                missed: u64,
                             }
+                            let frame: LaggedFrame =
+                                decode_frame("lag notice", event_data.as_deref())?;
+                            yield StreamEvent::Lagged(frame.missed);
                         }
                         _ => {} // ignore keep-alive, etc.
                     }
@@ -1136,6 +1122,17 @@ impl HttpClient {
 
 /// Classify a failure reading or decoding a response body.
 ///
+/// Decode one SSE frame's `data` payload, naming the frame `what` when it
+/// is missing or does not decode.
+fn decode_frame<T: serde::de::DeserializeOwned>(
+    what: &str,
+    data: Option<&str>,
+) -> Result<T, ClientError> {
+    let data = data.ok_or_else(|| ClientError::Parse(format!("stream {what} has no data")))?;
+    serde_json::from_str(data)
+        .map_err(|e| ClientError::Parse(format!("invalid stream {what}: {e}")))
+}
+
 /// reqwest reports every failure collecting a body as a decode error, a
 /// stall past the request's deadline included. A timeout is a transport
 /// failure, not a malformed answer, so it is a [`NetworkKind::BodyTimeout`]
@@ -1941,12 +1938,9 @@ mod tests {
         result
     }
 
-    /// A snapshot frame's `capped` reaches the event; a frame without it
-    /// reads as nothing dropped.
-    #[tokio::test]
-    async fn snapshot_event_carries_capped() {
+    /// Every frame `stream_events` reads from one SSE body, in order.
+    async fn stream_answered_with(body: &str) -> Vec<Result<StreamEvent, ClientError>> {
         use futures::StreamExt as _;
-        use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
 
         init();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1958,14 +1952,6 @@ mod tests {
             std::time::Duration::from_secs(10),
         )
         .unwrap();
-        let body = concat!(
-            "event: snapshot\n",
-            r#"data: {"columns":["host","count"],"rows":[{"host":"a","count":1}],"capped":[{"cap":"groups","limit":10000},{"cap":"exact_values","limit":100000}]}"#,
-            "\n\n",
-            "event: snapshot\n",
-            r#"data: {"columns":["count"],"rows":[{"count":2}]}"#,
-            "\n\n",
-        );
         let response = http_response("200 OK", "text/event-stream", body.as_bytes());
         let (events, request) = tokio::join!(
             async {
@@ -1975,34 +1961,144 @@ mod tests {
             serve_once(listener, response)
         );
         assert!(request.starts_with("GET /api/v1/stream?"), "{request}");
-        let events: Vec<StreamEvent> = events
-            .expect("the stream opens")
+        events.expect("the stream opens")
+    }
+
+    /// A snapshot frame lands as a typed result, and its `capped` reaches
+    /// the event; a frame without it reads as nothing dropped.
+    #[tokio::test]
+    async fn snapshot_event_carries_capped() {
+        use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        let body = concat!(
+            "event: snapshot\n",
+            r#"data: {"columns":[{"name":"host","type":"string"},{"name":"count","type":"integer"}],"rows":[["a","1"]],"capped":[{"cap":"groups","limit":10000},{"cap":"exact_values","limit":100000}]}"#,
+            "\n\n",
+            "event: snapshot\n",
+            r#"data: {"columns":[{"name":"count","type":"integer"}],"rows":[["2"]]}"#,
+            "\n\n",
+        );
+        let events: Vec<StreamEvent> = stream_answered_with(body)
+            .await
             .into_iter()
             .collect::<Result<_, _>>()
             .expect("every frame reads");
-        let capped: Vec<Vec<SnapshotCap>> = events
+        let snapshots: Vec<(QueryResult, Vec<SnapshotCap>)> = events
             .into_iter()
             .map(|event| match event {
-                StreamEvent::Snapshot { capped, .. } => capped,
+                StreamEvent::Snapshot { result, capped } => (result, capped),
                 other => panic!("expected a snapshot, got {other:?}"),
             })
             .collect();
         assert_eq!(
-            capped,
+            snapshots,
             vec![
-                vec![
-                    SnapshotCap {
-                        cap: SnapshotCapKind::Groups,
-                        limit: 10_000,
+                (
+                    QueryResult {
+                        columns: vec![
+                            Column::new("host", ColumnType::String),
+                            Column::new("count", ColumnType::Integer),
+                        ],
+                        rows: vec![vec![Value::String("a".to_owned()), Value::Integer(1)]],
                     },
-                    SnapshotCap {
-                        cap: SnapshotCapKind::ExactValues,
-                        limit: 100_000,
+                    vec![
+                        SnapshotCap {
+                            cap: SnapshotCapKind::Groups,
+                            limit: 10_000,
+                        },
+                        SnapshotCap {
+                            cap: SnapshotCapKind::ExactValues,
+                            limit: 100_000,
+                        },
+                    ],
+                ),
+                (
+                    QueryResult {
+                        columns: vec![Column::new("count", ColumnType::Integer)],
+                        rows: vec![vec![Value::Integer(2)]],
                     },
-                ],
-                Vec::new(),
+                    Vec::new(),
+                ),
             ]
         );
+    }
+
+    /// A `data` frame is a one-row typed result: an integer past `i64`
+    /// lands as the exact `UInt` it was, and a lag notice its count.
+    #[tokio::test]
+    async fn data_frames_land_typed_cells() {
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+
+        let body = concat!(
+            "event: data\n",
+            r#"data: {"columns":[{"name":"_time","type":"timestamp"},{"name":"request_id","type":"integer"},{"name":"status","type":"integer"}],"rows":[["2026-01-15T09:00:00.000000Z","18446744073709551615","404"]]}"#,
+            "\n\n",
+            ": keep-alive\n\n",
+            "event: lagged\n",
+            r#"data: {"missed":3}"#,
+            "\n\n",
+        );
+        let events: Vec<StreamEvent> = stream_answered_with(body)
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .expect("every frame reads");
+        let [StreamEvent::Event(event), StreamEvent::Lagged(3)] = events.as_slice() else {
+            panic!("expected an event and a lag notice, got {events:?}");
+        };
+        assert_eq!(
+            event,
+            &QueryResult {
+                columns: vec![
+                    Column::new("_time", ColumnType::Timestamp),
+                    Column::new("request_id", ColumnType::Integer),
+                    Column::new("status", ColumnType::Integer),
+                ],
+                rows: vec![vec![
+                    Value::String("2026-01-15T09:00:00.000000Z".to_owned()),
+                    Value::UInt(u64::MAX),
+                    Value::Integer(404),
+                ]],
+            }
+        );
+    }
+
+    /// A known frame that does not decode ends the stream with a parse
+    /// error naming the frame, rather than vanishing.
+    #[tokio::test]
+    async fn malformed_frames_are_parse_errors() {
+        for (body, named) in [
+            // A JSON number under `integer`: the old untyped wire.
+            (
+                concat!(
+                    "event: data\n",
+                    r#"data: {"columns":[{"name":"status","type":"integer"}],"rows":[[404]]}"#,
+                    "\n\n"
+                ),
+                r#"invalid stream event: column "status""#,
+            ),
+            // The old snapshot shape: bare column names, rows as maps.
+            (
+                concat!(
+                    "event: snapshot\n",
+                    r#"data: {"columns":["count"],"rows":[{"count":1}]}"#,
+                    "\n\n"
+                ),
+                "invalid stream snapshot",
+            ),
+            (
+                concat!("event: lagged\n", r#"data: {"missed":"many"}"#, "\n\n"),
+                "invalid stream lag notice",
+            ),
+            ("event: data\n\n", "stream event has no data"),
+        ] {
+            let events = stream_answered_with(body).await;
+            let [Err(ClientError::Parse(message))] = events.as_slice() else {
+                panic!("{body:?} must end in one parse error, got {events:?}");
+            };
+            assert!(message.contains(named), "{body:?}: {message}");
+        }
     }
 
     /// An unavailable daemon answers 503 with its per-check body. That body

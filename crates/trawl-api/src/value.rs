@@ -300,6 +300,27 @@ impl TypeFold {
         self.observe(&ty);
     }
 
+    /// A cell of a column a result typed `ty`, for merging typed results
+    /// (the live ring's frames, the TUI's live buffer).
+    ///
+    /// The column's type is the cell's evidence, with two refinements: a
+    /// null adds nothing, whatever its column says (a one-row frame types
+    /// a null cell `string` for want of evidence), and a list's items fold
+    /// element by element, so an empty list adds no item evidence.
+    pub fn observe_typed(&mut self, ty: &ColumnType, value: &Value) {
+        match (ty, value) {
+            (_, Value::Null) => {}
+            (ColumnType::List { items }, Value::Array(elements)) => {
+                let mut fold = Self::new();
+                for element in elements {
+                    fold.observe_typed(items, element);
+                }
+                self.observe_list(fold);
+            }
+            (ty, _) => self.observe(ty),
+        }
+    }
+
     /// Another fold's evidence, as if its cells were observed here.
     pub fn merge(&mut self, other: Self) {
         if let Some(shape) = other.0 {
@@ -1342,6 +1363,51 @@ mod wire_tests {
         timestamps.observe(&ColumnType::Timestamp);
         timestamps.observe(&ColumnType::String);
         assert_eq!(timestamps.finish(), Some(ColumnType::Mixed));
+    }
+
+    /// Merging typed results: the column's type is a cell's evidence, but
+    /// a null cell (typed `string` for want of any) and an empty list's
+    /// items add none, so a sparse field never turns `mixed`.
+    #[test]
+    fn typed_cells_fold_by_their_column_type() {
+        let fold = |cells: &[(ColumnType, Value)]| {
+            let mut fold = TypeFold::new();
+            for (ty, cell) in cells {
+                fold.observe_typed(ty, cell);
+            }
+            fold.finish()
+        };
+        let text = |s: &str| Value::String(s.to_owned());
+        assert_eq!(
+            fold(&[
+                (ColumnType::String, Value::Null),
+                (ColumnType::Timestamp, text("2026-01-15T09:00:00.000000Z")),
+                (ColumnType::Integer, Value::Null),
+            ]),
+            Some(ColumnType::Timestamp)
+        );
+        assert_eq!(fold(&[(ColumnType::String, Value::Null)]), None);
+        assert_eq!(
+            fold(&[
+                (ColumnType::Timestamp, text("2026-01-15T09:00:00.000000Z")),
+                (ColumnType::String, text("soon")),
+            ]),
+            Some(ColumnType::Mixed)
+        );
+        assert_eq!(
+            fold(&[
+                (ColumnType::list(ColumnType::String), Value::Array(vec![])),
+                (
+                    ColumnType::list(ColumnType::Integer),
+                    Value::Array(vec![Value::UInt(u64::MAX)])
+                ),
+            ]),
+            Some(ColumnType::list(ColumnType::Integer))
+        );
+        assert_eq!(
+            fold(&[(ColumnType::Mixed, Value::Integer(1))]),
+            Some(ColumnType::Mixed)
+        );
     }
 
     #[test]

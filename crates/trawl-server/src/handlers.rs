@@ -13,7 +13,7 @@ use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use axum::{Extension, Json};
 use fleet_auth::VerifiedKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::convert::Infallible;
 use trawl_api::csv::sanitize_csv_formula;
@@ -3611,11 +3611,13 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
 /// Build an SSE snapshot event from the current aggregation state,
 /// applying post-stages to each row.
 ///
-/// The payload carries `capped`, one `{cap, limit}` per cap that dropped
-/// input since the stream started, on this and every later snapshot, and
-/// omits it while nothing has been dropped (ADR-0001). An event dropped at
-/// a cap still counts toward the next snapshot, so the scheduled snapshot
-/// discloses a cap even when no further input arrives.
+/// The payload is a [`trawl_api::stream::SnapshotFrame`]: the rows as a
+/// typed result, its columns in the aggregation's declared order and typed
+/// by the cells the aggregation emitted, plus `capped`, one `{cap, limit}`
+/// per cap that dropped input since the stream started, on this and every
+/// later snapshot, omitted while nothing has been dropped (ADR-0001). An
+/// event dropped at a cap still counts toward the next snapshot, so the
+/// scheduled snapshot discloses a cap even when no further input arrives.
 ///
 /// `ctx` is the one instant this snapshot evaluates `now()` at, for every
 /// post-stage row alike (ADR-0017 §3) — a distinct type from the per-event
@@ -3627,19 +3629,78 @@ fn emit_agg_snapshot(
     aggregation: &trawl_core::stream::CompiledAggregation,
     post_stages: &mut [trawl_core::stream::CompiledStage],
     ctx: &trawl_core::stream::SnapshotContext,
-) -> Event {
+) -> Option<Event> {
     let (columns, rows) = trawl_core::stream::emit_snapshot(aggregation, post_stages, ctx);
-    let rows: Vec<_> = rows.into_iter().map(trawl_core::row::to_json).collect();
+    let frame = trawl_api::stream::SnapshotFrame {
+        result: trawl_engine::post_process::rows_to_result(&rows, &columns, &[]),
+        capped: aggregation.capped().into_iter().map(snapshot_cap).collect(),
+    };
+    result_frame("snapshot", &frame)
+}
 
-    let mut payload = serde_json::json!({
-        "columns": columns,
-        "rows": rows,
-    });
-    let capped: Vec<_> = aggregation.capped().into_iter().map(snapshot_cap).collect();
-    if !capped.is_empty() {
-        payload["capped"] = serde_json::json!(capped);
+/// Build an SSE `data` event for one event a pass-through stream emits:
+/// a one-row typed result.
+///
+/// Each cell is first conformed to the pin `output_pins` holds for its
+/// name ([`trawl_core::eval::conformed_cell`]), the reading a pinned
+/// `| where` takes, so a field the catalog pins BIGINT arrives as the
+/// integer a batch query answers for it, not as the text a sender wrote. A
+/// cell with no reading keeps its own kind, and a field a stage derived
+/// has no pin in the scope, so its own cell types it.
+fn emit_data_frame(
+    mut row: trawl_core::row::Row,
+    output_pins: &trawl_core::pin_scope::PinScope,
+) -> Option<Event> {
+    if !output_pins.is_empty() {
+        for (name, cell) in &mut row {
+            if let Some(conformed) = output_pins
+                .pin_for(name)
+                .and_then(|pin| trawl_core::eval::conformed_cell(cell, pin))
+            {
+                *cell = conformed;
+            }
+        }
     }
-    Event::default().event("snapshot").data(payload.to_string())
+    let result = trawl_engine::post_process::rows_to_result(std::slice::from_ref(&row), &[], &[]);
+    result_frame("data", &result)
+}
+
+/// The pin scope a pass-through stream's output fields are typed under:
+/// the stream's catalog snapshot with the ADR-0009 envelope table over it,
+/// walked to the end of the pipeline (ADR-0011), so a rename carries its
+/// pin and a derived value loses it, as in the batch lanes.
+fn stream_output_pins(
+    catalog: &trawl_core::schema::FieldTypes,
+    pipeline: &[trawl_core::ast::Spanned<trawl_core::ast::PipeStage>],
+) -> trawl_core::pin_scope::PinScope {
+    let mut root = catalog.clone();
+    for (name, ty) in trawl_core::schema::ENVELOPE_TYPES {
+        root.insert(name, *ty);
+    }
+    let mut scope = trawl_core::pin_scope::PinScope::root(&root);
+    for stage in pipeline {
+        scope.advance(&stage.node);
+    }
+    scope
+}
+
+/// One result frame as an SSE event named `name`. The codec checks every
+/// cell against its column's type, and the builder types columns from
+/// those very cells, so a refusal is a bug: it is logged and the frame
+/// dropped rather than sent half-written.
+fn result_frame(name: &'static str, payload: &impl Serialize) -> Option<Event> {
+    match serde_json::to_string(payload) {
+        Ok(json) => Some(Event::default().event(name).data(json)),
+        Err(error) => {
+            tracing::error!(
+                event_type = "stream_frame_unencodable",
+                frame = name,
+                %error,
+                "dropping a live result frame the result wire refused"
+            );
+            None
+        }
+    }
 }
 
 /// One dropped-input cap as the snapshot wire spells it.
@@ -3743,6 +3804,7 @@ pub async fn stream_query(
         None,
     )
     .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+    let output_pins = stream_output_pins(&pin_snapshot, &ast.pipeline);
 
     let Some(ref bus) = state.ingest.event_bus else {
         return Err(ServerError::BadRequest(
@@ -3783,11 +3845,9 @@ pub async fn stream_query(
                                     &ctx,
                                 ) {
                                     trawl_core::stream::LiveOutcome::Emit(row) => {
-                                        let json = serde_json::to_string(
-                                            &trawl_core::row::to_json(row),
-                                        )
-                                        .unwrap_or_default();
-                                        yield Ok(Event::default().event("data").data(json));
+                                        if let Some(frame) = emit_data_frame(row, &output_pins) {
+                                            yield Ok(frame);
+                                        }
                                     }
                                     trawl_core::stream::LiveOutcome::Filtered => {}
                                     trawl_core::stream::LiveOutcome::Done => {
@@ -3854,12 +3914,13 @@ pub async fn stream_query(
                                     }
 
                                     if events_since_snapshot >= SNAPSHOT_EVENT_THRESHOLD {
-                                        let snapshot = emit_agg_snapshot(
+                                        if let Some(snapshot) = emit_agg_snapshot(
                                             &aggregation,
                                             &mut post_stages,
                                             &snapshot_context(),
-                                        );
-                                        yield Ok(snapshot);
+                                        ) {
+                                            yield Ok(snapshot);
+                                        }
                                         events_since_snapshot = 0;
                                         snapshot_timer.reset();
                                     }
@@ -3881,12 +3942,13 @@ pub async fn stream_query(
                         _ = snapshot_timer.tick() => {
                             // Time-based snapshot: only emit if new events arrived.
                             if events_since_snapshot > 0 {
-                                let snapshot = emit_agg_snapshot(
+                                if let Some(snapshot) = emit_agg_snapshot(
                                     &aggregation,
                                     &mut post_stages,
                                     &snapshot_context(),
-                                );
-                                yield Ok(snapshot);
+                                ) {
+                                    yield Ok(snapshot);
+                                }
                                 events_since_snapshot = 0;
                             }
                         }
@@ -3909,6 +3971,26 @@ pub struct StreamParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live `_time` and `_ingested` are typed from the ADR-0009 envelope
+    /// table, not the catalog alone: an empty catalog still pins them, a
+    /// rename carries the pin, and a field the catalog pins keeps its pin.
+    #[test]
+    fn stream_output_pins_hold_the_envelope_table() {
+        use trawl_core::schema::{CanonicalType, FieldTypes};
+
+        let mut catalog = FieldTypes::new();
+        catalog.insert("status", CanonicalType::BigInt);
+        let ast = trawl_core::parser::parse("* | rename _ingested as seen").unwrap();
+        let pins = stream_output_pins(&catalog, &ast.pipeline);
+        assert_eq!(pins.pin_for("_time"), Some(CanonicalType::Timestamp));
+        assert_eq!(pins.pin_for("seen"), Some(CanonicalType::Timestamp));
+        assert_eq!(pins.pin_for("_ingested"), None);
+        assert_eq!(pins.pin_for("status"), Some(CanonicalType::BigInt));
+
+        let pins = stream_output_pins(&FieldTypes::new(), &[]);
+        assert_eq!(pins.pin_for("_time"), Some(CanonicalType::Timestamp));
+    }
 
     #[test]
     fn history_numeric_extractor_characterization() {

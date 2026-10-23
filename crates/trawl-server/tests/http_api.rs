@@ -3889,7 +3889,14 @@ async fn sse_freezes_now_per_event_and_per_snapshot() {
     assert_eq!(ingest.ingest(&records).await.unwrap().accepted, 2);
 
     let buf = read_sse_until(&mut stream, "now-needle-2").await;
-    let rows = sse_payloads(&buf);
+    let rows: Vec<serde_json::Value> = sse_payloads(&buf)
+        .into_iter()
+        .flat_map(|payload| {
+            let frame: trawl_api::value::QueryResult =
+                serde_json::from_value(payload).expect("a data frame is a typed result");
+            common::result_rows(&frame)
+        })
+        .collect();
     assert_eq!(rows.len(), 2, "both events must arrive: {buf}");
     for row in &rows {
         let a = row["a"].as_str().expect("a is a timestamp text");
@@ -3922,24 +3929,27 @@ async fn sse_freezes_now_per_event_and_per_snapshot() {
     let buf = read_sse_until(&mut stream, "agg-2").await;
     let snapshot = sse_payloads(&buf)
         .into_iter()
-        .rfind(|payload| {
-            payload["rows"]
-                .as_array()
-                .is_some_and(|rows| rows.len() == 2)
+        .map(|payload| {
+            let frame: trawl_api::stream::SnapshotFrame =
+                serde_json::from_value(payload).expect("a snapshot frame is a typed result");
+            common::result_rows(&frame.result)
         })
+        .rfind(|rows| rows.len() == 2)
         .unwrap_or_else(|| panic!("a snapshot carrying both groups: {buf}"));
-    let rows = snapshot["rows"].as_array().expect("rows is an array");
-    let first = rows[0]["seen"].as_str().expect("seen is a timestamp text");
-    for row in rows {
+    let first = snapshot[0]["seen"]
+        .as_str()
+        .expect("seen is a timestamp text");
+    let shown = serde_json::Value::from(snapshot.clone());
+    for row in &snapshot {
         assert_eq!(
             row["seen"].as_str(),
             Some(first),
-            "every group row of one snapshot carries ONE instant: {snapshot}"
+            "every group row of one snapshot carries ONE instant: {shown}"
         );
         assert_eq!(
             row["seen2"].as_str(),
             Some(first),
-            "…and one per row, not one per read: {snapshot}"
+            "…and one per row, not one per read: {shown}"
         );
     }
 }

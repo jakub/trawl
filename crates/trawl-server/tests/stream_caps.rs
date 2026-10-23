@@ -108,11 +108,32 @@ fn rows(payload: &Value) -> &Vec<Value> {
     payload["rows"].as_array().expect("rows is an array")
 }
 
+/// The count a snapshot holds for `host`, read through the shared frame
+/// type: the rows are positional and the counts typed `integer`.
 fn count_of(payload: &Value, host: &str) -> Option<u64> {
-    rows(payload)
+    use trawl_api::value::Value as Cell;
+
+    let frame: trawl_api::stream::SnapshotFrame =
+        serde_json::from_value(payload.clone()).expect("a snapshot frame decodes");
+    let place = |name: &str| {
+        frame
+            .result
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("no {name} column"))
+    };
+    let (host_at, count_at) = (place("host"), place("count"));
+    frame
+        .result
+        .rows
         .iter()
-        .find(|row| row["host"] == host)
-        .and_then(|row| row["count"].as_u64())
+        .find(|row| row[host_at] == Cell::String(host.to_owned()))
+        .and_then(|row| match row[count_at] {
+            Cell::Integer(n) => u64::try_from(n).ok(),
+            Cell::UInt(n) => Some(n),
+            _ => None,
+        })
 }
 
 fn groups_cap() -> Value {

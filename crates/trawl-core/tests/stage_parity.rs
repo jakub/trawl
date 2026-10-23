@@ -785,15 +785,13 @@ fn extract_reads_a_computed_timestamp_where_batch_refuses_the_query() {
     assert_eq!(column(&live, "y"), vec!["2026"]);
 }
 
-/// An SSE frame's bytes are the wire JSON of the event map itself.
-///
-/// The round trip through the row door (`from_json` then `to_json`) must
-/// change neither key order nor cell rendering, so the expectation is
-/// computed as `serde_json::to_string` of the map rather than
-/// transcribed. The literal below pins the same thing a second time, so a
-/// change to both sides at once is still visible.
+/// The round trip through the row doors (`from_json` then `to_json`)
+/// changes neither key order nor cell rendering of an event map, so the
+/// expectation is computed as `serde_json::to_string` of the map rather
+/// than transcribed. The literal below pins the same thing a second time,
+/// so a change to both sides at once is still visible.
 #[test]
-fn an_sse_frame_keeps_its_pre_change_bytes() {
+fn the_row_doors_keep_an_event_maps_bytes() {
     let event = json!({
         "service": "nginx",
         "_time": "2026-01-15T09:00:00Z",
@@ -802,7 +800,7 @@ fn an_sse_frame_keeps_its_pre_change_bytes() {
         "flag": true,
         "missing": null,
         "message": "hello",
-        // Above `i64::MAX`: the frame must carry the digits, not the
+        // Above `i64::MAX`: the map must carry the digits, not the
         // double they round to.
         "request_id": u64::MAX,
     });
@@ -812,10 +810,10 @@ fn an_sse_frame_keeps_its_pre_change_bytes() {
     let before = serde_json::to_string(map).unwrap();
     // The same event, through both row doors.
     let after = serde_json::to_string(&row::to_json(row::from_json(map))).unwrap();
-    assert_eq!(after, before, "the frame bytes changed");
+    assert_eq!(after, before, "the map's bytes changed");
     assert_eq!(
         after,
         r#"{"_time":"2026-01-15T09:00:00Z","flag":true,"message":"hello","missing":null,"rate":1.5,"request_id":18446744073709551615,"service":"nginx","status":200}"#,
-        "the frame's key order or cell rendering changed"
+        "the map's key order or cell rendering changed"
     );
 }

@@ -2279,6 +2279,28 @@ pub async fn setup() -> TestServer {
     setup_with_rate_limit(RateLimitConfig::default()).await
 }
 
+/// The rows of a typed result, each as the plain JSON object a test reads
+/// fields from: column name → cell, so an absent field indexes as null.
+///
+/// Live `data` frames are one-row results and `snapshot` frames carry one,
+/// so a test decodes the frame through the shared codec first; a frame the
+/// wire type refuses then fails the test instead of reading as absent
+/// fields.
+pub fn result_rows(result: &trawl_api::value::QueryResult) -> Vec<serde_json::Value> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            result
+                .columns
+                .iter()
+                .zip(row)
+                .map(|(column, cell)| (column.name.clone(), cell.to_plain_json()))
+                .collect()
+        })
+        .collect()
+}
+
 /// A tracing capture layer, for the tests that assert on audit events.
 ///
 /// Shared because the events it exists to prove are emitted from several

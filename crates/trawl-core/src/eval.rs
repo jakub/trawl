@@ -476,6 +476,31 @@ fn pin_read(cell: &EvalValue) -> serde_json::Value {
     }
 }
 
+/// A cell as the column its pin conforms it into holds it: the reading a
+/// pinned `| where` takes on the live lane, as a cell of the pin's type.
+///
+/// The live lane reads events before any conform runs, so a field the
+/// catalog pins BIGINT arrives as whatever the sender wrote, `"404"`
+/// included, where a batch query reads the conformed column's `404`.
+/// This is the batch lanes' cell for it, through the same conform rules
+/// the live matcher compares with ([`crate::pin_match`]), so nothing is
+/// guessed: `"404"` under a BIGINT pin is `Int(404)`, `"…+05:30"` under
+/// TIMESTAMP the UTC instant the corpus holds.
+///
+/// `None` keeps the cell as sent, for a cell with no reading (the
+/// conform's round-trip guard stores NULL for `"1.5"` under BIGINT, so
+/// the value lives only in `_raw`) and for the pins with no scalar
+/// reading of their own type: VARCHAR has no conform, and a SEVERITY
+/// reading is the bare `SeverityNumber`, which would show the sender's
+/// `"error"` as `17` on a wire that carries no severity columns.
+#[must_use]
+pub fn conformed_cell(cell: &EvalValue, pin: crate::schema::CanonicalType) -> Option<EvalValue> {
+    if matches!(cell, EvalValue::Null) {
+        return None;
+    }
+    pin_match::conformed_cell(&pin_read(cell), pin)
+}
+
 /// The in-memory mirror of the emitter's pinned-comparison arm (ADR-0011,
 /// ADR-0013 ruling 9): detect a pinned-subject-vs-literal comparison and
 /// answer it through the shared comparison core. `None` falls through to
@@ -1866,6 +1891,64 @@ mod tests {
                 .expect("literal is RFC 3339")
                 .with_timezone(&chrono::Utc),
         )
+    }
+
+    /// A cell conforms to the pin's own type exactly where the pinned
+    /// `| where` reads one, and keeps its own shape everywhere else.
+    #[test]
+    fn conformed_cell_is_the_pinned_columns_cell() {
+        use crate::schema::CanonicalType;
+        let text = |s: &str| EvalValue::Str(s.to_owned());
+
+        assert_eq!(
+            conformed_cell(&text("0404"), CanonicalType::BigInt),
+            Some(EvalValue::Int(404))
+        );
+        assert_eq!(
+            conformed_cell(&EvalValue::Int(9), CanonicalType::BigInt),
+            Some(EvalValue::Int(9))
+        );
+        // The round-trip guard stores NULL for these: no reading.
+        assert_eq!(conformed_cell(&text("1.5"), CanonicalType::BigInt), None);
+        assert_eq!(conformed_cell(&text("n/a"), CanonicalType::BigInt), None);
+        assert_eq!(
+            conformed_cell(&EvalValue::UInt(u64::MAX), CanonicalType::BigInt),
+            None
+        );
+
+        assert_eq!(
+            conformed_cell(&text("200"), CanonicalType::Double),
+            Some(EvalValue::Float(200.0))
+        );
+        assert_eq!(
+            conformed_cell(&text("true"), CanonicalType::Boolean),
+            Some(EvalValue::Bool(true))
+        );
+        assert_eq!(conformed_cell(&text("TRUE"), CanonicalType::Boolean), None);
+
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
+            .unwrap()
+            .and_hms_opt(3, 30, 0)
+            .unwrap();
+        assert_eq!(
+            conformed_cell(&text("2026-01-15T09:00:00+05:30"), CanonicalType::Timestamp),
+            Some(EvalValue::Timestamp(compare::Instant::At(at)))
+        );
+        assert_eq!(
+            conformed_cell(&EvalValue::Int(1_768_448_000), CanonicalType::Timestamp),
+            None
+        );
+
+        // No scalar reading of the pin's own type.
+        assert_eq!(conformed_cell(&text("200"), CanonicalType::Varchar), None);
+        assert_eq!(
+            conformed_cell(&text("error"), CanonicalType::Severity),
+            None
+        );
+        assert_eq!(
+            conformed_cell(&EvalValue::Null, CanonicalType::BigInt),
+            None
+        );
     }
 
     // ── pinned where/let comparisons (ADR-0011) ─────────────────────

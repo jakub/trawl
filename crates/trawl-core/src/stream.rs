@@ -1739,9 +1739,14 @@ fn snapshot_timechart(
         if let Some(group_map) = buckets.get(&bucket) {
             for (key, states) in group_map {
                 let mut row = Row::new();
+                // A TIMESTAMP, as `time_bucket` answers in SQL, so the
+                // bucket compares, prints and types as the SQL lane's does.
                 let ts = chrono::DateTime::from_timestamp(bucket * span_secs as i64, 0)
-                    .map_or_else(|| bucket.to_string(), |dt| dt.to_rfc3339());
-                row.insert("_time".to_string(), EvalValue::Str(ts));
+                    .map_or_else(
+                        || EvalValue::Str(bucket.to_string()),
+                        |dt| EvalValue::Timestamp(crate::compare::Instant::At(dt.naive_utc())),
+                    );
+                row.insert("_time".to_string(), ts);
                 for (col, val) in group_by.iter().zip(key.iter()) {
                     row.insert(col.clone(), EvalValue::Str(val.clone()));
                 }

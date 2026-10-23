@@ -96,7 +96,7 @@ pub fn apply_rust_stages(
     // Apply deferred sort stages.
     let sorted = apply_sorts(processed, &sort_stages);
 
-    Ok(rows_to_result(&sorted, &result.columns))
+    Ok(rows_to_result(&sorted, &[], &result.columns))
 }
 
 /// Convert a columnar `QueryResult` into a vec of typed pipeline rows.
@@ -215,17 +215,20 @@ fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
 ///
 /// The one builder for every result a Rust-side stage produces: the batch
 /// tail behind `extract kv`, and the live lane's frames and snapshots.
-/// Discovers the column set across all rows (preserving insertion order)
-/// and fills missing keys with NULL.
+/// The columns are `columns_hint`, in its order, then every other key the
+/// rows carry, in the order they are first seen; a missing key is NULL.
+/// The hint is how an aggregation snapshot keeps its declared column
+/// order, and its columns when no row survived, since a [`Row`] keeps its
+/// keys sorted.
 ///
 /// Each column is typed from the cells it holds (ADR-0035, amended
 /// 2026-10-22): one type of cell gives that type, several give `mixed`,
 /// and list items fold the same way. A column with no non-null cell has
 /// no evidence of its own and takes the type of the same-named column in
 /// `inherited` (the input the stages ran over), else `string`.
-pub fn rows_to_result(rows: &[Row], inherited: &[Column]) -> QueryResult {
-    // Discover columns across all rows, preserving insertion order.
-    let mut col_set = IndexSet::new();
+pub fn rows_to_result(rows: &[Row], columns_hint: &[String], inherited: &[Column]) -> QueryResult {
+    // The hint first, then the rows' own keys in first-seen order.
+    let mut col_set: IndexSet<String> = columns_hint.iter().cloned().collect();
     for row in rows {
         for key in row.keys() {
             col_set.insert(key.clone());
@@ -263,6 +266,7 @@ pub fn rows_to_result(rows: &[Row], inherited: &[Column]) -> QueryResult {
 
     QueryResult { columns, rows }
 }
+
 /// Run pass-through stages on each event.
 fn apply_pass_through(
     stages: &mut [CompiledStage],
@@ -600,9 +604,17 @@ fn tail_timechart_span_follows_the_query_window() {
         out.rows[row][idx].clone()
     };
     assert_eq!(windowed.rows.len(), 1, "{:?}", windowed.rows);
+    // The bucket is a TIMESTAMP, as the SQL lane's `time_bucket` is.
     assert_eq!(
         time(&windowed, 0),
-        Value::String("2026-01-01T00:00:00+00:00".into())
+        Value::String("2026-01-01T00:00:00.000000Z".into())
+    );
+    assert!(
+        windowed
+            .columns
+            .contains(&Column::new("_time", ColumnType::Timestamp)),
+        "{:?}",
+        windowed.columns
     );
 
     // The live answer for the same stages: no window, one-minute buckets.
@@ -690,6 +702,52 @@ mod tests {
                 crate::value::Value::String(text.into())
             );
         }
+    }
+
+    /// The hint fixes the column order a sorted [`Row`] cannot, keeps a
+    /// hinted column no row carries (as `string`, for want of evidence),
+    /// and every other key follows it.
+    #[test]
+    fn the_columns_hint_leads_the_column_order() {
+        let row = |cells: &[(&str, EvalValue)]| -> Row {
+            cells
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect()
+        };
+        let hint = ["host".to_owned(), "count".to_owned(), "gone".to_owned()];
+        let result = rows_to_result(
+            &[row(&[
+                ("count", EvalValue::UInt(u64::MAX)),
+                ("host", EvalValue::Str("web-1".into())),
+                ("extra", EvalValue::Bool(true)),
+            ])],
+            &hint,
+            &[],
+        );
+        assert_eq!(
+            result.columns,
+            vec![
+                Column::new("host", ColumnType::String),
+                Column::new("count", ColumnType::Integer),
+                Column::new("gone", ColumnType::String),
+                Column::new("extra", ColumnType::Boolean),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                crate::value::Value::String("web-1".into()),
+                crate::value::Value::UInt(u64::MAX),
+                crate::value::Value::Null,
+                crate::value::Value::Boolean(true),
+            ]]
+        );
+
+        let empty = rows_to_result(&[], &hint, &[]);
+        assert_eq!(empty.columns.len(), 3);
+        assert!(empty.columns.iter().all(|c| c.ty == ColumnType::String));
+        assert!(empty.rows.is_empty());
     }
 
     #[test]

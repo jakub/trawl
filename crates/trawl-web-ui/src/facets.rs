@@ -742,17 +742,27 @@ mod tests {
         ];
         let mut ring = RingBuffer::default();
         for (time, sender, level, host, status) in events {
-            let serde_json::Value::Object(map) = serde_json::json!({
-                "_time": time,
-                "timestamp": sender,
-                "level": level,
-                "host": host,
-                "status": status,
-                "_raw": format!("{level} {host}"),
-            }) else {
-                unreachable!()
-            };
-            ring.push(map);
+            // One `data` frame per event, as the server sends it.
+            let frame = serde_json::from_value(serde_json::json!({
+                "columns": [
+                    {"name": "_raw", "type": "string"},
+                    {"name": "_time", "type": "timestamp"},
+                    {"name": "host", "type": "string"},
+                    {"name": "level", "type": "string"},
+                    {"name": "status", "type": "integer"},
+                    {"name": "timestamp", "type": "string"},
+                ],
+                "rows": [[
+                    format!("{level} {host}"),
+                    time,
+                    host,
+                    level,
+                    status.to_string(),
+                    sender,
+                ]],
+            }))
+            .expect("a valid data frame");
+            ring.push(frame);
         }
         let live = ring_to_result(&ring);
 

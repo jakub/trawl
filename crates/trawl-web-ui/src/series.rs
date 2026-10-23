@@ -161,12 +161,12 @@ impl Refusal {
 /// Parse a `_time` cell into epoch seconds, admitting exactly the two
 /// forms ADR-0038 names and nothing else.
 ///
-/// - `YYYY-MM-DD HH:MM:SS[.fff]`: the snapshot wire format. UTC wall
-///   clock with no zone, because the web UI sends `timezone: None` and
-///   the server defaults the offset to zero.
+/// - `YYYY-MM-DD HH:MM:SS[.fff]`: `DuckDB`'s cast text, a UTC wall clock
+///   with no zone.
 /// - `YYYY-MM-DDTHH:MM:SS[.fff]Z` or `…+00:00`: RFC 3339 with a zero
-///   offset, which is what the live stream's chrono `to_rfc3339()`
-///   writes (`+00:00`).
+///   offset. The result wire writes a `timestamp` cell this way
+///   (`…T00:00:00.000000Z`), batch and live alike, because the web UI
+///   sends `timezone: None` and the server defaults the offset to zero.
 ///
 /// A non-zero offset, a `T` form with no zone, a space form with one, an
 /// impossible date (`2026-02-30`), or any other text is `None`. The
@@ -754,11 +754,11 @@ mod align_series_tests {
         assert_eq!(parse_instant_secs("2026-09-01 00:00:00"), Some(T0));
         assert_eq!(parse_instant_secs("2026-09-01T00:00:00Z"), Some(T0));
         assert_eq!(parse_instant_secs("2026-09-01T00:00:00+00:00"), Some(T0));
-        // The live stream's exact spelling, chrono `to_rfc3339()`.
-        let live = chrono::DateTime::from_timestamp(T0, 0)
+        // The result wire's exact spelling, batch and live alike.
+        let wire = chrono::DateTime::from_timestamp(T0, 0)
             .unwrap()
-            .to_rfc3339();
-        assert_eq!(parse_instant_secs(&live), Some(T0), "{live}");
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        assert_eq!(parse_instant_secs(&wire), Some(T0), "{wire}");
         // The epoch itself, and a date before it.
         assert_eq!(parse_instant_secs("1970-01-01 00:00:00"), Some(0));
         assert_eq!(parse_instant_secs("1969-12-31 23:59:59"), Some(-1));
