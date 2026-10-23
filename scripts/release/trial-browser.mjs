@@ -36,11 +36,22 @@ const browser = await chromium.launch({ headless: true });
 const phases = [];
 const errors = [];
 
+// One result cell as a JavaScript value, read by its column type
+// (reference/api.md, Result columns). An `integer` cell is a decimal string
+// on the wire; the documented rows hold small counts, so Number() is exact.
+function cell(type, value) {
+  if (value === null) return null;
+  if (type === 'integer') return Number(value);
+  if (typeof type === 'object' && type.type === 'list') return value.map(item => cell(type.items, item));
+  if (type === 'mixed') return cell(value.items ? { type: 'list', items: value.items } : value.type, value.value);
+  return value;
+}
+
 // One query response as an object per row, keyed by column name.
 async function rows(response) {
   assert.equal(response.status(), 200);
   const body = await response.json();
-  return body.rows.map(values => Object.fromEntries(body.columns.map((c, i) => [c.name, values[i]])));
+  return body.rows.map(values => Object.fromEntries(body.columns.map((c, i) => [c.name, cell(c.type, values[i])])));
 }
 
 // The whole tutorial at one origin, in a context that shares nothing with
