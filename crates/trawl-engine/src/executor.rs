@@ -24,7 +24,7 @@ use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
-use crate::column_type::column_type;
+use crate::column_type::{StoredType, column_type};
 use crate::error::{DuckDbDiagnostic, EngineError, missing_column};
 use crate::scratch::ScratchLock;
 use crate::timing::{Fallback, PhaseClock, QueryPhase};
@@ -1482,19 +1482,45 @@ impl Executor {
         })
     }
 
-    /// Write an in-memory [`QueryResult`] to a Parquet file.
+    /// Write an in-memory [`QueryResult`] to a Parquet file, every column
+    /// in an exact type, and return the number of rows written.
     ///
-    /// Serializes the result as temp ndjson, then uses `DuckDB` `COPY TO`
-    /// for efficient columnar conversion with Snappy compression.
-    /// Returns the number of rows written.
+    /// Each column is stored as its [`StoredType`]: the column's type, with
+    /// an `integer` column as wide as its cells need (`BIGINT` or
+    /// `UBIGINT`) and a `timestamp` column as a UTC `TIMESTAMP`. Nothing
+    /// is inferred. The cells go to a temp ndjson file in their wire
+    /// encoding ([`QueryResult`]'s serde), under positional keys, are read
+    /// back with `read_json` as declared `VARCHAR` (or `VARCHAR` lists),
+    /// and each column is cast to its stored type in the `COPY`. A zero-row
+    /// result is no different: the empty file reads as a typed, empty
+    /// relation, and the parquet file carries its schema.
+    ///
+    /// Refused with [`EngineError::NotParquetStorable`] when the result has
+    /// no columns, a `mixed` column, or an `integer` column holding both a
+    /// negative and a value above `i64::MAX` (see [`StoredType`]). A cell that disagrees with its
+    /// column's type fails the wire encoding, and the write with it.
     pub fn write_query_result_to_parquet(
         &self,
         result: &QueryResult,
         path: &Path,
     ) -> Result<usize, EngineError> {
-        if result.rows.is_empty() {
-            return Ok(0);
+        if result.columns.is_empty() {
+            return Err(EngineError::NotParquetStorable {
+                reason: "it has no columns".to_owned(),
+            });
         }
+        let stored = result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                StoredType::of(&column.ty, result.rows.iter().map(|row| &row[index])).map_err(
+                    |why| EngineError::NotParquetStorable {
+                        reason: format!("column {:?} {why}", column.name),
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let path_str = path.to_str().ok_or_else(|| {
             EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
@@ -1502,36 +1528,40 @@ impl Executor {
             })
         })?;
 
-        // Write result as temp ndjson.
         let tmp_json = format!("{path_str}.ndjson.tmp");
-        {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp_json)?;
-            for row in &result.rows {
-                let mut map = serde_json::Map::with_capacity(result.columns.len());
-                for (col, val) in result.columns.iter().zip(row.iter()) {
-                    map.insert(col.name.clone(), val.to_plain_json());
-                }
-                serde_json::to_writer(&mut file, &map).map_err(|e| {
-                    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
-                        message: format!("failed to serialize result row: {e}"),
-                    })
-                })?;
-                file.write_all(b"\n")?;
-            }
-            file.flush()?;
-        }
-
-        // Use DuckDB to convert ndjson → parquet.
-        let safe_json = tmp_json.replace('\'', "''");
-        let safe_path = path_str.replace('\'', "''");
-        let copy_sql = format!(
-            "COPY (SELECT * FROM read_json('{safe_json}', format='newline_delimited', \
-             records=true, auto_detect=true, field_appearance_threshold=0)) \
-             TO '{safe_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
-        );
-
-        let copy_result = self.conn.execute_batch(&copy_sql);
+        let written = write_wire_ndjson(result, Path::new(&tmp_json));
+        let copy_result = written.and_then(|()| {
+            // The keys are positional (`c0`, `c1`, ...), so neither a
+            // column name nor a duplicate one reaches the `columns` struct.
+            let declared = stored
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| format!("c{index}: '{}'", ty.text_sql()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let projected = stored
+                .iter()
+                .zip(&result.columns)
+                .enumerate()
+                .map(|(index, (ty, column))| {
+                    format!(
+                        "{} AS \"{}\"",
+                        ty.cast_text(&format!("c{index}")),
+                        column.name.replace('"', "\"\"")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let safe_json = tmp_json.replace('\'', "''");
+            let safe_path = path_str.replace('\'', "''");
+            let copy_sql = format!(
+                "COPY (SELECT {projected} FROM read_json('{safe_json}', \
+                 format='newline_delimited', records=true, auto_detect=false, \
+                 columns={{{declared}}})) \
+                 TO '{safe_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+            );
+            Ok(self.conn.execute_batch(&copy_sql)?)
+        });
 
         // Always clean up the temp ndjson file.
         let _ = std::fs::remove_file(&tmp_json);
@@ -1587,6 +1617,48 @@ impl Executor {
 
         Ok(QueryResult { columns, rows })
     }
+}
+
+/// Write `result`'s rows to `path` as ndjson in the result wire's cell
+/// encoding, one object per row keyed `c0`, `c1`, ... by column position.
+///
+/// The cells are encoded by [`QueryResult`]'s own serde, so an integer is
+/// a decimal string, a non-finite float is `NaN`, `Infinity` or
+/// `-Infinity`, and a timestamp is RFC 3339 with its offset: text the
+/// writer's casts read exactly. A cell its column's type refuses fails the
+/// encoding, naming the column.
+fn write_wire_ndjson(result: &QueryResult, path: &Path) -> Result<(), EngineError> {
+    use std::io::Write as _;
+
+    let unencodable = |e: serde_json::Error| {
+        EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+            message: format!("failed to encode the result: {e}"),
+        })
+    };
+    let wire = serde_json::to_value(result).map_err(unencodable)?;
+    let rows = match wire {
+        serde_json::Value::Object(mut body) => body.remove("rows"),
+        _ => None,
+    };
+    let Some(serde_json::Value::Array(rows)) = rows else {
+        unreachable!("a QueryResult encodes as an object with a rows array");
+    };
+
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for row in rows {
+        let serde_json::Value::Array(cells) = row else {
+            unreachable!("a QueryResult row encodes as an array");
+        };
+        let record = cells
+            .into_iter()
+            .enumerate()
+            .map(|(index, cell)| (format!("c{index}"), cell))
+            .collect::<serde_json::Map<_, _>>();
+        serde_json::to_writer(&mut file, &record).map_err(unencodable)?;
+        file.write_all(b"\n")?;
+    }
+    file.flush()?;
+    Ok(())
 }
 
 /// The query lanes' tail after the SQL read: the Rust stages and the

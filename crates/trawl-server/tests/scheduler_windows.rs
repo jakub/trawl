@@ -324,7 +324,7 @@ impl Harness {
         let relative = run
             .result_path
             .as_deref()
-            .expect("a run with rows writes a parquet result");
+            .expect("a successful run writes a parquet result");
         let executor = trawl_engine::executor::Executor::new().expect("engine");
         let result = executor
             .read_parquet_to_result(&self.data_dir.join(relative), 10_000)
@@ -612,9 +612,8 @@ async fn a_thirty_interval_gap_coalesces_into_one_clamped_run() {
 }
 
 /// Ruling 13: a window that held no events is still a run. It records its
-/// bounds, it carries its (empty) result as a zstd blob because a zero-row
-/// parquet has no schema to be written from, and it is the run
-/// `latest_successful_run` returns.
+/// bounds, it carries its (empty) result as a typed empty parquet file, and
+/// it is the run `latest_successful_run` returns.
 ///
 /// The older run's file is still on disk, which is exactly the trap: before
 /// this, `run=latest` filtered on `result_path IS NOT NULL` and answered
@@ -652,17 +651,20 @@ async fn a_zero_row_run_records_its_window_and_is_the_latest_success() {
     );
     assert_eq!(quiet.window_kind, Some(WindowKind::Fixed));
     assert!(
-        quiet.result_path.is_none(),
-        "a zero-row result has no schema to write a parquet from: {quiet:?}"
+        quiet.result_path.is_some(),
+        "a zero-row result is a typed empty parquet file: {quiet:?}"
+    );
+    assert!(
+        h.run_rows(quiet).is_empty(),
+        "the file holds no rows: {quiet:?}"
     );
     assert!(
         h.schedules
             .get_run_result(quiet.id, h.key_id)
             .await
             .expect("read the run's result blob")
-            .is_some(),
-        "the empty result is persisted as a blob, so `run=latest` has \
-         something to resolve"
+            .is_none(),
+        "a run with a file keeps no blob"
     );
 
     let latest = h

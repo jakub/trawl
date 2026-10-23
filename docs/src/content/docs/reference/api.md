@@ -1763,7 +1763,7 @@ A run summary has these fields:
 | `started_at`, `finished_at` | string | `finished_at` is absent while running |
 | `duration_ms`, `row_count` | integer | Absent while running |
 | `error_message` | string | Present when `status` is `error` |
-| `result_path` | string | Parquet result path relative to the data directory. Absent for a zero-row run, whose columns are stored as a compressed JSON blob. |
+| `result_path` | string | Parquet result path relative to the data directory. A zero-row run has one. Absent when the result is stored as a compressed JSON blob: a result with no columns, a `mixed` column, an integer column that needs both negative values and values above the signed 64-bit range, or a failed Parquet write. |
 | `window_start`, `window_end` | string | The half-open interval `[start, end)` the run covered |
 | `window_truncated` | boolean | `true` when a `since_last` catch-up gap exceeded `[scheduler] max_catchup_intervals` and the start was moved forward |
 | `window_kind` | string | `since_last` or `fixed`, the mode the run was claimed under |
@@ -1811,7 +1811,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/saved/7/r
 
 Permission: `saved_query`
 
-Returns one run with its result rows. trawld reads the Parquet file when `result_path` is set and the stored blob otherwise. A zero-row run returns its columns with an empty `rows`.
+Returns one run with its result rows. trawld reads the Parquet file when `result_path` is set and the stored blob otherwise. A zero-row run returns its typed columns with an empty `rows`.
 
 **Request**
 

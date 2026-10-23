@@ -274,7 +274,7 @@ mod unavailable_run_result {
     }
 
     /// The two neighbouring representations keep their own answers: a
-    /// genuine zero-row success is still an empty typed relation, and a
+    /// genuine zero-row success is an empty typed file that is there, and a
     /// blob-only nonempty run still refuses with its own message.
     #[tokio::test(flavor = "multi_thread")]
     async fn distinct_from_empty_and_blob_only() {
@@ -290,7 +290,7 @@ mod unavailable_run_result {
         let runs = finished_runs(&client, saved_id, 1).await;
         let empty = &runs[0];
         assert_eq!(empty.row_count, Some(0), "{empty:?}");
-        assert!(empty.result_path.is_none(), "{empty:?}");
+        assert!(empty.result_path.is_some(), "{empty:?}");
 
         let counted = client
             .query_paginated(
@@ -305,7 +305,7 @@ mod unavailable_run_result {
             .get_report_run(saved_id, empty.id)
             .await
             .expect("and the endpoint serves its columns");
-        let answered = answered.result.expect("the blob carries the columns");
+        let answered = answered.result.expect("the file carries the columns");
         assert!(
             answered.rows.is_empty() && !answered.columns.is_empty(),
             "{answered:?}"

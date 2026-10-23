@@ -613,6 +613,9 @@ impl ServerError {
             Self::Engine(EngineError::ColdDataUnread) => "cold_data_unread",
             Self::Engine(EngineError::Cancelled) => "cancelled",
             Self::Engine(EngineError::Io(_)) => "io",
+            // Only the run writer raises it, and the scheduler stores the
+            // result as a blob instead; no request carries it.
+            Self::Engine(EngineError::NotParquetStorable { .. }) => "not_parquet_storable",
             Self::Store(_) => "store",
             Self::Unauthorized(_) => "unauthorized",
             Self::Forbidden(_) => "forbidden",
@@ -889,12 +892,15 @@ impl IntoResponse for ServerError {
             // swallowed during a bind (ADR-0024). One request, one answer —
             // the latch does not earn the caller a different status than the
             // interrupt it backs up. `error_class` still tells the two apart
-            // for telemetry.
+            // for telemetry. The run writer's refusal never reaches a
+            // request (the scheduler stores a blob instead); were it to,
+            // it is the server's fault, not the query's.
             Self::Engine(
                 EngineError::Database(_)
                 | EngineError::BudgetNotApplied { .. }
                 | EngineError::Io(_)
-                | EngineError::Cancelled,
+                | EngineError::Cancelled
+                | EngineError::NotParquetStorable { .. },
             ) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),

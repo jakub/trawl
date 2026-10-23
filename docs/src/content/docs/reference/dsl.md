@@ -781,10 +781,11 @@ from saved <name> [run=latest|all|<id>]
 `from saved` must be the query's first pipe stage, and the rest of the pipeline follows it. The source is a materialized report result, so trawl does not execute the saved query again. The name must resolve among the caller's saved queries.
 
 - `run=latest` never substitutes an older run when the latest has no Parquet result.
-- `run=all` adds `_run_id` and `_run_time`, the run's start time. It omits runs without a Parquet result, including zero-row runs, and resolution returns not found when no run qualifies.
+- `run=all` adds `_run_id` and `_run_time`, the run's start time. It omits runs without a Parquet result, and resolution returns not found when no run qualifies. A zero-row run has a Parquet result and is included. It contributes no rows.
 - `run=<id>` checks ownership of that run, and does not require the run to belong to the named saved query, so use an ID from that query's run list. A missing, foreign-owned or unsuccessful run has no readable result.
-- A successful empty result without Parquet becomes an empty relation with the recorded column names, so `stats count()` returns zero.
-- A successful nonempty blob-only result returns a conflict. Fetch that run through the report-result API.
+- A zero-row run reads as an empty relation with the run's typed columns, so `stats count()` returns zero.
+- A run whose source matched no file recorded no columns. It reads as an empty relation with no fields, so `stats count()` returns zero.
+- Any other run without a Parquet result returns a conflict that names the run. Such a run has a `mixed` column, an integer column that needs both negative values and values above the signed 64-bit range, or a failed Parquet write. Fetch that run through the report-result API.
 - Corrupt success metadata is an error, not an empty result.
 - The remaining pipeline starts with no pins. Report columns can be computed values.
 

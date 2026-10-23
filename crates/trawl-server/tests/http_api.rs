@@ -3426,7 +3426,7 @@ async fn wait_for_finished_runs(
 /// The old empty-result path wrote neither a parquet file nor a blob, and
 /// `run=latest` skipped runs with no file, so a report that had just gone
 /// quiet kept answering with the PREVIOUS run's rows. Nothing said the data
-/// was stale.
+/// was stale. A zero-row run now stores a typed empty parquet file.
 #[tokio::test(flavor = "multi_thread")]
 async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
     let server = setup().await;
@@ -3468,11 +3468,12 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
     assert_eq!(newest.status, "success", "{newest:?}");
     assert_eq!(newest.row_count, Some(0), "{newest:?}");
     assert!(
-        newest.result_path.is_none(),
-        "a zero-row run has no parquet to point at: {newest:?}"
+        newest.result_path.is_some(),
+        "a zero-row run stores a typed empty parquet file: {newest:?}"
     );
 
-    // The zero-row run is served with its columns, not as a null result.
+    // The zero-row run is served with its typed columns, not as a null
+    // result.
     let fetched = client
         .get_report_run(saved.id, newest.id)
         .await
@@ -3480,9 +3481,13 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
         .result
         .expect("a zero-row run still carries a result");
     assert_eq!(fetched.rows.len(), 0, "{fetched:?}");
-    assert!(
-        !fetched.columns.is_empty(),
-        "the blob keeps the column names: {fetched:?}"
+    assert_eq!(
+        fetched.columns,
+        vec![
+            trawl_api::value::Column::new("service", trawl_api::value::ColumnType::String),
+            trawl_api::value::Column::new("host", trawl_api::value::ColumnType::String),
+        ],
+        "the empty file keeps the typed columns: {fetched:?}"
     );
 
     // And it is what `run=latest` resolves. Reading the older run would

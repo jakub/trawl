@@ -3075,11 +3075,11 @@ pub async fn trigger_run(
 /// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.
 ///
 /// A run records its result EITHER as a parquet file (via `result_path`) or
-/// as a zstd JSON blob, never both. It has a blob in two cases: its result
-/// had no rows (there is no schema to write a parquet from), or the parquet
-/// write failed and the scheduler fell back. Either way the blob carries the
-/// column names, so a zero-row run answers with its columns and an empty row
-/// list rather than a null result.
+/// as a zstd JSON blob, never both. The file is typed, so a zero-row run
+/// answers with its typed columns and an empty row list rather than a null
+/// result. It has a blob when parquet cannot hold the result exactly (no
+/// columns, or a `mixed` column) or when the parquet write failed; the blob
+/// is the same typed wire result.
 ///
 /// A run that names a file answers from that file or not at all. A file that
 /// is gone is a 409 naming the run (ADR-0035); any other read failure is the

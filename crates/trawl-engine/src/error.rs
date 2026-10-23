@@ -99,6 +99,13 @@ pub enum EngineError {
     )]
     IntegerOutOfRange { column: String },
 
+    /// A result the run parquet writer cannot store exactly: it has no
+    /// columns (a parquet file holds at least one), or a `mixed` column
+    /// (parquet has no union type). The scheduler keeps such a result as
+    /// its typed blob instead (ADR-0035, amended 2026-10-22).
+    #[error("the result has no exact parquet form: {reason}")]
+    NotParquetStorable { reason: String },
+
     /// The query database refused a budget, or a clone read one back other
     /// than configured (ADR-0056). The structured-error setting
     /// (`errors_as_json`) is read back the same way, since without it no
