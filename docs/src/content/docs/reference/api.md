@@ -84,6 +84,7 @@ Every error that trawld itself produces has this body:
 | `rate_limited` | 429 | The key's per-minute bucket is empty |
 | `too_many_streams` | 429 | `max_sse_connections` reached |
 | `execution_error` | 500 | DuckDB failed for a reason other than its resource budgets, or the query was cancelled. Details are logged, never returned. |
+| `execution_error` | 400 | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. See [Result columns](#result-columns). |
 | `internal_error` | 500 | Anything else |
 | `timeout` | 504 | The query started but did not finish within `timeout_secs`. Through trawl-web, also the proxy's own 504 when trawld's response head did not arrive within `timeout_secs` plus 10 s; the message says trawld may still be running the work. Open streams and bodies in flight are never cut |
 | `timeout` | 408 | trawl-web only: the request body did not arrive whole within 30 s. The request was not sent to trawld |
@@ -177,6 +178,7 @@ These limits apply:
 - DuckDB `DECIMAL`, `INTERVAL`, `STRUCT`, `MAP`, and `UNION` values arrive as null cells in a `string` column.
 - A timestamp that a stage after `extract kv` computes is written in UTC, not in the request's `timezone`.
 - A `date` or `time` column that passes through a stage after `extract kv` is `string`.
+- A `mixed` column tags a timestamp that a stage after `extract kv` computes as `string`, on its own or as a `list` item. A column whose every cell is such a timestamp is `timestamp`.
 
 The schema routes keep DuckDB type names, such as `BIGINT` and `VARCHAR`. The lowercase `type` vocabulary is for result columns only.
 
@@ -469,6 +471,7 @@ data: {"missed": 40}
 |-------|------|------|
 | `data` | A result with one row, `{"columns": [...], "rows": [[...]]}` | Each matching event, for a pipeline with no aggregation |
 | `snapshot` | A result with `capped` beside it, `{"columns": [...], "rows": [...], "capped": [...]}` | For an aggregating pipeline, every 500 ms or every 100 matching events, whichever comes first, and only when new events arrived. `capped` is present only when the aggregation dropped input. |
+| `lagged` | `{"missed": n}` | The subscriber fell behind the event bus and `n` ingest batches were skipped. A batch holds one or more events, so the number of missed events is unknown. |
 
 Both result frames use the [result column](#result-columns) encoding. A `data` frame's columns are the event's fields in byte order of their names, so `_time` comes before `host`. Each frame carries its own columns, because events differ in their fields. `_time` and `_ingested` are `timestamp`. A field the catalog pins `BIGINT`, `DOUBLE`, `BOOLEAN`, or `TIMESTAMP` is converted to that type the way a pinned `| where` reads it, so a pinned `BIGINT` field arrives as an `integer` decimal string. Any other field is typed by its own value. In a `timechart` snapshot, the `_time` bucket is a `timestamp`.
 
@@ -479,7 +482,6 @@ A `data` frame:
 ```json
 {"columns":[{"name":"_time","type":"timestamp"},{"name":"message","type":"string"},{"name":"service","type":"string"},{"name":"status","type":"integer"}],"rows":[["2026-10-22T12:00:00.000000Z","GET /","nginx","200"]]}
 ```
-| `lagged` | `{"missed": n}` | The subscriber fell behind the event bus and `n` ingest batches were skipped. A batch holds one or more events, so the number of missed events is unknown. |
 
 Each `snapshot` replaces the whole result. A live aggregation stops taking
 input at three caps, and a snapshot's `capped` lists each cap that dropped
