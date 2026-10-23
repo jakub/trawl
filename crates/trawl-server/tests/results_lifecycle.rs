@@ -29,6 +29,7 @@ use serde_json::json;
 use trawl_api::results::{CapturedResult, ResultState};
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
+use trawl_server::pool::seam::Seam;
 use trawl_server::results::service::GoneReason;
 use trawl_server::results::sweep::{Reconciled, reconcile_at_boot, sweep};
 use trawl_server::store::results::fault::InsertFault;
@@ -494,4 +495,192 @@ async fn an_insert_with_an_unknown_outcome_leaves_its_file_to_boot() {
         }
     );
     assert!(captured::root_names(&server).is_empty());
+}
+
+/// The read a race test holds.
+#[derive(Debug, Clone, Copy)]
+enum Read {
+    Page,
+    Cell,
+}
+
+/// What expires the capture while the read is held.
+#[derive(Debug, Clone, Copy)]
+enum Expiry {
+    /// Another client reads the capture at its deadline.
+    AnotherRead,
+    /// The sweep runs at the deadline.
+    Sweep,
+}
+
+/// `read` of capture `id` as the analyst.
+async fn read(server: &TestServer, read: Read, id: &str) -> captured::Answer {
+    match read {
+        Read::Page => captured::page(server, &server.analyst_token, id, "").await,
+        Read::Cell => captured::cell(server, &server.analyst_token, id, 0, 0, "").await,
+    }
+}
+
+/// Wait, a bounded while, for `cond`.
+async fn until(what: &str, cond: impl Fn() -> bool) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+}
+
+/// A read that passed the row checks a second before the deadline is held
+/// at `seam`; the clock reaches the deadline and `expiry` marks the row
+/// expired and unlinks the file; then the read goes on. It answers what a
+/// read after the expiry answers, 410 `expired`, and leaves the row an
+/// expired tombstone, not one marked `file_missing`.
+async fn a_read_racing_the_expiry(seam: Seam, kind: Read, expiry: Expiry) {
+    let what = format!("{kind:?} held at {seam:?}, expired by {expiry:?}");
+    let server = boot(CaptureConfig::default()).await;
+    let result = events(&server).await;
+    let key_id = captured::key_id(&server, &server.analyst_token).await;
+    let due = deadline(&result);
+    server.results_clock.set(due - TimeDelta::seconds(1));
+
+    let seams = server.state.query.pool.seams();
+    let gate = seams.hold(seam);
+    let (held, ()) = tokio::join!(read(&server, kind, &result.id), async {
+        until("the read reaches the seam", || gate.arrivals() == 1).await;
+        server.results_clock.set(due);
+        match expiry {
+            Expiry::AnotherRead => {
+                let answer = read(&server, kind, &result.id).await;
+                assert_gone(
+                    &answer,
+                    GoneReason::Expired,
+                    &format!("{what}: the other read"),
+                );
+            }
+            Expiry::Sweep => {
+                let swept = sweep(&server.state.results, due).await;
+                assert_eq!((swept.expired, swept.unlinked), (1, 1), "{what}: {swept:?}");
+            }
+        }
+        assert!(
+            !file_exists(&server, &result.id),
+            "{what}: the expiry removed the file"
+        );
+        gate.release();
+    });
+    assert_gone(
+        &held,
+        GoneReason::Expired,
+        &format!("{what}: the held read"),
+    );
+    let row = server
+        .state
+        .results
+        .store
+        .get(&result.id, key_id)
+        .await
+        .unwrap()
+        .expect("the tombstone stays");
+    assert_eq!(row.state, ResultState::Expired, "{what}");
+    assert!(!row.file_missing, "{what}: an expired row is not marked");
+}
+
+/// A page whose capture another read expires while the page waits to
+/// check its file, or to open it, answers 410 `expired`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_racing_another_reads_expiry_answers_expired() {
+    for seam in [Seam::Verifying, Seam::Opening] {
+        a_read_racing_the_expiry(seam, Read::Page, Expiry::AnotherRead).await;
+    }
+}
+
+/// The same race against the sweep.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_racing_the_sweeps_expiry_answers_expired() {
+    for seam in [Seam::Verifying, Seam::Opening] {
+        a_read_racing_the_expiry(seam, Read::Page, Expiry::Sweep).await;
+    }
+}
+
+/// A cell read racing another read's expiry answers 410 `expired`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cell_racing_another_reads_expiry_answers_expired() {
+    for seam in [Seam::Verifying, Seam::Opening] {
+        a_read_racing_the_expiry(seam, Read::Cell, Expiry::AnotherRead).await;
+    }
+}
+
+/// A cell read racing the sweep's expiry answers 410 `expired`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cell_racing_the_sweeps_expiry_answers_expired() {
+    for seam in [Seam::Verifying, Seam::Opening] {
+        a_read_racing_the_expiry(seam, Read::Cell, Expiry::Sweep).await;
+    }
+}
+
+/// What happens to a live capture's file, out of band, while a read is
+/// held.
+#[derive(Debug, Clone, Copy)]
+enum Tamper {
+    /// The file is removed.
+    Remove,
+    /// The file's bytes are replaced with bytes that are not parquet.
+    Replace,
+}
+
+/// The controls for the races above: while the capture is still live, a
+/// file removed out of band during a held read answers 409
+/// `result_unavailable` and marks the row, and a file replaced answers 500
+/// `result_corrupt`, whether the read was held before its digest check or
+/// after it, when only the engine's open can notice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_lost_out_of_band_during_a_read_is_unavailable_or_corrupt() {
+    let server = boot(CaptureConfig::default()).await;
+    let key_id = captured::key_id(&server, &server.analyst_token).await;
+    for seam in [Seam::Verifying, Seam::Opening] {
+        for kind in [Read::Page, Read::Cell] {
+            for tamper in [Tamper::Remove, Tamper::Replace] {
+                let what = format!("{kind:?} held at {seam:?}, file {tamper:?}d");
+                let result = events(&server).await;
+                let path = server.state.results.root.path_of(&result.id).unwrap();
+                let seams = server.state.query.pool.seams();
+                let gate = seams.hold(seam);
+                let (held, ()) = tokio::join!(read(&server, kind, &result.id), async {
+                    until("the read reaches the seam", || gate.arrivals() == 1).await;
+                    match tamper {
+                        Tamper::Remove => std::fs::remove_file(&path).unwrap(),
+                        Tamper::Replace => std::fs::write(&path, b"not a parquet file").unwrap(),
+                    }
+                    gate.release();
+                });
+                drop(seams);
+                let row = server
+                    .state
+                    .results
+                    .store
+                    .get(&result.id, key_id)
+                    .await
+                    .unwrap()
+                    .expect("the row stays");
+                assert_eq!(row.state, ResultState::Temporary, "{what}");
+                match tamper {
+                    Tamper::Remove => {
+                        assert_refused(&held, StatusCode::CONFLICT, "result_unavailable", &what);
+                        assert!(row.file_missing, "{what}: the read marked the row");
+                    }
+                    Tamper::Replace => {
+                        assert_refused(
+                            &held,
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "result_corrupt",
+                            &what,
+                        );
+                        assert!(!row.file_missing, "{what}");
+                    }
+                }
+            }
+        }
+    }
 }

@@ -791,6 +791,13 @@ pub mod seam {
         /// has not heard. The query, export and capture lanes only; the
         /// sample lane has no such point.
         Released,
+        /// In a captured result's page or cell read, once its row says it
+        /// is readable and before its file's digest is checked. The read
+        /// runs on a detached executor, outside any slot.
+        Verifying,
+        /// In a captured result's page or cell read, once its file's
+        /// digest matched and before the engine opens the file by path.
+        Opening,
     }
 
     /// A held (or merely watched) worker seam.
@@ -1557,6 +1564,13 @@ impl ExecutorPool {
     #[must_use]
     pub fn seams(&self) -> seam::Session {
         seam::Session(Arc::clone(&self.seams))
+    }
+
+    /// The worker's side of [`Self::seams`] for work on a detached
+    /// executor, which has no slot to carry them: a captured result's read.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reach(&self, seam: seam::Seam) {
+        self.seams.reach(seam);
     }
 
     /// Attach the shared field-catalog pin cache. Builder-style, mirroring

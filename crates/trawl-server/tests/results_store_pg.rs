@@ -488,6 +488,44 @@ async fn live_ids_lists_temporary_and_kept_rows(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn mark_file_missing_flags_a_live_row_once_and_never_a_gone_one(pool: PgPool) {
+    let store = ResultsStore::new(pool.clone());
+    let live = capture(64, 7, Duration::minutes(1), 100);
+    let kept = capture(65, 7, Duration::hours(2), 100);
+    let expired = capture(66, 7, Duration::minutes(30), 100);
+    let pruned = capture(67, 9, Duration::minutes(1), 100);
+    for row in [&live, &kept, &expired, &pruned] {
+        insert(&store, row).await;
+    }
+    keep(&pool, &kept.id).await;
+    assert!(store.mark_expired(&expired.id, now()).await.unwrap());
+    assert_eq!(
+        ids(&store.prune_oldest(9, 0, u64::MAX, now()).await.unwrap()),
+        [pruned.id.as_str()]
+    );
+
+    assert!(store.mark_file_missing(&live.id).await.unwrap());
+    assert!(
+        !store.mark_file_missing(&live.id).await.unwrap(),
+        "a second call changes nothing"
+    );
+    assert!(store.mark_file_missing(&kept.id).await.unwrap());
+    // A gone row's file went after its row was marked: nothing was lost.
+    assert!(!store.mark_file_missing(&expired.id).await.unwrap());
+    assert!(!store.mark_file_missing(&pruned.id).await.unwrap());
+
+    for (row, key, missing) in [
+        (&live, 7, true),
+        (&kept, 7, true),
+        (&expired, 7, false),
+        (&pruned, 9, false),
+    ] {
+        let read = store.get(&row.id, key).await.unwrap().unwrap();
+        assert_eq!(read.file_missing, missing, "{:?}", read.state);
+    }
+}
+
+#[sqlx::test]
 async fn prune_oldest_stops_when_the_result_count_fits(pool: PgPool) {
     let store = ResultsStore::new(pool.clone());
     let rows: Vec<NewCapture> = (0..4)

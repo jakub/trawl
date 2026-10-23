@@ -479,12 +479,15 @@ impl ResultsStore {
         Ok(rows.iter().map(decode_file).collect::<Result<_, _>>()?)
     }
 
-    /// Record that the result's file is absent. Returns whether the flag
+    /// Record that a live result's file is absent: a `temporary` or `kept`
+    /// row. The server unlinks a gone row's file after marking the row, so
+    /// a gone row lost nothing and is left alone, whatever a reader that
+    /// read it live a moment earlier asks. Returns whether the flag
     /// changed; a second call returns `false`.
     pub async fn mark_file_missing(&self, id: &str) -> Result<bool, StoreError> {
         let changed = sqlx::query(
             "UPDATE captured_results SET file_missing = TRUE
-             WHERE id = $1 AND NOT file_missing",
+             WHERE id = $1 AND NOT file_missing AND state IN ('temporary', 'kept')",
         )
         .bind(id)
         .execute(&self.pool)

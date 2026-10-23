@@ -104,6 +104,21 @@
 //! then the read itself on a connection outside the executor permits.
 //! A capture with no columns has no file and answers its rows, all empty,
 //! without touching disk.
+//!
+//! A read can lose its file between those checks and the engine's open:
+//! the deadline passes, and another read, the sweep or a capture's
+//! admission expires the row and unlinks the file. The read path relies on
+//! one rule. The server unlinks a committed capture's file only after the
+//! store marked its row expired or pruned: `expire_now` marks, then
+//! unlinks, and the sweep, boot and the gate unlink only the ids the
+//! store's expiry or prune returned, or files no live row names. A gone row
+//! never lives again. So a read that finds its file missing, or whose
+//! engine fails on the file, reads the row again under the caller's key
+//! and answers from the store. A row gone by then answers 410 or 404 as
+//! above. Only a row still live lost its file out of band: it is marked
+//! `file_missing` and answers 409. For a live row whose file is there, the
+//! digest decides: a changed file answers 500 `result_corrupt`, an intact
+//! one the engine's own failure.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -1341,7 +1356,7 @@ pub async fn page(
         let returned = limit.min(row.captured_rows - offset);
         vec![Vec::new(); usize::try_from(returned).unwrap_or(usize::MAX)]
     } else {
-        let path = checked_file(results, &row).await?;
+        let path = checked_file(state, &row).await?;
         let types: Vec<ColumnType> = row.columns.iter().map(|c| c.ty.clone()).collect();
         let stored_as: Vec<FileStoredAs> = row
             .columns
@@ -1350,12 +1365,18 @@ pub async fn page(
             .collect();
         let selected = positions.clone();
         let pool = state.query.pool.clone();
-        tokio::task::spawn_blocking(move || {
+        let read = tokio::task::spawn_blocking(move || {
+            #[cfg(any(test, feature = "test-support"))]
+            pool.reach(crate::pool::seam::Seam::Opening);
             let executor = pool.detached_executor()?;
             executor.read_capture_page(&path, &types, &stored_as, &selected, offset, limit)
         })
         .await
-        .map_err(|e| ServerError::from_join("capture page read", e))??
+        .map_err(|e| ServerError::from_join("capture page read", e))?;
+        match read {
+            Ok(rows) => rows,
+            Err(error) => return Err(read_failed(state, &row, error).await),
+        }
     };
 
     let page = QueryResult {
@@ -1431,16 +1452,22 @@ pub async fn cell(
         )));
     }
 
-    let path = checked_file(results, &record).await?;
+    let path = checked_file(state, &record).await?;
     let pool = state.query.pool.clone();
     let ty = meta.ty.clone();
     let stored_as = file_stored_as(meta.stored_as);
-    let value = tokio::task::spawn_blocking(move || {
+    let read = tokio::task::spawn_blocking(move || {
+        #[cfg(any(test, feature = "test-support"))]
+        pool.reach(crate::pool::seam::Seam::Opening);
         let executor = pool.detached_executor()?;
         executor.read_capture_cell(&path, &ty, stored_as, row, column)
     })
     .await
-    .map_err(|e| ServerError::from_join("capture cell read", e))??
+    .map_err(|e| ServerError::from_join("capture cell read", e))?;
+    let value = match read {
+        Ok(value) => value,
+        Err(error) => return Err(read_failed(state, &record, error).await),
+    }
     .ok_or_else(|| {
         ServerError::Internal("a captured result's file holds fewer rows than its record".into())
     })?;
@@ -1524,33 +1551,8 @@ async fn readable(
         .get(id, verified.id)
         .await?
         .ok_or_else(not_found)?;
-    let now = results.clock.now();
-    let gone = match row.state {
-        ResultState::Pruned => Some((GoneReason::Pruned, row.gone_at)),
-        ResultState::Expired => Some((GoneReason::Expired, row.gone_at)),
-        ResultState::Temporary => match row.expires_at {
-            Some(at) if at <= now => {
-                expire_now(results, &row, now).await;
-                // The tombstone clock starts at the deadline, not now.
-                Some((GoneReason::Expired, Some(at)))
-            }
-            _ => None,
-        },
-        ResultState::Kept => None,
-    };
-    if let Some((reason, gone_at)) = gone {
-        let tombstone = i64::try_from(results.capture.tombstone_secs)
-            .ok()
-            .and_then(TimeDelta::try_seconds)
-            .unwrap_or(TimeDelta::MAX);
-        let past = gone_at
-            .and_then(|at| at.checked_add_signed(tombstone))
-            .is_some_and(|end| end <= now);
-        return Err(if past {
-            not_found()
-        } else {
-            ServerError::ResultGone { reason }
-        });
+    if let Some(refusal) = gone(results, &row).await {
+        return Err(refusal);
     }
     if row.file_missing {
         return Err(ServerError::ResultUnavailable);
@@ -1562,6 +1564,52 @@ async fn readable(
         )));
     }
     Ok(row)
+}
+
+/// What a read of `row` answers when the row alone says the capture can no
+/// longer be read: 410 `result_gone` for a pruned or expired row, or a
+/// temporary one past its deadline, which is expired on the spot; 404 once
+/// its tombstone is past `tombstone_secs`. `None` for a live row.
+async fn gone(results: &ResultsState, row: &CaptureRow) -> Option<ServerError> {
+    let now = results.clock.now();
+    let (reason, gone_at) = match row.state {
+        ResultState::Pruned => (GoneReason::Pruned, row.gone_at),
+        ResultState::Expired => (GoneReason::Expired, row.gone_at),
+        ResultState::Temporary => match row.expires_at {
+            Some(at) if at <= now => {
+                expire_now(results, row, now).await;
+                // The tombstone clock starts at the deadline, not now.
+                (GoneReason::Expired, Some(at))
+            }
+            _ => return None,
+        },
+        ResultState::Kept => return None,
+    };
+    let tombstone = i64::try_from(results.capture.tombstone_secs)
+        .ok()
+        .and_then(TimeDelta::try_seconds)
+        .unwrap_or(TimeDelta::MAX);
+    let past = gone_at
+        .and_then(|at| at.checked_add_signed(tombstone))
+        .is_some_and(|end| end <= now);
+    Some(if past {
+        not_found()
+    } else {
+        ServerError::ResultGone { reason }
+    })
+}
+
+/// Whether `row` is still live as the store holds it now: `Ok` when it is,
+/// else what a read of it answers now ([`gone`]; 404 for a row the sweep
+/// has since deleted). Read under the same key, so the answer is the
+/// caller's own.
+async fn still_live(results: &ResultsState, row: &CaptureRow) -> Result<(), ServerError> {
+    let current = results
+        .store
+        .get(&row.id, row.key_id)
+        .await?
+        .ok_or_else(not_found)?;
+    gone(results, &current).await.map_or(Ok(()), Err)
 }
 
 /// A temporary capture a read found past its deadline: mark it expired and
@@ -1597,46 +1645,93 @@ async fn expire_now(results: &ResultsState, row: &CaptureRow, now: DateTime<Utc>
 }
 
 /// The path of `row`'s file once its digest matches: 409 when the file is
-/// gone, which marks the row, and 500 `result_corrupt` when it differs.
+/// gone, which marks the row, and 500 `result_corrupt` when it differs. A
+/// file the server removed because the capture expired or was pruned meanwhile
+/// answers what a read of the capture answers now ([`missing_file`]).
 async fn checked_file(
-    results: &ResultsState,
+    state: &AppState,
     row: &CaptureRow,
 ) -> Result<std::path::PathBuf, ServerError> {
+    let path = state
+        .results
+        .root
+        .path_of(&row.id)
+        .map_err(EngineError::Io)?;
+    match verify(state, row).await? {
+        Verified::Ok => Ok(path),
+        Verified::Missing => Err(missing_file(&state.results, row).await),
+        Verified::Mismatch => Err(corrupt(row)),
+    }
+}
+
+/// `row`'s file checked against its recorded digest, on the blocking pool.
+async fn verify(state: &AppState, row: &CaptureRow) -> Result<Verified, ServerError> {
     let digest = row.digest.ok_or_else(|| {
         ServerError::Internal("a captured result with columns has no digest".into())
     })?;
-    let root = Arc::clone(&results.root);
+    let root = Arc::clone(&state.results.root);
     let id = row.id.clone();
-    let (verified, path) = tokio::task::spawn_blocking(move || {
-        let verified = root.verify(&id, &digest)?;
-        Ok::<_, std::io::Error>((verified, root.path_of(&id)?))
+    #[cfg(any(test, feature = "test-support"))]
+    let pool = state.query.pool.clone();
+    Ok(tokio::task::spawn_blocking(move || {
+        #[cfg(any(test, feature = "test-support"))]
+        pool.reach(crate::pool::seam::Seam::Verifying);
+        root.verify(&id, &digest)
     })
     .await
     .map_err(|e| ServerError::from_join("capture digest check", e))?
-    .map_err(EngineError::Io)?;
-    match verified {
-        Verified::Ok => Ok(path),
-        Verified::Missing => {
-            if let Err(error) = results.store.mark_file_missing(&row.id).await {
-                tracing::warn!(
-                    event_type = "results_mark_missing_failed",
-                    error = %error,
-                    "could not mark a capture whose file is missing"
-                );
-            }
-            Err(ServerError::ResultUnavailable)
-        }
-        Verified::Mismatch => {
-            // The id lets an operator find the file; the request's own
-            // failure event carries the route and the request id.
-            tracing::error!(
-                event_type = "result_corrupt",
-                result_id = %row.id,
-                "a captured result's file does not match its recorded digest"
-            );
-            Err(ServerError::ResultCorrupt)
-        }
+    .map_err(EngineError::Io)?)
+}
+
+/// What a read answers when `row`'s file was not there.
+///
+/// The server unlinks a capture's file only after the store marked its row
+/// gone (module docs, "Reads"), and a gone row never lives again. So a row
+/// read back as gone answers as gone, and only a row still live after the
+/// file was found missing lost it out of band: that row is marked and the
+/// read answers 409.
+async fn missing_file(results: &ResultsState, row: &CaptureRow) -> ServerError {
+    if let Err(refusal) = still_live(results, row).await {
+        return refusal;
     }
+    if let Err(error) = results.store.mark_file_missing(&row.id).await {
+        tracing::warn!(
+            event_type = "results_mark_missing_failed",
+            error = %error,
+            "could not mark a capture whose file is missing"
+        );
+    }
+    ServerError::ResultUnavailable
+}
+
+/// What a read answers when the engine could not read `row`'s file, which
+/// passed its digest check: the store and the file say why, never the
+/// engine's text. A row gone since answers as gone; for a live row the file
+/// is checked again, and a missing or changed file answers as
+/// [`checked_file`] does. A file still intact leaves the engine's own
+/// failure.
+async fn read_failed(state: &AppState, row: &CaptureRow, error: EngineError) -> ServerError {
+    if let Err(refusal) = still_live(&state.results, row).await {
+        return refusal;
+    }
+    match verify(state, row).await {
+        Ok(Verified::Ok) => ServerError::Engine(error),
+        Ok(Verified::Missing) => missing_file(&state.results, row).await,
+        Ok(Verified::Mismatch) => corrupt(row),
+        Err(refusal) => refusal,
+    }
+}
+
+/// 500 `result_corrupt` for `row`, whose file does not match its digest.
+fn corrupt(row: &CaptureRow) -> ServerError {
+    // The id lets an operator find the file; the request's own failure
+    // event carries the route and the request id.
+    tracing::error!(
+        event_type = "result_corrupt",
+        result_id = %row.id,
+        "a captured result's file does not match its recorded digest"
+    );
+    ServerError::ResultCorrupt
 }
 
 /// 403 without the trawl `query` permission.
