@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The query scratch directory (ADR-0056).
+//! The query scratch directory (ADR-0056), and the hold every directory
+//! trawld keeps apart from its storage roots shares with it.
 //!
 //! `[server] query_scratch_dir` holds what trawld writes while it answers a
 //! query: the query database's private spill directory, and beside it the
@@ -16,18 +17,24 @@
 //! names without `O_EXCL`, so a directory another user could enter would let
 //! them plant or read one.
 //!
-//! [`ScratchLock::open_apart_from`] makes the scratch directory itself
-//! trawld's for the life of the process. It makes the directory 0700 if it
-//! is missing, holds its final component no-follow as ADR-0052 holds a
-//! storage root, and refuses the held directory if, by device and inode, it
-//! is one of trawld's storage roots or sits inside or above one. It then
-//! takes an exclusive `flock` on that handle, and only then clears what an
-//! earlier trawld left behind, such as after a SIGKILL or an eviction. The
-//! clearing reads the whole tree before it removes anything: one entry it
-//! does not recognize refuses the start with nothing deleted. It never
-//! follows a link and never crosses a mount. The `PostgreSQL` sole-writer
-//! lock does not authorize it: that lock guards one app-state database, not
-//! this directory, and a lost lock can go unseen for seconds.
+//! [`hold_apart_from`] makes a directory trawld's for the life of the
+//! process. It makes the directory 0700 if it is missing, holds its final
+//! component no-follow as ADR-0052 holds a storage root, and refuses the
+//! held directory if, by device and inode, it is one of trawld's storage
+//! roots or sits inside or above one. It then takes an exclusive `flock` on
+//! that handle. The query scratch directory and the results root
+//! (ADR-0057) are both held this way; a [`RootRole`] says which one a
+//! refusal names.
+//!
+//! [`ScratchLock::open_apart_from`] holds the scratch directory, and only
+//! then clears what an earlier trawld left behind, such as after a SIGKILL
+//! or an eviction. The clearing reads the whole tree before it removes
+//! anything: one entry it does not recognize refuses the start with nothing
+//! deleted. It never follows a link and never crosses a mount. The
+//! `PostgreSQL` sole-writer lock does not authorize it: that lock guards one
+//! app-state database, not this directory, and a lost lock can go unseen
+//! for seconds. The results root is never cleared: what it holds outlives
+//! a restart.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -57,8 +64,33 @@ const COPY_TMP_PREFIX: &str = "tmp_";
 const RANDOM_LEN: usize = 6;
 
 /// The setting an operator changes to move query spill, named in refusals
-/// of a spill directory made in the scratch directory.
+/// of the scratch directory and of a spill directory made in it.
 pub(crate) const SCRATCH_SETTING: &str = "[server] query_scratch_dir";
+
+/// Which directory [`hold_apart_from`] holds, as its refusals name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootRole {
+    /// What the directory is, as a refusal names it: `query scratch
+    /// directory`.
+    pub noun: &'static str,
+    /// The setting an operator changes to move it: `[server]
+    /// query_scratch_dir`.
+    pub setting: &'static str,
+}
+
+impl RootRole {
+    /// The query scratch directory (ADR-0056).
+    pub const QUERY_SCRATCH: Self = Self {
+        noun: "query scratch directory",
+        setting: SCRATCH_SETTING,
+    };
+
+    /// The results root, where captured results live (ADR-0057).
+    pub const RESULTS: Self = Self {
+        noun: "results root",
+        setting: "[server] results_dir",
+    };
+}
 
 /// The variable an operator changes to move spill of a database opened
 /// without a scratch directory ([`crate::executor::Executor::new`]).
@@ -282,9 +314,11 @@ pub(crate) fn check_private(path: &Path, euid: u32, setting: &str) -> std::io::R
     ))
 }
 
-/// A directory whose entries trawld names and removes on its own, which the
-/// scratch directory must not be, sit inside or sit above (ADR-0056): the
-/// data root, the WAL directory and the two repin staging roots.
+/// A directory whose entries trawld names and removes on its own, which a
+/// held directory ([`hold_apart_from`]) must not be, sit inside or sit
+/// above: for the scratch directory (ADR-0056) the data root, the WAL
+/// directory and the two repin staging roots, and for the results root
+/// (ADR-0057) those and the scratch directory.
 #[derive(Debug, Clone)]
 pub struct OwnedRoot {
     /// What the root is, with the setting it comes from, such as `the data
@@ -300,7 +334,7 @@ pub struct OwnedRoot {
     pub path: PathBuf,
 }
 
-/// How the scratch directory overlaps an [`OwnedRoot`].
+/// How a held directory overlaps an [`OwnedRoot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlap {
     /// It is the root.
@@ -321,20 +355,25 @@ impl std::fmt::Display for Overlap {
     }
 }
 
-/// Why [`ScratchLock::open`] refused the scratch directory. Every message
-/// names `[server] query_scratch_dir`, the setting the operator changes.
+/// Why [`hold_apart_from`] or [`ScratchLock::open`] refused a directory.
+/// Every message names the directory by its [`RootRole`], with the setting
+/// the operator changes.
 #[derive(Debug, thiserror::Error)]
 pub enum ScratchError {
     /// The directory overlaps one of trawld's roots as the filesystem
     /// resolves both. A symlink, `..` or a relative path can hide that from
     /// the configured spellings.
     #[error(
-        "the query scratch directory {} {overlap} {what} {}, as the filesystem resolves them; \
-         point {SCRATCH_SETTING} at a directory of its own",
+        "the {} {} {overlap} {what} {}, as the filesystem resolves them; point {} at a \
+         directory of its own",
+        .role.noun,
         .path.display(),
-        .root.display()
+        .root.display(),
+        .role.setting
     )]
     Overlap {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
         /// How it overlaps the root.
@@ -347,20 +386,27 @@ pub enum ScratchError {
     /// The path does not end in a directory name: it is empty, `/`, or ends
     /// in `..`.
     #[error(
-        "the query scratch directory {} does not end in a directory name; point {SCRATCH_SETTING} \
-         at a directory of its own",
-        .path.display()
+        "the {} {} does not end in a directory name; point {} at a directory of its own",
+        .role.noun,
+        .path.display(),
+        .role.setting
     )]
     BadPath {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
     },
     /// A filesystem call failed.
     #[error(
-        "cannot {action} the query scratch directory {}: {source}; check {SCRATCH_SETTING}",
-        .path.display()
+        "cannot {action} the {} {}: {source}; check {}",
+        .role.noun,
+        .path.display(),
+        .role.setting
     )]
     Io {
+        /// Which directory was refused.
+        role: RootRole,
         /// What trawld was doing, as a verb phrase.
         action: &'static str,
         /// The path it was doing it to.
@@ -372,42 +418,56 @@ pub enum ScratchError {
     /// The directory cannot be written: a query-only node whose data root is
     /// mounted read-only keeps the default scratch directory beside it.
     #[error(
-        "the query scratch directory {} is on a read-only filesystem; point {SCRATCH_SETTING} at \
-         a writable directory",
-        .path.display()
+        "the {} {} is on a read-only filesystem; point {} at a writable directory",
+        .role.noun,
+        .path.display(),
+        .role.setting
     )]
     ReadOnly {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
     },
     /// The final component is a symbolic link, which trawld does not follow.
     #[error(
-        "the query scratch directory {} is a symbolic link, which trawld does not follow; point \
-         {SCRATCH_SETTING} at the directory itself",
-        .path.display()
+        "the {} {} is a symbolic link, which trawld does not follow; point {} at the directory \
+         itself",
+        .role.noun,
+        .path.display(),
+        .role.setting
     )]
     Symlink {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
     },
     /// Something other than a directory is at the path.
     #[error(
-        "the query scratch directory {} is not a directory; move it aside or point \
-         {SCRATCH_SETTING} at a directory",
-        .path.display()
+        "the {} {} is not a directory; move it aside or point {} at a directory",
+        .role.noun,
+        .path.display(),
+        .role.setting
     )]
     NotDirectory {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
     },
     /// Another user owns the directory. trawld does not take over a
     /// directory it was not given, even when it runs as root.
     #[error(
-        "the query scratch directory {} is owned by uid {owner}, not uid {euid}, the user trawld \
-         runs as; point {SCRATCH_SETTING} at a directory uid {euid} owns",
-        .path.display()
+        "the {} {} is owned by uid {owner}, not uid {euid}, the user trawld runs as; point {} at \
+         a directory uid {euid} owns",
+        .role.noun,
+        .path.display(),
+        .role.setting
     )]
     ForeignOwner {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
         /// The directory's owner.
@@ -418,37 +478,49 @@ pub enum ScratchError {
     /// A group or other bit survived the change that removes them, as on a
     /// filesystem with fixed modes.
     #[error(
-        "the query scratch directory {} keeps mode {mode:04o} after trawld removed its group and \
-         other bits, so other users could read query data; point {SCRATCH_SETTING} at a \
-         directory on a filesystem that keeps Unix modes",
-        .path.display()
+        "the {} {} keeps mode {mode:04o} after trawld removed its group and other bits, so \
+         other users could read query data; point {} at a directory on a filesystem that keeps \
+         Unix modes",
+        .role.noun,
+        .path.display(),
+        .role.setting
     )]
     NotPrivate {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
         /// The mode read back after the change.
         mode: u32,
     },
-    /// Another process holds the lock.
+    /// Another process holds the lock, or another open in this one does.
     #[error(
-        "the query scratch directory {} is locked by another trawld; stop that trawld, or point \
-         this one's {SCRATCH_SETTING} at a directory of its own",
-        .path.display()
+        "the {} {} is locked by another trawld; stop that trawld, or point this one's {} at a \
+         directory of its own",
+        .role.noun,
+        .path.display(),
+        .role.setting
     )]
     Locked {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
     },
     /// An entry trawld does not make, or one it cannot remove safely. The
-    /// whole tree is read before anything is removed, so nothing was.
+    /// whole tree is read before anything is removed, so nothing was. Only
+    /// the scratch directory is cleared, so only it refuses this way.
     #[error(
-        "the query scratch directory {} holds {}, which {reason}; trawld removes only the entries \
-         it makes and has removed nothing. Move the entry out, or point {SCRATCH_SETTING} at a \
-         directory of its own",
+        "the {} {} holds {}, which {reason}; trawld removes only the entries it makes and has \
+         removed nothing. Move the entry out, or point {} at a directory of its own",
+        .role.noun,
         .path.display(),
-        .entry.display()
+        .entry.display(),
+        .role.setting
     )]
     ForeignEntry {
+        /// Which directory was refused.
+        role: RootRole,
         /// The configured path.
         path: PathBuf,
         /// The entry.
@@ -470,19 +542,91 @@ pub struct Reclaimed {
     pub exports: usize,
 }
 
-/// The query scratch directory, locked for this process and cleared of
-/// what an earlier trawld left behind.
+/// A directory held for this process by [`hold_apart_from`]: made, checked
+/// owner-only and locked, its contents left as they were.
 ///
 /// The lock is an exclusive `flock` on the directory's own no-follow
 /// handle, so it lives exactly as long as this value: dropping it closes
 /// the handle and frees the lock, and so does the end of the process,
 /// however it ends. `flock` belongs to the open file description, so a
-/// second open in the same process is refused like one in another process.
+/// second hold in the same process is refused like one in another process.
+#[derive(Debug)]
+pub struct HeldRoot {
+    path: PathBuf,
+    /// The handle the lock is held on.
+    handle: std::fs::File,
+}
+
+impl HeldRoot {
+    /// The held directory's path, as configured, with a trailing `/` or `.`
+    /// dropped.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The no-follow handle the lock is held on. Reach the directory's
+    /// entries through it, by `openat`, `renameat` and `unlinkat`, and
+    /// `fsync` it after a rename, so no link in the configured path can
+    /// redirect a call to another directory. Unlocking it gives the
+    /// directory up to any other process.
+    #[must_use]
+    pub fn dir(&self) -> &std::fs::File {
+        &self.handle
+    }
+}
+
+/// Make, check and lock the directory at `path` for a trawld running as
+/// `euid`, which must not be, sit inside or sit above any of `roots`.
+/// Nothing in it is removed: the scratch directory's clearing is
+/// [`ScratchLock::open_apart_from`]'s own.
+///
+/// A missing directory is made 0700, below parents made as needed, as the
+/// epoch gate makes the data root, unless the directory that would hold it
+/// is or sits inside a root. Its final component is then opened no-follow,
+/// and everything after is judged and done through that handle. It refuses
+/// a symlink, a non-directory, a directory that overlaps a root, a
+/// directory another user owns, and one on a read-only filesystem. A group
+/// or other bit is removed through the handle, as ADR-0052 closes a root,
+/// and refused if it survives. Then it takes the lock, refusing if another
+/// process holds it. Every refusal names the directory by `role`.
+///
+/// The overlap is judged by device and inode, never by spelling: the
+/// handle's own directory and each one above it, reached by opening `..`,
+/// against each root and each directory above it, or, for a root that does
+/// not exist yet, above where it would be made. A symlink, a `..` and a
+/// relative path in either path all resolve to the same pairs. Judging the
+/// handle makes the answer hold for the directory that is locked, whatever
+/// its path names by then.
+pub fn hold_apart_from(
+    path: &Path,
+    roots: &[OwnedRoot],
+    euid: u32,
+    role: RootRole,
+) -> Result<HeldRoot, ScratchError> {
+    #[cfg(unix)]
+    return lock::hold_apart_from(path, roots, euid, role);
+    #[cfg(not(unix))]
+    {
+        let _ = (roots, euid);
+        Err(ScratchError::Io {
+            role,
+            action: "lock",
+            path: path.to_owned(),
+            source: std::io::ErrorKind::Unsupported.into(),
+        })
+    }
+}
+
+/// The query scratch directory, locked for this process and cleared of
+/// what an earlier trawld left behind.
+///
+/// The lock is [`HeldRoot`]'s: it lives exactly as long as this value.
 #[derive(Debug)]
 pub struct ScratchLock {
     scratch: QueryScratch,
-    /// The handle the lock is held on.
-    _handle: std::fs::File,
+    /// The held directory, whose handle carries the lock.
+    _held: HeldRoot,
     reclaimed: Reclaimed,
 }
 
@@ -494,32 +638,18 @@ impl ScratchLock {
         Self::open_apart_from(path, &[])
     }
 
-    /// Make, check, lock and clear the scratch directory at `path`, which
-    /// must not be, sit inside or sit above any of `roots`.
+    /// Hold the scratch directory at `path` apart from `roots`, as
+    /// [`hold_apart_from`] holds a directory, then clear it (see the module
+    /// documentation). Refusals name [`RootRole::QUERY_SCRATCH`].
     ///
-    /// A missing directory is made 0700, below parents made as needed, as
-    /// the epoch gate makes the data root, unless the directory that would
-    /// hold it is or sits inside a root. Its final component is then opened
-    /// no-follow, and everything after is judged and done through that
-    /// handle. It refuses a symlink, a non-directory, a directory that
-    /// overlaps a root, a directory another user owns, and one on a
-    /// read-only filesystem. A group or other bit is removed through the
-    /// handle, as ADR-0052 closes a root, and refused if it survives. Then
-    /// it takes the lock, refusing if another process holds it, and clears
-    /// the directory (see the module documentation).
-    ///
-    /// The overlap is judged by device and inode, never by spelling: the
-    /// handle's own directory and each one above it, reached by opening
-    /// `..`, against each root and each directory above it, or, for a root
-    /// that does not exist yet, above where it would be made. A symlink, a
-    /// `..` and a relative path in either path all resolve to the same
-    /// pairs. Judging the handle makes the answer hold for the directory
-    /// that is locked and cleared, whatever its path names by then.
+    /// The lock comes before the clearing, so a directory another trawld
+    /// holds, for any role, is refused with nothing removed.
     pub fn open_apart_from(path: &Path, roots: &[OwnedRoot]) -> Result<Self, ScratchError> {
         #[cfg(unix)]
         return Self::open_as(path, roots, rustix::process::geteuid().as_raw());
         #[cfg(not(unix))]
         return Err(ScratchError::Io {
+            role: RootRole::QUERY_SCRATCH,
             action: "lock",
             path: path.to_owned(),
             source: std::io::ErrorKind::Unsupported.into(),
@@ -529,69 +659,12 @@ impl ScratchLock {
     /// [`Self::open_apart_from`] for a trawld running as `euid`.
     #[cfg(unix)]
     fn open_as(path: &Path, roots: &[OwnedRoot], euid: u32) -> Result<Self, ScratchError> {
-        use std::fs::TryLockError;
-        use std::os::fd::AsFd as _;
-
-        use rustix::fs::{Mode, StatVfsMountFlags};
-
-        let path = lock::final_name(path).ok_or_else(|| ScratchError::BadPath {
-            path: path.to_owned(),
-        })?;
-        lock::refuse_making_inside(&path, roots)?;
-        lock::make(&path)?;
-        let handle = lock::hold(&path)?;
-        lock::refuse_overlap(&path, &handle, roots)?;
-        let io = |action| {
-            let path = path.clone();
-            move |source: std::io::Error| ScratchError::Io {
-                action,
-                path,
-                source,
-            }
-        };
-
-        let stat = lock::stat_handle(handle.as_fd()).map_err(io("inspect"))?;
-        if stat.owner != euid {
-            return Err(ScratchError::ForeignOwner {
-                path,
-                owner: stat.owner,
-                euid,
-            });
-        }
-        let read_only = rustix::fs::fstatvfs(&handle)
-            .map_err(|e| io("inspect")(e.into()))?
-            .f_flag
-            .contains(StatVfsMountFlags::RDONLY);
-        if read_only {
-            return Err(ScratchError::ReadOnly { path });
-        }
-        if stat.mode & lock::GROUP_OTHER != 0 {
-            #[allow(
-                clippy::unnecessary_cast,
-                clippy::cast_possible_truncation,
-                reason = "RawMode is u32 on Linux and u16 on macOS; `mode` holds only the 0o7777 bits"
-            )]
-            let private = (stat.mode & !lock::GROUP_OTHER) as rustix::fs::RawMode;
-            rustix::fs::fchmod(&handle, Mode::from_raw_mode(private))
-                .map_err(|e| io("remove the group and other bits of")(e.into()))?;
-            let mode = lock::stat_handle(handle.as_fd())
-                .map_err(io("inspect"))?
-                .mode;
-            if mode & lock::GROUP_OTHER != 0 {
-                return Err(ScratchError::NotPrivate { path, mode });
-            }
-        }
-
-        match handle.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(ScratchError::Locked { path }),
-            Err(TryLockError::Error(e)) => return Err(io("lock")(e)),
-        }
-        let stale = lock::preflight(&path, &handle, euid)?;
-        let reclaimed = lock::remove(&path, &handle, stale)?;
+        let held = lock::hold_apart_from(path, roots, euid, RootRole::QUERY_SCRATCH)?;
+        let stale = lock::preflight(held.path(), held.dir(), euid)?;
+        let reclaimed = lock::remove(held.path(), held.dir(), stale)?;
         Ok(Self {
-            scratch: QueryScratch::new(path),
-            _handle: handle,
+            scratch: QueryScratch::new(held.path()),
+            _held: held,
             reclaimed,
         })
     }
@@ -609,9 +682,9 @@ impl ScratchLock {
     }
 }
 
-/// The filesystem work behind [`ScratchLock::open`]. Everything below the
-/// scratch directory is reached by descriptor, one `openat` or `unlinkat`
-/// at a time, never by a path a link could redirect.
+/// The filesystem work behind [`hold_apart_from`] and [`ScratchLock::open`].
+/// Everything below the held directory is reached by descriptor, one
+/// `openat` or `unlinkat` at a time, never by a path a link could redirect.
 #[cfg(unix)]
 mod lock {
     use std::ffi::{CStr, CString, OsStr};
@@ -625,12 +698,15 @@ mod lock {
     use rustix::io::Errno;
 
     use super::{
-        Overlap, OwnedRoot, Reclaimed, ScratchError, is_export_file_name, is_snapshot_file_name,
-        is_spill_dir_name, is_spill_file_name,
+        HeldRoot, Overlap, OwnedRoot, Reclaimed, RootRole, ScratchError, is_export_file_name,
+        is_snapshot_file_name, is_spill_dir_name, is_spill_file_name,
     };
 
+    /// The role the clearing names: only the scratch directory is cleared.
+    const SCRATCH: RootRole = RootRole::QUERY_SCRATCH;
+
     /// The group and other permission bits.
-    pub(super) const GROUP_OTHER: u32 = 0o077;
+    const GROUP_OTHER: u32 = 0o077;
 
     /// Flags for a no-follow directory open.
     const DIR_FLAGS: OFlags = OFlags::RDONLY
@@ -647,16 +723,86 @@ mod lock {
         matches!(components.last(), Some(Component::Normal(_))).then(|| components.iter().collect())
     }
 
+    /// [`super::hold_apart_from`].
+    pub(super) fn hold_apart_from(
+        path: &Path,
+        roots: &[OwnedRoot],
+        euid: u32,
+        role: RootRole,
+    ) -> Result<HeldRoot, ScratchError> {
+        use std::fs::TryLockError;
+
+        use rustix::fs::StatVfsMountFlags;
+
+        let path = final_name(path).ok_or_else(|| ScratchError::BadPath {
+            role,
+            path: path.to_owned(),
+        })?;
+        refuse_making_inside(&path, roots, role)?;
+        make(&path, role)?;
+        let handle = hold(&path, role)?;
+        refuse_overlap(&path, &handle, roots, role)?;
+        let io = |action| {
+            let path = path.clone();
+            move |source: io::Error| ScratchError::Io {
+                role,
+                action,
+                path,
+                source,
+            }
+        };
+
+        let stat = stat_handle(handle.as_fd()).map_err(io("inspect"))?;
+        if stat.owner != euid {
+            return Err(ScratchError::ForeignOwner {
+                role,
+                path,
+                owner: stat.owner,
+                euid,
+            });
+        }
+        let read_only = rustix::fs::fstatvfs(&handle)
+            .map_err(|e| io("inspect")(e.into()))?
+            .f_flag
+            .contains(StatVfsMountFlags::RDONLY);
+        if read_only {
+            return Err(ScratchError::ReadOnly { role, path });
+        }
+        if stat.mode & GROUP_OTHER != 0 {
+            #[allow(
+                clippy::unnecessary_cast,
+                clippy::cast_possible_truncation,
+                reason = "RawMode is u32 on Linux and u16 on macOS; `mode` holds only the 0o7777 bits"
+            )]
+            let private = (stat.mode & !GROUP_OTHER) as rustix::fs::RawMode;
+            rustix::fs::fchmod(&handle, Mode::from_raw_mode(private))
+                .map_err(|e| io("remove the group and other bits of")(e.into()))?;
+            let mode = stat_handle(handle.as_fd()).map_err(io("inspect"))?.mode;
+            if mode & GROUP_OTHER != 0 {
+                return Err(ScratchError::NotPrivate { role, path, mode });
+            }
+        }
+
+        match handle.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(ScratchError::Locked { role, path }),
+            Err(TryLockError::Error(e)) => return Err(io("lock")(e)),
+        }
+        Ok(HeldRoot { path, handle })
+    }
+
     /// Make the directory at `path` 0700 if nothing is there, and its
     /// parents as needed. Something already there is left for [`hold`] to
     /// judge.
-    pub(super) fn make(path: &Path) -> Result<(), ScratchError> {
+    fn make(path: &Path, role: RootRole) -> Result<(), ScratchError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let refuse = |action, source: io::Error| match source.kind() {
             io::ErrorKind::ReadOnlyFilesystem => ScratchError::ReadOnly {
+                role,
                 path: path.to_owned(),
             },
             _ => ScratchError::Io {
+                role,
                 action,
                 path: path.to_owned(),
                 source,
@@ -673,7 +819,7 @@ mod lock {
     }
 
     /// Open the directory at `path` without following a final symlink.
-    pub(super) fn hold(path: &Path) -> Result<File, ScratchError> {
+    pub(super) fn hold(path: &Path, role: RootRole) -> Result<File, ScratchError> {
         match rustix::fs::open(path, DIR_FLAGS, Mode::empty()) {
             Ok(fd) => Ok(File::from(fd)),
             // Linux answers a symlink with ENOTDIR here, not ELOOP: the open
@@ -681,15 +827,18 @@ mod lock {
             Err(Errno::LOOP | Errno::NOTDIR) => Err(
                 if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_symlink()) {
                     ScratchError::Symlink {
+                        role,
                         path: path.to_owned(),
                     }
                 } else {
                     ScratchError::NotDirectory {
+                        role,
                         path: path.to_owned(),
                     }
                 },
             ),
             Err(e) => Err(ScratchError::Io {
+                role,
                 action: "open",
                 path: path.to_owned(),
                 source: e.into(),
@@ -806,15 +955,18 @@ mod lock {
         here: Option<Identity>,
         above: &[Identity],
         roots: &[OwnedRoot],
+        role: RootRole,
     ) -> Result<(), ScratchError> {
         for root in roots {
             let located = locate(&root.path).map_err(|source| ScratchError::Io {
+                role,
                 action: "compare trawld's storage roots with",
                 path: path.to_owned(),
                 source,
             })?;
             if let Some(overlap) = overlap(here, above, &located) {
                 return Err(ScratchError::Overlap {
+                    role,
                     path: path.to_owned(),
                     overlap,
                     what: root.what,
@@ -829,9 +981,10 @@ mod lock {
     /// `path`, its parent or the nearest directory above that exists, is a
     /// root or sits inside one: making `path` there would make directories
     /// inside the root.
-    pub(super) fn refuse_making_inside(
+    fn refuse_making_inside(
         path: &Path,
         roots: &[OwnedRoot],
+        role: RootRole,
     ) -> Result<(), ScratchError> {
         if roots.is_empty() {
             return Ok(());
@@ -840,24 +993,27 @@ mod lock {
             return Ok(());
         };
         let above = lineage(holder.as_fd()).map_err(|source| ScratchError::Io {
+            role,
             action: "inspect the parents of",
             path: path.to_owned(),
             source,
         })?;
-        refuse_roots(path, None, &above, roots)
+        refuse_roots(path, None, &above, roots, role)
     }
 
     /// Refuse the directory `handle` holds when it is one of `roots`, sits
     /// inside one, or sits above one or above where trawld would make one.
-    pub(super) fn refuse_overlap(
+    fn refuse_overlap(
         path: &Path,
         handle: &File,
         roots: &[OwnedRoot],
+        role: RootRole,
     ) -> Result<(), ScratchError> {
         if roots.is_empty() {
             return Ok(());
         }
         let lineage = lineage(handle.as_fd()).map_err(|source| ScratchError::Io {
+            role,
             action: "inspect the parents of",
             path: path.to_owned(),
             source,
@@ -865,7 +1021,7 @@ mod lock {
         let (here, above) = lineage
             .split_first()
             .expect("a lineage starts at its directory");
-        refuse_roots(path, Some(*here), above, roots)
+        refuse_roots(path, Some(*here), above, roots, role)
     }
 
     /// Where an inode lives: its filesystem and, where the kernel says,
@@ -891,8 +1047,8 @@ mod lock {
     #[derive(Debug, Clone, Copy)]
     pub(super) struct EntryStat {
         kind: FileType,
-        pub(super) owner: u32,
-        pub(super) mode: u32,
+        owner: u32,
+        mode: u32,
         inode: u64,
         placement: Placement,
     }
@@ -966,7 +1122,7 @@ mod lock {
 
     /// The inode `fd` holds.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(super) fn stat_handle(fd: BorrowedFd<'_>) -> io::Result<EntryStat> {
+    fn stat_handle(fd: BorrowedFd<'_>) -> io::Result<EntryStat> {
         statx(fd, c"", AtFlags::EMPTY_PATH)
     }
 
@@ -998,7 +1154,7 @@ mod lock {
 
     /// The inode `fd` holds.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    pub(super) fn stat_handle(fd: BorrowedFd<'_>) -> io::Result<EntryStat> {
+    fn stat_handle(fd: BorrowedFd<'_>) -> io::Result<EntryStat> {
         Ok(from_stat(&rustix::fs::fstat(fd)?))
     }
 
@@ -1006,6 +1162,7 @@ mod lock {
     /// each with its `stat`. `path` names `dir` in errors.
     fn entries(dir: &File, path: &Path) -> Result<Vec<(CString, EntryStat)>, ScratchError> {
         let io = |source: io::Error| ScratchError::Io {
+            role: SCRATCH,
             action: "read",
             path: path.to_owned(),
             source,
@@ -1093,6 +1250,7 @@ mod lock {
     ) -> Result<Vec<Stale>, ScratchError> {
         let home = seen(
             stat_handle(root.as_fd()).map_err(|source| ScratchError::Io {
+                role: SCRATCH,
                 action: "inspect",
                 path: path.to_owned(),
                 source,
@@ -1105,6 +1263,7 @@ mod lock {
             let os_name = OsStr::from_bytes(name.to_bytes());
             let entry = path.join(os_name);
             let foreign = |entry: &Path, reason: String| ScratchError::ForeignEntry {
+                role: SCRATCH,
                 path: path.to_owned(),
                 entry: entry.to_owned(),
                 reason,
@@ -1118,6 +1277,7 @@ mod lock {
                     Ok(fd) => File::from(fd),
                     Err(e) => {
                         return Err(ScratchError::Io {
+                            role: SCRATCH,
                             action: "open",
                             path: entry,
                             source: e.into(),
@@ -1125,6 +1285,7 @@ mod lock {
                     }
                 };
                 let opened = seen(stat_handle(dir.as_fd()).map_err(|source| ScratchError::Io {
+                    role: SCRATCH,
                     action: "inspect",
                     path: entry.clone(),
                     source,
@@ -1174,6 +1335,7 @@ mod lock {
             ) {
                 Ok(()) | Err(Errno::NOENT) => Ok(()),
                 Err(e) => Err(ScratchError::Io {
+                    role: SCRATCH,
                     action: "remove an entry of",
                     path: dir_path.join(OsStr::from_bytes(name.to_bytes())),
                     source: e.into(),
@@ -1384,6 +1546,115 @@ mod tests {
         }
     }
 
+    /// Every refusal of the scratch directory, word for word: the boot
+    /// error an operator reads, the startup tests and the docs quote these.
+    #[test]
+    #[allow(clippy::too_many_lines)] // one case per variant, kept in one table
+    fn scratch_refusals_read_word_for_word() {
+        let path = || PathBuf::from("/srv/data.query-scratch");
+        let cases: [(ScratchError, &str); 10] = [
+            (
+                ScratchError::Overlap {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                    overlap: Overlap::Inside,
+                    what: "the data root ([data] path)",
+                    root: PathBuf::from("/srv/data"),
+                },
+                "the query scratch directory /srv/data.query-scratch is inside the data root \
+                 ([data] path) /srv/data, as the filesystem resolves them; point [server] \
+                 query_scratch_dir at a directory of its own",
+            ),
+            (
+                ScratchError::BadPath {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                },
+                "the query scratch directory /srv/data.query-scratch does not end in a directory \
+                 name; point [server] query_scratch_dir at a directory of its own",
+            ),
+            (
+                ScratchError::Io {
+                    role: RootRole::QUERY_SCRATCH,
+                    action: "open",
+                    path: path(),
+                    source: std::io::Error::other("boom"),
+                },
+                "cannot open the query scratch directory /srv/data.query-scratch: boom; check \
+                 [server] query_scratch_dir",
+            ),
+            (
+                ScratchError::ReadOnly {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                },
+                "the query scratch directory /srv/data.query-scratch is on a read-only \
+                 filesystem; point [server] query_scratch_dir at a writable directory",
+            ),
+            (
+                ScratchError::Symlink {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                },
+                "the query scratch directory /srv/data.query-scratch is a symbolic link, which \
+                 trawld does not follow; point [server] query_scratch_dir at the directory itself",
+            ),
+            (
+                ScratchError::NotDirectory {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                },
+                "the query scratch directory /srv/data.query-scratch is not a directory; move it \
+                 aside or point [server] query_scratch_dir at a directory",
+            ),
+            (
+                ScratchError::ForeignOwner {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                    owner: 7,
+                    euid: 8,
+                },
+                "the query scratch directory /srv/data.query-scratch is owned by uid 7, not uid \
+                 8, the user trawld runs as; point [server] query_scratch_dir at a directory uid \
+                 8 owns",
+            ),
+            (
+                ScratchError::NotPrivate {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                    mode: 0o750,
+                },
+                "the query scratch directory /srv/data.query-scratch keeps mode 0750 after trawld \
+                 removed its group and other bits, so other users could read query data; point \
+                 [server] query_scratch_dir at a directory on a filesystem that keeps Unix modes",
+            ),
+            (
+                ScratchError::Locked {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                },
+                "the query scratch directory /srv/data.query-scratch is locked by another trawld; \
+                 stop that trawld, or point this one's [server] query_scratch_dir at a directory \
+                 of its own",
+            ),
+            (
+                ScratchError::ForeignEntry {
+                    role: RootRole::QUERY_SCRATCH,
+                    path: path(),
+                    entry: PathBuf::from("/srv/data.query-scratch/notes.txt"),
+                    reason: "is not an entry trawld makes".to_owned(),
+                },
+                "the query scratch directory /srv/data.query-scratch holds \
+                 /srv/data.query-scratch/notes.txt, which is not an entry trawld makes; trawld \
+                 removes only the entries it makes and has removed nothing. Move the entry out, \
+                 or point [server] query_scratch_dir at a directory of its own",
+            ),
+        ];
+        for (error, text) in cases {
+            assert_eq!(error.to_string(), text);
+        }
+    }
+
     /// Every entry under `root`, `root` included, with what it is: a
     /// directory, a file and its bytes, or a link and its target. A refused
     /// open must leave this unchanged.
@@ -1503,6 +1774,198 @@ mod tests {
         drop(first);
         let second = ScratchLock::open(&path).expect("free once dropped");
         assert_eq!(second.reclaimed().spill_dirs, 1);
+    }
+
+    /// Hold `path` as the results root, for a trawld running as this test.
+    #[cfg(unix)]
+    fn hold_results(path: &Path, roots: &[OwnedRoot]) -> Result<HeldRoot, ScratchError> {
+        hold_apart_from(
+            path,
+            roots,
+            rustix::process::geteuid().as_raw(),
+            RootRole::RESULTS,
+        )
+    }
+
+    /// A refusal of the results root names it and the setting that moves
+    /// it.
+    #[cfg(unix)]
+    fn assert_names_the_results_root(error: &ScratchError) {
+        let message = error.to_string();
+        assert!(message.contains("the results root "), "{message}");
+        assert!(message.contains("[server] results_dir"), "{message}");
+    }
+
+    /// ADR-0057: the results root is held as the scratch directory is,
+    /// made 0700 when missing and closed through its handle when open, but
+    /// what it holds outlives the hold: names the scratch preflight would
+    /// refuse and names it would reclaim both stay.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_root_keeps_what_it_holds() {
+        let parent = tempfile::tempdir().expect("parent");
+        let made = parent.path().join("absent/data.results");
+        let held = hold_results(&made, &[]).expect("hold a missing root");
+        assert_eq!(held.path(), made);
+        assert_eq!(mode_of(&made), 0o700);
+        assert!(held.dir().metadata().expect("stat").is_dir());
+        drop(held);
+
+        let path = parent.path().join("data.results");
+        std::fs::create_dir(&path).expect("mkdir");
+        plant_stale(&path);
+        std::fs::write(
+            path.join("0123456789abcdef0123456789abcdef.parquet"),
+            b"result",
+        )
+        .expect("result");
+        std::fs::write(path.join(".stage-a1B2c3.parquet"), b"staged").expect("stage");
+        std::fs::create_dir(path.join("later")).expect("subdir");
+        set_mode(&path, 0o2755);
+        let before = tree(&path);
+
+        let held = hold_results(&path.join(""), &[]).expect("hold");
+        assert_eq!(held.path(), path, "a trailing `/` names the same directory");
+        assert_eq!(tree(&path), before, "the hold removed or changed an entry");
+        assert_eq!(mode_of(&path), 0o2700, "the hold closes the root");
+    }
+
+    /// The lock is the scratch directory's lock: a second hold of a held
+    /// root refuses, in this process as in another, and so does opening it
+    /// as the scratch directory, before anything in it is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_hold_refuses_until_the_first_drops() {
+        let parent = tempfile::tempdir().expect("parent");
+        let path = parent.path().join("data.results");
+        let first = hold_results(&path, &[]).expect("first");
+        plant_stale(&path);
+        let before = tree(&path);
+
+        let error = hold_results(&path, &[]).expect_err("held");
+        assert!(
+            matches!(error, ScratchError::Locked { role, .. } if role == RootRole::RESULTS),
+            "{error}"
+        );
+        assert_names_the_results_root(&error);
+        assert!(error.to_string().contains("locked by another trawld"));
+
+        let error = ScratchLock::open(&path).expect_err("held as the results root");
+        assert!(matches!(error, ScratchError::Locked { .. }), "{error}");
+        assert_eq!(tree(&path), before, "a refused open removed an entry");
+
+        drop(first);
+        let again = hold_results(&path, &[]).expect("free once dropped");
+        assert_eq!(tree(&path), before);
+        drop(again);
+    }
+
+    /// The results root is kept apart from the scratch directory and the
+    /// data root by device and inode, and the refusal names the results
+    /// root and its setting.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_root_refuses_an_owned_root_by_its_role() {
+        let parent = tempfile::tempdir().expect("parent");
+        let base = parent.path();
+        let data = base.join("data");
+        let scratch = base.join("data.query-scratch");
+        std::fs::create_dir(&data).expect("data");
+        std::fs::create_dir(&scratch).expect("scratch");
+        std::os::unix::fs::symlink(&scratch, base.join("alias")).expect("alias");
+        std::os::unix::fs::symlink(base, base.join("up")).expect("up");
+        let roots = [
+            OwnedRoot {
+                what: "the data root ([data] path)",
+                path: data.clone(),
+            },
+            OwnedRoot {
+                what: "the query scratch directory ([server] query_scratch_dir)",
+                path: scratch.clone(),
+            },
+        ];
+        let cases = [
+            (base.join("alias/results"), Overlap::Inside, roots[1].what),
+            (
+                base.join("up/data.query-scratch"),
+                Overlap::Is,
+                roots[1].what,
+            ),
+            (data.join("results"), Overlap::Inside, roots[0].what),
+            (base.to_owned(), Overlap::Above, roots[0].what),
+        ];
+        for (path, overlap, what) in cases {
+            let before = tree(base);
+            let error = hold_results(&path, &roots).expect_err("an overlap");
+            assert!(
+                matches!(&error, ScratchError::Overlap { role, overlap: o, what: w, .. }
+                    if *role == RootRole::RESULTS && *o == overlap && *w == what),
+                "{}: {error}",
+                path.display()
+            );
+            assert_names_the_results_root(&error);
+            assert!(
+                error.to_string().starts_with(&format!(
+                    "the results root {} {overlap} {what}",
+                    path.display()
+                )),
+                "{error}"
+            );
+            assert_eq!(
+                tree(base),
+                before,
+                "{}: the refusal changed the tree",
+                path.display()
+            );
+        }
+        hold_results(&base.join("data.results"), &roots).expect("a sibling holds");
+    }
+
+    /// The results root's final component is held no-follow: a symlink
+    /// refuses, the link's target is left as it was, and a file, a path
+    /// without a final name and another owner refuse too. Each refusal
+    /// names the results root.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_root_refuses_a_symlink_and_names_its_role() {
+        let euid = rustix::process::geteuid().as_raw();
+        let parent = tempfile::tempdir().expect("parent");
+        let target = parent.path().join("target");
+        std::fs::create_dir(&target).expect("mkdir");
+        set_mode(&target, 0o755);
+        let link = parent.path().join("data.results");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        for path in [link.clone(), link.join("")] {
+            let error = hold_results(&path, &[]).expect_err("a symlink");
+            assert!(
+                matches!(error, ScratchError::Symlink { role, .. } if role == RootRole::RESULTS),
+                "{error}"
+            );
+            assert_names_the_results_root(&error);
+        }
+        assert_eq!(mode_of(&target), 0o755, "the link was followed");
+
+        let file = parent.path().join("file");
+        std::fs::write(&file, b"not a directory").expect("file");
+        let error = hold_results(&file, &[]).expect_err("a file");
+        assert!(
+            matches!(error, ScratchError::NotDirectory { .. }),
+            "{error}"
+        );
+        assert_names_the_results_root(&error);
+
+        let error = hold_results(Path::new("results/.."), &[]).expect_err("no final name");
+        assert!(matches!(error, ScratchError::BadPath { .. }), "{error}");
+        assert_names_the_results_root(&error);
+
+        let error = hold_apart_from(&target, &[], euid.wrapping_add(1), RootRole::RESULTS)
+            .expect_err("another owner");
+        assert!(
+            matches!(error, ScratchError::ForeignOwner { .. }),
+            "{error}"
+        );
+        assert_names_the_results_root(&error);
+        assert_eq!(mode_of(&target), 0o755, "a foreign directory was changed");
     }
 
     #[cfg(unix)]
@@ -1753,7 +2216,7 @@ mod tests {
         assert_eq!(mode_of(&path), 0o755, "a foreign directory was changed");
         assert_eq!(tree(&path), before);
 
-        let handle = lock::hold(&path).expect("hold");
+        let handle = lock::hold(&path, RootRole::QUERY_SCRATCH).expect("hold");
         let Err(error) = lock::preflight(&path, &handle, other) else {
             panic!("an entry another uid owns passed the preflight");
         };
@@ -1779,14 +2242,14 @@ mod tests {
         let path = parent.path().join("scratch");
         std::fs::create_dir(&path).expect("mkdir");
         set_mode(&path, 0o700);
-        let handle = lock::hold(&path).expect("hold");
+        let handle = lock::hold(&path, RootRole::QUERY_SCRATCH).expect("hold");
         let empty = lock::preflight_seen(&path, &handle, euid, lock::EntryStat::without_mount)
             .expect("an empty directory");
         assert!(empty.is_empty());
 
         plant_stale(&path);
         let before = tree(&path);
-        let handle = lock::hold(&path).expect("hold");
+        let handle = lock::hold(&path, RootRole::QUERY_SCRATCH).expect("hold");
         let Err(error) = lock::preflight_seen(&path, &handle, euid, lock::EntryStat::without_mount)
         else {
             panic!("an entry in an unknown mount passed the preflight");
