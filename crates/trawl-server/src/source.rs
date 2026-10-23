@@ -185,13 +185,6 @@ impl SourceSelection {
     /// The `read_parquet()` source argument: a `DuckDB` list literal with
     /// one `'{dir}/{file_pattern}'` element per directory, or
     /// [`no_match_source`] when no directory was selected.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the capture service (ADR-0057) calls it; it lands in a later #307 checkpoint"
-        )
-    )]
     pub(crate) fn source(&self) -> String {
         if self.dirs.is_empty() {
             return no_match_source(&self.base, &self.file_pattern);
@@ -237,13 +230,6 @@ impl SourceSelection {
 /// nothing instead of falling back to every date directory it holds. The
 /// fallback would hand an empty window the whole env, and the capture's
 /// source budget would then refuse a quiet window over an old corpus.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the capture service (ADR-0057) calls it; it lands in a later #307 checkpoint"
-    )
-)]
 pub(crate) fn compute_window_source(
     base_dir: &str,
     dsl: &str,
@@ -310,13 +296,6 @@ fn window_source_at(
 /// through a live one, but trawld never writes a symlink into the data
 /// root, which is owner-only (ADR-0052), so a link there is not data this
 /// budget measures. A dangling link matches nothing in `DuckDB` either.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the capture service (ADR-0057) calls it; it lands in a later #307 checkpoint"
-    )
-)]
 pub(crate) fn selection_bytes(selection: &SourceSelection) -> io::Result<u64> {
     let mut total: u64 = 0;
     for dir in &selection.dirs {

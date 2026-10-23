@@ -237,6 +237,22 @@ pub enum ServerError {
         limit: usize,
     },
 
+    /// A capture whose window selects more stored parquet than
+    /// `[capture] source_max_bytes` (400, code `capture_source_too_large`,
+    /// ADR-0057). It is measured from the protected selection before the
+    /// engine runs, so nothing was scanned. The message gives both counts
+    /// and nothing else: no path, no partition, no query text.
+    #[error(
+        "the window selects {selected_bytes} bytes of stored data, above the capture limit \
+         of {max_bytes} bytes; narrow the window"
+    )]
+    CaptureSourceTooLarge {
+        /// The bytes the window's selection measured.
+        selected_bytes: u64,
+        /// `[capture] source_max_bytes`.
+        max_bytes: u64,
+    },
+
     /// The request body carries a `Content-Encoding` the route does not
     /// decode (415, code `unsupported_encoding`). The ingest preview reads
     /// uncompressed samples only (ADR-0049). The message never quotes the
@@ -580,7 +596,8 @@ impl ServerError {
             Self::ServiceUnavailable(msg) if msg == CAPACITY_NOT_STARTED => msg.clone(),
             Self::ServiceUnavailable(_) | Self::AuthBackend(_) => "service unavailable".to_owned(),
             // `IngestBodyTooLarge`, `RequestTooLarge`, `HotBufferFull`,
-            // `IngestBatchTooLarge`, `PreviewTooLarge`, `UnsupportedEncoding`,
+            // `IngestBatchTooLarge`, `PreviewTooLarge`,
+            // `CaptureSourceTooLarge`, `UnsupportedEncoding`,
             // `CorpusRecovering`, `HotSnapshot`, `EngineSampleFailed` and
             // `RequestLimitReached` render fixed text and counts, with
             // nothing to redact.
@@ -650,6 +667,7 @@ impl ServerError {
             | Self::RequestLimitReached(_) => "service_unavailable",
             Self::IngestBatchTooLarge { .. } => "ingest_batch_too_large",
             Self::PreviewTooLarge { .. } => "preview_too_large",
+            Self::CaptureSourceTooLarge { .. } => "capture_source_too_large",
             Self::RequestTooLarge { .. } => "request_too_large",
             Self::UnsupportedEncoding => "unsupported_encoding",
             Self::Internal(_) => "internal",
@@ -699,6 +717,7 @@ impl ServerError {
             | Self::TooManyStreams
             | Self::IngestBatchTooLarge { .. }
             | Self::PreviewTooLarge { .. }
+            | Self::CaptureSourceTooLarge { .. }
             | Self::RequestTooLarge { .. }
             | Self::UnsupportedEncoding
             | Self::Panicked(_) => CauseKind::None,
@@ -1120,6 +1139,13 @@ impl IntoResponse for ServerError {
             Self::PreviewTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorEnvelope::simple(ErrorCode::PreviewTooLarge, self.to_string()),
+            ),
+            // The caller's to fix by narrowing the window, so a 400 and no
+            // `Retry-After`: the same window selects the same files. Fixed
+            // text and two counts.
+            Self::CaptureSourceTooLarge { .. } => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::CaptureSourceTooLarge, self.to_string()),
             ),
             // Fixed text, the setting and its value: nothing from the request.
             Self::RequestTooLarge { .. } => (
@@ -1807,6 +1833,35 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
         assert_eq!(body["error"]["code"], "unsupported_encoding");
+    }
+
+    /// A capture refused for its source budget (ADR-0057): 400 with its own
+    /// code and no `Retry-After`, a message giving both counts and the fix,
+    /// and no cause beneath it.
+    #[tokio::test]
+    async fn a_capture_source_refusal_is_a_400_naming_both_counts() {
+        let too_large = ServerError::CaptureSourceTooLarge {
+            selected_bytes: 2_147_483_648,
+            max_bytes: 1_073_741_824,
+        };
+        assert_eq!(too_large.error_class(), "capture_source_too_large");
+        assert_eq!(too_large.cause_kind(), CauseKind::None);
+        assert_eq!(too_large.safe_message(), too_large.to_string());
+        let response = too_large.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
+        );
+        let body: serde_json::Value = serde_json::from_str(&body_string(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "capture_source_too_large");
+        assert_eq!(
+            body["error"]["message"],
+            "the window selects 2147483648 bytes of stored data, above the capture limit of \
+             1073741824 bytes; narrow the window"
+        );
     }
 
     /// A body-limit refusal: 413 with its own code, a message naming the
