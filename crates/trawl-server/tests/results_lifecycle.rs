@@ -390,6 +390,7 @@ async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
     .await;
     let analyst = &server.analyst_token;
     let key_id = captured::key_id(&server, analyst).await;
+    let permits = server.state.query.pool.available_permits();
     server
         .state
         .results
@@ -398,6 +399,7 @@ async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
         .fail_next_insert(InsertFault::Committed);
 
     let result = events(&server).await;
+    captured::assert_nothing_held(&server, permits, "a capture whose answer was lost").await;
     let row = server
         .state
         .results
