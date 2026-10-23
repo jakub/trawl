@@ -53,13 +53,14 @@ function descriptor({ type, items } = {}) {
 
 // The wire shapes of the cells that are strings: a canonical decimal
 // integer within the 64-bit ranges, RFC 3339 with six fraction digits and
-// an offset (or an expanded year, or an infinity), a date, a time.
+// an offset (or a signed expanded year outside 0000..9999, or an
+// infinity), a date, a time with any fraction.
 const INTEGER = /^(0|-?[1-9][0-9]*)$/;
 const INTEGER_MIN = -(2n ** 63n);
 const INTEGER_MAX = 2n ** 64n - 1n;
-const TIMESTAMP = /^(?:(?:\d{4}|[+-]\d{4,})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}(?:Z|[+-]\d{2}:\d{2})|-?infinity)$/;
+const TIMESTAMP = /^(?:(?:\d{4}|-\d{4,}|\+\d{5,})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}(?:Z|[+-]\d{2}:\d{2})|-?infinity)$/;
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
-const TIME = /^\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?$/;
+const TIME = /^\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
 
 // One result cell as a JavaScript value, read under a checked descriptor.
 // An `integer` cell is a decimal string on the wire; the documented rows
