@@ -517,7 +517,20 @@ impl DiagnosticConnection {
 struct Spill {
     // Declared first, so the directory is removed while the lock holds.
     dir: tempfile::TempDir,
-    _scratch: Option<Arc<ScratchLock>>,
+    scratch: Option<Arc<ScratchLock>>,
+}
+
+impl Spill {
+    /// A captured result's row staging file: in the scratch directory when
+    /// the database has one, named so the boot clearing reclaims one a
+    /// killed trawld left, and otherwise in the database's own private
+    /// spill directory, which nothing else reads.
+    fn stage_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
+        match &self.scratch {
+            Some(lock) => lock.scratch().stage_file(),
+            None => crate::scratch::stage_file_in(self.dir.path()),
+        }
+    }
 }
 
 /// Query executor backed by an in-memory `DuckDB` connection.
@@ -557,7 +570,7 @@ impl Executor {
         Self::open(
             Spill {
                 dir: private_spill_dir()?,
-                _scratch: None,
+                scratch: None,
             },
             crate::scratch::TMPDIR_SETTING,
             None,
@@ -586,7 +599,7 @@ impl Executor {
         let root = Self::open(
             Spill {
                 dir,
-                _scratch: Some(scratch),
+                scratch: Some(scratch),
             },
             crate::scratch::SCRATCH_SETTING,
             Some(budgets),
@@ -1618,6 +1631,481 @@ impl Executor {
 
         Ok(QueryResult { columns, rows })
     }
+
+    /// Write a captured result (ADR-0057) to the parquet file at `dest`,
+    /// every row in the result's order, and say how each column is stored.
+    ///
+    /// The file's columns are named by position, `c0`, `c1`, ..., so a
+    /// display name, a duplicate one included, never reaches it: names and
+    /// types live in the capture's metadata. A column is stored as its
+    /// [`StoredType`], exactly as [`Self::write_query_result_to_parquet`]
+    /// stores one, and is [`StoredAs::Native`]. A column `StoredType`
+    /// refuses, a `mixed` one or integers that need both a negative and the
+    /// range above `i64::MAX`, is stored as `VARCHAR` holding each cell's
+    /// wire JSON instead, and is [`StoredAs::WireText`]: the encoded cell as
+    /// `serde_json` writes it, object members sorted by key, and a null
+    /// cell `NULL`. [`Self::read_capture_page`] lands it back through the
+    /// result wire's own decoder.
+    ///
+    /// The rows are staged as ndjson in the result wire's encoding, each
+    /// with its index `r`, in a 0600 file in the query scratch directory
+    /// ([`crate::scratch::QueryScratch::stage_file`]), or for a database
+    /// opened without one in its private spill directory. `COPY` reads
+    /// them back declared, never inferred, and orders them by `r`, so the
+    /// file's order is the result's whatever order `read_json` reads in.
+    /// The staging file is removed before this returns, whatever the
+    /// outcome. Row groups are [`CAPTURE_ROW_GROUP_ROWS`] rows, so a page
+    /// read decodes a row group or two, not the whole file.
+    ///
+    /// `dest` is a file the caller made, 0600 in the results root. `COPY`
+    /// writes into it in place (`USE_TMP_FILE false`), truncating it first,
+    /// so its inode and mode survive: `DuckDB`'s default would write a
+    /// `tmp_` sibling and rename it over `dest`, a new inode with the
+    /// umask's mode. A `dest` that does not exist is created under the
+    /// umask. The file is `fsync`ed before this returns; the directory is
+    /// the caller's to sync once it renames the file. On an error `dest`
+    /// may hold part of a file, and is the caller's to remove.
+    ///
+    /// Refused with [`EngineError::NotParquetStorable`] when the result has
+    /// no columns: a parquet file holds at least one, so the caller keeps a
+    /// zero-column capture as its metadata alone and checks
+    /// `result.columns` before it calls. A cell that disagrees with its
+    /// column's type fails the wire encoding, and the write with it.
+    pub fn write_capture_parquet(
+        &self,
+        result: &QueryResult,
+        dest: &Path,
+    ) -> Result<CaptureFile, EngineError> {
+        if result.columns.is_empty() {
+            return Err(EngineError::NotParquetStorable {
+                reason: "it has no columns".to_owned(),
+            });
+        }
+        // A ragged row is the encoder's to refuse, below, rather than a
+        // panic here.
+        let stored: Vec<Option<StoredType>> = result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                StoredType::of(
+                    &column.ty,
+                    result.rows.iter().filter_map(|row| row.get(index)),
+                )
+                .ok()
+            })
+            .collect();
+        let stored_as: Vec<StoredAs> = stored
+            .iter()
+            .map(|ty| {
+                if ty.is_some() {
+                    StoredAs::Native
+                } else {
+                    StoredAs::WireText
+                }
+            })
+            .collect();
+        let dest_str = utf8_path(dest, "capture path")?;
+
+        let stage = self.spill.stage_file()?;
+        let stage_str = read_path(stage.path(), "capture staging path")?;
+        write_capture_ndjson(result, &stored_as, stage.as_file())?;
+        let declared = std::iter::once("r: 'UBIGINT'".to_owned())
+            .chain(stored.iter().enumerate().map(|(index, ty)| {
+                let text = ty
+                    .as_ref()
+                    .map_or_else(|| "VARCHAR".to_owned(), StoredType::text_sql);
+                format!("c{index}: '{text}'")
+            }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let projected = stored
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                let key = format!("c{index}");
+                let value = ty
+                    .as_ref()
+                    .map_or_else(|| key.clone(), |ty| ty.cast_text(&key));
+                format!("{value} AS {key}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let copy_sql = format!(
+            "COPY (SELECT {projected} FROM read_json('{}', format='newline_delimited', \
+             records=true, auto_detect=false, columns={{{declared}}}) ORDER BY r) \
+             TO '{}' (FORMAT PARQUET, COMPRESSION SNAPPY, \
+             ROW_GROUP_SIZE {CAPTURE_ROW_GROUP_ROWS}, USE_TMP_FILE false)",
+            stage_str.replace('\'', "''"),
+            dest_str.replace('\'', "''"),
+        );
+        let copied = self.conn.execute(&copy_sql, []);
+        drop(stage);
+        let copied = copied?;
+        if copied != result.rows.len() {
+            return Err(EngineError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the capture copy wrote {copied} rows of {}",
+                    result.rows.len()
+                ),
+            )));
+        }
+
+        let file = std::fs::File::open(dest)?;
+        file.sync_all()?;
+        let bytes = file.metadata()?.len();
+        Ok(CaptureFile {
+            stored_as,
+            rows: u64::try_from(copied).unwrap_or(u64::MAX),
+            bytes,
+        })
+    }
+
+    /// Read rows `offset` up to `offset + limit` of the captured result in
+    /// the file at `path`, the columns at `positions` in that order, a
+    /// repeated position repeated.
+    ///
+    /// `columns` and `stored_as` describe every column of the capture, by
+    /// position, as the capture's metadata records them and
+    /// [`Self::write_capture_parquet`] reported them. A row is its 0-based
+    /// position in the file, which is the result's order: the rows are
+    /// selected by `file_row_number` and ordered by it, never by scan
+    /// order. Past the last row the page is short or empty. The path,
+    /// `offset` and `limit` are bound, never spliced; the projection is
+    /// the file's own positional names, which only `positions` choose.
+    ///
+    /// A [`StoredAs::Native`] column is decoded as a query result's column
+    /// is, its timestamps in UTC; a [`StoredAs::WireText`] one is parsed as
+    /// JSON and landed under its recorded type by the result wire's
+    /// decoder, `QueryResult`'s serde. A file column whose type disagrees
+    /// with the recorded one, or a stored text that does not land, fails
+    /// the read as invalid data.
+    ///
+    /// A position past the last column, or `columns` and `stored_as` of
+    /// different lengths, is refused as invalid input: the caller checks a
+    /// requested column against the capture's metadata before it reads.
+    /// `path` must not carry a glob metacharacter, because `read_parquet`
+    /// expands one even in a bound path.
+    pub fn read_capture_page(
+        &self,
+        path: &Path,
+        columns: &[ColumnType],
+        stored_as: &[StoredAs],
+        positions: &[usize],
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<Vec<Value>>, EngineError> {
+        if columns.len() != stored_as.len() {
+            return Err(invalid_input(format!(
+                "a capture of {} columns has {} storage entries",
+                columns.len(),
+                stored_as.len()
+            )));
+        }
+        let selected = positions
+            .iter()
+            .map(|&position| {
+                columns
+                    .get(position)
+                    .map(|ty| Selected {
+                        position,
+                        ty,
+                        stored_as: stored_as[position],
+                    })
+                    .ok_or_else(|| {
+                        invalid_input(format!(
+                            "column position {position} is past the capture's {} columns",
+                            columns.len()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.read_capture_rows(path, &selected, offset, limit)
+    }
+
+    /// Read one cell of the captured result in the file at `path`: row
+    /// `row`, the column at `position`, recorded as `column` and stored as
+    /// `stored_as`. `None` past the last row.
+    ///
+    /// The read is [`Self::read_capture_page`]'s, for one column and one
+    /// row. `position` must be a column of the capture, checked against
+    /// its metadata by the caller: past the last one, the file has no such
+    /// column and the read fails as a database error.
+    pub fn read_capture_cell(
+        &self,
+        path: &Path,
+        column: &ColumnType,
+        stored_as: StoredAs,
+        row: u64,
+        position: usize,
+    ) -> Result<Option<Value>, EngineError> {
+        let selected = [Selected {
+            position,
+            ty: column,
+            stored_as,
+        }];
+        let mut rows = self.read_capture_rows(path, &selected, row, 1)?;
+        Ok(rows.pop().and_then(|mut cells| cells.pop()))
+    }
+
+    /// The rows `from` up to `from + limit` of `selected`, in file order.
+    fn read_capture_rows(
+        &self,
+        path: &Path,
+        selected: &[Selected<'_>],
+        from: u64,
+        limit: u64,
+    ) -> Result<Vec<Vec<Value>>, EngineError> {
+        let path_str = read_path(path, "capture path")?;
+        let names: Vec<String> = selected
+            .iter()
+            .map(|column| format!("c{}", column.position))
+            .collect();
+        // With no column chosen the page still has its rows, each empty.
+        let projection = if names.is_empty() {
+            "file_row_number".to_owned()
+        } else {
+            names.join(", ")
+        };
+        let sql = format!(
+            "SELECT {projection} FROM read_parquet($1, file_row_number = true) \
+             WHERE file_row_number >= $2 ORDER BY file_row_number LIMIT $3"
+        );
+        // `file_row_number` is a BIGINT, so past `i64::MAX` there is no row.
+        let from = i64::try_from(from).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(duckdb::params![path_str, from, limit])?;
+        let stmt_ref =
+            rows.as_ref()
+                .ok_or(EngineError::Database(duckdb::Error::InvalidColumnName(
+                    "statement unavailable after query execution".into(),
+                )))?;
+        let found = typed_columns(stmt_ref);
+        for (column, found) in selected.iter().zip(&found) {
+            let recorded = match column.stored_as {
+                StoredAs::Native => column.ty.clone(),
+                StoredAs::WireText => ColumnType::String,
+            };
+            if found.ty != recorded {
+                return Err(invalid_data(format!(
+                    "the captured column c{} is stored as {}, not as the recorded {recorded}",
+                    column.position, found.ty
+                )));
+            }
+        }
+
+        let mut page = Vec::new();
+        // Each wire-text column's stored texts, by row, landed once the
+        // page is read.
+        let mut texts: Vec<(usize, Vec<Option<String>>)> = selected
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.stored_as == StoredAs::WireText)
+            .map(|(index, _)| (index, Vec::new()))
+            .collect();
+        while let Some(row) = rows.next()? {
+            let mut cells = Vec::with_capacity(selected.len());
+            for (index, (column, name)) in selected.iter().zip(&names).enumerate() {
+                cells.push(match column.stored_as {
+                    StoredAs::Native => extract_value(row, index, name, TimestampText::UTC)?,
+                    StoredAs::WireText => Value::Null,
+                });
+            }
+            for (index, column_texts) in &mut texts {
+                column_texts.push(row.get::<_, Option<String>>(*index)?);
+            }
+            page.push(cells);
+        }
+        for (index, column_texts) in texts {
+            let column = &selected[index];
+            let landed = land_wire_texts(column.position, column.ty, column_texts)?;
+            for (cells, cell) in page.iter_mut().zip(landed) {
+                cells[index] = cell;
+            }
+        }
+        Ok(page)
+    }
+}
+
+/// The rows of one row group in a captured result's file: one `DuckDB`
+/// vector. A capture holds at most a few thousand rows (ADR-0057), so a
+/// page of them decodes one row group or two rather than the whole file:
+/// `file_row_number`'s statistics skip the groups before the page.
+pub const CAPTURE_ROW_GROUP_ROWS: usize = 2048;
+
+/// How a captured result's column is stored in its parquet file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredAs {
+    /// As its [`StoredType`], the column's own type exactly.
+    Native,
+    /// As `VARCHAR` holding each cell's result-wire JSON, for a column no
+    /// [`StoredType`] holds exactly: a `mixed` one, or integers that need
+    /// both a negative and the range above `i64::MAX`.
+    WireText,
+}
+
+/// What [`Executor::write_capture_parquet`] wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureFile {
+    /// How each column is stored, by position.
+    pub stored_as: Vec<StoredAs>,
+    /// The rows written: every row of the result.
+    pub rows: u64,
+    /// The file's length in bytes once synced.
+    pub bytes: u64,
+}
+
+/// A captured column a read selects.
+struct Selected<'a> {
+    /// Its position, which names it in the file (`c3`).
+    position: usize,
+    /// Its recorded type.
+    ty: &'a ColumnType,
+    stored_as: StoredAs,
+}
+
+/// `path` as UTF-8, which every path spliced into `DuckDB` text must be.
+fn utf8_path<'a>(path: &'a Path, what: &str) -> Result<&'a str, EngineError> {
+    path.to_str().ok_or_else(|| {
+        EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+            message: format!("the {what} is not valid UTF-8"),
+        })
+    })
+}
+
+/// The characters `DuckDB` reads as a glob pattern in a path it reads from,
+/// the set `trawl-config` refuses in every directory setting.
+const GLOB_METACHARACTERS: &[char] = &['*', '?', '[', ']', '{', '}'];
+
+/// `path` as UTF-8, for `read_json` or `read_parquet` to read exactly that
+/// file: both expand a glob metacharacter, bound or spliced, so a path
+/// with one could read another file or several.
+fn read_path<'a>(path: &'a Path, what: &str) -> Result<&'a str, EngineError> {
+    let text = utf8_path(path, what)?;
+    if let Some(found) = text.chars().find(|c| GLOB_METACHARACTERS.contains(c)) {
+        return Err(invalid_input(format!(
+            "the {what} carries the glob character '{found}', which DuckDB would expand"
+        )));
+    }
+    Ok(text)
+}
+
+fn invalid_input(message: String) -> EngineError {
+    EngineError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
+}
+
+fn invalid_data(message: String) -> EngineError {
+    EngineError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message,
+    ))
+}
+
+/// Land a wire-text column's stored texts, by row, under its recorded type
+/// `ty`: each text is parsed as one JSON value, then the whole column goes
+/// through `QueryResult`'s own decoder, the one every result consumer
+/// lands cells with. A `NULL` is a null cell.
+fn land_wire_texts(
+    position: usize,
+    ty: &ColumnType,
+    texts: Vec<Option<String>>,
+) -> Result<Vec<Value>, EngineError> {
+    let rows = texts
+        .into_iter()
+        .map(|text| {
+            text.map_or(Ok(serde_json::Value::Null), |text| {
+                serde_json::from_str(&text)
+            })
+            .map(|cell| serde_json::Value::Array(vec![cell]))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            invalid_data(format!(
+                "the captured column c{position} holds a text that is not JSON: {e}"
+            ))
+        })?;
+    let column = serde_json::to_value(Column::new(format!("c{position}"), ty.clone()))
+        .map_err(|e| invalid_data(format!("the type of captured column c{position}: {e}")))?;
+    let wire = serde_json::json!({ "columns": [column], "rows": rows });
+    let landed: QueryResult = serde_json::from_value(wire).map_err(|e| {
+        invalid_data(format!(
+            "the captured column c{position} holds a cell its type does not admit: {e}"
+        ))
+    })?;
+    Ok(landed
+        .rows
+        .into_iter()
+        .map(|mut cells| cells.pop().unwrap_or(Value::Null))
+        .collect())
+}
+
+/// Write `result`'s rows to `file` as ndjson for
+/// [`Executor::write_capture_parquet`]: one object per row, its index under
+/// `r` and its cells under `c0`, `c1`, ... by position, in the result
+/// wire's encoding. A [`StoredAs::WireText`] cell is its encoded JSON as a
+/// string, and a null cell `null` either way.
+fn write_capture_ndjson(
+    result: &QueryResult,
+    stored_as: &[StoredAs],
+    file: &std::fs::File,
+) -> Result<(), EngineError> {
+    use std::io::Write as _;
+
+    let mut out = std::io::BufWriter::new(file);
+    for (index, cells) in wire_rows(result)?.into_iter().enumerate() {
+        let mut record = serde_json::Map::new();
+        record.insert("r".to_owned(), index.into());
+        for (position, (cell, stored_as)) in cells.into_iter().zip(stored_as).enumerate() {
+            let cell = match (stored_as, cell) {
+                (_, serde_json::Value::Null) => serde_json::Value::Null,
+                (StoredAs::Native, cell) => cell,
+                (StoredAs::WireText, cell) => serde_json::Value::String(cell.to_string()),
+            };
+            record.insert(format!("c{position}"), cell);
+        }
+        serde_json::to_writer(&mut out, &record).map_err(|e| unencodable(&e))?;
+        out.write_all(b"\n")?;
+    }
+    out.flush()?;
+    Ok(())
+}
+
+/// A wire encoding that failed, as the writers report it.
+fn unencodable(e: &serde_json::Error) -> EngineError {
+    EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
+        message: format!("failed to encode the result: {e}"),
+    })
+}
+
+/// `result`'s rows in the result wire's cell encoding, [`QueryResult`]'s
+/// own serde, each row an array of its cells. A cell its column's type
+/// refuses, or a row of the wrong length, fails the encoding, naming the
+/// column or the row.
+fn wire_rows(result: &QueryResult) -> Result<Vec<Vec<serde_json::Value>>, EngineError> {
+    let wire = serde_json::to_value(result).map_err(|e| unencodable(&e))?;
+    let rows = match wire {
+        serde_json::Value::Object(mut body) => body.remove("rows"),
+        _ => None,
+    };
+    let Some(serde_json::Value::Array(rows)) = rows else {
+        unreachable!("a QueryResult encodes as an object with a rows array");
+    };
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let serde_json::Value::Array(cells) = row else {
+                unreachable!("a QueryResult row encodes as an array");
+            };
+            cells
+        })
+        .collect())
 }
 
 /// Write `result`'s rows to `path` as ndjson in the result wire's cell
@@ -1631,31 +2119,15 @@ impl Executor {
 fn write_wire_ndjson(result: &QueryResult, path: &Path) -> Result<(), EngineError> {
     use std::io::Write as _;
 
-    let unencodable = |e: serde_json::Error| {
-        EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
-            message: format!("failed to encode the result: {e}"),
-        })
-    };
-    let wire = serde_json::to_value(result).map_err(unencodable)?;
-    let rows = match wire {
-        serde_json::Value::Object(mut body) => body.remove("rows"),
-        _ => None,
-    };
-    let Some(serde_json::Value::Array(rows)) = rows else {
-        unreachable!("a QueryResult encodes as an object with a rows array");
-    };
-
+    let rows = wire_rows(result)?;
     let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
-    for row in rows {
-        let serde_json::Value::Array(cells) = row else {
-            unreachable!("a QueryResult row encodes as an array");
-        };
+    for cells in rows {
         let record = cells
             .into_iter()
             .enumerate()
             .map(|(index, cell)| (format!("c{index}"), cell))
             .collect::<serde_json::Map<_, _>>();
-        serde_json::to_writer(&mut file, &record).map_err(unencodable)?;
+        serde_json::to_writer(&mut file, &record).map_err(|e| unencodable(&e))?;
         file.write_all(b"\n")?;
     }
     file.flush()?;

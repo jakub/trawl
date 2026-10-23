@@ -6,11 +6,11 @@
 //! (ADR-0046).
 //!
 //! One [`PhaseClock`] accumulates one query's time across every layer
-//! that works on it: the server books its request-side waits, the
-//! engine books source resolution, emit, probe, bind, execute, copy and
-//! post. The clock records durations and counts only. It emits nothing
-//! and carries no tracing; the server turns a [`PhaseTotals`] into the
-//! `query_timing` event.
+//! that works on it: the server books its request-side waits and a
+//! captured result's file write, and the engine books source resolution,
+//! emit, probe, bind, execute, copy and post. The clock records durations
+//! and counts only. It emits nothing and carries no tracing; the server
+//! turns a [`PhaseTotals`] into the `query_timing` event.
 //!
 //! One phase is active at a time. A phase entered more than once adds to
 //! the same total. Durations accumulate at full precision and floor to
@@ -53,12 +53,15 @@ pub enum QueryPhase {
     /// Rust tail stages, cap trim, reorder, severity walk, vanished-result
     /// guard.
     Post,
+    /// A captured result's file write: its rows staged, copied to parquet
+    /// and synced (ADR-0057).
+    Write,
     /// Export body rendering or parquet readback.
     Render,
 }
 
 /// How many [`QueryPhase`] variants there are.
-const PHASES: usize = 14;
+const PHASES: usize = 15;
 
 impl QueryPhase {
     /// Every phase, in the ADR's order.
@@ -76,6 +79,7 @@ impl QueryPhase {
         Self::Execute,
         Self::Copy,
         Self::Post,
+        Self::Write,
         Self::Render,
     ];
 
@@ -96,6 +100,7 @@ impl QueryPhase {
             Self::Execute => "execute",
             Self::Copy => "copy",
             Self::Post => "post",
+            Self::Write => "write",
             Self::Render => "render",
         }
     }
@@ -121,6 +126,7 @@ impl QueryPhase {
             Self::Execute => "query_execute_us",
             Self::Copy => "query_copy_us",
             Self::Post => "query_post_us",
+            Self::Write => "query_write_us",
             Self::Render => "query_render_us",
         }
     }
@@ -522,6 +528,13 @@ mod tests {
         for (i, phase) in QueryPhase::ALL.into_iter().enumerate() {
             assert_eq!(phase.index(), i, "ALL is in declaration order");
         }
+        // A capture's write follows its post (ADR-0046, amended for
+        // ADR-0057).
+        assert_eq!(QueryPhase::Write.as_str(), "write");
+        assert_eq!(
+            QueryPhase::ALL[QueryPhase::Post.index() + 1],
+            QueryPhase::Write
+        );
     }
 
     #[test]

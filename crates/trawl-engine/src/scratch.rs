@@ -7,9 +7,10 @@
 //!
 //! `[server] query_scratch_dir` holds what trawld writes while it answers a
 //! query: the query database's private spill directory, and beside it the
-//! hot-buffer query snapshots and the Parquet export staging files. This
-//! module owns the names trawld makes there, so the code that creates an
-//! entry and the code that recognizes one left behind read one spelling.
+//! hot-buffer query snapshots, the Parquet export staging files and the
+//! rows a captured result stages for its write. This module owns the names
+//! trawld makes there, so the code that creates an entry and the code that
+//! recognizes one left behind read one spelling.
 //!
 //! The spill directory follows ADR-0052: a fresh random name, mode 0700,
 //! refused unless a no-follow handle shows it owned by this process's euid
@@ -51,6 +52,12 @@ pub const SNAPSHOT_FILE_SUFFIX: &str = ".ndjson";
 pub const EXPORT_FILE_PREFIX: &str = "trawl-export-";
 /// See [`EXPORT_FILE_PREFIX`].
 pub const EXPORT_FILE_SUFFIX: &str = ".parquet";
+
+/// Prefix and suffix of the file a captured result stages its rows in for
+/// `DuckDB` to copy to parquet (ADR-0057).
+pub const STAGE_FILE_PREFIX: &str = "trawl-stage-";
+/// See [`STAGE_FILE_PREFIX`].
+pub const STAGE_FILE_SUFFIX: &str = ".ndjson";
 
 /// The prefix `DuckDB` 1.5.5's `COPY ... TO` gives the file it writes before
 /// renaming it onto the target (`use_tmp_file`, on by default for a local
@@ -135,6 +142,19 @@ impl QueryScratch {
     pub fn export_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
         named_file_in(&self.path, EXPORT_FILE_PREFIX, EXPORT_FILE_SUFFIX)
     }
+
+    /// Create a captured result's row staging file, 0600, named so
+    /// [`is_stage_file_name`] recognizes it.
+    pub fn stage_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
+        stage_file_in(&self.path)
+    }
+}
+
+/// Create a captured result's row staging file in `dir`, 0600, named as
+/// [`QueryScratch::stage_file`] names one: for a database opened without a
+/// scratch directory, whose private spill directory holds it instead.
+pub(crate) fn stage_file_in(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+    named_file_in(dir, STAGE_FILE_PREFIX, STAGE_FILE_SUFFIX)
 }
 
 /// Create a 0600 file in `dir` named `prefix`, [`RANDOM_LEN`] ASCII letters
@@ -184,6 +204,12 @@ pub fn is_export_file_name(name: &OsStr) -> bool {
         .to_str()
         .map(|name| name.strip_prefix(COPY_TMP_PREFIX).unwrap_or(name));
     name.is_some_and(|name| is_made_name(OsStr::new(name), EXPORT_FILE_PREFIX, EXPORT_FILE_SUFFIX))
+}
+
+/// Whether `name` is one [`QueryScratch::stage_file`] makes.
+#[must_use]
+pub fn is_stage_file_name(name: &OsStr) -> bool {
+    is_made_name(name, STAGE_FILE_PREFIX, STAGE_FILE_SUFFIX)
 }
 
 /// The size classes `DuckDB` 1.5.5 names a grouped spill file by: every
@@ -540,6 +566,8 @@ pub struct Reclaimed {
     pub snapshots: usize,
     /// Parquet export staging files, `DuckDB`'s `tmp_` copies included.
     pub exports: usize,
+    /// Captured results' row staging files.
+    pub stages: usize,
 }
 
 /// A directory held for this process by [`hold_apart_from`]: made, checked
@@ -699,7 +727,7 @@ mod lock {
 
     use super::{
         HeldRoot, Overlap, OwnedRoot, Reclaimed, RootRole, ScratchError, is_export_file_name,
-        is_snapshot_file_name, is_spill_dir_name, is_spill_file_name,
+        is_snapshot_file_name, is_spill_dir_name, is_spill_file_name, is_stage_file_name,
     };
 
     /// The role the clearing names: only the scratch directory is cleared.
@@ -1192,6 +1220,8 @@ mod lock {
         Snapshot(CString),
         /// An export staging file.
         Export(CString),
+        /// A captured result's row staging file.
+        Stage(CString),
     }
 
     /// Why `stat` refuses whatever its name: a symlink, another mount or a
@@ -1221,10 +1251,11 @@ mod lock {
     /// what to remove, or refuse at the first entry trawld did not make.
     /// Nothing is removed here, so a refusal leaves the tree as it was.
     ///
-    /// trawld makes three kinds of entry. A spill directory is a directory
+    /// trawld makes four kinds of entry. A spill directory is a directory
     /// named by [`is_spill_dir_name`] holding only regular files named by
-    /// [`is_spill_file_name`]. A snapshot or an export is a regular file
-    /// named by [`is_snapshot_file_name`] or [`is_export_file_name`]. Each
+    /// [`is_spill_file_name`]. A snapshot, an export or a stage is a regular
+    /// file named by [`is_snapshot_file_name`], [`is_export_file_name`] or
+    /// [`is_stage_file_name`]. Each
     /// is owned by `euid` and sits in the root's mount. Anything else
     /// refuses: another name, a symlink, a special file, a directory
     /// inside a spill directory, another owner, another mount. On Linux a
@@ -1314,6 +1345,8 @@ mod lock {
                 stale.push(Stale::Snapshot(name));
             } else if regular && is_export_file_name(os_name) {
                 stale.push(Stale::Export(name));
+            } else if regular && is_stage_file_name(os_name) {
+                stale.push(Stale::Stage(name));
             } else {
                 return Err(foreign(&entry, "is not an entry trawld makes".to_owned()));
             }
@@ -1360,6 +1393,10 @@ mod lock {
                 Stale::Export(name) => {
                     unlink(root, path, &name, AtFlags::empty())?;
                     reclaimed.exports += 1;
+                }
+                Stale::Stage(name) => {
+                    unlink(root, path, &name, AtFlags::empty())?;
+                    reclaimed.stages += 1;
                 }
             }
         }
@@ -1497,21 +1534,24 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_and_export_names_are_recognized_exactly() {
+    fn snapshot_export_and_stage_names_are_recognized_exactly() {
         let parent = tempfile::tempdir().expect("parent");
         let scratch = QueryScratch::new(parent.path());
         let snapshot = scratch.snapshot_file().expect("snapshot");
         let export = scratch.export_file().expect("export");
+        let stage = scratch.stage_file().expect("stage");
         let snapshot_name = snapshot.path().file_name().expect("a final component");
         let export_name = export.path().file_name().expect("a final component");
+        let stage_name = stage.path().file_name().expect("a final component");
         assert!(is_snapshot_file_name(snapshot_name), "{snapshot_name:?}");
         assert!(is_export_file_name(export_name), "{export_name:?}");
+        assert!(is_stage_file_name(stage_name), "{stage_name:?}");
         let copy_tmp = format!("tmp_{}", export_name.to_str().expect("utf-8"));
         assert!(is_export_file_name(OsStr::new(&copy_tmp)), "{copy_tmp}");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            for file in [&snapshot, &export] {
+            for file in [&snapshot, &export, &stage] {
                 let mode = file
                     .as_file()
                     .metadata()
@@ -1543,6 +1583,18 @@ mod tests {
             "trawl-snapshot-abc123.ndjson",
         ] {
             assert!(!is_export_file_name(OsStr::new(name)), "{name}");
+        }
+        for name in [
+            "trawl-stage-.ndjson",
+            "trawl-stage-abc12.ndjson",
+            "trawl-stage-abc1234.ndjson",
+            "trawl-stage-abc-12.ndjson",
+            "trawl-stage-abc123.ndjson.tmp",
+            "tmp_trawl-stage-abc123.ndjson",
+            "trawl-stage-abc123.parquet",
+            "trawl-snapshot-abc123.ndjson",
+        ] {
+            assert!(!is_stage_file_name(OsStr::new(name)), "{name}");
         }
     }
 
@@ -1699,8 +1751,8 @@ mod tests {
 
     /// Leave in `scratch` what a trawld killed mid-query leaves: a spill
     /// directory holding both kinds of `DuckDB` spill file, a snapshot, an
-    /// export staging file and `DuckDB`'s `tmp_` copy of it. Returns the
-    /// spill directory.
+    /// export staging file and `DuckDB`'s `tmp_` copy of it, and a
+    /// capture's row staging file. Returns the spill directory.
     #[cfg(unix)]
     fn plant_stale(scratch: &Path) -> PathBuf {
         let made = QueryScratch::new(scratch);
@@ -1718,6 +1770,7 @@ mod tests {
         let (_, export) = made.export_file().expect("export").keep().expect("keep");
         let name = export.file_name().expect("name").to_str().expect("utf-8");
         std::fs::write(scratch.join(format!("tmp_{name}")), b"half a copy").expect("copy");
+        made.stage_file().expect("stage").keep().expect("keep");
         spill
     }
 
@@ -1985,6 +2038,7 @@ mod tests {
                 spill_dirs: 2,
                 snapshots: 2,
                 exports: 4,
+                stages: 2,
             }
         );
         assert_eq!(tree(&path), vec![(path.clone(), "dir".to_owned())]);
@@ -2312,7 +2366,7 @@ mod tests {
     /// Each entry the preflight refuses: what it is, how to plant it, and
     /// the reason the refusal gives.
     #[cfg(unix)]
-    fn foreign_entries() -> [(&'static str, Plant, &'static str); 9] {
+    fn foreign_entries() -> [(&'static str, Plant, &'static str); 10] {
         [
             (
                 "an unknown file",
@@ -2395,6 +2449,15 @@ mod tests {
                     entry
                 },
                 "is not an entry trawld makes",
+            ),
+            (
+                "a symlink with a capture stage's name",
+                |scratch, _, victim| {
+                    let entry = scratch.join("trawl-stage-abc123.ndjson");
+                    std::os::unix::fs::symlink(victim, &entry).expect("symlink");
+                    entry
+                },
+                "is a symbolic link",
             ),
         ]
     }
