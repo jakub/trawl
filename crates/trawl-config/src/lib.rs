@@ -42,6 +42,8 @@ pub struct Config {
     pub web: WebConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+    #[serde(default)]
+    pub capture: CaptureConfig,
 }
 
 /// HTTPS listener settings.
@@ -169,6 +171,14 @@ pub struct ServerConfig {
     /// sit inside or above any of them. A value is an absolute path with no
     /// `..` component and no glob metacharacter.
     pub query_scratch_dir: Option<PathBuf>,
+
+    /// Root where captured results live (ADR-0057). Unset means [`Config::results_dir`]'s
+    /// default, the data root's sibling `<data.path>.results`. It follows
+    /// the query scratch directory's rules (absolute, no `..`, no glob
+    /// metacharacter, apart from the data root, the WAL directory and the
+    /// repin staging roots) and must also stay apart from the query scratch
+    /// directory: neither may equal, sit inside or contain the other.
+    pub results_dir: Option<PathBuf>,
 
     /// The query database's spill cap, `DuckDB`'s `max_temp_directory_size`,
     /// shared by every query, export and field sample (default: 4 GiB).
@@ -1206,6 +1216,9 @@ pub const MAX_DEFAULT_CONCURRENT_QUERIES: usize = 8;
 /// Suffix of the data root's sibling that [`Config::query_scratch_dir`]
 /// defaults to.
 pub const QUERY_SCRATCH_SUFFIX: &str = ".query-scratch";
+/// Suffix of the data root's sibling that [`Config::results_dir`] defaults
+/// to.
+pub const RESULTS_SUFFIX: &str = ".results";
 /// Suffix of the repin shadow (next-generation) sibling root.
 pub const REPIN_SHADOW_SUFFIX: &str = ".repin-next";
 /// Suffix of the repin aside (previous-generation) sibling root.
@@ -1658,9 +1671,9 @@ fn default_query_threads() -> NonZeroU32 {
     DEFAULT_QUERY_THREADS
 }
 
-/// The sibling of a data root that ends in `suffix`: the repin staging roots
-/// and the default query scratch directory. A root with no final component
-/// is treated as one named `data`.
+/// The sibling of a data root that ends in `suffix`: the repin staging roots,
+/// the default query scratch directory and the default results root. A root
+/// with no final component is treated as one named `data`.
 #[must_use]
 pub fn data_root_sibling(data_dir: &Path, suffix: &str) -> PathBuf {
     let name = data_dir
@@ -1694,6 +1707,207 @@ impl Default for RateLimitConfig {
         Self {
             default_rpm: DEFAULT_RATE_LIMIT_RPM,
             ingest_rpm: DEFAULT_INGEST_RATE_LIMIT_RPM,
+        }
+    }
+}
+
+// -- capture limits (ADR-0057) ------------------------------------------------
+
+const DEFAULT_CAPTURE_MAX_ROWS: u64 = 5_000;
+const DEFAULT_CAPTURE_MAX_WIRE_BYTES: u64 = 4 << 20;
+const DEFAULT_CAPTURE_MAX_FILE_BYTES: u64 = 8 << 20;
+const DEFAULT_CAPTURE_TTL_SECS: u64 = 900;
+const DEFAULT_CAPTURE_WINDOW_SECS: u64 = 900;
+const DEFAULT_CAPTURE_MAX_SPAN_SECS: u64 = 604_800;
+const DEFAULT_CAPTURE_DEADLINE_SECS: u64 = 15;
+const DEFAULT_CAPTURE_SOURCE_MAX_BYTES: u64 = 1 << 30;
+const DEFAULT_CAPTURE_PER_KEY_RESULTS: u64 = 64;
+const DEFAULT_CAPTURE_PER_KEY_BYTES: u64 = 64 << 20;
+const DEFAULT_CAPTURE_INSTALLATION_RESULTS: u64 = 512;
+const DEFAULT_CAPTURE_INSTALLATION_BYTES: u64 = 512 << 20;
+const DEFAULT_CAPTURE_PER_KEY_RUNNING: u64 = 1;
+const DEFAULT_CAPTURE_INSTALLATION_RUNNING: u64 = 2;
+const DEFAULT_CAPTURE_QUEUE_DEPTH: u64 = 4;
+const DEFAULT_CAPTURE_PAGE_MAX_ROWS: u64 = 200;
+const DEFAULT_CAPTURE_TOMBSTONE_SECS: u64 = 86_400;
+
+/// Limits of captured results (ADR-0057). Every number is configuration;
+/// the capabilities route advertises the ones a client plans around.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CaptureConfig {
+    /// Most rows one capture holds. A result with more matches is cut here and says so.
+    #[serde(default = "default_capture_max_rows")]
+    pub max_rows: u64,
+
+    /// Most bytes of cell data one capture holds, counted as the rows would travel on the wire (default: 4 MiB). Accepts human-readable sizes like `"4M"`.
+    #[serde(
+        default = "default_capture_max_wire_bytes",
+        deserialize_with = "deserialize_byte_size_u64"
+    )]
+    pub max_wire_bytes: u64,
+
+    /// Hard cap on one capture's file and the size reserved against the quotas before a capture runs (default: 8 MiB). Accepts human-readable sizes like `"8M"`.
+    #[serde(
+        default = "default_capture_max_file_bytes",
+        deserialize_with = "deserialize_byte_size_u64"
+    )]
+    pub max_file_bytes: u64,
+
+    /// Seconds a capture without an investigation stays readable after it is created.
+    #[serde(default = "default_capture_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// Seconds of history a capture covers, ending now, when the request names no time bounds.
+    #[serde(default = "default_capture_default_window_secs")]
+    pub default_window_secs: u64,
+
+    /// Longest time span, in seconds, one capture may cover. A wider request is refused before any scan.
+    #[serde(default = "default_capture_max_span_secs")]
+    pub max_span_secs: u64,
+
+    /// Seconds one capture may take, from resolution through the file write and including its wait for a free slot. The server's query timeout caps it.
+    #[serde(default = "default_capture_deadline_secs")]
+    pub deadline_secs: u64,
+
+    /// Most bytes of stored data a capture may select to scan, computed before it runs (default: 1 GiB). A capture over it is refused. Accepts human-readable sizes like `"1G"`.
+    #[serde(
+        default = "default_capture_source_max_bytes",
+        deserialize_with = "deserialize_byte_size_u64"
+    )]
+    pub source_max_bytes: u64,
+
+    /// Most live captures one key may hold.
+    #[serde(default = "default_capture_per_key_results")]
+    pub per_key_results: u64,
+
+    /// Most capture file bytes one key may hold (default: 64 MiB). Accepts human-readable sizes like `"64M"`.
+    #[serde(
+        default = "default_capture_per_key_bytes",
+        deserialize_with = "deserialize_byte_size_u64"
+    )]
+    pub per_key_bytes: u64,
+
+    /// Most live captures the whole installation may hold.
+    #[serde(default = "default_capture_installation_results")]
+    pub installation_results: u64,
+
+    /// Most capture file bytes the whole installation may hold (default: 512 MiB). Accepts human-readable sizes like `"512M"`.
+    #[serde(
+        default = "default_capture_installation_bytes",
+        deserialize_with = "deserialize_byte_size_u64"
+    )]
+    pub installation_bytes: u64,
+
+    /// Most captures one key may execute at once.
+    #[serde(default = "default_capture_per_key_running")]
+    pub per_key_running: u64,
+
+    /// Most captures the whole installation may execute at once, inside the query executor pool.
+    #[serde(default = "default_capture_installation_running")]
+    pub installation_running: u64,
+
+    /// Most captures one key may have waiting for its running slot. The next one is refused.
+    #[serde(default = "default_capture_queue_depth")]
+    pub queue_depth: u64,
+
+    /// Most rows one page of a stored capture returns.
+    #[serde(default = "default_capture_page_max_rows")]
+    pub page_max_rows: u64,
+
+    /// Seconds an expired or pruned capture's record stays, so its owner can tell expired from never existed.
+    #[serde(default = "default_capture_tombstone_secs")]
+    pub tombstone_secs: u64,
+}
+
+fn default_capture_max_rows() -> u64 {
+    DEFAULT_CAPTURE_MAX_ROWS
+}
+
+fn default_capture_max_wire_bytes() -> u64 {
+    DEFAULT_CAPTURE_MAX_WIRE_BYTES
+}
+
+fn default_capture_max_file_bytes() -> u64 {
+    DEFAULT_CAPTURE_MAX_FILE_BYTES
+}
+
+fn default_capture_ttl_secs() -> u64 {
+    DEFAULT_CAPTURE_TTL_SECS
+}
+
+fn default_capture_default_window_secs() -> u64 {
+    DEFAULT_CAPTURE_WINDOW_SECS
+}
+
+fn default_capture_max_span_secs() -> u64 {
+    DEFAULT_CAPTURE_MAX_SPAN_SECS
+}
+
+fn default_capture_deadline_secs() -> u64 {
+    DEFAULT_CAPTURE_DEADLINE_SECS
+}
+
+fn default_capture_source_max_bytes() -> u64 {
+    DEFAULT_CAPTURE_SOURCE_MAX_BYTES
+}
+
+fn default_capture_per_key_results() -> u64 {
+    DEFAULT_CAPTURE_PER_KEY_RESULTS
+}
+
+fn default_capture_per_key_bytes() -> u64 {
+    DEFAULT_CAPTURE_PER_KEY_BYTES
+}
+
+fn default_capture_installation_results() -> u64 {
+    DEFAULT_CAPTURE_INSTALLATION_RESULTS
+}
+
+fn default_capture_installation_bytes() -> u64 {
+    DEFAULT_CAPTURE_INSTALLATION_BYTES
+}
+
+fn default_capture_per_key_running() -> u64 {
+    DEFAULT_CAPTURE_PER_KEY_RUNNING
+}
+
+fn default_capture_installation_running() -> u64 {
+    DEFAULT_CAPTURE_INSTALLATION_RUNNING
+}
+
+fn default_capture_queue_depth() -> u64 {
+    DEFAULT_CAPTURE_QUEUE_DEPTH
+}
+
+fn default_capture_page_max_rows() -> u64 {
+    DEFAULT_CAPTURE_PAGE_MAX_ROWS
+}
+
+fn default_capture_tombstone_secs() -> u64 {
+    DEFAULT_CAPTURE_TOMBSTONE_SECS
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            max_rows: DEFAULT_CAPTURE_MAX_ROWS,
+            max_wire_bytes: DEFAULT_CAPTURE_MAX_WIRE_BYTES,
+            max_file_bytes: DEFAULT_CAPTURE_MAX_FILE_BYTES,
+            ttl_secs: DEFAULT_CAPTURE_TTL_SECS,
+            default_window_secs: DEFAULT_CAPTURE_WINDOW_SECS,
+            max_span_secs: DEFAULT_CAPTURE_MAX_SPAN_SECS,
+            deadline_secs: DEFAULT_CAPTURE_DEADLINE_SECS,
+            source_max_bytes: DEFAULT_CAPTURE_SOURCE_MAX_BYTES,
+            per_key_results: DEFAULT_CAPTURE_PER_KEY_RESULTS,
+            per_key_bytes: DEFAULT_CAPTURE_PER_KEY_BYTES,
+            installation_results: DEFAULT_CAPTURE_INSTALLATION_RESULTS,
+            installation_bytes: DEFAULT_CAPTURE_INSTALLATION_BYTES,
+            per_key_running: DEFAULT_CAPTURE_PER_KEY_RUNNING,
+            installation_running: DEFAULT_CAPTURE_INSTALLATION_RUNNING,
+            queue_depth: DEFAULT_CAPTURE_QUEUE_DEPTH,
+            page_max_rows: DEFAULT_CAPTURE_PAGE_MAX_ROWS,
+            tombstone_secs: DEFAULT_CAPTURE_TOMBSTONE_SECS,
         }
     }
 }
@@ -1861,6 +2075,9 @@ impl Config {
             self.server.query_scratch_dir =
                 Some(PathBuf::from(expand_tilde(&scratch.to_string_lossy())));
         }
+        if let Some(results) = &self.server.results_dir {
+            self.server.results_dir = Some(PathBuf::from(expand_tilde(&results.to_string_lossy())));
+        }
     }
 
     /// Resolve the WAL directory: explicit config value or `{data.base_dir}/wal/`.
@@ -1878,6 +2095,15 @@ impl Config {
             .query_scratch_dir
             .clone()
             .unwrap_or_else(|| data_root_sibling(&self.data.base_dir(), QUERY_SCRATCH_SUFFIX))
+    }
+
+    /// Resolve the results root: explicit config value or the data root's
+    /// sibling `<data.path>.results` (ADR-0057).
+    pub fn results_dir(&self) -> PathBuf {
+        self.server
+            .results_dir
+            .clone()
+            .unwrap_or_else(|| data_root_sibling(&self.data.base_dir(), RESULTS_SUFFIX))
     }
 
     /// State directory — parent of the data directory.
@@ -2004,6 +2230,8 @@ impl Config {
         }
 
         self.validate_query_scratch_dir()?;
+        self.validate_results_dir()?;
+        self.validate_capture()?;
         validate_telemetry_buffer_max_bytes(self.ingest.telemetry_buffer_max_bytes)?;
         validate_max_catchup_intervals(self.scheduler.max_catchup_intervals)?;
 
@@ -2070,32 +2298,71 @@ impl Config {
     /// `..`. Startup repeats the check against the opened directory, which
     /// also sees symlinks.
     fn validate_query_scratch_dir(&self) -> Result<(), ConfigError> {
-        const KEY: &str = "server.query_scratch_dir";
-        if let Some(dir) = &self.server.query_scratch_dir {
+        self.validate_owned_dir(
+            "server.query_scratch_dir",
+            self.server.query_scratch_dir.as_deref(),
+            &self.query_scratch_dir(),
+        )
+    }
+
+    /// The results root follows the scratch directory's rules and also stays
+    /// apart from the effective query scratch directory: boot removes the
+    /// names it makes in scratch, and a capture file must never sit where
+    /// that sweep or a query's spill can reach it.
+    fn validate_results_dir(&self) -> Result<(), ConfigError> {
+        const KEY: &str = "server.results_dir";
+        let results = self.results_dir();
+        self.validate_owned_dir(KEY, self.server.results_dir.as_deref(), &results)?;
+        let scratch = self.query_scratch_dir();
+        let relation = if results == scratch {
+            "equal to"
+        } else if results.starts_with(&scratch) {
+            "inside"
+        } else if scratch.starts_with(&results) {
+            "above"
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::Validation(format!(
+            "{KEY} must not be {relation} the query scratch directory \
+             (server.query_scratch_dir); set {KEY} to a directory of its own"
+        )))
+    }
+
+    /// The shared checks of a directory trawld owns by name: `explicit` is
+    /// the configured value (shape rules apply only to it), `effective` the
+    /// resolved one (glob and overlap rules apply to it).
+    fn validate_owned_dir(
+        &self,
+        key: &str,
+        explicit: Option<&Path>,
+        effective: &Path,
+    ) -> Result<(), ConfigError> {
+        if let Some(dir) = explicit {
             if dir.as_os_str().is_empty() {
-                return Err(ConfigError::Validation(format!("{KEY} cannot be empty")));
+                return Err(ConfigError::Validation(format!("{key} cannot be empty")));
             }
             if dir.is_relative() {
                 return Err(ConfigError::Validation(format!(
-                    "{KEY} must be an absolute path"
+                    "{key} must be an absolute path"
                 )));
             }
             if dir.components().any(|c| c == Component::ParentDir) {
                 return Err(ConfigError::Validation(format!(
-                    "{KEY} must not contain a '..' component"
+                    "{key} must not contain a '..' component"
                 )));
             }
         }
-        let scratch = self.query_scratch_dir();
         // The snapshot paths in the scratch directory reach `read_json`,
-        // which expands a glob as `read_parquet` does `data.path`.
-        if let Some(found) = scratch
+        // which expands a glob as `read_parquet` does `data.path`; the
+        // results root is held to the same rule.
+        if let Some(found) = effective
             .to_string_lossy()
             .chars()
             .find(|c| GLOB_METACHARACTERS.contains(c))
         {
             return Err(ConfigError::Validation(format!(
-                "{KEY} must be a directory path without glob metacharacters; found '{found}'"
+                "{key} must be a directory path without glob metacharacters; found '{found}'"
             )));
         }
         let data = self.data.base_dir();
@@ -2112,18 +2379,91 @@ impl Config {
             ),
         ];
         for (root, what) in owned {
-            let relation = if scratch == root {
+            let relation = if effective == root {
                 "equal to"
-            } else if scratch.starts_with(&root) {
+            } else if effective.starts_with(&root) {
                 "inside"
-            } else if root.starts_with(&scratch) {
+            } else if root.starts_with(effective) {
                 "above"
             } else {
                 continue;
             };
             return Err(ConfigError::Validation(format!(
-                "{KEY} must not be {relation} {what}; set {KEY} to a directory of its own"
+                "{key} must not be {relation} {what}; set {key} to a directory of its own"
             )));
+        }
+        Ok(())
+    }
+
+    /// Every capture limit is positive, and each per-key limit fits inside
+    /// its installation-wide counterpart: a per-key quota above the
+    /// installation quota could never be reached, and a window default above
+    /// the span limit would refuse every default request.
+    fn validate_capture(&self) -> Result<(), ConfigError> {
+        let c = &self.capture;
+        for (key, value) in [
+            ("max_rows", c.max_rows),
+            ("max_wire_bytes", c.max_wire_bytes),
+            ("max_file_bytes", c.max_file_bytes),
+            ("ttl_secs", c.ttl_secs),
+            ("default_window_secs", c.default_window_secs),
+            ("max_span_secs", c.max_span_secs),
+            ("deadline_secs", c.deadline_secs),
+            ("source_max_bytes", c.source_max_bytes),
+            ("per_key_results", c.per_key_results),
+            ("per_key_bytes", c.per_key_bytes),
+            ("installation_results", c.installation_results),
+            ("installation_bytes", c.installation_bytes),
+            ("per_key_running", c.per_key_running),
+            ("installation_running", c.installation_running),
+            ("queue_depth", c.queue_depth),
+            ("page_max_rows", c.page_max_rows),
+            ("tombstone_secs", c.tombstone_secs),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Validation(format!(
+                    "capture.{key} must be > 0"
+                )));
+            }
+        }
+        for (small, large, small_value, large_value) in [
+            (
+                "per_key_results",
+                "installation_results",
+                c.per_key_results,
+                c.installation_results,
+            ),
+            (
+                "per_key_bytes",
+                "installation_bytes",
+                c.per_key_bytes,
+                c.installation_bytes,
+            ),
+            (
+                "per_key_running",
+                "installation_running",
+                c.per_key_running,
+                c.installation_running,
+            ),
+            ("page_max_rows", "max_rows", c.page_max_rows, c.max_rows),
+            (
+                "default_window_secs",
+                "max_span_secs",
+                c.default_window_secs,
+                c.max_span_secs,
+            ),
+            (
+                "max_wire_bytes",
+                "max_file_bytes",
+                c.max_wire_bytes,
+                c.max_file_bytes,
+            ),
+        ] {
+            if small_value > large_value {
+                return Err(ConfigError::Validation(format!(
+                    "capture.{small} must be <= capture.{large}"
+                )));
+            }
         }
         Ok(())
     }
@@ -4526,5 +4866,260 @@ severity_from = [7]
         )
         .unwrap();
         assert_eq!(config.wal_dir(), Path::new("/srv/./wal"));
+    }
+
+    /// A config with `[server]`, `[capture]` and `[ingest]` lines on a fixed
+    /// data root.
+    fn capture_config(server: &str, capture: &str) -> Result<Config, ConfigError> {
+        Config::from_toml(&format!(
+            "[server]\n{server}\n[data]\npath = \"/var/lib/trawl/data\"\n[capture]\n{capture}\n"
+        ))
+    }
+
+    #[test]
+    fn results_dir_defaults_to_the_data_root_sibling() {
+        let config = capture_config("", "").unwrap();
+        assert_eq!(config.server.results_dir, None);
+        assert_eq!(
+            config.results_dir(),
+            Path::new("/var/lib/trawl/data.results")
+        );
+        assert_eq!(RESULTS_SUFFIX, ".results");
+    }
+
+    #[test]
+    fn results_dir_explicit_value_normalises_the_tilde() {
+        let config = capture_config("results_dir = \"/srv/results\"", "").unwrap();
+        assert_eq!(config.results_dir(), Path::new("/srv/results"));
+
+        let home = std::env::var("HOME").expect("HOME is set");
+        let config = capture_config("results_dir = \"~/results\"", "").unwrap();
+        assert_eq!(config.results_dir(), Path::new(&home).join("results"));
+    }
+
+    #[test]
+    fn results_dir_follows_the_scratch_directory_rules() {
+        for (value, reason) in [
+            ("\"\"", "cannot be empty"),
+            ("\"results\"", "must be an absolute path"),
+            ("\"/srv/../results\"", "must not contain a '..' component"),
+            (
+                "'/srv/res*'",
+                "must be a directory path without glob metacharacters",
+            ),
+            (
+                "\"/var/lib/trawl/data\"",
+                "must not be equal to the data root",
+            ),
+            (
+                "\"/var/lib/trawl/data/results\"",
+                "must not be inside the data root",
+            ),
+            ("\"/var/lib/trawl\"", "must not be above the data root"),
+            (
+                "\"/var/lib/trawl/data.repin-next\"",
+                "must not be equal to the repin shadow root",
+            ),
+        ] {
+            let err = capture_config(&format!("results_dir = {value}"), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("server.results_dir {reason}")),
+                "{value}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn results_dir_refuses_overlap_with_the_query_scratch_directory() {
+        let scratch = "query_scratch_dir = \"/srv/scratch\"";
+        for (results, relation) in [
+            ("/srv/scratch", "equal to"),
+            ("/srv/scratch/", "equal to"),
+            ("/srv/scratch/results", "inside"),
+            ("/srv", "above"),
+        ] {
+            let err = capture_config(&format!("{scratch}\nresults_dir = \"{results}\""), "")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "server.results_dir must not be {relation} the query scratch directory"
+                )),
+                "{results}: {err}"
+            );
+        }
+        // Scratch placed inside the results root is the same overlap, found
+        // from the other side: the results root is `above` scratch.
+        let err = capture_config(
+            "query_scratch_dir = \"/srv/results/scratch\"\nresults_dir = \"/srv/results\"",
+            "",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("server.results_dir must not be above the query scratch directory"),
+            "{err}"
+        );
+        // The default results root also checks the default scratch root.
+        let err = capture_config("query_scratch_dir = \"/var/lib/trawl/data.results\"", "")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("server.results_dir must not be equal to the query scratch directory"),
+            "{err}"
+        );
+        // Lookalike prefixes are siblings, not overlap.
+        let config = capture_config(
+            "query_scratch_dir = \"/srv/scratch\"\nresults_dir = \"/srv/scratch-results\"",
+            "",
+        )
+        .unwrap();
+        assert_eq!(config.results_dir(), Path::new("/srv/scratch-results"));
+    }
+
+    #[test]
+    fn capture_defaults_apply_when_the_table_is_absent() {
+        let config =
+            Config::from_toml("[server]\n[data]\npath = \"/var/lib/trawl/data\"\n").unwrap();
+        let capture = &config.capture;
+        assert_eq!(capture.max_rows, 5_000);
+        assert_eq!(capture.max_wire_bytes, 4 << 20);
+        assert_eq!(capture.max_file_bytes, 8 << 20);
+        assert_eq!(capture.ttl_secs, 900);
+        assert_eq!(capture.default_window_secs, 900);
+        assert_eq!(capture.max_span_secs, 604_800);
+        assert_eq!(capture.deadline_secs, 15);
+        assert_eq!(capture.source_max_bytes, 1 << 30);
+        assert_eq!(capture.per_key_results, 64);
+        assert_eq!(capture.per_key_bytes, 64 << 20);
+        assert_eq!(capture.installation_results, 512);
+        assert_eq!(capture.installation_bytes, 512 << 20);
+        assert_eq!(capture.per_key_running, 1);
+        assert_eq!(capture.installation_running, 2);
+        assert_eq!(capture.queue_depth, 4);
+        assert_eq!(capture.page_max_rows, 200);
+        assert_eq!(capture.tombstone_secs, 86_400);
+        // An empty table and `Default` agree with the absent one.
+        let empty = capture_config("", "").unwrap();
+        let default = CaptureConfig::default();
+        assert_eq!(empty.capture.max_rows, default.max_rows);
+        assert_eq!(empty.capture.tombstone_secs, default.tombstone_secs);
+        assert_eq!(empty.capture.installation_bytes, default.installation_bytes);
+    }
+
+    #[test]
+    fn capture_full_override_round_trips() {
+        let config = capture_config(
+            "",
+            "max_rows = 1000\nmax_wire_bytes = \"1M\"\nmax_file_bytes = \"2M\"\n\
+             ttl_secs = 60\ndefault_window_secs = 120\nmax_span_secs = 3600\n\
+             deadline_secs = 5\nsource_max_bytes = \"256M\"\nper_key_results = 8\n\
+             per_key_bytes = \"16M\"\ninstallation_results = 32\n\
+             installation_bytes = \"128M\"\nper_key_running = 2\n\
+             installation_running = 3\nqueue_depth = 6\npage_max_rows = 100\n\
+             tombstone_secs = 7200",
+        )
+        .unwrap();
+        let capture = &config.capture;
+        assert_eq!(capture.max_rows, 1000);
+        assert_eq!(capture.max_wire_bytes, 1 << 20);
+        assert_eq!(capture.max_file_bytes, 2 << 20);
+        assert_eq!(capture.ttl_secs, 60);
+        assert_eq!(capture.default_window_secs, 120);
+        assert_eq!(capture.max_span_secs, 3600);
+        assert_eq!(capture.deadline_secs, 5);
+        assert_eq!(capture.source_max_bytes, 256 << 20);
+        assert_eq!(capture.per_key_results, 8);
+        assert_eq!(capture.per_key_bytes, 16 << 20);
+        assert_eq!(capture.installation_results, 32);
+        assert_eq!(capture.installation_bytes, 128 << 20);
+        assert_eq!(capture.per_key_running, 2);
+        assert_eq!(capture.installation_running, 3);
+        assert_eq!(capture.queue_depth, 6);
+        assert_eq!(capture.page_max_rows, 100);
+        assert_eq!(capture.tombstone_secs, 7200);
+    }
+
+    #[test]
+    fn capture_refuses_unknown_keys() {
+        assert!(capture_config("", "no_such_limit = 1").is_err());
+    }
+
+    #[test]
+    fn capture_refuses_a_zero_value_naming_the_key() {
+        for key in [
+            "max_rows",
+            "max_wire_bytes",
+            "max_file_bytes",
+            "ttl_secs",
+            "default_window_secs",
+            "max_span_secs",
+            "deadline_secs",
+            "source_max_bytes",
+            "per_key_results",
+            "per_key_bytes",
+            "installation_results",
+            "installation_bytes",
+            "per_key_running",
+            "installation_running",
+            "queue_depth",
+            "page_max_rows",
+            "tombstone_secs",
+        ] {
+            let err = capture_config("", &format!("{key} = 0"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("capture.{key} must be > 0")),
+                "{key}: {err}"
+            );
+        }
+        // A zero byte size spelled with a unit is the same refusal.
+        let err = capture_config("", "max_file_bytes = \"0M\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("capture.max_file_bytes"), "{err}");
+    }
+
+    #[test]
+    fn capture_refuses_a_per_key_limit_above_its_installation_limit() {
+        for (capture, small, large) in [
+            (
+                "per_key_results = 513",
+                "per_key_results",
+                "installation_results",
+            ),
+            (
+                "per_key_bytes = \"513M\"",
+                "per_key_bytes",
+                "installation_bytes",
+            ),
+            (
+                "per_key_running = 3",
+                "per_key_running",
+                "installation_running",
+            ),
+            ("page_max_rows = 5001", "page_max_rows", "max_rows"),
+            (
+                "default_window_secs = 604801",
+                "default_window_secs",
+                "max_span_secs",
+            ),
+            (
+                "max_wire_bytes = \"9M\"",
+                "max_wire_bytes",
+                "max_file_bytes",
+            ),
+        ] {
+            let err = capture_config("", capture).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("capture.{small} must be <= capture.{large}")),
+                "{capture}: {err}"
+            );
+        }
+        // Equality is allowed.
+        capture_config("", "per_key_results = 512\nper_key_running = 2").unwrap();
     }
 }

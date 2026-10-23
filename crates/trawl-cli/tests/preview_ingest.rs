@@ -153,6 +153,7 @@ impl Server {
                 rate_limit: RateLimitConfig::default(),
                 monitor_refresh_ms: 1000,
                 query_scratch_dir: None,
+                results_dir: None,
                 query_spill_max_bytes: trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
                 query_memory_limit: trawl_server::config::DEFAULT_QUERY_MEMORY_LIMIT,
                 query_threads: trawl_server::config::DEFAULT_QUERY_THREADS,
@@ -176,6 +177,7 @@ impl Server {
             storage: StorageConfig {
                 database_url: Some(app_db_url.clone()),
             },
+            capture: trawl_config::CaptureConfig::default(),
         };
 
         let app = fixture_pool(&app_db_url, APP_POOL_MAX).await;

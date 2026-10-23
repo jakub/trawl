@@ -2089,6 +2089,7 @@ async fn setup_with_ingest_config(
             rate_limit,
             monitor_refresh_ms: 1000,
             query_scratch_dir: None,
+            results_dir: None,
             query_spill_max_bytes: query.spill_max_bytes,
             query_memory_limit: query.memory_limit,
             query_threads: query.threads,
@@ -2122,6 +2123,7 @@ async fn setup_with_ingest_config(
         storage: StorageConfig {
             database_url: Some(app_db_url.clone()),
         },
+        capture: trawl_config::CaptureConfig::default(),
     };
 
     // ADR-0021 ruling 3: the server receives pools the fixture built and
