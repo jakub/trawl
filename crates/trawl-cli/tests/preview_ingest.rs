@@ -438,6 +438,23 @@ fn text(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).expect("utf-8 output")
 }
 
+/// Whether `stderr` is exactly `line`, then the ` (request <id>)` suffix
+/// the CLI ends every server error with, then a newline. The id is a
+/// ULID, new on every request, so only its shape can be asserted: 26
+/// Crockford base32 characters.
+fn is_server_line(stderr: &str, line: &str) -> bool {
+    stderr
+        .strip_prefix(line)
+        .and_then(|rest| rest.strip_prefix(" (request "))
+        .and_then(|rest| rest.strip_suffix(")\n"))
+        .is_some_and(|id| {
+            id.len() == 26
+                && id.bytes().all(|b| {
+                    b.is_ascii_digit() || (b.is_ascii_uppercase() && !b"ILOU".contains(&b))
+                })
+        })
+}
+
 /// The table with the header's arrival instant, the one value that
 /// changes between runs, masked. The instant must have the report's fixed
 /// shape (RFC 3339 UTC, microseconds) to be masked at all.
@@ -745,10 +762,13 @@ async fn a_body_moderately_over_the_limit_prints_the_servers_413() {
     assert_eq!(text(&output.stdout), "");
     let stderr = text(&output.stderr);
     assert!(!stderr.contains("unknown error"), "{stderr}");
-    assert_eq!(
-        stderr,
-        "trawl: server error (HTTP 413): request body exceeds [server] \
-         max_request_body_bytes (1024 bytes)\n"
+    assert!(
+        is_server_line(
+            stderr,
+            "trawl: server error (HTTP 413): request body exceeds [server] \
+             max_request_body_bytes (1024 bytes)"
+        ),
+        "{stderr}"
     );
     server.stop().await;
 }
@@ -768,12 +788,16 @@ async fn more_events_than_a_preview_reads_prints_the_servers_413() {
     let output = trawl(&config, Some(&server.admin_token), &["-"], body.as_bytes()).await;
     assert_eq!(output.status.code(), Some(2), "{}", text(&output.stderr));
     assert_eq!(text(&output.stdout), "");
-    assert_eq!(
-        text(&output.stderr),
-        format!(
-            "trawl: server error (HTTP 413): the sample holds more than {limit} events; \
-             preview at most {limit} at a time\n"
-        )
+    let stderr = text(&output.stderr);
+    assert!(
+        is_server_line(
+            stderr,
+            &format!(
+                "trawl: server error (HTTP 413): the sample holds more than {limit} events; \
+                 preview at most {limit} at a time"
+            )
+        ),
+        "{stderr}"
     );
     server.stop().await;
 }
@@ -806,12 +830,15 @@ async fn a_body_far_over_the_limit_prints_the_413_or_a_cut_off_upload() {
     assert!(!stderr.contains("unknown error"), "{stderr}");
     let refused = format!(
         "trawl: server error (HTTP 413): request body exceeds [server] \
-         max_request_body_bytes ({DEFAULT_BODY_LIMIT} bytes)\n"
+         max_request_body_bytes ({DEFAULT_BODY_LIMIT} bytes)"
     );
     let cut_off = "trawl: network error: the server closed the connection before the \
                    upload finished; the request may exceed the server's request size limit, \
                    or the server may be at its request limit\n";
-    assert!(stderr == refused || stderr == cut_off, "{stderr}");
+    assert!(
+        is_server_line(stderr, &refused) || stderr == cut_off,
+        "{stderr}"
+    );
     eprintln!("far-over-limit outcome: {}", stderr.trim_end());
     server.stop().await;
 }
