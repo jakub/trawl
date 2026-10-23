@@ -8,16 +8,20 @@
 //! and service names extracted from the DSL query, avoiding full-directory
 //! scans when possible.
 //!
-//! Two entry points share the narrowing. [`compute_source`] serves `/query`
-//! and reads the window from the DSL's own `last=`. [`compute_window_source`]
-//! serves a capture (ADR-0057), whose window the server resolved before
-//! execution, and [`selection_bytes`] measures what that selection reaches.
+//! [`select`] computes the selection and [`compute_source`] renders it for
+//! `/query`. A capture (ADR-0057) reads the same selection for the same
+//! text, so it reads what `/query` of its recorded text reads, and
+//! [`selection_bytes`] measures the part of it that can hold the
+//! capture's window.
 
 use std::io;
 use std::path::Path;
 
 use chrono::{DateTime, NaiveDateTime, Timelike as _, Utc};
 use trawl_core::ast::{FieldFilter, FilterOp, FilterValue, Query, SearchToken};
+use trawl_engine::cancel::CancelLatch;
+use trawl_engine::error::EngineError;
+use trawl_engine::parquet_stats::{ParquetStatsError, StatVal, TimestampUnit, read_file_stats};
 
 /// Time filter padding (seconds) to account for WAL compaction delay.
 /// Events ingested at time T may land in the hourly partition for T + ~20s,
@@ -80,42 +84,51 @@ fn extract_eq_filter<'a>(
 /// same parser before it reads, so a source built from DSL that does not
 /// parse never reaches `read_parquet` at all.
 pub(crate) fn compute_source(base_dir: &str, dsl: &str) -> String {
-    let base = base_dir.trim_end_matches('/');
+    select(base_dir, dsl).source()
+}
+
+/// The selection [`compute_source`] renders, before it is rendered: the
+/// rules are [`compute_source`]'s.
+pub(crate) fn select(base_dir: &str, dsl: &str) -> SourceSelection {
+    let base = base_dir.trim_end_matches('/').to_owned();
 
     let Ok(ast) = trawl_core::parser::parse(dsl) else {
-        return no_match_source(base, ANY_SERVICE);
+        return SourceSelection {
+            base,
+            file_pattern: ANY_SERVICE.to_owned(),
+            elements: Vec::new(),
+        };
     };
 
-    let Narrowing { file_pattern, envs } = narrowing(base, &ast);
-    if envs.is_empty() {
-        return no_match_source(base, &file_pattern);
-    }
-
+    let Narrowing { file_pattern, envs } = narrowing(&base, &ast);
     let time_filter = ast.search.time_filter.as_ref().map(|tf| tf.node.duration);
 
-    let mut globs: Vec<String> = Vec::new();
+    let mut elements: Vec<Element> = Vec::new();
     for env in &envs {
         let env_base = format!("{base}/{env}");
         match time_filter {
             Some(duration) => {
-                let scoped = time_scoped_globs(&env_base, duration, &file_pattern);
+                let scoped = time_scoped_dirs(&env_base, duration, &file_pattern);
                 if scoped.is_empty() {
-                    globs.extend(date_scoped_globs(&env_base, &file_pattern));
+                    elements.extend(date_scoped_dirs(&env_base));
                 } else {
-                    globs.extend(scoped);
+                    elements.extend(scoped);
                 }
             }
-            None => globs.extend(date_scoped_globs(&env_base, &file_pattern)),
+            None => elements.extend(date_scoped_dirs(&env_base)),
         }
     }
 
-    if globs.is_empty() {
-        // Every env exists but none holds a matching date directory — the
-        // same "nothing to read" state as a cold start, and the same reason
-        // not to fall back to `{base}/**/` over `scheduled/`.
-        return no_match_source(base, &file_pattern);
+    // No elements is every env existing with no matching date directory,
+    // or no env at all: the same "nothing to read" state as a cold start,
+    // and the same reason not to fall back to `{base}/**/` over
+    // `scheduled/`. [`SourceSelection::source`] renders it as
+    // [`no_match_source`].
+    SourceSelection {
+        base,
+        file_pattern,
+        elements,
     }
-    format!("[{}]", globs.join(", "))
 }
 
 /// The source for "no on-disk file can match": a path segment that is not a
@@ -164,10 +177,10 @@ fn narrowing(base: &str, ast: &Query) -> Narrowing {
     Narrowing { file_pattern, envs }
 }
 
-/// The cold-side selection of a capture window: the partition directories
-/// to read and the one file pattern every directory is read with.
+/// What one `read_parquet()` source reads: the partition directories and
+/// the one file pattern every directory is read with.
 ///
-/// It is structured rather than a source string because the capture needs
+/// It is structured rather than a source string because a capture needs
 /// two things from it: the `read_parquet()` argument ([`Self::source`]) and
 /// the bytes behind it ([`selection_bytes`]), and the second must expand
 /// exactly the directories and pattern the first names.
@@ -177,30 +190,65 @@ pub(crate) struct SourceSelection {
     base: String,
     /// `*.parquet`, or `{service}.parquet` for a pinned service.
     file_pattern: String,
-    /// Existing partition directories, day- or hour-level, in walk order.
-    dirs: Vec<String>,
+    /// The directories, in the order the source lists them.
+    elements: Vec<Element>,
+}
+
+/// One directory of a [`SourceSelection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Element {
+    /// The directory's path.
+    dir: String,
+    /// Read through `**`: the pattern matches files at any depth under
+    /// `dir`, `dir` itself included. Otherwise only the files directly in
+    /// `dir`.
+    recursive: bool,
+}
+
+impl Element {
+    fn hour_or_day(dir: String) -> Self {
+        Self {
+            dir,
+            recursive: false,
+        }
+    }
+
+    fn date(dir: String) -> Self {
+        Self {
+            dir,
+            recursive: true,
+        }
+    }
+
+    /// The element's `read_parquet()` list entry.
+    fn glob(&self, file_pattern: &str) -> String {
+        if self.recursive {
+            format!("'{}/**/{file_pattern}'", self.dir)
+        } else {
+            format!("'{}/{file_pattern}'", self.dir)
+        }
+    }
 }
 
 impl SourceSelection {
     /// The `read_parquet()` source argument: a `DuckDB` list literal with
-    /// one `'{dir}/{file_pattern}'` element per directory, or
-    /// [`no_match_source`] when no directory was selected.
+    /// one entry per directory, or [`no_match_source`] when no directory
+    /// was selected.
     pub(crate) fn source(&self) -> String {
-        if self.dirs.is_empty() {
+        if self.elements.is_empty() {
             return no_match_source(&self.base, &self.file_pattern);
         }
         let globs: Vec<String> = self
-            .dirs
+            .elements
             .iter()
-            .map(|dir| format!("'{dir}/{}'", self.file_pattern))
+            .map(|element| element.glob(&self.file_pattern))
             .collect();
         format!("[{}]", globs.join(", "))
     }
 
-    /// Whether a file name in a selected directory matches the pattern the
-    /// way `DuckDB`'s `glob()` does: `*` matches any run of bytes,
-    /// including an empty one and a leading dot, and the match is
-    /// case-sensitive.
+    /// Whether a file name matches the pattern the way `DuckDB`'s `glob()`
+    /// does: `*` matches any run of bytes, including an empty one and a
+    /// leading dot, and the match is case-sensitive.
     fn matches(&self, name: &std::ffi::OsStr) -> bool {
         let name = name.as_encoded_bytes();
         if self.file_pattern == ANY_SERVICE {
@@ -211,136 +259,185 @@ impl SourceSelection {
     }
 }
 
-/// The source for a capture whose window starts at `start` (ADR-0057).
+/// The bytes of parquet `selection` reaches that can hold an event of the
+/// window `[start, end)`: the summed size of every regular file its pattern
+/// matches in its directories, less each file whose footer statistics put
+/// every `_time` it holds outside the window.
 ///
-/// `env=` and `service=` narrow exactly as in [`compute_source`]. The DSL's
-/// own time clauses are not read: the caller resolved the window and
-/// spliced it into `dsl` already, and `start` is that window's start.
+/// Partitions are named by when compaction wrote them and ingest keeps the
+/// `_time` a sender says (`ingest::envelope`), so no directory name bounds
+/// the `_time` of what it holds: the selection is the whole of what
+/// `/query` reads for the same text, and only the files themselves can say
+/// they hold nothing in the window. The engine's `_time` bounds skip the
+/// same row groups by the same statistics, so a file left out here is one
+/// whose rows the read would not keep. A file counts whole when its footer
+/// gives no such proof: no `_time` column, `_time` not a timestamp in every
+/// row group, no min or max, or a footer the reader refuses. Ticks are read
+/// as UTC whether or not the file marks the column UTC-adjusted, as the
+/// engine's UTC session casts them.
 ///
-/// The selection runs from `start` minus [`TIME_FILTER_PADDING_SECS`] (the
-/// pad the `last=` path widens by) through NOW, never stopping at the
-/// window's end. Partitions are keyed by compaction wall time
-/// (`ingest::compaction`), so an event whose `_time` is inside the window
-/// can sit in any later partition, today's included. The read's SQL bounds
-/// do the exact cut.
-///
-/// The padded start's own date is listed from its hour on, where
-/// `compute_source` takes a historical start day whole. Unlike
-/// `compute_source`, an env with nothing in range contributes
-/// nothing instead of falling back to every date directory it holds. The
-/// fallback would hand an empty window the whole env, and the capture's
-/// source budget would then refuse a quiet window over an old corpus.
-pub(crate) fn compute_window_source(
-    base_dir: &str,
-    dsl: &str,
-    start: DateTime<Utc>,
-) -> SourceSelection {
-    window_source_at(base_dir, dsl, start, Utc::now())
-}
-
-/// [`compute_window_source`] with the clock reading passed in.
-fn window_source_at(
-    base_dir: &str,
-    dsl: &str,
-    start: DateTime<Utc>,
-    now: DateTime<Utc>,
-) -> SourceSelection {
-    let base = base_dir.trim_end_matches('/').to_owned();
-
-    // Unparseable text never reaches `read_parquet`: the executor parses
-    // the same text first (see `compute_source`).
-    let Ok(ast) = trawl_core::parser::parse(dsl) else {
-        return SourceSelection {
-            base,
-            file_pattern: ANY_SERVICE.to_owned(),
-            dirs: Vec::new(),
-        };
-    };
-
-    let Narrowing { file_pattern, envs } = narrowing(&base, &ast);
-    let from = start
-        .naive_utc()
-        .checked_sub_signed(padding())
-        .unwrap_or(NaiveDateTime::MIN);
-    let dirs = envs
-        .iter()
-        .flat_map(|env| {
-            partition_dirs(
-                &format!("{base}/{env}"),
-                from,
-                now.naive_utc(),
-                &file_pattern,
-            )
-        })
-        .collect();
-
-    SourceSelection {
-        base,
-        file_pattern,
-        dirs,
-    }
-}
-
-/// The bytes of parquet `selection` reaches: the summed size of every
-/// regular file its pattern matches in its directories.
+/// The walk lists the directories on disk; it never builds a path the disk
+/// does not hold. It checks `cancel` before each entry and stops with
+/// [`EngineError::Cancelled`] once the work is cancelled, so an abandoned
+/// capture stops walking.
 ///
 /// This is a budget estimate, not a promise. The caller takes it under the
 /// publication read guard, before the engine runs, so no canonical Parquet
 /// publication in this process lands between the measurement and the read.
 /// Retention takes no such guard: a directory that is gone, or a file that
-/// vanishes between the listing and its `stat`, counts as zero. Any other
+/// vanishes between the listing and its footer, counts as zero. Any other
 /// IO error is returned, so the caller cannot mistake an unreadable
 /// directory for an empty one.
 ///
 /// Symlinks are not followed and count as zero. `DuckDB` would read
-/// through a live one, but trawld never writes a symlink into the data
-/// root, which is owner-only (ADR-0052), so a link there is not data this
-/// budget measures. A dangling link matches nothing in `DuckDB` either.
-pub(crate) fn selection_bytes(selection: &SourceSelection) -> io::Result<u64> {
+/// through a live link to a file, but trawld never writes a symlink into
+/// the data root, which is owner-only (ADR-0052), so a link there is not
+/// data this budget measures. A dangling link matches nothing in `DuckDB`
+/// either.
+pub(crate) fn selection_bytes(
+    selection: &SourceSelection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    cancel: &CancelLatch,
+) -> Result<u64, EngineError> {
+    let window = Window {
+        start: i128::from(start.timestamp_micros()),
+        end: i128::from(end.timestamp_micros()),
+    };
     let mut total: u64 = 0;
-    for dir in &selection.dirs {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let entry = entry?;
-            if !selection.matches(&entry.file_name()) {
-                continue;
-            }
-            // `DirEntry::metadata` does not traverse a symlink.
-            let meta = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e),
-            };
-            if meta.file_type().is_file() {
-                total = total.saturating_add(meta.len());
-            }
-        }
+    for element in &selection.elements {
+        let bytes = dir_bytes(
+            selection,
+            Path::new(&element.dir),
+            element.recursive,
+            window,
+            cancel,
+        )?;
+        total = total.saturating_add(bytes);
     }
     Ok(total)
 }
 
-/// [`TIME_FILTER_PADDING_SECS`] as a span.
-fn padding() -> chrono::TimeDelta {
-    chrono::TimeDelta::seconds(
-        i64::try_from(TIME_FILTER_PADDING_SECS).expect("the padding fits in a signed span"),
-    )
+/// A half-open window `[start, end)` in microseconds since the epoch.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    start: i128,
+    end: i128,
 }
 
-/// Time-scoped globs for one env root: hour-level for today, day-level
-/// and/or hour-level for historical dates, existence-filtered. Returns
-/// an empty vec when nothing on disk matches the window.
+/// The bytes under one directory of `selection`, for [`selection_bytes`].
+fn dir_bytes(
+    selection: &SourceSelection,
+    dir: &Path,
+    recursive: bool,
+    window: Window,
+    cancel: &CancelLatch,
+) -> Result<u64, EngineError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(EngineError::Io(e)),
+    };
+    let mut total: u64 = 0;
+    for entry in entries {
+        if cancel.latched() {
+            return Err(EngineError::Cancelled);
+        }
+        let entry = entry.map_err(EngineError::Io)?;
+        // `DirEntry::file_type` does not traverse a symlink.
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(EngineError::Io(e)),
+        };
+        let bytes = if file_type.is_dir() {
+            // `**` descends into every directory, a dot-named one or one
+            // whose own name matches the pattern included, and matches
+            // only files.
+            if !recursive {
+                continue;
+            }
+            dir_bytes(selection, &entry.path(), true, window, cancel)?
+        } else if file_type.is_file() && selection.matches(&entry.file_name()) {
+            file_bytes(&entry, window)?
+        } else {
+            continue;
+        };
+        total = total.saturating_add(bytes);
+    }
+    Ok(total)
+}
+
+/// One matching regular file's bytes, or zero when its footer proves it
+/// holds no `_time` in `window` or it vanished (see [`selection_bytes`]).
+fn file_bytes(entry: &std::fs::DirEntry, window: Window) -> Result<u64, EngineError> {
+    let len = match entry.metadata() {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(EngineError::Io(e)),
+    };
+    match read_file_stats(&entry.path()) {
+        Ok(stats) => {
+            let outside = stats
+                .columns
+                .iter()
+                .find(|column| column.name == trawl_core::schema::TIME)
+                .is_some_and(|time| outside_window(time.samples.min(), time.samples.max(), window));
+            Ok(if outside { 0 } else { len })
+        }
+        Err(ParquetStatsError::Open { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            Ok(0)
+        }
+        Err(ParquetStatsError::Open { source, .. }) => Err(EngineError::Io(source)),
+        // A footer the reader refuses reaches the engine whole, which
+        // reads or refuses it on its own terms.
+        Err(_) => Ok(len),
+    }
+}
+
+/// Whether a column whose values lie in `[min, max]` holds nothing in
+/// `window`: both bounds are timestamps, and the latest is before the
+/// window or the earliest at or after its end. A bound read at a finer unit
+/// than the microsecond is widened outward to whole microseconds, so a cast
+/// that truncates or rounds it cannot move a value across the window.
+fn outside_window(min: Option<&StatVal>, max: Option<&StatVal>, window: Window) -> bool {
+    let (Some(min), Some(max)) = (
+        min.and_then(|min| micros(min, false)),
+        max.and_then(|max| micros(max, true)),
+    ) else {
+        return false;
+    };
+    max < window.start || min >= window.end
+}
+
+/// A timestamp sample in microseconds since the epoch, rounded down, or up
+/// when `ceil`. `None` for any other sample.
+fn micros(sample: &StatVal, ceil: bool) -> Option<i128> {
+    let StatVal::Timestamp { raw, unit, .. } = sample else {
+        return None;
+    };
+    let raw = i128::from(*raw);
+    Some(match unit {
+        TimestampUnit::Millis => raw * 1_000,
+        TimestampUnit::Micros => raw,
+        TimestampUnit::Nanos if ceil => {
+            raw.div_euclid(1_000) + i128::from(raw.rem_euclid(1_000) != 0)
+        }
+        TimestampUnit::Nanos => raw.div_euclid(1_000),
+    })
+}
+
+/// Time-scoped directories for one env root: hour-level for today,
+/// day-level and/or hour-level for historical dates, existence-filtered.
+/// Returns an empty vec when nothing on disk matches the window.
 ///
 /// A historical start day is selected whole, every hour of it: the walk
 /// starts at that day's midnight rather than at the padded start's hour.
-fn time_scoped_globs(
+fn time_scoped_dirs(
     base: &str,
     duration: trawl_core::ast::TrawlDuration,
     file_pattern: &str,
-) -> Vec<String> {
+) -> Vec<Element> {
     let total_secs = duration
         .to_seconds()
         .saturating_add(TIME_FILTER_PADDING_SECS);
@@ -358,7 +455,7 @@ fn time_scoped_globs(
     // "No files found" error before the executor safety net catches it.
     partition_dirs(base, from, now.naive_utc(), file_pattern)
         .into_iter()
-        .map(|dir| format!("'{dir}/{file_pattern}'"))
+        .map(Element::hour_or_day)
         .collect()
 }
 
@@ -424,31 +521,31 @@ fn partition_dirs(
     dirs
 }
 
-/// Date-scoped globs for one env root, for queries without a time filter.
+/// Date-scoped directories for one env root, for queries without a
+/// `last=` filter.
 ///
-/// Enumerates directories matching `YYYY-MM-DD` in the env base and
-/// builds one recursive glob per date dir. Returns an empty vec when the
-/// env base holds no date dirs.
-fn date_scoped_globs(base: &str, file_pattern: &str) -> Vec<String> {
+/// Enumerates directories matching `YYYY-MM-DD` in the env base, each read
+/// through `**`. Returns an empty vec when the env base holds no date dirs.
+fn date_scoped_dirs(base: &str) -> Vec<Element> {
     let Ok(entries) = std::fs::read_dir(base) else {
         return Vec::new();
     };
 
-    let mut globs = Vec::new();
+    let mut dirs = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
             continue;
         };
         if is_date_dir_name(name_str) && entry.path().is_dir() {
-            globs.push(format!("'{base}/{name_str}/**/{file_pattern}'"));
+            dirs.push(format!("{base}/{name_str}"));
         }
     }
 
     // `read_dir` yields entries in filesystem order; sort so the emitted
     // source list is stable across calls.
-    globs.sort();
-    globs
+    dirs.sort();
+    dirs.into_iter().map(Element::date).collect()
 }
 
 /// Check if a directory name looks like `YYYY-MM-DD`.
@@ -1039,8 +1136,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Capture windows (ADR-0057): `compute_window_source`, `selection_bytes`
+    // Capture windows (ADR-0057): `select`, `selection_bytes`
     // -----------------------------------------------------------------
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     fn at(text: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(text)
@@ -1053,256 +1153,245 @@ mod tests {
         std::fs::create_dir_all(root.join(rel)).unwrap();
     }
 
-    /// Write `len` bytes to `{root}/{rel}`, creating its directory.
-    fn write_len(root: &Path, rel: &str, len: usize) {
+    /// Write `len` bytes to `{root}/{rel}`, creating its directory: a file
+    /// whose footer no reader accepts.
+    fn write_len(root: &Path, rel: &str, len: usize) -> u64 {
         let path = root.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![b'x'; len]).unwrap();
+        u64::try_from(len).unwrap()
+    }
+
+    /// Write `{root}/{rel}` as parquet with one row per `_time`, each a
+    /// `DuckDB` timestamp of `ty`, and return its size.
+    fn write_times(root: &Path, rel: &str, ty: &str, times: &[&str]) -> u64 {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let rows: Vec<String> = times
+            .iter()
+            .map(|t| format!("(CAST('{t}' AS {ty}), 'm')"))
+            .collect();
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT * FROM (VALUES {}) AS t(_time, message)) \
+                 TO '{}' (FORMAT PARQUET)",
+                rows.join(", "),
+                path.display()
+            ))
+            .unwrap();
+        std::fs::metadata(path).unwrap().len()
     }
 
     /// The selected directories relative to `root`, for readable asserts.
     fn rel_dirs(selection: &SourceSelection, root: &Path) -> Vec<String> {
         let prefix = format!("{}/", root.to_str().unwrap());
         selection
-            .dirs
+            .elements
             .iter()
-            .map(|d| d.strip_prefix(&prefix).unwrap_or(d).to_owned())
+            .map(|e| e.dir.strip_prefix(&prefix).unwrap_or(&e.dir).to_owned())
             .collect()
     }
 
+    /// A latch nothing sets.
+    fn running() -> CancelLatch {
+        CancelLatch::never()
+    }
+
+    /// A capture's executed text for `[earliest, latest)` over `head`.
+    fn executed(head: &str, earliest: &str, latest: &str) -> String {
+        let text = format!("{head} earliest={earliest} latest={latest}");
+        trawl_core::parser::parse(&text).expect("the executed text parses");
+        text
+    }
+
     #[test]
-    fn a_window_starting_yesterday_selects_todays_partitions() {
+    fn a_window_selects_every_date_directory_as_query_does() {
+        // The window's clauses never prune by directory name: a partition
+        // is named by when compaction wrote it, not by the `_time` it holds.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
-        for rel in [
-            "prod/2026-10-22/22",
-            "prod/2026-10-22/23",
-            "prod/2026-10-23/00",
-            "prod/2026-10-23/09",
-        ] {
-            mkdir(tmp.path(), rel);
-        }
-
-        let selection = window_source_at(
-            base,
-            "service=nginx",
-            at("2026-10-22T23:50:00Z"),
-            at("2026-10-23T09:30:00Z"),
+        mkdir(tmp.path(), "prod/2026-10-21/13");
+        mkdir(tmp.path(), "prod/2026-10-23/09");
+        mkdir(tmp.path(), "prod/notes");
+        mkdir(tmp.path(), "lab/2026-10-22");
+        let text = executed(
+            "env=prod service=nginx",
+            "2026-10-23T09:00:00Z",
+            "2026-10-23T09:30:00Z",
         );
+
+        let selection = select(base, &text);
 
         assert_eq!(
             rel_dirs(&selection, tmp.path()),
-            [
-                "prod/2026-10-22/22",
-                "prod/2026-10-22/23",
-                "prod/2026-10-23/00",
-                "prod/2026-10-23/09",
-            ],
-            "the padded start (22:50 yesterday) through today's hour"
+            ["prod/2026-10-21", "prod/2026-10-23"]
         );
+        assert!(selection.elements.iter().all(|e| e.recursive));
+        assert_eq!(selection.source(), compute_source(base, &text));
         assert_eq!(
             selection.source(),
             format!(
-                "['{base}/prod/2026-10-22/22/nginx.parquet', \
-                 '{base}/prod/2026-10-22/23/nginx.parquet', \
-                 '{base}/prod/2026-10-23/00/nginx.parquet', \
-                 '{base}/prod/2026-10-23/09/nginx.parquet']"
+                "['{base}/prod/2026-10-21/**/nginx.parquet', \
+                 '{base}/prod/2026-10-23/**/nginx.parquet']"
             )
         );
     }
 
     #[test]
-    fn a_window_ending_last_week_still_selects_through_today() {
-        // Only the start is passed: a late event with an old `_time` sits
-        // in today's partition, so the window's end never trims the walk.
+    fn selection_bytes_counts_the_files_that_can_hold_the_window() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
-        write_len(tmp.path(), "prod/2026-10-15/nginx.parquet", 1);
-        mkdir(tmp.path(), "prod/2026-10-16/10");
-        mkdir(tmp.path(), "prod/2026-10-23/08");
-        mkdir(tmp.path(), "prod/2026-10-14/23");
-
-        let selection = window_source_at(
-            base,
-            "*",
-            at("2026-10-15T12:00:00Z"),
-            at("2026-10-23T08:05:00Z"),
+        // A day-level file two days old whose sender ran ahead: its
+        // `_time` is inside the window.
+        let skewed = write_times(
+            tmp.path(),
+            "prod/2026-10-21/nginx.parquet",
+            "TIMESTAMP",
+            &["2026-10-21 13:00:00", "2026-10-23 09:10:00"],
         );
+        // This hour, every `_time` before the window.
+        write_times(
+            tmp.path(),
+            "prod/2026-10-23/09/postgres.parquet",
+            "TIMESTAMP",
+            &["2026-10-23 08:00:00", "2026-10-23 08:59:59.999999"],
+        );
+        // The last microsecond inside the window.
+        let last = write_times(
+            tmp.path(),
+            "prod/2026-10-23/09/redis.parquet",
+            "TIMESTAMP",
+            &["2026-10-23 09:29:59.999999"],
+        );
+        // The window's end, which it excludes.
+        write_times(
+            tmp.path(),
+            "prod/2026-10-23/10/api.parquet",
+            "TIMESTAMP",
+            &["2026-10-23 09:30:00"],
+        );
+        // UTC-adjusted ticks are read as instants too.
+        let zoned = write_times(
+            tmp.path(),
+            "prod/2026-10-23/10/edge.parquet",
+            "TIMESTAMPTZ",
+            &["2026-10-23 09:00:00+00"],
+        );
+        // No footer to prove anything: counted whole.
+        let unreadable = write_len(tmp.path(), "prod/2026-10-23/10/torn.parquet", 13);
+        let (start, end) = (at("2026-10-23T09:00:00Z"), at("2026-10-23T09:30:00Z"));
 
+        let every = select(
+            base,
+            &executed("*", "2026-10-23T09:00:00Z", "2026-10-23T09:30:00Z"),
+        );
         assert_eq!(
-            rel_dirs(&selection, tmp.path()),
-            [
-                "prod/2026-10-15",
-                "prod/2026-10-16/10",
-                "prod/2026-10-23/08"
-            ],
-            "a rolled-up start day, a later day and today; nothing before the padded start"
+            selection_bytes(&every, start, end, &running()).unwrap(),
+            skewed + last + zoned + unreadable
+        );
+        let nginx = select(
+            base,
+            &executed(
+                "service=nginx",
+                "2026-10-23T09:00:00Z",
+                "2026-10-23T09:30:00Z",
+            ),
+        );
+        assert_eq!(
+            selection_bytes(&nginx, start, end, &running()).unwrap(),
+            skewed
         );
     }
 
     #[test]
-    fn the_padded_start_crosses_a_year_and_a_month_boundary() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_str().unwrap();
-        for rel in [
-            "prod/2025-12-31/22",
-            "prod/2025-12-31/23",
-            "prod/2026-01-01/00",
-            "prod/2026-01-01/02",
-            "prod/2026-02-28/22",
-            "prod/2026-02-28/23",
-            "prod/2026-03-01/00",
-        ] {
-            mkdir(tmp.path(), rel);
-        }
-
-        let year = window_source_at(
-            base,
-            "*",
-            at("2026-01-01T00:30:00Z"),
-            at("2026-01-01T02:10:00Z"),
+    fn a_footer_without_timestamp_bounds_counts_whole() {
+        let window = Window {
+            start: i128::from(at("2026-10-23T09:00:00Z").timestamp_micros()),
+            end: i128::from(at("2026-10-23T09:30:00Z").timestamp_micros()),
+        };
+        let early = StatVal::Timestamp {
+            raw: at("2026-10-23T08:00:00Z").timestamp_micros(),
+            unit: TimestampUnit::Micros,
+            utc: false,
+        };
+        assert!(outside_window(Some(&early), Some(&early), window));
+        assert!(!outside_window(None, Some(&early), window), "no min");
+        assert!(!outside_window(Some(&early), None, window), "no max");
+        let text = StatVal::Bytes(b"2026-10-23 08:00:00".to_vec());
+        assert!(
+            !outside_window(Some(&text), Some(&text), window),
+            "a text `_time` orders as text, not as instants"
         );
-        assert_eq!(
-            rel_dirs(&year, tmp.path()),
-            [
-                "prod/2025-12-31/23",
-                "prod/2026-01-01/00",
-                "prod/2026-01-01/02"
-            ],
-            "00:30 minus the pad is 23:30 on the last day of the previous year"
-        );
-
-        let month = window_source_at(
-            base,
-            "*",
-            at("2026-03-01T00:10:00Z"),
-            at("2026-03-01T00:20:00Z"),
-        );
-        assert_eq!(
-            rel_dirs(&month, tmp.path()),
-            ["prod/2026-02-28/23", "prod/2026-03-01/00"],
-            "00:10 minus the pad is 23:10 on the last day of February"
-        );
+        assert!(!outside_window(
+            Some(&StatVal::Int(0)),
+            Some(&StatVal::Int(1)),
+            window
+        ));
     }
 
     #[test]
-    fn a_missing_date_directory_is_skipped() {
+    fn finer_timestamps_widen_outward_to_whole_microseconds() {
+        let start = at("2026-10-23T09:00:00Z");
+        let window = Window {
+            start: i128::from(start.timestamp_micros()),
+            end: i128::from(at("2026-10-23T09:30:00Z").timestamp_micros()),
+        };
+        let nanos = |offset: i64| StatVal::Timestamp {
+            raw: start.timestamp_nanos_opt().unwrap() + offset,
+            unit: TimestampUnit::Nanos,
+            utc: true,
+        };
+        // 500 ns before the start could round onto it: not provably out.
+        let close = nanos(-500);
+        assert!(!outside_window(Some(&close), Some(&close), window));
+        // A whole microsecond before it is out.
+        let before = nanos(-1_000);
+        assert!(outside_window(Some(&before), Some(&before), window));
+        let millis = StatVal::Timestamp {
+            raw: start.timestamp_millis() - 1,
+            unit: TimestampUnit::Millis,
+            utc: false,
+        };
+        assert!(outside_window(Some(&millis), Some(&millis), window));
+        assert_eq!(micros(&nanos(-1), false), Some(window.start - 1));
+        assert_eq!(micros(&nanos(-1), true), Some(window.start));
+        assert_eq!(micros(&nanos(1), false), Some(window.start));
+        assert_eq!(micros(&nanos(1), true), Some(window.start + 1));
+    }
+
+    #[test]
+    fn an_empty_selection_reads_nothing_and_measures_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
-        // 2026-10-21 and 2026-10-22 never had data.
-        mkdir(tmp.path(), "prod/2026-10-20/18");
-        mkdir(tmp.path(), "prod/2026-10-23/07");
+        let (start, end) = (at("2026-10-23T09:00:00Z"), at("2026-10-23T09:15:00Z"));
 
-        let selection = window_source_at(
+        let cold_start = select(
             base,
-            "*",
-            at("2026-10-20T18:30:00Z"),
-            at("2026-10-23T07:45:00Z"),
+            &executed("*", "2026-10-23T09:00:00Z", "2026-10-23T09:15:00Z"),
         );
-
+        assert!(cold_start.elements.is_empty(), "{cold_start:?}");
         assert_eq!(
-            rel_dirs(&selection, tmp.path()),
-            ["prod/2026-10-20/18", "prod/2026-10-23/07"]
+            cold_start.source(),
+            format!("{base}/.no-such-env/*.parquet")
         );
-    }
-
-    #[test]
-    fn an_empty_window_selects_nothing_rather_than_every_date() {
-        // `compute_source` falls back to every date directory when a
-        // `last=` window finds none; a capture's budget must not see that.
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_str().unwrap();
-        write_len(tmp.path(), "prod/2026-01-15/nginx.parquet", 10);
-
-        let selection = window_source_at(
-            base,
-            "*",
-            at("2026-10-23T09:00:00Z"),
-            at("2026-10-23T09:15:00Z"),
+        assert!(glob_matches(&cold_start.source()).is_empty());
+        assert_eq!(
+            selection_bytes(&cold_start, start, end, &running()).unwrap(),
+            0
         );
 
-        assert!(selection.dirs.is_empty(), "{selection:?}");
-        assert_eq!(selection.source(), format!("{base}/.no-such-env/*.parquet"));
-        assert!(glob_matches(&selection.source()).is_empty());
-        assert_eq!(selection_bytes(&selection).unwrap(), 0);
-    }
-
-    #[test]
-    fn a_window_source_narrows_env_and_service_like_compute_source() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_str().unwrap();
         mkdir(tmp.path(), "prod/2026-10-23/09");
-        mkdir(tmp.path(), "lab/2026-10-23/09");
-        let start = at("2026-10-23T09:10:00Z");
-        let now = at("2026-10-23T09:20:00Z");
-
-        let both = window_source_at(base, "env=lab service=nginx", start, now);
-        assert_eq!(rel_dirs(&both, tmp.path()), ["lab/2026-10-23/09"]);
-        assert_eq!(both.file_pattern, "nginx.parquet");
-
-        let every_env = window_source_at(base, "*", start, now);
-        let mut dirs = rel_dirs(&every_env, tmp.path());
-        dirs.sort();
-        assert_eq!(dirs, ["lab/2026-10-23/09", "prod/2026-10-23/09"]);
-        assert_eq!(every_env.file_pattern, "*.parquet");
-
-        // A value no on-disk env or file can carry selects nothing and is
-        // never spliced into the source.
-        let bad_env = window_source_at(base, "env=../evil", start, now);
-        assert!(bad_env.dirs.is_empty());
-        let bad_service = window_source_at(base, r#"service="x', '/etc""#, start, now);
+        let bad_env = select(base, "env=../evil");
+        assert!(bad_env.elements.is_empty());
+        let bad_service = select(base, r#"service="x', '/etc""#);
         assert_eq!(bad_service.file_pattern, "*.parquet");
         assert!(!bad_service.source().contains("/etc"));
-
-        let unparseable = window_source_at(base, "| | broken", start, now);
+        let unparseable = select(base, "| | broken");
         assert_eq!(
             unparseable.source(),
             format!("{base}/.no-such-env/*.parquet")
         );
-    }
-
-    #[test]
-    fn the_window_source_reads_the_clock_for_its_end() {
-        // The public entry point: a window that started a minute ago
-        // reaches the partition compaction is writing right now.
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_str().unwrap();
-        let now = Utc::now();
-        let hour_dir = format!("prod/{}", now.format("%Y-%m-%d/%H"));
-        write_len(tmp.path(), &format!("{hour_dir}/nginx.parquet"), 7);
-
-        let selection =
-            compute_window_source(base, "service=nginx", now - chrono::TimeDelta::minutes(1));
-
-        assert!(
-            rel_dirs(&selection, tmp.path()).contains(&hour_dir),
-            "{selection:?}"
-        );
-        assert_eq!(selection_bytes(&selection).unwrap(), 7);
-    }
-
-    #[test]
-    fn selection_bytes_sums_the_matching_regular_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().to_str().unwrap();
-        write_len(tmp.path(), "prod/2026-10-22/nginx.parquet", 100); // day-level
-        write_len(tmp.path(), "prod/2026-10-22/23/postgres.parquet", 20);
-        write_len(tmp.path(), "prod/2026-10-23/09/nginx.parquet", 3);
-        write_len(tmp.path(), "prod/2026-10-23/09/redis.parquet", 4);
-        // Never read by `*.parquet`: a compaction stage and a stray file.
-        write_len(tmp.path(), "prod/2026-10-23/09/nginx.parquet.tmp", 1000);
-        write_len(tmp.path(), "prod/2026-10-23/09/notes.txt", 1000);
-        // Outside the selection: before the padded start.
-        write_len(tmp.path(), "prod/2026-10-21/nginx.parquet", 1000);
-
-        let start = at("2026-10-22T23:30:00Z");
-        let now = at("2026-10-23T09:40:00Z");
-
-        let every = window_source_at(base, "*", start, now);
-        assert_eq!(selection_bytes(&every).unwrap(), 100 + 20 + 3 + 4);
-
-        let nginx = window_source_at(base, "service=nginx", start, now);
-        assert_eq!(selection_bytes(&nginx).unwrap(), 100 + 3);
     }
 
     #[test]
@@ -1317,26 +1406,29 @@ mod tests {
             hour.join("dangling.parquet"),
         )
         .unwrap();
-        // A live link to a large file outside the data layout.
+        // A live link to a large file, and one to a directory of them,
+        // outside the data layout.
         write_len(tmp.path(), "elsewhere/big.parquet", 4096);
         std::os::unix::fs::symlink(
             tmp.path().join("elsewhere/big.parquet"),
             hour.join("linked.parquet"),
         )
         .unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("elsewhere"), hour.join("linkdir")).unwrap();
 
-        let selection = window_source_at(
-            base,
-            "*",
-            at("2026-10-23T09:00:00Z"),
-            at("2026-10-23T09:10:00Z"),
-        );
+        let selection = select(base, "*");
 
-        assert_eq!(rel_dirs(&selection, tmp.path()), ["prod/2026-10-23/09"]);
+        assert_eq!(rel_dirs(&selection, tmp.path()), ["prod/2026-10-23"]);
         assert_eq!(
-            selection_bytes(&selection).unwrap(),
+            selection_bytes(
+                &selection,
+                at("2026-10-23T09:00:00Z"),
+                at("2026-10-23T09:10:00Z"),
+                &running()
+            )
+            .unwrap(),
             5,
-            "only the regular file counts; neither link is followed"
+            "only the regular file counts; no link is followed"
         );
     }
 
@@ -1346,54 +1438,82 @@ mod tests {
         let base = tmp.path().to_str().unwrap();
         write_len(tmp.path(), "prod/2026-10-22/23/nginx.parquet", 9);
         write_len(tmp.path(), "prod/2026-10-23/09/nginx.parquet", 2);
-        let selection = window_source_at(
-            base,
-            "*",
-            at("2026-10-23T00:10:00Z"),
-            at("2026-10-23T09:10:00Z"),
+        let selection = select(base, "*");
+        let (start, end) = (at("2026-10-23T00:10:00Z"), at("2026-10-23T09:10:00Z"));
+        assert_eq!(
+            selection_bytes(&selection, start, end, &running()).unwrap(),
+            11
         );
-        assert_eq!(selection_bytes(&selection).unwrap(), 11);
 
-        // Retention removed the oldest hour after the walk listed it.
-        std::fs::remove_dir_all(tmp.path().join("prod/2026-10-22/23")).unwrap();
-        assert_eq!(selection_bytes(&selection).unwrap(), 2);
+        // Retention removed the oldest day after the walk listed it.
+        std::fs::remove_dir_all(tmp.path().join("prod/2026-10-22")).unwrap();
+        assert_eq!(
+            selection_bytes(&selection, start, end, &running()).unwrap(),
+            2
+        );
     }
 
-    /// Drift guard: the file matcher `selection_bytes` sizes must reach
-    /// the files `read_parquet` reaches through the same element, on every
-    /// non-symlink shape a partition directory can hold.
+    #[test]
+    fn a_cancelled_walk_stops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        write_len(tmp.path(), "prod/2026-10-23/09/nginx.parquet", 2);
+        let selection = select(base, "*");
+        let cancelled = CancelLatch::new(Arc::new(AtomicBool::new(true)));
+
+        let walked = selection_bytes(
+            &selection,
+            at("2026-10-23T09:00:00Z"),
+            at("2026-10-23T09:10:00Z"),
+            &cancelled,
+        );
+
+        assert!(matches!(walked, Err(EngineError::Cancelled)), "{walked:?}");
+    }
+
+    /// Drift guard: the files `selection_bytes` sizes must be the files
+    /// `read_parquet` reaches through the same elements, on every
+    /// non-symlink shape a date directory can hold.
     #[test]
     fn selection_bytes_matches_what_duckdb_glob_matches() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_str().unwrap();
-        let dir = "prod/2026-10-23/09";
+        let day = "prod/2026-10-23";
         for name in [
             "nginx.parquet",
-            "redis.parquet",
-            ".parquet",
-            ".hidden.parquet",
-            "nginx.parquet.tmp",
-            "upper.PARQUET",
-            "nginx.parquetx",
+            "09/nginx.parquet",
+            "09/redis.parquet",
+            "09/.parquet",
+            "09/.hidden.parquet",
+            "09/nginx.parquet.tmp",
+            "09/upper.PARQUET",
+            "09/nginx.parquetx",
+            "09/deeper/nginx.parquet",
+            ".stage/nginx.parquet",
+            "dir.parquet/nginx.parquet",
+            "notes.txt",
         ] {
-            write_len(tmp.path(), &format!("{dir}/{name}"), 1);
+            write_len(tmp.path(), &format!("{day}/{name}"), 1);
         }
-        mkdir(tmp.path(), &format!("{dir}/dir.parquet"));
 
         for dsl in ["*", "service=nginx", "service=absent"] {
-            let selection = window_source_at(
-                base,
-                dsl,
-                at("2026-10-23T09:00:00Z"),
-                at("2026-10-23T09:10:00Z"),
-            );
-            assert_eq!(rel_dirs(&selection, tmp.path()), [dir]);
-            let element = format!("{base}/{dir}/{}", selection.file_pattern);
-            let duckdb = u64::try_from(glob_matches(&element).len()).unwrap();
+            let selection = select(base, dsl);
+            assert_eq!(rel_dirs(&selection, tmp.path()), [day]);
+            let duckdb: usize = selection
+                .elements
+                .iter()
+                .map(|e| glob_matches(&e.glob(&selection.file_pattern).replace('\'', "")).len())
+                .sum();
             assert_eq!(
-                selection_bytes(&selection).unwrap(),
-                duckdb,
-                "one byte per file, so the counts must agree for {dsl:?}"
+                selection_bytes(
+                    &selection,
+                    at("2026-10-23T09:00:00Z"),
+                    at("2026-10-23T09:10:00Z"),
+                    &running()
+                )
+                .unwrap(),
+                u64::try_from(duckdb).unwrap(),
+                "one unreadable byte per file, so the counts must agree for {dsl:?}"
             );
         }
     }

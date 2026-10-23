@@ -549,10 +549,11 @@ async fn plan(
     })?;
 
     match resolved.source {
-        Source::Live { earliest, .. } => Ok(Plan {
+        Source::Live { earliest, latest } => Ok(Plan {
             lane_dsl: resolved.executed.clone(),
             lane_source: CaptureSource::Window {
                 start: earliest,
+                end: latest,
                 max_bytes: capture.source_max_bytes,
             },
             run_files: Vec::new(),

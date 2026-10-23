@@ -45,7 +45,6 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use trawl_engine::cancel::CancelLatch;
-use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, QueryBudgets, RowCap};
 use trawl_engine::scratch::{QueryScratch, ScratchLock};
 use trawl_engine::timing::{PhaseClock, QueryPhase};
@@ -55,7 +54,7 @@ use crate::deadline::Deadline;
 use crate::error::{CAPACITY_NOT_STARTED, ServerError};
 use crate::hot_buffer::{HotBuffer, HotSnapshot};
 use crate::query_timing::{Outcome, PhysicalOutcome, QueryTiming, Reclaim, emit_reclaimed};
-use crate::source::{compute_source, compute_window_source, selection_bytes};
+use crate::source::{compute_source, select, selection_bytes};
 
 /// Test-only delay injected into the blocking query task so timeout and
 /// cancellation tests can reliably win the `select!`/cancel race. Zero means
@@ -1020,15 +1019,18 @@ pub struct ExecuteOutcome {
 /// What a capture reads its stored events from (ADR-0057).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureSource {
-    /// A live window starting at `start`. The worker selects the partition
-    /// directories from `start`, less the compaction pad, through now,
-    /// under the publication guard, measures the files they hold, and
-    /// refuses a selection above `max_bytes` with
-    /// [`ServerError::CaptureSourceTooLarge`] before the engine runs. The
-    /// read includes the hot buffer, as `/query`'s does.
+    /// A live window `[start, end)`. The worker selects what `/query`
+    /// selects for the same text (`source::select`), under the publication
+    /// guard, measures the files in it that can hold the window
+    /// (`source::selection_bytes`), and refuses a measure above
+    /// `max_bytes` with [`ServerError::CaptureSourceTooLarge`] before the
+    /// engine runs. The read includes the hot buffer, as `/query`'s does.
     Window {
         /// The resolved window's start, the one spliced into the DSL.
         start: DateTime<Utc>,
+        /// The resolved window's exclusive end, the one spliced into the
+        /// DSL.
+        end: DateTime<Utc>,
         /// `[capture] source_max_bytes`.
         max_bytes: u64,
     },
@@ -2674,17 +2676,23 @@ impl ExecutorPool {
                     }
                     slot.started_timing();
 
-                    // The budget is measured over the very selection the
-                    // engine reads, under the publication guard, and refused
-                    // before anything is scanned (ADR-0057).
+                    // The engine reads the selection `/query` reads for this
+                    // text, and the budget is measured over it, under the
+                    // publication guard, and refused before anything is
+                    // scanned (ADR-0057). A cancellation stops the walk.
                     let clock = slot.clock();
                     let (source, source_bytes, hot) = match source {
-                        CaptureSource::Window { start, max_bytes } => {
+                        CaptureSource::Window {
+                            start,
+                            end,
+                            max_bytes,
+                        } => {
                             let selected = clock.time(QueryPhase::Source, || {
-                                let selection = compute_window_source(&base_dir, &dsl, start);
-                                selection_bytes(&selection).map(|bytes| (selection, bytes))
+                                let selection = select(&base_dir, &dsl);
+                                selection_bytes(&selection, start, end, &slot.cancel_latch())
+                                    .map(|bytes| (selection, bytes))
                             });
-                            let (selection, selected_bytes) = selected.map_err(EngineError::Io)?;
+                            let (selection, selected_bytes) = selected?;
                             if selected_bytes > max_bytes {
                                 // Counts only: no path, no partition, no DSL.
                                 tracing::warn!(
@@ -5873,11 +5881,18 @@ mod tests {
         );
     }
 
-    /// A live 15-minute window ending now, under a budget nothing reaches.
+    /// The hour holding [`cold_and_hot_pool`]'s rows, under a budget
+    /// nothing reaches.
     fn window() -> CaptureSource {
+        window_under(u64::MAX)
+    }
+
+    /// [`window`] under a budget of `max_bytes`.
+    fn window_under(max_bytes: u64) -> CaptureSource {
         CaptureSource::Window {
-            start: Utc::now() - chrono::TimeDelta::minutes(15),
-            max_bytes: u64::MAX,
+            start: "2026-01-03T00:00:00Z".parse().unwrap(),
+            end: "2026-01-03T01:00:00Z".parse().unwrap(),
+            max_bytes,
         }
     }
 
@@ -6192,10 +6207,7 @@ mod tests {
             .capture(
                 id,
                 "*",
-                CaptureSource::Window {
-                    start: Utc::now() - chrono::TimeDelta::minutes(15),
-                    max_bytes: 1,
-                },
+                window_under(1),
                 RowCap::Refuse(100),
                 Deadline::after(Duration::from_secs(60)),
                 0,
@@ -6362,7 +6374,10 @@ mod tests {
             .await
             .expect_err("the query does not parse");
         assert!(
-            matches!(failed, ServerError::Engine(EngineError::Parse(_))),
+            matches!(
+                failed,
+                ServerError::Engine(trawl_engine::error::EngineError::Parse(_))
+            ),
             "{failed:?}"
         );
         assert!(!finished.load(Ordering::SeqCst), "finish never ran");

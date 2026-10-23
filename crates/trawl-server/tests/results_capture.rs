@@ -651,6 +651,118 @@ async fn a_selection_over_the_source_budget_is_refused_before_work_starts() {
     assert_eq!(started.arrivals(), 1);
 }
 
+/// The page of a capture of `window`, and what `/query` answers for its
+/// recorded text right after.
+async fn captured_and_live(
+    server: &TestServer,
+    dsl: &str,
+    window: &serde_json::Value,
+) -> (
+    trawl_api::results::ResultPage,
+    trawl_api::value::QueryResult,
+) {
+    let body = json!({ "query": dsl, "window": window });
+    let result = captured::captured(server, &server.analyst_token, &body)
+        .await
+        .result;
+    let (status, _, page) = captured::page(server, &server.analyst_token, &result.id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let page = serde_json::from_value(page).unwrap();
+    (page, query(server, &result.executed_query).await)
+}
+
+/// A capture reads what `/query` reads for the text it recorded, whatever
+/// partition holds the event. Compaction names a partition by when it
+/// wrote it, and ingest keeps the `_time` a sender says, so an event's
+/// partition does not bound its `_time` (ADR-0057):
+///
+/// - a sender stamping six hours ahead: its event is compacted now, into
+///   this hour's partition, and drained from the hot buffer, and the
+///   capture covers the hour around its `_time`;
+/// - a sender whose clock ran two days ahead: its partition was written
+///   two days ago, and its `_time` is ten minutes ago, inside a capture of
+///   the last half hour.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capture_reads_what_query_reads_whatever_partition_holds_the_event() {
+    let now = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp(), 0).unwrap();
+    let ahead = now + TimeDelta::hours(6);
+    let skewed = now - TimeDelta::minutes(10);
+    let written = (now - TimeDelta::days(2))
+        .format("prod/%Y-%m-%d/%H")
+        .to_string();
+    let rfc3339 = |at: chrono::DateTime<chrono::Utc>| at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let (fixture, server) = captured::Restartable::boot(
+        RateLimitConfig::default(),
+        CaptureConfig::default(),
+        |data| {
+            captured::seed_partition(
+                data,
+                &written,
+                "skewed",
+                &[captured::Event {
+                    time: skewed,
+                    host: "web08".into(),
+                    message: "two days ahead".into(),
+                }],
+            );
+        },
+    )
+    .await;
+    captured::ingest(
+        &server,
+        &[json!({
+            "_time": rfc3339(ahead),
+            "service": "ahead",
+            "host": "web09",
+            "message": "six hours ahead",
+        })],
+    )
+    .await;
+    captured::compact(&server, &fixture.disk).await;
+    assert_eq!(
+        server
+            .state
+            .query
+            .hot_buffer
+            .as_ref()
+            .unwrap()
+            .event_count(),
+        0,
+        "the event is stored, not hot"
+    );
+
+    for (dsl, window, message) in [
+        (
+            "service=ahead",
+            json!({
+                "earliest": rfc3339(ahead - TimeDelta::minutes(30)),
+                "latest": rfc3339(ahead + TimeDelta::minutes(30)),
+            }),
+            "six hours ahead",
+        ),
+        (
+            "service=skewed",
+            json!({
+                "earliest": rfc3339(now - TimeDelta::minutes(30)),
+                "latest": rfc3339(now),
+            }),
+            "two days ahead",
+        ),
+    ] {
+        let (page, live) = captured_and_live(&server, dsl, &window).await;
+        let found = rows(live.clone());
+        assert_eq!(found.len(), 1, "{dsl}: `/query` finds the event");
+        assert_eq!(
+            found[0].get("message"),
+            Some(&Value::String(message.into())),
+            "{dsl}: {found:?}"
+        );
+        assert_eq!(page.pagination.total, 1, "{dsl}: the capture found it");
+        assert_eq!(page.page.columns, live.columns, "{dsl}");
+        assert_eq!(page.page.rows, live.rows, "{dsl}");
+    }
+}
+
 /// A window with no events, over a corpus that knows no field yet,
 /// captures no columns: 200, no file, and an empty page.
 #[tokio::test(flavor = "multi_thread")]

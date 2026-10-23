@@ -2475,7 +2475,16 @@ pub mod captured {
                 .all(|e| e.time.format("%Y-%m-%d/%H").to_string() == hour),
             "every event falls in {hour}"
         );
-        let dir = Path::new(data).join("prod").join(&hour);
+        seed_partition(data, &format!("prod/{hour}"), service, events)
+    }
+
+    /// Write `events` as `{data}/{partition}/{service}.parquet` with the
+    /// shared fixture's columns, whatever their times. Compaction names a
+    /// partition by when it wrote it, not by the events' `_time`, so this
+    /// is the file a sender whose clock was off leaves behind. Seed before
+    /// the fixture boots.
+    pub fn seed_partition(data: &str, partition: &str, service: &str, events: &[Event]) -> PathBuf {
+        let dir = Path::new(data).join(partition);
         std::fs::create_dir_all(&dir).unwrap();
         let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
         conn.execute_batch(
