@@ -24,6 +24,7 @@
 use std::collections::HashSet;
 
 use crate::result_actions::passes_names_through;
+use crate::results_layout::cell_text;
 use trawl_api::value::{QueryResult, Value};
 use trawl_core::ast::{PipeStage, Spanned, StatsStage};
 use trawl_core::projection::agg_output_name;
@@ -63,6 +64,16 @@ impl CatShape {
         }
         let full = if self.signed { 50.0 } else { 100.0 };
         v.abs() / self.max_abs * full
+    }
+
+    /// One bar's label: the row's group cell as the exact table beside the
+    /// chart prints it, decided by the group column's type ([`cell_text`]),
+    /// so a timestamp group reads in the same short form in both. `None`
+    /// when the row has no such cell.
+    #[must_use]
+    pub fn group_label(&self, result: &QueryResult, row: &[Value]) -> Option<String> {
+        let ty = result.columns.get(self.group).map(|column| &column.ty);
+        Some(cell_text(ty, row.get(self.group)?))
     }
 }
 
@@ -348,7 +359,7 @@ fn scale_is_taken_from_the_fetched_result() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use trawl_api::value::Column;
+    use trawl_api::value::{Column, ColumnType};
 
     const BY_STATUS: &str = "* | stats count() by status";
     /// The "rank services by errors" quick-start query.
@@ -818,5 +829,49 @@ mod tests {
         for q in ["* | top 10 status", "* | stats count()", "status=200", ""] {
             assert!(group_columns(q, &columns).is_empty(), "{q}");
         }
+    }
+
+    /// A bar's label is the exact table's text for the group cell, decided
+    /// by the group column's type, never the spelling: a timestamp group
+    /// is shortened as the table shortens it, and RFC 3339 text in a
+    /// `string` group shows as sent.
+    #[test]
+    fn a_group_label_follows_the_group_columns_type() {
+        let wire = || Value::String("2026-10-22T12:34:56.120000-07:00".into());
+        let typed = |ty: ColumnType| QueryResult {
+            columns: vec![
+                Column::new("at", ty),
+                Column::new("count", ColumnType::Integer),
+            ],
+            rows: vec![vec![wire(), Value::Integer(3)]],
+        };
+        let shape = CatShape {
+            group: 0,
+            metric: 1,
+            group_name: "at".to_owned(),
+            metric_name: "count".to_owned(),
+            signed: false,
+            max_abs: 3.0,
+        };
+
+        let timestamps = typed(ColumnType::Timestamp);
+        assert_eq!(
+            shape
+                .group_label(&timestamps, &timestamps.rows[0])
+                .as_deref(),
+            Some("2026-10-22 12:34:56.12")
+        );
+        assert_eq!(
+            shape.group_label(&timestamps, &timestamps.rows[0]),
+            Some(cell_text(Some(&ColumnType::Timestamp), &wire())),
+            "the label is the exact table's text"
+        );
+
+        let strings = typed(ColumnType::String);
+        assert_eq!(
+            shape.group_label(&strings, &strings.rows[0]).as_deref(),
+            Some("2026-10-22T12:34:56.120000-07:00")
+        );
+        assert_eq!(shape.group_label(&strings, &[]), None);
     }
 }
