@@ -197,7 +197,13 @@ pub fn kept_as(code: &ErrorCode) -> Kept {
         | ErrorCode::PreviewTooLarge
         | ErrorCode::RequestTooLarge
         | ErrorCode::UnsupportedEncoding
-        | ErrorCode::RequestLimitReached => Kept::Summary,
+        | ErrorCode::RequestLimitReached
+        | ErrorCode::ResultGone
+        | ErrorCode::ResultUnavailable
+        | ErrorCode::ResultCorrupt
+        | ErrorCode::CaptureBusy
+        | ErrorCode::CaptureQuotaExceeded
+        | ErrorCode::CaptureSourceTooLarge => Kept::Summary,
     }
 }
 
@@ -253,7 +259,7 @@ mod tests {
     /// Every wire code, spelled out. The match in `kept_as` has no
     /// wildcard, so a new code already fails to compile there; this list
     /// makes the test say how each existing code is kept.
-    const EVERY_CODE: [(ErrorCode, Kept); 22] = [
+    const EVERY_CODE: [(ErrorCode, Kept); 28] = [
         (ErrorCode::ParseError, Kept::Query),
         (ErrorCode::ValidationError, Kept::Query),
         (ErrorCode::ExecutionError, Kept::Summary),
@@ -276,6 +282,12 @@ mod tests {
         (ErrorCode::UnsupportedEncoding, Kept::Summary),
         (ErrorCode::RequestLimitReached, Kept::Summary),
         (ErrorCode::QueryResourceExhausted, Kept::ResourceExhausted),
+        (ErrorCode::ResultGone, Kept::Summary),
+        (ErrorCode::ResultUnavailable, Kept::Summary),
+        (ErrorCode::ResultCorrupt, Kept::Summary),
+        (ErrorCode::CaptureBusy, Kept::Summary),
+        (ErrorCode::CaptureQuotaExceeded, Kept::Summary),
+        (ErrorCode::CaptureSourceTooLarge, Kept::Summary),
     ];
 
     #[test]

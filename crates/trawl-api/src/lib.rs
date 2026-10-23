@@ -17,6 +17,7 @@ pub mod csv;
 pub mod display;
 pub mod doctor;
 pub mod ingest_preview;
+pub mod results;
 pub mod stream;
 pub mod value;
 
@@ -162,6 +163,29 @@ pub enum ErrorCode {
     /// narrowing the time range or simplifying the query is what helps, so
     /// the message says that and names no path, size or engine text.
     QueryResourceExhausted,
+    /// The captured result is past its deadline or was pruned by quota
+    /// (410, ADR-0057). The message says which. It stays this answer for
+    /// the tombstone's 24 hours and is a 404 after.
+    ResultGone,
+    /// The captured result's metadata is committed but its file is missing
+    /// (409, ADR-0057). Never an empty page and never a silent re-run.
+    ResultUnavailable,
+    /// The captured result's file does not match its recorded blake3
+    /// digest (500, ADR-0057). The server records an ADR-0040 failure
+    /// event; the message names no path.
+    ResultCorrupt,
+    /// The caller's per-key capture queue is full, or the installation is
+    /// at its count of executing captures (429, with `Retry-After`,
+    /// ADR-0057). Refused before any executor permit was taken.
+    CaptureBusy,
+    /// The capture cannot reserve room in the key's or the installation's
+    /// result quota (429, with `Retry-After`, ADR-0057). Refused before any
+    /// executor permit was taken.
+    CaptureQuotaExceeded,
+    /// The capture's selected cold input is larger than the capture source
+    /// budget (400, ADR-0057). Refused before scanning; narrowing the time
+    /// range is what helps.
+    CaptureSourceTooLarge,
 }
 
 /// Source location within a query string.
@@ -408,7 +432,7 @@ pub struct QueryResponse {
 }
 
 /// Pagination metadata for query responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaginationMeta {
     /// The limit applied to this response.
     pub limit: usize,
@@ -2644,6 +2668,100 @@ mod tests {
             serde_json::to_string(&ErrorCode::RequestLimitReached).unwrap(),
             "\"request_limit_reached\""
         );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ResultGone).unwrap(),
+            "\"result_gone\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::CaptureQuotaExceeded).unwrap(),
+            "\"capture_quota_exceeded\""
+        );
+    }
+
+    /// Every wire code with its spelling.
+    const EVERY_ERROR_CODE: [(ErrorCode, &str); 28] = [
+        (ErrorCode::ParseError, "parse_error"),
+        (ErrorCode::ValidationError, "validation_error"),
+        (ErrorCode::ExecutionError, "execution_error"),
+        (ErrorCode::ResultTooLarge, "result_too_large"),
+        (ErrorCode::AuthError, "auth_error"),
+        (ErrorCode::Forbidden, "forbidden"),
+        (ErrorCode::BadRequest, "bad_request"),
+        (ErrorCode::NotFound, "not_found"),
+        (ErrorCode::Timeout, "timeout"),
+        (ErrorCode::IngestError, "ingest_error"),
+        (ErrorCode::RateLimited, "rate_limited"),
+        (ErrorCode::TooManyStreams, "too_many_streams"),
+        (ErrorCode::InternalError, "internal_error"),
+        (ErrorCode::ServiceUnavailable, "service_unavailable"),
+        (ErrorCode::HotBufferFull, "hot_buffer_full"),
+        (ErrorCode::IngestBatchTooLarge, "ingest_batch_too_large"),
+        (ErrorCode::CorpusRecovering, "corpus_recovering"),
+        (ErrorCode::PreviewTooLarge, "preview_too_large"),
+        (ErrorCode::RequestTooLarge, "request_too_large"),
+        (ErrorCode::UnsupportedEncoding, "unsupported_encoding"),
+        (ErrorCode::RequestLimitReached, "request_limit_reached"),
+        (
+            ErrorCode::QueryResourceExhausted,
+            "query_resource_exhausted",
+        ),
+        (ErrorCode::ResultGone, "result_gone"),
+        (ErrorCode::ResultUnavailable, "result_unavailable"),
+        (ErrorCode::ResultCorrupt, "result_corrupt"),
+        (ErrorCode::CaptureBusy, "capture_busy"),
+        (ErrorCode::CaptureQuotaExceeded, "capture_quota_exceeded"),
+        (ErrorCode::CaptureSourceTooLarge, "capture_source_too_large"),
+    ];
+
+    /// The declaration index of a code. No wildcard arm, so a new code
+    /// fails to compile here until it is numbered, and the test below then
+    /// fails until [`EVERY_ERROR_CODE`] lists it.
+    fn declared_index(code: &ErrorCode) -> usize {
+        match code {
+            ErrorCode::ParseError => 0,
+            ErrorCode::ValidationError => 1,
+            ErrorCode::ExecutionError => 2,
+            ErrorCode::ResultTooLarge => 3,
+            ErrorCode::AuthError => 4,
+            ErrorCode::Forbidden => 5,
+            ErrorCode::BadRequest => 6,
+            ErrorCode::NotFound => 7,
+            ErrorCode::Timeout => 8,
+            ErrorCode::IngestError => 9,
+            ErrorCode::RateLimited => 10,
+            ErrorCode::TooManyStreams => 11,
+            ErrorCode::InternalError => 12,
+            ErrorCode::ServiceUnavailable => 13,
+            ErrorCode::HotBufferFull => 14,
+            ErrorCode::IngestBatchTooLarge => 15,
+            ErrorCode::CorpusRecovering => 16,
+            ErrorCode::PreviewTooLarge => 17,
+            ErrorCode::RequestTooLarge => 18,
+            ErrorCode::UnsupportedEncoding => 19,
+            ErrorCode::RequestLimitReached => 20,
+            ErrorCode::QueryResourceExhausted => 21,
+            ErrorCode::ResultGone => 22,
+            ErrorCode::ResultUnavailable => 23,
+            ErrorCode::ResultCorrupt => 24,
+            ErrorCode::CaptureBusy => 25,
+            ErrorCode::CaptureQuotaExceeded => 26,
+            ErrorCode::CaptureSourceTooLarge => 27,
+        }
+    }
+
+    #[test]
+    fn every_error_code_round_trips_under_its_wire_name() {
+        for (position, (code, wire)) in EVERY_ERROR_CODE.into_iter().enumerate() {
+            assert_eq!(
+                declared_index(&code),
+                position,
+                "{code:?} is listed out of place"
+            );
+            let json = serde_json::to_string(&code).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: ErrorCode = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, code);
+        }
     }
 
     #[test]
