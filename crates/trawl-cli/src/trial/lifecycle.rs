@@ -2400,12 +2400,8 @@ fi"#,
         use trawl_api::value::{Column, QueryResult, Value};
         let result = QueryResult {
             columns: vec![
-                Column {
-                    name: "events".into(),
-                },
-                Column {
-                    name: "service".into(),
-                },
+                Column::new("events", trawl_api::value::ColumnType::Integer),
+                Column::new("service", trawl_api::value::ColumnType::String),
             ],
             rows: vec![
                 vec![Value::Integer(700), Value::String("web".into())],
@@ -2423,9 +2419,7 @@ fi"#,
             Some(std::collections::BTreeMap::new())
         );
         let unreadable = QueryResult {
-            columns: vec![Column {
-                name: "count".into(),
-            }],
+            columns: vec![Column::new("count", trawl_api::value::ColumnType::Integer)],
             rows: vec![vec![Value::Integer(1)]],
         };
         assert_eq!(counts_by_service(&unreadable), None);
@@ -2538,12 +2532,8 @@ fi"#,
             },
             result: QueryResult {
                 columns: vec![
-                    Column {
-                        name: "service".into(),
-                    },
-                    Column {
-                        name: "events".into(),
-                    },
+                    Column::new("service", trawl_api::value::ColumnType::String),
+                    Column::new("events", trawl_api::value::ColumnType::Integer),
                 ],
                 rows,
             },

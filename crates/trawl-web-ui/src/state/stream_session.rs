@@ -7,10 +7,12 @@
 //! single `EventSource` whose lifetime is bounded by a `StoredValue`.
 //!
 //! The server emits three distinct SSE event names:
-//! - `data`  → JSON object for one log event
-//! - `snapshot` → `{columns: [...], rows: [{...}, ...], capped?: [...]}`
-//!   aggregation result, with the caps that dropped input (ADR-0001)
+//! - `data`  → one log event, as a one-row typed result
+//! - `snapshot` → the aggregation's whole result so far, typed, with the
+//!   caps that dropped input ([`trawl_api::stream::SnapshotFrame`], ADR-0001)
 //! - `lagged` → `{missed: N}` back-pressure notification
+//!
+//! Both result frames decode through `trawl_api`'s result codec.
 //!
 //! `EventSource` auto-reconnects on network blips (cookie rides along).
 //! Search reports failed connections and malformed snapshots, and clears
@@ -21,14 +23,13 @@ use std::rc::Rc;
 
 use leptos::prelude::*;
 use serde::Deserialize;
-use trawl_api::stream::SnapshotCap;
-use trawl_api::value::{Column, QueryResult, Value};
+use trawl_api::stream::{SnapshotCap, SnapshotFrame};
+use trawl_api::value::QueryResult;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{EventSource, MessageEvent};
 
-use super::stream_session_value::json_to_value;
-pub use super::stream_session_value::{RingBuffer, ring_to_result};
+pub use super::stream_session_value::{RingBuffer, event_field, event_object, ring_to_result};
 
 /// The failure copy for a stream the browser has given up on: closed,
 /// not reconnecting. Search reads it back to tell this failure from the
@@ -174,10 +175,10 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         let Some(data_str) = ev.data().as_string() else {
             return;
         };
-        let Ok(map) = serde_json::from_str::<serde_json::Map<_, _>>(&data_str) else {
+        let Ok(event) = serde_json::from_str::<QueryResult>(&data_str) else {
             return;
         };
-        if ring.try_update_untracked(|r| r.push(map)).is_some() {
+        if ring.try_update_untracked(|r| r.push(event)).is_some() {
             event_dirty.set(true);
         }
     });
@@ -263,8 +264,12 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
         let wire = ev
             .data()
             .as_string()
-            .and_then(|data| serde_json::from_str::<SnapshotWire>(&data).ok());
-        let Some(wire) = wire else {
+            .and_then(|data| serde_json::from_str::<SnapshotFrame>(&data).ok());
+        let Some(SnapshotFrame {
+            result,
+            capped: frame_capped,
+        }) = wire
+        else {
             snapshot.set(None);
             if let Some(failure) = failure {
                 failure.set(Some(
@@ -273,13 +278,14 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
             }
             return;
         };
-        if (wire.columns.is_empty() && !wire.rows.is_empty())
-            || wire
+        if (result.columns.is_empty() && !result.rows.is_empty())
+            || result
                 .columns
                 .iter()
+                .map(|column| &column.name)
                 .collect::<std::collections::HashSet<_>>()
                 .len()
-                != wire.columns.len()
+                != result.columns.len()
         {
             snapshot.set(None);
             if let Some(failure) = failure {
@@ -299,41 +305,12 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
         // one replaces it. Untracked compare, and a write only when it
         // changes: a capped stream repeats the same report every frame.
         if let Some(capped) = capped
-            && capped.with_untracked(|current| *current != wire.capped)
+            && capped.with_untracked(|current| *current != frame_capped)
         {
-            capped.set(wire.capped.clone());
+            capped.set(frame_capped);
         }
-        // Rehydrate rows in declared column order. Missing keys land as
-        // Null (consistent with how the server materializes sparse rows).
-        let rows: Vec<Vec<Value>> = wire
-            .rows
-            .iter()
-            .map(|row_map| {
-                wire.columns
-                    .iter()
-                    .map(|col| row_map.get(col).cloned().map_or(Value::Null, json_to_value))
-                    .collect()
-            })
-            .collect();
-        let result = QueryResult {
-            columns: wire
-                .columns
-                .into_iter()
-                .map(|name| Column { name })
-                .collect(),
-            rows,
-        };
         snapshot.set(Some(result));
     })
-}
-
-#[derive(Deserialize)]
-struct SnapshotWire {
-    columns: Vec<String>,
-    rows: Vec<serde_json::Map<String, serde_json::Value>>,
-    /// Omitted by the server while nothing has been dropped.
-    #[serde(default)]
-    capped: Vec<SnapshotCap>,
 }
 
 #[derive(Deserialize)]

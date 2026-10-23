@@ -513,7 +513,11 @@ fn assert_only_the_barrier_streamed(streamed: &str) {
     let others: Vec<Value> = streamed
         .lines()
         .filter_map(|line| line.strip_prefix("data: "))
-        .map(|data| serde_json::from_str::<Value>(data).unwrap())
+        .flat_map(|data| {
+            let frame: trawl_api::value::QueryResult =
+                serde_json::from_str(data).expect("a data frame is a typed result");
+            common::result_rows(&frame)
+        })
         .filter(|event| event["service"] != "trawld")
         .collect();
     assert_eq!(

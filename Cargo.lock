@@ -6285,6 +6285,7 @@ dependencies = [
 name = "trawl-api"
 version = "0.9.3"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
 ]
@@ -6409,7 +6410,6 @@ version = "0.9.3"
 dependencies = [
  "chrono",
  "duckdb",
- "indexmap",
  "insta",
  "parquet",
  "rustix 1.1.4",

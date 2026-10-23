@@ -146,7 +146,10 @@ test('live-tail wraps the whole message including unbroken suffixes', async ({ p
   // This geometry fixture sends one event. Delay reconnection beyond the
   // 20-second test timeout so the closed response cannot replay that event.
   await page.route('**/api/v1/stream?*', route => route.fulfill({
-    contentType: 'text/event-stream', body: `retry: 60000\nevent: data\ndata: ${JSON.stringify({ _time: '2026-09-10T12:00:00Z', message })}\n\n`,
+    contentType: 'text/event-stream', body: `retry: 60000\nevent: data\ndata: ${JSON.stringify({
+      columns: [{ name: '_time', type: 'timestamp' }, { name: 'message', type: 'string' }],
+      rows: [['2026-09-10T12:00:00.000000Z', message]],
+    })}\n\n`,
   }));
   await page.setViewportSize({ width: 390, height: 900 });
   await page.goto('/search/schema?svc=nginx&stab=tail');

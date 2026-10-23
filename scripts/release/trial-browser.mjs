@@ -36,11 +36,83 @@ const browser = await chromium.launch({ headless: true });
 const phases = [];
 const errors = [];
 
-// One query response as an object per row, keyed by column name.
+// The result-column vocabulary (reference/api.md, Result columns). A column
+// or a mixed cell's tag is a descriptor `{type, items}`, where only `list`
+// carries `items`, itself a descriptor. Checked before any cell is read, so
+// a response with no rows still has to name known types.
+const SCALARS = new Set(['integer', 'float', 'boolean', 'string', 'timestamp', 'date', 'time', 'mixed']);
+function descriptor({ type, items } = {}) {
+  if (type === 'list') {
+    assert.ok(items && typeof items === 'object', `list carries no items descriptor: ${JSON.stringify({ type, items })}`);
+    return { type, items: descriptor(items) };
+  }
+  assert.ok(SCALARS.has(type), `column type ${JSON.stringify(type)} is not in the result-column vocabulary`);
+  assert.equal(items, undefined, `${type} carries an items descriptor`);
+  return { type };
+}
+
+// The wire shapes of the cells that are strings: a canonical decimal
+// integer within the 64-bit ranges, RFC 3339 with six fraction digits and
+// an offset (or a signed expanded year outside 0000..9999, or an
+// infinity), a date, a time with any fraction.
+const INTEGER = /^(0|-?[1-9][0-9]*)$/;
+const INTEGER_MIN = -(2n ** 63n);
+const INTEGER_MAX = 2n ** 64n - 1n;
+const TIMESTAMP = /^(?:(?:\d{4}|-\d{4,}|\+\d{5,})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}(?:Z|[+-]\d{2}:\d{2})|-?infinity)$/;
+const DATE = /^\d{4}-\d{2}-\d{2}$/;
+const TIME = /^\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+
+// One result cell as a JavaScript value, read under a checked descriptor.
+// An `integer` cell is a decimal string on the wire; the documented rows
+// hold small counts, so Number() is exact. A cell outside the contract is
+// an error, so an old or malformed response cannot produce the documented
+// row by accident.
+function cell({ type, items }, value) {
+  if (value === null) return null;
+  const shaped = (ok, what) => assert.ok(ok, `${what} cell ${JSON.stringify(value)} is not on the wire contract`);
+  switch (type) {
+    case 'integer': {
+      shaped(typeof value === 'string' && INTEGER.test(value), 'integer');
+      const integer = BigInt(value);
+      shaped(integer >= INTEGER_MIN && integer <= INTEGER_MAX, 'integer');
+      return Number(value);
+    }
+    case 'float':
+      shaped(typeof value === 'number' || ['NaN', 'Infinity', '-Infinity'].includes(value), 'float');
+      return value;
+    case 'boolean':
+      shaped(typeof value === 'boolean', 'boolean');
+      return value;
+    case 'string':
+      shaped(typeof value === 'string', 'string');
+      return value;
+    case 'timestamp':
+      shaped(typeof value === 'string' && TIMESTAMP.test(value), 'timestamp');
+      return value;
+    case 'date':
+      shaped(typeof value === 'string' && DATE.test(value), 'date');
+      return value;
+    case 'time':
+      shaped(typeof value === 'string' && TIME.test(value), 'time');
+      return value;
+    case 'list':
+      shaped(Array.isArray(value), 'list');
+      return value.map(item => cell(items, item));
+    case 'mixed':
+      shaped(value !== null && typeof value === 'object' && !Array.isArray(value), 'mixed');
+      return cell(descriptor({ type: value.type, items: value.items }), value.value);
+    default:
+      throw new Error(`column type ${JSON.stringify(type)} is not in the result-column vocabulary`);
+  }
+}
+
+// One query response as an object per row, keyed by column name. Every
+// column descriptor is checked first, rows or no rows.
 async function rows(response) {
   assert.equal(response.status(), 200);
   const body = await response.json();
-  return body.rows.map(values => Object.fromEntries(body.columns.map((c, i) => [c.name, values[i]])));
+  const columns = body.columns.map(c => ({ name: c.name, ...descriptor({ type: c.type, items: c.items }) }));
+  return body.rows.map(values => Object.fromEntries(columns.map((c, i) => [c.name, cell(c, values[i])])));
 }
 
 // The whole tutorial at one origin, in a context that shares nothing with

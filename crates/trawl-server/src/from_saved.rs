@@ -34,7 +34,7 @@ pub(crate) struct ResolvedFromSaved {
     /// time, so the walk happens here, over both texts.
     pub saved_dsl: String,
     /// The stored result files [`source`](Self::source) reads, in selected-run
-    /// order. Empty when the selected run has no file at all (a zero-row
+    /// order. Empty when the selected run has no file at all (a zero-column
     /// success resolves to a literal relation, not a read).
     ///
     /// Carried out of resolution so the handler can ask whether those files
@@ -159,16 +159,17 @@ pub(crate) async fn resolve(
 ///
 /// Three shapes, all of them successful runs:
 ///
-/// - a `result_path`: the ordinary run, read as parquet.
-/// - no path, a blob with no rows: the run genuinely found nothing. Its
-///   blob still carries the column names, so it resolves to the empty typed
-///   source [`empty_typed_source`] builds, and `| stats count()` over it
-///   answers 0.
-/// - no path, a blob WITH rows: a run whose parquet write failed and fell
-///   back to the blob. It exists and `GET /saved/{id}/runs/{run_id}` serves
-///   it, but there is no file to point a query at, so this is a 409 naming
-///   the run. For `run=latest` the next scheduled run clears it, which is
-///   what makes 409 the right status rather than 404 or 500.
+/// - a `result_path`: the ordinary run, read as parquet. A run that found
+///   no rows is one of these too: its file is empty and typed.
+/// - no path, a blob with no columns: the run's own source matched no file
+///   at all, so it recorded no schema. It resolves to
+///   [`ZERO_COLUMN_SOURCE`], and `| stats count()` over it answers 0.
+/// - no path, a blob WITH columns: a result parquet cannot hold exactly (a
+///   `mixed` column) or a run whose parquet write failed, with any number
+///   of rows. It exists and `GET /saved/{id}/runs/{run_id}` serves it, but
+///   there is no file to point a query at, so this is a 409 naming the
+///   run. For `run=latest` the next scheduled run clears it, which is what
+///   makes 409 the right status rather than 404 or 500.
 ///
 /// Whether the first shape's file is still THERE is not decided here.
 /// Resolution reads the catalog row; the [`RunFile`] it returns beside the
@@ -199,8 +200,8 @@ async fn source_for_run(
         )));
     };
 
-    if result.rows.is_empty() {
-        return Ok((empty_typed_source(&result.columns), None));
+    if result.columns.is_empty() {
+        return Ok((ZERO_COLUMN_SOURCE.to_owned(), None));
     }
 
     Err(ServerError::Conflict(format!(
@@ -269,14 +270,13 @@ async fn resolve_specific(
 
 /// Resolve `run=all` — all successful runs, unioned with `_run_id` and `_run_time` metadata.
 ///
-/// Zero-row runs are deliberately NOT members. They have no parquet file
-/// (see [`empty_typed_source`]), a union branch built from their column
-/// names would contribute no rows anyway, and its all-NULL columns could
-/// only clash with the typed ones the real files bring. The visible
-/// consequence: `_run_id` and `_run_time` never name a run that found
-/// nothing, so `run=all` describes the runs that produced data, not every
-/// run that happened. The single-run selectors, `run=latest` and `run=N`,
-/// both answer for a zero-row run.
+/// Every run with a parquet file is a member, a zero-row run included: its
+/// file is typed, so it unions by name with the others and contributes no
+/// rows. Runs whose result is a blob are not members, because there is no
+/// file to read: a zero-column run would contribute no rows, and a blob
+/// with columns is the one `run=latest` and `run=N` refuse by name. The
+/// union widens a column to the type every member fits, so a `BIGINT` run
+/// and a `UBIGINT` run read as one exact `HUGEINT` column.
 async fn resolve_all(
     schedule_store: &ScheduleStore,
     saved_query_id: i64,
@@ -317,37 +317,14 @@ async fn resolve_all(
     Ok((format!("({})", parts.join(" UNION ALL BY NAME ")), files))
 }
 
-/// Build a zero-row source that still carries a run's column NAMES.
+/// The source a zero-column run resolves to: one dummy column, no rows.
 ///
-/// A successful report run with no rows has no parquet file: the ndjson
-/// writer behind `write_query_result_to_parquet` has nothing to infer a
-/// schema from, so there is no typed empty parquet to point at. The run's
-/// zstd JSON blob is the one representation that kept the column names, and
-/// this turns them back into a FROM source: `(SELECT NULL AS "a", NULL AS
-/// "b" WHERE FALSE)`. Downstream stages bind their fields, aggregates
-/// answer over an empty relation, and no row is invented.
-///
-/// Every column is NULL-typed. That is enough for `| where`, `stats` and
-/// `table` (probed in `empty_typed_source_executes_downstream_shapes`), and
-/// it is the only honest type available: the blob records names, not the
-/// `DuckDB` types the run's rows would have had.
-///
-/// A result with ZERO columns is `QueryResult::empty()`, the answer a run
-/// gets when its own source matched no file at all. There are no names to
-/// carry, so the source is a one-column dummy nothing binds to:
-/// `(SELECT 1 WHERE FALSE)`. A downstream field reference then fails to
-/// bind, which is the truth about that run: it recorded no schema.
-fn empty_typed_source(columns: &[trawl_api::value::Column]) -> String {
-    if columns.is_empty() {
-        return "(SELECT 1 WHERE FALSE)".to_string();
-    }
-    let projected = columns
-        .iter()
-        .map(|c| format!("NULL AS \"{}\"", c.name.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("(SELECT {projected} WHERE FALSE)")
-}
+/// A result with zero columns is `QueryResult::empty()`, the answer a run
+/// gets when its own source matched no file at all. Parquet cannot hold
+/// it, so the run keeps it as a blob, and there are no names to carry. A
+/// downstream field reference then fails to bind, which is the truth about
+/// that run: it recorded no schema. A row-count aggregate answers 0.
+const ZERO_COLUMN_SOURCE: &str = "(SELECT 1 WHERE FALSE)";
 
 /// Resolve a run's stored `result_path` against `data_dir`.
 ///
@@ -374,7 +351,7 @@ fn parquet_source(data_dir: &str, result_path: &str) -> String {
 /// The source a SINGLE selected run resolves to.
 ///
 /// A parenthesised subquery, the shape `resolve_all`'s union and
-/// [`empty_typed_source`] already resolve to. [`trawl_core::emitter`] passes
+/// [`ZERO_COLUMN_SOURCE`] already resolve to. [`trawl_core::emitter`] passes
 /// a `(`-prefixed source through untouched by design, because the server
 /// built it and owns its escaping; everything else it treats as a path and
 /// sends through `validate_source_path`. That validator exists for the
@@ -391,80 +368,22 @@ fn run_source(data_dir: &str, result_path: &str) -> String {
 mod tests {
     use super::*;
 
-    pub(super) fn cols(names: &[&str]) -> Vec<trawl_api::value::Column> {
-        names
-            .iter()
-            .map(|n| trawl_api::value::Column {
-                name: (*n).to_string(),
-            })
-            .collect()
-    }
-
+    /// The zero-column source answers a row-count aggregate with 0 and
+    /// binds no field, through the real emitter and a real `DuckDB`.
     #[test]
-    fn empty_typed_source_projects_quoted_names() {
-        assert_eq!(
-            empty_typed_source(&cols(&["a", "b"])),
-            r#"(SELECT NULL AS "a", NULL AS "b" WHERE FALSE)"#
-        );
-        assert_eq!(
-            empty_typed_source(&cols(&[r#"we"ird"#])),
-            r#"(SELECT NULL AS "we""ird" WHERE FALSE)"#
-        );
-        assert_eq!(empty_typed_source(&[]), "(SELECT 1 WHERE FALSE)");
-    }
-
-    /// Execution probe: the NULL-typed empty source has to survive every
-    /// downstream shape a `from saved` pipeline can put after it, through the
-    /// real emitter and a real `DuckDB`. A NULL column is an untyped literal
-    /// in `DuckDB`, so "does `count()` over it work" is a question only
-    /// execution answers.
-    #[test]
-    fn empty_typed_source_executes_downstream_shapes() {
+    fn zero_column_source_counts_zero_and_binds_nothing() {
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let pins = trawl_core::schema::FieldTypes::new();
-        let source = empty_typed_source(&cols(&["a", "b", "_time"]));
-
-        let run = |dsl: &str| {
-            executor
-                .run_query(dsl, &source, &pins, 100, 0)
-                .unwrap_or_else(|e| panic!("{dsl} over {source} failed: {e}"))
-        };
-
-        // Filtering an untyped NULL column: binds, matches nothing.
-        assert_eq!(run("* | where a > 5").rows.len(), 0);
-        // A row-count aggregate still answers, with zero.
-        let counted = run("* | stats count()");
-        assert_eq!(counted.rows.len(), 1);
+        let counted = executor
+            .run_query("* | stats count()", ZERO_COLUMN_SOURCE, &pins, 100, 0)
+            .unwrap();
         assert_eq!(counted.rows[0][0].to_string(), "0");
-        // An aggregate that reads the NULL column itself.
-        assert_eq!(run("* | stats avg(a)").rows.len(), 1);
-        // Projection binds the name and returns no rows.
-        let projected = run("* | table a");
-        assert_eq!(projected.rows.len(), 0);
-        assert_eq!(projected.columns.len(), 1);
-        assert_eq!(projected.columns[0].name, "a");
-        // `_time` survives the TIMESTAMP cast the time-aware stages emit.
-        assert_eq!(run("* | sort -_time | head 5").rows.len(), 0);
-        executor
-            .run_query("* | table _time", &source, &pins, 100, 0)
-            .expect("_time column must bind");
-        // The timestamp cast the union and display paths put on `_time`,
-        // asked of DuckDB directly so the assertion does not depend on which
-        // stage happens to emit it today.
-        duckdb::Connection::open_in_memory()
-            .unwrap()
-            .execute_batch(&format!(
-                r#"SELECT TRY_CAST("_time" AS TIMESTAMP) AS t FROM {source}"#
-            ))
-            .expect("TRY_CAST over a NULL-typed _time column must plan");
-        // The zero-column fallback is a valid source too (nothing binds).
-        assert_eq!(
-            executor
-                .run_query("* | stats count()", &empty_typed_source(&[]), &pins, 100, 0)
-                .unwrap()
-                .rows[0][0]
-                .to_string(),
-            "0"
+        let refused = executor
+            .run_query("* | table n", ZERO_COLUMN_SOURCE, &pins, 100, 0)
+            .expect_err("a run that recorded no schema has no field to project");
+        assert!(
+            refused.to_string().ends_with("unknown field: n"),
+            "the refusal names the missing field: {refused}"
         );
     }
 
@@ -711,7 +630,8 @@ mod pg_tests {
     use trawl_core::ast::{FromSavedStage, SavedRunSelector};
 
     use super::{
-        ResolvedFromSaved, resolve, resolve_all, resolve_latest, resolve_specific, run_source,
+        ResolvedFromSaved, ZERO_COLUMN_SOURCE, resolve, resolve_all, resolve_latest,
+        resolve_specific, run_source,
     };
     use crate::error::ServerError;
     use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore};
@@ -760,8 +680,8 @@ mod pg_tests {
     }
 
     /// Start then finish a run whose result is a zstd JSON blob instead of a
-    /// parquet file, the way `write_result_parquet` persists a zero-row (or
-    /// parquet-write-failed) result. Returns its id.
+    /// parquet file, the way `write_result_parquet` persists a zero-column,
+    /// `mixed` or parquet-write-failed result. Returns its id.
     async fn run_with_blob(
         store: &ScheduleStore,
         schedule_id: i64,
@@ -793,13 +713,28 @@ mod pg_tests {
         rid
     }
 
-    /// A `QueryResult` with the given column names and no rows: what a run
-    /// whose window held nothing records.
-    fn zero_row_result(names: &[&str]) -> trawl_api::value::QueryResult {
+    /// A typed `QueryResult` with no rows: what a run whose window held
+    /// nothing records.
+    fn zero_row_result() -> trawl_api::value::QueryResult {
+        use trawl_api::value::{Column, ColumnType};
         trawl_api::value::QueryResult {
-            columns: super::tests::cols(names),
+            columns: vec![
+                Column::new("n", ColumnType::Integer),
+                Column::new("msg", ColumnType::String),
+            ],
             rows: Vec::new(),
         }
+    }
+
+    /// Store `result` at `data_dir/rel` through the run writer the
+    /// scheduler uses.
+    fn write_result(data_dir: &str, rel: &str, result: &trawl_api::value::QueryResult) {
+        let full = std::path::Path::new(data_dir).join(rel);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        trawl_engine::executor::Executor::new()
+            .unwrap()
+            .write_query_result_to_parquet(result, &full)
+            .unwrap();
     }
 
     /// Schedule id for a saved query (seed always creates exactly one).
@@ -903,7 +838,8 @@ mod pg_tests {
 
     /// The point of ADR-0018 ruling 13: a run that found nothing is still the
     /// newest run, and `run=latest` has to answer from IT. Resolving the
-    /// older run behind it would report yesterday's rows as today's.
+    /// older run behind it would report yesterday's rows as today's. Its
+    /// result is a typed empty parquet file, read like any other run.
     #[sqlx::test]
     async fn resolve_latest_answers_a_zero_row_success_not_an_older_run(pool: PgPool) {
         let dir = tempfile::tempdir().unwrap();
@@ -921,16 +857,29 @@ mod pg_tests {
             Some("scheduled/latest_zero/run_1.parquet"),
         )
         .await;
-        run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n", "msg"])).await;
+        write_result(
+            data_dir,
+            "scheduled/latest_zero/run_2.parquet",
+            &zero_row_result(),
+        );
+        let quiet = run(
+            &sched_store,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("scheduled/latest_zero/run_2.parquet"),
+        )
+        .await;
 
         let (source, files) = resolve_latest(&sched_store, saved_id, 1, data_dir)
             .await
-            .expect("a zero-row success resolves to its own empty source");
-        assert_eq!(source, r#"(SELECT NULL AS "n", NULL AS "msg" WHERE FALSE)"#);
-        assert!(
-            files.is_empty(),
-            "a literal relation reads no file: {files:?}"
+            .expect("a zero-row success resolves to its own file");
+        assert_eq!(
+            source,
+            run_source(data_dir, "scheduled/latest_zero/run_2.parquet")
         );
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].run_id, quiet);
 
         // Executed, because the assertion that matters is the ANSWER: the
         // older run holds one row, and reading it here would count 1.
@@ -940,14 +889,68 @@ mod pg_tests {
             .run_query("* | stats count()", &source, &pins, 100, 0)
             .unwrap();
         assert_eq!(counted.rows[0][0].to_string(), "0");
+        let listed = executor
+            .run_query("* | table n", &source, &pins, 100, 0)
+            .unwrap();
+        assert!(listed.rows.is_empty());
         assert_eq!(
-            executor
-                .run_query("* | table n", &source, &pins, 100, 0)
-                .unwrap()
-                .rows
-                .len(),
-            0
+            listed.columns,
+            vec![trawl_api::value::Column::new(
+                "n",
+                trawl_api::value::ColumnType::Integer
+            )],
+            "the empty file keeps the column's type"
         );
+    }
+
+    /// A run whose own source matched no file recorded no columns, which
+    /// parquet cannot hold. Its blob resolves to the zero-column source.
+    #[sqlx::test]
+    async fn resolve_latest_answers_a_zero_column_run_with_no_rows(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest_nothing").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        run(
+            &sched_store,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("scheduled/latest_nothing/run_1.parquet"),
+        )
+        .await;
+        run_with_blob(
+            &sched_store,
+            sid,
+            saved_id,
+            &trawl_api::value::QueryResult::empty(),
+        )
+        .await;
+
+        let (source, files) = resolve_latest(&sched_store, saved_id, 1, "/data")
+            .await
+            .expect("a zero-column success resolves");
+        assert_eq!(source, ZERO_COLUMN_SOURCE);
+        assert!(files.is_empty(), "no file is read: {files:?}");
+    }
+
+    /// A blob with columns is refused by the run's name whatever its row
+    /// count: there is no file to read, and no source is rebuilt from the
+    /// column names any more.
+    #[sqlx::test]
+    async fn resolve_latest_refuses_a_zero_row_blob_with_columns(pool: PgPool) {
+        let (saved_id, sched_store, _saved) = seed(&pool, 1, "latest_blob_empty").await;
+        let sid = schedule_id(&sched_store, saved_id).await;
+        let blob_run = run_with_blob(&sched_store, sid, saved_id, &zero_row_result()).await;
+
+        let err = resolve_latest(&sched_store, saved_id, 1, "/data")
+            .await
+            .expect_err("a blob with columns is not a source");
+        match err {
+            ServerError::Conflict(msg) => assert!(
+                msg.contains(&format!("run {blob_run}")) && msg.contains("no parquet result"),
+                "the refusal must name the run: {msg}"
+            ),
+            other => panic!("expected Conflict, got: {other:?}"),
+        }
     }
 
     /// A run whose parquet write failed kept its rows in the blob. It exists
@@ -971,7 +974,10 @@ mod pg_tests {
             sid,
             saved_id,
             &trawl_api::value::QueryResult {
-                columns: super::tests::cols(&["n"]),
+                columns: vec![trawl_api::value::Column::new(
+                    "n",
+                    trawl_api::value::ColumnType::Integer,
+                )],
                 rows: vec![vec![trawl_api::value::Value::Integer(7)]],
             },
         )
@@ -995,10 +1001,11 @@ mod pg_tests {
         }
     }
 
-    /// `run=all` unions files. A zero-row run has none, so it contributes
-    /// nothing and `_run_id` never names it (see `resolve_all`).
+    /// `run=all` unions files, a zero-row run's typed empty file included.
+    /// It contributes no rows, and its typed columns union by name with the
+    /// run that has one.
     #[sqlx::test]
-    async fn resolve_all_skips_zero_row_members(pool: PgPool) {
+    async fn resolve_all_includes_zero_row_members(pool: PgPool) {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().to_str().unwrap();
 
@@ -1014,27 +1021,40 @@ mod pg_tests {
             Some("scheduled/all_zero/run_1.parquet"),
         )
         .await;
-        let empty = run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n"])).await;
-
-        let (source, _files) = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
-        assert!(
-            !source.contains(&format!("{empty} AS _run_id")),
-            "the zero-row run is not a member: {source}"
+        write_result(
+            data_dir,
+            "scheduled/all_zero/run_2.parquet",
+            &zero_row_result(),
         );
+        let empty = run(
+            &sched_store,
+            sid,
+            saved_id,
+            RunStatus::Success,
+            Some("scheduled/all_zero/run_2.parquet"),
+        )
+        .await;
+
+        let (source, files) = resolve_all(&sched_store, saved_id, data_dir).await.unwrap();
+        assert!(
+            source.contains(&format!("{empty} AS _run_id")),
+            "the zero-row run is a member: {source}"
+        );
+        assert_eq!(files.len(), 2);
 
         let executor = trawl_engine::executor::Executor::new().unwrap();
-        let rows = executor
+        let result = executor
             .run_query(
-                "* | table _run_id",
+                "* | table _run_id, n",
                 &source,
                 &trawl_core::schema::FieldTypes::new(),
                 100,
                 0,
             )
-            .unwrap()
-            .rows;
-        assert_eq!(rows.len(), 1, "one member, one row");
-        assert_eq!(rows[0][0].to_string(), with_rows.to_string());
+            .unwrap();
+        assert_eq!(result.rows.len(), 1, "one row, from the run that has one");
+        assert_eq!(result.rows[0][0].to_string(), with_rows.to_string());
+        assert_eq!(result.rows[0][1], trawl_api::value::Value::Integer(1));
     }
 
     // --- resolve_specific ---------------------------------------------------
@@ -1111,18 +1131,25 @@ mod pg_tests {
     }
 
     /// The point of the shared [`source_for_run`]: a run id answers exactly
-    /// as it would if it happened to be the latest. A zero-row run resolves
-    /// to its own empty source instead of 404ing for want of a file.
+    /// as it would if it happened to be the latest. A zero-column run
+    /// resolves to the zero-column source instead of 404ing for want of a
+    /// file.
     #[sqlx::test]
-    async fn resolve_specific_answers_a_zero_row_run(pool: PgPool) {
+    async fn resolve_specific_answers_a_zero_column_run(pool: PgPool) {
         let (saved_id, sched_store, _saved) = seed(&pool, 1, "specific_zero").await;
         let sid = schedule_id(&sched_store, saved_id).await;
-        let rid = run_with_blob(&sched_store, sid, saved_id, &zero_row_result(&["n", "msg"])).await;
+        let rid = run_with_blob(
+            &sched_store,
+            sid,
+            saved_id,
+            &trawl_api::value::QueryResult::empty(),
+        )
+        .await;
 
         let (source, files) = resolve_specific(&sched_store, rid, 1, "/data")
             .await
-            .expect("a zero-row run resolves by id");
-        assert_eq!(source, r#"(SELECT NULL AS "n", NULL AS "msg" WHERE FALSE)"#);
+            .expect("a zero-column run resolves by id");
+        assert_eq!(source, ZERO_COLUMN_SOURCE);
         assert!(files.is_empty(), "no file is read: {files:?}");
 
         let counted = trawl_engine::executor::Executor::new()
@@ -1150,7 +1177,10 @@ mod pg_tests {
             sid,
             saved_id,
             &trawl_api::value::QueryResult {
-                columns: super::tests::cols(&["n"]),
+                columns: vec![trawl_api::value::Column::new(
+                    "n",
+                    trawl_api::value::ColumnType::Integer,
+                )],
                 rows: vec![vec![trawl_api::value::Value::Integer(7)]],
             },
         )

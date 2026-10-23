@@ -12,21 +12,35 @@
 //! This module applies those Rust stages to the SQL result set, reusing
 //! the streaming engine's per-event transforms and aggregation machinery.
 
-use indexmap::IndexSet;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+
+use chrono::{Offset as _, Utc};
 use trawl_core::ast::{PipeStage, SortDirection, Spanned, TrawlDuration};
+use trawl_core::compare::Instant;
 use trawl_core::context::EvalContext;
 use trawl_core::eval::EvalValue;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::row::{self, Row};
-use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
+use trawl_core::schema::catalog_key;
+use trawl_core::stream::{self, CompiledStage, OutputColumn, StageResult, StreamPlan};
 
 use crate::error::EngineError;
-use crate::value::{Column, QueryResult, land_u64};
+use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 
 /// Apply Rust pipeline stages to a SQL result set.
 ///
 /// Converts the columnar `QueryResult` into typed pipeline rows, compiles a
-/// stream plan from the given stages, runs it, and converts back.
+/// stream plan from the given stages, runs it, and converts back. The
+/// result's columns are the plan's output schema over the input's
+/// ([`StreamPlan::output_schema`]), so a tail that removes every row still
+/// answers with the columns it projects, typed as far as the input says
+/// ([`tail_cell_type`]), and then any field an `extract kv` found.
+///
+/// An input with no columns is the SQL read's answer for a source that
+/// matched no file, and it is returned as it came, as the same query
+/// without the tail returns it: there is no input schema to walk, and no
+/// row for the tail to read.
 ///
 /// `pins` is the pin scope stamped at the kv split
 /// (`EmittedQuery::rust_stage_pins`), so the tail's `where`/`let` evaluate
@@ -73,6 +87,17 @@ pub fn apply_rust_stages(
             message: format!("post-processing: {e}"),
         })
     })?;
+    if result.columns.is_empty() {
+        return Ok(result);
+    }
+    // Sort stages order rows and leave the columns alone.
+    let schema = plan.output_schema(
+        result
+            .columns
+            .iter()
+            .map(|column| OutputColumn::new(column.name.clone(), Some(tail_cell_type(&column.ty))))
+            .collect(),
+    );
 
     let processed = match plan {
         StreamPlan::PassThrough(mut compiled_stages) => {
@@ -94,7 +119,28 @@ pub fn apply_rust_stages(
     // Apply deferred sort stages.
     let sorted = apply_sorts(processed, &sort_stages);
 
-    Ok(events_to_result(&sorted))
+    Ok(rows_to_result(&sorted, &schema))
+}
+
+/// The type the tail's own cells give an input column of type `ty`.
+///
+/// The SQL read hands the tail DATE, TIME and TIMESTAMP cells as text
+/// ([`crate::executor`] renders them before the tail reads them), so such
+/// a column, or a list of them, passes through the tail as `string` cells;
+/// every other type passes through as itself. Seeding the output schema
+/// with these types keeps an empty answer typed as the same answer with
+/// rows would be. A timestamp the tail passes through is typed back after
+/// the tail by its lineage, rows or none (`render_tracked_timestamps`).
+fn tail_cell_type(ty: &ColumnType) -> ColumnType {
+    match ty {
+        ColumnType::Date | ColumnType::Time | ColumnType::Timestamp => ColumnType::String,
+        ColumnType::List { items } => ColumnType::list(tail_cell_type(items)),
+        ColumnType::Boolean
+        | ColumnType::Integer
+        | ColumnType::Float
+        | ColumnType::String
+        | ColumnType::Mixed => ty.clone(),
+    }
 }
 
 /// Convert a columnar `QueryResult` into a vec of typed pipeline rows.
@@ -135,14 +181,16 @@ fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
 
 /// A pipeline cell as a result cell.
 ///
-/// A non-finite double survives as `Value::Float`; the one place it becomes
-/// `null` is `trawl_api::value`'s serializer, at the wire, which is where
-/// the all-SQL path nulls it too. Nulling it here as well would make the kv
-/// tail disagree with the same query without the split.
+/// A non-finite double survives as `Value::Float`, and the wire spells it
+/// as `NaN`, `Infinity` or `-Infinity` under its `float` column, the same
+/// as the all-SQL path. Nulling it here would make the kv tail disagree
+/// with the same query without the split.
 ///
-/// A `Timestamp` becomes the string `executor::extract_value` renders,
-/// deliberately: the display-offset shift runs after the tail and re-parses
-/// that text, so a cell retyped here would silently stop shifting.
+/// A `Timestamp` the tail computed becomes the wire's RFC 3339 text in
+/// UTC (`Z`), the spelling every `timestamp` cell has: it is the tail's own
+/// instant, not a stored column the display offset applies to, so it says
+/// which offset it is in. Its column is typed `timestamp`
+/// ([`rows_to_result`] folds the pipeline cell, not this one).
 fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
     match cell {
         EvalValue::Null => crate::value::Value::Null,
@@ -156,7 +204,13 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::UInt(u) => land_u64(*u),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
         EvalValue::Str(s) => crate::value::Value::String(s.clone()),
-        EvalValue::Timestamp(instant) => crate::value::Value::String(instant.cast_text()),
+        EvalValue::Timestamp(instant) => crate::value::Value::String(match instant {
+            Instant::NegInfinity => "-infinity".to_owned(),
+            Instant::At(at) => {
+                crate::executor::wire_timestamp(at.and_utc().timestamp_micros(), Utc.fix())
+            }
+            Instant::Infinity => "infinity".to_owned(),
+        }),
         EvalValue::Array(arr) => crate::value::Value::Array(arr.iter().map(eval_to_cell).collect()),
     }
 }
@@ -176,31 +230,108 @@ fn unsigned_arm() {
     );
 }
 
-/// Convert pipeline rows back to a columnar `QueryResult`.
+/// Add one pipeline cell's type to a column's evidence.
 ///
-/// Discovers the column set across all events (preserving insertion order)
-/// and fills missing keys with NULL.
-fn events_to_result(events: &[Row]) -> QueryResult {
-    // Discover columns across all events, preserving insertion order.
-    let mut col_set = IndexSet::new();
-    for event in events {
-        for key in event.keys() {
-            col_set.insert(key.clone());
+/// The pipeline cell, not the result cell it becomes: an
+/// [`EvalValue::Timestamp`] is text in the result, but its column is a
+/// `timestamp` column.
+fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
+    let ty = match cell {
+        EvalValue::Null => return,
+        EvalValue::Bool(_) => ColumnType::Boolean,
+        EvalValue::Int(_) | EvalValue::UInt(_) => ColumnType::Integer,
+        EvalValue::Float(_) => ColumnType::Float,
+        EvalValue::Str(_) => ColumnType::String,
+        EvalValue::Timestamp(_) => ColumnType::Timestamp,
+        EvalValue::Array(elements) => {
+            let mut items = TypeFold::new();
+            for element in elements {
+                observe_cell(&mut items, element);
+            }
+            fold.observe_list(items);
+            return;
+        }
+    };
+    fold.observe(&ty);
+}
+
+/// Convert pipeline rows to a typed, columnar [`QueryResult`].
+///
+/// The one builder for every result a Rust-side stage produces: the batch
+/// tail behind `extract kv`, and the live lane's frames and snapshots.
+/// The columns are `schema`'s, in its order, then every other key the rows
+/// carry, in the order first seen; a missing key is NULL. The schema is
+/// the stages' statically known output ([`StreamPlan::output_schema`]):
+/// it orders the columns, which a [`Row`] keeps sorted, and it is the
+/// whole answer when no row survived.
+///
+/// A row key lands in the column of its exact name, else in the one it
+/// matches ASCII case-insensitively, so one name is one column: the stages
+/// bind names that way, and a `table N` keeps the `n` an `extract kv`
+/// produced under the row's own spelling. A row holding two case variants
+/// fills the column from the exact one, else from the first in key order,
+/// as a stage reading the name would.
+///
+/// Each column is typed from the cells it holds (ADR-0035, amended
+/// 2026-10-22): one type of cell gives that type, several give `mixed`,
+/// and list items fold the same way. The type its schema column carries
+/// fills what the cells leave open ([`TypeFold::finish_with`]): a column
+/// with no non-null cell takes it whole, and a list whose cells are all
+/// empty or null takes its items, so a stored `BIGINT[]` with nothing in
+/// it is still `list` of `integer` after the tail. A column that carries
+/// nothing and shows nothing is `string`.
+pub fn rows_to_result(rows: &[Row], schema: &[OutputColumn<ColumnType>]) -> QueryResult {
+    let mut names: Vec<String> = Vec::new();
+    let mut carried: Vec<Option<ColumnType>> = Vec::new();
+    // Each column by its ASCII-folded name.
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let known = schema
+        .iter()
+        .map(|column| (column.name.as_str(), column.carries.clone()));
+    let seen = rows
+        .iter()
+        .flat_map(|row| row.keys().map(|key| (key.as_str(), None)));
+    for (name, carries) in known.chain(seen) {
+        if let Entry::Vacant(slot) = index.entry(catalog_key(name)) {
+            slot.insert(names.len());
+            names.push(name.to_owned());
+            carried.push(carries);
         }
     }
 
-    let columns: Vec<Column> = col_set
+    let mut folds = vec![TypeFold::new(); names.len()];
+    let rows: Vec<Vec<crate::value::Value>> = rows
         .iter()
-        .map(|name| Column { name: name.clone() })
+        .map(|row| {
+            let mut cells: Vec<Option<&EvalValue>> = vec![None; names.len()];
+            for (key, cell) in row {
+                let at = index[&catalog_key(key)];
+                if cells[at].is_none() || *key == names[at] {
+                    cells[at] = Some(cell);
+                }
+            }
+            cells
+                .into_iter()
+                .zip(folds.iter_mut())
+                .map(|(cell, fold)| {
+                    let cell = cell.unwrap_or(&EvalValue::Null);
+                    observe_cell(fold, cell);
+                    eval_to_cell(cell)
+                })
+                .collect()
+        })
         .collect();
 
-    let rows: Vec<Vec<crate::value::Value>> = events
-        .iter()
-        .map(|event| {
-            col_set
-                .iter()
-                .map(|col| eval_to_cell(event.get(col).unwrap_or(&EvalValue::Null)))
-                .collect()
+    let columns = names
+        .into_iter()
+        .zip(carried)
+        .zip(folds)
+        .map(|((name, carries), fold)| {
+            Column::new(
+                name,
+                fold.finish_with(carries.as_ref())
+                    .unwrap_or(ColumnType::String),
+            )
         })
         .collect();
 
@@ -427,9 +558,7 @@ fn rust_tail_sort_orders_large_unsigned_exactly() {
         .expect("dsl parses")
         .pipeline;
     let result = QueryResult {
-        columns: vec![Column {
-            name: "bytes".to_string(),
-        }],
+        columns: vec![Column::new("bytes", ColumnType::Mixed)],
         rows: vec![
             vec![Value::UInt(u64::MAX)],
             vec![Value::UInt(u64::MAX - 1)],
@@ -475,9 +604,7 @@ fn timechart_on_refused_in_batch_tail() {
         .expect("dsl parses")
         .pipeline;
     let result = QueryResult {
-        columns: vec![Column {
-            name: "_raw".to_string(),
-        }],
+        columns: vec![Column::new("_raw", ColumnType::String)],
         rows: Vec::new(),
     };
     let anchor = EvalContext::at(
@@ -519,12 +646,8 @@ fn tail_timechart_span_follows_the_query_window() {
     let last = query.search.time_filter.as_ref().map(|tf| tf.node.duration);
     let rows = || QueryResult {
         columns: vec![
-            Column {
-                name: "_time".to_string(),
-            },
-            Column {
-                name: "message".to_string(),
-            },
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("message", ColumnType::String),
         ],
         rows: vec![
             vec![
@@ -552,9 +675,17 @@ fn tail_timechart_span_follows_the_query_window() {
         out.rows[row][idx].clone()
     };
     assert_eq!(windowed.rows.len(), 1, "{:?}", windowed.rows);
+    // The bucket is a TIMESTAMP, as the SQL lane's `time_bucket` is.
     assert_eq!(
         time(&windowed, 0),
-        Value::String("2026-01-01T00:00:00+00:00".into())
+        Value::String("2026-01-01T00:00:00.000000Z".into())
+    );
+    assert!(
+        windowed
+            .columns
+            .contains(&Column::new("_time", ColumnType::Timestamp)),
+        "{:?}",
+        windowed.columns
     );
 
     // The live answer for the same stages: no window, one-minute buckets.
@@ -576,9 +707,7 @@ mod tests {
         QueryResult {
             columns: columns
                 .iter()
-                .map(|n| Column {
-                    name: n.to_string(),
-                })
+                .map(|n| Column::new(*n, ColumnType::String))
                 .collect(),
             rows,
         }
@@ -624,25 +753,123 @@ mod tests {
     }
 
     /// A `Timestamp` cell — the one shape with no result-side twin — lands
-    /// as the string the shift machinery re-parses after the tail.
+    /// as the wire's RFC 3339 text in UTC, and an infinity as its word.
     #[test]
-    fn a_timestamp_cell_leaves_the_bridge_as_text() {
+    fn a_timestamp_cell_leaves_the_bridge_as_wire_text() {
         let ts = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
             .unwrap()
-            .and_hms_opt(9, 0, 0)
+            .and_hms_micro_opt(9, 0, 0, 120_000)
             .unwrap();
-        assert_eq!(
-            eval_to_cell(&EvalValue::Timestamp(trawl_core::compare::Instant::At(ts))),
-            crate::value::Value::String("2026-01-15 09:00:00".into())
+        for (instant, text) in [
+            (
+                trawl_core::compare::Instant::At(ts),
+                "2026-01-15T09:00:00.120000Z",
+            ),
+            (trawl_core::compare::Instant::Infinity, "infinity"),
+            (trawl_core::compare::Instant::NegInfinity, "-infinity"),
+        ] {
+            assert_eq!(
+                eval_to_cell(&EvalValue::Timestamp(instant)),
+                crate::value::Value::String(text.into())
+            );
+        }
+    }
+
+    /// The schema fixes the column order a sorted [`Row`] cannot, keeps a
+    /// schema column no row carries (typed by what it carries, else
+    /// `string`), and every other key follows it.
+    #[test]
+    fn the_schema_leads_the_column_order() {
+        let row = |cells: &[(&str, EvalValue)]| -> Row {
+            cells
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect()
+        };
+        let schema = [
+            OutputColumn::new("host", None),
+            OutputColumn::new("count", None),
+            OutputColumn::new("gone", None),
+            OutputColumn::new("rate", Some(ColumnType::Float)),
+        ];
+        let result = rows_to_result(
+            &[row(&[
+                ("count", EvalValue::UInt(u64::MAX)),
+                ("host", EvalValue::Str("web-1".into())),
+                ("extra", EvalValue::Bool(true)),
+            ])],
+            &schema,
         );
-        // An infinity crosses as its word — a text the display-offset
-        // shift leaves alone (it re-parses only its own rendering), so a
-        // computed infinity survives a shifted run unchanged.
         assert_eq!(
-            eval_to_cell(&EvalValue::Timestamp(
-                trawl_core::compare::Instant::Infinity
-            )),
-            crate::value::Value::String("infinity".into())
+            result.columns,
+            vec![
+                Column::new("host", ColumnType::String),
+                Column::new("count", ColumnType::Integer),
+                Column::new("gone", ColumnType::String),
+                Column::new("rate", ColumnType::Float),
+                Column::new("extra", ColumnType::Boolean),
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                crate::value::Value::String("web-1".into()),
+                crate::value::Value::UInt(u64::MAX),
+                crate::value::Value::Null,
+                crate::value::Value::Null,
+                crate::value::Value::Boolean(true),
+            ]]
+        );
+
+        let empty = rows_to_result(&[], &schema);
+        assert_eq!(
+            empty.columns,
+            vec![
+                Column::new("host", ColumnType::String),
+                Column::new("count", ColumnType::String),
+                Column::new("gone", ColumnType::String),
+                Column::new("rate", ColumnType::Float),
+            ]
+        );
+        assert!(empty.rows.is_empty());
+    }
+
+    /// One name is one column: a row key lands in the column it names
+    /// ASCII case-insensitively, under the spelling first listed, and a
+    /// row holding both spellings fills it from the exact one.
+    #[test]
+    fn a_case_variant_key_lands_in_its_column() {
+        let row = |cells: &[(&str, EvalValue)]| -> Row {
+            cells
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect()
+        };
+        let result = rows_to_result(
+            &[
+                row(&[("n", EvalValue::Int(1))]),
+                row(&[("N", EvalValue::Int(2)), ("Other", EvalValue::Int(3))]),
+                row(&[("other", EvalValue::Int(4))]),
+                row(&[("N", EvalValue::Int(5)), ("n", EvalValue::Int(6))]),
+            ],
+            &[OutputColumn::new("N", None)],
+        );
+        assert_eq!(
+            result.columns,
+            vec![
+                Column::new("N", ColumnType::Integer),
+                Column::new("Other", ColumnType::Integer),
+            ]
+        );
+        let int = crate::value::Value::Integer;
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![int(1), crate::value::Value::Null],
+                vec![int(2), int(3)],
+                vec![crate::value::Value::Null, int(4)],
+                vec![int(5), crate::value::Value::Null],
+            ]
         );
     }
 

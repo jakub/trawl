@@ -489,10 +489,8 @@ async fn overhang_refuses_corpus_reads_until_compaction_settles_it() {
 fn report() -> QueryResult {
     QueryResult {
         columns: vec![
-            Column {
-                name: "host".into(),
-            },
-            Column { name: "n".into() },
+            Column::new("host", trawl_engine::value::ColumnType::String),
+            Column::new("n", trawl_engine::value::ColumnType::Integer),
         ],
         rows: vec![
             vec![Value::String("web-1".into()), Value::Integer(3)],
@@ -701,7 +699,7 @@ async fn unaffected_lanes_answer_during_overhang_as_on_a_settled_server() {
     );
 
     let settled = from_saved(&control).await;
-    assert_eq!(settled.1, serde_json::json!([[7]]), "the recorded report");
+    assert_eq!(settled.1, serde_json::json!([["7"]]), "the recorded report");
     assert_eq!(from_saved(&server).await, settled, "| from saved");
 
     assert_eq!(

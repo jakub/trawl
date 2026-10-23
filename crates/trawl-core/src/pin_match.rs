@@ -519,6 +519,21 @@ fn conformed_reading(v: &Value, pin: CanonicalType) -> Option<Conformed> {
     }
 }
 
+/// [`conformed_reading`] as the pipeline cell the conformed column holds,
+/// for every pin whose reading is a scalar of its own type. A SEVERITY
+/// reading is the `SeverityNumber` alone, whose name only a severity
+/// column's renderer restores, so it has no cell here.
+pub(crate) fn conformed_cell(v: &Value, pin: CanonicalType) -> Option<crate::eval::EvalValue> {
+    use crate::eval::EvalValue;
+    Some(match conformed_reading(v, pin)? {
+        Conformed::Int(i) => EvalValue::Int(i),
+        Conformed::Double(d) => EvalValue::Float(d),
+        Conformed::Bool(b) => EvalValue::Bool(b),
+        Conformed::Time(t) => EvalValue::Timestamp(t),
+        Conformed::Severity(_) => return None,
+    })
+}
+
 /// Compare a conformed reading against the literal in the pin's own
 /// domain — the promotions `DuckDB` performs between the pinned COLUMN's
 /// type and the bound parameter's, each one probed.

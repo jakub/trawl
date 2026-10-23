@@ -399,8 +399,8 @@ fn a_timechart_snapshot_stamps_one_instant_too() {
     assert_eq!(
         buckets,
         vec![
-            "2026-08-24T09:00:00+00:00".to_owned(),
-            "2026-08-24T09:01:00+00:00".to_owned()
+            "2026-08-24 09:00:00".to_owned(),
+            "2026-08-24 09:01:00".to_owned()
         ],
         "the buckets are the EVENTS' own hours, hours before the snapshot"
     );
@@ -519,8 +519,8 @@ fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
     assert_eq!(
         buckets,
         vec![
-            "2020-03-04T05:05:00+00:00".to_owned(),
-            "2020-03-04T05:06:00+00:00".to_owned()
+            "2020-03-04 05:05:00".to_owned(),
+            "2020-03-04 05:06:00".to_owned()
         ],
         "one bucket each side of the boundary, from the EVENTS' contexts \
          — never the snapshot's, and never a fresh clock's"

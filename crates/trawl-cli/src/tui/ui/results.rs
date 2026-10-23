@@ -15,8 +15,11 @@ use ratatui::widgets::{
     Table,
 };
 use std::collections::HashSet;
-use trawl_api::display::{downsample, extract_series, is_timechart_result, value_to_string};
+use trawl_api::display::{
+    downsample, extract_series, is_timechart_result, timestamp_cell_text, value_to_string,
+};
 use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+use trawl_api::value::ColumnType;
 use trawl_engine::value::Value;
 
 use crate::tui::App;
@@ -312,7 +315,7 @@ fn render_table(
                         // (ADR-0013 §6).
                         severity_cell_text(value)
                     } else {
-                        value_to_string(value)
+                        cell_text(&result.columns[col_idx].ty, value)
                     };
                     let truncated = truncate_with_ellipsis(&text, width);
                     let cell = Cell::from(truncated);
@@ -1001,7 +1004,7 @@ fn render_bar_chart(
         .take(max_bars)
         .enumerate()
         .map(|(idx, row)| {
-            let label = value_to_string(&row[label_col]);
+            let label = cell_text(&result.columns[label_col].ty, &row[label_col]);
             // A bar's height is a `u64`, which is `Value::UInt`'s own
             // width, so an oversized unsigned draws at its real
             // magnitude. A negative or a NaN clamps to the bottom of the
@@ -1402,7 +1405,7 @@ fn compute_column_widths(
 
             for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
                 if let Some(value) = row.get(col_idx) {
-                    let display_len = value_to_string(value).len();
+                    let display_len = cell_text(&col.ty, value).len();
                     if display_len > max_width {
                         max_width = display_len;
                     }
@@ -1439,8 +1442,9 @@ fn extract_time_metadata(
     // Find the _time column by name (UNION ALL BY NAME can reorder columns)
     let time_col = result.columns.iter().position(|c| c.name == "_time")?;
 
-    let first_time = value_to_string(&result.rows[0][time_col]);
-    let last_time = value_to_string(&result.rows[result.rows.len() - 1][time_col]);
+    let time_ty = &result.columns[time_col].ty;
+    let first_time = cell_text(time_ty, &result.rows[0][time_col]);
+    let last_time = cell_text(time_ty, &result.rows[result.rows.len() - 1][time_col]);
 
     // Derive span from the minimum non-zero delta between consecutive time buckets.
     // Using min rather than just the first pair handles sparse data (empty buckets
@@ -1448,8 +1452,8 @@ fn extract_time_metadata(
     let span = if result.rows.len() >= 2 {
         let mut min_delta: Option<u64> = None;
         for pair in result.rows.windows(2) {
-            let t1 = value_to_string(&pair[0][time_col]);
-            let t2 = value_to_string(&pair[1][time_col]);
+            let t1 = cell_text(time_ty, &pair[0][time_col]);
+            let t2 = cell_text(time_ty, &pair[1][time_col]);
             if let (Some(s1), Some(s2)) = (parse_timestamp_secs(&t1), parse_timestamp_secs(&t2)) {
                 let delta = s2.saturating_sub(s1);
                 if delta > 0 {
@@ -1513,6 +1517,14 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
+/// A result cell as the TUI shows it: a timestamp as the wall clock the
+/// server rendered in the reader's offset ([`timestamp_cell_text`]), any
+/// other cell through [`value_to_string`]. The grid, its column widths,
+/// the detail popup and the search all read this one text.
+pub fn cell_text(ty: &ColumnType, value: &Value) -> String {
+    timestamp_cell_text(ty, value).unwrap_or_else(|| value_to_string(value))
+}
+
 /// A `_severity` cell as the TUI shows it: the shared `OTel` token, or the
 /// grid's ordinary rendering where the ladder has no reading for the value.
 fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
@@ -1531,13 +1543,14 @@ fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
 fn timechart_sparklines_survive_unsigned_magnitudes() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use trawl_engine::value::{Column, QueryResult};
+    use trawl_engine::value::{Column, ColumnType, QueryResult};
 
-    let col = |name: &str| Column {
-        name: name.to_owned(),
-    };
     let result = QueryResult {
-        columns: vec![col("_time"), col("m0"), col("m1")],
+        columns: vec![
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("m0", ColumnType::Integer),
+            Column::new("m1", ColumnType::Integer),
+        ],
         rows: vec![
             vec![
                 Value::String("2026-01-01 00:00:00".to_owned()),
@@ -1605,12 +1618,8 @@ fn bar_chart_renders_uint_metric() {
 
     let result = QueryResult {
         columns: vec![
-            Column {
-                name: "service".to_owned(),
-            },
-            Column {
-                name: "first_request_id".to_owned(),
-            },
+            Column::new("service", trawl_engine::value::ColumnType::String),
+            Column::new("first_request_id", trawl_engine::value::ColumnType::Integer),
         ],
         rows: vec![vec![
             Value::String("nginx".to_owned()),
@@ -1653,6 +1662,65 @@ fn bar_chart_renders_uint_metric() {
         screen.contains('\u{2588}'),
         "the bar must have a height, not sit at zero:\n{screen}"
     );
+}
+
+/// AC 2 in the TUI: a response decoded from its wire text shows every
+/// digit of 2^53+1, 2^63 and `u64::MAX` in the grid, and the bar chart
+/// orders the three by magnitude. The TUI has no client-side row sort, so
+/// the bar lengths are where it compares the numbers: a reader that went
+/// through `f64` would print 9007199254740992 and could not tell the two
+/// largest apart.
+#[cfg(test)]
+#[test]
+fn big_integers_from_the_wire_render_exactly_and_in_order() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let response: trawl_client::QueryResponse = serde_json::from_str(
+        r#"{
+            "columns": [{"name": "host", "type": "string"},
+                        {"name": "id", "type": "integer"}],
+            "rows": [["a", "9007199254740993"],
+                     ["b", "9223372036854775808"],
+                     ["c", "18446744073709551615"]],
+            "pagination": {"limit": 100, "offset": 0, "returned": 3, "total": 3}
+        }"#,
+    )
+    .expect("the typed wire decodes");
+
+    let draw = |view| {
+        let mut app = crate::tui::tests::test_app();
+        app.tab.result = Some(response.clone());
+        app.tab.chart_view = view;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).expect("terminal");
+        terminal
+            .draw(|f| crate::tui::ui::render(&mut app, f))
+            .expect("render");
+        terminal.backend().to_string()
+    };
+
+    let grid = draw(ChartView::Table);
+    for digits in [
+        "9007199254740993",
+        "9223372036854775808",
+        "18446744073709551615",
+    ] {
+        assert!(grid.contains(digits), "{digits} missing from:\n{grid}");
+    }
+    assert!(!grid.contains("9007199254740992"), "{grid}");
+
+    // One bar per host; its length is its share of the largest value.
+    let bars = draw(ChartView::BarChart);
+    let length = |host: &str| {
+        bars.lines()
+            .find(|line| line.contains(&format!("{host} ")) && line.contains("  "))
+            .map_or_else(
+                || panic!("no bar for {host}:\n{bars}"),
+                |line| line.matches('\u{2588}').count(),
+            )
+    };
+    let (a, b, c) = (length("a"), length("b"), length("c"));
+    assert!(a < b && b < c, "bars out of order ({a}, {b}, {c}):\n{bars}");
 }
 
 #[cfg(test)]

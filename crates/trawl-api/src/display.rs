@@ -10,7 +10,80 @@
 
 use std::collections::HashMap;
 
-use crate::value::{QueryResult, Value};
+use crate::value::{ColumnType, QueryResult, Value};
+
+/// A cell of a `timestamp` column, or of a list of them, as the CLI table
+/// and the TUI show it: each timestamp through [`timestamp_text`], a list
+/// the way `Value`'s `Display` writes one.
+///
+/// `None` for any other cell, which each surface renders its own way.
+#[must_use]
+pub fn timestamp_cell_text(ty: &ColumnType, value: &Value) -> Option<String> {
+    match (ty, value) {
+        (ColumnType::Timestamp, Value::String(text)) => Some(timestamp_text(text)),
+        (ColumnType::List { items }, Value::Array(_)) if holds_timestamps(items) => {
+            Some(element_text(ty, value))
+        }
+        _ => None,
+    }
+}
+
+fn holds_timestamps(ty: &ColumnType) -> bool {
+    match ty {
+        ColumnType::Timestamp => true,
+        ColumnType::List { items } => holds_timestamps(items),
+        _ => false,
+    }
+}
+
+/// A list element the way `Value`'s `Display` writes one, with the
+/// timestamps in it shown through [`timestamp_text`].
+fn element_text(ty: &ColumnType, value: &Value) -> String {
+    match (ty, value) {
+        (ColumnType::Timestamp, Value::String(text)) => timestamp_text(text),
+        (ColumnType::List { items }, Value::Array(elements)) => {
+            let shown: Vec<String> = elements.iter().map(|e| element_text(items, e)).collect();
+            format!("[{}]", shown.join(", "))
+        }
+        _ => value.to_string(),
+    }
+}
+
+/// A wire timestamp as the terminal shows it: the wall-clock reading
+/// without the `T`, the offset or the fraction's trailing zeros, so
+/// `2024-01-15T10:00:00.120000+02:00` shows as `2024-01-15 10:00:00.12`.
+///
+/// The server renders a result in the reader's offset, so the wall clock
+/// is the reading the reader asked for. Text that is not a wire timestamp
+/// (`infinity`, or anything else) shows as it stands.
+#[must_use]
+pub fn timestamp_text(text: &str) -> String {
+    if !text.is_ascii() {
+        return text.to_owned();
+    }
+    let Some((date, rest)) = text.split_once('T') else {
+        return text.to_owned();
+    };
+    let clock = if let Some(clock) = rest.strip_suffix('Z') {
+        clock
+    } else {
+        match rest.len().checked_sub(6) {
+            Some(at) if matches!(rest.as_bytes()[at], b'+' | b'-') => &rest[..at],
+            _ => return text.to_owned(),
+        }
+    };
+    match clock.split_once('.') {
+        Some((whole, fraction)) => {
+            let fraction = fraction.trim_end_matches('0');
+            if fraction.is_empty() {
+                format!("{date} {whole}")
+            } else {
+                format!("{date} {whole}.{fraction}")
+            }
+        }
+        None => format!("{date} {clock}"),
+    }
+}
 
 /// Convert a [`Value`] to a string for display.
 ///
@@ -219,12 +292,14 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
 #[cfg(test)]
 #[test]
 fn series_ranking_survives_unsigned_totals() {
-    let mut columns = vec![crate::value::Column {
-        name: "_time".to_owned(),
-    }];
-    columns.extend((0..7).map(|i| crate::value::Column {
-        name: format!("m{i}"),
-    }));
+    let mut columns = vec![crate::value::Column::new(
+        "_time",
+        crate::value::ColumnType::Timestamp,
+    )];
+    columns
+        .extend((0..7).map(|i| {
+            crate::value::Column::new(format!("m{i}"), crate::value::ColumnType::Integer)
+        }));
 
     // Six small metrics and one enormous one, twice over.
     let row = |t: &str| {
@@ -264,15 +339,9 @@ fn series_ranking_survives_unsigned_totals() {
 fn uint_metric_is_not_a_group() {
     let result = QueryResult {
         columns: vec![
-            crate::value::Column {
-                name: "_time".to_owned(),
-            },
-            crate::value::Column {
-                name: "first_request_id".to_owned(),
-            },
-            crate::value::Column {
-                name: "count".to_owned(),
-            },
+            crate::value::Column::new("_time", crate::value::ColumnType::Timestamp),
+            crate::value::Column::new("first_request_id", crate::value::ColumnType::Integer),
+            crate::value::Column::new("count", crate::value::ColumnType::Integer),
         ],
         rows: vec![vec![
             Value::String("2026-01-01 00:00:00".to_owned()),
@@ -300,15 +369,9 @@ fn digit_string_label_stays_a_group() {
     let grouped_by = |label: &str| {
         let result = QueryResult {
             columns: vec![
-                crate::value::Column {
-                    name: "_time".to_owned(),
-                },
-                crate::value::Column {
-                    name: "status".to_owned(),
-                },
-                crate::value::Column {
-                    name: "count".to_owned(),
-                },
+                crate::value::Column::new("_time", crate::value::ColumnType::Timestamp),
+                crate::value::Column::new("status", crate::value::ColumnType::String),
+                crate::value::Column::new("count", crate::value::ColumnType::Integer),
             ],
             rows: vec![
                 vec![
@@ -345,9 +408,7 @@ mod tests {
     use crate::value::Column;
 
     fn col(name: &str) -> Column {
-        Column {
-            name: name.to_owned(),
-        }
+        Column::new(name, crate::value::ColumnType::String)
     }
 
     #[test]
@@ -579,6 +640,66 @@ mod tests {
         assert_eq!(
             value_to_string(&Value::Array(vec![Value::Integer(1), Value::Integer(2)])),
             "[1, 2]"
+        );
+    }
+
+    /// The terminal shows a wire timestamp as the wall clock it carries,
+    /// the look it had before the wire spelled an offset: no `T`, no
+    /// offset, no trailing fraction zeros.
+    #[test]
+    fn timestamps_show_as_the_wall_clock() {
+        for (wire, shown) in [
+            ("2024-01-15T10:00:00.000000Z", "2024-01-15 10:00:00"),
+            ("2024-01-15T10:00:00.120000+02:00", "2024-01-15 10:00:00.12"),
+            (
+                "1969-12-31T23:59:59.999999-08:00",
+                "1969-12-31 23:59:59.999999",
+            ),
+            ("+10000-01-01T00:00:00.000000Z", "+10000-01-01 00:00:00"),
+            ("infinity", "infinity"),
+            ("-infinity", "-infinity"),
+            ("not a timestamp", "not a timestamp"),
+            ("2024-01-15T10:00:00", "2024-01-15T10:00:00"),
+        ] {
+            assert_eq!(timestamp_text(wire), shown, "{wire}");
+        }
+    }
+
+    /// Only a `timestamp` cell, alone or in a list, has a timestamp look;
+    /// every other cell is left to the surface.
+    #[test]
+    fn timestamp_cells_are_picked_by_column_type() {
+        let wire = Value::String("2024-01-15T10:00:00.000000Z".into());
+        assert_eq!(
+            timestamp_cell_text(&ColumnType::Timestamp, &wire).as_deref(),
+            Some("2024-01-15 10:00:00")
+        );
+        assert_eq!(timestamp_cell_text(&ColumnType::String, &wire), None);
+        assert_eq!(
+            timestamp_cell_text(&ColumnType::Timestamp, &Value::Null),
+            None
+        );
+        let list = Value::Array(vec![wire.clone(), Value::Null]);
+        assert_eq!(
+            timestamp_cell_text(&ColumnType::list(ColumnType::Timestamp), &list).as_deref(),
+            Some("[2024-01-15 10:00:00, ]")
+        );
+        let nested = Value::Array(vec![list.clone()]);
+        assert_eq!(
+            timestamp_cell_text(
+                &ColumnType::list(ColumnType::list(ColumnType::Timestamp)),
+                &nested
+            )
+            .as_deref(),
+            Some("[[2024-01-15 10:00:00, ]]")
+        );
+        assert_eq!(
+            timestamp_cell_text(&ColumnType::list(ColumnType::String), &list),
+            None
+        );
+        assert_eq!(
+            timestamp_cell_text(&ColumnType::Float, &Value::Float(1.0)),
+            None
         );
     }
 

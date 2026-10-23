@@ -2,22 +2,29 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The API reference's ingest response examples are wire values. Each
-//! JSON example under "Ingest events" and "Preview ingest" must decode as
-//! the `trawl_api` type the route answers with and encode back to the same
-//! JSON, so a renamed, misspelled, or invented field fails here. Every
-//! `reason` an example shows must be a `RejectReason` wire code, and every
-//! repair an example shows a `RepairCode`, imported rather than copied.
+//! The API reference's response examples are wire values. Each JSON
+//! example under the sections below must decode as the `trawl_api` type
+//! the route answers with and encode back to the same JSON, so a renamed,
+//! misspelled, or invented field fails here.
 //!
-//! The preview example was captured from a real trawld; only `arrival`
-//! and `_ingested` vary between runs, and both are free-form strings to
-//! the wire type.
+//! Ingest: every `reason` an example under "Ingest events" and "Preview
+//! ingest" shows must be a `RejectReason` wire code, and every repair a
+//! `RepairCode`, imported rather than copied. The preview example was
+//! captured from a real trawld; only `arrival` and `_ingested` vary
+//! between runs, and both are free-form strings to the wire type.
+//!
+//! Results: the examples under "Result columns", "Run a query", "Report
+//! run" and "Stream live events" decode through the typed result codec
+//! (ADR-0035, amended 2026-10-22), so an untyped column, a JSON-number
+//! integer or a cell that disagrees with its column's type fails here.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use trawl_api::IngestResponse;
 use trawl_api::ingest_preview::{PreviewEvent, PreviewResponse};
+use trawl_api::stream::SnapshotFrame;
+use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell};
+use trawl_api::{IngestResponse, QueryResponse, ReportRunResponse};
 use trawl_server::ingest::envelope::{RejectReason, RepairCode};
 
 const API: &str = include_str!("../../../docs/src/content/docs/reference/api.md");
@@ -146,4 +153,110 @@ fn preview_response_example_is_the_wire_type_with_real_codes() {
             "{heading:?} example's counts disagree with its events"
         );
     }
+}
+
+#[test]
+fn the_result_column_example_is_a_typed_column() {
+    let heading = "Result columns";
+    let examples = json_blocks(section(heading));
+    assert_eq!(examples.len(), 1, "one column example under {heading:?}");
+    let column: Column = decode_exactly(heading, examples[0]);
+    assert_eq!(column.ty, ColumnType::list(ColumnType::Integer));
+}
+
+#[test]
+fn the_query_response_example_carries_typed_big_integers() {
+    let heading = "Run a query";
+    let examples = json_blocks(section(heading));
+    assert_eq!(examples.len(), 1, "one response example under {heading:?}");
+    let response: QueryResponse = decode_exactly(heading, examples[0]);
+    assert_eq!(
+        response.result.columns,
+        vec![
+            Column::new("service", ColumnType::String),
+            Column::new("count", ColumnType::Integer),
+            Column::new("bytes", ColumnType::Integer),
+        ]
+    );
+    assert_eq!(
+        response.result.rows[0][2],
+        Cell::UInt(u64::MAX),
+        "the example shows an integer past i64::MAX"
+    );
+    assert_eq!(
+        response.result.rows[1][2],
+        Cell::Integer(9_007_199_254_740_993),
+        "and one past 2^53"
+    );
+    assert_eq!(response.pagination.returned, response.result.rows.len());
+}
+
+#[test]
+fn the_report_run_examples_are_typed_including_a_zero_row_run() {
+    let heading = "Report run";
+    let examples = json_blocks(section(heading));
+    assert_eq!(
+        examples.len(),
+        2,
+        "a run and a zero-row run under {heading:?}"
+    );
+    let runs: Vec<ReportRunResponse> = examples
+        .iter()
+        .map(|example| decode_exactly(heading, example))
+        .collect();
+    for run in &runs {
+        let result = run.result.as_ref().expect("a successful run has a result");
+        assert_eq!(
+            run.summary.row_count,
+            Some(result.rows.len()),
+            "{heading:?} example's row_count disagrees with its rows"
+        );
+        assert!(
+            result.columns.iter().any(|c| c.ty == ColumnType::Integer),
+            "{heading:?} example shows an integer column"
+        );
+    }
+    assert!(runs[1].result.as_ref().unwrap().rows.is_empty());
+}
+
+#[test]
+fn the_stream_examples_are_typed_result_frames() {
+    let heading = "Stream live events";
+    let text = section(heading);
+    let examples = json_blocks(text);
+    assert_eq!(
+        examples.len(),
+        2,
+        "a data frame and a snapshot under {heading:?}"
+    );
+    let data: QueryResult = decode_exactly(heading, examples[0]);
+    assert_eq!(data.rows.len(), 1, "a data frame is one row");
+    let snapshot: SnapshotFrame = decode_exactly(heading, examples[1]);
+    assert!(
+        !snapshot.capped.is_empty(),
+        "{heading:?} snapshot example shows capped"
+    );
+
+    // The SSE transcript's frames are wire values too.
+    let mut frames = 0;
+    let mut event = "";
+    for line in text.lines() {
+        if let Some(name) = line.strip_prefix("event: ") {
+            event = name;
+        } else if let Some(body) = line.strip_prefix("data: ") {
+            frames += 1;
+            match event {
+                "data" => {
+                    let frame: QueryResult = decode_exactly(heading, body);
+                    assert_eq!(frame, data, "the transcript shows the documented frame");
+                }
+                "lagged" => {
+                    let lagged: Value = serde_json::from_str(body).unwrap();
+                    assert!(lagged["missed"].is_u64(), "{body}");
+                }
+                other => panic!("{heading:?} transcript shows an unknown event {other:?}"),
+            }
+        }
+    }
+    assert_eq!(frames, 2, "the transcript shows a data and a lagged frame");
 }

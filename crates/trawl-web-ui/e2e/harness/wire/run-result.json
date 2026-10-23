@@ -7,11 +7,11 @@
   "duration_ms": 125,
   "row_count": 3,
   "result": {
-    "columns": [{ "name": "host" }, { "name": "count" }],
+    "columns": [{ "name": "host", "type": "string" }, { "name": "count", "type": "integer" }],
     "rows": [
-      ["web-02", 12],
-      ["edge-01", 5],
-      ["db-01", 1]
+      ["web-02", "12"],
+      ["edge-01", "5"],
+      ["db-01", "1"]
     ]
   }
 }

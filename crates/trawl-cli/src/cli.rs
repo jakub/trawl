@@ -386,7 +386,14 @@ fn render_table(
                 if severity_cells.get(i).copied().unwrap_or(false) {
                     severity_cell_text(v)
                 } else {
-                    v.to_string()
+                    // A timestamp shows the wall clock the server rendered
+                    // in the reader's offset, without the wire's `T` and
+                    // offset.
+                    result
+                        .columns
+                        .get(i)
+                        .and_then(|c| trawl_api::display::timestamp_cell_text(&c.ty, v))
+                        .unwrap_or_else(|| v.to_string())
                 }
             })
             .collect();
@@ -425,12 +432,9 @@ fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
-            // `Value`'s Serialize impl emits plain JSON, never a struct or
-            // a map, so this conversion has no failure mode.
-            map.insert(
-                col.name.clone(),
-                serde_json::to_value(val).expect("Value serialization is infallible"),
-            );
+            // An export file, not the wire: integers stay JSON numbers
+            // (ADR-0035, amended 2026-10-22).
+            map.insert(col.name.clone(), val.to_plain_json());
         }
         serde_json::to_writer(&mut *out, &map).map_err(io::Error::other)?;
         writeln!(out)?;
@@ -464,10 +468,7 @@ fn csv_escape_value(val: &Value) -> String {
         // full precision for data fidelity (TUI display uses 2dp for readability)
         Value::Float(f) => f.to_string(),
         Value::String(s) => csv_escape_string(s),
-        Value::Array(arr) => {
-            let json = serde_json::to_string(arr).unwrap_or_default();
-            csv_escape_string(&json)
-        }
+        Value::Array(_) => csv_escape_string(&val.to_plain_json().to_string()),
     }
 }
 
@@ -732,15 +733,64 @@ mod tests {
         );
     }
 
+    /// AC 2: integers past 2^53 reach the table with every digit. The
+    /// response is decoded from its wire text, decimal strings under an
+    /// `integer` column, so this is the path a daemon answer takes; a
+    /// reader that went through `f64` would print 9007199254740992.
+    #[test]
+    fn the_table_prints_big_integers_from_the_wire_exactly() {
+        let response: trawl_client::QueryResponse = serde_json::from_str(
+            r#"{
+                "columns": [{"name": "host", "type": "string"},
+                            {"name": "id", "type": "integer"}],
+                "rows": [["a", "9007199254740993"],
+                         ["b", "9223372036854775808"],
+                         ["c", "18446744073709551615"],
+                         ["d", "-9223372036854775808"]],
+                "pagination": {"limit": 100, "offset": 0, "returned": 4, "total": 4}
+            }"#,
+        )
+        .expect("the typed wire decodes");
+        let (result, degraded, severity) = daemon_outcome(response);
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| row[1].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Value::Integer(9_007_199_254_740_993),
+                Value::UInt(9_223_372_036_854_775_808),
+                Value::UInt(u64::MAX),
+                Value::Integer(i64::MIN),
+            ]
+        );
+
+        let mut out = Vec::new();
+        render_table(&result, &severity, &mut out).unwrap();
+        let table = String::from_utf8(out).unwrap();
+        for digits in [
+            "9007199254740993",
+            "9223372036854775808",
+            "18446744073709551615",
+            "-9223372036854775808",
+        ] {
+            assert!(table.contains(digits), "{digits} missing from:\n{table}");
+        }
+        assert!(!table.contains("9007199254740992"), "{table}");
+        assert!(degraded.is_empty());
+    }
+
     /// A mocked daemon response carrying the note channel beside one
     /// result row.
     fn mocked_response() -> trawl_client::QueryResponse {
         trawl_client::QueryResponse {
             execution: None,
             result: QueryResult {
-                columns: vec![trawl_engine::value::Column {
-                    name: "host".to_owned(),
-                }],
+                columns: vec![trawl_engine::value::Column::new(
+                    "host",
+                    trawl_engine::value::ColumnType::String,
+                )],
                 rows: vec![vec![Value::String("db1".to_owned())]],
             },
             pagination: trawl_client::PaginationMeta {
@@ -814,9 +864,10 @@ mod tests {
         assert_eq!(severity_cell_text(&Value::Integer(99)), "99");
 
         let result = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: trawl_core::schema::SEVERITY.to_owned(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                trawl_core::schema::SEVERITY,
+                trawl_engine::value::ColumnType::Integer,
+            )],
             rows: vec![vec![Value::Integer(17)]],
         };
         let render = |f: fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>| {
@@ -835,6 +886,66 @@ mod tests {
         assert!(render(render_csv).contains("17"));
     }
 
+    /// A `timestamp` column shows in the table exactly as the engine's old
+    /// zoneless text did (the wall clock the server rendered in the
+    /// reader's offset), while json and csv carry the wire's RFC 3339.
+    #[test]
+    fn the_table_shows_wire_timestamps_as_the_wall_clock() {
+        use trawl_engine::value::{Column, ColumnType};
+        let table = |result: &QueryResult| {
+            let mut buf = Vec::new();
+            render_table(result, &[], &mut buf).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        let wire = [
+            "2026-01-15T10:00:00.000000+05:30",
+            "2026-01-15T10:00:00.120000+05:30",
+            "infinity",
+        ];
+        let shown = ["2026-01-15 10:00:00", "2026-01-15 10:00:00.12", "infinity"];
+        let typed = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("seen", ColumnType::list(ColumnType::Timestamp)),
+            ],
+            rows: wire
+                .iter()
+                .map(|t| {
+                    vec![
+                        Value::String((*t).into()),
+                        Value::Array(vec![Value::String((*t).into())]),
+                    ]
+                })
+                .collect(),
+        };
+        let before = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::String),
+                Column::new("seen", ColumnType::list(ColumnType::String)),
+            ],
+            rows: shown
+                .iter()
+                .map(|t| {
+                    vec![
+                        Value::String((*t).into()),
+                        Value::Array(vec![Value::String((*t).into())]),
+                    ]
+                })
+                .collect(),
+        };
+        assert_eq!(table(&typed), table(&before));
+
+        for f in [
+            render_ndjson as fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>,
+            render_csv,
+        ] {
+            let mut buf = Vec::new();
+            f(&typed, &mut buf).unwrap();
+            let text = String::from_utf8(buf).unwrap();
+            assert!(text.contains(wire[1]), "{text}");
+        }
+    }
+
     /// A declared severity column (`sev()`'s output under its own alias)
     /// renders its token in the table and its number everywhere a machine
     /// reads (ADR-0013).
@@ -842,12 +953,8 @@ mod tests {
     fn a_declared_severity_column_displays_its_token_in_the_table_only() {
         let result = QueryResult {
             columns: vec![
-                trawl_engine::value::Column {
-                    name: "s".to_owned(),
-                },
-                trawl_engine::value::Column {
-                    name: "n".to_owned(),
-                },
+                trawl_engine::value::Column::new("s", trawl_engine::value::ColumnType::Integer),
+                trawl_engine::value::Column::new("n", trawl_engine::value::ColumnType::Integer),
             ],
             rows: vec![vec![Value::Integer(18), Value::Integer(18)]],
         };
@@ -872,9 +979,10 @@ mod tests {
         // result column keeps the spelling the user typed, so the match
         // folds too — `DuckDB` identifiers are case-insensitive.
         let mixed = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: "S".to_owned(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                "S",
+                trawl_engine::value::ColumnType::Integer,
+            )],
             rows: vec![vec![Value::Integer(18)]],
         };
         let mut buf = Vec::new();
@@ -978,9 +1086,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let source = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: "message".into(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                "message",
+                trawl_engine::value::ColumnType::String,
+            )],
             rows: vec![vec![Value::String("local row".into())]],
         };
         for name in ["one.parquet", "two.parquet", "excluded.other"] {
@@ -1008,9 +1117,10 @@ mod tests {
         let output = dir.path().join("output.parquet");
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let source = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: "message".to_owned(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                "message",
+                trawl_engine::value::ColumnType::String,
+            )],
             rows: vec![
                 vec![Value::String("first".to_owned())],
                 vec![Value::String("second".to_owned())],

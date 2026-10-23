@@ -214,9 +214,7 @@ fn uint_values_are_faceted() {
     use crate::result_actions::Capabilities;
     use trawl_api::value::Column;
 
-    let col = |name: &str| Column {
-        name: name.to_owned(),
-    };
+    let col = |name: &str| Column::new(name, trawl_api::value::ColumnType::Integer);
 
     // A column mixing the two integer widths facets both of them.
     let mixed = QueryResult {
@@ -258,10 +256,10 @@ mod tests {
     use super::*;
     use trawl_api::value::Column;
 
+    /// Facets classify by cell variant, never by column type, so the type
+    /// here is not under test.
     fn col(name: &str) -> Column {
-        Column {
-            name: name.to_owned(),
-        }
+        Column::new(name, trawl_api::value::ColumnType::String)
     }
 
     #[test]
@@ -744,17 +742,27 @@ mod tests {
         ];
         let mut ring = RingBuffer::default();
         for (time, sender, level, host, status) in events {
-            let serde_json::Value::Object(map) = serde_json::json!({
-                "_time": time,
-                "timestamp": sender,
-                "level": level,
-                "host": host,
-                "status": status,
-                "_raw": format!("{level} {host}"),
-            }) else {
-                unreachable!()
-            };
-            ring.push(map);
+            // One `data` frame per event, as the server sends it.
+            let frame = serde_json::from_value(serde_json::json!({
+                "columns": [
+                    {"name": "_raw", "type": "string"},
+                    {"name": "_time", "type": "timestamp"},
+                    {"name": "host", "type": "string"},
+                    {"name": "level", "type": "string"},
+                    {"name": "status", "type": "integer"},
+                    {"name": "timestamp", "type": "string"},
+                ],
+                "rows": [[
+                    format!("{level} {host}"),
+                    time,
+                    host,
+                    level,
+                    status.to_string(),
+                    sender,
+                ]],
+            }))
+            .expect("a valid data frame");
+            ring.push(frame);
         }
         let live = ring_to_result(&ring);
 

@@ -35,6 +35,62 @@ export function wire(name) {
   return JSON.parse(wireText.get(name));
 }
 
+// ---- the typed result wire (ADR-0035, amended 2026-10-22) ---------------
+//
+// A generated result goes through these, never through a hand-spelled
+// cell: `trawl_api::value::QueryResult` is the authority, and the SPA
+// refuses a whole response for one cell its column type refuses.
+
+/** A canonical decimal integer, `-?(0|[1-9][0-9]*)`: the only spelling
+ * the decoder lands. */
+const DECIMAL = /^-?(0|[1-9][0-9]*)$/;
+
+/** RFC 3339 with microseconds and an offset, `Z` at zero: how the server
+ * writes a `timestamp` cell. */
+const WIRE_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}(Z|[+-]\d{2}:\d{2})$/;
+
+/** An instant (epoch ms or a `Date`) as a `timestamp` cell. */
+export function wireInstant(at) {
+  return new Date(at).toISOString().replace(/\.(\d{3})Z$/, '.$1000Z');
+}
+
+/** One cell under its column's type. An `integer` cell is a JS safe
+ * integer or already a decimal string; a number past 2^53 has already
+ * lost digits, so it throws instead of being spelled. */
+export function wireCell(type, value) {
+  if (value === null) return null;
+  if (type === 'integer') {
+    if (typeof value === 'number' && Number.isSafeInteger(value)) return String(value);
+    if (typeof value === 'string' && DECIMAL.test(value) && value !== '-0') return value;
+    throw new Error(`${JSON.stringify(value)} is not an integer cell`);
+  }
+  if (type === 'timestamp' && !(typeof value === 'string' && WIRE_INSTANT.test(value))) {
+    throw new Error(`${JSON.stringify(value)} is not a timestamp cell`);
+  }
+  return value;
+}
+
+/** `columns` (`{ name, type }`) and positional `rows`, every cell
+ * encoded under its column. */
+export function typedResult(columns, rows) {
+  return {
+    columns,
+    rows: rows.map((row) => {
+      if (row.length !== columns.length) throw new Error(`a ${row.length}-cell row for ${columns.length} columns`);
+      return row.map((cell, i) => wireCell(columns[i].type, cell));
+    }),
+  };
+}
+
+/** One raw live event as the `data` frame the server sends: a one-row
+ * typed result. `fields` is `[name, type, cell]` per field, in order. */
+export function dataFrame(fields) {
+  return typedResult(
+    fields.map(([name, type]) => ({ name, type })),
+    [fields.map(([, , cell]) => cell)],
+  );
+}
+
 /** `GET /api/v1/schema/field?name=` — one field's pin, its per-service
  * observations and its conflict evidence. The `name` a route answers with
  * is the one that was asked for; this body carries the rest. */
@@ -403,23 +459,18 @@ function aggregateCount(i) {
   return i === 0 ? 47 : ((i * 7) % 13) + 1;
 }
 
-/** A `_time` cell as a snapshot response actually spells it: UTC wall
- * clock, a space between the date and the time, and no zone suffix. The
- * web UI sends `timezone: None` and the server defaults the offset to
- * zero, so there is nothing for the cell to carry (ADR-0038). The LIVE
- * lane is the one that writes RFC 3339 with a `+00:00` offset. */
+/** A `_time` bucket as a snapshot response spells it: a `timestamp`
+ * cell at offset zero, because the web UI sends `timezone: None` and the
+ * server defaults the offset to zero (ADR-0038). */
 function aggregateInstant(i) {
-  return new Date(AGGREGATE_EPOCH + i * AGGREGATE_BUCKET_MS)
-    .toISOString()
-    .replace('T', ' ')
-    .replace('.000Z', '');
+  return wireInstant(AGGREGATE_EPOCH + i * AGGREGATE_BUCKET_MS);
 }
 
 /** `POST /api/v1/query` under `aggregate` for a `| timechart` pipeline:
  * `buckets` rows of `_time, count`, sliced to the posted window. */
 export function aggregateTimechartResponse(buckets, total, offset, limit) {
   const rows = Array.from({ length: buckets }, (_, i) => [aggregateInstant(i), aggregateCount(i)]);
-  return aggregateBody([{ name: '_time' }, { name: 'count' }], rows, total, offset, limit);
+  return aggregateBody([TIME, COUNT], rows, total, offset, limit);
 }
 
 /** The same pipeline with a `by host`: `buckets` × `hosts` rows of
@@ -437,7 +488,7 @@ export function aggregateGroupedTimechartResponse(buckets, hosts, total, offset,
     }
   }
   return aggregateBody(
-    [{ name: '_time' }, { name: 'host' }, { name: 'count' }],
+    [TIME, { name: 'host', type: 'string' }, COUNT],
     rows,
     total,
     offset,
@@ -455,7 +506,7 @@ export function aggregatePivotResponse(groups, total, offset, limit) {
     aggregateCount(i + 1),
   ]);
   return aggregateBody(
-    [{ name: 'host' }, { name: '200' }, { name: '500' }],
+    [{ name: 'host', type: 'string' }, { name: '200', type: 'integer' }, { name: '500', type: 'integer' }],
     rows,
     total,
     offset,
@@ -484,23 +535,31 @@ export function aggregateRankedResponse(dsl, offset, limit) {
     .filter(([service]) => only === undefined || service === only)
     .slice(0, 10)
     .map(([service, errors]) => [service, errors]);
-  return aggregateBody([{ name: 'service' }, { name: 'errors' }], rows, null, offset, limit);
+  return aggregateBody(
+    [{ name: 'service', type: 'string' }, { name: 'errors', type: 'integer' }],
+    rows,
+    null,
+    offset,
+    limit,
+  );
 }
 
 /** `POST /api/v1/query` under `aggregate` for a `| stats count() by`
  * pipeline: `groups` rows of `status, count`, sliced the same way. */
 export function aggregateStatsByResponse(groups, total, offset, limit) {
   const rows = Array.from({ length: groups }, (_, i) => [`${200 + i}`, aggregateCount(i)]);
-  return aggregateBody([{ name: 'status' }, { name: 'count' }], rows, total, offset, limit);
+  return aggregateBody([{ name: 'status', type: 'string' }, COUNT], rows, total, offset, limit);
 }
+
+const TIME = { name: '_time', type: 'timestamp' };
+const COUNT = { name: 'count', type: 'integer' };
 
 function aggregateBody(columns, rows, total, offset, limit) {
   // `total` before the slice, `returned` after it.
   const produced = total ?? rows.length;
   const window = rows.slice(offset, offset + limit);
   return {
-    columns,
-    rows: window,
+    ...typedResult(columns, window),
     pagination: { limit, offset, returned: window.length, total: produced },
     degraded_fields: [],
     severity_columns: [],

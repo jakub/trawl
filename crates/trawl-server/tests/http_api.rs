@@ -3426,7 +3426,7 @@ async fn wait_for_finished_runs(
 /// The old empty-result path wrote neither a parquet file nor a blob, and
 /// `run=latest` skipped runs with no file, so a report that had just gone
 /// quiet kept answering with the PREVIOUS run's rows. Nothing said the data
-/// was stale.
+/// was stale. A zero-row run now stores a typed empty parquet file.
 #[tokio::test(flavor = "multi_thread")]
 async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
     let server = setup().await;
@@ -3468,11 +3468,12 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
     assert_eq!(newest.status, "success", "{newest:?}");
     assert_eq!(newest.row_count, Some(0), "{newest:?}");
     assert!(
-        newest.result_path.is_none(),
-        "a zero-row run has no parquet to point at: {newest:?}"
+        newest.result_path.is_some(),
+        "a zero-row run stores a typed empty parquet file: {newest:?}"
     );
 
-    // The zero-row run is served with its columns, not as a null result.
+    // The zero-row run is served with its typed columns, not as a null
+    // result.
     let fetched = client
         .get_report_run(saved.id, newest.id)
         .await
@@ -3480,9 +3481,13 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
         .result
         .expect("a zero-row run still carries a result");
     assert_eq!(fetched.rows.len(), 0, "{fetched:?}");
-    assert!(
-        !fetched.columns.is_empty(),
-        "the blob keeps the column names: {fetched:?}"
+    assert_eq!(
+        fetched.columns,
+        vec![
+            trawl_api::value::Column::new("service", trawl_api::value::ColumnType::String),
+            trawl_api::value::Column::new("host", trawl_api::value::ColumnType::String),
+        ],
+        "the empty file keeps the typed columns: {fetched:?}"
     );
 
     // And it is what `run=latest` resolves. Reading the older run would
@@ -3889,7 +3894,14 @@ async fn sse_freezes_now_per_event_and_per_snapshot() {
     assert_eq!(ingest.ingest(&records).await.unwrap().accepted, 2);
 
     let buf = read_sse_until(&mut stream, "now-needle-2").await;
-    let rows = sse_payloads(&buf);
+    let rows: Vec<serde_json::Value> = sse_payloads(&buf)
+        .into_iter()
+        .flat_map(|payload| {
+            let frame: trawl_api::value::QueryResult =
+                serde_json::from_value(payload).expect("a data frame is a typed result");
+            common::result_rows(&frame)
+        })
+        .collect();
     assert_eq!(rows.len(), 2, "both events must arrive: {buf}");
     for row in &rows {
         let a = row["a"].as_str().expect("a is a timestamp text");
@@ -3922,24 +3934,27 @@ async fn sse_freezes_now_per_event_and_per_snapshot() {
     let buf = read_sse_until(&mut stream, "agg-2").await;
     let snapshot = sse_payloads(&buf)
         .into_iter()
-        .rfind(|payload| {
-            payload["rows"]
-                .as_array()
-                .is_some_and(|rows| rows.len() == 2)
+        .map(|payload| {
+            let frame: trawl_api::stream::SnapshotFrame =
+                serde_json::from_value(payload).expect("a snapshot frame is a typed result");
+            common::result_rows(&frame.result)
         })
+        .rfind(|rows| rows.len() == 2)
         .unwrap_or_else(|| panic!("a snapshot carrying both groups: {buf}"));
-    let rows = snapshot["rows"].as_array().expect("rows is an array");
-    let first = rows[0]["seen"].as_str().expect("seen is a timestamp text");
-    for row in rows {
+    let first = snapshot[0]["seen"]
+        .as_str()
+        .expect("seen is a timestamp text");
+    let shown = serde_json::Value::from(snapshot.clone());
+    for row in &snapshot {
         assert_eq!(
             row["seen"].as_str(),
             Some(first),
-            "every group row of one snapshot carries ONE instant: {snapshot}"
+            "every group row of one snapshot carries ONE instant: {shown}"
         );
         assert_eq!(
             row["seen2"].as_str(),
             Some(first),
-            "…and one per row, not one per read: {snapshot}"
+            "…and one per row, not one per read: {shown}"
         );
     }
 }

@@ -1977,6 +1977,76 @@ mod tests {
         assert_eq!(decoded.execution, response.execution);
     }
 
+    /// `QueryResponse` and `ReportRunResponse` both go through serde's
+    /// flatten buffer, which hands the result codec buffered content
+    /// rather than the JSON text. The typed cells must land the same way
+    /// there: exact integers, refusals naming the column, and a `u64`
+    /// that stays exact through the buffer (the refusal quotes it whole).
+    #[test]
+    fn typed_results_survive_the_flatten_buffer() {
+        use crate::value::{Column, ColumnType, QueryResult, Value};
+
+        let result = QueryResult {
+            columns: vec![
+                Column::new("big", ColumnType::Integer),
+                Column::new("rate", ColumnType::Float),
+                Column::new("kv", ColumnType::Mixed),
+            ],
+            rows: vec![vec![
+                Value::UInt(u64::MAX),
+                Value::Float(f64::INFINITY),
+                Value::Integer(9_007_199_254_740_993),
+            ]],
+        };
+        let wire = serde_json::json!({
+            "columns": [
+                {"name": "big", "type": "integer"},
+                {"name": "rate", "type": "float"},
+                {"name": "kv", "type": "mixed"},
+            ],
+            "rows": [["18446744073709551615", "Infinity",
+                      {"type": "integer", "value": "9007199254740993"}]],
+            "pagination": {"limit": 10, "offset": 0, "returned": 1, "total": 1},
+        });
+        let response: super::QueryResponse =
+            serde_json::from_str(&wire.to_string()).expect("decodes through flatten");
+        assert_eq!(response.result, result);
+        assert_eq!(serde_json::to_value(&response).unwrap(), wire);
+
+        let mut run = serde_json::json!({
+            "id": 7, "query": "*", "status": "success",
+            "started_at": "2026-10-22T00:00:00Z",
+            "result": {"columns": wire["columns"], "rows": wire["rows"]},
+        });
+        let decoded: super::ReportRunResponse =
+            serde_json::from_str(&run.to_string()).expect("decodes through flatten");
+        assert_eq!(decoded.result.as_ref(), Some(&result));
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), run);
+
+        // A JSON number under `integer` is refused even inside the
+        // buffer, and the refusal quotes the number exactly: the buffer
+        // kept it a `u64`, never a float.
+        run["result"]["rows"][0][0] = serde_json::json!(u64::MAX);
+        let err = serde_json::from_str::<super::ReportRunResponse>(&run.to_string())
+            .expect_err("a JSON number is not an integer cell");
+        assert!(
+            err.to_string().contains(
+                "column \"big\": an integer cell is a decimal string, \
+                 not the JSON number 18446744073709551615"
+            ),
+            "{err}"
+        );
+        let mut query = wire;
+        query["rows"][0][0] = serde_json::json!("18446744073709551616");
+        let err = serde_json::from_str::<super::QueryResponse>(&query.to_string())
+            .expect_err("past u64::MAX is out of range");
+        assert!(
+            err.to_string()
+                .contains("column \"big\": 18446744073709551616 is outside the integer range"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn pagination_total_is_required_on_the_wire() {
         let wire = serde_json::json!({"columns": [], "rows": [],

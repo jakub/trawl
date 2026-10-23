@@ -1569,8 +1569,8 @@ fn LiveRawTable(
                                 </thead>
                                 <tbody>
                                     {rows.iter().map(|row| {
-                                        let cells = row.iter().map(|v| {
-                                            let s = trawl_api::display::value_to_string(v);
+                                        let cells = row.iter().zip(&r.columns).map(|(v, column)| {
+                                            let s = crate::results_layout::cell_text(Some(&column.ty), v);
                                             view! { <td>{s}</td> }
                                         }).collect::<Vec<_>>();
                                         view! { <tr>{cells}</tr> }

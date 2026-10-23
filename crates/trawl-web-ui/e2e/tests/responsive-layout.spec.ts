@@ -347,7 +347,7 @@ test('Runs crosses the 1099/1100 docking boundary without remounting or fetching
     const body = JSON.parse(await readFile(`${__dirname}/../harness/wire/run-result-paged.json`, 'utf8'));
     // Wide stored data exercises the preview's own scroll region even in
     // the wide viewport, where the docked column itself remains narrow.
-    body.result.columns.push({ name: 'wide_value' });
+    body.result.columns.push({ name: 'wide_value', type: 'string' });
     body.result.rows.forEach((row: unknown[]) => row.push('stored-column-'.repeat(60)));
     await route.fulfill({ json: body });
   });

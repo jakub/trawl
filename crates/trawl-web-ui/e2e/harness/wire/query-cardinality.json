@@ -1,6 +1,12 @@
 {
-  "columns": [{ "name": "c0" }, { "name": "c1" }, { "name": "c2" }],
-  "rows": [[1200, 5, null]],
+  "columns": [
+    { "name": "c0", "type": "integer" },
+    { "name": "c1", "type": "integer" },
+    { "name": "c2", "type": "integer" }
+  ],
+  "rows": [
+    ["1200", "5", null]
+  ],
   "pagination": { "limit": 50, "offset": 0, "returned": 1, "total": 1 },
   "execution": { "started_at": "2026-09-15T12:34:56Z", "duration_ms": 125 }
 }

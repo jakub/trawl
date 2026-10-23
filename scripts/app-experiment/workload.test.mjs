@@ -17,15 +17,20 @@ test('seeded traffic is stable, varied, and carries consecutive IDs', () => {
 test('the oracle detects loss, duplication, value corruption, and a cut result', () => {
   const events = corpus(42, 3, 'test');
   const result = { pagination: { total: 3 },
-    columns: [{ name: 'status' }, { name: 'experiment_seq' }],
-    rows: events.map(e => [e.status, e.experiment_seq]).reverse(),
+    columns: [{ name: 'status', type: 'integer' }, { name: 'experiment_seq', type: 'integer' }],
+    rows: events.map(e => [String(e.status), String(e.experiment_seq)]).reverse(),
   };
   verifyWholeResult(result, events);
   for (const mutate of [
     r => r.rows.pop(),
     r => r.rows.push(r.rows[0]),
-    r => { r.rows[0][0] = 999; },
+    r => { r.rows[0][0] = '999'; },
     r => { r.pagination.total = r.rows.length + 1; },
+    // The typed wire: a JSON number under `integer`, a non-canonical
+    // spelling, and an untyped column are wire faults, not values.
+    r => { r.rows[0][0] = Number(r.rows[0][0]); },
+    r => { r.rows[0][1] = `0${r.rows[0][1]}`; },
+    r => { delete r.columns[1].type; },
   ]) {
     const broken = structuredClone(result);
     mutate(broken);
@@ -44,8 +49,8 @@ test('traffic avoids fixed eight-event host cycles and single-parity errors', ()
 test('browser oracle refuses a short page even when returned count agrees with it', () => {
   const events = corpus(42, 100, 'test');
   const response = { pagination: { returned: 50, total: 100 },
-    columns: [{ name: 'experiment_seq' }, { name: 'status' }],
-    rows: events.slice(0, 50).map(e => [e.experiment_seq, e.status]),
+    columns: [{ name: 'experiment_seq', type: 'integer' }, { name: 'status', type: 'integer' }],
+    rows: events.slice(0, 50).map(e => [String(e.experiment_seq), String(e.status)]),
   };
   verifyBrowserPage(response, events);
   response.rows = response.rows.slice(0, 10);

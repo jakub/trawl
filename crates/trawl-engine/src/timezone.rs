@@ -55,33 +55,22 @@ fn parse_fixed_offset(s: &str) -> Result<i32, String> {
     Ok(sign * (hours * 3600 + minutes * 60))
 }
 
-/// Reformat an RFC 3339 timestamp string with a UTC offset applied.
+/// A result-wire timestamp re-rendered at the display offset
+/// `utc_offset_secs`: the same instant in the wire's own spelling, so the
+/// text a query run at that offset would have answered.
 ///
-/// Parses the input as RFC 3339, shifts by `utc_offset_secs`, and returns
-/// a display string matching the executor's format: `YYYY-MM-DD HH:MM:SS[.fff]`.
-/// Returns the original string unchanged if parsing fails.
-pub fn reformat_rfc3339(ts: &str, utc_offset_secs: i32) -> String {
-    use chrono::{DateTime, FixedOffset, Utc};
-
-    let Ok(dt) = ts.parse::<DateTime<Utc>>() else {
-        return ts.to_owned();
-    };
-
-    let offset =
-        FixedOffset::east_opt(utc_offset_secs).unwrap_or(FixedOffset::east_opt(0).unwrap());
-    let local = dt.with_timezone(&offset);
-
-    // Match executor format: omit sub-second part if zero, otherwise
-    // include trimmed fractional seconds.
-    let nanos = local.timestamp_subsec_nanos();
-    if nanos == 0 {
-        local.format("%Y-%m-%d %H:%M:%S").to_string()
-    } else {
-        let micros = nanos / 1_000;
-        let frac = format!("{micros:06}");
-        let trimmed = frac.trim_end_matches('0');
-        local.format("%Y-%m-%d %H:%M:%S").to_string() + "." + trimmed
-    }
+/// The live tail's frames carry UTC, and a client applies its own display
+/// offset to them with this. `None` when the text is not RFC 3339 that
+/// chrono reads (an infinity, a year past 9999) or the offset is a day or
+/// more; the caller keeps such a cell as it came.
+#[must_use]
+pub fn rfc3339_at_offset(ts: &str, utc_offset_secs: i32) -> Option<String> {
+    let at = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    let offset = chrono::FixedOffset::east_opt(utc_offset_secs)?;
+    Some(crate::executor::wire_timestamp(
+        at.timestamp_micros(),
+        offset,
+    ))
 }
 
 #[cfg(test)]
@@ -137,61 +126,45 @@ mod tests {
         assert_eq!(resolve_utc_offset(" +05:30 ").unwrap(), 19800);
     }
 
-    // ── reformat_rfc3339 ──────────────────────────────────────────
+    // ── rfc3339_at_offset ─────────────────────────────────────────
 
     #[test]
-    fn reformat_utc_no_change() {
+    fn at_offset_renders_the_wire_spelling() {
+        let at = |ts, secs| rfc3339_at_offset(ts, secs);
         assert_eq!(
-            reformat_rfc3339("2026-02-18T12:00:00Z", 0),
-            "2026-02-18 12:00:00"
+            at("2026-02-18T12:00:00Z", 0).as_deref(),
+            Some("2026-02-18T12:00:00.000000Z")
         );
-    }
-
-    #[test]
-    fn reformat_positive_offset() {
         // +05:30 = 19800 seconds
         assert_eq!(
-            reformat_rfc3339("2026-02-18T12:00:00Z", 19800),
-            "2026-02-18 17:30:00"
+            at("2026-02-18T12:00:00.000000Z", 19800).as_deref(),
+            Some("2026-02-18T17:30:00.000000+05:30")
         );
-    }
-
-    #[test]
-    fn reformat_negative_offset() {
         // -06:00 = -21600 seconds
         assert_eq!(
-            reformat_rfc3339("2026-02-18T12:00:00Z", -21600),
-            "2026-02-18 06:00:00"
+            at("2026-02-18T12:00:00.123456Z", -21600).as_deref(),
+            Some("2026-02-18T06:00:00.123456-06:00")
         );
-    }
-
-    #[test]
-    fn reformat_preserves_subseconds() {
-        assert_eq!(
-            reformat_rfc3339("2026-02-18T12:00:00.123456Z", 0),
-            "2026-02-18 12:00:00.123456"
-        );
-    }
-
-    #[test]
-    fn reformat_trims_trailing_zeros() {
-        assert_eq!(
-            reformat_rfc3339("2026-02-18T12:00:00.100000Z", 0),
-            "2026-02-18 12:00:00.1"
-        );
-    }
-
-    #[test]
-    fn reformat_crosses_midnight() {
         // 23:00 UTC + 2h offset = 01:00 next day
         assert_eq!(
-            reformat_rfc3339("2026-02-18T23:00:00Z", 7200),
-            "2026-02-19 01:00:00"
+            at("2026-02-18T23:00:00.000000Z", 7200).as_deref(),
+            Some("2026-02-19T01:00:00.000000+02:00")
+        );
+        // Already at an offset: the instant moves, not the wall clock.
+        assert_eq!(
+            at("2026-02-18T12:00:00.000000+05:30", 0).as_deref(),
+            Some("2026-02-18T06:30:00.000000Z")
         );
     }
 
     #[test]
-    fn reformat_invalid_input_passthrough() {
-        assert_eq!(reformat_rfc3339("not a timestamp", 3600), "not a timestamp");
+    fn at_offset_leaves_what_it_cannot_read() {
+        assert_eq!(rfc3339_at_offset("infinity", 3600), None);
+        assert_eq!(
+            rfc3339_at_offset("+10000-01-01T00:00:00.000000Z", 3600),
+            None
+        );
+        assert_eq!(rfc3339_at_offset("not a timestamp", 3600), None);
+        assert_eq!(rfc3339_at_offset("2026-02-18T12:00:00Z", 86_400), None);
     }
 }

@@ -526,6 +526,12 @@ impl SnapshotContext {
 /// loops would silently change one lane's row set. (That lane emits one
 /// snapshot from a freshly compiled plan, so its counters start armed
 /// and this re-arming would be a no-op there.)
+///
+/// The columns are the snapshot's output schema: the aggregation's
+/// declared columns walked through the post-stages
+/// ([`StreamPlan::output_schema`]), so `| stats count() as n by host |
+/// rename n as c` names `host` and `c`, and a snapshot whose post-stages
+/// drop every row still names them.
 pub fn emit_snapshot(
     aggregation: &CompiledAggregation,
     post_stages: &mut [CompiledStage],
@@ -534,7 +540,11 @@ pub fn emit_snapshot(
     for stage in post_stages.iter_mut() {
         stage.reset_limit();
     }
-    let (columns, rows) = aggregation.snapshot();
+    let columns = aggregate_output_schema::<()>(aggregation, post_stages)
+        .into_iter()
+        .map(|column| column.name)
+        .collect();
+    let (_, rows) = aggregation.snapshot();
     let rows = rows
         .into_iter()
         .filter_map(|mut row| {
@@ -548,6 +558,213 @@ pub fn emit_snapshot(
         })
         .collect();
     (columns, rows)
+}
+
+// ── the static output schema ───────────────────────────────────────
+
+/// One column of a plan's statically known output.
+///
+/// `carries` is the caller's payload for the input column whose values
+/// this column still holds, passed through, renamed or copied by a bare
+/// `let x = field`. It is `None` for a value a stage computed (a `let`
+/// expression, an `extract` capture, an aggregate or a group key) and for
+/// a name a `table` lists that no earlier stage is known to produce. The
+/// batch tail attaches each input column's result type; the live
+/// snapshot attaches nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputColumn<T> {
+    pub name: String,
+    pub carries: Option<T>,
+}
+
+impl<T> OutputColumn<T> {
+    #[must_use]
+    pub fn new(name: impl Into<String>, carries: Option<T>) -> Self {
+        Self {
+            name: name.into(),
+            carries,
+        }
+    }
+}
+
+impl StreamPlan {
+    /// The columns this plan outputs over rows with the `input` columns,
+    /// as far as the stages say without seeing a row: the schema a result
+    /// keeps when no row survives.
+    ///
+    /// Each stage's rule is [`apply_stage`]'s, column for column, so every
+    /// row the plan emits carries every column listed here (a `table` name
+    /// nothing produced aside), and a row adds only the fields an `extract
+    /// kv` found in its text:
+    ///
+    /// - `where`, `limit`, `tail` and `dedup` select rows and keep the
+    ///   columns, and `extract kv` adds nothing a row's text does not hold;
+    /// - `table` keeps the names it lists, in its order, each bound the way
+    ///   the stage binds it (exact, else ASCII case-insensitive), so a bound
+    ///   name keeps the column's own spelling and what it carries; a listed
+    ///   name that binds nothing is kept, carrying nothing, since a row may
+    ///   still produce it;
+    /// - `drop` removes what it binds;
+    /// - `rename` moves each bound source to its target, every source
+    ///   resolving against the columns before the stage, and a target
+    ///   whose source binds nothing is absent, as `apply_rename` leaves it;
+    /// - `let` writes each target, carrying what a bare field reference's
+    ///   column carries before the stage and nothing for any other
+    ///   expression;
+    /// - `extract` with a regex writes every capture name on every row
+    ///   (NULL when it does not match), carrying nothing;
+    /// - an aggregation outputs its declared columns
+    ///   ([`CompiledAggregation::output_columns`]), carrying nothing,
+    ///   whatever came before it.
+    ///
+    /// A written column (a `rename`, `let` or `extract` target) replaces
+    /// every ASCII case variant of its name and goes last, where the SQL
+    /// lane's projection (`COLUMNS(c -> … NOT IN (…)), … AS target`) puts
+    /// it.
+    #[must_use]
+    pub fn output_schema<T: Clone>(&self, input: Vec<OutputColumn<T>>) -> Vec<OutputColumn<T>> {
+        match self {
+            Self::PassThrough(stages) => stages_output_schema(input, stages),
+            Self::Aggregate {
+                aggregation,
+                post_stages,
+                ..
+            } => aggregate_output_schema(aggregation, post_stages),
+        }
+    }
+}
+
+/// The output schema of an aggregate plan: the aggregation's declared
+/// columns, carrying nothing, walked through its post-stages.
+fn aggregate_output_schema<T: Clone>(
+    aggregation: &CompiledAggregation,
+    post_stages: &[CompiledStage],
+) -> Vec<OutputColumn<T>> {
+    let declared = aggregation
+        .output_columns()
+        .into_iter()
+        .map(|name| OutputColumn::new(name, None))
+        .collect();
+    stages_output_schema(declared, post_stages)
+}
+
+/// Walk `schema` through `stages` by [`StreamPlan::output_schema`]'s rules.
+fn stages_output_schema<T: Clone>(
+    mut schema: Vec<OutputColumn<T>>,
+    stages: &[CompiledStage],
+) -> Vec<OutputColumn<T>> {
+    for stage in stages {
+        advance_output_schema(&mut schema, stage);
+    }
+    schema
+}
+
+fn advance_output_schema<T: Clone>(schema: &mut Vec<OutputColumn<T>>, stage: &CompiledStage) {
+    match stage {
+        CompiledStage::Where { .. }
+        | CompiledStage::Limit { .. }
+        | CompiledStage::Tail { .. }
+        | CompiledStage::Dedup { .. }
+        | CompiledStage::ExtractKv { .. } => {}
+        CompiledStage::Table { fields } => {
+            let mut kept: Vec<OutputColumn<T>> = Vec::with_capacity(fields.len());
+            for field in fields {
+                let column = bind_output_column(schema, field).map_or_else(
+                    || OutputColumn::new(field.clone(), None),
+                    |index| schema[index].clone(),
+                );
+                if !kept
+                    .iter()
+                    .any(|other| other.name.eq_ignore_ascii_case(&column.name))
+                {
+                    kept.push(column);
+                }
+            }
+            *schema = kept;
+        }
+        CompiledStage::Drop { fields } => {
+            for field in fields {
+                if let Some(index) = bind_output_column(schema, field) {
+                    schema.remove(index);
+                }
+            }
+        }
+        CompiledStage::Rename { renames } => {
+            let sources: Vec<Option<usize>> = renames
+                .iter()
+                .map(|(from, _)| bind_output_column(schema, from))
+                .collect();
+            let moved: Vec<(String, Option<Option<T>>)> = renames
+                .iter()
+                .zip(&sources)
+                .map(|((_, to), source)| {
+                    (
+                        to.clone(),
+                        source.map(|index| schema[index].carries.clone()),
+                    )
+                })
+                .collect();
+            let mut removed: Vec<usize> = sources.into_iter().flatten().collect();
+            removed.sort_unstable();
+            removed.dedup();
+            for index in removed.into_iter().rev() {
+                schema.remove(index);
+            }
+            for (to, carries) in moved {
+                schema.retain(|column| !column.name.eq_ignore_ascii_case(&to));
+                if let Some(carries) = carries {
+                    schema.push(OutputColumn::new(to, carries));
+                }
+            }
+        }
+        CompiledStage::Let { assignments, .. } => {
+            let written: Vec<OutputColumn<T>> = assignments
+                .iter()
+                .map(|(target, expr)| {
+                    let carries = match &expr.node {
+                        Expr::FieldRef(source) => bind_output_column(schema, source)
+                            .and_then(|index| schema[index].carries.clone()),
+                        _ => None,
+                    };
+                    OutputColumn::new(target.clone(), carries)
+                })
+                .collect();
+            write_output_columns(schema, written);
+        }
+        CompiledStage::ExtractRegex { regex, .. } => {
+            let written = regex
+                .capture_names()
+                .flatten()
+                .map(|name| OutputColumn::new(name, None))
+                .collect();
+            write_output_columns(schema, written);
+        }
+    }
+}
+
+/// The schema column `name` binds, by [`bind_event_key`]'s rule: the exact
+/// spelling, else the lexicographically first ASCII case variant.
+fn bind_output_column<T>(schema: &[OutputColumn<T>], name: &str) -> Option<usize> {
+    schema
+        .iter()
+        .position(|column| column.name == name)
+        .or_else(|| {
+            schema
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.name.eq_ignore_ascii_case(name))
+                .min_by(|(_, a), (_, b)| a.name.cmp(&b.name))
+                .map(|(index, _)| index)
+        })
+}
+
+/// Write projected columns: each replaces every case variant of its name
+/// and goes last.
+fn write_output_columns<T>(schema: &mut Vec<OutputColumn<T>>, written: Vec<OutputColumn<T>>) {
+    for column in written {
+        schema.retain(|other| !other.name.eq_ignore_ascii_case(&column.name));
+        schema.push(column);
+    }
 }
 
 // ── stage compilation ──────────────────────────────────────────────
@@ -1664,11 +1881,46 @@ impl CompiledAggregation {
         }
     }
 
+    /// The columns this aggregation outputs, in its declared order: the
+    /// `timechart` bucket `_time` first, then the group-by keys (`by` for
+    /// `top`/`rare`, then their field), then each aggregate's alias
+    /// (`count` for `top`/`rare`).
+    ///
+    /// Every row [`Self::snapshot`] takes carries exactly these keys.
+    #[must_use]
+    pub fn output_columns(&self) -> Vec<String> {
+        match self {
+            Self::Stats {
+                accumulators,
+                group_by,
+                ..
+            } => group_by
+                .iter()
+                .cloned()
+                .chain(accumulators.iter().map(|a| a.alias.clone()))
+                .collect(),
+            Self::Timechart {
+                accumulators,
+                group_by,
+                ..
+            } => std::iter::once("_time".to_string())
+                .chain(group_by.iter().cloned())
+                .chain(accumulators.iter().map(|a| a.alias.clone()))
+                .collect(),
+            Self::Top { field, by, .. } | Self::Rare { field, by, .. } => by
+                .iter()
+                .cloned()
+                .chain([field.clone(), "count".to_string()])
+                .collect(),
+        }
+    }
+
     /// Take a snapshot of the current aggregation state as rows.
     ///
-    /// Returns `(column_names, rows)` where each row is a [`Row`].
+    /// Returns `(column_names, rows)`: [`Self::output_columns`], and the
+    /// rows as [`Row`]s.
     pub fn snapshot(&self) -> (Vec<String>, Vec<Row>) {
-        match self {
+        let rows = match self {
             Self::Stats {
                 accumulators,
                 group_by,
@@ -1694,7 +1946,8 @@ impl CompiledAggregation {
                 by,
                 counters,
             } => snapshot_frequency(counters, field, by, *count, false),
-        }
+        };
+        (self.output_columns(), rows)
     }
 }
 
@@ -1702,10 +1955,7 @@ fn snapshot_stats(
     accumulators: &[CompiledAcc],
     group_by: &[String],
     groups: &HashMap<GroupKey, Vec<AccState>>,
-) -> (Vec<String>, Vec<Row>) {
-    let mut columns: Vec<String> = group_by.to_vec();
-    columns.extend(accumulators.iter().map(|a| a.alias.clone()));
-
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for (key, states) in groups {
         let mut row = Row::new();
@@ -1717,7 +1967,7 @@ fn snapshot_stats(
         }
         rows.push(row);
     }
-    (columns, rows)
+    rows
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -1726,11 +1976,7 @@ fn snapshot_timechart(
     group_by: &[String],
     buckets: &HashMap<i64, HashMap<GroupKey, Vec<AccState>>>,
     span_secs: u64,
-) -> (Vec<String>, Vec<Row>) {
-    let mut columns = vec!["_time".to_string()];
-    columns.extend(group_by.iter().cloned());
-    columns.extend(accumulators.iter().map(|a| a.alias.clone()));
-
+) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut sorted_buckets: Vec<_> = buckets.keys().copied().collect();
     sorted_buckets.sort_unstable();
@@ -1739,9 +1985,14 @@ fn snapshot_timechart(
         if let Some(group_map) = buckets.get(&bucket) {
             for (key, states) in group_map {
                 let mut row = Row::new();
+                // A TIMESTAMP, as `time_bucket` answers in SQL, so the
+                // bucket compares, prints and types as the SQL lane's does.
                 let ts = chrono::DateTime::from_timestamp(bucket * span_secs as i64, 0)
-                    .map_or_else(|| bucket.to_string(), |dt| dt.to_rfc3339());
-                row.insert("_time".to_string(), EvalValue::Str(ts));
+                    .map_or_else(
+                        || EvalValue::Str(bucket.to_string()),
+                        |dt| EvalValue::Timestamp(crate::compare::Instant::At(dt.naive_utc())),
+                    );
+                row.insert("_time".to_string(), ts);
                 for (col, val) in group_by.iter().zip(key.iter()) {
                     row.insert(col.clone(), EvalValue::Str(val.clone()));
                 }
@@ -1752,7 +2003,7 @@ fn snapshot_timechart(
             }
         }
     }
-    (columns, rows)
+    rows
 }
 
 /// Snapshot helper for top/rare — identical except sort direction.
@@ -1764,11 +2015,7 @@ fn snapshot_frequency(
     by: &[String],
     count: u64,
     descending: bool,
-) -> (Vec<String>, Vec<Row>) {
-    let mut columns: Vec<String> = by.to_vec();
-    columns.push(field.to_string());
-    columns.push("count".to_string());
-
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for (group_key, counts) in counters {
         let mut sorted: Vec<_> = counts.iter().collect();
@@ -1787,7 +2034,7 @@ fn snapshot_frequency(
             rows.push(row);
         }
     }
-    (columns, rows)
+    rows
 }
 
 fn make_group_key(group_by: &[String], event: &Row) -> GroupKey {
@@ -4190,5 +4437,209 @@ mod tests {
             feed(&mut aggregation, &json!({"host": format!("h{i}")}));
         }
         assert!(aggregation.capped().is_empty());
+    }
+}
+
+/// [`StreamPlan::output_schema`] against the stages it describes: each
+/// case names the schema a pipeline outputs, and runs the compiled stages
+/// over a row carrying every input column to show the row carries exactly
+/// the schema's columns (a `table` name nothing produced aside) plus what
+/// an `extract kv` found.
+#[cfg(test)]
+mod output_schema_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The input every case starts from, each column carrying its own
+    /// name as the payload.
+    const INPUT: [&str; 4] = ["_time", "message", "latency", "User"];
+
+    fn ctx() -> EvalContext {
+        EvalContext::at(
+            chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
+                .expect("literal is RFC 3339")
+                .with_timezone(&chrono::Utc),
+        )
+    }
+
+    fn plan(dsl: &str) -> StreamPlan {
+        let query = crate::parser::parse(dsl).expect("the pipeline parses");
+        compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None)
+            .expect("the pipeline compiles")
+    }
+
+    fn schema(dsl: &str) -> Vec<(String, Option<&'static str>)> {
+        plan(dsl)
+            .output_schema(
+                INPUT
+                    .iter()
+                    .map(|name| OutputColumn::new(*name, Some(*name)))
+                    .collect(),
+            )
+            .into_iter()
+            .map(|column| (column.name, column.carries))
+            .collect()
+    }
+
+    /// The keys a pass-through plan leaves on a row carrying every input
+    /// column, with `message` holding `kv`'s text.
+    fn row_keys(dsl: &str) -> Vec<String> {
+        let StreamPlan::PassThrough(mut stages) = plan(dsl) else {
+            panic!("{dsl} must be a pass-through plan");
+        };
+        let mut row = crate::row::from_json(
+            json!({
+                "_time": "2026-08-24 11:00:00",
+                "message": "k=v",
+                "latency": 1.5,
+                "User": "alice",
+            })
+            .as_object()
+            .unwrap(),
+        );
+        for stage in &mut stages {
+            assert_eq!(apply_stage(stage, &mut row, &ctx()), StageResult::Pass);
+        }
+        row.into_keys().collect()
+    }
+
+    fn named(columns: &[(&str, Option<&'static str>)]) -> Vec<(String, Option<&'static str>)> {
+        columns
+            .iter()
+            .map(|(name, carries)| ((*name).to_owned(), *carries))
+            .collect()
+    }
+
+    /// The schema's names, sorted as a row's keys are, less the ones in
+    /// `unproduced`, plus the ones in `found`.
+    fn expected_keys(
+        schema: &[(String, Option<&'static str>)],
+        unproduced: &[&str],
+        found: &[&str],
+    ) -> Vec<String> {
+        let mut keys: Vec<String> = schema
+            .iter()
+            .map(|(name, _)| name.clone())
+            .filter(|name| !unproduced.contains(&name.as_str()))
+            .chain(found.iter().map(|name| (*name).to_owned()))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn selection_keeps_the_input_and_kv_adds_nothing_static() {
+        let dsl = "* | extract kv | where k == \"v\" | limit 5 | dedup message";
+        let walked = schema(dsl);
+        assert_eq!(
+            walked,
+            named(&[
+                ("_time", Some("_time")),
+                ("message", Some("message")),
+                ("latency", Some("latency")),
+                ("User", Some("User")),
+            ])
+        );
+        assert_eq!(row_keys(dsl), expected_keys(&walked, &[], &["k"]));
+    }
+
+    #[test]
+    fn table_projects_in_its_order_binding_the_columns_own_spelling() {
+        let dsl = "* | table LATENCY, user, gone, _time";
+        let walked = schema(dsl);
+        assert_eq!(
+            walked,
+            named(&[
+                ("latency", Some("latency")),
+                ("User", Some("User")),
+                ("gone", None),
+                ("_time", Some("_time")),
+            ])
+        );
+        assert_eq!(row_keys(dsl), expected_keys(&walked, &["gone"], &[]));
+    }
+
+    #[test]
+    fn rename_and_drop_move_and_remove_what_they_bind() {
+        let dsl = "* | rename latency as l, User as message, nothing as n | drop _TIME";
+        let walked = schema(dsl);
+        assert_eq!(
+            walked,
+            named(&[("l", Some("latency")), ("message", Some("User"))])
+        );
+        assert_eq!(row_keys(dsl), expected_keys(&walked, &[], &[]));
+    }
+
+    #[test]
+    fn let_carries_a_bare_reference_and_nothing_else() {
+        let dsl = "* | let t = _time, user = latency * 2, m = missing, latency = message";
+        let walked = schema(dsl);
+        assert_eq!(
+            walked,
+            named(&[
+                ("_time", Some("_time")),
+                ("message", Some("message")),
+                ("t", Some("_time")),
+                ("user", None),
+                ("m", None),
+                ("latency", Some("message")),
+            ])
+        );
+        assert_eq!(row_keys(dsl), expected_keys(&walked, &[], &[]));
+    }
+
+    #[test]
+    fn a_regex_extract_writes_its_captures_on_every_row() {
+        let dsl = r#"* | extract "(?P<user>\d+)(?P<code>x)" from message"#;
+        let walked = schema(dsl);
+        assert_eq!(
+            walked,
+            named(&[
+                ("_time", Some("_time")),
+                ("message", Some("message")),
+                ("latency", Some("latency")),
+                ("user", None),
+                ("code", None),
+            ])
+        );
+        assert_eq!(row_keys(dsl), expected_keys(&walked, &[], &[]));
+    }
+
+    #[test]
+    fn an_aggregation_outputs_its_declared_columns_through_the_post_stages() {
+        assert_eq!(
+            schema(
+                "* | where latency > 1 | stats count() as n, avg(latency) by host | rename n as c"
+            ),
+            named(&[("host", None), ("avg_latency", None), ("c", None)])
+        );
+        assert_eq!(
+            schema("* | timechart span=1m count() by host"),
+            named(&[("_time", None), ("host", None), ("count", None)])
+        );
+        assert_eq!(
+            schema("* | top 3 latency by host | table count, latency"),
+            named(&[("count", None), ("latency", None)])
+        );
+    }
+
+    /// The live snapshot names its post-stage output, so a snapshot whose
+    /// post-stages drop every row still answers with its columns.
+    #[test]
+    fn a_snapshot_names_the_columns_its_post_stages_output() {
+        let StreamPlan::Aggregate {
+            mut aggregation,
+            mut post_stages,
+            ..
+        } = plan("* | stats count() as n by host | rename n as c | where c > 100")
+        else {
+            panic!("an aggregate plan");
+        };
+        let event = crate::row::from_json(json!({"host": "web-1"}).as_object().unwrap());
+        aggregation.feed_event(&event, &ctx());
+        let (columns, rows) =
+            emit_snapshot(&aggregation, &mut post_stages, &SnapshotContext::new(ctx()));
+        assert_eq!(columns, vec!["host".to_owned(), "c".to_owned()]);
+        assert!(rows.is_empty(), "{rows:?}");
     }
 }

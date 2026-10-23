@@ -5,9 +5,9 @@
 //! Background scheduler for periodic query execution.
 //!
 //! Polls [`ScheduleStore`] for enabled schedules and spawns query execution
-//! tasks on the [`ExecutorPool`]. Results are written as parquet files (with
-//! a zstd-JSON blob fallback) and recorded as report runs in the app-state
-//! database.
+//! tasks on the [`ExecutorPool`]. Results are written as exact-typed parquet
+//! files (with a typed zstd-JSON blob for what parquet cannot hold and for a
+//! failed write) and recorded as report runs in the app-state database.
 
 use std::time::Duration;
 
@@ -429,7 +429,21 @@ pub(crate) async fn execute_scheduled_query(
             let row_count = query_result.rows.len();
 
             // Write result as parquet file.
-            let (result_path, result_data) = write_result_parquet(&pool, run_id, &query_result);
+            let (result_path, result_data) =
+                match write_result_parquet(&pool, run_id, &query_result) {
+                    Ok(persisted) => persisted,
+                    Err(reason) => {
+                        fail_unpersisted_run(
+                            &schedule_store,
+                            run_id,
+                            query_id,
+                            duration_ms,
+                            &reason,
+                        )
+                        .await;
+                        return;
+                    }
+                };
 
             finish_run_or_recover(
                 &schedule_store,
@@ -459,25 +473,7 @@ pub(crate) async fn execute_scheduled_query(
                 (RunStatus::Error, format!("{e}"))
             };
 
-            if let Err(e2) = schedule_store
-                .finish_run(
-                    run_id,
-                    status,
-                    duration_ms,
-                    None,
-                    Some(&error_msg),
-                    None,
-                    None,
-                )
-                .await
-            {
-                tracing::error!(
-                    event_type = "scheduler_error",
-                    run_id,
-                    error = %e2,
-                    "failed to finish run"
-                );
-            }
+            finish_failed_run(&schedule_store, run_id, status, duration_ms, &error_msg).await;
 
             // The class only: the error's text can quote the saved query
             // (ADR-0040). The run record keeps the text for its owner.
@@ -491,6 +487,65 @@ pub(crate) async fn execute_scheduled_query(
                 "scheduled query failed"
             );
         }
+    }
+}
+
+/// Fail a run whose result has neither a file nor a blob. A success here
+/// would be one nothing can read, which `run=latest` would then resolve
+/// and refuse to look past (ADR-0018 ruling 13).
+async fn fail_unpersisted_run(
+    schedule_store: &ScheduleStore,
+    run_id: i64,
+    query_id: u64,
+    duration_ms: u64,
+    reason: &str,
+) {
+    finish_failed_run(
+        schedule_store,
+        run_id,
+        RunStatus::Error,
+        duration_ms,
+        &format!("the run's result could not be stored: {reason}"),
+    )
+    .await;
+    tracing::warn!(
+        event_type = "scheduled_query_failed",
+        run_id,
+        query_id,
+        duration_ms,
+        status = RunStatus::Error.as_str(),
+        error_class = "result_persistence",
+        "scheduled query failed"
+    );
+}
+
+/// Record a run as failed with `error_msg`, its owner's to read. A store
+/// error is logged; the run then stays `running` until boot-time cleanup.
+async fn finish_failed_run(
+    schedule_store: &ScheduleStore,
+    run_id: i64,
+    status: RunStatus,
+    duration_ms: u64,
+    error_msg: &str,
+) {
+    if let Err(e) = schedule_store
+        .finish_run(
+            run_id,
+            status,
+            duration_ms,
+            None,
+            Some(error_msg),
+            None,
+            None,
+        )
+        .await
+    {
+        tracing::error!(
+            event_type = "scheduler_error",
+            run_id,
+            error = %e,
+            "failed to finish run"
+        );
     }
 }
 
@@ -665,31 +720,34 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
 
 /// Write a `QueryResult` to a parquet file under `{data_dir}/scheduled/`, keyed only by the stable run ID.
 ///
-/// Returns `(Some(relative_path), None)` on success, or `(None, Some(blob))`
-/// as a zstd-JSON fallback if parquet writing fails.
+/// Returns `(Some(relative_path), None)` for the file, or `(None,
+/// Some(blob))` for the typed zstd-JSON blob [`zstd_fallback`] encodes.
 ///
-/// A ZERO-ROW result always takes the blob. Parquet cannot carry it: the
-/// writer serialises the rows as ndjson and lets `read_json` infer the
-/// schema, so with no rows there is no schema to write and
-/// `write_query_result_to_parquet` returns without creating a file. The blob
-/// is the one representation that keeps the column NAMES, it is what
-/// `get_report_run` already reads back, and it is what
-/// `from_saved::resolve_latest` turns into an empty typed source. It also
-/// costs almost nothing: a few dozen bytes of compressed JSON for a run
-/// whose whole content is its header.
+/// The file is the ordinary representation, zero-row results included:
+/// `write_query_result_to_parquet` stores every column in an exact type,
+/// so an empty file still carries the run's schema, and `from saved` reads
+/// it like any other run. The blob is kept for what parquet cannot hold
+/// exactly and for failures:
 ///
-/// Recording it matters because `run=latest` resolves the NEWEST successful
-/// run and refuses to look past it. A run persisted with neither a path nor
-/// a blob would be a success nothing can read (ADR-0018 ruling 13).
+/// - a result with no columns, the answer when the run's own source matched
+///   no file at all;
+/// - a `mixed` column, or an integer column that needs both a negative and
+///   a value above `i64::MAX` (the writer refuses both);
+/// - a failed write, directory, executor or rename.
+///
+/// `get_report_run` serves the blob as the same typed result. `from saved`
+/// resolves a zero-column blob to a source with no rows and refuses the
+/// rest by name.
+///
+/// `Err` when the blob itself cannot be encoded or compressed. A run
+/// persisted with neither a path nor a blob would be a success nothing can
+/// read, which `run=latest` would then resolve and refuse to look past
+/// (ADR-0018 ruling 13), so the caller fails the run instead.
 fn write_result_parquet(
     pool: &ExecutorPool,
     run_id: i64,
     result: &trawl_api::value::QueryResult,
-) -> (Option<String>, Option<Vec<u8>>) {
-    if result.rows.is_empty() {
-        return zstd_fallback(result);
-    }
-
+) -> Result<(Option<String>, Option<Vec<u8>>), String> {
     let base = pool.base_dir().trim_end_matches('/');
     let relative = format!("scheduled/run_{run_id}.parquet");
     let full_path = format!("{base}/{relative}");
@@ -723,15 +781,29 @@ fn write_result_parquet(
     // Write to temp file, then atomic rename.
     let temp = std::path::Path::new(&temp_path);
     let final_path = std::path::Path::new(&full_path);
-    if let Err(e) = executor.write_query_result_to_parquet(result, temp) {
-        tracing::warn!(
-            event_type = "scheduler_parquet_error",
-            run_id,
-            error = %e,
-            "failed to write parquet result, falling back to blob"
-        );
-        let _ = std::fs::remove_file(temp);
-        return zstd_fallback(result);
+    match executor.write_query_result_to_parquet(result, temp) {
+        Ok(_) => {}
+        // Not a failure: the result's shape has no exact parquet form, and
+        // the blob is its representation.
+        Err(e @ trawl_engine::error::EngineError::NotParquetStorable { .. }) => {
+            tracing::info!(
+                event_type = "scheduler_result_blob",
+                run_id,
+                reason = %e,
+                "storing the run's result as a blob"
+            );
+            return zstd_fallback(result);
+        }
+        Err(e) => {
+            tracing::warn!(
+                event_type = "scheduler_parquet_error",
+                run_id,
+                error = %e,
+                "failed to write parquet result, falling back to blob"
+            );
+            let _ = std::fs::remove_file(temp);
+            return zstd_fallback(result);
+        }
     }
 
     if let Err(e) = std::fs::rename(temp, final_path) {
@@ -745,16 +817,20 @@ fn write_result_parquet(
         return zstd_fallback(result);
     }
 
-    (Some(relative), None)
+    Ok((Some(relative), None))
 }
 
-/// Compress a `QueryResult` as a zstd JSON blob (the representation for a
-/// zero-row run, and the fallback when a parquet write fails).
-fn zstd_fallback(result: &trawl_api::value::QueryResult) -> (Option<String>, Option<Vec<u8>>) {
-    let blob = serde_json::to_vec(result)
-        .ok()
-        .and_then(|json| zstd::encode_all(json.as_slice(), 3).ok());
-    (None, blob)
+/// Compress a `QueryResult` as a zstd blob of its typed wire JSON, the
+/// representation for a result parquet cannot hold exactly and the
+/// fallback when a parquet write fails. `Err` names what failed: the
+/// encoding (a cell its column's type refuses) or the compression.
+fn zstd_fallback(
+    result: &trawl_api::value::QueryResult,
+) -> Result<(Option<String>, Option<Vec<u8>>), String> {
+    let json = serde_json::to_vec(result).map_err(|e| format!("encoding failed: {e}"))?;
+    let blob =
+        zstd::encode_all(json.as_slice(), 3).map_err(|e| format!("compression failed: {e}"))?;
+    Ok((None, Some(blob)))
 }
 
 /// Read back what [`zstd_fallback`] wrote: a zstd-compressed JSON
@@ -762,8 +838,8 @@ fn zstd_fallback(result: &trawl_api::value::QueryResult) -> (Option<String>, Opt
 ///
 /// Lives beside the writer so the two halves of the representation are one
 /// pair. Both readers call it: `get_report_run`, which serves the run over
-/// HTTP, and `from_saved::resolve_latest`, which turns a zero-row run's
-/// column names back into a queryable source.
+/// HTTP, and `from_saved`, which resolves a zero-column blob to a source
+/// with no rows and refuses any other blob by the run's name.
 pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::value::QueryResult> {
     let compressed = blob?;
     let decompressed = zstd::decode_all(compressed.as_slice())
@@ -931,7 +1007,7 @@ mod pg_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{CorpusWatch, remove_result_file};
+    use super::{CorpusWatch, decode_result_blob, remove_result_file, zstd_fallback};
     use crate::publication::CorpusUnsettled::{RestartBacklog, RollupPending};
 
     /// The loop logs a change of corpus state once, never a poll that
@@ -1117,6 +1193,39 @@ mod tests {
                 .as_deref()
                 .is_some_and(|m| m.contains("zz_sched_needle")),
             "the run record keeps the text: {run:?}"
+        );
+    }
+
+    /// The blob is the typed wire, and decodes back to the same result.
+    #[test]
+    fn the_blob_round_trips_a_typed_result() {
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+        let result = QueryResult {
+            columns: vec![Column::new("x", ColumnType::Mixed)],
+            rows: vec![
+                vec![Value::UInt(u64::MAX)],
+                vec![Value::String("abc".into())],
+            ],
+        };
+        let (path, blob) = zstd_fallback(&result).expect("the result encodes");
+        assert!(path.is_none());
+        assert_eq!(decode_result_blob(blob), Some(result));
+    }
+
+    /// A result the codec refuses has no blob either, and the fallback
+    /// says so instead of handing back nothing: the caller then fails the
+    /// run rather than record a success nothing can read.
+    #[test]
+    fn the_blob_refuses_a_result_the_codec_refuses() {
+        use trawl_api::value::{Column, ColumnType, QueryResult, Value};
+        let result = QueryResult {
+            columns: vec![Column::new("n", ColumnType::Integer)],
+            rows: vec![vec![Value::String("7".into())]],
+        };
+        let reason = zstd_fallback(&result).expect_err("a string cell is not an integer");
+        assert!(
+            reason.contains("encoding failed") && reason.contains("\"n\""),
+            "{reason}"
         );
     }
 }

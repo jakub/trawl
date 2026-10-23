@@ -242,10 +242,22 @@ mod tests {
         trawl_api::QueryResponse {
             execution: None,
             result: trawl_api::value::QueryResult {
+                // Typed by the cells each column holds, as a server would.
                 columns: columns
                     .iter()
-                    .map(|name| trawl_api::value::Column {
-                        name: (*name).to_string(),
+                    .enumerate()
+                    .map(|(idx, name)| {
+                        let mut fold = trawl_api::value::TypeFold::new();
+                        for row in &rows {
+                            if let Some(cell) = row.get(idx) {
+                                fold.observe_value(cell);
+                            }
+                        }
+                        trawl_api::value::Column::new(
+                            *name,
+                            fold.finish()
+                                .unwrap_or(trawl_api::value::ColumnType::String),
+                        )
                     })
                     .collect(),
                 rows,

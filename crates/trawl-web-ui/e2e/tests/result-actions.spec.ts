@@ -110,7 +110,8 @@ test('result audit: live aggregate Events replaces exact table while Visualizati
   await page.goto('/search?q=' + encodeURIComponent('* | stats count() by host') + '&mode=live');
   await expect.poll(async () => (await (await request.get('/__ctl/state')).json()).sse.open).toBe(1);
   const send = async (host: string, count: number) => {
-    expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns: ['host', 'count'], rows: [{host, count}] }) } })).ok()).toBe(true);
+    const columns = [{ name: 'host', type: 'string' }, { name: 'count', type: 'integer' }];
+    expect((await request.post('/__ctl/stream/frame', { data: { data: JSON.stringify({ columns, rows: [[host, String(count)]] }) } })).ok()).toBe(true);
   };
   await send('first', 100);
   await expect(page.locator('.results-table')).toContainText('first');
@@ -191,9 +192,9 @@ test('result audit: pending query cannot retarget retained aggregate row actions
 // string service field so two untouched facet groups must remain usable.
 function transformedRaw(query: string) {
   const response = structuredClone(raw);
-  response.columns.push({ name: 'service' });
+  response.columns.push({ name: 'service', type: 'string' });
   response.rows.forEach((row: unknown[]) => row.push('nginx'));
-  if (query.toLowerCase().includes('let status')) response.rows.forEach((row: unknown[]) => { row[2] = 0; });
+  if (query.toLowerCase().includes('let status')) response.rows.forEach((row: unknown[]) => { row[2] = '0'; });
   if (query.toLowerCase().includes('rename message')) response.columns[3].name = 'summary';
   return response;
 }
@@ -210,7 +211,8 @@ for (const mode of ['snapshot', 'live']) {
       if (mode === 'snapshot') {
         await page.route(routeQuery, route => route.fulfill({ json: response }));
       } else {
-        const events = response.rows.map((row: unknown[]) => Object.fromEntries(response.columns.map((column: {name: string}, i: number) => [column.name, row[i]])));
+        // One `data` frame per row: a one-row result under the same columns.
+        const events = response.rows.map((row: unknown[]) => ({ columns: response.columns, rows: [row] }));
         await page.route('**/api/v1/stream?*', route => route.fulfill({
           contentType: 'text/event-stream',
           body: events.map((event: object) => `event: data\ndata: ${JSON.stringify(event)}\n\n`).join(''),

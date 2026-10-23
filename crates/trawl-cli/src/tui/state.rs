@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 use trawl_client::{PaginationMeta, QueryResponse};
-use trawl_engine::value::{Column, QueryResult, Value};
+use trawl_engine::value::{Column, ColumnType, QueryResult, TypeFold, Value};
 
 /// Cached layout areas from the last render frame, used for mouse hit-testing.
 ///
@@ -75,15 +75,11 @@ impl ResultsSearch {
                 {
                     continue;
                 }
-                let display = match value {
-                    Value::Null => "NULL".to_owned(),
-                    Value::Boolean(b) => b.to_string(),
-                    Value::Integer(i) => i.to_string(),
-                    Value::UInt(u) => u.to_string(),
-                    Value::Float(f) => format!("{f:.2}"),
-                    Value::String(s) => s.clone(),
-                    Value::Array(_) => value.to_string(),
+                // The text the grid shows, so a hit is a hit the reader sees.
+                let Some(column) = result.columns.get(col_idx) else {
+                    continue;
                 };
+                let display = crate::tui::ui::results::cell_text(&column.ty, value);
                 if display.to_lowercase().contains(&needle) {
                     self.matches.push((row_idx, col_idx));
                 }
@@ -1808,6 +1804,14 @@ impl SimpleEditor {
     }
 }
 
+/// One buffered live row: each cell beside the type its frame gave the
+/// cell's column. The buffer types its columns from these, merged, rather
+/// than re-guessing from the cells, in which a timestamp is only text.
+struct LiveRow {
+    cells: Vec<Value>,
+    types: Vec<ColumnType>,
+}
+
 /// Rolling buffer for live-streamed log events.
 ///
 /// Tracks columns via union of all seen field names and maintains
@@ -1819,7 +1823,7 @@ pub struct LiveBuffer {
     /// Column name -> index for O(1) lookup.
     column_index: HashMap<String, usize>,
     /// Bounded row buffer (newest at back).
-    rows: VecDeque<Vec<Value>>,
+    rows: VecDeque<LiveRow>,
     /// Max rows to retain.
     max_rows: usize,
     /// The caps the latest aggregation snapshot reported as having dropped
@@ -1857,32 +1861,10 @@ impl LiveBuffer {
         self
     }
 
-    /// Push a log event map into the buffer, extending the column union as needed.
-    pub fn push_event(&mut self, event: &serde_json::Map<String, serde_json::Value>) {
-        // Extend column set with any new fields.
-        for key in event.keys() {
-            if !self.column_index.contains_key(key) {
-                let idx = self.column_names.len();
-                self.column_names.push(key.clone());
-                self.column_index.insert(key.clone(), idx);
-
-                // Back-fill existing rows with Null for the new column.
-                for row in &mut self.rows {
-                    row.push(Value::Null);
-                }
-            }
-        }
-
-        // Build the row in column order.
-        let mut row = vec![Value::Null; self.column_names.len()];
-        for (key, json_val) in event {
-            if let Some(&idx) = self.column_index.get(key) {
-                row[idx] = serde_json::from_value(json_val.clone()).unwrap_or(Value::Null);
-            }
-        }
-
-        self.rows.push_back(row);
-
+    /// Push one live frame (a one-row typed result) into the buffer,
+    /// extending the column union as needed.
+    pub fn push_frame(&mut self, frame: &QueryResult) {
+        self.append(frame);
         // Trim to capacity.
         while self.rows.len() > self.max_rows {
             self.rows.pop_front();
@@ -1891,13 +1873,23 @@ impl LiveBuffer {
 
     /// Snapshot the current buffer state as a `QueryResponse` for rendering.
     pub fn to_query_response(&self) -> QueryResponse {
+        let rows: Vec<Vec<Value>> = self.rows.iter().map(|row| row.cells.clone()).collect();
+        // Each column merges the types its frames gave it, over the cells
+        // that hold a value: one type stays, disagreement is `mixed`, and a
+        // column no buffered frame gave a value has no evidence and is
+        // `string`.
         let columns: Vec<Column> = self
             .column_names
             .iter()
-            .map(|name| Column { name: name.clone() })
+            .enumerate()
+            .map(|(idx, name)| {
+                let mut fold = TypeFold::new();
+                for row in &self.rows {
+                    fold.observe_typed(&row.types[idx], &row.cells[idx]);
+                }
+                Column::new(name.clone(), fold.finish().unwrap_or(ColumnType::String))
+            })
             .collect();
-
-        let rows: Vec<Vec<Value>> = self.rows.iter().cloned().collect();
         let returned = rows.len();
 
         QueryResponse {
@@ -1920,30 +1912,57 @@ impl LiveBuffer {
     /// Replace the entire buffer contents with an aggregation snapshot.
     ///
     /// Used when the server emits a `snapshot` event (aggregation mode).
-    /// The buffer is cleared and rebuilt from the given columns and rows,
-    /// and the snapshot's `capped` report replaces the previous one.
+    /// The buffer is cleared and rebuilt from the snapshot's typed columns
+    /// and rows, and the snapshot's `capped` report replaces the previous
+    /// one. A snapshot is the whole answer, so it is not trimmed.
     pub fn replace_with_snapshot(
         &mut self,
-        columns: &[String],
-        rows: &[serde_json::Map<String, serde_json::Value>],
+        snapshot: &QueryResult,
         capped: &[trawl_api::stream::SnapshotCap],
     ) {
         self.capped = capped.to_vec();
-        self.column_names = columns.to_vec();
+        self.column_names.clear();
         self.column_index.clear();
-        for (i, name) in columns.iter().enumerate() {
-            self.column_index.insert(name.clone(), i);
-        }
         self.rows.clear();
-        for row_map in rows {
-            let mut row = vec![Value::Null; self.column_names.len()];
-            for (key, json_val) in row_map {
-                if let Some(&idx) = self.column_index.get(key) {
-                    row[idx] = serde_json::from_value(json_val.clone()).unwrap_or(Value::Null);
-                }
+        self.append(snapshot);
+    }
+
+    /// Append every row of `result`, each cell at its column's place in
+    /// the union and typed by its column.
+    fn append(&mut self, result: &QueryResult) {
+        let places: Vec<usize> = result
+            .columns
+            .iter()
+            .map(|column| self.column_place(&column.name))
+            .collect();
+        let width = self.column_names.len();
+        for cells in &result.rows {
+            let mut row = LiveRow {
+                cells: vec![Value::Null; width],
+                types: vec![ColumnType::String; width],
+            };
+            for ((column, &place), cell) in result.columns.iter().zip(&places).zip(cells) {
+                row.cells[place] = cell.clone();
+                row.types[place] = column.ty.clone();
             }
             self.rows.push_back(row);
         }
+    }
+
+    /// The union position of the column `name`, adding it (and a null,
+    /// untyped cell to every buffered row) the first time it is seen.
+    fn column_place(&mut self, name: &str) -> usize {
+        if let Some(&place) = self.column_index.get(name) {
+            return place;
+        }
+        let place = self.column_names.len();
+        self.column_names.push(name.to_owned());
+        self.column_index.insert(name.to_owned(), place);
+        for row in &mut self.rows {
+            row.cells.push(Value::Null);
+            row.types.push(ColumnType::String);
+        }
+        place
     }
 
     /// Number of buffered rows.
@@ -2084,13 +2103,19 @@ impl Tab {
 mod tests {
     use super::*;
 
-    fn make_event(
-        pairs: &[(&str, serde_json::Value)],
-    ) -> serde_json::Map<String, serde_json::Value> {
-        pairs
-            .iter()
-            .map(|(k, v)| ((*k).to_owned(), v.clone()))
-            .collect()
+    fn text(s: &str) -> Value {
+        Value::String(s.to_owned())
+    }
+
+    /// A one-row live frame, as the server sends one event.
+    fn make_frame(cells: &[(&str, ColumnType, Value)]) -> QueryResult {
+        QueryResult {
+            columns: cells
+                .iter()
+                .map(|(name, ty, _)| Column::new(*name, ty.clone()))
+                .collect(),
+            rows: vec![cells.iter().map(|(_, _, cell)| cell.clone()).collect()],
+        }
     }
 
     // --- SimpleEditor tests ---
@@ -2728,11 +2753,10 @@ mod tests {
     #[test]
     fn live_buffer_push_single_event() {
         let mut buf = LiveBuffer::new(100);
-        let event = make_event(&[
-            ("host", serde_json::json!("web-1")),
-            ("level", serde_json::json!("error")),
-        ]);
-        buf.push_event(&event);
+        buf.push_frame(&make_frame(&[
+            ("host", ColumnType::String, text("web-1")),
+            ("level", ColumnType::String, text("error")),
+        ]));
         assert_eq!(buf.len(), 1);
 
         let resp = buf.to_query_response();
@@ -2745,15 +2769,15 @@ mod tests {
         let mut buf = LiveBuffer::new(100);
 
         // First event has {host, level}.
-        buf.push_event(&make_event(&[
-            ("host", serde_json::json!("web-1")),
-            ("level", serde_json::json!("info")),
+        buf.push_frame(&make_frame(&[
+            ("host", ColumnType::String, text("web-1")),
+            ("level", ColumnType::String, text("info")),
         ]));
 
         // Second event has {host, service} — new field appears.
-        buf.push_event(&make_event(&[
-            ("host", serde_json::json!("web-2")),
-            ("service", serde_json::json!("nginx")),
+        buf.push_frame(&make_frame(&[
+            ("host", ColumnType::String, text("web-2")),
+            ("service", ColumnType::String, text("nginx")),
         ]));
 
         let resp = buf.to_query_response();
@@ -2775,7 +2799,11 @@ mod tests {
         let mut buf = LiveBuffer::new(3);
 
         for i in 0..5 {
-            buf.push_event(&make_event(&[("n", serde_json::json!(i))]));
+            buf.push_frame(&make_frame(&[(
+                "n",
+                ColumnType::Integer,
+                Value::Integer(i),
+            )]));
         }
 
         assert_eq!(buf.len(), 3);
@@ -2786,24 +2814,108 @@ mod tests {
         assert_eq!(resp.result.rows[2][0], Value::Integer(4));
     }
 
+    /// The buffer's columns are the frames' types merged: a timestamp
+    /// stays `timestamp` though its cells are text, a null cell (typed
+    /// `string` by its frame for want of evidence) adds nothing, and two
+    /// frames that disagree make the column `mixed`.
     #[test]
-    fn live_buffer_handles_mixed_value_types() {
+    fn live_buffer_types_columns_from_the_frames() {
         let mut buf = LiveBuffer::new(100);
-        buf.push_event(&make_event(&[
-            ("count", serde_json::json!(42)),
-            ("rate", serde_json::json!(1.5)),
-            ("active", serde_json::json!(true)),
-            ("tag", serde_json::json!(null)),
+        buf.push_frame(&make_frame(&[
+            (
+                "_time",
+                ColumnType::Timestamp,
+                text("2026-01-15T09:00:00.000000Z"),
+            ),
+            ("active", ColumnType::Boolean, Value::Boolean(true)),
+            ("code", ColumnType::Integer, Value::Integer(404)),
+            ("tag", ColumnType::String, Value::Null),
+        ]));
+        buf.push_frame(&make_frame(&[
+            (
+                "_time",
+                ColumnType::Timestamp,
+                text("2026-01-15T09:00:01.000000Z"),
+            ),
+            ("code", ColumnType::String, text("E_TIMEOUT")),
+            ("tag", ColumnType::Float, Value::Float(1.5)),
         ]));
 
         let resp = buf.to_query_response();
-        let row = &resp.result.rows[0];
-        // serde_json::Map iterates in BTreeMap (alphabetical) order:
-        // active, count, rate, tag
-        assert_eq!(row[0], Value::Boolean(true));
-        assert_eq!(row[1], Value::Integer(42));
-        assert_eq!(row[2], Value::Float(1.5));
-        assert_eq!(row[3], Value::Null);
+        assert_eq!(
+            resp.result.columns,
+            vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("active", ColumnType::Boolean),
+                Column::new("code", ColumnType::Mixed),
+                Column::new("tag", ColumnType::Float),
+            ]
+        );
+    }
+
+    /// A snapshot replaces the buffer whole, typed as it came, columns
+    /// and caps included, and is not trimmed to the live row cap.
+    #[test]
+    fn live_buffer_snapshot_replaces_everything() {
+        let mut buf = LiveBuffer::new(1);
+        buf.push_frame(&make_frame(&[("host", ColumnType::String, text("web-1"))]));
+
+        let snapshot = QueryResult {
+            columns: vec![
+                Column::new("service", ColumnType::String),
+                Column::new("total", ColumnType::Integer),
+            ],
+            rows: vec![
+                vec![text("nginx"), Value::UInt(u64::MAX)],
+                vec![text("api"), Value::Null],
+            ],
+        };
+        let caps = [trawl_api::stream::SnapshotCap {
+            cap: trawl_api::stream::SnapshotCapKind::Groups,
+            limit: 10_000,
+        }];
+        buf.replace_with_snapshot(&snapshot, &caps);
+
+        assert_eq!(buf.to_query_response().result, snapshot);
+        assert_eq!(buf.capped(), caps);
+    }
+
+    /// AC 2 on the live lane: data frames decoded from their wire text
+    /// land 2^53+1 and the unsigned range exactly, and the buffer serves
+    /// them under one `integer` column. So does a decoded snapshot.
+    #[test]
+    fn live_buffer_keeps_big_integers_from_the_wire_exactly() {
+        let mut buf = LiveBuffer::new(10);
+        for id in [
+            "9007199254740993",
+            "9223372036854775808",
+            "18446744073709551615",
+        ] {
+            let frame: QueryResult = serde_json::from_str(&format!(
+                r#"{{"columns":[{{"name":"id","type":"integer"}}],"rows":[["{id}"]]}}"#
+            ))
+            .expect("a data frame decodes");
+            buf.push_frame(&frame);
+        }
+        let exact = vec![
+            vec![Value::Integer(9_007_199_254_740_993)],
+            vec![Value::UInt(9_223_372_036_854_775_808)],
+            vec![Value::UInt(u64::MAX)],
+        ];
+        let resp = buf.to_query_response();
+        assert_eq!(
+            resp.result.columns,
+            vec![Column::new("id", ColumnType::Integer)]
+        );
+        assert_eq!(resp.result.rows, exact);
+
+        let snapshot: trawl_api::stream::SnapshotFrame = serde_json::from_str(
+            r#"{"columns":[{"name":"id","type":"integer"}],
+                "rows":[["9007199254740993"],["9223372036854775808"],["18446744073709551615"]]}"#,
+        )
+        .expect("a snapshot frame decodes");
+        buf.replace_with_snapshot(&snapshot.result, &snapshot.capped);
+        assert_eq!(buf.to_query_response().result.rows, exact);
     }
 
     // --- compute_common_fields tests ---
@@ -3074,5 +3186,31 @@ mod tests {
         let (vrow, _) = editor.visual_cursor();
         assert!(editor.scroll_row <= vrow);
         assert!(editor.scroll_row + 5 > vrow);
+    }
+
+    /// The search reads the text the grid shows: a timestamp hit is on
+    /// its wall clock, never on the wire's `T` or offset.
+    #[test]
+    fn search_matches_a_timestamp_as_the_grid_shows_it() {
+        let result = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("note", ColumnType::String),
+            ],
+            rows: vec![vec![
+                Value::String("2026-01-15T10:00:01.250000+05:30".into()),
+                Value::String("T10".into()),
+            ]],
+        };
+        let mut search = ResultsSearch::new();
+        search.query = "10:00:01.25".to_owned();
+        search.update_matches(&result, None);
+        assert_eq!(search.matches, vec![(0, 0)]);
+        search.query = "t10".to_owned();
+        search.update_matches(&result, None);
+        assert_eq!(search.matches, vec![(0, 1)], "only the cell that shows it");
+        search.query = "+05:30".to_owned();
+        search.update_matches(&result, None);
+        assert!(search.matches.is_empty());
     }
 }

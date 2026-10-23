@@ -151,12 +151,13 @@ fn the_tail_computes_over_the_specials_it_received() {
     );
 }
 
-/// (c) The silent-regression guard: a TIMESTAMP column still display-shifts
-/// after a tail runs.
+/// (c) The silent-regression guard: a TIMESTAMP column still renders in
+/// the display offset after a tail runs.
 ///
-/// The shift re-parses the rendered TEXT (`shift_timestamp_columns`), so a
-/// bridge that retyped timestamp cells would break it without any test
-/// noticing — the value would simply stay in UTC.
+/// The tail reads `DuckDB`'s cast text in UTC and the render after it
+/// re-parses that TEXT (`render_tracked_timestamps`), so a bridge that
+/// retyped timestamp cells would break it without any test noticing: the
+/// value would simply stay UTC cast text.
 #[test]
 fn a_timestamp_column_still_shifts_after_the_tail() {
     let (_dir, glob) = source(&[
@@ -179,9 +180,9 @@ fn a_timestamp_column_still_shifts_after_the_tail() {
     let Value::String(utc_time) = cell(&utc, 0, "_time") else {
         panic!("_time must stay a string through the tail");
     };
-    assert_eq!(utc_time, "2026-01-15 09:00:00");
+    assert_eq!(utc_time, "2026-01-15T09:00:00.000000Z");
     assert_eq!(
-        shifted_time, "2026-01-15 14:30:00",
+        shifted_time, "2026-01-15T14:30:00.000000+05:30",
         "the display offset must still reach a cell that crossed the tail"
     );
 }
@@ -189,11 +190,11 @@ fn a_timestamp_column_still_shifts_after_the_tail() {
 /// A timestamp the TAIL computes — an infinity included — survives a
 /// display-shifted run.
 ///
-/// The shift re-parses the rendered text of the columns it tracks; an
-/// infinity renders as a WORD, which is not that rendering, so it passes
-/// through untouched while a real `_time` beside it still shifts. Both
-/// halves are asserted, because "nothing moved" is also what a broken
-/// shift looks like.
+/// The render after the tail only touches the columns its lineage tracks;
+/// a computed infinity is the tail's own value, so it passes through as
+/// the word while a real `_time` beside it still renders in the display
+/// offset. Both halves are asserted, because "nothing moved" is also what
+/// a broken render looks like.
 #[test]
 fn a_tail_computed_infinity_survives_a_shifted_run() {
     let (_dir, glob) = source(&[
@@ -214,7 +215,7 @@ fn a_tail_computed_infinity_survives_a_shifted_run() {
     );
     assert_eq!(
         cell(&shifted, 0, "_time"),
-        &Value::String("2026-01-15 14:30:00".into()),
+        &Value::String("2026-01-15T14:30:00.000000+05:30".into()),
         "…while the real timestamp column beside it still shifts"
     );
 }
@@ -454,19 +455,15 @@ fn the_kv_tail_timechart_cuts_the_buckets_the_sql_lane_cuts() {
     let (_dir, glob) = source(&[&event(bucket + 60), &event(bucket + 120)]);
     let exec = Executor::new().unwrap();
 
-    // A `_time` cell as epoch seconds, in either lane's spelling: the
-    // tail writes RFC 3339, the SQL lane a zoneless wall clock.
+    // A `_time` cell as epoch seconds: both lanes write the wire's
+    // RFC 3339.
     let instant = |cell: &Value| -> i64 {
         let Value::String(text) = cell else {
             panic!("_time must be text: {cell:?}");
         };
         DateTime::parse_from_rfc3339(text)
-            .map(|dt| dt.timestamp())
-            .or_else(|_| {
-                chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-                    .map(|naive| naive.and_utc().timestamp())
-            })
             .unwrap_or_else(|e| panic!("_time {text:?} did not parse: {e}"))
+            .timestamp()
     };
 
     let with_tail = run(

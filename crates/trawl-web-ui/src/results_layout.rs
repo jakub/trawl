@@ -15,7 +15,26 @@
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-use trawl_api::value::Value;
+use trawl_api::display::{timestamp_cell_text, value_to_string};
+use trawl_api::value::{ColumnType, Value};
+
+/// A result cell as the grids print it.
+///
+/// A `timestamp` cell (or a list of them) shows in the short form the CLI
+/// and the TUI use, `2024-01-15 10:00:00.12`: the wall clock in the
+/// offset the server rendered it in, without the `T`, the offset or the
+/// fraction's trailing zeros. Whether a cell is a timestamp is the
+/// column's type, never the cell's spelling, so a `string` column holding
+/// RFC 3339 text shows as sent. A column the grid has no type for (a
+/// short `types` list) shows like any other cell.
+///
+/// Display only: a filter built from a cell keeps the wire text, which
+/// names the instant exactly.
+#[must_use]
+pub fn cell_text(ty: Option<&ColumnType>, value: &Value) -> String {
+    ty.and_then(|ty| timestamp_cell_text(ty, value))
+        .unwrap_or_else(|| value_to_string(value))
+}
 
 /// One event's detail rows, split for the null-field disclosure: column
 /// indices, each list in wire order.
@@ -257,6 +276,73 @@ mod tests {
 
         let none = message_first(&cols(&["message", "status"]), &[]).unwrap();
         assert!(none.meta.is_empty());
+    }
+
+    #[test]
+    fn cell_text_shortens_timestamp_typed_cells_only() {
+        let wire = Value::String("2026-10-22T12:34:56.123450-07:00".into());
+        assert_eq!(
+            cell_text(Some(&ColumnType::Timestamp), &wire),
+            "2026-10-22 12:34:56.12345"
+        );
+        assert_eq!(
+            cell_text(
+                Some(&ColumnType::Timestamp),
+                &Value::String("2026-10-22T12:34:56.000000Z".into())
+            ),
+            "2026-10-22 12:34:56"
+        );
+        // The column type decides, never the spelling: RFC 3339 text in a
+        // string column, or with no type at all, shows as sent.
+        assert_eq!(
+            cell_text(Some(&ColumnType::String), &wire),
+            "2026-10-22T12:34:56.123450-07:00"
+        );
+        assert_eq!(cell_text(None, &wire), "2026-10-22T12:34:56.123450-07:00");
+        assert_eq!(
+            cell_text(
+                Some(&ColumnType::Timestamp),
+                &Value::String("infinity".into())
+            ),
+            "infinity"
+        );
+        assert_eq!(
+            cell_text(Some(&ColumnType::Timestamp), &Value::Null),
+            "NULL"
+        );
+        assert_eq!(
+            cell_text(
+                Some(&ColumnType::list(ColumnType::Timestamp)),
+                &Value::Array(vec![
+                    Value::String("2026-01-01T00:00:00.500000Z".into()),
+                    Value::Null,
+                ])
+            ),
+            "[2026-01-01 00:00:00.5, ]"
+        );
+    }
+
+    #[test]
+    fn cell_text_leaves_other_types_to_value_to_string() {
+        assert_eq!(
+            cell_text(Some(&ColumnType::Integer), &Value::UInt(u64::MAX)),
+            "18446744073709551615"
+        );
+        assert_eq!(
+            cell_text(
+                Some(&ColumnType::Integer),
+                &Value::Integer(9_007_199_254_740_993)
+            ),
+            "9007199254740993"
+        );
+        assert_eq!(
+            cell_text(Some(&ColumnType::Float), &Value::Float(1.5)),
+            "1.50"
+        );
+        assert_eq!(
+            cell_text(Some(&ColumnType::Date), &Value::String("2026-10-22".into())),
+            "2026-10-22"
+        );
     }
 
     #[test]

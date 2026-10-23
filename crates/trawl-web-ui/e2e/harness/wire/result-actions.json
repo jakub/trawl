@@ -1,7 +1,13 @@
 {
-  "columns": [{"name":"host"},{"name":"count"}],
-  "rows": [["hundred",100],["twenty",20],["ten",10],["null",null],["negative",-1.5]],
-  "pagination":{"limit":50,"offset":0,"returned":5,"total":5},
-  "degraded_fields":[],
-  "severity_columns":[]
+  "columns": [{ "name": "host", "type": "string" }, { "name": "count", "type": "mixed" }],
+  "rows": [
+    ["hundred", { "type": "integer", "value": "100" }],
+    ["twenty", { "type": "integer", "value": "20" }],
+    ["ten", { "type": "integer", "value": "10" }],
+    ["null", null],
+    ["negative", { "type": "float", "value": -1.5 }]
+  ],
+  "pagination": { "limit": 50, "offset": 0, "returned": 5, "total": 5 },
+  "degraded_fields": [],
+  "severity_columns": []
 }

@@ -5,19 +5,19 @@
 //! The typed row the pipeline stages pass between them.
 //!
 //! A row carries [`crate::eval::EvalValue`] cells end to end, and JSON
-//! appears only at the wire, through the two doors here. Crossing a JSON
+//! appears only at the edges, through the two doors here. Crossing a JSON
 //! boundary once per stage would lose every non-finite double — JSON has
 //! no spelling for one, so `serde_json::Number::from_f64` yields NULL — and
 //! `* | let x = 0/0 | where x == x` would keep the row in batch
 //! (`NaN = NaN` is TRUE in `DuckDB`, ADR-0011) while dropping it live, for
-//! no reason a query author could see. On the wire a non-finite still
-//! serializes as `null`, matching what `trawl-api`'s `serialize_f64` sends
-//! on the batch path, but that happens once, at the edge.
+//! no reason a query author could see. The SSE wire does not come through
+//! here at all: `trawl-engine` builds its typed result frames from the
+//! cells themselves, so a non-finite double reaches it intact.
 //!
 //! [`Row`] is a type alias for the same `BTreeMap` `serde_json::Map` is
 //! (this workspace does not enable serde_json's `preserve_order`, checked
 //! in `Cargo.lock`: no `indexmap` dependency), so key ordering — and with
-//! it SSE frame bytes and result-column order — is preserved by
+//! it the column order of a live frame and of a result — is preserved by
 //! construction rather than by care.
 
 use std::collections::BTreeMap;
@@ -52,13 +52,12 @@ pub fn from_json(event: &Map<String, Value>) -> Row {
         .collect()
 }
 
-/// The one row → JSON door: the SSE wire, and the batch bridge's
-/// compatibility path.
+/// The one row → JSON door: a row as a plain JSON object, the form the
+/// parity suites compare against `DuckDB`'s own `to_json`.
 ///
-/// This is the live lane's single nulling site — `Float(inf)` has no JSON
-/// spelling and serializes as `null` — and it is deliberately never
-/// called from a stage. A stage that needed JSON would re-introduce the
-/// per-stage boundary this module exists to avoid.
+/// `Float(inf)` has no JSON spelling and serializes as `null` here, and it
+/// is deliberately never called from a stage. A stage that needed JSON
+/// would re-introduce the per-stage boundary this module exists to avoid.
 #[must_use]
 pub fn to_json(row: Row) -> Map<String, Value> {
     row.into_iter()
@@ -121,8 +120,8 @@ pub fn cell_text(cell: &EvalValue) -> String {
             }
         }
         EvalValue::Str(s) => s.clone(),
-        // The instant's own cast text, not the JSON string it becomes on
-        // the wire: the wire door would wrap it in quote characters, which
+        // The instant's own cast text, not the JSON string the JSON door
+        // makes of it: that door would wrap it in quote characters, which
         // land inside a group key (`stats count() by t` giving
         // `"2026-01-15 09:00:00"` live against `2026-01-15 09:00:00` in
         // batch) and split a `Timestamp` cell from a `Str` cell holding
@@ -309,8 +308,8 @@ mod tests {
     }
 
     /// Both doors ORDER by key, whatever order the input arrived in —
-    /// the property an SSE frame's bytes and a result-column list rest
-    /// on, pinned with deliberately UNSORTED input keys.
+    /// the property a live frame's and a result's column order rest on,
+    /// pinned with deliberately UNSORTED input keys.
     ///
     /// What this does NOT pin, stated so it is not mistaken for it: a
     /// crate added anywhere in the graph can turn on `serde_json`'s
@@ -319,7 +318,7 @@ mod tests {
     /// it collects in [`Row`] order, and `Row` is a `BTreeMap` in its
     /// own right, not `serde_json::Map`'s alias — so this case would
     /// stay green. The case that catches the flip is
-    /// `an_sse_frame_keeps_its_pre_change_bytes` in `stage_parity`,
+    /// `the_row_doors_keep_an_event_maps_bytes` in `stage_parity`,
     /// which compares a WIRE map's own serialization against the
     /// round trip: under `preserve_order` the wire side would keep its
     /// insertion order while this side stays sorted.
@@ -341,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn the_wire_door_is_the_one_place_a_special_becomes_null() {
+    fn the_json_door_writes_a_special_as_null() {
         let mut row = Row::new();
         row.insert("x".into(), EvalValue::Float(f64::INFINITY));
         row.insert("y".into(), EvalValue::Float(f64::NAN));

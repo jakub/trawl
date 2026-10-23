@@ -78,7 +78,16 @@ def signin_query(token_file):
         {"query": 'service="host-ci" last=24h | stats count()'},
         headers,
     )
-    if not any(type(value) is int and value == 1 for row in result.get("rows", []) for value in row):
+    # An integer cell is a decimal string under an `integer` column
+    # (reference/api.md, Result columns), so the count of one stored event
+    # is the string "1" in the column typed integer.
+    columns = result.get("columns", [])
+    counted = any(
+        column.get("type") == "integer" and row[index] == "1"
+        for row in result.get("rows", [])
+        for index, column in enumerate(columns)
+    )
+    if not counted:
         fail("proxied query did not find the stored event")
 
 

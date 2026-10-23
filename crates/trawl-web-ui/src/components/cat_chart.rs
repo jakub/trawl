@@ -33,7 +33,7 @@ pub fn CatChart(shape: CatShape, result: QueryResult) -> impl IntoView {
         .rows
         .iter()
         .filter_map(|row| {
-            let label = value_to_string(row.get(shape.group)?);
+            let label = shape.group_label(&result, row)?;
             let value = row.get(shape.metric)?;
             let is_null = matches!(value, Value::Null);
             let negative = matches!(value, Value::Integer(i) if *i < 0)

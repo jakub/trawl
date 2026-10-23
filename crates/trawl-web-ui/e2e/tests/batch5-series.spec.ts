@@ -20,8 +20,8 @@ for (const deviceScaleFactor of [1, 2]) {
       const labels = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta'];
       const values = [[1, 9, 5, 2, 8, 3], [9, 1, 5, 8, 2, 7], [1, 9, 5, 2, 8, 3]];
       await page.route('**/api/v1/query', route => route.fulfill({ json: {
-        columns: [{ name: '_time' }, ...labels.map(name => ({ name }))],
-        rows: values.map((row, i) => [`2026-09-01T00:0${i}:00Z`, ...row]),
+        columns: [{ name: '_time', type: 'timestamp' }, ...labels.map(name => ({ name, type: 'integer' }))],
+        rows: values.map((row, i) => [`2026-09-01T00:0${i}:00.000000Z`, ...row.map(String)]),
         pagination: { limit: 50, offset: 0, returned: 3, total: 3 },
       } }));
       await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart ' + labels.map(label => `count() as ${label}`).join(', ')));
@@ -57,15 +57,15 @@ for (const deviceScaleFactor of [1, 2]) {
 test('a wide grouped result draws the six largest and says what it left out', async ({ page }) => {
   // Fourteen hosts, ranked by their total over the fetched rows. Six
   // draw; the caption is what keeps the other eight from being a lie by
-  // omission (ADR-0038). `_time` here is the snapshot wire spelling:
-  // UTC wall clock, a space, no zone.
+  // omission (ADR-0038). `_time` here is the snapshot wire spelling: a
+  // `timestamp` cell at offset zero.
   const hosts = Array.from({ length: 14 }, (_, i) => `host-${String(i + 1).padStart(2, '0')}`);
   const rows = hosts.flatMap((host, i) => [
-    ['2026-09-01 00:00:00', host, i + 1],
-    ['2026-09-01 00:01:00', host, i + 1],
+    ['2026-09-01T00:00:00.000000Z', host, String(i + 1)],
+    ['2026-09-01T00:01:00.000000Z', host, String(i + 1)],
   ]);
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
-    columns: [{ name: '_time' }, { name: 'host' }, { name: 'count' }],
+    columns: [{ name: '_time', type: 'timestamp' }, { name: 'host', type: 'string' }, { name: 'count', type: 'integer' }],
     rows,
     pagination: { limit: 20000, offset: 0, returned: rows.length, total: rows.length },
   } }));
@@ -91,8 +91,8 @@ test('ingest charts show the containing hour in a bounded tooltip', async ({ pag
   await page.route('**/api/v1/query', route => {
     if (!route.request().postData()?.includes('timechart')) return route.fallback();
     return route.fulfill({ json: {
-      columns: [{ name: '_time' }, { name: 'count' }],
-      rows: [['2026-09-01T00:00:00Z', 2], ['2026-09-01T01:00:00Z', 1]],
+      columns: [{ name: '_time', type: 'timestamp' }, { name: 'count', type: 'integer' }],
+      rows: [['2026-09-01T00:00:00.000000Z', '2'], ['2026-09-01T01:00:00.000000Z', '1']],
       pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
     } });
   });

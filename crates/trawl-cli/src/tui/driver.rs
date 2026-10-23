@@ -169,27 +169,17 @@ pub fn query_response_to_data(response: &QueryResponse) -> DriverData {
         .result
         .rows
         .iter()
-        .map(|row| row.iter().map(value_to_json).collect())
+        .map(|row| {
+            row.iter()
+                .map(trawl_engine::value::Value::to_plain_json)
+                .collect()
+        })
         .collect();
     DriverData {
         row_count: Some(rows.len()),
         columns: Some(columns),
         rows: Some(rows),
         ..DriverData::default()
-    }
-}
-
-fn value_to_json(v: &trawl_engine::value::Value) -> serde_json::Value {
-    match v {
-        trawl_engine::value::Value::Null => serde_json::Value::Null,
-        trawl_engine::value::Value::Boolean(b) => serde_json::Value::Bool(*b),
-        trawl_engine::value::Value::Integer(i) => serde_json::json!(i),
-        trawl_engine::value::Value::UInt(u) => serde_json::json!(u),
-        trawl_engine::value::Value::Float(f) => serde_json::json!(f),
-        trawl_engine::value::Value::String(s) => serde_json::Value::String(s.clone()),
-        trawl_engine::value::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(value_to_json).collect())
-        }
     }
 }
 

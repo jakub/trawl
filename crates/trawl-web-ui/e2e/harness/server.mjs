@@ -21,6 +21,9 @@ import { fileURLToPath } from 'node:url';
 import { snapshotDist } from './dist-snapshot.mjs';
 import {
   wire,
+  wireInstant,
+  typedResult,
+  dataFrame,
   globalRunsOrder,
   sortedGlobalRuns,
   paginationGlobalRuns,
@@ -234,8 +237,8 @@ function paginationRuns(offset, limit) {
 }
 function paginationQuery(offset, limit, query) {
   const response = wire('query-rows');
-  response.rows = paginationSlice(pagination.queryTotal, offset, limit,
-    i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1} ${query}`]);
+  response.rows = typedResult(response.columns, paginationSlice(pagination.queryTotal, offset, limit,
+    i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1} ${query}`])).rows;
   // `total` is what the execution produced, measured before the window
   // was cut from it — never the length of the slice that went back.
   response.pagination = {
@@ -424,7 +427,11 @@ function serveStream(res) {
   const chart = scenario === 'stream-chart';
   const timer = (burst || chart) ? undefined : setInterval(() => {
     n += 1;
-    res.write(`event: data\ndata: ${JSON.stringify({ _time: new Date().toISOString(), message: `tick ${n}` })}\n\n`);
+    // `wire/live-data-tick.json` is the frame's shape, guarded natively;
+    // only its one row is stamped here.
+    const tick = wire('live-data-tick');
+    tick.rows = typedResult(tick.columns, [[wireInstant(Date.now()), `tick ${n}`]]).rows;
+    res.write(`event: data\ndata: ${JSON.stringify(tick)}\n\n`);
   }, 150);
 
   const end = () => {
@@ -449,10 +456,10 @@ function serveStream(res) {
   res.on('close', end);
   if (burst) {
     for (let seq = 0; seq < 6000; seq++) {
-      const event = { seq, message: `burst-${seq}` };
-      if (seq < 1000) event.expired_only = true;
-      if (seq === 5999) event.late_column = 'arrived';
-      res.write(`event: data\ndata: ${JSON.stringify(event)}\n\n`);
+      const fields = [['seq', 'integer', seq], ['message', 'string', `burst-${seq}`]];
+      if (seq < 1000) fields.push(['expired_only', 'boolean', true]);
+      if (seq === 5999) fields.push(['late_column', 'string', 'arrived']);
+      res.write(`event: data\ndata: ${JSON.stringify(dataFrame(fields))}\n\n`);
     }
   }
 }

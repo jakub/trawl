@@ -31,12 +31,14 @@ import { SEL } from '../selectors';
 type Pg = import('@playwright/test').Page;
 type Ctl = import('@playwright/test').APIRequestContext;
 
-/** The live lane's own `_time` spelling: RFC 3339 at a zero offset, which
- * is what chrono's `to_rfc3339()` writes (ADR-0038). */
-const live = (minute: number) => `2026-09-01T00:0${minute}:00+00:00`;
-/** The other admitted spelling of the same instant. One frame below uses
- * it, so the strict parser's second form is covered too. */
-const liveZ = (minute: number) => `2026-09-01T00:0${minute}:00Z`;
+/** A live bucket's `_time`: a `timestamp` cell, RFC 3339 with
+ * microseconds at offset zero, as the SQL lane's bucket is (ADR-0038). */
+const live = (minute: number) => `2026-09-01T00:0${minute}:00.000000Z`;
+
+type Col = { name: string, type: string };
+const TIME: Col = { name: '_time', type: 'timestamp' };
+const SERVICE: Col = { name: 'service', type: 'string' };
+const COUNT: Col = { name: 'count', type: 'integer' };
 
 const GROUPED = '/search?q='
   + encodeURIComponent('* | timechart span=1m count() by service')
@@ -62,11 +64,16 @@ async function liveVisualization(page: Pg, request: Ctl, url: string) {
   await expect.poll(() => sseOpen(request)).toBe(1);
 }
 
-/** Broadcast one aggregation frame, as the server does: `columns` plus
- * row OBJECTS keyed by column name. */
-async function frame(request: Ctl, columns: string[], rows: Record<string, unknown>[]) {
+/** Broadcast one aggregation frame, as the server does: typed `columns`
+ * and positional rows. The rows here are written keyed by column name for
+ * reading's sake and laid out positionally on the way, an `integer` cell
+ * as its decimal string. */
+async function frame(request: Ctl, columns: Col[], rows: Record<string, unknown>[]) {
+  const cell = (type: string, value: unknown) =>
+    value === undefined || value === null ? null : type === 'integer' ? String(value) : value;
+  const positional = rows.map(row => columns.map(c => cell(c.type, row[c.name])));
   const sent = await request.post('/__ctl/stream/frame', {
-    data: { data: JSON.stringify({ columns, rows }) },
+    data: { data: JSON.stringify({ columns, rows: positional }) },
   });
   expect(sent.ok(), `frame: HTTP ${sent.status()}`).toBe(true);
   expect((await sent.json()).sent, 'exactly one stream is listening').toBe(1);
@@ -96,7 +103,7 @@ test('a grouped live timechart draws one series per service, and a seventh becom
   const host = page.locator(SEL.chartHost);
 
   // Frame 1 — two services over two minutes.
-  await frame(request, ['_time', 'service', 'count'], buckets(live, {
+  await frame(request, [TIME, SERVICE, COUNT], buckets(live, {
     nginx: [2, 4],
     postgres: [1, 3],
   }));
@@ -108,7 +115,7 @@ test('a grouped live timechart draws one series per service, and a seventh becom
   // Frame 2 — a third service arrives, and it has no row for the middle
   // minute. The grid is the three minutes the frame spans, not the rows
   // any one service happens to carry.
-  await frame(request, ['_time', 'service', 'count'], buckets(live, {
+  await frame(request, [TIME, SERVICE, COUNT], buckets(live, {
     nginx: [2, 4, 5],
     postgres: [1, 3, 2],
     redis: [7, null, 9],
@@ -126,9 +133,8 @@ test('a grouped live timechart draws one series per service, and a seventh becom
   await expect(value('redis')).toHaveText('');
 
   // Frame 3 — seven services, ranked by their total over the frame. Six
-  // draw and the caption names the one left out. This frame spells the
-  // zero offset `Z`, the parser's other admitted form.
-  await frame(request, ['_time', 'service', 'count'], buckets(liveZ, {
+  // draw and the caption names the one left out.
+  await frame(request, [TIME, SERVICE, COUNT], buckets(live, {
     'svc-1': [1, 1],
     'svc-2': [2, 2],
     'svc-3': [3, 3],
@@ -149,7 +155,7 @@ test('a live stats by draws columns and re-ranks them on every frame', async ({ 
   await liveVisualization(page, request, STATS);
 
   const host = page.locator(SEL.chartHost);
-  const columns = ['service', 'count'];
+  const columns = [SERVICE, COUNT];
 
   await frame(request, columns, [
     { service: 'nginx', count: 5 },

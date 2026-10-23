@@ -23,14 +23,35 @@ export function corpus(seed, count, run) {
   });
 }
 
+// An `integer` result cell, read as the exact integer it spells. The result
+// wire carries integers as canonical decimal strings under their column's
+// type (ADR-0035, amended 2026-10-22): no sign on zero, no leading zero,
+// within the signed or the unsigned 64-bit range. A JSON number there is a
+// wire fault, and `BigInt` keeps every digit a `Number` would round past
+// 2^53.
+const INTEGER = /^(0|-?[1-9][0-9]*)$/;
+const INTEGER_MIN = -(2n ** 63n);
+const INTEGER_MAX = 2n ** 64n - 1n;
+export function integerCell(column, value) {
+  assert.equal(column.type, 'integer', `column ${column.name} is ${column.type}, not integer`);
+  assert.ok(typeof value === 'string' && INTEGER.test(value),
+    `column ${column.name}: ${JSON.stringify(value)} is not a decimal integer cell`);
+  const integer = BigInt(value);
+  assert.ok(integer >= INTEGER_MIN && integer <= INTEGER_MAX,
+    `column ${column.name}: ${value} is outside the 64-bit integer range`);
+  return integer;
+}
+
 // The rows of one response, whether it is a whole result or one browser page.
 export function verifyRows(response, events) {
   const columns = response.columns.map(c => c.name);
   const seq = columns.indexOf('experiment_seq');
   const status = columns.indexOf('status');
   assert.ok(seq >= 0 && status >= 0, 'expected sequence and status columns');
-  const actual = response.rows.map(row => [row[seq], row[status]]).sort((a, b) => a[0] - b[0]);
-  assert.deepEqual(actual, events.map(e => [e.experiment_seq, e.status]), 'missing, duplicate, or changed events');
+  const actual = response.rows
+    .map(row => [integerCell(response.columns[seq], row[seq]), integerCell(response.columns[status], row[status])])
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  assert.deepEqual(actual, events.map(e => [BigInt(e.experiment_seq), BigInt(e.status)]), 'missing, duplicate, or changed events');
 }
 
 export function percentile(values, fraction) {

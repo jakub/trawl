@@ -1,0 +1,40 @@
+{
+  "execution": {
+    "started_at": "2026-09-15T12:34:56Z",
+    "duration_ms": 125
+  },
+  "columns": [
+    {
+      "name": "host",
+      "type": "string"
+    },
+    {
+      "name": "count",
+      "type": "integer"
+    }
+  ],
+  "rows": [
+    [
+      "web-01",
+      "18446744073709551615"
+    ],
+    [
+      "web-02",
+      "9007199254740993"
+    ],
+    [
+      "web-03",
+      "9223372036854775808"
+    ],
+    [
+      "web-04",
+      "9223372036854775807"
+    ]
+  ],
+  "pagination": {
+    "limit": 50,
+    "offset": 0,
+    "returned": 4,
+    "total": 4
+  }
+}

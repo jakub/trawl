@@ -1599,7 +1599,7 @@ fn field_presentation_fixture_carries_one_off_times_and_a_sparse_event() {
 }
 
 /// Every query fixture the stub serves, decoded as the wire type.
-const QUERY_FIXTURES: [(&str, &str); 7] = [
+const QUERY_FIXTURES: [(&str, &str); 10] = [
     ("query-rows", QUERY_ROWS),
     ("query-cardinality", QUERY_CARDINALITY),
     ("query-top-values", QUERY_TOP_VALUES),
@@ -1613,6 +1613,18 @@ const QUERY_FIXTURES: [(&str, &str); 7] = [
         include_str!("../e2e/harness/wire/result-actions.json"),
     ),
     ("query-field-presentation", QUERY_FIELD_PRESENTATION),
+    (
+        "query-big-integers",
+        include_str!("../e2e/harness/wire/query-big-integers.json"),
+    ),
+    (
+        "query-big-integers-stats-by",
+        include_str!("../e2e/harness/wire/query-big-integers-stats-by.json"),
+    ),
+    (
+        "query-big-integers-timechart",
+        include_str!("../e2e/harness/wire/query-big-integers-timechart.json"),
+    ),
 ];
 
 /// Each fixture is a whole result: its `total` is the count the
@@ -1866,16 +1878,6 @@ fn the_query_resource_exhausted_fixture_is_the_budget_refusal() {
 
 const LIVE_SNAPSHOT_CAPPED: &str = include_str!("../e2e/harness/wire/live-snapshot-capped.json");
 
-/// The snapshot frame `live-aggregate-capped.spec.ts` broadcasts: the
-/// shape the SPA's snapshot listener reads, with nothing it does not.
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LiveSnapshotFrame {
-    columns: Vec<String>,
-    rows: Vec<serde_json::Map<String, serde_json::Value>>,
-    capped: Vec<trawl_api::stream::SnapshotCap>,
-}
-
 /// The frame reports the group cap with the limit trawl-core enforces,
 /// and trawl-core does report that cap once a new group arrives past it.
 /// The second half ties the fixture to its producer: a server that
@@ -1883,10 +1885,19 @@ struct LiveSnapshotFrame {
 /// can no longer send.
 #[test]
 fn the_live_snapshot_capped_fixture_is_what_an_overflowing_stats_reports() {
-    use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+    use trawl_api::stream::{SnapshotCap, SnapshotCapKind, SnapshotFrame};
+    use trawl_api::value::{Column, ColumnType};
     use trawl_core::stream::{AggregationCap, StreamPlan, compile_stream_plan};
 
-    let frame: LiveSnapshotFrame = decode("live-snapshot-capped.json", LIVE_SNAPSHOT_CAPPED);
+    // The frame `live-aggregate-capped.spec.ts` broadcasts, decoded by
+    // the type the SPA's snapshot listener decodes it with. Re-encoding
+    // gives back the fixture byte for byte as JSON, so it carries nothing
+    // the frame does not.
+    let frame: SnapshotFrame = decode("live-snapshot-capped.json", LIVE_SNAPSHOT_CAPPED);
+    assert_eq!(
+        serde_json::to_value(&frame).unwrap(),
+        serde_json::from_str::<serde_json::Value>(LIVE_SNAPSHOT_CAPPED).unwrap(),
+    );
     let limit = AggregationCap::Groups.limit();
     assert_eq!(
         frame.capped,
@@ -1895,13 +1906,12 @@ fn the_live_snapshot_capped_fixture_is_what_an_overflowing_stats_reports() {
             limit: u64::try_from(limit).unwrap(),
         }]
     );
-    assert_eq!(frame.columns, ["service", "count"]);
-    assert!(
-        frame
-            .rows
-            .iter()
-            .all(|row| row.keys().all(|key| frame.columns.contains(key))),
-        "every row key is a declared column"
+    assert_eq!(
+        frame.result.columns,
+        [
+            Column::new("service", ColumnType::String),
+            Column::new("count", ColumnType::Integer),
+        ]
     );
 
     let pipeline = trawl_core::parser::parse("* | stats count() by service")
@@ -1927,4 +1937,115 @@ fn the_live_snapshot_capped_fixture_is_what_an_overflowing_stats_reports() {
         );
     }
     assert_eq!(aggregation.capped(), vec![AggregationCap::Groups]);
+}
+
+// ---- the typed result wire (ADR-0035, amended 2026-10-22) -----------------
+
+/// Which result type a wire file holds, by its name: a query answer, a
+/// stored run, a live aggregate snapshot, or one raw live event.
+enum ResultBody {
+    Query,
+    Run,
+    Snapshot,
+    DataFrame,
+}
+
+fn result_body(name: &str) -> Option<ResultBody> {
+    if name.starts_with("query-") || name == "result-actions" {
+        Some(ResultBody::Query)
+    } else if name.starts_with("run-result") {
+        Some(ResultBody::Run)
+    } else if name.starts_with("live-snapshot") {
+        Some(ResultBody::Snapshot)
+    } else if name.starts_with("live-data") {
+        Some(ResultBody::DataFrame)
+    } else {
+        None
+    }
+}
+
+/// The `columns` and `rows` a body carries, at the top level or under a
+/// run's `result`.
+fn result_part(body: &serde_json::Value) -> Option<&serde_json::Value> {
+    if body.get("columns").is_some() {
+        Some(body)
+    } else {
+        body.get("result").filter(|r| r.get("columns").is_some())
+    }
+}
+
+/// Every `harness/wire/` body that carries a result decodes through the
+/// typed result codec the SPA decodes it with (ADR-0035, amended
+/// 2026-10-22): each column has a type, integers are canonical decimal
+/// strings, timestamps are RFC 3339. A partly converted body is refused
+/// whole by the SPA, far from the cause, so this reads the directory
+/// rather than a list: a new fixture with columns is held to the wire
+/// the day it lands, and one this test cannot classify fails by name.
+///
+/// Re-encoding the decoded cells gives back the fixture's own `columns`
+/// and `rows`, so every cell is already in the encoder's canonical
+/// spelling, not just one the decoder tolerates.
+#[test]
+fn every_result_fixture_decodes_through_the_typed_result_codec() {
+    use trawl_api::stream::SnapshotFrame;
+    use trawl_api::value::QueryResult;
+
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("e2e/harness/wire");
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the wire directory")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter_map(|file| file.strip_suffix(".json").map(str::to_owned))
+        .collect();
+    names.sort();
+
+    let mut checked = Vec::new();
+    for name in &names {
+        let text = std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}.json is not JSON: {e}"));
+        let Some(part) = result_part(&body) else {
+            continue;
+        };
+        let kind = result_body(name).unwrap_or_else(|| {
+            panic!("{name}.json carries result columns but names no result type this test knows")
+        });
+        let result: QueryResult = match kind {
+            ResultBody::Query => decode::<QueryResponse>(&format!("{name}.json"), &text).result,
+            ResultBody::Run => decode::<ReportRunResponse>(&format!("{name}.json"), &text)
+                .result
+                .unwrap_or_else(|| panic!("{name}.json carries columns but no result")),
+            ResultBody::Snapshot => decode::<SnapshotFrame>(&format!("{name}.json"), &text).result,
+            ResultBody::DataFrame => {
+                let frame: QueryResult = decode(&format!("{name}.json"), &text);
+                assert_eq!(
+                    frame.rows.len(),
+                    1,
+                    "{name}.json: a data frame is one event"
+                );
+                frame
+            }
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            (&encoded["columns"], &encoded["rows"]),
+            (&part["columns"], &part["rows"]),
+            "{name}.json is not in the encoder's canonical spelling"
+        );
+        checked.push(name.as_str());
+    }
+    // The sweep reached the bodies the specs are written against.
+    for expected in [
+        "live-data-tick",
+        "live-snapshot-capped",
+        "query-big-integers",
+        "query-rows",
+        "result-actions",
+        "run-result",
+        "run-result-wide",
+    ] {
+        assert!(
+            checked.contains(&expected),
+            "{expected}.json was not checked"
+        );
+    }
 }
