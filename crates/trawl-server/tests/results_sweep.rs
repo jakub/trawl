@@ -12,6 +12,7 @@ mod common;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use trawl_api::results::{ColumnFacts, ResultColumn, ResultShape, ResultSource, StoredAs};
@@ -19,7 +20,7 @@ use trawl_api::value::ColumnType;
 use trawl_server::config::CaptureConfig;
 use trawl_server::results::ResultsState;
 use trawl_server::results::root::{Published, ResultsRoot};
-use trawl_server::results::sweep::{Reconciled, Sweep, reconcile_at_boot, sweep};
+use trawl_server::results::sweep::{Reconciled, Sweep, reconcile_at_boot, spawn_sweep, sweep};
 use trawl_server::store::{CaptureInsert, NewCapture};
 
 const KEY: i64 = 7;
@@ -224,6 +225,36 @@ async fn boot_marks_live_rows_whose_files_are_gone() {
         reconcile_at_boot(results).await.unwrap(),
         Reconciled::default()
     );
+}
+
+/// A temporary row already past its deadline when the server boots (it was
+/// down when the row came due) expires at once, with `gone_at` at its
+/// deadline and its file unlinked; a row still inside its lifetime is left.
+#[tokio::test]
+async fn boot_expires_rows_already_past_their_deadline() {
+    let server = common::setup().await;
+    let results = &server.state.results;
+    let now = server.results_clock.now();
+    let ttl = results.capture.ttl_secs;
+    let created = now - seconds(ttl) - TimeDelta::minutes(5);
+    stored(results, &id(15), KEY, created).await;
+    stored(results, &id(16), KEY, now).await;
+
+    let reconciled = reconcile_at_boot(results).await.unwrap();
+    assert_eq!(
+        reconciled,
+        Reconciled {
+            expired: 1,
+            ..Reconciled::default()
+        }
+    );
+    assert_eq!(
+        state_of(&server, &id(15)).await,
+        Some(("expired".to_owned(), Some(created + seconds(ttl))))
+    );
+    assert!(!exists(&results.root, &id(15)));
+    assert_eq!(state_of(&server, &id(16)).await.unwrap().0, "temporary");
+    assert!(exists(&results.root, &id(16)));
 }
 
 /// A key over a lowered `per_key_results` loses its oldest temporary
@@ -493,4 +524,44 @@ async fn the_scheduler_s_retention_tick_sweeps_captured_results() {
     assert!(!exists(&results.root, &id(90)));
     stop.send(true).unwrap();
     scheduler.await.unwrap();
+}
+
+/// With no scheduler to carry the retention tick, the standalone sweep task
+/// expires a capture past its deadline within its own interval, and stops
+/// when told to.
+#[tokio::test]
+async fn the_standalone_sweep_tick_expires_captures_without_the_scheduler() {
+    let server = common::setup().await;
+    let results = &server.state.results;
+    let clock = &server.results_clock;
+    let created = clock.now();
+    stored(results, &id(60), KEY, created).await;
+    let expiry = created + seconds(results.capture.ttl_secs);
+    clock.set(expiry + TimeDelta::seconds(1));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let task = spawn_sweep(Arc::clone(results), Duration::from_secs(1), shutdown_rx);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if state_of(&server, &id(60)).await.map(|(state, _)| state) == Some("expired".to_owned()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sweep task never expired the capture"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        state_of(&server, &id(60)).await,
+        Some(("expired".to_owned(), Some(expiry)))
+    );
+    assert!(!exists(&results.root, &id(60)));
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("the sweep task did not stop on shutdown")
+        .unwrap();
 }

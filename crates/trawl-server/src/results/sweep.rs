@@ -7,7 +7,8 @@
 //! [`reconcile_at_boot`] runs once, before the server answers anything,
 //! while this process holds the root's lock and so no capture is in flight.
 //! It removes what a killed process left in the root, marks rows whose
-//! files are gone, and prunes the oldest temporary captures of anyone over
+//! files are gone, expires the temporary captures that came due while the
+//! server was down, and prunes the oldest temporary captures of anyone over
 //! a quota an operator lowered. A failure stops the boot.
 //!
 //! [`sweep`] runs on the scheduler's hourly retention tick, the one that
@@ -17,17 +18,25 @@
 //! capture deadline has passed. A failure is logged and counted, never
 //! fatal: the next tick tries again.
 //!
+//! An installation with `[scheduler] enabled = false` has no retention
+//! tick, so [`spawn_sweep`] runs the same sweep on its own cadence
+//! ([`sweep_interval`]); `trawld` spawns it only in that case.
+//!
 //! Neither logs a capture's id: the counts say what happened, and an id is
 //! a key's private handle.
 
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use super::ResultsState;
 use super::root::ResultsRoot;
+use crate::config::CaptureConfig;
 use crate::error::join_failure_text;
 use crate::store::ExpiredFile;
 
@@ -43,6 +52,9 @@ pub struct Reconciled {
     /// Live rows newly marked `file_missing`: they name a file and none is
     /// there.
     pub missing: usize,
+    /// Temporary rows already past their deadline, marked `expired`: the
+    /// server was down when they came due.
+    pub expired: usize,
     /// Temporary rows pruned to bring a key, then the installation, within
     /// the `[capture]` quotas.
     pub pruned: usize,
@@ -69,7 +81,8 @@ pub struct Sweep {
 ///
 /// In order: every staged file goes; every published file no `temporary`
 /// or `kept` row names goes; every such row that names a file
-/// (`file_bytes > 0`) and has none is marked `file_missing`; then each key
+/// (`file_bytes > 0`) and has none is marked `file_missing`; every
+/// temporary row past its deadline expires and its file goes; then each key
 /// over `per_key_results` or `per_key_bytes`, and after that the
 /// installation over `installation_results` or `installation_bytes`, loses
 /// its oldest temporary captures ([`crate::store::ResultsStore::prune_oldest`],
@@ -128,6 +141,18 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         }
     }
 
+    // After downtime a due row would otherwise wait for the first sweep or
+    // a read; expiring before the prunes also keeps a dead capture from
+    // counting against a quota.
+    let expired = store
+        .expire_due(now)
+        .await
+        .map_err(|e| fail("expiring due captures", &e))?;
+    let expired_rows = expired.len();
+    unlink_all(&results.root, with_files(expired))
+        .await
+        .map_err(|e| fail("removing expired captures' files", &e))?;
+
     let capture = &results.capture;
     let mut pruned = Vec::new();
     for key in store
@@ -161,6 +186,7 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         stages,
         orphans,
         missing,
+        expired: expired_rows,
         pruned: pruned_rows,
     };
     tracing::info!(
@@ -168,6 +194,7 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         stages = reconciled.stages,
         orphans = reconciled.orphans,
         missing = reconciled.missing,
+        expired = reconciled.expired,
         pruned = reconciled.pruned,
         "results root reconciled with the captured-result rows"
     );
@@ -239,6 +266,52 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
         "captured results swept"
     );
     outcome
+}
+
+/// How often [`spawn_sweep`] should sweep under `capture`: every
+/// `ttl_secs`, at most hourly (the cadence of the scheduler's retention
+/// tick it stands in for), and at least every second. A short TTL sweeps
+/// sooner, so a capture's file does not outlive its deadline by much more
+/// than the TTL itself.
+pub fn sweep_interval(capture: &CaptureConfig) -> Duration {
+    Duration::from_secs(capture.ttl_secs.clamp(1, 3600))
+}
+
+/// Sweep on a task of its own: [`sweep`] at the results clock's now, every
+/// `interval`, the first one `interval` after the call (boot has just
+/// reconciled). Stops when `shutdown_rx` changes or its sender drops.
+///
+/// This is the sweep for an installation whose scheduler is disabled; with
+/// the scheduler on, its retention tick (ADR-0018 as amended by ADR-0057)
+/// already sweeps and a second task would only repeat the work. A sweep in
+/// progress finishes before the task stops.
+pub fn spawn_sweep(
+    results: Arc<ResultsState>,
+    interval: Duration,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        tracing::info!(
+            event_type = "lifecycle",
+            action = "results_sweep_start",
+            interval_secs = interval.as_secs(),
+            "captured-results sweep task started"
+        );
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                _ = shutdown_rx.changed() => {
+                    tracing::info!(
+                        event_type = "lifecycle",
+                        action = "results_sweep_stop",
+                        "captured-results sweep task shutting down"
+                    );
+                    return;
+                }
+            }
+            sweep(&results, results.clock.now()).await;
+        }
+    })
 }
 
 /// `now` less `secs` seconds, or the earliest instant when that is out of
@@ -367,6 +440,20 @@ mod tests {
             before(now, u64::try_from(i64::MAX).unwrap()),
             DateTime::<Utc>::MIN_UTC
         );
+    }
+
+    #[test]
+    fn the_sweep_interval_is_the_ttl_between_one_second_and_one_hour() {
+        let interval = |ttl_secs| {
+            sweep_interval(&CaptureConfig {
+                ttl_secs,
+                ..CaptureConfig::default()
+            })
+        };
+        assert_eq!(interval(0), Duration::from_secs(1));
+        assert_eq!(interval(90), Duration::from_secs(90));
+        assert_eq!(interval(3600), Duration::from_secs(3600));
+        assert_eq!(interval(86_400), Duration::from_secs(3600));
     }
 
     #[test]

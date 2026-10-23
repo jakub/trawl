@@ -587,6 +587,22 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
         None
     };
 
+    // Captured results expire on the scheduler's retention tick (ADR-0018 as
+    // amended by ADR-0057). Without the scheduler there is no tick, so a
+    // sweep task of its own stands in; with it, a second task would only
+    // repeat the same sweep.
+    let results_sweep_handle = if config.scheduler.enabled {
+        None
+    } else {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = trawl_server::results::sweep::spawn_sweep(
+            Arc::clone(&state.results),
+            trawl_server::results::sweep::sweep_interval(&state.results.capture),
+            shutdown_rx,
+        );
+        Some((handle, shutdown_tx))
+    };
+
     let state_dir = config.state_dir();
 
     // Pre-compute per-service schema metadata in the background.
@@ -636,7 +652,8 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     }
 
     // Shutdown ordering: flush telemetry first so final events reach WAL,
-    // then stats emitter, then scheduler (stop issuing new queries),
+    // then stats emitter, then scheduler (stop issuing new queries) and
+    // the results sweep that stands in for its retention tick,
     // then syslog (flush final events to WAL before compaction),
     // then compaction, then retention, then audit. Compaction stops
     // without a final pass: WAL it has not merged stays for the next run,
@@ -645,6 +662,7 @@ async fn async_main(crash_dump: trawl_crashdump::Status) -> Result<(), Box<dyn s
     shutdown_task(telemetry_handle, "telemetry").await;
     shutdown_task(Some(stats_handle), "stats_emitter").await;
     shutdown_task(scheduler_handle, "scheduler").await;
+    shutdown_task(results_sweep_handle, "results_sweep").await;
     if let Some((handles, shutdown_tx)) = syslog_handle {
         let _ = shutdown_tx.send(true);
         for handle in handles {
