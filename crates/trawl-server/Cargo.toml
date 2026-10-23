@@ -102,6 +102,10 @@ trawl-server = { path = ".", default-features = false, features = ["test-support
 tokio = { workspace = true, features = ["test-util"] }
 fleet-auth = { workspace = true, features = ["axum", "fast-hash"] }
 trawl-client = { workspace = true }
+# `tests/results_abort.rs` asserts its test-only listener negotiates HTTP/2.
+# A dev-dependency feature reaches only this crate's test builds (resolver
+# 3), never the `trawld` binary, which stays HTTP/1.1 (ADR-0054).
+reqwest = { workspace = true, features = ["http2"] }
 # The CLI's catalog read commands are driven against a real booted server in
 # `tests/catalog_surface.rs`. The workspace dependency disables optional
 # CLI features, including clipboard support, for this server-side test.

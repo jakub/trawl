@@ -632,6 +632,110 @@ pub async fn serve_with_listener_failing_accepts(
     .await
 }
 
+/// The router [`serve_with_listener`] serves, behind a listener that also
+/// speaks HTTP/2: ALPN offers `h2` then `http/1.1`, and hyper-util's
+/// `auto` builder serves whichever protocol the client's first bytes
+/// announce.
+///
+/// This listener exists only in tests. trawld serves HTTP/1.1 only
+/// (ADR-0054); this proves the router and the client under HTTP/2, not
+/// the production edge. It holds none of [`ConnectionTimeouts`]: hyper's
+/// HTTP/2 server has no header deadline, and protocol detection waits
+/// without bound for a preface. It reloads no certificate, and a failed
+/// `accept()` ends it instead of backing off.
+///
+/// Shutdown is the production drain: the signal stops the accept loop,
+/// interrupts the pool's work, asks every connection to finish, and
+/// aborts what is left after `shutdown_drain_secs`. Without
+/// `external_shutdown` it serves until its task is dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn serve_with_listener_h2_for_tests(
+    listener: std::net::TcpListener,
+    state: AppState,
+    http: &HttpConfig,
+    config: &ServerConfig,
+    state_dir: &Path,
+    external_shutdown: Option<ShutdownRx>,
+) -> Result<(), crate::error::ServerError> {
+    let (tls_config, _self_signed) = tls::build_server_config(
+        config.tls_cert_path.as_deref(),
+        config.tls_key_path.as_deref(),
+        state_dir,
+    )
+    .map_err(|e| crate::error::ServerError::Internal(format!("TLS setup failed: {e}")))?;
+    let mut tls_config = Arc::unwrap_or_clone(tls_config);
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let listener = adopt_listener(listener)?;
+
+    let drain_secs = http.shutdown_drain_secs;
+    let pool = state.query.pool.clone();
+    let app = router(state, http);
+
+    // Without the caller's channel nothing signals: the sender lives as
+    // long as this function.
+    let (_never, never) = crate::shutdown::shutdown_channel();
+    let mut accept_rx = external_shutdown.unwrap_or(never);
+    let conn_rx = accept_rx.clone();
+    let mut connections = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (tcp_stream, peer_addr) = accepted.map_err(|e| {
+                    crate::error::ServerError::Internal(format!("accept failed: {e}"))
+                })?;
+                let tls_acceptor = tls_acceptor.clone();
+                let tower_service = app.clone();
+                let mut conn_shutdown = conn_rx.clone();
+                connections.spawn(async move {
+                    let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                        Ok(stream) => stream,
+                        Err(e) => {
+                            tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "tls_handshake_failed", peer = %peer_addr, error = %e, "TLS handshake failed");
+                            return;
+                        }
+                    };
+                    let hyper_service =
+                        hyper::service::service_fn(move |mut req: Request<hyper::body::Incoming>| {
+                            req.extensions_mut().insert(peer_addr);
+                            let mut svc = tower_service.clone();
+                            async move { svc.call(req).await }
+                        });
+                    let builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    let mut conn = std::pin::pin!(
+                        builder.serve_connection(TokioIo::new(tls_stream), hyper_service)
+                    );
+                    let served = tokio::select! {
+                        result = conn.as_mut() => result,
+                        () = shutdown_observed(&mut conn_shutdown) => {
+                            conn.as_mut().graceful_shutdown();
+                            conn.await
+                        }
+                    };
+                    if let Err(e) = served {
+                        tracing::debug!(target: crate::telemetry::PREAUTH_TRANSPORT_TARGET, event_type = "connection_error", peer = %peer_addr, error = %e, "connection error");
+                    }
+                });
+            }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            () = shutdown_observed(&mut accept_rx) => break,
+        }
+    }
+
+    pool.cancel_all();
+    let drain = async { while connections.join_next().await.is_some() {} };
+    if tokio::time::timeout(Duration::from_secs(drain_secs), drain)
+        .await
+        .is_err()
+    {
+        connections.abort_all();
+    }
+    Ok(())
+}
+
 /// [`serve_with_listener`], holding connections to `timeouts` instead of
 /// [`ConnectionTimeouts::DEFAULT`], and reporting what the accept loop
 /// does with them through `probe`.
