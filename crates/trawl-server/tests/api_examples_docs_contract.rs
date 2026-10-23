@@ -17,13 +17,23 @@
 //! run" and "Stream live events" decode through the typed result codec
 //! (ADR-0035, amended 2026-10-22), so an untyped column, a JSON-number
 //! integer or a cell that disagrees with its column's type fails here.
+//!
+//! Captured results: the request and response examples under "Capture a
+//! result", "List captured results", "Read a page of a captured result"
+//! and "Read one cell of a captured result" decode as the `trawl_api::results`
+//! types the routes answer with (ADR-0057), and agree with themselves: a
+//! page's positions name its columns, and a cell's ranges join into a cell
+//! that lands under its type.
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use trawl_api::ingest_preview::{PreviewEvent, PreviewResponse};
+use trawl_api::results::{
+    CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage, ResultShape, ResultSource,
+};
 use trawl_api::stream::SnapshotFrame;
-use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell};
+use trawl_api::value::{Column, ColumnType, QueryResult, Value as Cell, land_cell};
 use trawl_api::{IngestResponse, QueryResponse, ReportRunResponse};
 use trawl_server::ingest::envelope::{RejectReason, RepairCode};
 
@@ -259,4 +269,93 @@ fn the_stream_examples_are_typed_result_frames() {
         }
     }
     assert_eq!(frames, 2, "the transcript shows a data and a lagged frame");
+}
+
+#[test]
+fn the_capture_examples_are_a_request_and_a_cut_event_capture() {
+    let heading = "Capture a result";
+    let examples = json_blocks(section(heading));
+    assert_eq!(
+        examples.len(),
+        2,
+        "a request and a response under {heading:?}"
+    );
+    let request: CaptureRequest = decode_exactly(heading, examples[0]);
+    let window = request.window.expect("the request example shows a window");
+    assert!(window.last.is_some(), "{heading:?} request uses last");
+
+    let response: CaptureResponse = decode_exactly(heading, examples[1]);
+    let result = &response.result;
+    assert_eq!(result.query, request.query, "the response echoes the query");
+    assert_eq!(result.source, ResultSource::Live);
+    assert_eq!(result.shape, ResultShape::Events);
+    assert!(
+        result.executed_query.ends_with("| sort -_time, -_ingested"),
+        "an events capture records the imposed order"
+    );
+    assert!(result.truncated && result.captured_rows < result.total_rows);
+    assert_eq!(result.column_facts.len(), result.columns.len());
+    assert!(response.execution.is_some());
+}
+
+#[test]
+fn the_capture_list_example_is_a_result_list() {
+    let heading = "List captured results";
+    let examples = json_blocks(section(heading));
+    assert_eq!(examples.len(), 1, "one response example under {heading:?}");
+    let list: ResultList = decode_exactly(heading, examples[0]);
+    assert!(!list.results.is_empty());
+    for result in &list.results {
+        assert_eq!(result.truncated, result.captured_rows < result.total_rows);
+        assert_eq!(result.column_facts.len(), result.columns.len());
+    }
+}
+
+#[test]
+fn the_result_page_example_projects_by_position() {
+    let heading = "Read a page of a captured result";
+    let examples = json_blocks(section(heading));
+    assert_eq!(examples.len(), 1, "one response example under {heading:?}");
+    let page: ResultPage = decode_exactly(heading, examples[0]);
+    assert_eq!(page.positions.len(), page.page.columns.len());
+    for (position, column) in page.positions.iter().zip(&page.page.columns) {
+        let stored = &page.result.columns[*position];
+        assert_eq!(
+            (&stored.name, &stored.ty),
+            (&column.name, &column.ty),
+            "{heading:?} position {position} names its column"
+        );
+    }
+    assert_eq!(page.pagination.returned, page.page.rows.len());
+    assert_eq!(
+        page.pagination.total as u64, page.result.captured_rows,
+        "a page's total is the captured rows"
+    );
+}
+
+#[test]
+fn the_cell_examples_join_into_one_cell() {
+    let heading = "Read one cell of a captured result";
+    let examples = json_blocks(section(heading));
+    assert_eq!(
+        examples.len(),
+        2,
+        "two ranges of one cell under {heading:?}"
+    );
+    let first: ResultCell = decode_exactly(heading, examples[0]);
+    let last: ResultCell = decode_exactly(heading, examples[1]);
+    assert_eq!(first.offset, 0);
+    assert_eq!(first.next_offset, Some(last.offset));
+    assert_eq!(last.next_offset, None);
+    for range in [&first, &last] {
+        assert_eq!(range.length, range.text.len() as u64);
+        assert_eq!(range.total_bytes, first.total_bytes);
+    }
+    let whole = format!("{}{}", first.text, last.text);
+    assert_eq!(whole.len() as u64, first.total_bytes);
+    let cell: Value = serde_json::from_str(&whole).expect("the ranges join into JSON");
+    assert!(matches!(
+        land_cell(&first.ty, cell).expect("the joined text lands under its type"),
+        Cell::String(_)
+    ));
 }

@@ -144,7 +144,8 @@ APT repository from [Installation](/getting-started/).
 
    Mount storage at `/var/lib/trawl`, not at `/var/lib/trawl/data`. A repin
    writes a sibling directory next to `data/` on the same filesystem, and so
-   does query scratch, `data.query-scratch`.
+   do query scratch, `data.query-scratch`, and the results root,
+   `data.results`.
 
 4. Decide on TLS. Without `tls_cert_path` and `tls_key_path`, trawld
    generates a self-signed certificate for `localhost` under
@@ -186,7 +187,8 @@ and `tls/cert.pem`. It reaches stored events only through trawld's API.
 | `/etc/default/trawl-web` | root:root 0644 | Environment for `trawl-web.service`: `RUST_LOG`. World-readable, so no secrets. |
 | `/var/lib/trawl` | trawl:trawl 0750 | State directory. The package creates it, and systemd reapplies the mode at every start of `trawld.service`. `trawld` writes only here and to `/var/log/trawl`. The `trawl` group lets `trawl-web` pass through to `web.cookie` and `tls/`. |
 | `/var/lib/trawl/data` | trawl:trawl 0700 | Parquet files, `wal/`, `scheduled/`, and the `EPOCH` and `CATALOG` markers. Everything trawld creates beneath it is 0700 or 0600. trawld creates it at 0700 on first start, and removes any group or other permission from it at every start. |
-| `/var/lib/trawl/data.query-scratch` | trawl:trawl 0700 | Query scratch: query spill, hot-buffer query snapshots, and export staging files. trawld creates it, locks it, and empties what a killed process left. It holds nothing that must survive a restart. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets). |
+| `/var/lib/trawl/data.query-scratch` | trawl:trawl 0700 | Query scratch: query spill, hot-buffer query snapshots, and export and capture staging files. trawld creates it, locks it, and empties what a killed process left. It holds nothing that must survive a restart. See [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets). |
+| `/var/lib/trawl/data.results` | trawl:trawl 0700 | The results root: one 0600 Parquet file per [captured result](/reference/api/#captured-results), and the 0600 `.stage-*.parquet` file of a capture still being written. trawld creates it on first start, locks it, removes any group or other permission at every start, and matches its files against the capture records before it serves. See [the results root](/reference/configuration/#the-results-root). |
 | `/var/lib/trawl/tls` | trawl:trawl 0755 | `cert.pem`, mode 0644, generated when `[server]` names no certificate. trawld creates both on first start. The packaged `[web] upstream_ca_path` pins the certificate. |
 | `/var/lib/trawl/tls-key` | trawl:trawl 0700 | `key.pem`, mode 0600, the private key of the generated certificate. trawld creates both on first start. |
 | `/var/lib/trawl/web.cookie` | trawl:trawl 0640 | 32-byte session cookie key, generated once on first install. The `trawl` group lets `trawl-web` read it. |
@@ -427,7 +429,10 @@ to 512Mi. See [the memory arithmetic](/reference/configuration/#the-memory-arith
 before you raise `config.server.maxConcurrentRequests`,
 `config.server.queryMemoryLimit` or `config.ingest.compactionMemoryLimit`.
 The chart refuses to render a `config.server.queryScratchDir` that sits off
-the data volume.
+the data volume. The results root, `/var/lib/trawl/data.results` by
+default, sits on the same PVC, and the chart refuses a
+`config.server.resultsDir` off the data volume or overlapping scratch. Its
+files take at most `[capture] installation_bytes` (512 MiB) of the PVC.
 
 The pod's `terminationGracePeriodSeconds` is `config.server.shutdownDrainSecs`
 plus 30 seconds: the drain, then the runtime's 10-second shutdown and the
@@ -436,15 +441,15 @@ how long trawld takes to exit. The startup probe allows five minutes
 (`failureThreshold: 60` at `periodSeconds: 5`) for boot recovery, hydration
 and the boot conformance pass.
 
-On Debian, the same directory sits in `/var/lib/trawl`, inside the unit's
-writable paths. A `query_scratch_dir` outside `/var/lib/trawl` needs the
-unit's `ReadWritePaths=` extended in a drop-in. The units cap memory the same
+On Debian, the same directories sit in `/var/lib/trawl`, inside the unit's
+writable paths. A `query_scratch_dir` or `results_dir` outside
+`/var/lib/trawl` needs the unit's `ReadWritePaths=` extended in a drop-in. The units cap memory the same
 way: `trawld.service` sets `MemoryMax=8G`, and `trawl-web.service` sets
 `MemoryMax=512M`. `MemoryMax` is a ceiling, not a reservation, so a host with
 less RAM runs out before the unit does. `trawld.service` also sets
 `LimitNOFILE=65536`, and trawld raises its soft descriptor limit to the hard
 limit at startup and logs both values as `descriptor limit`. `trawl trial` places scratch
-on its `trawld` volume.
+and the results root on its `trawld` volume.
 
 Stored data is owner-only on Helm too, but the modes differ from the
 [Debian table](#install-the-debian-package). The chart's `fsGroup` makes the
@@ -730,6 +735,10 @@ nothing else. You supply what the package supplies:
   `TMPDIR`, so `TMPDIR` needs no sizing. Set `[server] query_scratch_dir` to a
   writable directory if the data directory is read-only. See
   [query scratch and budgets](/reference/configuration/#query-scratch-and-budgets).
+  Captured results live in the results root, `<data.path>.results` by
+  default, under the same rules, and trawld never empties it. Set
+  `[server] results_dir` to a writable directory if the data directory is
+  read-only. See [the results root](/reference/configuration/#the-results-root).
 
 ## Use a current storage root
 

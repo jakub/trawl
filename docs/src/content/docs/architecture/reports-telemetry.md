@@ -50,7 +50,8 @@ and the decision is
 
 Every DSL query that reaches its DSL check gets one account, refusals at that
 check and capacity refusals included. `kind` is `query`, `from_saved`,
-`export`, or `scheduled`, which covers manual runs too. Live tail and field
+`export`, `scheduled`, which covers manual runs too, or `capture`, a
+[captured result](/reference/api/#captured-results). Live tail and field
 sampling get none. Live tail never reaches DuckDB, and field sampling does not
 run user DSL.
 
@@ -58,7 +59,7 @@ Each phase is an integer number of microseconds in a field named
 `query_<phase>_us`. Milliseconds would floor the short phases of a typical
 query to zero. A phase the query never entered is absent, and a present zero is
 a measured value. A phase entered more than once adds to one field. There are
-14 phases:
+15 phases:
 
 | Phase | Covers |
 | --- | --- |
@@ -74,7 +75,8 @@ a measured value. A phase entered more than once adds to one field. There are
 | `bind` | The DuckDB bind of the main statement. It ends when `prepare` returns. |
 | `execute` | Statement execution up to the last row materialized, including parquet staging. |
 | `copy` | The parquet `COPY` and its cleanup. |
-| `post` | Rust tail stages, the cap trim, reorder, the severity walk, and the vanished-result guard. |
+| `post` | Rust tail stages, the cap trim, reorder, the severity walk, and the vanished-result guard. For a capture, also the capture cut and its column facts. |
+| `write` | A capture's file write: its rows staged, copied to Parquet, synced, and published in the results root. |
 | `render` | Export body rendering, or the parquet readback. |
 
 Each span of work counts in one phase only. A timechart probe's bind counts in
@@ -115,10 +117,10 @@ account, so each query gets exactly one. If the worker had already finished
 and released its permit when the deadline fired, no reclaim is coming. The
 request then writes a complete event with `outcome=timeout`.
 
-A tracing event holds at most 32 fields. `query_timing` declares 31:
-`event_type`, the 15 fields in the table above, 14 phases, and the message. A test
+A tracing event holds at most 32 fields. `query_timing` declares 32:
+`event_type`, the 15 fields in the table above, 15 phases, and the message. A test
 holds that count and requires one field per phase on both events, so a new
-field on `query_timing` is a design decision, with one slot left.
+field on `query_timing` is a design decision, with no slot left.
 
 Two older events changed with this one. trawld no longer writes
 `pool_acquired`. Its one value, the permit wait, is now `query_pool_wait_us`,

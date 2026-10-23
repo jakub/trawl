@@ -1,6 +1,6 @@
 # A query reports its phases in one timing event
 
-status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds
+status: accepted (2026-09-27), prep record for slice A of query-path observability; amended (2026-10-22) by ADR-0057 and ADR-0058: four new kinds; amended (2026-10-23): the capture kind and the write phase
 
 `/metrics` shows that queries got slow, but nothing shows where a single query spent its time. The only split today is the permit wait in the opt-in query debug log. This record adds a `query_timing` event to trawld's own telemetry. The event splits each executed query into named **query phases**, so an operator finds the slow phase with the DSL. Per-operator DuckDB profiles are slice B and are out of scope here.
 
@@ -80,3 +80,7 @@ Building slice A settled six points that the decision above left loose or stated
 ## Amendment: four new kinds, 2026-10-22
 
 The kind enum gains `capture` ([ADR-0057](0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md)) and `context`, `sightings` and `compare` ([ADR-0058](0058-the-mcp-server-is-a-thin-client-that-answers-in-text-first.md)). Each runs through the executor pool like a query and emits one timing event with the same phases; the file write of a capture is its own phase. The durable keys stay `request_id` and, for a capture, the result id; pool query ids still restart at zero.
+
+## Amendment: the capture kind and the write phase, 2026-10-23
+
+#307 added `capture` to the kinds. A capture's event carries `request_id`, like a query's; the event has no room for the result id. The phase list gains `write`, field `query_write_us`: the capture's file write, from staging its rows through the Parquet copy, the sync and the rename into the results root. It sits between `post` and `render`, and only a capture enters it. A capture books its cut and its column facts in `post`. With 15 phases, `query_timing` declares 32 fields, tracing's limit, so the next field needs a decision about which one to drop or merge.

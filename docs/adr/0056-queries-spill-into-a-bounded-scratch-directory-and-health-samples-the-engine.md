@@ -1,6 +1,6 @@
 # Queries spill into a bounded scratch directory, and health samples the engine
 
-status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-17; amended (2026-10-17): sizing for an 8 GiB process ceiling, and the binder-column fallback reads the error subtype, see the Amendments; amended (2026-10-22) by ADR-0057: captures do not use query scratch
+status: accepted (2026-10-17), prep record for the homelab eviction of 2026-10-17; amended (2026-10-17): sizing for an 8 GiB process ceiling, and the binder-column fallback reads the error subtype, see the Amendments; amended (2026-10-22) by ADR-0057: captures do not use query scratch; amended (2026-10-23): capture staging is a fourth scratch entry
 
 On 2026-10-17 one search from the web UI took the homelab's only trawld pod out of service twice in one minute. The chart gave trawld a 512Mi `/tmp` emptyDir, and the query engine spilled into it. DuckDB sizes its spill cap from `statvfs` on the temp directory, and inside a disk-backed emptyDir `statvfs` reports the node's disk, not the `sizeLimit`. Nothing in trawld set `max_temp_directory_size`, `memory_limit` or `threads` on the query database. The kubelet evicted the pod for exceeding the emptyDir limit 30 seconds after the query timed out.
 
@@ -117,3 +117,7 @@ Considered and rejected:
 ## Amendment: captures do not use query scratch, 2026-10-22
 
 A captured result ([ADR-0057](0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md)) must survive a restart until its deadline and may be promoted to kept evidence without a copy, so it is not written into query scratch, which boot empties. Captures live in the results root of ADR-0052's amendment of the same date. The spill a capture's execution produces still lands in query scratch under the shared budgets, and the hot snapshot it reads is still a scratch file.
+
+## Amendment: capture staging is a fourth scratch entry, 2026-10-23
+
+The directory now holds four kinds of entry, not three. The fourth is the file in which a capture stages its rows before DuckDB copies them to Parquet, named `trawl-stage-<6 letters or digits>.ndjson` and made 0600, like a snapshot. It lives for the write of one capture. Boot removes one that an earlier trawld left behind, under the same rules as the other three. The capture's Parquet file is still written in the results root, never here, as the amendment of 2026-10-22 rules. A capture's spill and its hot snapshot stay in scratch under the shared budgets.

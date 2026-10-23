@@ -30,7 +30,7 @@ A role is a named bundle of permission strings in the Fleet keystore. A key can 
 
 | Permission | Allows |
 |------------|--------|
-| `query` | Run queries, list running queries, and read or clear the key's query history |
+| `query` | Run queries, capture results and read the key's own [captured results](#captured-results), list running queries, and read or clear the key's query history |
 | `schema_read` | Read the schema, the field catalog, conflict samples, and repin status |
 | `validate` | Validate DSL without running it |
 | `saved_query` | Create, read, update, and delete saved queries, schedules, and report runs |
@@ -71,8 +71,9 @@ Every error that trawld itself produces has this body:
 |------|--------|---------|
 | `parse_error` | 400 | The DSL does not parse |
 | `validation_error` | 400 | The DSL parses but fails semantic checks: unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
-| `result_too_large` | 400 | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at a cap. The message names the cap and its limit. See [stream live events](#stream-live-events) for the caps |
-| `bad_request` | 400 | Malformed input. Also the code on every 409, which has no code of its own. |
+| `result_too_large` | 400 | The result exceeded `max_result_rows`, or an aggregation after a Rust stage such as `extract kv` would drop input at a cap. The message names the cap and its limit. See [stream live events](#stream-live-events) for the caps. A capture also answers it when a whole result does not fit the capture's caps. See [shapes and caps](#shapes-and-caps) |
+| `bad_request` | 400 | Malformed input. Also the code on a 409 that has no code of its own. |
+| `capture_source_too_large` | 400 | A capture's window selects more stored data than `[capture] source_max_bytes`. Nothing was scanned. Narrow the window. See [admission](#admission-and-quotas) |
 | `ingest_error` | 400, 413 | An ingest body that cannot be read. 413 when a gzip body decodes past `[ingest] max_body_bytes` |
 | `ingest_batch_too_large` | 413 | An ingest request holds more events or bytes than external producers may place in the hot buffer, so it can never be admitted |
 | `request_too_large` | 413 | A request body exceeds the router's body limit, `[server] max_request_body_bytes` or `[ingest] max_body_bytes`. The message names the setting and its value. See [body size limits](#body-size-limits). Through trawl-web, also the proxy's own refusal of a body over `[server] max_request_body_bytes`, over the proxy body budget of 128 MiB when that setting is above it, or, under `/api/auth/*`, over the login body limit of 16 KiB, before trawld is contacted. The message names the limit in the same words |
@@ -81,10 +82,15 @@ Every error that trawld itself produces has this body:
 | `auth_error` | 401 | Authentication failed |
 | `forbidden` | 403 | The key lacks a permission |
 | `not_found` | 404 | No such resource, or the key does not own it. The response does not say which. |
-| `rate_limited` | 429 | The key's per-minute bucket is empty |
+| `result_unavailable` | 409 | A captured result's record exists, but its file is missing. See [captured result outcomes](#captured-result-outcomes) |
+| `result_gone` | 410 | A captured result expired, or was removed to fit a lowered quota. The message says which. See [captured result outcomes](#captured-result-outcomes) |
+| `rate_limited` | 429 | The key's per-minute bucket is empty. Sent with `Retry-After` |
 | `too_many_streams` | 429 | `max_sse_connections` reached |
+| `capture_busy` | 429 | The key's capture queue is full, the installation runs as many captures as it may, or the capture's deadline passed while it waited. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
+| `capture_quota_exceeded` | 429 | The key's or the installation's capture quota has no room for one more result. Sent with `Retry-After`. See [admission](#admission-and-quotas) |
 | `execution_error` | 500 | DuckDB failed for a reason other than its resource budgets, or the query was cancelled. Details are logged, never returned. |
 | `execution_error` | 400 | A result cell is an integer outside the signed and unsigned 64-bit range. The message names the column. See [Result columns](#result-columns). |
+| `result_corrupt` | 500 | A captured result's file does not match its recorded digest. See [captured result outcomes](#captured-result-outcomes) |
 | `internal_error` | 500 | Anything else |
 | `timeout` | 504 | The query started but did not finish within `timeout_secs`. Through trawl-web, also the proxy's own 504 when trawld's response head did not arrive within `timeout_secs` plus 10 s; the message says trawld may still be running the work. Open streams and bodies in flight are never cut |
 | `timeout` | 408 | trawl-web only: the request body did not arrive whole within 30 s. The request was not sent to trawld |
@@ -96,7 +102,7 @@ Every error that trawld itself produces has this body:
 
 #### Corpus recovering
 
-A read answers 503 `corpus_recovering` while the corpus is unsettled: after a restart, until compaction proves that the WAL from before the restart is covered, or while a daily rollup marker is unfinished. It applies to [queries](#run-a-query), [exports](#export-query-results), uncached [field values](#field-values), [manual runs](#run-a-saved-query-now), and [repins](#repin-a-field). The message is fixed for each reason and names no count, path, or marker:
+A read answers 503 `corpus_recovering` while the corpus is unsettled: after a restart, until compaction proves that the WAL from before the restart is covered, or while a daily rollup marker is unfinished. It applies to [queries](#run-a-query), [captures](#capture-a-result) of the corpus, [exports](#export-query-results), uncached [field values](#field-values), [manual runs](#run-a-saved-query-now), and [repins](#repin-a-field). The message is fixed for each reason and names no count, path, or marker:
 
 | Reason | Message |
 |--------|---------|
@@ -107,7 +113,7 @@ When both reasons hold, the response names `rollup_pending`. The reason is the `
 
 A body over the size limit is refused before a handler runs, with 413 and the envelope, code `request_too_large`. Three other refusals come from the HTTP framework before a handler runs, with an empty or plain-text body instead of the envelope: 415 when a JSON route receives no `Content-Type: application/json`, 400 when the body is not valid JSON, and 422 when the JSON does not match the request shape.
 
-Every response carries an `X-Request-Id` header holding a ULID. Quote it when reporting a problem.
+Every response carries an `X-Request-Id` header holding a ULID. Quote it when reporting a problem. The trawl CLI and trawl-client end the message of every error that got a response with `(request <id>)`.
 
 #### Query resource exhausted
 
@@ -135,7 +141,7 @@ trawld keeps one token bucket per API key and route class. The bucket refills co
 | Interactive | `[server.rate_limit] default_rpm` | `100` | Every authenticated route except `/api/v1/ingest` |
 | Ingest | `[server.rate_limit] ingest_rpm` | `1000` | `/api/v1/ingest`, for a key that holds `ingest` |
 
-A key without `ingest` spends its interactive bucket when it posts to `/api/v1/ingest`. A `0` disables the class. When any of the key's roles sets `rate_rpm`, the largest such value replaces the class default in both classes. The 429 body is the error envelope with code `rate_limited`. A 429 carries no `Retry-After` or `X-RateLimit-*` headers. The only response that carries `Retry-After` is 503 `hot_buffer_full` from [ingest](#ingest-events). `/api/v1/health` and `/metrics` are not rate limited.
+A key without `ingest` spends its interactive bucket when it posts to `/api/v1/ingest`. A `0` disables the class. When any of the key's roles sets `rate_rpm`, the largest such value replaces the class default in both classes. The 429 body is the error envelope with code `rate_limited`. It carries `Retry-After`: the seconds until the bucket holds a token again, rounded up, and never less than 1. No response carries `X-RateLimit-*` headers. Three other responses carry `Retry-After`: 503 `hot_buffer_full` from [ingest](#ingest-events), and 429 `capture_busy` and `capture_quota_exceeded` from [captures](#admission-and-quotas). `/api/v1/health` and `/metrics` are not rate limited.
 
 ### Pagination
 
@@ -184,7 +190,7 @@ The schema routes keep DuckDB type names, such as `BIGINT` and `VARCHAR`. The lo
 
 ### Timestamps
 
-Every instant is RFC 3339 in UTC, except result cells, which [Result columns](#result-columns) describes. Catalog, repin, pin reclamation, and schedule window instants carry microseconds and a `Z` suffix, for example `2026-08-01T10:00:00.000000Z`. History, saved query, schedule `created_at` and `updated_at`, and run `started_at` and `finished_at` carry a `+00:00` offset, for example `2026-03-14T02:00:00+00:00`.
+Every instant is RFC 3339 in UTC, except result cells, which [Result columns](#result-columns) describes. Catalog, repin, pin reclamation, schedule window, and captured result instants carry microseconds and a `Z` suffix, for example `2026-08-01T10:00:00.000000Z`. History, saved query, schedule `created_at` and `updated_at`, and run `started_at` and `finished_at` carry a `+00:00` offset, for example `2026-03-14T02:00:00+00:00`.
 
 ### Body size limits
 
@@ -197,7 +203,7 @@ Both accept sizes such as `"128K"` and `"1M"`. These two keys are the only body 
 
 ### Query timeout
 
-`[server] timeout_secs` (default `30`) is one absolute deadline per request, started after authentication. Queue waits, `from saved` resolution, and execution all spend from it. If the deadline passes before the query starts, the response is 503 `service_unavailable` with the message `server at capacity: the query was not started`. If it passes after the query starts, the response is 504 `timeout`. The deadline applies to `/api/v1/query`, `/api/v1/export`, and `/api/v1/schema/values/{field}`.
+`[server] timeout_secs` (default `30`) is one absolute deadline per request, started after authentication. Queue waits, `from saved` resolution, and execution all spend from it. If the deadline passes before the query starts, the response is 503 `service_unavailable` with the message `server at capacity: the query was not started`. If it passes after the query starts, the response is 504 `timeout`. The deadline applies to `/api/v1/query`, `/api/v1/export`, and `/api/v1/schema/values/{field}`. A capture has a shorter deadline of its own, `[capture] deadline_secs`, which `timeout_secs` caps. See [admission and quotas](#admission-and-quotas).
 
 ### CORS
 
@@ -433,6 +439,400 @@ An export file is not the [result wire](#result-columns). Each format keeps its 
 | 503 | `service_unavailable` | The hot buffer's snapshot could not be built. The message is `recent events could not be read for this query`. |
 | 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering). |
 | 504 | `timeout` | The deadline passed after the export started |
+
+## Captured results
+
+A capture runs one query once and keeps its result as an immutable, typed file that expires. Later reads page the stored rows and never run the query again. So row 7 of a capture is the same row a minute later, while new events keep arriving and compaction moves files. A captured row is the pair of a result `id` and a 0-based row number. It names a row of a frozen copy, not an event. [ADR-0057](https://github.com/jakub/trawl/blob/main/docs/adr/0057-a-capture-is-an-immutable-expiring-result-that-later-reads-page.md) records the decision.
+
+Every route in this section needs the `query` permission. A key reads only the captures it made: another key's capture answers 404 `not_found`, as an unknown id does. The routes use the regular [request count](/reference/configuration/#the-request-limit) and the interactive [rate limit](#rate-limiting). A page or cell read answers 400 `bad_request` to a query parameter it does not take, or to one that does not read as its type.
+
+The numbers in this section are defaults. The [`[capture]`](/reference/configuration/#capture) table sets each of them.
+
+### Capture a result
+
+`POST /api/v1/results`
+
+Permission: `query`
+
+Runs one query under every guard that [run a query](#run-a-query) applies, and keeps its result: the key's permission and rate, the request count, an executor permit, the publication guard, the [query scratch](/reference/configuration/#query-scratch-and-budgets) budgets, history, and the [`query_timing` event](/architecture/reports-telemetry/#query-timing). A capture of the corpus answers 503 `corpus_recovering` while the corpus is unsettled. While it runs, the capture is listed by [`GET /api/v1/queries`](#active-recent-and-retained-work) with the `own` flag, and as `retained` work with the kind `capture` when it outlives its request. Its [history](#query-history) entry holds the executed text. It writes one `query_timing` event with the kind `capture`, which measures the file write in its own phase, `query_write_us`.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `query` | body | string | yes | The DSL query |
+| `window` | body | object | no | The time window, instead of time clauses in `query`. See [bounds](#bounds) |
+| `window.earliest` | body | string | no | The inclusive start, as an RFC 3339 instant such as `2026-10-23T09:00:00Z`. An offset is applied |
+| `window.latest` | body | string | no | The exclusive end, as an RFC 3339 instant |
+| `window.last` | body | string | no | A span that ends now: a number and one of `s`, `m`, `h`, `d`, or `w`, such as `1h` |
+
+The body and `window` refuse a member they do not know, so a misspelled `window` cannot capture the default window by accident.
+
+**Request**
+
+```json
+{
+  "query": "service=nginx status>=500",
+  "window": { "last": "1h" }
+}
+```
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" -H "Content-Type: application/json" \
+  -d '{"query": "service=nginx status>=500", "window": {"last": "1h"}}' \
+  "$TRAWL_URL/api/v1/results"
+```
+
+**Response**
+
+```json
+{
+  "result": {
+    "id": "4f2a9c1e7b3d40e8a6c5f1d2e3b4a597",
+    "query": "service=nginx status>=500",
+    "executed_query": "earliest=\"2026-10-23T09:00:00.000000Z\" latest=\"2026-10-23T10:00:00.000000Z\" service=nginx status>=500\n| sort -_time, -_ingested",
+    "source": "live",
+    "shape": "events",
+    "earliest": "2026-10-23T09:00:00.000000Z",
+    "latest": "2026-10-23T10:00:00.000000Z",
+    "created_at": "2026-10-23T10:00:01.482113Z",
+    "expires_at": "2026-10-23T10:15:01.482113Z",
+    "state": "temporary",
+    "columns": [
+      { "name": "_time", "type": "timestamp", "stored_as": "native" },
+      { "name": "_ingested", "type": "timestamp", "stored_as": "native" },
+      { "name": "service", "type": "string", "stored_as": "native" },
+      { "name": "status", "type": "integer", "stored_as": "native" },
+      { "name": "_raw", "type": "string", "stored_as": "native" }
+    ],
+    "captured_rows": 5000,
+    "total_rows": 18342,
+    "wire_bytes": 1048311,
+    "file_bytes": 212480,
+    "truncated": true,
+    "column_facts": [
+      { "nulls": 0, "distinct": 6, "distinct_capped": true, "min": { "type": "string", "value": "2026-10-23T09:41:12.004518Z" }, "max": { "type": "string", "value": "2026-10-23T09:59:59.873002Z" } },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true },
+      { "nulls": 0, "distinct": 1, "distinct_capped": false, "values": [{ "value": { "type": "string", "value": "nginx" }, "count": 5000 }] },
+      { "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "502" }, "count": 4112 }, { "value": { "type": "integer", "value": "500" }, "count": 851 }, { "value": { "type": "integer", "value": "504" }, "count": 37 }] },
+      { "nulls": 0, "distinct": 6, "distinct_capped": true }
+    ],
+    "format_version": 1
+  },
+  "execution": { "started_at": "2026-10-23T10:00:00.000141Z", "duration_ms": 1482 }
+}
+```
+
+The window matched 18,342 events. The capture kept the 5,000 most recent and says so in `truncated`.
+
+Every capture, list, and page answer carries the result's metadata in this shape:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | The result id: 32 lowercase hex digits, a random 128-bit value that is never reused |
+| `query` | string | The query text as the caller sent it |
+| `executed_query` | string | The text that ran: the query with the resolved bounds spliced in and, for the `events` shape, the imposed `sort -_time, -_ingested`. A [query](#run-a-query) of this text reads the same window |
+| `source` | string | `live` for the corpus, read inside the bounds. `stored` for a `from saved` query, which reads a stored report run and has no bounds |
+| `shape` | string | `events` or `whole`. See [shapes and caps](#shapes-and-caps) |
+| `earliest`, `latest` | string | The resolved half-open window `[earliest, latest)`, with microseconds. Absent for a `stored` source |
+| `created_at` | string | When the result was committed |
+| `expires_at` | string | When the result stops being readable: `created_at` plus `[capture] ttl_secs` (`900`) |
+| `state` | string | `temporary` while it is readable. A gone result is `expired` or `pruned`. `kept` is reserved for results attached to an investigation, which this release does not make |
+| `columns` | array | The columns in stored positional order, each a [result column](#result-columns) with `stored_as`. Names are not unique |
+| `columns[].stored_as` | string | `native` when the file stores the column in its own type. `wire_text` when no single file type holds it: a `mixed` column, or an integer column that holds both a negative value and one above `9223372036854775807`. Reads answer both the same way |
+| `captured_rows` | integer | Rows the file holds |
+| `total_rows` | integer | Rows the executed query produced before the capture cut, exact, from the same execution |
+| `wire_bytes` | integer | Bytes of the captured cells as the [result columns](#result-columns) encoding writes them, without framing. The byte cap counts this |
+| `file_bytes` | integer | Bytes of the stored file. `0` for a result with no columns, which has no file |
+| `truncated` | boolean | `true` when `captured_rows` is less than `total_rows` |
+| `column_facts` | array | Facts about each column over the captured rows, in the order of `columns` |
+| `column_facts[].nulls` | integer | Captured rows whose cell is null |
+| `column_facts[].distinct` | integer | Distinct non-null values, counted up to 6 |
+| `column_facts[].distinct_capped` | boolean | `true` when counting stopped at 6, so `distinct` is a lower bound |
+| `column_facts[].values` | array | Each distinct value with its count, most frequent first. Present only when the column holds at most 5 distinct values and each value, as a tagged cell, is at most 256 bytes |
+| `column_facts[].min`, `column_facts[].max` | object | The earliest and latest instant. Present for a `_time` column of type `timestamp` only, and absent when it holds an infinite or unordered instant |
+| `format_version` | integer | The layout version of the stored file |
+
+A fact value is a tagged cell, as a `mixed` column writes one: `{"type": "integer", "value": "502"}`. Text is tagged `string` whatever the column's type, so a `_time` instant reads `{"type": "string", "value": "..."}`. The response's `execution` has the meaning it has on [run a query](#run-a-query).
+
+#### Bounds
+
+A live capture covers one window, which the server resolves once, at the instant `T` it reads its clock, in microseconds:
+
+- The window comes from one source: `window`, or the query's own `last=`, `earliest=`, and `latest=`. A request with both is refused.
+- `last=d` covers `[T − d, T)`.
+- `earliest=X` covers from `X` to `latest=Y` when given, and to `T` otherwise.
+- `latest=` alone is refused, because it names no start. Add `earliest=`, or give `last=` instead.
+- With neither, the capture covers the last 15 minutes, `[capture] default_window_secs`.
+- `last` beside `earliest` or `latest` is refused.
+- An empty window and a window longer than 7 days, `[capture] max_span_secs`, are refused.
+
+In the query text, an `earliest=` or `latest=` value is read as [run a query](#run-a-query) reads it, which drops a spelled offset, so write the instant in UTC. In `window`, an offset is applied. A value that names no finite instant is refused. A time clause must sit where the search takes it as the window: at the top level, under `OR`, inside parentheses, or directly under `NOT`. A clause inside `NOT (...)` filters nothing in a query, so a capture refuses it.
+
+The server cuts the query's own time clauses out of the text, writes the window in front as `earliest="..." latest="..."` with microseconds, and checks that the rest of the text is unchanged. The result is `executed_query`. A text where that check fails is refused with a request to write the time clause at the top level. Every refusal in this list is 400 `bad_request`, and comes before the capture takes anything.
+
+A query whose first stage is `from saved` reads a stored report run, not the corpus. It takes no window and no time clause, and either is refused. It runs as written. Its result has `source: "stored"`, no `earliest` or `latest`, and the `whole` shape.
+
+#### Shapes and caps
+
+A capture keeps at most 5,000 rows, `[capture] max_rows`, and at most 4 MiB of cells, `[capture] max_wire_bytes`. The byte cap counts each cell as the [result columns](#result-columns) encoding writes it, without the commas and brackets between cells. The engine's own `max_result_rows` refusal applies first, with 400 `result_too_large`.
+
+A result has the `events` shape when every stage after the search only filters events or adds fields: `where`, `extract`, `let`, `drop`, and `rename`, where no `let`, `drop`, or `rename` writes, removes, or renames `_time` or `_ingested`. The result must also carry both columns. The server appends `| sort -_time, -_ingested` to the executed text of every `events` capture, so the rows are newest first. When the rows pass a cap, the capture keeps the rows before the first one that does not fit, and `total_rows` counts every row. A first row larger than the byte cap leaves zero rows.
+
+Every other result has the `whole` shape: one that aggregates, projects, orders, limits, deduplicates, or samples, such as `stats`, `table`, `sort`, `head`, `top`, or `dedup`, and every `from saved` result. A prefix of such a result answers a different question, so a `whole` result past either cap is refused with 400 `result_too_large`. The message names the cap and says to aggregate further or narrow the window.
+
+A stored file larger than 8 MiB, `[capture] max_file_bytes`, is refused with `result_too_large` too.
+
+A result with columns and no rows is stored as a file that holds only its columns. A result with no columns, such as a search that matches no event, has no file, and its `file_bytes` is `0`.
+
+#### Admission and quotas
+
+A capture is admitted before it takes a query id, an executor permit, or the publication guard. A refusal leaves nothing taken, and the capture appears in neither `/api/v1/queries` nor history. The checks run in this order:
+
+1. **The key's quota, read ahead.** A key that is already full is refused before it waits.
+2. **The key's lane.** One capture per key runs at a time, `[capture] per_key_running`. Up to 4 more wait in the key's queue, `[capture] queue_depth`, inside their own deadline. The next one is refused with 429 `capture_busy`.
+3. **The installation.** Two captures run at once, `[capture] installation_running`, inside the executor pool. A capture that finds both running is refused with 429 `capture_busy`. It does not queue.
+4. **The binding reservation.** The server first expires every temporary capture that is due and removes its file. It then reserves one result and 8 MiB, `[capture] max_file_bytes`, against the key's quota and the installation's quota, or refuses with 429 `capture_quota_exceeded`.
+
+| Quota | Key | Default |
+|-------|-----|---------|
+| Live captures per key | `per_key_results` | `64` |
+| File bytes per key | `per_key_bytes` | 64 MiB |
+| Live captures per installation | `installation_results` | `512` |
+| File bytes per installation | `installation_bytes` | 512 MiB |
+
+A capture needs `max_file_bytes` of free quota to start, even when its file turns out small. When its row commits, the reservation becomes the file's real size.
+
+Both 429 answers carry `Retry-After`, in whole seconds and never less than 1. For `capture_busy` it is the time until the first running capture's deadline. For `capture_quota_exceeded` it is the time until the first temporary result in the full quota expires, at most `[capture] ttl_secs`, and `ttl_secs` when none will expire. A capture whose deadline passes while it waits in its queue gets `capture_busy` with `Retry-After: 1`.
+
+Before it scans, the server measures the stored files the window selects, under the publication guard. A selection larger than 1 GiB, `[capture] source_max_bytes`, is refused with 400 `capture_source_too_large`. The message gives both byte counts and nothing else. The hot buffer is not counted. A `from saved` capture measures its run's files against the same limit, and counts a missing file as 0 bytes.
+
+A capture has one deadline of 15 seconds, `[capture] deadline_secs`, capped by `[server] timeout_secs`. It covers resolution, the wait in the queue, execution, and the file write. Past the deadline the capture ends as a [query](#query-timeout) does. A client that disconnects cancels the work, as it cancels a query. The lane slot, the installation slot, and the reservation stay charged until the work has stopped.
+
+A capture writes its file to the [results root](/reference/configuration/#the-results-root) before it commits the result's record, so a reader never finds a record whose file is still being written. The server commits the record even when the client has gone.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `parse_error` | The query does not parse. The spans point into the text as sent |
+| 400 | `validation_error` | Unknown function, wrong arity, or a pipeline over the expression budget or stage cap |
+| 400 | `bad_request` | A [bounds](#bounds) refusal: a window and a time clause together, `latest=` alone, an empty window, a span over `max_span_secs`, a value that names no instant, a nested time clause, or a window or time clause on `from saved` |
+| 400 | `result_too_large` | The result exceeded `max_result_rows`, a `whole` result exceeded `max_rows` or `max_wire_bytes`, or the file exceeded `max_file_bytes` |
+| 400 | `capture_source_too_large` | The window, or the `from saved` run, selects more than `source_max_bytes` of stored data |
+| 400 | `execution_error` | A result cell is an integer outside the signed and unsigned 64-bit range |
+| 403 | `forbidden` | The key lacks `query` |
+| 404 | `not_found` | A `from saved` stage names a saved query the key does not own, or one with no successful run |
+| 409 | `bad_request` | A `from saved` stage selects a run that has columns but no Parquet file |
+| 429 | `capture_busy` | The key's queue is full, two captures already run, or the deadline passed in the queue. Sent with `Retry-After` |
+| 429 | `capture_quota_exceeded` | The key's or the installation's quota cannot take one more result. Sent with `Retry-After` |
+| 500 | `execution_error` | DuckDB failed or the capture was cancelled |
+| 503 | `query_resource_exhausted` | The query went over the spill or memory budget |
+| 503 | `service_unavailable` | The deadline passed before the query started, or the metadata store did not answer |
+| 503 | `corpus_recovering` | The corpus is unsettled. See [corpus recovering](#corpus-recovering) |
+| 504 | `timeout` | The deadline passed after the query started |
+
+### List captured results
+
+`GET /api/v1/results`
+
+Permission: `query`
+
+Lists the key's live captures, newest first: every temporary capture before its `expires_at`. A client that lost a capture's response finds the result here. The list has no paging. It holds at most `[capture] per_key_results` entries.
+
+**Request**
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/results"
+```
+
+**Response**
+
+```json
+{
+  "results": [
+    { "id": "9b07d3e2c4a1458f8e6d2b1a0c9f7e63", "query": "service=nginx last=1h | stats count() by status", "executed_query": "earliest=\"2026-10-23T09:02:10.000000Z\" latest=\"2026-10-23T10:02:10.000000Z\" service=nginx  | stats count() by status", "source": "live", "shape": "whole", "earliest": "2026-10-23T09:02:10.000000Z", "latest": "2026-10-23T10:02:10.000000Z", "created_at": "2026-10-23T10:02:10.391207Z", "expires_at": "2026-10-23T10:17:10.391207Z", "state": "temporary", "columns": [{ "name": "status", "type": "integer", "stored_as": "native" }, { "name": "count", "type": "integer", "stored_as": "native" }], "captured_rows": 3, "total_rows": 3, "wire_bytes": 34, "file_bytes": 1206, "truncated": false, "column_facts": [{ "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "200" }, "count": 1 }, { "value": { "type": "integer", "value": "404" }, "count": 1 }, { "value": { "type": "integer", "value": "502" }, "count": 1 }] }, { "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "48211" }, "count": 1 }, { "value": { "type": "integer", "value": "1290" }, "count": 1 }, { "value": { "type": "integer", "value": "4112" }, "count": 1 }] }], "format_version": 1 }
+  ]
+}
+```
+
+Each entry has the fields of a [captured result](#capture-a-result).
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 403 | `forbidden` | The key lacks `query` |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+### Read a page of a captured result
+
+`GET /api/v1/results/{id}`
+
+Permission: `query`
+
+Returns rows of a capture by row number, from the stored file. It runs no query and takes no executor permit.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | yes | The result id |
+| `offset` | query | integer | no | The first row number, 0-based. Default `0`. At most `captured_rows`, where the page is empty |
+| `limit` | query | integer | no | Rows in the page. Default and cap: `[capture] page_max_rows` (`200`) |
+| `columns` | query | string | no | Column names separated by commas. Default: every column |
+
+A name in `columns` selects every column with that name, so a duplicate name returns each of its columns. The page carries the selected columns in stored order, whatever order `columns` names them in. A name that the result does not have is 400 `bad_request`. A name that holds a comma cannot be selected on its own; leave `columns` out to read every column.
+
+**Request**
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" \
+  "$TRAWL_URL/api/v1/results/9b07d3e2c4a1458f8e6d2b1a0c9f7e63?offset=1&limit=2&columns=count"
+```
+
+**Response**
+
+```json
+{
+  "result": {
+    "id": "9b07d3e2c4a1458f8e6d2b1a0c9f7e63",
+    "query": "service=nginx last=1h | stats count() by status",
+    "executed_query": "earliest=\"2026-10-23T09:02:10.000000Z\" latest=\"2026-10-23T10:02:10.000000Z\" service=nginx  | stats count() by status",
+    "source": "live",
+    "shape": "whole",
+    "earliest": "2026-10-23T09:02:10.000000Z",
+    "latest": "2026-10-23T10:02:10.000000Z",
+    "created_at": "2026-10-23T10:02:10.391207Z",
+    "expires_at": "2026-10-23T10:17:10.391207Z",
+    "state": "temporary",
+    "columns": [
+      { "name": "status", "type": "integer", "stored_as": "native" },
+      { "name": "count", "type": "integer", "stored_as": "native" }
+    ],
+    "captured_rows": 3,
+    "total_rows": 3,
+    "wire_bytes": 34,
+    "file_bytes": 1206,
+    "truncated": false,
+    "column_facts": [
+      { "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "200" }, "count": 1 }, { "value": { "type": "integer", "value": "404" }, "count": 1 }, { "value": { "type": "integer", "value": "502" }, "count": 1 }] },
+      { "nulls": 0, "distinct": 3, "distinct_capped": false, "values": [{ "value": { "type": "integer", "value": "48211" }, "count": 1 }, { "value": { "type": "integer", "value": "1290" }, "count": 1 }, { "value": { "type": "integer", "value": "4112" }, "count": 1 }] }
+    ],
+    "format_version": 1
+  },
+  "positions": [1],
+  "page": {
+    "columns": [{ "name": "count", "type": "integer" }],
+    "rows": [["1290"], ["4112"]]
+  },
+  "pagination": { "limit": 2, "offset": 1, "returned": 2, "total": 3 }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `result` | object | The [captured result](#capture-a-result) the page belongs to |
+| `positions` | array | For each column of `page`, its 0-based position in `result.columns`, ascending |
+| `page` | object | The selected columns and the page's rows, encoded as [result columns](#result-columns). Row `i` of the page is captured row `offset + i` |
+| `pagination.total` | integer | The result's `captured_rows` |
+
+A result with no columns answers rows that are empty arrays and reads no file. Two reads of the same rows of one capture return the same bytes, whatever ingest, compaction, or a restart did between them.
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | `limit` is above `page_max_rows`, `offset` is past `captured_rows`, `columns` names a column the result does not have, or a query parameter is unknown or not an integer |
+| 403 | `forbidden` | The key lacks `query` |
+
+Every [captured result outcome](#captured-result-outcomes) applies too.
+
+### Read one cell of a captured result
+
+`GET /api/v1/results/{id}/cells/{row}/{column}`
+
+Permission: `query`
+
+Returns a byte range of one cell, so a client can read a cell too long for a page. The range is over the cell's text as the [result columns](#result-columns) encoding writes it, under the column's type. A string cell's text is a JSON string, quotes included.
+
+**Parameters**
+
+| Name | In | Type | Required | Description |
+|------|----|------|----------|-------------|
+| `id` | path | string | yes | The result id |
+| `row` | path | integer | yes | The row number, 0-based |
+| `column` | path | integer | yes | The column's position in `columns`, 0-based. Names are not unique, so a cell is addressed by position |
+| `offset` | query | integer | no | The first byte of the range. Default `0`. It must start a UTF-8 character: use `0` or a `next_offset` |
+| `length` | query | integer | no | The most bytes in the range, at least 4. Default and cap: `[capture] max_wire_bytes`, which holds any captured cell whole |
+
+The range ends at a character boundary, so it can be shorter than `length`. Follow `next_offset` until it is absent, join the `text` values, and decode the joined text as a cell of the column's type.
+
+**Request**
+
+```bash
+curl --fail-with-body --config "$TRAWL_CURL_CONFIG" \
+  "$TRAWL_URL/api/v1/results/4f2a9c1e7b3d40e8a6c5f1d2e3b4a597/cells/0/4?length=64"
+```
+
+**Response**
+
+```json
+{
+  "type": "string",
+  "offset": 0,
+  "length": 64,
+  "total_bytes": 109,
+  "next_offset": 64,
+  "text": "\"203.0.113.7 - - [23/Oct/2026:09:59:59 +0000] \\\"GET /api/orders/"
+}
+```
+
+The next request asks for `offset=64` and gets the rest of the cell, with no `next_offset`:
+
+```json
+{
+  "type": "string",
+  "offset": 64,
+  "length": 45,
+  "total_bytes": 109,
+  "text": "8812 HTTP/1.1\\\" 502 157 \\\"-\\\" \\\"curl/8.9.1\\\"\""
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | The column's type, spelled as a [result column](#result-columns) spells it. A `list` type also has `items` |
+| `offset` | integer | The byte offset of `text` in the cell's text |
+| `length` | integer | The byte length of `text` |
+| `total_bytes` | integer | The byte length of the whole cell's text |
+| `next_offset` | integer | The offset of the next range. Absent when `text` reaches the end |
+| `text` | string | The range of the cell's text |
+
+**Errors**
+
+| Status | Code | When |
+|--------|------|------|
+| 400 | `bad_request` | `row` is past the captured rows, `column` is past the columns, `offset` is past the cell or inside a character, `length` is below 4 or above `max_wire_bytes`, or a path segment or query parameter does not read as an integer |
+| 403 | `forbidden` | The key lacks `query` |
+
+Every [captured result outcome](#captured-result-outcomes) applies too.
+
+### Captured result outcomes
+
+A page or cell read checks, in this order, before it reads any row:
+
+| Status | Code | When |
+|--------|------|------|
+| 404 | `not_found` | The id is not 32 lowercase hex digits, no capture has it, or another key made it |
+| 410 | `result_gone` | The capture passed its `expires_at`, or was pruned to fit a lowered quota. The message says which and asks for a new capture |
+| 404 | `not_found` | The capture was gone for longer than `[capture] tombstone_secs` (`86400`), counted from the moment it was lost |
+| 409 | `result_unavailable` | The record exists, but its file is missing. The response is never an empty page, and the query is never run again |
+| 500 | `internal_error` | The record names a file format version that this server does not read |
+| 500 | `result_corrupt` | The file does not match the blake3 digest recorded at capture. The server checks the whole file on every read. The response names no path, and the server logs a `result_corrupt` event with the result id beside the request's [`http_failure` event](/operate/health/#trace-a-server-failure) |
+| 503 | `service_unavailable` | The metadata store did not answer |
+
+A gone capture keeps a record, called a tombstone, so that its owner can tell expired from never existed. A read that finds a temporary capture past its `expires_at` marks it expired and removes its file at once. The sweep removes the rest: every hour with the [scheduler](/reference/configuration/#scheduler) on, and every `[capture] ttl_secs`, at most hourly and at least every second, with it off. The sweep also deletes tombstones past `tombstone_secs`. A capture survives a restart until its `expires_at`. [Back up and restore](/operate/backup-restore/) describes what the start does to captures and their files.
 
 ## Stream
 
@@ -1376,7 +1776,7 @@ curl --fail-with-body --config "$TRAWL_CURL_CONFIG" "$TRAWL_URL/api/v1/queries"
 | `active[].role` | string | The key's role names, sorted and comma-joined. `none` when the key holds no roles. |
 | `recent` | array | Most recent first. At most `[server] max_query_history` (`1000`) entries are kept. |
 | `retained` | array | Work that still holds a pool permit after its request answered. Disjoint from `active`. |
-| `retained[].kind` | string | `query`, `from_saved`, `export`, `scheduled`, or `sample` |
+| `retained[].kind` | string | `query`, `from_saved`, `export`, `scheduled`, `sample`, or `capture` |
 | `retained[].started` | boolean | Whether the work passed its start transition |
 | `retained[].user`, `retained[].query` | string | Present for key-submitted work. For system work, present only for a reader with `server_manage`. |
 

@@ -1,6 +1,6 @@
 # A capture is an immutable, expiring result that later reads page
 
-status: accepted (2026-10-22), prep record for the MCP 1.0 slices (A1 of the arc #214 → A1 → A2 → B, C1 → C2)
+status: accepted (2026-10-22), prep record for the MCP 1.0 slices (A1 of the arc #214 → A1 → A2 → B, C1 → C2); amended (2026-10-23): decided during implementation
 
 Trawl has no stable event identifier. Identical events exist, the hot buffer moves between two pages of one query, and a repin or compaction can change what a second run of the same text returns. An agent that reads a page, reasons about row 7 and then asks for "the events around row 7" needs row 7 to mean the same thing a minute later. Offset paging over `/query` re-runs the text each time, so it cannot promise that. The proposal of 2026-10-21 said a captured result "is a run result without a net" and could reuse the retained-run machinery. The tree disagrees: a report run has mandatory schedule and saved-query foreign keys (`migrations/20260913000001_initial_schema.sql`), its parquet writer is private, goes through NDJSON and `read_json` type inference so exact types are lost, writes no file for zero rows, lives under `scheduled/` inside the epoch-managed data root, and expires by days. Only its publication pattern (stage a temporary file, rename, then commit metadata) and its named missing-file outcome carry over.
 
@@ -31,3 +31,20 @@ Considered and rejected:
 - **Keep a labelled prefix of any result.** Honest for events once ordered, dishonest for `stats`, `top` or `dedup`, whose first 5000 rows are not the answer. The split rule keeps the first and refuses the second.
 - **A derived event handle from `_time`, `_ingested` and a hash of `_raw`.** Identical events collide, and the handle would survive the hot buffer moving without the rows doing so. A frozen copy is honest about what it is.
 - **Reuse pool query ids as durable handles.** They restart at zero at each boot (ADR-0046). Result ids are random 128-bit strings, never reused.
+
+## Amendment: decided during implementation, 2026-10-23
+
+Building #307 settled ten points the decision left open. The decision stands; these refine it.
+
+- **HTTP/2.** trawld's listener stays HTTP/1.1, as ADR-0054 records. The abort evidence runs over HTTP/1.1 against the real listener, and over HTTP/2 only in a test that serves the real router behind a test listener. Enabling HTTP/2 in production is a separate decision.
+- **Read permission.** Every read, the list included, needs the trawl `query` permission and ownership of the capture. A key without `query` gets 403, and another key's capture answers 404, as an unknown id does.
+- **Operator visibility.** No route shows another key's captures in this release, not even to `server_manage`.
+- **`latest=` alone is refused**, in the query and in the window, because it names no start. A 15-minute span ending at `latest` was rejected: it guesses a start the caller never gave.
+- **Projection is by name.** `columns` lists display names separated by commas, each name selects every column that has it, and the page lists the selected columns in stored order with their `positions`. A name that holds a comma cannot be selected alone. A cell is addressed by position, since names are not unique.
+- **A cell is read by byte range in query parameters**, `offset` and `length`, over the cell's wire text, cut back to a UTF-8 boundary, with `total_bytes` and `next_offset`. HTTP `Range` and 206 were rejected: the capability is transport-free, and an in-process host has no headers.
+- **The reservation is `[capture] max_file_bytes`**, 8 MiB, which is also the writer's hard cap on the file. A key needs that much free quota to start a capture.
+- **A result with no columns has no file.** Its record has `file_bytes = 0` and no digest, and its reads answer empty rows without touching disk. A result with columns and no rows still has a file that holds the columns.
+- **Admission refusals are 429 with `Retry-After`**: `capture_busy` names the time until the first running capture's deadline, and `capture_quota_exceeded` the time until the first temporary result in the full scope expires, capped at `ttl_secs`. Bounds refusals, `capture_source_too_large` and `result_too_large` are 400.
+- **`X-Request-Id` reaches the caller on every error that got a response.** trawl-client exposes it on each such error, and the CLI prints it after the message.
+
+The structured window spells `earliest` and `latest` as RFC 3339 instants with their offset applied, unlike the DSL's literals, whose offset `/query` drops. A missing file of a `from saved` run counts as zero bytes against the source budget; the vanished-run check then names it.
