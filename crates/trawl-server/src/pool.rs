@@ -777,6 +777,9 @@ pub mod seam {
         /// window's source first, so a capture refused for its source
         /// budget never reaches it.
         Started,
+        /// Inside a capture's `finish`, once its file is staged and before
+        /// it is written. The capture lane only.
+        Writing,
         /// After the work produced its answer, before cleanup.
         Finished,
         /// After cleanup released everything the work held, before the
@@ -1063,6 +1066,9 @@ pub struct CaptureInput<'a> {
     /// The bytes a window's source budget measured; `None` for a resolved
     /// source, which is not measured.
     pub source_bytes: Option<u64>,
+    /// The pool's seams, for [`seam::Seam::Writing`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub seams: &'a seam::Table,
 }
 
 /// A capture's last step: the worker runs it inside the slot on the
@@ -2736,6 +2742,8 @@ impl ExecutorPool {
                         clock,
                         cancel: &cancel,
                         source_bytes,
+                        #[cfg(any(test, feature = "test-support"))]
+                        seams: &seams,
                     });
                     worker_seam!(seams, Finished);
                     answer

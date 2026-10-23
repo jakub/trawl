@@ -727,6 +727,8 @@ impl Keep {
     /// The lane's `finish`: cut, count the facts, write and publish, all on
     /// the worker inside the slot.
     fn run(self, input: CaptureInput<'_>) -> Result<Captured, ServerError> {
+        #[cfg(any(test, feature = "test-support"))]
+        let seams = input.seams;
         let CaptureInput {
             mut result,
             executor,
@@ -764,6 +766,8 @@ impl Keep {
         }
         let (stored_as, published) = clock.time(QueryPhase::Write, || {
             let staged = self.root.stage().map_err(EngineError::Io)?;
+            #[cfg(any(test, feature = "test-support"))]
+            seams.reach(crate::pool::seam::Seam::Writing);
             let written = executor.write_capture_parquet(&result, staged.path())?;
             if written.bytes > self.max_file_bytes {
                 return Err(ServerError::CaptureTooLarge(CaptureOverflow::FileBytes {
