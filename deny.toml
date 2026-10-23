@@ -15,17 +15,6 @@ ignore = [
     # compile-time proc-macro with no runtime attack surface, pulled transitively
     # by parquet; there is no replacement until parquet drops it upstream.
     "RUSTSEC-2024-0436",
-    # rustls 0.23.45, fixed in 0.23.46 (published 2026-10-14). The fix is
-    # younger than the 3-day minimum publish age, so these stay ignored until
-    # 2026-10-17; then run `cargo update -p rustls` and delete these four.
-    # rustls is reached only through reqwest's client, with no ECH, no brotli
-    # certificate compression, and no custom ClientSessionStore, so 0346,
-    # 0347 and 0348 do not apply. 0349 can push a later connection from the
-    # hybrid post-quantum group back to classical X25519.
-    { id = "RUSTSEC-2026-0346", reason = "custom ClientSessionStore Debug only; none here" },
-    { id = "RUSTSEC-2026-0347", reason = "ECH only; not enabled" },
-    { id = "RUSTSEC-2026-0348", reason = "brotli certificate compression only; not enabled" },
-    { id = "RUSTSEC-2026-0349", reason = "PQ-to-classical downgrade; bump to 0.23.46 after 2026-10-17" },
     # zip 6.0.0 is a build dependency of libduckdb-sys 1.10505.0, which pins
     # zip "6"; the fixes are in zip >= 9. libduckdb-sys extracts an archive
     # only when it downloads the DuckDB library itself, and .cargo/config.toml
