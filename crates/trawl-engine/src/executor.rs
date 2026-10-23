@@ -32,7 +32,8 @@ use crate::value::{
     Column, ColumnType, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64,
 };
 
-/// Names of the result columns `DuckDB` returned as TIMESTAMP.
+/// Names of the result columns `DuckDB` returned as TIMESTAMP, or as a
+/// list of them at any depth ([`holds_timestamps`]).
 type TimestampColumns = Vec<String>;
 
 /// How many statements the query and export lanes handed `DuckDB` to bind.
@@ -899,7 +900,7 @@ impl Executor {
     }
 
     /// [`Self::execute_emitted`], additionally reporting which result
-    /// columns `DuckDB` returned as TIMESTAMP.
+    /// columns `DuckDB` returned as TIMESTAMP or a list of them.
     ///
     /// Only the Rust-tail lane needs that: it reads `DuckDB`'s cast text
     /// and renders the wire's text afterwards
@@ -1005,7 +1006,7 @@ impl Executor {
 
         let timestamp_columns: TimestampColumns = columns
             .iter()
-            .filter(|col| col.ty == ColumnType::Timestamp)
+            .filter(|col| holds_timestamps(&col.ty))
             .map(|col| col.name.clone())
             .collect();
 
@@ -2876,8 +2877,8 @@ fn sql_timestamp_text(emitted: &EmittedQuery, display: FixedOffset) -> Timestamp
     }
 }
 
-/// Follow the SQL result's TIMESTAMP columns through the Rust tail's own
-/// rename/alias lineage.
+/// Follow the SQL result's TIMESTAMP columns, and its lists of them,
+/// through the Rust tail's own rename/alias lineage.
 ///
 /// The tail re-uses the pin-scope walk ([`PinScope::advance`]) with a scope
 /// holding exactly the tracked columns: a `rename`d timestamp column carries
@@ -2898,51 +2899,163 @@ fn tail_timestamp_scope(timestamp_columns: &[String], stages: &[Spanned<PipeStag
     scope
 }
 
+/// Whether a column of type `ty` holds stored timestamps: a `timestamp`,
+/// or a `list` whose items do, at any depth.
+fn holds_timestamps(ty: &ColumnType) -> bool {
+    match ty {
+        ColumnType::Timestamp => true,
+        ColumnType::List { items } => holds_timestamps(items),
+        _ => false,
+    }
+}
+
+/// The type a tracked column becomes when its cast text is rendered: a
+/// `string` column a `timestamp` one, and a list of strings, at any depth,
+/// the same list of timestamps. `None` for any other type, which the
+/// tail's cells gave a column that is no longer stored timestamps (a
+/// group key's text of a list, a value a kv pair overwrote).
+fn rendered_timestamp_type(ty: &ColumnType) -> Option<ColumnType> {
+    match ty {
+        ColumnType::String => Some(ColumnType::Timestamp),
+        ColumnType::List { items } => rendered_timestamp_type(items).map(ColumnType::list),
+        _ => None,
+    }
+}
+
+/// One tracked cell in the wire's text at `display`: cast text as RFC 3339,
+/// a list element by element, and NULL as NULL. `None` when any text in
+/// it is not cast text.
+fn render_tracked_cell(cell: &Value, display: FixedOffset) -> Option<Value> {
+    match cell {
+        Value::Null => Some(Value::Null),
+        Value::String(text) => parse_cast_timestamp(text).map(|micros| {
+            Value::String(format_timestamp(
+                TimeUnit::Microsecond,
+                micros,
+                TimestampText::Wire(display),
+            ))
+        }),
+        Value::Array(elements) => elements
+            .iter()
+            .map(|element| render_tracked_cell(element, display))
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Array),
+        _ => None,
+    }
+}
+
 /// Render the columns the Rust tail's lineage ([`tail_timestamp_scope`])
-/// still calls a stored TIMESTAMP in the wire's text and display offset,
-/// and type them `timestamp`.
+/// still calls a stored TIMESTAMP, or a stored list of them, in the wire's
+/// text and display offset, and type them `timestamp` (or the list of it).
 ///
 /// The tail ran over `DuckDB`'s cast text ([`sql_timestamp_text`]), where a
-/// stored TIMESTAMP is a string, so [`crate::post_process::rows_to_result`]
-/// typed a pass-through column `string`. The lineage knows better: it is
-/// the SQL result's timestamp, renamed or aliased at most. A column is
-/// rendered whole or not at all: if any cell is not cast text (the tail
-/// replaced it, or its year is outside chrono's calendar), the column
-/// stays the `string` the tail left. A column the lineage cannot vouch
-/// for, such as an aggregate output or a computed `let`, keeps the type its
-/// own cells gave it, and a timestamp the tail computed is already wire
-/// text in UTC.
+/// stored TIMESTAMP is a string, list items included, so
+/// [`crate::post_process::rows_to_result`] typed a pass-through column
+/// `string` or a `list` of `string`. The lineage knows better: it is the
+/// SQL result's timestamps, renamed or aliased at most. The column's own
+/// type says which shape its cells have ([`rendered_timestamp_type`]), and
+/// list cells are rendered element by element. A column is rendered whole
+/// or not at all: if any text in it is not cast text (the tail replaced
+/// it, or its year is outside chrono's calendar), the column stays the
+/// type the tail left. A column the lineage cannot vouch for, such as an
+/// aggregate output or a computed `let`, keeps the type its own cells gave
+/// it, and a timestamp the tail computed is already wire text in UTC.
 fn render_tracked_timestamps(result: &mut QueryResult, tracked: &PinScope, display: FixedOffset) {
     if tracked.is_empty() {
         return;
     }
     for idx in 0..result.columns.len() {
         let column = &result.columns[idx];
-        if column.ty != ColumnType::String || tracked.pin_for(&column.name).is_none() {
+        if tracked.pin_for(&column.name).is_none() {
             continue;
         }
-        let instants: Option<Vec<Option<i64>>> = result
-            .rows
-            .iter()
-            .map(|row| match row.get(idx) {
-                None | Some(Value::Null) => Some(None),
-                Some(Value::String(text)) => parse_cast_timestamp(text).map(Some),
-                Some(_) => None,
-            })
-            .collect();
-        let Some(instants) = instants else {
+        let Some(rendered_type) = rendered_timestamp_type(&column.ty) else {
             continue;
         };
-        for (row, micros) in result.rows.iter_mut().zip(instants) {
-            if let Some(micros) = micros {
-                row[idx] = Value::String(format_timestamp(
-                    TimeUnit::Microsecond,
-                    micros,
-                    TimestampText::Wire(display),
-                ));
-            }
+        let rendered: Option<Vec<Value>> = result
+            .rows
+            .iter()
+            .map(|row| render_tracked_cell(row.get(idx).unwrap_or(&Value::Null), display))
+            .collect();
+        let Some(rendered) = rendered else {
+            continue;
+        };
+        for (row, cell) in result.rows.iter_mut().zip(rendered) {
+            row[idx] = cell;
         }
-        result.columns[idx].ty = ColumnType::Timestamp;
+        result.columns[idx].ty = rendered_type;
+    }
+}
+
+/// A tracked list renders element by element at any depth, NULLs kept, and
+/// is typed the same list of timestamps. A list holding one text that is
+/// not cast text stays as the tail left it, and so does a tracked `string`
+/// column whose text is a list's (a group key's), since its shape is not a
+/// stored timestamp's.
+#[cfg(test)]
+#[test]
+fn tracked_lists_render_element_by_element() {
+    let text = |s: &str| Value::String(s.to_owned());
+    let list = Value::Array;
+    let strings = ColumnType::list(ColumnType::String);
+    let mut result = QueryResult {
+        columns: vec![
+            Column::new("seen", strings.clone()),
+            Column::new("deep", ColumnType::list(strings.clone())),
+            Column::new("bad", strings),
+            Column::new("key", ColumnType::String),
+        ],
+        rows: vec![
+            vec![
+                list(vec![text("2026-01-15 09:00:00.123456"), Value::Null]),
+                list(vec![list(vec![text("infinity")]), list(vec![])]),
+                list(vec![text("2026-01-15 09:00:00")]),
+                text("[2026-01-15 09:00:00]"),
+            ],
+            vec![
+                Value::Null,
+                list(vec![list(vec![text("1969-12-31 23:59:59.5")])]),
+                list(vec![text("not a timestamp")]),
+                text("[2026-01-15 09:00:00]"),
+            ],
+        ],
+    };
+    let untouched = result.clone();
+    let tracked = tail_timestamp_scope(
+        &["seen".into(), "deep".into(), "bad".into(), "key".into()],
+        &[],
+    );
+    render_tracked_timestamps(
+        &mut result,
+        &tracked,
+        FixedOffset::east_opt(19_800).unwrap(),
+    );
+
+    let timestamps = ColumnType::list(ColumnType::Timestamp);
+    assert_eq!(
+        result.columns,
+        vec![
+            Column::new("seen", timestamps.clone()),
+            Column::new("deep", ColumnType::list(timestamps)),
+            untouched.columns[2].clone(),
+            untouched.columns[3].clone(),
+        ]
+    );
+    assert_eq!(
+        result.rows[0][0],
+        list(vec![text("2026-01-15T14:30:00.123456+05:30"), Value::Null])
+    );
+    assert_eq!(result.rows[1][0], Value::Null);
+    assert_eq!(
+        result.rows[0][1],
+        list(vec![list(vec![text("infinity")]), list(vec![])])
+    );
+    assert_eq!(
+        result.rows[1][1],
+        list(vec![list(vec![text("1970-01-01T05:29:59.500000+05:30")])])
+    );
+    for row in 0..2 {
+        assert_eq!(result.rows[row][2..], untouched.rows[row][2..]);
     }
 }
 

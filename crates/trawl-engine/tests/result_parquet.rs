@@ -234,6 +234,54 @@ fn a_zero_row_result_writes_a_typed_empty_file() {
     assert_eq!(read(&path), written);
 }
 
+/// A timestamp list a Rust tail passed through is a list of timestamps in
+/// its result, so a run of it stores `TIMESTAMP[]` and reads back as the
+/// same instants, in UTC.
+#[test]
+fn a_timestamp_list_through_a_rust_tail_is_stored_as_timestamps() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("events.parquet");
+    duckdb::Connection::open_in_memory()
+        .unwrap()
+        .execute_batch(&format!(
+            "COPY (SELECT 'k=v' AS message, TIMESTAMP '2026-01-15 09:00:00.123456' AS _time) \
+             TO '{}' (FORMAT PARQUET)",
+            source.display()
+        ))
+        .unwrap();
+    let written = Executor::new()
+        .unwrap()
+        .run_query(
+            "* | stats list(_time) as seen, max(message) as message | extract kv | table seen",
+            &source.display().to_string(),
+            &trawl_core::schema::FieldTypes::new(),
+            100,
+            19_800,
+        )
+        .expect("the kv tail runs");
+    assert_eq!(
+        written.rows,
+        vec![vec![Value::Array(vec![text(
+            "2026-01-15T14:30:00.123456+05:30"
+        )])]]
+    );
+
+    let (_dir, path) = write(&written);
+    assert_eq!(
+        described(&path),
+        vec![("seen".to_owned(), "TIMESTAMP[]".to_owned())]
+    );
+    assert_eq!(
+        read(&path),
+        QueryResult {
+            columns: vec![Column::new("seen", ColumnType::list(ColumnType::Timestamp))],
+            rows: vec![vec![Value::Array(vec![text(
+                "2026-01-15T09:00:00.123456Z"
+            )])]],
+        }
+    );
+}
+
 /// Column names are the result's own, quotes and duplicates of a key
 /// spelling included: the ndjson keys are positional.
 #[test]

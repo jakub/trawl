@@ -254,3 +254,57 @@ fn a_rust_tail_that_removes_every_row_keeps_the_projected_schema() {
         "a filter removes rows, not the projected schema"
     );
 }
+
+/// A stored `TIMESTAMP[]` the Rust tail passes through is still a list of
+/// timestamps: typed `list` of `timestamp`, each item in the display
+/// offset, exactly as the same query answers without the tail.
+#[test]
+fn a_timestamp_list_keeps_its_type_and_display_offset_through_a_rust_tail() {
+    let (_dir, source) =
+        parquet("SELECT 'k=v' AS message, [TIMESTAMP '2026-01-15 09:00:00.123456'] AS seen");
+    let baseline = run_at("* | table seen", &source, 19800).expect("the SQL lane runs");
+    let tail = run_at("* | extract kv | table seen", &source, 19800).expect("the kv tail runs");
+    assert_eq!(
+        baseline.columns[0].ty,
+        ColumnType::list(ColumnType::Timestamp),
+        "{baseline:?}"
+    );
+    assert_eq!(
+        tail, baseline,
+        "an unrelated kv stage must retain the timestamp list"
+    );
+}
+
+/// The same through an aggregate the SQL prefix computes: `list(_time)`
+/// is a `TIMESTAMP[]`, and a kv tail after it keeps it one.
+#[test]
+fn a_listed_aggregate_keeps_its_timestamp_items_through_kv() {
+    let (_dir, source) =
+        parquet("SELECT 'k=v' AS message, TIMESTAMP '2026-01-15 09:00:00.123456' AS _time");
+    let base = "* | stats list(_time) as seen, max(message) as message";
+    let baseline =
+        run_at(&format!("{base} | table seen"), &source, 19800).expect("the SQL lane runs");
+    let tail = run_at(&format!("{base} | extract kv | table seen"), &source, 19800)
+        .expect("the kv tail runs");
+    assert_eq!(tail, baseline);
+}
+
+/// With no row left the lineage still types the list: the tail's own
+/// schema says `list` of `string`, and the lineage says those strings are
+/// stored timestamps.
+#[test]
+fn a_timestamp_list_with_no_row_left_is_still_typed() {
+    let (_dir, source) =
+        parquet("SELECT 'k=v' AS message, [TIMESTAMP '2026-01-15 09:00:00.123456'] AS seen");
+    let result = run_at(
+        "* | extract kv | where k == \"nope\" | table seen",
+        &source,
+        19800,
+    )
+    .expect("the kv tail runs");
+    assert!(result.rows.is_empty(), "{result:?}");
+    assert_eq!(
+        types(&result),
+        vec![("seen".to_owned(), ColumnType::list(ColumnType::Timestamp))]
+    );
+}
