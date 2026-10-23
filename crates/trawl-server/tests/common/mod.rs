@@ -1696,6 +1696,7 @@ pub async fn setup_in_dir_with_data_and_timeout(
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -1742,6 +1743,7 @@ pub async fn setup_with_query_knobs(
         &[],
         FleetPoolSize::DEFAULT,
         query,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -1804,6 +1806,7 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1848,6 +1851,7 @@ pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1872,6 +1876,7 @@ pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> T
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -1895,6 +1900,7 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1921,6 +1927,7 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         cidrs,
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
@@ -1968,6 +1975,7 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -1997,6 +2005,7 @@ pub async fn setup_observing_boot(
         &[],
         FleetPoolSize::DEFAULT,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await
 }
@@ -2017,6 +2026,7 @@ async fn setup_with_ingest_config(
     trusted_relays: &[&str],
     fleet_pool_size: FleetPoolSize,
     query: QueryKnobs,
+    capture: trawl_config::CaptureConfig,
 ) -> TestServer {
     assert!(
         std::path::Path::new(&data_path).is_dir(),
@@ -2127,7 +2137,7 @@ async fn setup_with_ingest_config(
         storage: StorageConfig {
             database_url: Some(app_db_url.clone()),
         },
-        capture: trawl_config::CaptureConfig::default(),
+        capture,
     };
 
     // ADR-0021 ruling 3: the server receives pools the fixture built and
@@ -2279,11 +2289,274 @@ pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
         &[],
         size,
         QueryKnobs::DEFAULT,
+        trawl_config::CaptureConfig::default(),
     )
     .await;
     // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
+}
+
+/// A fixture over `data_path` whose `[capture]` limits are `capture`
+/// (ADR-0057), for the captured-results suites. `dir` holds the WAL and
+/// stays the caller's, so a test can seed the data root before boot.
+pub async fn setup_with_capture(
+    dir: &std::path::Path,
+    data_path: String,
+    rate_limit: RateLimitConfig,
+    capture: trawl_config::CaptureConfig,
+) -> TestServer {
+    setup_with_ingest_config(
+        dir,
+        data_path,
+        rate_limit,
+        DEFAULT_TEST_TIMEOUT_SECS,
+        true,
+        RowCaps::DEFAULT,
+        BodyLimits::DEFAULT,
+        SchedulerConfig::default(),
+        None,
+        None,
+        &[],
+        FleetPoolSize::DEFAULT,
+        QueryKnobs::DEFAULT,
+        capture,
+    )
+    .await
+}
+
+/// Captured results through the fixture's HTTPS listener (ADR-0057): the
+/// requests, a corpus with known times, and the check that a refused
+/// capture took nothing.
+pub mod captured {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use chrono::{DateTime, Utc};
+    use reqwest::StatusCode;
+    use reqwest::header::HeaderMap;
+    use trawl_api::results::CaptureResponse;
+
+    use super::TestServer;
+
+    /// One answer: its status, its headers and its JSON body.
+    pub type Answer = (StatusCode, HeaderMap, serde_json::Value);
+
+    fn client() -> reqwest::Client {
+        super::harness_client_builder().build().unwrap()
+    }
+
+    async fn answer(request: reqwest::RequestBuilder) -> Answer {
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let text = response.text().await.unwrap();
+        let body = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("{status}: the body is not JSON ({e}): {text}"));
+        (status, headers, body)
+    }
+
+    /// `POST /api/v1/results` with `body`, as `token`.
+    pub async fn capture(server: &TestServer, token: &str, body: &serde_json::Value) -> Answer {
+        answer(
+            client()
+                .post(format!("{}/api/v1/results", server.url))
+                .bearer_auth(token)
+                .json(body),
+        )
+        .await
+    }
+
+    /// A capture that must answer 200, decoded through the wire type.
+    pub async fn captured(
+        server: &TestServer,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> CaptureResponse {
+        let (status, _, answer) = capture(server, token, body).await;
+        assert_eq!(status, StatusCode::OK, "{body}: {answer}");
+        serde_json::from_value(answer).expect("a capture response")
+    }
+
+    /// `GET /api/v1{path}`, as `token`.
+    pub async fn get(server: &TestServer, token: &str, path: &str) -> Answer {
+        answer(
+            client()
+                .get(format!("{}/api/v1{path}", server.url))
+                .bearer_auth(token),
+        )
+        .await
+    }
+
+    /// A page of capture `id`; `query` is the query string, `""` or
+    /// `"?offset=..."`.
+    pub async fn page(server: &TestServer, token: &str, id: &str, query: &str) -> Answer {
+        get(server, token, &format!("/results/{id}{query}")).await
+    }
+
+    /// A byte range of one cell of capture `id`.
+    pub async fn cell(
+        server: &TestServer,
+        token: &str,
+        id: &str,
+        row: u64,
+        column: usize,
+        query: &str,
+    ) -> Answer {
+        get(
+            server,
+            token,
+            &format!("/results/{id}/cells/{row}/{column}{query}"),
+        )
+        .await
+    }
+
+    /// The ids `GET /api/v1/results` lists for `token`, in its order.
+    pub async fn listed(server: &TestServer, token: &str) -> Vec<String> {
+        let (status, _, body) = get(server, token, "/results").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let list: trawl_api::results::ResultList =
+            serde_json::from_value(body).expect("a result list");
+        list.results.into_iter().map(|r| r.id).collect()
+    }
+
+    /// One event of a seeded corpus. Its `_ingested` is ten seconds after
+    /// its `_time`.
+    pub struct Event {
+        pub time: DateTime<Utc>,
+        pub host: String,
+        pub message: String,
+    }
+
+    /// Write `events` as `{data}/prod/{date}/{HH}/{service}.parquet`, the
+    /// layout the planner prunes over, with the shared fixture's columns.
+    /// Every event must fall in the first event's hour. Seed before the
+    /// fixture boots, as the shared tree is.
+    pub fn seed_hour(data: &str, service: &str, events: &[Event]) -> PathBuf {
+        let first = events.first().expect("a corpus has events").time;
+        let hour = first.format("%Y-%m-%d/%H").to_string();
+        assert!(
+            events
+                .iter()
+                .all(|e| e.time.format("%Y-%m-%d/%H").to_string() == hour),
+            "every event falls in {hour}"
+        );
+        let dir = Path::new(data).join("prod").join(&hour);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
+        conn.execute_batch(
+            "CREATE TABLE logs (
+                _time TIMESTAMP,
+                _ingested TIMESTAMP,
+                _raw VARCHAR,
+                _repairs VARCHAR,
+                env VARCHAR,
+                service VARCHAR,
+                host VARCHAR,
+                severity BIGINT,
+                severity_text VARCHAR,
+                message VARCHAR
+            )",
+        )
+        .unwrap();
+        let micros = |at: DateTime<Utc>| at.format("%Y-%m-%d %H:%M:%S%.6f").to_string();
+        let mut insert = conn
+            .prepare(
+                "INSERT INTO logs VALUES
+                 (CAST(? AS TIMESTAMP), CAST(? AS TIMESTAMP), ?, NULL, 'prod', ?, ?, 9, 'info', ?)",
+            )
+            .unwrap();
+        for event in events {
+            insert
+                .execute(duckdb::params![
+                    micros(event.time),
+                    micros(event.time + chrono::TimeDelta::seconds(10)),
+                    event.message,
+                    service,
+                    event.host,
+                    event.message,
+                ])
+                .unwrap();
+        }
+        let path = dir.join(format!("{service}.parquet"));
+        conn.execute_batch(&format!(
+            "COPY logs TO '{}' (FORMAT PARQUET)",
+            path.display()
+        ))
+        .unwrap();
+        path
+    }
+
+    /// The service of the [`corpus`] events, which no shared seed row has.
+    pub const SERVICE: &str = "capturecorpus";
+
+    /// Events in the [`corpus`].
+    pub const ROWS: usize = 20;
+
+    /// The `seq` of the corpus event whose message is multi-byte text.
+    pub const WIDE_SEQ: usize = 7;
+
+    /// The multi-byte message: two-, three- and four-byte characters.
+    pub const WIDE_MESSAGE: &str = "wide ✓ ünïcødé ☕🐟 end";
+
+    /// An RFC 3339 instant.
+    pub fn at(text: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// [`ROWS`] events of [`SERVICE`], one a second from
+    /// 2024-01-16T10:00:00Z, hosts alternating `web01` and `web02`; event
+    /// [`WIDE_SEQ`] carries [`WIDE_MESSAGE`], the rest `event {seq}`.
+    pub fn corpus() -> Vec<Event> {
+        let start = at("2024-01-16T10:00:00Z");
+        (0..ROWS)
+            .map(|seq| Event {
+                time: start + chrono::TimeDelta::seconds(i64::try_from(seq).unwrap()),
+                host: if seq % 2 == 0 { "web01" } else { "web02" }.to_owned(),
+                message: if seq == WIDE_SEQ {
+                    WIDE_MESSAGE.to_owned()
+                } else {
+                    format!("event {seq}")
+                },
+            })
+            .collect()
+    }
+
+    /// A fixture over the shared seed plus the [`corpus`], with `capture`
+    /// and `rate_limit`. The tempdir is leaked so it outlives the server.
+    pub async fn boot(
+        rate_limit: super::RateLimitConfig,
+        capture: trawl_config::CaptureConfig,
+    ) -> TestServer {
+        boot_with_data(rate_limit, capture).await.0
+    }
+
+    /// [`boot`], with the data root's path.
+    pub async fn boot_with_data(
+        rate_limit: super::RateLimitConfig,
+        capture: trawl_config::CaptureConfig,
+    ) -> (TestServer, String) {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let data = super::seed_data_root(tmp.path());
+        seed_hour(&data, SERVICE, &corpus());
+        let server = super::setup_with_capture(tmp.path(), data.clone(), rate_limit, capture).await;
+        std::mem::forget(tmp);
+        (server, data)
+    }
+
+    /// A refused capture took nothing: the pool has the `permits` it had
+    /// before, and a publication writer still acquires.
+    pub async fn assert_nothing_held(server: &TestServer, permits: usize, what: &str) {
+        let pool = &server.state.query.pool;
+        assert_eq!(pool.available_permits(), permits, "{what}: no permit held");
+        let writer = tokio::time::timeout(Duration::from_secs(5), pool.publication().write()).await;
+        assert!(
+            writer.is_ok(),
+            "{what}: a publication writer acquires, so no reader guard is held"
+        );
+    }
 }
 
 /// Set up a test server with fixtures and return a `TestServer` handle.
