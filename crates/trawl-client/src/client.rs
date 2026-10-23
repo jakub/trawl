@@ -12,13 +12,16 @@ use zeroize::Zeroizing;
 
 use crate::error::{ClientError, NetworkError, NetworkKind};
 use crate::types::{
-    CancelResponse, CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse,
-    ClearHistoryResponse, DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldAck,
-    FieldValuesResponse, GcPinsResponse, HealthResponse, HistoryResponse, IngestResponse,
-    ListAllRunsResponse, ListReportRunsResponse, ListSavedResponse, PreviewResponse,
-    QueriesResponse, QueryResponse, RepinStatusResponse, ReportRunResponse, ReportRunSummary,
-    RunsStatsResponse, SavedQueryResponse, ScheduleResponse, SchemaResponse, ServiceSchemaResponse,
-    StatsResponse, ValidationResponse, WhoAmIResponse,
+    CancelResponse, CaptureRequest, CaptureResponse, ResultCell, ResultList, ResultPage,
+};
+use crate::types::{
+    CatalogConflictsResponse, CatalogFieldResponse, CatalogFieldsResponse, ClearHistoryResponse,
+    DashboardSnapshot, DeleteSavedResponse, DeleteScheduleResponse, FieldAck, FieldValuesResponse,
+    GcPinsResponse, HealthResponse, HistoryResponse, IngestResponse, ListAllRunsResponse,
+    ListReportRunsResponse, ListSavedResponse, PreviewResponse, QueriesResponse, QueryResponse,
+    RepinStatusResponse, ReportRunResponse, ReportRunSummary, RunsStatsResponse,
+    SavedQueryResponse, ScheduleResponse, SchemaResponse, ServiceSchemaResponse, StatsResponse,
+    ValidationResponse, WhoAmIResponse,
 };
 use crate::types::{
     CreateSavedRequestRef, ErrorResponse, ExportRequestRef, SetScheduleRequestRef, StreamEvent,
@@ -79,11 +82,11 @@ fn json_depth_exceeds(json: &[u8], max: usize) -> bool {
 /// carries sample values.
 fn decode_preview(bytes: &[u8]) -> Result<PreviewResponse, ClientError> {
     if json_depth_exceeds(bytes, INGEST_EVENT_MAX_DEPTH + PREVIEW_WRAPPER_DEPTH) {
-        return Err(ClientError::Parse(
-            "the ingest preview report nests deeper than any event ingest accepts".into(),
+        return Err(ClientError::parse(
+            "the ingest preview report nests deeper than any event ingest accepts",
         ));
     }
-    let invalid = |_| ClientError::Parse("response is not valid JSON for an ingest preview".into());
+    let invalid = |_| ClientError::parse("response is not valid JSON for an ingest preview");
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     deserializer.disable_recursion_limit();
     let report: PreviewResponse =
@@ -330,15 +333,17 @@ impl HttpClient {
 
         let status = resp.status();
         if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            let headers = ErrorHeaders::of(&resp);
             let body = read_bounded(resp, HEALTH_BODY_CAP).await?;
             if let Ok(health) = serde_json::from_slice::<HealthResponse>(&body) {
                 return Ok((503, health));
             }
-            return Err(server_error(503, &body));
+            return Err(server_error(503, headers, &body));
         }
         if status != reqwest::StatusCode::OK {
+            let headers = ErrorHeaders::of(&resp);
             let body = read_bounded(resp, HEALTH_BODY_CAP).await?;
-            return Err(server_error(status.as_u16(), &body));
+            return Err(server_error(status.as_u16(), headers, &body));
         }
         read_json_capped(resp, HEALTH_BODY_CAP, "health")
             .await
@@ -459,6 +464,105 @@ impl HttpClient {
         let url = self.endpoint(&format!("/api/v1/saved/{id}"));
         let req = self.client.delete(&url);
         self.send_authenticated(req).await
+    }
+
+    /// Capture one query's answer as an immutable, expiring result
+    /// (`POST /api/v1/results`, needs `query`; ADR-0057).
+    ///
+    /// The bounds come from `request.window` or from the query's own time
+    /// clauses, never both. Refusals are [`ClientError::Server`]: 400 for
+    /// a bounds refusal, `capture_source_too_large` and `result_too_large`;
+    /// 429 for `capture_busy`, `capture_quota_exceeded` and the per-key
+    /// rate limit, each with
+    /// [`retry_after_secs`](ClientError::Server::retry_after_secs). The
+    /// response body is read whole, as the saved-query methods read theirs.
+    pub async fn capture(&self, request: &CaptureRequest) -> Result<CaptureResponse, ClientError> {
+        let url = self.endpoint("/api/v1/results");
+        let req = self.client.post(&url).json(request);
+        self.send_authenticated(req).await
+    }
+
+    /// List the caller's own unexpired captures, newest first
+    /// (`GET /api/v1/results`, needs `query`; ADR-0057).
+    ///
+    /// The way back to a capture whose response was lost. The response
+    /// body is read whole, as the saved-query methods read theirs.
+    pub async fn list_results(&self) -> Result<ResultList, ClientError> {
+        let url = self.endpoint("/api/v1/results");
+        let req = self.client.get(&url);
+        self.send_authenticated(req).await
+    }
+
+    /// Read one page of a captured result
+    /// (`GET /api/v1/results/{id}?offset=&limit=[&columns=]`, needs
+    /// `query`; ADR-0057).
+    ///
+    /// `offset` is the first 0-based captured row; the server answers at
+    /// most its page limit of rows whatever `limit` asks. `columns` names
+    /// display names to project, sent comma-joined in one query parameter;
+    /// each name selects every column of that name, in stored order, and
+    /// `None` reads every column. A name holding a comma cannot be named
+    /// apart from its pieces.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are
+    /// [`ClientError::Server`]: 404 for an unknown id or another key's
+    /// result, 410 `result_gone` (expired or pruned), 409
+    /// `result_unavailable` (its file is missing) and 500 `result_corrupt`
+    /// (its file does not match its digest). No body is read past
+    /// [`RESULT_PAGE_BODY_CAP`].
+    pub async fn result_page(
+        &self,
+        id: &str,
+        offset: u64,
+        limit: u64,
+        columns: Option<&[&str]>,
+    ) -> Result<ResultPage, ClientError> {
+        check_result_id(id)?;
+        let url = self.endpoint(&format!("/api/v1/results/{id}"));
+        let mut req = self
+            .client
+            .get(&url)
+            .query(&[("offset", offset), ("limit", limit)]);
+        if let Some(columns) = columns {
+            req = req.query(&[("columns", columns.join(","))]);
+        }
+        self.send_capped(req, RESULT_PAGE_BODY_CAP, "a result page")
+            .await
+    }
+
+    /// Read a byte range of one captured cell's wire JSON text
+    /// (`GET /api/v1/results/{id}/cells/{row}/{column}[?offset=&length=]`,
+    /// needs `query`; ADR-0057).
+    ///
+    /// `row` is the 0-based captured row and `column` the 0-based column
+    /// position. `offset` and `length` are sent only when given; the server
+    /// cuts the range back to a UTF-8 boundary and names the next offset
+    /// until the text ends.
+    ///
+    /// An `id` that is not 32 lowercase hex digits is
+    /// [`ClientError::InvalidUrl`] before any request. Refusals are the
+    /// ones [`Self::result_page`] names, and 404 for a row or column past
+    /// the result. No body is read past [`RESULT_CELL_BODY_CAP`].
+    pub async fn result_cell(
+        &self,
+        id: &str,
+        row: u64,
+        column: usize,
+        offset: Option<u64>,
+        length: Option<u64>,
+    ) -> Result<ResultCell, ClientError> {
+        check_result_id(id)?;
+        let url = self.endpoint(&format!("/api/v1/results/{id}/cells/{row}/{column}"));
+        let mut req = self.client.get(&url);
+        if let Some(offset) = offset {
+            req = req.query(&[("offset", offset)]);
+        }
+        if let Some(length) = length {
+            req = req.query(&[("length", length)]);
+        }
+        self.send_capped(req, RESULT_CELL_BODY_CAP, "a result cell")
+            .await
     }
 
     /// Create or update a schedule for a saved query.
@@ -588,8 +692,9 @@ impl HttpClient {
             .map_err(sanitize_reqwest_error)?;
         let status = resp.status();
         if status != reqwest::StatusCode::OK {
+            let headers = ErrorHeaders::of(&resp);
             let body = read_bounded(resp, WHOAMI_BODY_CAP).await?;
-            return Err(server_error(status.as_u16(), &body));
+            return Err(server_error(status.as_u16(), headers, &body));
         }
         read_json_capped(resp, WHOAMI_BODY_CAP, "whoami").await
     }
@@ -766,24 +871,20 @@ impl HttpClient {
         if status == 409 {
             // Two 409 shapes: a refused-needs-force plan (a RepinResponse
             // body) and the already-running error envelope.
-            let bytes = resp.bytes().await.map_err(body_read_error)?;
+            let headers = ErrorHeaders::of(&resp);
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| body_read_error(e, headers.request_id.clone()))?;
             if let Ok(refused) = serde_json::from_slice::<trawl_api::RepinResponse>(&bytes) {
                 return Ok(RepinStart::Refused(refused.job));
             }
-            let error = serde_json::from_slice::<ErrorResponse>(&bytes).map_or_else(
-                |_| {
-                    trawl_api::ErrorEnvelope::simple(
-                        trawl_api::ErrorCode::InternalError,
-                        "unknown error",
-                    )
-                },
-                |e| e.error,
-            );
-            return Err(ClientError::Server { status, error });
+            return Err(server_error(status, headers, &bytes));
         }
         let resp = check_status(resp).await?;
-        let outcome: trawl_api::RepinResponse = resp.json().await.map_err(body_read_error)?;
-        decode_repin_start(status, outcome.job)
+        let request_id = request_id_of(&resp);
+        let outcome: trawl_api::RepinResponse = read_json(resp).await?;
+        decode_repin_start(status, outcome.job).map_err(|e| e.answered_by(request_id.as_deref()))
     }
 
     /// Ask the running repin to stop
@@ -805,31 +906,27 @@ impl HttpClient {
             .map_err(sanitize_reqwest_error)?;
 
         let status = resp.status().as_u16();
+        let headers = ErrorHeaders::of(&resp);
         if !matches!(status, 202 | 409 | 404) {
             // Turns any failure status into a `Server` error; a success
             // status this endpoint never sends falls through as a protocol
             // complaint rather than being guessed at.
             check_status(resp).await?;
-            return Err(ClientError::Parse(format!(
-                "repin cancel: unexpected HTTP {status}"
-            )));
+            return Err(ClientError::Parse {
+                message: format!("repin cancel: unexpected HTTP {status}"),
+                request_id: headers.request_id,
+            });
         }
-        let bytes = resp.bytes().await.map_err(body_read_error)?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| body_read_error(e, headers.request_id.clone()))?;
         let Ok(body) = serde_json::from_slice::<trawl_api::RepinCancelResponse>(&bytes) else {
             // A 404 from a server that predates the route, or a 409 from
             // something else on the path: the error envelope, not a verdict.
-            let error = serde_json::from_slice::<ErrorResponse>(&bytes).map_or_else(
-                |_| {
-                    trawl_api::ErrorEnvelope::simple(
-                        trawl_api::ErrorCode::InternalError,
-                        "unknown error",
-                    )
-                },
-                |e| e.error,
-            );
-            return Err(ClientError::Server { status, error });
+            return Err(server_error(status, headers, &bytes));
         };
-        decode_repin_cancel(status, body)
+        decode_repin_cancel(status, body).map_err(|e| e.answered_by(headers.request_id.as_deref()))
     }
 
     /// Fetch the repin status surface
@@ -854,7 +951,10 @@ impl HttpClient {
     ) -> Result<trawl_api::RepinJobResponse, ClientError> {
         let url = self.endpoint("/api/v1/schema/repin/status");
         let req = self.client.get(&url).query(&[("id", id)]);
-        decode_repin_job(id, self.send_authenticated(req).await?)
+        let resp = self.execute_authenticated(req).await?;
+        let request_id = request_id_of(&resp);
+        let body = read_json(resp).await?;
+        decode_repin_job(id, body).map_err(|e| e.answered_by(request_id.as_deref()))
     }
 
     /// Reclaim pin slots held by dead fields
@@ -912,7 +1012,7 @@ impl HttpClient {
         let mut ndjson = String::new();
         for record in records {
             let line = serde_json::to_string(record)
-                .map_err(|e| ClientError::Parse(format!("failed to serialize record: {e}")))?;
+                .map_err(|e| ClientError::parse(format!("failed to serialize record: {e}")))?;
             ndjson.push_str(&line);
             ndjson.push('\n');
         }
@@ -928,7 +1028,7 @@ impl HttpClient {
             .map_err(sanitize_upload_error)?;
 
         let resp = check_status(resp).await?;
-        resp.json().await.map_err(body_read_error)
+        read_json(resp).await
     }
 
     /// Preview what ingest would do to a sample, storing nothing of it
@@ -961,11 +1061,15 @@ impl HttpClient {
         }
         let resp = req.send().await.map_err(sanitize_upload_error)?;
         let status = resp.status();
-        let bytes = resp.bytes().await.map_err(body_read_error)?;
+        let headers = ErrorHeaders::of(&resp);
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| body_read_error(e, headers.request_id.clone()))?;
         if status != reqwest::StatusCode::OK {
-            return Err(server_error(status.as_u16(), &bytes));
+            return Err(server_error(status.as_u16(), headers, &bytes));
         }
-        decode_preview(&bytes)
+        decode_preview(&bytes).map_err(|e| e.answered_by(headers.request_id.as_deref()))
     }
 
     /// Export query results in the specified format.
@@ -991,10 +1095,11 @@ impl HttpClient {
             .map_err(sanitize_upload_error)?;
 
         let resp = check_status(resp).await?;
+        let request_id = request_id_of(&resp);
         resp.bytes()
             .await
             .map(|b| b.to_vec())
-            .map_err(body_read_error)
+            .map_err(|e| body_read_error(e, request_id))
     }
 
     /// Stream live query results as typed events.
@@ -1096,14 +1201,36 @@ impl HttpClient {
     }
 
     /// Send an authenticated request, check for errors, and deserialize the response.
-    ///
-    /// The request is built before it is sent so its body decides how a
-    /// send failure reads: only a request that uploads something can have
-    /// its upload cut off (see [`sanitize_upload_error`]).
     async fn send_authenticated<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, ClientError> {
+        let resp = self.execute_authenticated(req).await?;
+        read_json(resp).await
+    }
+
+    /// [`Self::send_authenticated`], reading at most `cap` body bytes
+    /// through [`read_json_capped`].
+    async fn send_capped<T: serde::de::DeserializeOwned>(
+        &self,
+        req: reqwest::RequestBuilder,
+        cap: usize,
+        what: &str,
+    ) -> Result<T, ClientError> {
+        let resp = self.execute_authenticated(req).await?;
+        read_json_capped(resp, cap, what).await
+    }
+
+    /// Send an authenticated request and hand back a success response,
+    /// its body unread; a failure status is a [`ClientError::Server`].
+    ///
+    /// The request is built before it is sent so its body decides how a
+    /// send failure reads: only a request that uploads something can have
+    /// its upload cut off (see [`sanitize_upload_error`]).
+    async fn execute_authenticated(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ClientError> {
         let request = req
             .header("Authorization", self.auth_header_value())
             .build()
@@ -1114,9 +1241,59 @@ impl HttpClient {
             sanitize_reqwest_error
         };
         let resp = self.client.execute(request).await.map_err(sanitize)?;
+        check_status(resp).await
+    }
+}
 
-        let resp = check_status(resp).await?;
-        resp.json().await.map_err(body_read_error)
+/// Deserialize a success response's whole body as JSON. A body that does
+/// not decode is a [`ClientError::Parse`] carrying the response's request
+/// id.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+) -> Result<T, ClientError> {
+    let request_id = request_id_of(&resp);
+    resp.json()
+        .await
+        .map_err(|e| body_read_error(e, request_id))
+}
+
+/// The response's `X-Request-Id`: the server's correlation token for its
+/// own logs (ADR-0040). A value that is not visible ASCII is not an id.
+fn request_id_of(resp: &reqwest::Response) -> Option<String> {
+    let value = resp.headers().get("x-request-id")?.to_str().ok()?;
+    Some(value.to_owned())
+}
+
+/// The response's `Retry-After` in whole seconds. Only the delay-seconds
+/// form (digits alone) is read; the HTTP-date form, a value past
+/// `u32::MAX`, or anything else, is `None`.
+fn retry_after_of(resp: &reqwest::Response) -> Option<u32> {
+    let value = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// What an answering response's headers add to an error built from it.
+struct ErrorHeaders {
+    /// See [`request_id_of`].
+    request_id: Option<String>,
+    /// See [`retry_after_of`].
+    retry_after_secs: Option<u32>,
+}
+
+impl ErrorHeaders {
+    fn of(resp: &reqwest::Response) -> Self {
+        Self {
+            request_id: request_id_of(resp),
+            retry_after_secs: retry_after_of(resp),
+        }
     }
 }
 
@@ -1128,22 +1305,26 @@ fn decode_frame<T: serde::de::DeserializeOwned>(
     what: &str,
     data: Option<&str>,
 ) -> Result<T, ClientError> {
-    let data = data.ok_or_else(|| ClientError::Parse(format!("stream {what} has no data")))?;
+    let data = data.ok_or_else(|| ClientError::parse(format!("stream {what} has no data")))?;
     serde_json::from_str(data)
-        .map_err(|e| ClientError::Parse(format!("invalid stream {what}: {e}")))
+        .map_err(|e| ClientError::parse(format!("invalid stream {what}: {e}")))
 }
 
 /// reqwest reports every failure collecting a body as a decode error, a
 /// stall past the request's deadline included. A timeout is a transport
 /// failure, not a malformed answer, so it is a [`NetworkKind::BodyTimeout`]
 /// with the same sanitized message as a timeout before the headers. Anything
-/// else stays [`ClientError::Parse`].
-#[allow(clippy::needless_pass_by_value)] // used as `.map_err(body_read_error)`
-fn body_read_error(e: reqwest::Error) -> ClientError {
+/// else stays [`ClientError::Parse`], carrying the answering response's
+/// `request_id`.
+#[allow(clippy::needless_pass_by_value)] // the error is consumed on the timeout path
+fn body_read_error(e: reqwest::Error, request_id: Option<String>) -> ClientError {
     if e.is_timeout() {
         body_timeout(e)
     } else {
-        ClientError::Parse(e.to_string())
+        ClientError::Parse {
+            message: e.to_string(),
+            request_id,
+        }
     }
 }
 
@@ -1180,20 +1361,15 @@ fn body_timeout(e: reqwest::Error) -> ClientError {
     }
 }
 
-/// Check HTTP response status and return a `Server` error on failure.
+/// Check HTTP response status and return a `Server` error on failure. A
+/// failure body that cannot be read is an envelope that cannot be judged,
+/// so the error falls back to `unknown error`.
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
-        let error = resp.json::<ErrorResponse>().await.map_or_else(
-            |_| {
-                trawl_api::ErrorEnvelope::simple(
-                    trawl_api::ErrorCode::InternalError,
-                    "unknown error",
-                )
-            },
-            |e| e.error,
-        );
-        return Err(ClientError::Server { status, error });
+        let headers = ErrorHeaders::of(&resp);
+        let body = resp.bytes().await.unwrap_or_default();
+        return Err(server_error(status, headers, &body));
     }
     Ok(resp)
 }
@@ -1205,6 +1381,29 @@ const HEALTH_BODY_CAP: usize = 64 * 1024;
 /// The most a whoami body may hold. The daemon's names one key, its roles
 /// and its permissions, well under a kilobyte.
 const WHOAMI_BODY_CAP: usize = 64 * 1024;
+
+/// The most a result page body may hold. A page carries the result's
+/// metadata, whose column facts can quote captured values up to the
+/// server's 4 MiB capture budget, beside rows that can reach the same
+/// budget plus their JSON framing.
+pub const RESULT_PAGE_BODY_CAP: usize = 16 * 1024 * 1024;
+
+/// The most a result cell body may hold. A cell's wire text is at most
+/// the server's 4 MiB capture budget, and carrying it as a JSON string can
+/// double it: every quote and backslash in it is escaped again.
+pub const RESULT_CELL_BODY_CAP: usize = 16 * 1024 * 1024;
+
+/// Refuse a result id that is not 32 lowercase hex digits before it
+/// enters a path. The reason never quotes the id.
+fn check_result_id(id: &str) -> Result<(), ClientError> {
+    if id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidUrl(
+            "a result id is 32 lowercase hex digits".into(),
+        ))
+    }
+}
 
 /// Read a success body of at most `cap` bytes and parse it as JSON. A body
 /// past the cap is [`ClientError::TooLarge`], and the rest is never read.
@@ -1218,19 +1417,27 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
     cap: usize,
     what: &str,
 ) -> Result<T, ClientError> {
+    let request_id = request_id_of(&resp);
     let body = read_bounded(resp, cap).await?;
-    serde_json::from_slice(&body)
-        .map_err(|_| ClientError::Parse(format!("response is not valid JSON for {what}")))
+    serde_json::from_slice(&body).map_err(|_| ClientError::Parse {
+        message: format!("response is not valid JSON for {what}"),
+        request_id,
+    })
 }
 
 /// A `Server` error for `status`, carrying the body's error envelope when
-/// it holds one.
-fn server_error(status: u16, body: &[u8]) -> ClientError {
+/// it holds one and what the response's headers said.
+fn server_error(status: u16, headers: ErrorHeaders, body: &[u8]) -> ClientError {
     let error = serde_json::from_slice::<ErrorResponse>(body).map_or_else(
         |_| trawl_api::ErrorEnvelope::simple(trawl_api::ErrorCode::InternalError, "unknown error"),
         |e| e.error,
     );
-    ClientError::Server { status, error }
+    ClientError::Server {
+        status,
+        error,
+        request_id: headers.request_id,
+        retry_after_secs: headers.retry_after_secs,
+    }
 }
 
 /// Read a whole response body of at most `cap` bytes. A body that holds
@@ -1244,6 +1451,7 @@ async fn read_bounded(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>
     // A chunk's error carries no URL; restore it so the sanitized message
     // names the origin as a failure before the headers does.
     let url = resp.url().clone();
+    let request_id = request_id_of(&resp);
     let mut body = Vec::new();
     while let Some(chunk) = resp
         .chunk()
@@ -1251,7 +1459,7 @@ async fn read_bounded(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>
         .map_err(|e| body_chunk_error(e.with_url(url.clone())))?
     {
         if chunk.len() > cap - body.len() {
-            return Err(ClientError::TooLarge { cap });
+            return Err(ClientError::TooLarge { cap, request_id });
         }
         body.extend_from_slice(&chunk);
     }
@@ -1561,7 +1769,7 @@ fn decode_repin_start(
 ) -> Result<RepinStart, ClientError> {
     match (status, job.status.as_str()) {
         (202, _) => Ok(RepinStart::Started(job)),
-        (_, "running") => Err(ClientError::Parse(format!(
+        (_, "running") => Err(ClientError::parse(format!(
             "repin: HTTP {status} carried a job still marked running, which \
              this route only answers with a terminal row"
         ))),
@@ -1584,11 +1792,11 @@ fn decode_repin_job(
 ) -> Result<trawl_api::RepinJobResponse, ClientError> {
     match body.job {
         Some(job) if job.id == id => Ok(job),
-        Some(job) => Err(ClientError::Parse(format!(
+        Some(job) => Err(ClientError::parse(format!(
             "repin status: asked for job {id}, the server answered about job {}",
             job.id
         ))),
-        None => Err(ClientError::Parse(format!(
+        None => Err(ClientError::parse(format!(
             "repin status: asked for job {id}, the server answered with no job"
         ))),
     }
@@ -1610,7 +1818,7 @@ fn decode_repin_cancel(
         (202, O::Cancelling) => Ok(RepinCancel::Cancelling(body)),
         (409, O::PastPointOfNoReturn) => Ok(RepinCancel::PastPointOfNoReturn(body)),
         (404, O::NoJobRunning) => Ok(RepinCancel::NoJobRunning(body)),
-        (_, outcome) => Err(ClientError::Parse(format!(
+        (_, outcome) => Err(ClientError::parse(format!(
             "repin cancel: HTTP {status} disagrees with the body's outcome {outcome:?}"
         ))),
     }
@@ -1876,7 +2084,7 @@ mod tests {
         let err = health_answered_with(http_response("200 OK", "text/html", b"<html>hi</html>"))
             .await
             .expect_err("html is not a health body");
-        assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+        assert!(matches!(err, ClientError::Parse { .. }), "{err:?}");
     }
 
     // ── real listeners ──────────────────────────────────────────────────
@@ -2094,7 +2302,7 @@ mod tests {
             ("event: data\n\n", "stream event has no data"),
         ] {
             let events = stream_answered_with(body).await;
-            let [Err(ClientError::Parse(message))] = events.as_slice() else {
+            let [Err(ClientError::Parse { message, .. })] = events.as_slice() else {
                 panic!("{body:?} must end in one parse error, got {events:?}");
             };
             assert!(message.contains(named), "{body:?}: {message}");
@@ -2246,7 +2454,7 @@ mod tests {
         )
         .await;
         let err = result.expect_err("not a report");
-        assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+        assert!(matches!(err, ClientError::Parse { .. }), "{err:?}");
         assert!(!err.to_string().contains("canary"), "{err}");
     }
 
@@ -2334,7 +2542,7 @@ mod tests {
             )
             .await;
             let err = result.expect_err("deeper than ingest accepts");
-            assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+            assert!(matches!(err, ClientError::Parse { .. }), "{err:?}");
             assert!(!err.to_string().contains("canary"), "{err}");
         }
         // Far deeper is refused the same way, before any recursion.
@@ -2348,7 +2556,10 @@ mod tests {
             ),
         )
         .await;
-        assert!(matches!(result, Err(ClientError::Parse(_))), "{result:?}");
+        assert!(
+            matches!(result, Err(ClientError::Parse { .. })),
+            "{result:?}"
+        );
     }
 
     /// Brackets inside strings, escaped quotes included, are text, not
@@ -2430,7 +2641,7 @@ mod tests {
         .await
         .expect_err("a body past the cap is not a health answer");
         assert!(
-            matches!(err, ClientError::TooLarge { cap } if cap == HEALTH_BODY_CAP),
+            matches!(err, ClientError::TooLarge { cap, .. } if cap == HEALTH_BODY_CAP),
             "{err:?}"
         );
     }
@@ -2472,7 +2683,7 @@ mod tests {
             .await
             .expect_err("a body past the cap is not read");
         assert!(
-            matches!(err, ClientError::TooLarge { cap } if cap == HEALTH_BODY_CAP),
+            matches!(err, ClientError::TooLarge { cap, .. } if cap == HEALTH_BODY_CAP),
             "{err:?}"
         );
     }
@@ -2508,7 +2719,7 @@ mod tests {
                 .await
                 .expect_err("a body past the cap is not an answer");
             assert!(
-                matches!(err, ClientError::TooLarge { cap } if cap == HEALTH_BODY_CAP),
+                matches!(err, ClientError::TooLarge { cap, .. } if cap == HEALTH_BODY_CAP),
                 "{status}: {err:?}"
             );
         }
@@ -2528,7 +2739,7 @@ mod tests {
                 .await
                 .expect_err("a body past the cap is not an answer");
             assert!(
-                matches!(err, ClientError::TooLarge { cap } if cap == WHOAMI_BODY_CAP),
+                matches!(err, ClientError::TooLarge { cap, .. } if cap == WHOAMI_BODY_CAP),
                 "{status}: {err:?}"
             );
         }
@@ -2551,7 +2762,7 @@ mod tests {
             .await
             .expect_err("a body past the cap is not read");
         assert!(
-            matches!(err, ClientError::TooLarge { cap } if cap == WHOAMI_BODY_CAP),
+            matches!(err, ClientError::TooLarge { cap, .. } if cap == WHOAMI_BODY_CAP),
             "{err:?}"
         );
     }
@@ -2571,7 +2782,7 @@ mod tests {
             whoami_answered_with(http_response("200 OK", "application/json", body.as_bytes()))
                 .await
                 .expect_err("an unknown kind does not decode");
-        assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+        assert!(matches!(err, ClientError::Parse { .. }), "{err:?}");
         assert_eq!(
             err.to_string(),
             "response parse error: response is not valid JSON for whoami"
@@ -2856,7 +3067,7 @@ mod tests {
             )
         );
         assert!(
-            matches!(result, Err(ClientError::TooLarge { cap }) if cap == OriginProbe::BODY_CAP),
+            matches!(result, Err(ClientError::TooLarge { cap, .. }) if cap == OriginProbe::BODY_CAP),
             "{result:?}"
         );
 
@@ -3268,7 +3479,7 @@ mod tests {
     fn a_running_job_under_a_200_is_a_protocol_error() {
         let err = decode_repin_start(200, start_job("running"))
             .expect_err("200 + running must not decode");
-        assert!(matches!(err, ClientError::Parse(_)), "{err:?}");
+        assert!(matches!(err, ClientError::Parse { .. }), "{err:?}");
     }
 
     /// A read by id answers the job asked about or nothing a caller may
@@ -3291,14 +3502,14 @@ mod tests {
         let err = decode_repin_job(1, RepinStatusResponse { job: Some(newer) })
             .expect_err("another job is not an answer about job 1");
         assert!(
-            matches!(&err, ClientError::Parse(m) if m.contains("job 1") && m.contains("job 2")),
+            matches!(&err, ClientError::Parse { message: m, .. } if m.contains("job 1") && m.contains("job 2")),
             "{err:?}"
         );
 
         let err = decode_repin_job(1, RepinStatusResponse { job: None })
             .expect_err("no job is not an answer about job 1");
         assert!(
-            matches!(&err, ClientError::Parse(m) if m.contains("job 1")),
+            matches!(&err, ClientError::Parse { message: m, .. } if m.contains("job 1")),
             "{err:?}"
         );
     }
@@ -3350,7 +3561,7 @@ mod tests {
             let err = decode_repin_cancel(status, cancel_body(outcome))
                 .expect_err("mismatch must not decode");
             assert!(
-                matches!(err, ClientError::Parse(_)),
+                matches!(err, ClientError::Parse { .. }),
                 "{status} + {outcome:?} gave {err:?}"
             );
         }
@@ -3447,6 +3658,8 @@ mod tests {
         let err = ClientError::Server {
             status: 409,
             error: envelope.error,
+            request_id: None,
+            retry_after_secs: None,
         };
         assert_eq!(
             err.error_envelope().map(|e| e.message.as_str()),

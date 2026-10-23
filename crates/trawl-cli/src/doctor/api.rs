@@ -236,9 +236,9 @@ mod witness {
 fn answered<T>(result: &Result<T, ClientError>) -> bool {
     match result {
         Ok(_)
-        | Err(ClientError::Server { .. } | ClientError::Parse(_) | ClientError::TooLarge { .. }) => {
-            true
-        }
+        | Err(
+            ClientError::Server { .. } | ClientError::Parse { .. } | ClientError::TooLarge { .. },
+        ) => true,
         Err(e) => matches!(
             e.network_kind(),
             Some(NetworkKind::Redirect | NetworkKind::BodyTimeout | NetworkKind::BodyRead)
@@ -589,9 +589,9 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
         // and typed code only: the doctor could not look, and the server
         // is not another service. No witness was minted, so the key stays
         // home.
-        ClientError::Server { status: 503, error }
-            if error.code == ErrorCode::RequestLimitReached =>
-        {
+        ClientError::Server {
+            status: 503, error, ..
+        } if error.code == ErrorCode::RequestLimitReached => {
             check.outcome = Outcome::NotSampled;
             check.detail = Some(health::REQUEST_LIMIT_REFUSED.to_owned());
             with_next(
@@ -609,7 +609,7 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
             "check that the URL names trawld's API, not a proxy or another service, and read \
              the server's log",
         ),
-        ClientError::Parse(_) => with_next(
+        ClientError::Parse { .. } => with_next(
             with_reason(check, format!("the answer is not a trawl {what} response")),
             "check that the URL names trawld's API, not another service",
         ),
@@ -808,7 +808,10 @@ mod tests {
 
         for other in [
             ClientError::InvalidUrl("unsupported".to_owned()),
-            ClientError::Parse("tls backend".to_owned()),
+            ClientError::Parse {
+                message: "tls backend".to_owned(),
+                request_id: None,
+            },
         ] {
             let check = not_built_row(row(API_TRANSPORT, Outcome::Complete), Some(&other));
             assert_eq!(check.outcome, Outcome::Failed, "{other:?}");

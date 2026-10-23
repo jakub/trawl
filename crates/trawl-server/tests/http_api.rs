@@ -1349,7 +1349,7 @@ async fn retained_work_is_listed_once_and_carries_its_display_metadata() {
     // the request already answered, and the key that submitted it can
     // still ask for the work to stop while a twin cannot.
     match b.cancel_query(id).await {
-        Err(trawl_client::ClientError::Server { status, error }) => {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
             assert_eq!(status, 403);
             assert_eq!(error.message, "cannot cancel this query");
         }
@@ -2441,7 +2441,7 @@ async fn cancel_query_isolated_by_key_id_not_name() {
     // ownership gate — the query is guaranteed still in-flight here.
     let denied = b.cancel_query(target).await;
     match denied {
-        Err(trawl_client::ClientError::Server { status, error }) => {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
             assert_eq!(status, 403, "twin key B must not cancel key A's query");
             assert_eq!(error.code, trawl_api::ErrorCode::Forbidden);
             assert_eq!(error.message, "cannot cancel this query");
@@ -2605,7 +2605,7 @@ async fn query_pagination_page_past_max_rows_is_bad_request() {
     // ends past the cap is request validation, not an ingest failure.
     let result = client.query_paginated("*", Some(10), Some(100_000)).await;
     match result {
-        Err(trawl_client::ClientError::Server { status, error }) => {
+        Err(trawl_client::ClientError::Server { status, error, .. }) => {
             assert_eq!(status, 400);
             assert_eq!(error.code, trawl_api::ErrorCode::BadRequest);
             assert_eq!(
@@ -2976,7 +2976,7 @@ async fn response_includes_ulid_request_id() {
 fn assert_403<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) {
     let err = result.expect_err("expected 403 but got success");
     match err {
-        trawl_client::ClientError::Server { status, error } => {
+        trawl_client::ClientError::Server { status, error, .. } => {
             assert_eq!(status, 403, "expected 403, got {status}");
             assert_eq!(error.code, trawl_api::ErrorCode::Forbidden);
             assert_eq!(error.message, "insufficient permissions");
@@ -3055,7 +3055,7 @@ fn assert_result_too_large<T: std::fmt::Debug>(
     what: &str,
 ) {
     match result.expect_err(what) {
-        trawl_client::ClientError::Server { status, error } => {
+        trawl_client::ClientError::Server { status, error, .. } => {
             assert_eq!(status, 400, "{what}");
             assert_eq!(error.code, trawl_api::ErrorCode::ResultTooLarge, "{what}");
         }
@@ -3642,7 +3642,7 @@ async fn repin_permission_matrix() {
         .await
         .expect_err("unpinned field refuses on the merits");
     match err {
-        trawl_client::ClientError::Server { status, error } => {
+        trawl_client::ClientError::Server { status, error, .. } => {
             assert_eq!(status, 400);
             assert!(error.message.contains("not a pinned field"), "{error:?}");
         }
@@ -4005,7 +4005,7 @@ async fn shutdown_set_before_boot_stops_the_accept_loop() {
 /// sides.
 fn refusal<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) -> (u16, String) {
     match result.expect_err("expected a refusal") {
-        trawl_client::ClientError::Server { status, error } => (status, error.message),
+        trawl_client::ClientError::Server { status, error, .. } => (status, error.message),
         other => panic!("expected a server error, got: {other:?}"),
     }
 }

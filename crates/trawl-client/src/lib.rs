@@ -6,8 +6,8 @@
 //!
 //! Used by `trawl-cli` (CLI and TUI modes) and by the server's own
 //! integration tests. Wraps the daemon's HTTP API: bearer authentication,
-//! query submission, catalog reads, ingest and its preview, export, and SSE
-//! streaming.
+//! query submission, captured results, catalog reads, ingest and its
+//! preview, export, and SSE streaming.
 
 pub mod client;
 pub mod error;
@@ -18,18 +18,20 @@ pub use client::{
 };
 pub use error::{ClientError, NetworkError, NetworkKind};
 pub use types::{
-    ActiveQuerySnapshot, CancelResponse, CatalogConflictRow, CatalogConflictsResponse,
-    CatalogFieldResponse, CatalogFieldServiceRow, CatalogFieldSummary, CatalogFieldsResponse,
-    ClearHistoryResponse, CompletedQuerySnapshot, CreateSavedRequest, DashboardSnapshot,
-    DegradedVerdict, DeleteSavedResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse,
-    ErrorSpan, ExportFormat, ExportRequest, FieldAck, FieldChangeKind, FieldChangeWire,
-    FieldValuesResponse, GcPinCandidate, GcPinsResponse, HealthResponse, HealthStatus,
-    HistoryEntryResponse, HistoryResponse, IngestEventError, IngestResponse,
-    ListReportRunsResponse, ListSavedResponse, MAX_PREVIEW_EVENTS, PLACEHOLDER_PEER,
-    PaginationMeta, PreviewDerivation, PreviewEvent, PreviewLineage, PreviewPeer, PreviewResponse,
-    QueriesResponse, QueryActiveEntry, QueryRecentEntry, QueryRequest, QueryResponse, QueryStatus,
-    RepinCancelOutcome, RepinCancelResponse, RepinJobResponse, RepinLiveness, RepinRequest,
-    RepinResponse, RepinStatusResponse, ReportRunResponse, ReportRunSummary, SavedQueryResponse,
-    SchemaColumnResponse, SchemaResponse, SeverityLineage, SeveritySourceSpec, StatsResponse,
-    StreamEvent, TimeLineage, UpdateSavedRequest, ValidationResponse, WhoAmIResponse,
+    ActiveQuerySnapshot, CancelResponse, CaptureRequest, CaptureResponse, CaptureWindow,
+    CapturedResult, CatalogConflictRow, CatalogConflictsResponse, CatalogFieldResponse,
+    CatalogFieldServiceRow, CatalogFieldSummary, CatalogFieldsResponse, ClearHistoryResponse,
+    ColumnFacts, CompletedQuerySnapshot, CreateSavedRequest, DashboardSnapshot, DegradedVerdict,
+    DeleteSavedResponse, ErrorCode, ErrorDetail, ErrorEnvelope, ErrorResponse, ErrorSpan,
+    ExportFormat, ExportRequest, FieldAck, FieldChangeKind, FieldChangeWire, FieldValuesResponse,
+    GcPinCandidate, GcPinsResponse, HealthResponse, HealthStatus, HistoryEntryResponse,
+    HistoryResponse, IngestEventError, IngestResponse, ListReportRunsResponse, ListSavedResponse,
+    MAX_PREVIEW_EVENTS, PLACEHOLDER_PEER, PaginationMeta, PreviewDerivation, PreviewEvent,
+    PreviewLineage, PreviewPeer, PreviewResponse, QueriesResponse, QueryActiveEntry,
+    QueryRecentEntry, QueryRequest, QueryResponse, QueryStatus, RepinCancelOutcome,
+    RepinCancelResponse, RepinJobResponse, RepinLiveness, RepinRequest, RepinResponse,
+    RepinStatusResponse, ReportRunResponse, ReportRunSummary, ResultCell, ResultColumn, ResultList,
+    ResultPage, ResultShape, ResultSource, ResultState, SavedQueryResponse, SchemaColumnResponse,
+    SchemaResponse, SeverityLineage, SeveritySourceSpec, StatsResponse, StoredAs, StreamEvent,
+    TimeLineage, UpdateSavedRequest, ValidationResponse, ValueCount, WhoAmIResponse,
 };

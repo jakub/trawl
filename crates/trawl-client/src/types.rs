@@ -89,6 +89,11 @@ pub use trawl_api::ingest_preview::{
     PreviewEvent, PreviewLineage, PreviewPeer, PreviewResponse, SeverityLineage,
     SeveritySourceSpec, TimeLineage,
 };
+pub use trawl_api::results::{
+    CaptureRequest, CaptureResponse, CaptureWindow, CapturedResult, ColumnFacts, ResultCell,
+    ResultColumn, ResultList, ResultPage, ResultShape, ResultSource, ResultState, StoredAs,
+    ValueCount,
+};
 pub use trawl_api::{
     ActiveQuerySnapshot, CancelResponse, CatalogConflictRow, CatalogConflictsResponse,
     CatalogFieldResponse, CatalogFieldServiceRow, CatalogFieldSummary, CatalogFieldsResponse,

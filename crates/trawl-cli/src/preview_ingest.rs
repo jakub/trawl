@@ -151,11 +151,14 @@ fn check_complete(report: &PreviewResponse) -> Result<(), CliError> {
     if accepted == report.accepted && rejected == report.rejected {
         return Ok(());
     }
-    Err(CliError::Client(ClientError::Parse(format!(
-        "the ingest preview report is incomplete: it counts {} accepted and {} rejected \
-         but lists {accepted} accepted and {rejected} rejected events",
-        report.accepted, report.rejected
-    ))))
+    Err(CliError::Client(ClientError::Parse {
+        message: format!(
+            "the ingest preview report is incomplete: it counts {} accepted and {} rejected \
+             but lists {accepted} accepted and {rejected} rejected events",
+            report.accepted, report.rejected
+        ),
+        request_id: None,
+    }))
 }
 
 /// The table's columns, in order.
@@ -464,6 +467,8 @@ mod tests {
         Err(CliError::Client(ClientError::Server {
             status,
             error: ErrorEnvelope::simple(ErrorCode::Forbidden, "insufficient permissions"),
+            request_id: None,
+            retry_after_secs: None,
         }))
     }
 
@@ -511,6 +516,8 @@ mod tests {
                 ErrorCode::Forbidden,
                 "denied\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[31mred\u{9b}2J\r\ntrawl: forged\u{202e}",
             ),
+            request_id: None,
+            retry_after_secs: None,
         }));
         let (status, stderr) = status_and_stderr(hostile);
         assert_eq!(status, NO_REPORT);
@@ -537,7 +544,7 @@ mod tests {
         short.events.pop();
         let err = check_complete(&short).expect_err("one event missing");
         assert!(
-            matches!(&err, CliError::Client(ClientError::Parse(m)) if m.contains("incomplete")),
+            matches!(&err, CliError::Client(ClientError::Parse { message: m, .. }) if m.contains("incomplete")),
             "{err:?}"
         );
         assert_eq!(status_and_stderr(Err(err)).0, NO_REPORT);

@@ -61,7 +61,7 @@ mod unavailable_run_result {
     /// back instead.
     fn refusal<T: std::fmt::Debug>(outcome: Result<T, ClientError>) -> (u16, String) {
         match outcome {
-            Err(ClientError::Server { status, error }) => (status, error.message),
+            Err(ClientError::Server { status, error, .. }) => (status, error.message),
             other => panic!("expected a refusal, got: {other:?}"),
         }
     }

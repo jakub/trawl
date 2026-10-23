@@ -262,7 +262,7 @@ async fn kv_tail_over_group_cap_refuses_over_http() {
         )
         .await;
     match refused.expect_err("a tail past the group cap must not answer") {
-        trawl_client::ClientError::Server { status, error } => {
+        trawl_client::ClientError::Server { status, error, .. } => {
             assert_eq!(status, 400);
             assert_eq!(error.code, trawl_api::ErrorCode::ResultTooLarge);
             assert_eq!(

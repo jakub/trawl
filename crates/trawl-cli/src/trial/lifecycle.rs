@@ -1323,9 +1323,10 @@ async fn count_samples(
         })?;
     counts_by_service(&response.result).ok_or_else(|| TrialError::Api {
         url: url.to_owned(),
-        source: trawl_client::ClientError::Parse(format!(
-            "`{COUNT_QUERY}` returned columns trawl cannot read"
-        )),
+        source: trawl_client::ClientError::Parse {
+            message: format!("`{COUNT_QUERY}` returned columns trawl cannot read"),
+            request_id: None,
+        },
     })
 }
 

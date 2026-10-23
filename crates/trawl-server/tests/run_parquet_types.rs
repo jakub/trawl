@@ -107,7 +107,7 @@ async fn served(client: &HttpClient, saved_id: i64, run_id: i64) -> QueryResult 
 
 fn refusal<T: std::fmt::Debug>(outcome: Result<T, ClientError>) -> (u16, String) {
     match outcome {
-        Err(ClientError::Server { status, error }) => (status, error.message),
+        Err(ClientError::Server { status, error, .. }) => (status, error.message),
         other => panic!("expected a refusal, got: {other:?}"),
     }
 }

@@ -1195,7 +1195,7 @@ async fn gc_pins_route_surfaces_a_refusal_as_a_409() {
         .await
         .expect_err("a repin owning the data root refuses gc");
     match err {
-        trawl_client::ClientError::Server { status, error } => {
+        trawl_client::ClientError::Server { status, error, .. } => {
             assert_eq!(status, 409);
             assert!(error.message.contains("repin"), "{error:?}");
         }

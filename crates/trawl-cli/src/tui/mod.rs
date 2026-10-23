@@ -1015,7 +1015,9 @@ fn snapshot_large_unsigned_exact() {
 /// re-assert a failure the run did not have.
 fn run_result_error_message(e: &ClientError) -> String {
     match e {
-        ClientError::Server { status: 409, error } => error.message.clone(),
+        ClientError::Server {
+            status: 409, error, ..
+        } => error.message.clone(),
         other => format!("Failed to fetch run result: {other}"),
     }
 }
@@ -1030,6 +1032,8 @@ fn unavailable_result_toast() {
     let conflict = ClientError::Server {
         status: 409,
         error: trawl_api::ErrorEnvelope::simple(trawl_api::ErrorCode::BadRequest, SENTENCE),
+        request_id: None,
+        retry_after_secs: None,
     };
     assert_eq!(run_result_error_message(&conflict), SENTENCE);
 

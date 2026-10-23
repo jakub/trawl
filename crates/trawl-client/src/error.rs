@@ -16,17 +16,36 @@ pub enum ClientError {
     Network(NetworkError),
 
     /// Server returned a non-success status with structured error info.
-    #[error("server error (HTTP {status}): {}", error.message)]
+    #[error(
+        "server error (HTTP {status}): {}{}",
+        error.message,
+        RequestSuffix(request_id.as_deref())
+    )]
     Server {
         /// HTTP status code.
         status: u16,
         /// Structured error envelope from the server.
         error: ErrorEnvelope,
+        /// The response's `X-Request-Id`, when it carried one.
+        request_id: Option<String>,
+        /// The response's `Retry-After` in seconds, when it carried the
+        /// numeric form. The HTTP-date form, a value past `u32::MAX`, or
+        /// anything else, is `None`. A `u32`, so the error stays small
+        /// enough to return by value.
+        retry_after_secs: Option<u32>,
     },
 
     /// Failed to parse the server's response.
-    #[error("response parse error: {0}")]
-    Parse(String),
+    #[error("response parse error: {message}")]
+    Parse {
+        /// What did not parse. Never quotes the body.
+        message: String,
+        /// The response's `X-Request-Id`, when the failure came from a
+        /// response that carried one. `None` for a failure with no
+        /// response behind it, such as a stream frame or a request body
+        /// that did not serialize.
+        request_id: Option<String>,
+    },
 
     /// A pinned CA bundle holds no usable certificate. The reason never
     /// quotes the bundle's bytes.
@@ -39,6 +58,8 @@ pub enum ClientError {
     TooLarge {
         /// The most bytes the endpoint's body may hold.
         cap: usize,
+        /// The response's `X-Request-Id`, when it carried one.
+        request_id: Option<String>,
     },
 
     /// A URL the client refuses to build on. The reason never quotes the
@@ -105,7 +126,60 @@ impl fmt::Display for NetworkError {
     }
 }
 
+/// Renders ` (request <id>)` after a server error's message when the
+/// response named a request id, so a CLI user can quote it.
+struct RequestSuffix<'a>(Option<&'a str>);
+
+impl fmt::Display for RequestSuffix<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(id) => write!(f, " (request {id})"),
+            None => Ok(()),
+        }
+    }
+}
+
 impl ClientError {
+    /// A parse failure with no response behind it.
+    pub(crate) fn parse(message: impl Into<String>) -> Self {
+        Self::Parse {
+            message: message.into(),
+            request_id: None,
+        }
+    }
+
+    /// The server's `X-Request-Id` for the response this error came from.
+    ///
+    /// The id is the server's correlation token for its own logs
+    /// (ADR-0040): quoting it lets an operator find the request's failure
+    /// event. The client never generates one. Present for every error that
+    /// saw response headers carrying it ([`Self::Server`], a response body
+    /// that did not parse, [`Self::TooLarge`]); `None` for
+    /// [`Self::Network`], [`Self::InvalidCa`] and [`Self::InvalidUrl`],
+    /// which have no response.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Server { request_id, .. }
+            | Self::Parse { request_id, .. }
+            | Self::TooLarge { request_id, .. } => request_id.as_deref(),
+            Self::Network(_) | Self::InvalidCa(_) | Self::InvalidUrl(_) => None,
+        }
+    }
+
+    /// This error, naming `id` as its response's request id when it is a
+    /// response error that names none yet. For decode steps that only see
+    /// a body, so the caller holding the response attaches its id.
+    pub(crate) fn answered_by(mut self, id: Option<&str>) -> Self {
+        if let Self::Server { request_id, .. }
+        | Self::Parse { request_id, .. }
+        | Self::TooLarge { request_id, .. } = &mut self
+            && request_id.is_none()
+        {
+            *request_id = id.map(str::to_owned);
+        }
+        self
+    }
+
     /// The kind of transport failure, if this is a network error.
     pub fn network_kind(&self) -> Option<NetworkKind> {
         match self {

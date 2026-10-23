@@ -218,7 +218,7 @@ async fn a_read_413_is_the_server_refusal() {
     let error = exchange(client.ingest_preview(body, None), served)
         .await
         .expect_err("a 413 has no report");
-    let ClientError::Server { status, error } = &error else {
+    let ClientError::Server { status, error, .. } = &error else {
         panic!("a read 413 is a server error: {error:?}");
     };
     assert_eq!(*status, 413);
@@ -245,7 +245,7 @@ async fn a_read_503_request_limit_is_the_server_refusal() {
         .await
         .expect_err("a 503 has no report");
     assert_eq!(error.network_kind(), None, "{error:?}");
-    let ClientError::Server { status, error } = &error else {
+    let ClientError::Server { status, error, .. } = &error else {
         panic!("a read 503 is a server error: {error:?}");
     };
     assert_eq!(*status, 503);
@@ -257,7 +257,9 @@ async fn a_read_503_request_limit_is_the_server_refusal() {
     assert_ne!(
         ClientError::Server {
             status: 503,
-            error: error.clone()
+            error: error.clone(),
+            request_id: None,
+            retry_after_secs: None,
         }
         .to_string(),
         CUT_OFF
