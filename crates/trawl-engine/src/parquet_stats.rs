@@ -508,6 +508,59 @@ pub fn read_file_stats(path: &Path) -> Result<FileStats, ParquetStatsError> {
     })
 }
 
+/// Read `column`'s min and max in each of a parquet file's row groups, in
+/// row-group order, for a decision that must hold for every row the file
+/// holds.
+///
+/// [`read_file_stats`] folds a file's bounds for display, and a missing
+/// min or max is neutral in that fold, so its bounds can leave out the
+/// rows of a row group that carried none. This reader is complete instead:
+/// it answers `None` when the file declares no leaf `column`, or when any
+/// row group's chunk of it lacks a min or a max that decodes. A file with
+/// no row groups holds no rows and answers an empty list.
+///
+/// # Errors
+/// Returns [`ParquetStatsError::Open`] if the file cannot be opened and
+/// [`ParquetStatsError::Footer`] if its footer cannot be parsed.
+pub fn read_row_group_bounds(
+    path: &Path,
+    column: &str,
+) -> Result<Option<Vec<(StatVal, StatVal)>>, ParquetStatsError> {
+    let file = File::open(path).map_err(|source| ParquetStatsError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let reader = SerializedFileReader::new(file).map_err(|source| ParquetStatsError::Footer {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let meta = reader.metadata();
+    let schema = meta.file_metadata().schema_descr();
+    let Some(index) = schema
+        .columns()
+        .iter()
+        .position(|leaf| leaf.path().string() == column)
+    else {
+        return Ok(None);
+    };
+    let kind = SampleKind::of(&schema.column(index));
+
+    let mut bounds = Vec::with_capacity(meta.num_row_groups());
+    for rg in meta.row_groups() {
+        let decoded = rg.columns().get(index).and_then(|cc| {
+            let stats = cc.statistics()?;
+            let min = StatVal::decode(kind, stats, stats.min_bytes_opt()?)?;
+            let max = StatVal::decode(kind, stats, stats.max_bytes_opt()?)?;
+            Some((min, max))
+        });
+        let Some(pair) = decoded else {
+            return Ok(None);
+        };
+        bounds.push(pair);
+    }
+    Ok(Some(bounds))
+}
+
 /// Read the column names a parquet file declares, from its schema
 /// descriptor alone.
 ///
@@ -611,6 +664,62 @@ impl StatsAccumulator {
                 compressed_bytes: c.compressed_bytes,
             })
             .collect()
+    }
+}
+
+/// Footer surgery for tests: a legal parquet footer that no writer trawl
+/// runs produces, for this crate's tests and, through the `test-support`
+/// feature, trawl-server's. No production consumer enables it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixture {
+    use std::fs::File;
+    use std::path::Path;
+
+    use parquet::file::metadata::ParquetMetaDataWriter;
+    use parquet::file::reader::{FileReader as _, SerializedFileReader};
+
+    /// Rewrite the footer of the parquet file at `path` without the
+    /// statistics of `column`'s chunk in row group `row_group`, as a writer
+    /// that keeps none for it would. The data pages stay byte for byte, so
+    /// a reader still reads every row of that chunk.
+    ///
+    /// # Panics
+    /// When the file is not parquet or has no such row group or column.
+    pub fn drop_statistics(path: &Path, row_group: usize, column: &str) {
+        let reader = SerializedFileReader::new(File::open(path).expect("open the parquet file"))
+            .expect("a parquet footer");
+        let meta = reader.metadata().clone();
+        drop(reader);
+        let mut groups = meta.row_groups().to_vec();
+        let group = groups.get(row_group).expect("the row group").clone();
+        let mut chunks = group.columns().to_vec();
+        let chunk = chunks
+            .iter_mut()
+            .find(|chunk| chunk.column_path().string() == column)
+            .expect("the column");
+        *chunk = chunk
+            .clone()
+            .into_builder()
+            .clear_statistics()
+            .build()
+            .expect("the chunk without statistics");
+        groups[row_group] = group
+            .into_builder()
+            .set_column_metadata(chunks)
+            .build()
+            .expect("the row group without the chunk's statistics");
+        let meta = meta.into_builder().set_row_groups(groups).build();
+
+        // A file ends with its footer, the footer's length as 4 bytes, and
+        // the 4-byte magic `PAR1`, which the writer puts back.
+        let mut bytes = std::fs::read(path).expect("read the parquet file");
+        let tail = bytes.len() - 8;
+        let footer = u32::from_le_bytes(bytes[tail..tail + 4].try_into().expect("4 bytes"));
+        bytes.truncate(tail - usize::try_from(footer).expect("a footer length"));
+        ParquetMetaDataWriter::new(&mut bytes, &meta)
+            .finish()
+            .expect("write the footer");
+        std::fs::write(path, bytes).expect("rewrite the parquet file");
     }
 }
 
@@ -1152,5 +1261,59 @@ mod tests {
             read_file_stats(path),
             Err(ParquetStatsError::Open { .. })
         ));
+        assert!(matches!(
+            read_row_group_bounds(path, "t"),
+            Err(ParquetStatsError::Open { .. })
+        ));
+    }
+
+    /// The raw ticks of each row group's bounds, for readable asserts.
+    fn ticks(bounds: &[(StatVal, StatVal)]) -> Vec<(i64, i64)> {
+        bounds
+            .iter()
+            .map(|pair| match pair {
+                (StatVal::Timestamp { raw: min, .. }, StatVal::Timestamp { raw: max, .. }) => {
+                    (*min, *max)
+                }
+                other => panic!("not timestamp bounds: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Every row group's bounds, in order; and none at all once one row
+    /// group's chunk has no statistics, where the display fold keeps the
+    /// other groups' bounds as if they were the file's.
+    #[test]
+    fn row_group_bounds_are_complete_or_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groups.parquet");
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT make_timestamp(i) AS t, i AS n FROM range(4096) r(i)) \
+             TO '{}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)",
+            path.display()
+        ))
+        .unwrap();
+
+        let bounds = read_row_group_bounds(&path, "t").unwrap().unwrap();
+        assert_eq!(ticks(&bounds), [(0, 2047), (2048, 4095)]);
+        assert!(
+            read_row_group_bounds(&path, "absent").unwrap().is_none(),
+            "no such column"
+        );
+
+        fixture::drop_statistics(&path, 1, "t");
+        assert!(read_row_group_bounds(&path, "t").unwrap().is_none());
+        let n = read_row_group_bounds(&path, "n").unwrap().unwrap();
+        assert_eq!(n.len(), 2, "the other column keeps its statistics");
+        let (min, max) = samples_of(&[path.as_path()], "t");
+        assert_eq!(
+            (min.as_deref(), max.as_deref()),
+            (
+                Some("1970-01-01T00:00:00.000000"),
+                Some("1970-01-01T00:00:00.002047")
+            ),
+            "the display fold is the first group's alone"
+        );
     }
 }

@@ -21,7 +21,9 @@ use chrono::{DateTime, NaiveDateTime, Timelike as _, Utc};
 use trawl_core::ast::{FieldFilter, FilterOp, FilterValue, Query, SearchToken};
 use trawl_engine::cancel::CancelLatch;
 use trawl_engine::error::EngineError;
-use trawl_engine::parquet_stats::{ParquetStatsError, StatVal, TimestampUnit, read_file_stats};
+use trawl_engine::parquet_stats::{
+    ParquetStatsError, StatVal, TimestampUnit, read_row_group_bounds,
+};
 
 /// Time filter padding (seconds) to account for WAL compaction delay.
 /// Events ingested at time T may land in the hourly partition for T + ~20s,
@@ -262,7 +264,7 @@ impl SourceSelection {
 /// The bytes of parquet `selection` reaches that can hold an event of the
 /// window `[start, end)`: the summed size of every regular file its pattern
 /// matches in its directories, less each file whose footer statistics put
-/// every `_time` it holds outside the window.
+/// every row group's `_time` outside the window.
 ///
 /// Partitions are named by when compaction wrote them and ingest keeps the
 /// `_time` a sender says (`ingest::envelope`), so no directory name bounds
@@ -270,11 +272,13 @@ impl SourceSelection {
 /// `/query` reads for the same text, and only the files themselves can say
 /// they hold nothing in the window. The engine's `_time` bounds skip the
 /// same row groups by the same statistics, so a file left out here is one
-/// whose rows the read would not keep. A file counts whole when its footer
-/// gives no such proof: no `_time` column, `_time` not a timestamp in every
-/// row group, no min or max, or a footer the reader refuses. Ticks are read
-/// as UTC whether or not the file marks the column UTC-adjusted, as the
-/// engine's UTC session casts them.
+/// whose rows the read would not keep. The proof is per row group and must
+/// cover every one ([`read_row_group_bounds`]): a file counts whole when its
+/// footer gives none, which is no `_time` column, a row group whose `_time`
+/// chunk has no min or max, `_time` not a timestamp, one row group whose
+/// bounds reach into the window, or a footer the reader refuses. Ticks are
+/// read as UTC whether or not the file marks the column UTC-adjusted, as
+/// the engine's UTC session casts them.
 ///
 /// The walk lists the directories on disk; it never builds a path the disk
 /// does not hold. It checks `cancel` before each entry and stops with
@@ -376,13 +380,13 @@ fn file_bytes(entry: &std::fs::DirEntry, window: Window) -> Result<u64, EngineEr
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(EngineError::Io(e)),
     };
-    match read_file_stats(&entry.path()) {
-        Ok(stats) => {
-            let outside = stats
-                .columns
-                .iter()
-                .find(|column| column.name == trawl_core::schema::TIME)
-                .is_some_and(|time| outside_window(time.samples.min(), time.samples.max(), window));
+    match read_row_group_bounds(&entry.path(), trawl_core::schema::TIME) {
+        Ok(groups) => {
+            let outside = groups.is_some_and(|groups| {
+                groups
+                    .iter()
+                    .all(|(min, max)| outside_window(Some(min), Some(max), window))
+            });
             Ok(if outside { 0 } else { len })
         }
         Err(ParquetStatsError::Open { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
@@ -1183,6 +1187,42 @@ mod tests {
         std::fs::metadata(path).unwrap().len()
     }
 
+    /// Write `{root}/{rel}` as parquet of two row groups of 2,048 rows,
+    /// every `_time` of the first `first` and of the second `second`, and
+    /// return its path.
+    fn write_two_groups(root: &Path, rel: &str, first: &str, second: &str) -> std::path::PathBuf {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT CASE WHEN i < 2048 THEN TIMESTAMP '{first}' \
+                 ELSE TIMESTAMP '{second}' END AS _time, 'm' AS message \
+                 FROM range(4096) t(i)) \
+                 TO '{}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)",
+                path.display()
+            ))
+            .unwrap();
+        path
+    }
+
+    /// The bytes [`selection_bytes`] charges for `service`'s files over
+    /// `[09:00, 09:30)` on 2026-10-23.
+    fn charged(base: &str, service: &str) -> u64 {
+        let text = executed(
+            &format!("service={service}"),
+            "2026-10-23T09:00:00Z",
+            "2026-10-23T09:30:00Z",
+        );
+        selection_bytes(
+            &select(base, &text),
+            at("2026-10-23T09:00:00Z"),
+            at("2026-10-23T09:30:00Z"),
+            &running(),
+        )
+        .unwrap()
+    }
+
     /// The selected directories relative to `root`, for readable asserts.
     fn rel_dirs(selection: &SourceSelection, root: &Path) -> Vec<String> {
         let prefix = format!("{}/", root.to_str().unwrap());
@@ -1381,6 +1421,90 @@ mod tests {
             Some(&StatVal::Int(1)),
             window
         ));
+    }
+
+    /// A row group whose `_time` chunk carries no statistics proves nothing
+    /// about its rows, however far outside the window the other groups'
+    /// statistics put theirs: `DuckDB` reads it, so the file counts whole.
+    #[test]
+    fn a_row_group_without_time_statistics_counts_its_file_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let path = write_two_groups(
+            tmp.path(),
+            "prod/2026-10-23/09/app.parquet",
+            "2026-10-22 09:00:00",
+            "2026-10-23 09:10:00",
+        );
+        trawl_engine::parquet_stats::fixture::drop_statistics(&path, 1, trawl_core::schema::TIME);
+        let len = std::fs::metadata(&path).unwrap().len();
+
+        let read: i64 = duckdb::Connection::open_in_memory()
+            .unwrap()
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{}') \
+                     WHERE _time >= TIMESTAMP '2026-10-23 09:00:00' \
+                     AND _time < TIMESTAMP '2026-10-23 09:30:00'",
+                    path.display()
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(read, 2048, "DuckDB reads the group without statistics");
+        assert_eq!(charged(base, "app"), len);
+    }
+
+    /// A file is left out only when each of its row groups' statistics put
+    /// that group outside the window, and counts whole otherwise.
+    #[test]
+    fn a_file_is_left_out_only_when_every_row_group_is_outside_the_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_str().unwrap();
+        let hour = "prod/2026-10-23/09";
+        // Both groups before the window.
+        write_two_groups(
+            tmp.path(),
+            &format!("{hour}/before.parquet"),
+            "2026-10-22 09:00:00",
+            "2026-10-23 08:59:59.999999",
+        );
+        // One group before it and one after it: the file's earliest and
+        // latest `_time` span the window, but no group holds any of it.
+        write_two_groups(
+            tmp.path(),
+            &format!("{hour}/around.parquet"),
+            "2026-10-23 08:00:00",
+            "2026-10-23 09:30:00",
+        );
+        // One group inside it.
+        let inside = write_two_groups(
+            tmp.path(),
+            &format!("{hour}/inside.parquet"),
+            "2026-10-22 09:00:00",
+            "2026-10-23 09:29:59.999999",
+        );
+        // No `_time` at all.
+        let untimed = tmp.path().join(format!("{hour}/untimed.parquet"));
+        duckdb::Connection::open_in_memory()
+            .unwrap()
+            .execute_batch(&format!(
+                "COPY (SELECT 'm' AS message FROM range(4096)) TO '{}' (FORMAT PARQUET)",
+                untimed.display()
+            ))
+            .unwrap();
+
+        assert_eq!(charged(base, "before"), 0);
+        assert_eq!(charged(base, "around"), 0);
+        assert_eq!(
+            charged(base, "inside"),
+            std::fs::metadata(inside).unwrap().len()
+        );
+        assert_eq!(
+            charged(base, "untimed"),
+            std::fs::metadata(untimed).unwrap().len()
+        );
     }
 
     #[test]
