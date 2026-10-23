@@ -35,7 +35,7 @@ CREATE TABLE captured_results (
     shape TEXT NOT NULL CONSTRAINT captured_results_shape_check
         CHECK (shape IN ('events', 'whole')),
     earliest TIMESTAMPTZ, latest TIMESTAMPTZ,
-    columns JSONB NOT NULL, column_facts JSONB NOT NULL,
+    columns TEXT NOT NULL, column_facts TEXT NOT NULL,
     captured_rows BIGINT NOT NULL, total_rows BIGINT NOT NULL,
     wire_bytes BIGINT NOT NULL, file_bytes BIGINT NOT NULL, digest BYTEA,
     file_missing BOOLEAN NOT NULL DEFAULT FALSE, format_version SMALLINT NOT NULL,

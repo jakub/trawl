@@ -32,7 +32,7 @@ use common::TestServer;
 use common::captured::{self, at};
 use serde_json::json;
 use tokio::sync::{Semaphore, mpsc};
-use trawl_api::results::{ResultShape, ResultSource};
+use trawl_api::results::{ResultList, ResultPage, ResultShape, ResultSource, ValueCount};
 use trawl_api::value::Value;
 use trawl_config::CaptureConfig;
 use trawl_server::config::{IngestConfig, RateLimitConfig};
@@ -858,4 +858,70 @@ async fn a_quiet_window_captures_its_columns_and_no_rows() {
     let page: trawl_api::results::ResultPage = serde_json::from_value(page).unwrap();
     assert_eq!(page.page.columns.len(), captured.columns.len());
     assert!(page.page.rows.is_empty());
+}
+
+/// A string holding U+0000 is a value like any other. An event whose
+/// message carries one is ingested and compacted, then captured: its
+/// column facts list the value, the list answers the capture as it was
+/// committed, and a page reads the value back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_value_holding_nul_is_captured_listed_and_read_back() {
+    const MESSAGE: &str = "a\u{0}b";
+    let (fixture, server) =
+        captured::Restartable::boot(RateLimitConfig::default(), CaptureConfig::default(), |_| {})
+            .await;
+    captured::ingest(
+        &server,
+        &[json!({
+            "_time": "2024-01-16T10:05:00Z",
+            "service": "nulcorpus",
+            "host": "web09",
+            "message": MESSAGE,
+        })],
+    )
+    .await;
+    captured::compact(&server, &fixture.disk).await;
+    server.results_clock.set(at("2024-01-16T10:30:00Z"));
+
+    let body = json!({
+        "query": "service=nulcorpus",
+        "window": { "earliest": "2024-01-16T10:00:00Z", "latest": "2024-01-16T10:10:00Z" },
+    });
+    let result = captured::captured(&server, &server.analyst_token, &body)
+        .await
+        .result;
+    assert_eq!(result.captured_rows, 1, "{result:?}");
+    let message = result
+        .columns
+        .iter()
+        .position(|column| column.name == "message")
+        .expect("a message column");
+    assert_eq!(
+        result.column_facts[message].values.as_deref(),
+        Some(
+            &[ValueCount {
+                value: Value::String(MESSAGE.to_owned()),
+                count: 1,
+            }][..]
+        ),
+        "the facts list the value"
+    );
+
+    let (status, _, list) = captured::get(&server, &server.analyst_token, "/results").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let list: ResultList = serde_json::from_value(list).unwrap();
+    assert_eq!(
+        list.results,
+        std::slice::from_ref(&result),
+        "listed as it was committed"
+    );
+
+    let (status, _, page) = captured::page(&server, &server.analyst_token, &result.id, "").await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let page: ResultPage = serde_json::from_value(page).unwrap();
+    assert_eq!(page.result, result);
+    assert_eq!(
+        page.page.rows[0][message],
+        Value::String(MESSAGE.to_owned())
+    );
 }

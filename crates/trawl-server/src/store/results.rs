@@ -18,8 +18,10 @@
 //! A temporary row past its deadline is no longer live even before a sweep
 //! or a read marks it `expired`.
 //!
-//! The JSONB columns travel as text: they are bound as `$n::jsonb` and read
-//! as `::text`, then decoded into the trawl-api types. A row whose metadata
+//! The two JSON documents, `columns` and `column_facts`, are stored as
+//! text, encoded and decoded with the trawl-api types. Not as JSONB, which
+//! refuses `\u0000`: a column name or a listed value is any string, and a
+//! capture holding one must commit like any other. A row whose metadata
 //! does not decode is a [`StoreError::Unavailable`] carrying a
 //! [`sqlx::Error::ColumnDecode`] that names the column, never a panic.
 
@@ -45,14 +47,12 @@ macro_rules! live_at {
     };
 }
 
-/// `SELECT` every column of `captured_results`, JSONB as text, followed by
-/// `$tail`.
+/// `SELECT` every column of `captured_results`, followed by `$tail`.
 macro_rules! select_rows {
     ($tail:expr) => {
         concat!(
             "SELECT id, key_id, created_at, expires_at, gone_at, state, query, \
-             executed_query, source, shape, earliest, latest, \
-             columns::text AS columns, column_facts::text AS column_facts, \
+             executed_query, source, shape, earliest, latest, columns, column_facts, \
              captured_rows, total_rows, wire_bytes, file_bytes, digest, file_missing, \
              format_version, investigation_id \
              FROM captured_results ",
@@ -376,7 +376,7 @@ impl ResultsStore {
                  source, shape, earliest, latest, columns, column_facts,
                  captured_rows, total_rows, wire_bytes, file_bytes, digest, format_version)
              VALUES ($1, $2, $3, $4, 'temporary', $5, $6, $7, $8, $9, $10,
-                     $11::jsonb, $12::jsonb, $13, $14, $15, $16, $17, $18)",
+                     $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(&row.id)
         .bind(row.key_id)

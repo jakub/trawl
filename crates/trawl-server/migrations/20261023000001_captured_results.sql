@@ -11,10 +11,11 @@
 --
 -- A live source has resolved bounds; a stored source (`from saved`) has none.
 -- columns and column_facts are the trawl-api JSON of Vec<ResultColumn> and
--- Vec<ColumnFacts>, positional with each other. A capture with no columns has
--- no file: file_bytes is 0 and digest (blake3, 32 bytes) is NULL. file_missing
--- records a committed row whose file was found absent. investigation_id has no
--- foreign key until the investigations table exists.
+-- Vec<ColumnFacts>, positional with each other, kept as TEXT because JSONB
+-- refuses \u0000, which a column name or a listed value may hold. A capture
+-- with no columns has no file: file_bytes is 0 and digest (blake3, 32 bytes)
+-- is NULL. file_missing records a committed row whose file was found absent.
+-- investigation_id has no foreign key until the investigations table exists.
 --
 -- Every lifecycle statement binds the server's clock as a parameter; none
 -- reads now(). Constraint names are part of the store error contract.
@@ -38,8 +39,8 @@ CREATE TABLE captured_results (
         CHECK (shape IN ('events', 'whole')),
     earliest         TIMESTAMPTZ,
     latest           TIMESTAMPTZ,
-    columns          JSONB       NOT NULL,
-    column_facts     JSONB       NOT NULL,
+    columns          TEXT        NOT NULL,
+    column_facts     TEXT        NOT NULL,
     captured_rows    BIGINT      NOT NULL,
     total_rows       BIGINT      NOT NULL,
     wire_bytes       BIGINT      NOT NULL,
