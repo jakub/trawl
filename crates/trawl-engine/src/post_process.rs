@@ -12,8 +12,10 @@
 //! This module applies those Rust stages to the SQL result set, reusing
 //! the streaming engine's per-event transforms and aggregation machinery.
 
+use chrono::{Offset as _, Utc};
 use indexmap::IndexSet;
 use trawl_core::ast::{PipeStage, SortDirection, Spanned, TrawlDuration};
+use trawl_core::compare::Instant;
 use trawl_core::context::EvalContext;
 use trawl_core::eval::EvalValue;
 use trawl_core::pin_scope::PinScope;
@@ -140,11 +142,11 @@ fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
 /// as the all-SQL path. Nulling it here would make the kv tail disagree
 /// with the same query without the split.
 ///
-/// A `Timestamp` becomes the string `executor::extract_value` renders,
-/// deliberately: the display-offset shift runs after the tail and re-parses
-/// that text, so a cell retyped here would silently stop shifting. Its
-/// column is still typed `timestamp` ([`rows_to_result`] folds the
-/// pipeline cell, not this one).
+/// A `Timestamp` the tail computed becomes the wire's RFC 3339 text in
+/// UTC (`Z`), the spelling every `timestamp` cell has: it is the tail's own
+/// instant, not a stored column the display offset applies to, so it says
+/// which offset it is in. Its column is typed `timestamp`
+/// ([`rows_to_result`] folds the pipeline cell, not this one).
 fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
     match cell {
         EvalValue::Null => crate::value::Value::Null,
@@ -158,7 +160,13 @@ fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
         EvalValue::UInt(u) => land_u64(*u),
         EvalValue::Float(f) => crate::value::Value::Float(*f),
         EvalValue::Str(s) => crate::value::Value::String(s.clone()),
-        EvalValue::Timestamp(instant) => crate::value::Value::String(instant.cast_text()),
+        EvalValue::Timestamp(instant) => crate::value::Value::String(match instant {
+            Instant::NegInfinity => "-infinity".to_owned(),
+            Instant::At(at) => {
+                crate::executor::wire_timestamp(at.and_utc().timestamp_micros(), Utc.fix())
+            }
+            Instant::Infinity => "infinity".to_owned(),
+        }),
         EvalValue::Array(arr) => crate::value::Value::Array(arr.iter().map(eval_to_cell).collect()),
     }
 }
@@ -662,26 +670,26 @@ mod tests {
     }
 
     /// A `Timestamp` cell — the one shape with no result-side twin — lands
-    /// as the string the shift machinery re-parses after the tail.
+    /// as the wire's RFC 3339 text in UTC, and an infinity as its word.
     #[test]
-    fn a_timestamp_cell_leaves_the_bridge_as_text() {
+    fn a_timestamp_cell_leaves_the_bridge_as_wire_text() {
         let ts = chrono::NaiveDate::from_ymd_opt(2026, 1, 15)
             .unwrap()
-            .and_hms_opt(9, 0, 0)
+            .and_hms_micro_opt(9, 0, 0, 120_000)
             .unwrap();
-        assert_eq!(
-            eval_to_cell(&EvalValue::Timestamp(trawl_core::compare::Instant::At(ts))),
-            crate::value::Value::String("2026-01-15 09:00:00".into())
-        );
-        // An infinity crosses as its word — a text the display-offset
-        // shift leaves alone (it re-parses only its own rendering), so a
-        // computed infinity survives a shifted run unchanged.
-        assert_eq!(
-            eval_to_cell(&EvalValue::Timestamp(
-                trawl_core::compare::Instant::Infinity
-            )),
-            crate::value::Value::String("infinity".into())
-        );
+        for (instant, text) in [
+            (
+                trawl_core::compare::Instant::At(ts),
+                "2026-01-15T09:00:00.120000Z",
+            ),
+            (trawl_core::compare::Instant::Infinity, "infinity"),
+            (trawl_core::compare::Instant::NegInfinity, "-infinity"),
+        ] {
+            assert_eq!(
+                eval_to_cell(&EvalValue::Timestamp(instant)),
+                crate::value::Value::String(text.into())
+            );
+        }
     }
 
     #[test]

@@ -336,17 +336,15 @@ impl Harness {
     }
 }
 
-/// Read a result cell back as the instant it renders.
-///
-/// The engine renders a TIMESTAMP as `YYYY-MM-DD HH:MM:SS[.ffffff]` with
-/// trailing zeros trimmed, so both spellings have to parse.
+/// Read a result cell back as the instant it renders: the result wire's
+/// RFC 3339 with its offset.
 fn cell_time(cell: &Value) -> DateTime<Utc> {
     let Value::String(text) = cell else {
         panic!("expected a rendered timestamp, got {cell:?}");
     };
-    chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+    DateTime::parse_from_rfc3339(text)
         .unwrap_or_else(|e| panic!("unparseable result timestamp {text:?}: {e}"))
-        .and_utc()
+        .with_timezone(&Utc)
 }
 
 /// The DSL a windowed run of [`DSL`] must have executed and stored.

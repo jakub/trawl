@@ -13,7 +13,7 @@ mod common;
 use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::Executor;
-use trawl_engine::value::{QueryResult, Value};
+use trawl_engine::value::{ColumnType, QueryResult, Value};
 
 /// Test helper — runs query with no row limit.
 trait RunQueryUnlimited {
@@ -402,9 +402,9 @@ fn timechart_bucket_values_group_by_full_expression() {
     assert_eq!(
         buckets,
         vec![
-            ("2024-01-15 10:00:00".to_string(), 6),
-            ("2024-01-15 10:01:00".to_string(), 4),
-            ("2024-01-15 10:02:00".to_string(), 3),
+            ("2024-01-15T10:00:00.000000Z".to_string(), 6),
+            ("2024-01-15T10:01:00.000000Z".to_string(), 4),
+            ("2024-01-15T10:02:00.000000Z".to_string(), 3),
         ],
         "rows must aggregate into whole-minute buckets"
     );
@@ -1994,19 +1994,36 @@ fn setup_pinned_time() -> (Executor, String, FieldTypes, tempfile::TempDir) {
 }
 
 /// The tail's pin-aware TIMESTAMP comparison reads the STORED instant, not
-/// the caller's display shift: `utc_offset_secs` is a rendering knob, so
+/// the caller's display offset: `utc_offset_secs` is a rendering knob, so
 /// the same query must answer the same rows in every display zone — and
 /// exactly what the split-free query answers.
 #[test]
 fn extract_kv_tail_timestamp_compare_ignores_the_display_offset() {
     let (exec, src, ft, _dir) = setup_pinned_time();
     let dsl = "* | extract kv | where _time > \"2026-01-01T05:00:00Z\"";
-    for offset in [0, -18_000, 19_800] {
+    for (offset, rendered) in [
+        (0, "2026-01-01T05:30:00.000000Z"),
+        (-18_000, "2026-01-01T00:30:00.000000-05:00"),
+        (19_800, "2026-01-01T11:00:00.000000+05:30"),
+    ] {
         let result = exec.run_query(dsl, &src, &ft, 1000, offset).unwrap();
         assert_eq!(
             result.row_count(),
             1,
             "05:30Z is after 05:00Z whatever zone the client displays in (offset {offset})"
+        );
+        // The tail compared the stored instant; the column it passed
+        // through is still that TIMESTAMP, typed and rendered as one.
+        let idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == "_time")
+            .expect("_time column");
+        assert_eq!(result.columns[idx].ty, ColumnType::Timestamp, "{offset}");
+        assert_eq!(
+            result.rows[0][idx],
+            Value::String(rendered.into()),
+            "{offset}"
         );
     }
     // The threshold that genuinely excludes the row excludes it everywhere.
@@ -2036,8 +2053,8 @@ fn extract_kv_tail_timestamp_compare_ignores_the_display_offset() {
 }
 
 /// Running the tail over UTC does not cost the caller its display zone:
-/// the surviving TIMESTAMP columns are shifted back afterwards, so the
-/// rendered cell is the same one the split-free query prints.
+/// the surviving TIMESTAMP columns are rendered in it afterwards, so the
+/// cell is the same one the split-free query prints.
 #[test]
 fn extract_kv_tail_still_renders_timestamps_in_the_display_zone() {
     let (exec, src, ft, _dir) = setup_pinned_time();
@@ -2055,11 +2072,14 @@ fn extract_kv_tail_still_renders_timestamps_in_the_display_zone() {
             .expect("_time column");
         result.rows[0][idx].clone()
     };
-    assert_eq!(cell(&with_kv), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(
+        cell(&with_kv),
+        Value::String("2026-01-01T00:30:00.000000-05:00".into())
+    );
     assert_eq!(cell(&with_kv), cell(&without_kv));
 }
 
-/// The display shift follows the tail's own lineage: a timestamp column
+/// The display offset follows the tail's own lineage: a timestamp column
 /// renamed INSIDE the tail still renders in the caller's zone under its
 /// new name — the value is untransformed, only the label moved.
 #[test]
@@ -2078,7 +2098,7 @@ fn extract_kv_tail_rename_keeps_the_display_zone() {
     assert_eq!(result.columns[0].name, "t");
     assert_eq!(
         result.rows[0][0],
-        Value::String("2026-01-01 00:30:00".into()),
+        Value::String("2026-01-01T00:30:00.000000-05:00".into()),
         "the renamed column is still the stored instant and shifts with it"
     );
 }
@@ -2106,7 +2126,10 @@ fn extract_kv_tail_alias_copy_keeps_the_display_zone() {
             .unwrap_or_else(|| panic!("{name} column"));
         result.rows[0][idx].clone()
     };
-    assert_eq!(cell("_time"), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(
+        cell("_time"),
+        Value::String("2026-01-01T00:30:00.000000-05:00".into())
+    );
     assert_eq!(
         cell("t2"),
         cell("_time"),
@@ -2138,12 +2161,24 @@ fn extract_kv_tail_computed_value_stays_as_rendered() {
             .unwrap_or_else(|| panic!("{name} column"));
         result.rows[0][idx].clone()
     };
-    assert_eq!(cell("_time"), Value::String("2026-01-01 00:30:00".into()));
+    assert_eq!(
+        cell("_time"),
+        Value::String("2026-01-01T00:30:00.000000-05:00".into())
+    );
     assert_eq!(
         cell("t3"),
         Value::String("2026-01-01 05:30:00".into()),
         "a derived value keeps the tail's own rendering"
     );
+    let ty = |name: &str| {
+        result
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.ty.clone())
+    };
+    assert_eq!(ty("_time"), Some(ColumnType::Timestamp));
+    assert_eq!(ty("t3"), Some(ColumnType::String), "text the tail computed");
 }
 
 // ── parameter ordering across an aggregate SELECT list ────────────────
@@ -2175,8 +2210,8 @@ fn fixed_anchor() -> trawl_core::context::EvalContext {
     )
 }
 
-/// How `DuckDB` renders [`fixed_anchor`] once bound and cast.
-const ANCHOR_TEXT: &str = "2026-02-03 04:05:06.789012";
+/// [`fixed_anchor`] on the result wire once bound, rendered in UTC.
+const ANCHOR_TEXT: &str = "2026-02-03T04:05:06.789012Z";
 
 /// Emit under the fixed anchor and execute through the production
 /// emit-and-bind seam (including the `_raw`-free retry).

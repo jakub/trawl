@@ -58,7 +58,8 @@ fn parse_fixed_offset(s: &str) -> Result<i32, String> {
 /// Reformat an RFC 3339 timestamp string with a UTC offset applied.
 ///
 /// Parses the input as RFC 3339, shifts by `utc_offset_secs`, and returns
-/// a display string matching the executor's format: `YYYY-MM-DD HH:MM:SS[.fff]`.
+/// the wall clock the CLI and TUI show for a result timestamp
+/// (`trawl_api::display::timestamp_text`): `YYYY-MM-DD HH:MM:SS[.fff]`.
 /// Returns the original string unchanged if parsing fails.
 pub fn reformat_rfc3339(ts: &str, utc_offset_secs: i32) -> String {
     use chrono::{DateTime, FixedOffset, Utc};

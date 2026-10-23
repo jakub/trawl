@@ -386,7 +386,14 @@ fn render_table(
                 if severity_cells.get(i).copied().unwrap_or(false) {
                     severity_cell_text(v)
                 } else {
-                    v.to_string()
+                    // A timestamp shows the wall clock the server rendered
+                    // in the reader's offset, without the wire's `T` and
+                    // offset.
+                    result
+                        .columns
+                        .get(i)
+                        .and_then(|c| trawl_api::display::timestamp_cell_text(&c.ty, v))
+                        .unwrap_or_else(|| v.to_string())
                 }
             })
             .collect();
@@ -829,6 +836,66 @@ mod tests {
         assert!(!table.contains(" 17 "));
         assert!(render(render_ndjson).contains("17"));
         assert!(render(render_csv).contains("17"));
+    }
+
+    /// A `timestamp` column shows in the table exactly as the engine's old
+    /// zoneless text did (the wall clock the server rendered in the
+    /// reader's offset), while json and csv carry the wire's RFC 3339.
+    #[test]
+    fn the_table_shows_wire_timestamps_as_the_wall_clock() {
+        use trawl_engine::value::{Column, ColumnType};
+        let table = |result: &QueryResult| {
+            let mut buf = Vec::new();
+            render_table(result, &[], &mut buf).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        let wire = [
+            "2026-01-15T10:00:00.000000+05:30",
+            "2026-01-15T10:00:00.120000+05:30",
+            "infinity",
+        ];
+        let shown = ["2026-01-15 10:00:00", "2026-01-15 10:00:00.12", "infinity"];
+        let typed = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("seen", ColumnType::list(ColumnType::Timestamp)),
+            ],
+            rows: wire
+                .iter()
+                .map(|t| {
+                    vec![
+                        Value::String((*t).into()),
+                        Value::Array(vec![Value::String((*t).into())]),
+                    ]
+                })
+                .collect(),
+        };
+        let before = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::String),
+                Column::new("seen", ColumnType::list(ColumnType::String)),
+            ],
+            rows: shown
+                .iter()
+                .map(|t| {
+                    vec![
+                        Value::String((*t).into()),
+                        Value::Array(vec![Value::String((*t).into())]),
+                    ]
+                })
+                .collect(),
+        };
+        assert_eq!(table(&typed), table(&before));
+
+        for f in [
+            render_ndjson as fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>,
+            render_csv,
+        ] {
+            let mut buf = Vec::new();
+            f(&typed, &mut buf).unwrap();
+            let text = String::from_utf8(buf).unwrap();
+            assert!(text.contains(wire[1]), "{text}");
+        }
     }
 
     /// A declared severity column (`sev()`'s output under its own alias)

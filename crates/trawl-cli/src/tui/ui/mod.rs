@@ -540,6 +540,48 @@ mod tests {
         insta::assert_snapshot!(terminal.backend().to_string());
     }
 
+    /// A `timestamp` column draws exactly as the engine's old zoneless
+    /// text drew, widths included: the grid shows the wall clock the
+    /// server rendered in the reader's offset, not the wire's `T` and
+    /// offset.
+    #[test]
+    fn wire_timestamps_draw_as_the_old_wall_clock_text() {
+        let draw = |time_ty: trawl_engine::value::ColumnType, times: [&str; 2]| {
+            let mut app = test_app();
+            let mut response = make_query_response(
+                vec!["_time", "message"],
+                times
+                    .iter()
+                    .map(|t| {
+                        vec![
+                            Value::String((*t).into()),
+                            Value::String("request ok".into()),
+                        ]
+                    })
+                    .collect(),
+            );
+            response.result.columns[0].ty = time_ty;
+            app.tab.result = Some(response);
+            app.tab.status = TabStatus::Success { duration_ms: 3 };
+            let mut terminal = Terminal::new(TestBackend::new(80, 16)).unwrap();
+            terminal.draw(|f| super::render(&mut app, f)).unwrap();
+            terminal.backend().to_string()
+        };
+        let wire = draw(
+            trawl_engine::value::ColumnType::Timestamp,
+            [
+                "2026-01-15T10:00:00.000000+05:30",
+                "2026-01-15T10:00:01.250000+05:30",
+            ],
+        );
+        let before = draw(
+            trawl_engine::value::ColumnType::String,
+            ["2026-01-15 10:00:00", "2026-01-15 10:00:01.25"],
+        );
+        assert_eq!(wire, before);
+        assert!(wire.contains("2026-01-15 10:00:01.25"), "{wire}");
+    }
+
     #[test]
     fn render_with_error_status() {
         let mut app = test_app();

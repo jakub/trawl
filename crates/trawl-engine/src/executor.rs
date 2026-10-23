@@ -12,6 +12,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::{Datelike as _, FixedOffset};
 use duckdb::Connection;
 use duckdb::core::LogicalTypeId;
 use duckdb::types::{TimeUnit, ValueRef};
@@ -700,8 +701,9 @@ impl Executor {
     /// A result past `max_rows` is refused ([`RowCap::Refuse`]); a lane
     /// that cuts instead goes through [`Cancellable::run_query`].
     ///
-    /// `utc_offset_secs` is applied to all timestamp values at format time.
-    /// Pass `0` for UTC display.
+    /// Timestamps render in the wire's RFC 3339 at the display offset
+    /// `utc_offset_secs`; pass `0` for UTC. An offset of a day or more is
+    /// refused.
     pub fn run_query(
         &self,
         dsl: &str,
@@ -739,9 +741,10 @@ impl Executor {
         let emitted = clock.time(QueryPhase::Emit, || {
             resolved.emit_cold(&ast, pins, EvalContext::capture())
         })?;
-        let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
+        let display = display_offset(utc_offset_secs)?;
+        let sql_text = sql_timestamp_text(&emitted, display);
         let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
-        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel, clock);
+        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_text, cancel, clock);
         // Same gate as the hot lanes, one column over: with no hot buffer to
         // fall back to, `HotOnly` is unreachable (see [`cold_action`]) — but a
         // "no files" answer over a source that still reaches files is the
@@ -756,14 +759,7 @@ impl Executor {
             ColdAction::ReturnOutcome | ColdAction::HotOnly => outcome?,
         };
         clock.time(QueryPhase::Post, || {
-            finish_result(
-                result,
-                &timestamp_columns,
-                &emitted,
-                &ast,
-                cap,
-                utc_offset_secs,
-            )
+            finish_result(result, &timestamp_columns, &emitted, &ast, cap, display)
         })
     }
 
@@ -826,9 +822,10 @@ impl Executor {
         let emitted = clock.time(QueryPhase::Emit, || {
             resolved.emit_union(&ast, hot_source, hot_pins, pins, EvalContext::capture())
         })?;
-        let sql_offset = sql_render_offset(&emitted, utc_offset_secs);
+        let display = display_offset(utc_offset_secs)?;
+        let sql_text = sql_timestamp_text(&emitted, display);
         let sql_cap = cap.sql_read(!emitted.rust_stages.is_empty());
-        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_offset, cancel, clock);
+        let outcome = self.execute_emitted_tracked(&emitted, sql_cap, sql_text, cancel, clock);
 
         // A hot value disagreeing with a catalog pin is already conformed on
         // the union's hot branch by the emitter (TRY_CAST to NULL), and
@@ -864,8 +861,7 @@ impl Executor {
                 let hot_emitted = clock.time(QueryPhase::Emit, || {
                     emitter::emit_hot_only(&ast, hot_source, hot_pins, pins, emitted.anchor)
                 })?;
-                match self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_offset, cancel, clock)
-                {
+                match self.execute_emitted_tracked(&hot_emitted, sql_cap, sql_text, cancel, clock) {
                     // Hot-only also hit a binder/emit error (e.g. empty ndjson
                     // between compaction cycles). Treat as empty, not error.
                     Err(EngineError::Emit(_)) => (QueryResult::empty(), TimestampColumns::new()),
@@ -876,14 +872,7 @@ impl Executor {
             ColdAction::ReturnOutcome => outcome?,
         };
         clock.time(QueryPhase::Post, || {
-            finish_result(
-                result,
-                &timestamp_columns,
-                &emitted,
-                &ast,
-                cap,
-                utc_offset_secs,
-            )
+            finish_result(result, &timestamp_columns, &emitted, &ast, cap, display)
         })
     }
 
@@ -892,7 +881,7 @@ impl Executor {
     /// `max_rows` caps the number of result rows to prevent unbounded memory
     /// allocation. Returns [`EngineError::ResultTooLarge`] if exceeded.
     ///
-    /// `utc_offset_secs` is applied to all timestamp values at format time.
+    /// Timestamps render in the wire's RFC 3339 at `utc_offset_secs`.
     pub fn execute_emitted(
         &self,
         query: &EmittedQuery,
@@ -902,7 +891,7 @@ impl Executor {
         self.execute_emitted_tracked(
             query,
             RowCap::Refuse(max_rows),
-            utc_offset_secs,
+            TimestampText::Wire(display_offset(utc_offset_secs)?),
             &CancelLatch::never(),
             &PhaseClock::off(),
         )
@@ -912,19 +901,19 @@ impl Executor {
     /// [`Self::execute_emitted`], additionally reporting which result
     /// columns `DuckDB` returned as TIMESTAMP.
     ///
-    /// Only the Rust-tail lane needs that: it runs over an unshifted
-    /// rendering and re-applies the display offset afterwards
-    /// ([`shift_timestamp_columns`]).
+    /// Only the Rust-tail lane needs that: it reads `DuckDB`'s cast text
+    /// and renders the wire's text afterwards
+    /// ([`render_tracked_timestamps`]).
     fn execute_emitted_tracked(
         &self,
         query: &EmittedQuery,
         cap: RowCap,
-        utc_offset_secs: i32,
+        timestamps: TimestampText,
         cancel: &CancelLatch,
         clock: &PhaseClock,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
         with_raw_fallback(query, clock, |q| {
-            self.execute_emitted_once(q, cap, utc_offset_secs, cancel, clock)
+            self.execute_emitted_once(q, cap, timestamps, cancel, clock)
         })
     }
 
@@ -932,7 +921,7 @@ impl Executor {
         &self,
         query: &EmittedQuery,
         cap: RowCap,
-        utc_offset_secs: i32,
+        timestamps: TimestampText,
         cancel: &CancelLatch,
         clock: &PhaseClock,
     ) -> Result<(QueryResult, TimestampColumns), EngineError> {
@@ -1009,7 +998,7 @@ impl Executor {
             }
             let mut cells = Vec::with_capacity(col_count);
             for (i, column) in columns.iter().enumerate() {
-                cells.push(extract_value(row, i, &column.name, utc_offset_secs)?);
+                cells.push(extract_value(row, i, &column.name, timestamps)?);
             }
             rows.push(cells);
         }
@@ -1591,7 +1580,7 @@ impl Executor {
         while let Some(row) = result_rows.next()? {
             let mut cells = Vec::with_capacity(columns.len());
             for (i, column) in columns.iter().enumerate() {
-                cells.push(extract_value(row, i, &column.name, 0)?);
+                cells.push(extract_value(row, i, &column.name, TimestampText::UTC)?);
             }
             rows.push(cells);
         }
@@ -1600,16 +1589,16 @@ impl Executor {
     }
 }
 
-/// The query lanes' tail after the SQL read: the Rust stages and their
-/// display shift, the cap's cut, and the column reorder — the engine's
-/// share of `post` (ADR-0046).
+/// The query lanes' tail after the SQL read: the Rust stages and the
+/// wire rendering of their timestamp columns, the cap's cut, and the
+/// column reorder — the engine's share of `post` (ADR-0046).
 fn finish_result(
     mut result: QueryResult,
     timestamp_columns: &[String],
     emitted: &EmittedQuery,
     ast: &Query,
     cap: RowCap,
-    utc_offset_secs: i32,
+    display: FixedOffset,
 ) -> Result<QueryResult, EngineError> {
     if !emitted.rust_stages.is_empty() {
         result = crate::post_process::apply_rust_stages(
@@ -1620,8 +1609,7 @@ fn finish_result(
             ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
         )?;
         let tracked = tail_timestamp_scope(timestamp_columns, &emitted.rust_stages);
-        retype_tracked_timestamps(&mut result, &tracked);
-        shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
+        render_tracked_timestamps(&mut result, &tracked, display);
     }
     cap.trim(&mut result);
     if emitted.needs_column_reorder {
@@ -2341,10 +2329,8 @@ fn typed_columns(stmt: &duckdb::Statement<'_>) -> Vec<Column> {
 /// Uses `ValueRef` for type-safe dispatch. Temporal values render through
 /// this module's own formatters ([`format_timestamp`], [`format_date`],
 /// [`format_time`]) rather than `DuckDB`'s, because the display offset has
-/// to be applied while the value is still an integer count.
-///
-/// `utc_offset_secs` is applied to timestamp values before civil time
-/// formatting. Pass `0` for UTC.
+/// to be applied while the value is still an integer count. `timestamps`
+/// picks the wire's RFC 3339 or `DuckDB`'s cast text ([`TimestampText`]).
 ///
 /// The cell has to agree with the type [`crate::column_type::column_type`]
 /// gives its column, or the wire encoder refuses it; a `HUGEINT` or
@@ -2354,7 +2340,7 @@ fn extract_value(
     row: &duckdb::Row<'_>,
     idx: usize,
     column: &str,
-    utc_offset_secs: i32,
+    timestamps: TimestampText,
 ) -> Result<Value, EngineError> {
     Ok(match row.get_ref_unwrap(idx) {
         ValueRef::Null => Value::Null,
@@ -2376,14 +2362,12 @@ fn extract_value(
         ValueRef::Double(f) => Value::Float(f),
         ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
         ValueRef::Blob(bytes) => Value::String(format!("<blob {} bytes>", bytes.len())),
-        ValueRef::Timestamp(unit, val) => {
-            Value::String(format_timestamp(unit, val, utc_offset_secs))
-        }
+        ValueRef::Timestamp(unit, val) => Value::String(format_timestamp(unit, val, timestamps)),
         ValueRef::Date32(days) => Value::String(format_date(days)),
         ValueRef::Time64(unit, val) => Value::String(format_time(unit, val)),
         // list values from aggregations like LIST(DISTINCT col)
         ValueRef::List(..) | ValueRef::Array(..) => match row.get::<_, duckdb::types::Value>(idx) {
-            Ok(value) => convert_duckdb_value(value, column, utc_offset_secs)?,
+            Ok(value) => convert_duckdb_value(value, column, timestamps)?,
             Err(_) => Value::Null,
         },
         // everything else: try string extraction, fall back to null
@@ -2402,7 +2386,7 @@ fn extract_value(
 fn convert_duckdb_value(
     v: duckdb::types::Value,
     column: &str,
-    utc_offset_secs: i32,
+    timestamps: TimestampText,
 ) -> Result<Value, EngineError> {
     Ok(match v {
         duckdb::types::Value::Null => Value::Null,
@@ -2425,7 +2409,7 @@ fn convert_duckdb_value(
         // so it renders the same way: the column is `list<timestamp>`,
         // and a debug spelling would not be a timestamp at all.
         duckdb::types::Value::Timestamp(unit, val) => {
-            Value::String(format_timestamp(unit, val, utc_offset_secs))
+            Value::String(format_timestamp(unit, val, timestamps))
         }
         duckdb::types::Value::Date32(days) => Value::String(format_date(days)),
         duckdb::types::Value::Time64(unit, val) => Value::String(format_time(unit, val)),
@@ -2433,7 +2417,7 @@ fn convert_duckdb_value(
             Value::Array(
                 elements
                     .into_iter()
-                    .map(|element| convert_duckdb_value(element, column, utc_offset_secs))
+                    .map(|element| convert_duckdb_value(element, column, timestamps))
                     .collect::<Result<_, _>>()?,
             )
         }
@@ -2476,7 +2460,8 @@ fn list_ubigint_renders_digits() {
         .expect("prepare");
     let mut rows = stmt.query([]).expect("query");
     let row = rows.next().expect("step").expect("one row");
-    let cell = extract_value(row, 0, "ids", 0).expect("every element fits an integer cell");
+    let cell = extract_value(row, 0, "ids", TimestampText::UTC)
+        .expect("every element fits an integer cell");
 
     assert_eq!(
         cell,
@@ -2584,7 +2569,7 @@ fn every_duckdb_type_agrees_with_its_cells() {
     let mut landed = 0;
     while let Some(row) = rows.next().expect("step") {
         for (i, column) in columns.iter().enumerate() {
-            let cell = match extract_value(row, i, &column.name, 0) {
+            let cell = match extract_value(row, i, &column.name, TimestampText::UTC) {
                 Ok(cell) => cell,
                 Err(EngineError::IntegerOutOfRange { column }) => {
                     refused.push(column);
@@ -2657,23 +2642,101 @@ const fn to_micros(unit: TimeUnit, val: i64) -> i64 {
 /// `DuckDB`'s infinite timestamps: the two extremes of its count, in every
 /// unit. They are not instants, so they spell `DuckDB`'s own words, the ones
 /// `trawl_core::compare::Instant::cast_text` uses too, rather than a civil
-/// time no calendar holds (the count would also overflow the shift below).
+/// time no calendar holds.
 const TIMESTAMP_INFINITY: i64 = i64::MAX;
 const TIMESTAMP_NEG_INFINITY: i64 = -i64::MAX;
 
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless
-)]
-fn format_timestamp(unit: TimeUnit, val: i64, utc_offset_secs: i32) -> String {
+/// How a result renders its `TIMESTAMP` cells.
+#[derive(Debug, Clone, Copy)]
+enum TimestampText {
+    /// The result wire's RFC 3339 ([`wire_timestamp`]) in a display
+    /// offset.
+    Wire(FixedOffset),
+    /// `DuckDB`'s own `CAST(ts AS VARCHAR)` text, in UTC: what a Rust tail
+    /// reads ([`sql_timestamp_text`]).
+    Cast,
+}
+
+impl TimestampText {
+    /// The wire's text in UTC, for a result no reader's offset applies to.
+    const UTC: Self = Self::Wire(match FixedOffset::east_opt(0) {
+        Some(utc) => utc,
+        None => unreachable!(),
+    });
+}
+
+/// The display offset as a zone the wire can spell.
+///
+/// An RFC 3339 offset is under a day, so a larger one is refused rather
+/// than rendered. `timezone::resolve_utc_offset` only resolves offsets
+/// under a day from the forms it documents.
+fn display_offset(utc_offset_secs: i32) -> Result<FixedOffset, EngineError> {
+    FixedOffset::east_opt(utc_offset_secs).ok_or_else(|| EngineError::Refused {
+        message: format!("a display offset of {utc_offset_secs} seconds is not under a day"),
+    })
+}
+
+fn format_timestamp(unit: TimeUnit, val: i64, text: TimestampText) -> String {
     match val {
         TIMESTAMP_INFINITY => return "infinity".to_owned(),
         TIMESTAMP_NEG_INFINITY => return "-infinity".to_owned(),
         _ => {}
     }
-    let micros = to_micros(unit, val) + i64::from(utc_offset_secs) * 1_000_000;
+    let micros = to_micros(unit, val);
+    match text {
+        TimestampText::Wire(offset) => wire_timestamp(micros, offset),
+        TimestampText::Cast => cast_timestamp(micros),
+    }
+}
 
+/// 40,000 Gregorian years in microseconds: 100 cycles of 400 years, each
+/// exactly 146,097 days.
+const FORTY_MILLENNIA_MICROS: i64 = 100 * 146_097 * 86_400 * 1_000_000;
+
+/// An instant in the result wire's spelling: chrono's
+/// `to_rfc3339_opts(SecondsFormat::Micros, true)` in `offset`, so RFC 3339
+/// with six fraction digits, `Z` at offset zero and `+HH:MM` otherwise.
+///
+/// RFC 3339 spells four-digit years only, and chrono writes any other year
+/// in ISO 8601's expanded form, a sign and at least four digits
+/// (`+10000-01-01T00:00:00.000000Z`). chrono's calendar ends at ±262,143
+/// years, short of `DuckDB`'s 294,247; the Gregorian calendar repeats every
+/// 400 years to the day, so an instant past chrono's end is written
+/// 40,000 years nearer and its year moved back.
+pub(crate) fn wire_timestamp(micros: i64, offset: FixedOffset) -> String {
+    if let Some(at) = chrono::DateTime::from_timestamp_micros(micros) {
+        return at
+            .with_timezone(&offset)
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    }
+    let (nearer, years) = if micros > 0 {
+        (micros - FORTY_MILLENNIA_MICROS, 40_000)
+    } else {
+        (micros + FORTY_MILLENNIA_MICROS, -40_000)
+    };
+    let local = chrono::DateTime::from_timestamp_micros(nearer)
+        .expect("40,000 years nearer is inside chrono's calendar")
+        .with_timezone(&offset);
+    let text = local.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    // The nearer year is still past 0000-9999, so chrono wrote a sign and
+    // digits up to the first `-` after it.
+    let month_on = 1 + text[1..].find('-').expect("chrono writes a dated year");
+    format!(
+        "{:+05}{}",
+        i64::from(local.year()) + years,
+        &text[month_on..]
+    )
+}
+
+/// An instant as `DuckDB`'s `CAST(ts AS VARCHAR)` writes it, in UTC:
+/// `YYYY-MM-DD HH:MM:SS`, and the fraction without its trailing zeros
+/// when it has one. Any year `DuckDB` holds, by the civil calendar below.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
+fn cast_timestamp(micros: i64) -> String {
     let (total_secs, sub_secs) = if micros >= 0 {
         (micros / 1_000_000, (micros % 1_000_000) as u32)
     } else {
@@ -2707,24 +2770,37 @@ fn format_timestamp(unit: TimeUnit, val: i64, utc_offset_secs: i32) -> String {
     }
 }
 
-/// The offset the SQL result is rendered with, given the display offset
-/// the caller asked for.
+/// [`cast_timestamp`]'s text back as the microsecond count it renders,
+/// [`TIMESTAMP_INFINITY`] and [`TIMESTAMP_NEG_INFINITY`] included.
 ///
-/// Zero whenever a Rust tail follows, because that tail is a second
-/// evaluator, not a printer: its `| where`/`| let` are pin-aware
-/// (ADR-0011) and read a TIMESTAMP cell through
-/// `compare::conformed_timestamp`, which takes a zoneless text as UTC. A
-/// display-shifted rendering handed to it would compare local wall-clock
-/// text against a UTC instant and skew every timestamp comparison by the
-/// client's offset — silently dropping rows for any non-UTC client. So
-/// the tail runs over UTC and the shift is re-applied afterwards
-/// ([`shift_timestamp_columns`]), which is the all-SQL path's order too:
-/// compare the stored instant, shift last.
-fn sql_render_offset(emitted: &EmittedQuery, utc_offset_secs: i32) -> i32 {
+/// `None` when the text is not that rendering (a cell the tail replaced
+/// with something else) or its year is outside chrono's calendar.
+fn parse_cast_timestamp(text: &str) -> Option<i64> {
+    match text {
+        "infinity" => Some(TIMESTAMP_INFINITY),
+        "-infinity" => Some(TIMESTAMP_NEG_INFINITY),
+        _ => chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+            .ok()
+            .map(|at| at.and_utc().timestamp_micros()),
+    }
+}
+
+/// How the SQL result renders its TIMESTAMP cells.
+///
+/// The wire's RFC 3339 in the display offset, unless a Rust tail follows,
+/// because that tail is a second evaluator, not a printer. Its `| where`
+/// and `| let` are pin-aware (ADR-0011) and read a TIMESTAMP cell's text
+/// as the stored instant through `compare::conformed_timestamp`, and its
+/// string functions read that text where the all-SQL lane reads
+/// `CAST(ts AS VARCHAR)`. So the tail gets `DuckDB`'s own cast text in UTC,
+/// the text the SQL lane compares and prints, and
+/// [`render_tracked_timestamps`] renders the wire's text afterwards: the
+/// all-SQL path's order too, compare the stored instant and render last.
+fn sql_timestamp_text(emitted: &EmittedQuery, display: FixedOffset) -> TimestampText {
     if emitted.rust_stages.is_empty() {
-        utc_offset_secs
+        TimestampText::Wire(display)
     } else {
-        0
+        TimestampText::Cast
     }
 }
 
@@ -2750,68 +2826,52 @@ fn tail_timestamp_scope(timestamp_columns: &[String], stages: &[Spanned<PipeStag
     scope
 }
 
-/// Type the columns the Rust tail's lineage ([`tail_timestamp_scope`])
-/// still calls a stored TIMESTAMP as `timestamp`.
+/// Render the columns the Rust tail's lineage ([`tail_timestamp_scope`])
+/// still calls a stored TIMESTAMP in the wire's text and display offset,
+/// and type them `timestamp`.
 ///
-/// The tail runs over pipeline cells, where a stored TIMESTAMP arrives as
-/// text, so [`crate::post_process::rows_to_result`] types a pass-through
-/// timestamp column `string`. The lineage knows better: the column is the
-/// SQL result's timestamp, renamed or aliased at most, so it keeps that
-/// type. A column the lineage cannot vouch for is typed by its own cells.
-fn retype_tracked_timestamps(result: &mut QueryResult, tracked: &PinScope) {
-    for column in &mut result.columns {
-        if column.ty == ColumnType::String && tracked.pin_for(&column.name).is_some() {
-            column.ty = ColumnType::Timestamp;
+/// The tail ran over `DuckDB`'s cast text ([`sql_timestamp_text`]), where a
+/// stored TIMESTAMP is a string, so [`crate::post_process::rows_to_result`]
+/// typed a pass-through column `string`. The lineage knows better: it is
+/// the SQL result's timestamp, renamed or aliased at most. A column is
+/// rendered whole or not at all: if any cell is not cast text (the tail
+/// replaced it, or its year is outside chrono's calendar), the column
+/// stays the `string` the tail left. A column the lineage cannot vouch
+/// for, such as an aggregate output or a computed `let`, keeps the type its
+/// own cells gave it, and a timestamp the tail computed is already wire
+/// text in UTC.
+fn render_tracked_timestamps(result: &mut QueryResult, tracked: &PinScope, display: FixedOffset) {
+    if tracked.is_empty() {
+        return;
+    }
+    for idx in 0..result.columns.len() {
+        let column = &result.columns[idx];
+        if column.ty != ColumnType::String || tracked.pin_for(&column.name).is_none() {
+            continue;
         }
-    }
-}
-
-/// Re-apply the display offset to the TIMESTAMP columns that survived the
-/// Rust tail, resolved through the tail's lineage
-/// ([`tail_timestamp_scope`]).
-///
-/// A column the lineage cannot vouch for — an aggregate output, a
-/// computed `let` — displays UTC: the honest reading for a value the
-/// tail has already transformed, and never a wrong instant. Cells the
-/// tail replaced with non-timestamp text are guarded per-cell by
-/// [`shift_display_timestamp`]'s parse.
-fn shift_timestamp_columns(result: &mut QueryResult, tracked: &PinScope, utc_offset_secs: i32) {
-    if utc_offset_secs == 0 || tracked.is_empty() {
-        return;
-    }
-    let targets: Vec<usize> = result
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(_, col)| tracked.pin_for(&col.name).is_some())
-        .map(|(idx, _)| idx)
-        .collect();
-    if targets.is_empty() {
-        return;
-    }
-    for row in &mut result.rows {
-        for &idx in &targets {
-            if let Some(Value::String(text)) = row.get_mut(idx)
-                && let Some(shifted) = shift_display_timestamp(text, utc_offset_secs)
-            {
-                *text = shifted;
+        let instants: Option<Vec<Option<i64>>> = result
+            .rows
+            .iter()
+            .map(|row| match row.get(idx) {
+                None | Some(Value::Null) => Some(None),
+                Some(Value::String(text)) => parse_cast_timestamp(text).map(Some),
+                Some(_) => None,
+            })
+            .collect();
+        let Some(instants) = instants else {
+            continue;
+        };
+        for (row, micros) in result.rows.iter_mut().zip(instants) {
+            if let Some(micros) = micros {
+                row[idx] = Value::String(format_timestamp(
+                    TimeUnit::Microsecond,
+                    micros,
+                    TimestampText::Wire(display),
+                ));
             }
         }
+        result.columns[idx].ty = ColumnType::Timestamp;
     }
-}
-
-/// Re-render [`format_timestamp`]'s UTC output in the display offset.
-///
-/// `None` when the text is not that rendering — a cell the tail replaced
-/// with something else, or a year outside `chrono`'s parse — in which
-/// case it is left exactly as it stands.
-fn shift_display_timestamp(text: &str, utc_offset_secs: i32) -> Option<String> {
-    let naive = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").ok()?;
-    Some(format_timestamp(
-        TimeUnit::Microsecond,
-        naive.and_utc().timestamp_micros(),
-        utc_offset_secs,
-    ))
 }
 
 /// Convert a date (days since Unix epoch) to YYYY-MM-DD.
@@ -2820,14 +2880,21 @@ fn format_date(days: i32) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Convert a time value to HH:MM:SS.
+/// A time of day as `DuckDB` casts it to text: `HH:MM:SS`, and the
+/// fraction without its trailing zeros when it has one.
 fn format_time(unit: TimeUnit, val: i64) -> String {
     let micros = to_micros(unit, val);
     let total_secs = micros / 1_000_000;
     let h = total_secs / 3600;
     let m = (total_secs % 3600) / 60;
     let s = total_secs % 60;
-    format!("{h:02}:{m:02}:{s:02}")
+    let fraction = micros % 1_000_000;
+    if fraction == 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        let digits = format!("{fraction:06}");
+        format!("{h:02}:{m:02}:{s:02}.{}", digits.trim_end_matches('0'))
+    }
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
@@ -2852,6 +2919,182 @@ fn days_to_ymd(days: i32) -> (i32, u32, u32) {
     let y = if m <= 2 { y + 1 } else { y };
 
     (y as i32, m, d)
+}
+
+/// The wire's timestamp text: RFC 3339 with six fraction digits, `Z` at
+/// offset zero and the offset otherwise, before the epoch and after it,
+/// and `DuckDB`'s words for its infinities in every unit.
+#[cfg(test)]
+#[test]
+fn timestamps_render_as_rfc3339_with_micros_and_an_offset() {
+    let wire = |secs: i32| TimestampText::Wire(FixedOffset::east_opt(secs).unwrap());
+    // 2024-01-15T10:00:00Z and 1969-12-31T23:59:59.5Z.
+    let at = 1_705_312_800_000_000;
+    let pre_epoch = -500_000;
+    for (unit, val, text, expected) in [
+        (
+            TimeUnit::Microsecond,
+            at,
+            wire(0),
+            "2024-01-15T10:00:00.000000Z",
+        ),
+        (
+            TimeUnit::Microsecond,
+            at,
+            wire(19_800),
+            "2024-01-15T15:30:00.000000+05:30",
+        ),
+        (
+            TimeUnit::Microsecond,
+            at,
+            wire(-18_000),
+            "2024-01-15T05:00:00.000000-05:00",
+        ),
+        (
+            TimeUnit::Microsecond,
+            at + 120_450,
+            wire(0),
+            "2024-01-15T10:00:00.120450Z",
+        ),
+        (
+            TimeUnit::Microsecond,
+            pre_epoch,
+            wire(0),
+            "1969-12-31T23:59:59.500000Z",
+        ),
+        (
+            TimeUnit::Microsecond,
+            pre_epoch,
+            wire(3_600),
+            "1970-01-01T00:59:59.500000+01:00",
+        ),
+        (TimeUnit::Second, 0, wire(0), "1970-01-01T00:00:00.000000Z"),
+        (
+            TimeUnit::Millisecond,
+            1_705_312_800_123,
+            wire(0),
+            "2024-01-15T10:00:00.123000Z",
+        ),
+        (
+            TimeUnit::Nanosecond,
+            1_705_312_800_123_456_789,
+            wire(0),
+            "2024-01-15T10:00:00.123456Z",
+        ),
+        (
+            TimeUnit::Microsecond,
+            at,
+            TimestampText::Cast,
+            "2024-01-15 10:00:00",
+        ),
+        (
+            TimeUnit::Microsecond,
+            pre_epoch,
+            TimestampText::Cast,
+            "1969-12-31 23:59:59.5",
+        ),
+    ] {
+        assert_eq!(
+            format_timestamp(unit, val, text),
+            expected,
+            "{unit:?} {val}"
+        );
+    }
+    for unit in [
+        TimeUnit::Second,
+        TimeUnit::Millisecond,
+        TimeUnit::Microsecond,
+        TimeUnit::Nanosecond,
+    ] {
+        for text in [wire(0), wire(19_800), TimestampText::Cast] {
+            assert_eq!(format_timestamp(unit, i64::MAX, text), "infinity");
+            assert_eq!(format_timestamp(unit, -i64::MAX, text), "-infinity");
+        }
+    }
+}
+
+/// Past chrono's calendar the wire still writes the instant exactly, in
+/// chrono's own expanded-year form: the 40,000-year step lands on the
+/// same calendar day, checked against chrono where both can write it and
+/// against `DuckDB`'s own extremes where only the step can.
+#[cfg(test)]
+#[test]
+fn timestamps_past_chronos_calendar_keep_their_civil_date() {
+    let utc = FixedOffset::east_opt(0).unwrap();
+    // Inside chrono's calendar, the step's arithmetic agrees with chrono.
+    for micros in [
+        253_402_300_800_000_000_i64, // +10000-01-01T00:00:00Z
+        -62_167_219_200_000_001,     // -0001-12-31T23:59:59.999999Z
+        5_000_000_000_000_000_000,
+        -5_000_000_000_000_000_000,
+    ] {
+        let direct = wire_timestamp(micros, utc);
+        let (nearer, years) = if micros > 0 {
+            (micros - FORTY_MILLENNIA_MICROS, 40_000)
+        } else {
+            (micros + FORTY_MILLENNIA_MICROS, -40_000)
+        };
+        let stepped = wire_timestamp(nearer, utc);
+        let year = |text: &str| -> i64 {
+            let end = 1 + text[1..].find('-').unwrap();
+            text[..end].parse().unwrap()
+        };
+        assert_eq!(year(&direct), year(&stepped) + years, "{direct}");
+        assert_eq!(
+            direct[direct[1..].find('-').unwrap() + 1..],
+            stepped[stepped[1..].find('-').unwrap() + 1..],
+            "{direct}"
+        );
+    }
+    assert_eq!(
+        wire_timestamp(253_402_300_800_000_000, utc),
+        "+10000-01-01T00:00:00.000000Z"
+    );
+    // `DuckDB`'s own finite extremes, from `test_all_types()`, which only the
+    // step can write; the cast text agrees on the civil date.
+    let min = -9_223_372_022_400_000_000;
+    let max = 9_223_372_036_854_775_806;
+    assert_eq!(wire_timestamp(min, utc), "-290308-12-22T00:00:00.000000Z");
+    assert_eq!(cast_timestamp(min), "-290308-12-22 00:00:00");
+    assert_eq!(wire_timestamp(max, utc), "+294247-01-10T04:00:54.775806Z");
+    assert_eq!(cast_timestamp(max), "294247-01-10 04:00:54.775806");
+    assert_eq!(
+        wire_timestamp(max, FixedOffset::east_opt(-3_600).unwrap()),
+        "+294247-01-10T03:00:54.775806-01:00"
+    );
+}
+
+/// A time keeps its fraction, in `DuckDB`'s cast spelling.
+#[cfg(test)]
+#[test]
+fn times_keep_their_fraction() {
+    assert_eq!(format_time(TimeUnit::Microsecond, 0), "00:00:00");
+    assert_eq!(
+        format_time(TimeUnit::Microsecond, 45_296_500_000),
+        "12:34:56.5"
+    );
+    assert_eq!(
+        format_time(TimeUnit::Microsecond, 45_296_000_001),
+        "12:34:56.000001"
+    );
+    assert_eq!(
+        format_time(TimeUnit::Microsecond, 86_400_000_000),
+        "24:00:00"
+    );
+}
+
+/// An offset RFC 3339 cannot spell is refused, never rendered.
+#[cfg(test)]
+#[test]
+fn a_display_offset_of_a_day_is_refused() {
+    assert!(display_offset(86_399).is_ok());
+    assert!(display_offset(-86_399).is_ok());
+    for secs in [86_400, -86_400, i32::MAX] {
+        assert!(
+            matches!(display_offset(secs), Err(EngineError::Refused { .. })),
+            "{secs}"
+        );
+    }
 }
 
 /// One parquet fixture for the `timechart on` lane, two rows, one

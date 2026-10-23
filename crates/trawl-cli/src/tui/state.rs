@@ -75,15 +75,11 @@ impl ResultsSearch {
                 {
                     continue;
                 }
-                let display = match value {
-                    Value::Null => "NULL".to_owned(),
-                    Value::Boolean(b) => b.to_string(),
-                    Value::Integer(i) => i.to_string(),
-                    Value::UInt(u) => u.to_string(),
-                    Value::Float(f) => format!("{f:.2}"),
-                    Value::String(s) => s.clone(),
-                    Value::Array(_) => value.to_string(),
+                // The text the grid shows, so a hit is a hit the reader sees.
+                let Some(column) = result.columns.get(col_idx) else {
+                    continue;
                 };
+                let display = crate::tui::ui::results::cell_text(&column.ty, value);
                 if display.to_lowercase().contains(&needle) {
                     self.matches.push((row_idx, col_idx));
                 }
@@ -3104,5 +3100,31 @@ mod tests {
         let (vrow, _) = editor.visual_cursor();
         assert!(editor.scroll_row <= vrow);
         assert!(editor.scroll_row + 5 > vrow);
+    }
+
+    /// The search reads the text the grid shows: a timestamp hit is on
+    /// its wall clock, never on the wire's `T` or offset.
+    #[test]
+    fn search_matches_a_timestamp_as_the_grid_shows_it() {
+        let result = QueryResult {
+            columns: vec![
+                Column::new("_time", ColumnType::Timestamp),
+                Column::new("note", ColumnType::String),
+            ],
+            rows: vec![vec![
+                Value::String("2026-01-15T10:00:01.250000+05:30".into()),
+                Value::String("T10".into()),
+            ]],
+        };
+        let mut search = ResultsSearch::new();
+        search.query = "10:00:01.25".to_owned();
+        search.update_matches(&result, None);
+        assert_eq!(search.matches, vec![(0, 0)]);
+        search.query = "t10".to_owned();
+        search.update_matches(&result, None);
+        assert_eq!(search.matches, vec![(0, 1)], "only the cell that shows it");
+        search.query = "+05:30".to_owned();
+        search.update_matches(&result, None);
+        assert!(search.matches.is_empty());
     }
 }

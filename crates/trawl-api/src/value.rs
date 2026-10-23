@@ -747,10 +747,16 @@ fn land_cell(ty: &ColumnType, cell: serde_json::Value) -> Result<Value, String> 
             )),
         },
         (ColumnType::Boolean, Json::Bool(b)) => Ok(Value::Boolean(b)),
-        (
-            ColumnType::String | ColumnType::Timestamp | ColumnType::Date | ColumnType::Time,
-            Json::String(text),
-        ) => Ok(Value::String(text)),
+        (ColumnType::Timestamp, Json::String(text)) => {
+            if is_timestamp_text(&text) {
+                Ok(Value::String(text))
+            } else {
+                Err(format!("{text:?} is not an RFC 3339 timestamp"))
+            }
+        }
+        (ColumnType::String | ColumnType::Date | ColumnType::Time, Json::String(text)) => {
+            Ok(Value::String(text))
+        }
         (ColumnType::List { items }, Json::Array(elements)) => elements
             .into_iter()
             .enumerate()
@@ -804,6 +810,36 @@ fn land_decimal(text: &str) -> Result<Value, String> {
     } else {
         Err(format!("{text} is outside the integer range (i64 and u64)"))
     }
+}
+
+/// Whether `text` spells a `timestamp` cell: RFC 3339, or `infinity` and
+/// `-infinity` for `DuckDB`'s infinite timestamps.
+///
+/// RFC 3339 has four-digit years only, and `DuckDB` holds years from
+/// 290309 BC to 294247 AD. The encoder writes a year outside 0000–9999
+/// the way chrono does, in ISO 8601's expanded form: a sign and at least
+/// four digits (`+10000-01-01T00:00:00.000000Z`, `-0001-12-31T…`). That
+/// form is read as RFC 3339 over a four-digit year with the same leap
+/// rule, so 29 February is valid exactly where the real year has one.
+fn is_timestamp_text(text: &str) -> bool {
+    if text == "infinity" || text == "-infinity" {
+        return true;
+    }
+    let Some(unsigned) = text.strip_prefix(['+', '-']) else {
+        return chrono::DateTime::parse_from_rfc3339(text).is_ok();
+    };
+    let Some((digits, rest)) = unsigned.split_once('-') else {
+        return false;
+    };
+    if digits.len() < 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(year) = digits.parse::<i64>() else {
+        return false;
+    };
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let proxy = if leap { "2000" } else { "2001" };
+    chrono::DateTime::parse_from_rfc3339(&format!("{proxy}-{rest}")).is_ok()
 }
 
 fn json_kind(value: &serde_json::Value) -> &'static str {
@@ -900,9 +936,9 @@ mod wire_tests {
                     Value::Integer(-42),
                     Value::Float(1.5),
                     Value::String("nginx".into()),
-                    Value::String("2026-01-15 09:00:00".into()),
+                    Value::String("2026-01-15T09:00:00.000000Z".into()),
                     Value::String("2026-01-15".into()),
-                    Value::String("09:00:00".into()),
+                    Value::String("09:00:00.5".into()),
                     Value::Array(vec![Value::Integer(1), Value::Null, Value::UInt(u64::MAX)]),
                     Value::Array(vec![Value::Array(vec![Value::Float(0.5)])]),
                     Value::Integer(7),
@@ -936,8 +972,8 @@ mod wire_tests {
                 {"name": "m", "type": "mixed"},
             ],
             "rows": [
-                [true, "-42", 1.5, "nginx", "2026-01-15 09:00:00", "2026-01-15",
-                 "09:00:00", ["1", null, "18446744073709551615"], [[0.5]],
+                [true, "-42", 1.5, "nginx", "2026-01-15T09:00:00.000000Z", "2026-01-15",
+                 "09:00:00.5", ["1", null, "18446744073709551615"], [[0.5]],
                  {"type": "integer", "value": "7"}],
                 [null, null, null, null, null, null, null, null, null, null],
             ],
@@ -1019,6 +1055,56 @@ mod wire_tests {
             err.starts_with("column \"n\": an integer cell is a decimal string"),
             "{err}"
         );
+    }
+
+    /// A `timestamp` cell is RFC 3339, or `infinity`/`-infinity`; a year
+    /// RFC 3339 cannot spell takes ISO 8601's expanded form, with the
+    /// real year's leap rule. Anything else is refused by column.
+    #[test]
+    fn timestamp_cells_are_rfc3339() {
+        for text in [
+            "2026-01-15T09:00:00.000000Z",
+            "2026-01-15T14:30:00.123456+05:30",
+            "1969-12-31T23:59:59.999999-08:00",
+            "0000-01-01T00:00:00.000000Z",
+            "infinity",
+            "-infinity",
+            "+10000-01-01T00:00:00.000000Z",
+            "-0001-12-31T23:59:59.000000Z",
+            "-290308-12-22T00:00:00.000000Z",
+            "+294247-01-10T04:00:54.775806Z",
+            "+2000000-02-29T00:00:00.000000Z",
+        ] {
+            let one = result(
+                vec![Column::new("t", ColumnType::Timestamp)],
+                vec![vec![Value::String(text.into())]],
+            );
+            assert_eq!(round_trip(&one), one, "{text}");
+        }
+        for text in [
+            "2026-01-15",
+            "09:00:00",
+            "2026-01-15T09:00:00",
+            "2026-02-30T00:00:00Z",
+            "Infinity",
+            "now",
+            "+2001-02-29T00:00:00Z",
+            "+999-01-01T00:00:00Z",
+            "+-2000-01-01T00:00:00Z",
+            "-",
+            "",
+        ] {
+            let err = decode(json!({
+                "columns": [{"name": "t", "type": "timestamp"}],
+                "rows": [[text]],
+            }))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                format!("column \"t\": {text:?} is not an RFC 3339 timestamp"),
+                "{text:?}"
+            );
+        }
     }
 
     /// A decimal string under any type but `integer` is refused, and so is

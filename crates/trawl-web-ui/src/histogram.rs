@@ -198,10 +198,10 @@ pub fn align_buckets(rows: &[(i64, u64)], slot_ms: i64, n: usize) -> Vec<Slot> {
 /// Parse a trawl timestamp into epoch milliseconds, treating it as
 /// naive wall-clock (no timezone shift applied).
 ///
-/// Accepts the executor's `YYYY-MM-DD HH:MM:SS[.fff]` display format and
-/// the RFC 3339 `T`-separated form; any trailing zone designator or
-/// fractional part is ignored, since the grid resolution is whole
-/// buckets. Returns `None` on anything it can't read, which the caller
+/// Accepts the result wire's RFC 3339 `T`-separated form and the
+/// space-separated `YYYY-MM-DD HH:MM:SS[.fff]` cast text; any trailing
+/// zone designator or fractional part is ignored, since the grid
+/// resolution is whole buckets. Returns `None` on anything it can't read, which the caller
 /// treats as "fall back to unpositioned bars".
 ///
 /// Deliberately lenient, unlike `series::parse_instant_secs`: the ingest

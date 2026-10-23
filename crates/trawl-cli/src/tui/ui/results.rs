@@ -15,8 +15,11 @@ use ratatui::widgets::{
     Table,
 };
 use std::collections::HashSet;
-use trawl_api::display::{downsample, extract_series, is_timechart_result, value_to_string};
+use trawl_api::display::{
+    downsample, extract_series, is_timechart_result, timestamp_cell_text, value_to_string,
+};
 use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
+use trawl_api::value::ColumnType;
 use trawl_engine::value::Value;
 
 use crate::tui::App;
@@ -312,7 +315,7 @@ fn render_table(
                         // (ADR-0013 §6).
                         severity_cell_text(value)
                     } else {
-                        value_to_string(value)
+                        cell_text(&result.columns[col_idx].ty, value)
                     };
                     let truncated = truncate_with_ellipsis(&text, width);
                     let cell = Cell::from(truncated);
@@ -1001,7 +1004,7 @@ fn render_bar_chart(
         .take(max_bars)
         .enumerate()
         .map(|(idx, row)| {
-            let label = value_to_string(&row[label_col]);
+            let label = cell_text(&result.columns[label_col].ty, &row[label_col]);
             // A bar's height is a `u64`, which is `Value::UInt`'s own
             // width, so an oversized unsigned draws at its real
             // magnitude. A negative or a NaN clamps to the bottom of the
@@ -1402,7 +1405,7 @@ fn compute_column_widths(
 
             for row in result.rows.iter().skip(v_scroll).take(SAMPLE_ROWS) {
                 if let Some(value) = row.get(col_idx) {
-                    let display_len = value_to_string(value).len();
+                    let display_len = cell_text(&col.ty, value).len();
                     if display_len > max_width {
                         max_width = display_len;
                     }
@@ -1439,8 +1442,9 @@ fn extract_time_metadata(
     // Find the _time column by name (UNION ALL BY NAME can reorder columns)
     let time_col = result.columns.iter().position(|c| c.name == "_time")?;
 
-    let first_time = value_to_string(&result.rows[0][time_col]);
-    let last_time = value_to_string(&result.rows[result.rows.len() - 1][time_col]);
+    let time_ty = &result.columns[time_col].ty;
+    let first_time = cell_text(time_ty, &result.rows[0][time_col]);
+    let last_time = cell_text(time_ty, &result.rows[result.rows.len() - 1][time_col]);
 
     // Derive span from the minimum non-zero delta between consecutive time buckets.
     // Using min rather than just the first pair handles sparse data (empty buckets
@@ -1448,8 +1452,8 @@ fn extract_time_metadata(
     let span = if result.rows.len() >= 2 {
         let mut min_delta: Option<u64> = None;
         for pair in result.rows.windows(2) {
-            let t1 = value_to_string(&pair[0][time_col]);
-            let t2 = value_to_string(&pair[1][time_col]);
+            let t1 = cell_text(time_ty, &pair[0][time_col]);
+            let t2 = cell_text(time_ty, &pair[1][time_col]);
             if let (Some(s1), Some(s2)) = (parse_timestamp_secs(&t1), parse_timestamp_secs(&t2)) {
                 let delta = s2.saturating_sub(s1);
                 if delta > 0 {
@@ -1511,6 +1515,14 @@ fn format_duration(secs: u64) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+/// A result cell as the TUI shows it: a timestamp as the wall clock the
+/// server rendered in the reader's offset ([`timestamp_cell_text`]), any
+/// other cell through [`value_to_string`]. The grid, its column widths,
+/// the detail popup and the search all read this one text.
+pub fn cell_text(ty: &ColumnType, value: &Value) -> String {
+    timestamp_cell_text(ty, value).unwrap_or_else(|| value_to_string(value))
 }
 
 /// A `_severity` cell as the TUI shows it: the shared `OTel` token, or the

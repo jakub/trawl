@@ -179,10 +179,10 @@ async fn trigger_variants_survive_ingest_compact_query() {
         );
         let ts = first_row_string(&result.result, "_time")
             .unwrap_or_else(|| panic!("variant {bad}: _time column present"));
-        // Engine formats timestamps as "YYYY-MM-DD HH:MM:SS[.frac]" (UTC).
-        let parsed = chrono::NaiveDateTime::parse_from_str(&ts, "%Y-%m-%d %H:%M:%S%.f")
+        // The result wire spells a timestamp in RFC 3339 with its offset.
+        let parsed = chrono::DateTime::parse_from_rfc3339(&ts)
             .unwrap_or_else(|e| panic!("variant {bad}: timestamp {ts} must parse: {e}"))
-            .and_utc();
+            .with_timezone(&chrono::Utc);
         assert!(
             parsed > before_ingest && parsed < after_ingest,
             "variant {bad}: _time must be the arrival time, got {ts}"
@@ -217,7 +217,7 @@ async fn offset_timestamp_canonicalized_to_utc_instant() {
     assert_eq!(result.result.row_count(), 1);
     assert_eq!(
         first_row_string(&result.result, "_time").as_deref(),
-        Some("2026-01-01 04:30:00.123456"),
+        Some("2026-01-01T04:30:00.123456Z"),
         "the +05:30 instant must land as UTC with microsecond precision"
     );
     assert_eq!(
@@ -245,7 +245,7 @@ async fn offset_timestamp_canonicalized_to_utc_instant() {
     assert_eq!(result.result.row_count(), 1);
     assert_eq!(
         first_row_string(&result.result, "_time").as_deref(),
-        Some("2026-01-01 04:30:00.123456"),
+        Some("2026-01-01T04:30:00.123456Z"),
         "an offset-less ISO 8601 value must keep its event time, read as UTC"
     );
     assert_eq!(
