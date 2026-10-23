@@ -28,13 +28,14 @@ use crate::api::PAGE_SIZE;
 use crate::categorical::group_columns;
 use crate::fetch_plan::cap_line;
 use crate::result_actions::{Capabilities, sorted_page};
+use crate::results_layout::cell_text;
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
 use fleet_ui::{LoadState, Loaded, OffsetPager, PageTotal, PageWindow};
 use leptos::prelude::*;
 use trawl_api::QueryResponse;
 use trawl_api::display::value_to_string;
-use trawl_api::value::Value;
+use trawl_api::value::{ColumnType, Value};
 
 #[component]
 pub fn ExactTable(
@@ -151,6 +152,7 @@ fn ExactTableBody(
     let col_count = columns.len();
     let body_rows = rows_data.clone();
     let body_cols = columns.clone();
+    let body_types: Vec<ColumnType> = resp.result.columns.iter().map(|c| c.ty.clone()).collect();
     let window = Signal::derive(move || {
         let page = page.get();
         PageWindow::new(
@@ -201,7 +203,7 @@ fn ExactTableBody(
                                 let cells = body_rows[i]
                                     .iter()
                                     .enumerate()
-                                    .map(|(ci, v)| cell(ci, v, &body_cols, &group_cols, &capabilities, &executed_query, on_add_filter))
+                                    .map(|(ci, v)| cell(ci, v, &body_cols, body_types.get(ci), &group_cols, &capabilities, &executed_query, on_add_filter))
                                     .collect::<Vec<_>>();
                                 view! { <tr>{cells}</tr> }
                             }).collect::<Vec<_>>().into_any()
@@ -233,18 +235,20 @@ fn ExactTableBody(
 
 /// One body cell: a search control on a grouped field, plain text on a
 /// generated metric or on a value no filter can name (a null group, an
-/// array).
+/// array). A timestamp shows in its short form; the filter keeps the
+/// wire text.
 #[allow(clippy::too_many_arguments)]
 fn cell(
     ci: usize,
     value: &Value,
     columns: &[String],
+    ty: Option<&ColumnType>,
     group_cols: &[usize],
     capabilities: &Capabilities,
     executed_query: &ExecutedQuery,
     on_add_filter: Callback<(ExecutedQuery, Filter)>,
 ) -> AnyView {
-    let text = value_to_string(value);
+    let text = cell_text(ty, value);
     if !group_cols.contains(&ci) {
         return view! { <td>{text}</td> }.into_any();
     }
@@ -257,7 +261,7 @@ fn cell(
     let label = format!("Search {field} = {text}");
     let filter = StoredValue::new(Filter {
         field,
-        value: text.clone(),
+        value: value_to_string(value),
         op: FilterOp::Include,
     });
     let query = executed_query.clone();

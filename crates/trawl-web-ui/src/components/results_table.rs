@@ -36,7 +36,8 @@ use crate::context_query::SearchNavigation;
 use crate::context_query::{build_context_query, escape_dq, find_col};
 use crate::result_actions::{Capabilities, compare};
 use crate::results_layout::{
-    MessageFirst, inspector_selection, message_first, null_fields_label, partition_detail_fields,
+    MessageFirst, cell_text, inspector_selection, message_first, null_fields_label,
+    partition_detail_fields,
 };
 use crate::state::query::{Filter, FilterOp};
 use crate::state::search_session::{ExecutedFailure, ExecutedQuery, ExecutedResponse};
@@ -52,7 +53,7 @@ use trawl_api::display::value_to_string;
 use wasm_bindgen::JsCast as _;
 
 use crate::severity_cell::{severity_class, severity_columns, severity_display};
-use trawl_api::value::Value;
+use trawl_api::value::{ColumnType, Value};
 
 #[component]
 pub fn ResultsTable(
@@ -147,6 +148,8 @@ pub fn ResultsTable(
                 let resp = rows.get()?.ok()?;
                 let columns: Vec<String> =
                     resp.response.result.columns.iter().map(|c| c.name.clone()).collect();
+                let types: Vec<ColumnType> =
+                    resp.response.result.columns.iter().map(|c| c.ty.clone()).collect();
                 let row = resp.response.result.rows.get(idx)?.clone();
                 let capabilities = Capabilities::for_query(&resp.query.effective);
                 Some(view! {
@@ -154,6 +157,7 @@ pub fn ResultsTable(
                         idx=idx
                         row=row
                         columns=columns
+                        types=types
                         executed_query=resp.query
                         capabilities=capabilities
                         on_add_filter=on_add_filter
@@ -249,6 +253,8 @@ fn InspectorPanel(
     idx: usize,
     row: Vec<Value>,
     columns: Vec<String>,
+    /// Each column's type, by the same index as `columns`.
+    types: Vec<ColumnType>,
     executed_query: ExecutedQuery,
     capabilities: Capabilities,
     on_add_filter: Callback<(ExecutedQuery, Filter)>,
@@ -257,9 +263,8 @@ fn InspectorPanel(
     bus: ToastBus,
     show_nulls: RwSignal<bool>,
 ) -> impl IntoView {
-    let time_text = find_col(&columns, &["_time"])
-        .and_then(|i| row.get(i))
-        .map(value_to_string);
+    let time_text =
+        find_col(&columns, &["_time"]).and_then(|i| Some(cell_text(types.get(i), row.get(i)?)));
     let raw_actions = capabilities.raw_actions();
     let row_for_actions = row.clone();
     let columns_for_actions = columns.clone();
@@ -289,7 +294,10 @@ fn InspectorPanel(
                 {move || fields.visible(show_nulls.get()).into_iter().map(|i| {
                     let (name, v) = (&columns[i], &row[i]);
                     let key = name.clone();
+                    // The filter and the copy keep the wire text; only
+                    // the reading is shortened.
                     let value_text = value_to_string(v);
+                    let shown = cell_text(types.get(i), v);
                     let copy_text = value_text.clone();
                     let allowed = capabilities.detail_filter(name, v);
                     let inc = Filter {
@@ -302,13 +310,13 @@ fn InspectorPanel(
                         value: value_text.clone(),
                         op: FilterOp::Exclude,
                     };
-                    let inc_label = format!("Include {name} = {value_text}");
-                    let exc_label = format!("Exclude {name} = {value_text}");
+                    let inc_label = format!("Include {name} = {shown}");
+                    let exc_label = format!("Exclude {name} = {shown}");
                     let query_for_inc = executed_query.clone();
                     let query_for_exc = executed_query.clone();
                     view! {
                         <span class="k">{key}</span>
-                        <span class="v">{value_text}</span>
+                        <span class="v">{shown}</span>
                         <span class="kv-act">
                             // The visible word says what the press does;
                             // the field and value it acts on live in the
@@ -424,6 +432,7 @@ fn ResultsTableBody(
 ) -> impl IntoView {
     let capabilities = Capabilities::for_query(&executed_query.effective);
     let columns: Vec<String> = resp.result.columns.iter().map(|c| c.name.clone()).collect();
+    let types: Vec<ColumnType> = resp.result.columns.iter().map(|c| c.ty.clone()).collect();
     let rows_data = resp.result.rows.clone();
     let returned = resp.pagination.returned;
     let empty_message = if resp.pagination.offset == 0 {
@@ -567,6 +576,7 @@ fn ResultsTableBody(
                             (move || sorted_indices.render(
                                 rows_data.clone(),
                                 cols_for_view.clone(),
+                                types.clone(),
                                 severity_cols.clone(),
                                 expanded,
                                 wiring.clone(),
@@ -629,6 +639,7 @@ impl SortedIndices {
         &self,
         rows: Vec<Vec<Value>>,
         columns: Vec<String>,
+        types: Vec<ColumnType>,
         severity_cols: Vec<usize>,
         expanded: RwSignal<Option<usize>>,
         wiring: RowWiring,
@@ -639,12 +650,14 @@ impl SortedIndices {
             .map(|i| {
                 let row = rows[i].clone();
                 let cols = columns.clone();
+                let tys = types.clone();
                 let sev_cols = severity_cols.clone();
                 view! {
                     <RowFragment
                         idx=i
                         row=row
                         columns=cols
+                        types=tys
                         severity_cols=sev_cols
                         expanded=expanded
                         wiring=wiring.clone()
@@ -686,6 +699,8 @@ fn RowFragment(
     idx: usize,
     row: Vec<Value>,
     columns: Vec<String>,
+    /// Each column's type, by the same index as `columns`.
+    types: Vec<ColumnType>,
     severity_cols: Vec<usize>,
     expanded: RwSignal<Option<usize>>,
     wiring: RowWiring,
@@ -719,12 +734,14 @@ fn RowFragment(
 
     let cells_row = row.clone();
     let cells_cols = columns.clone();
+    let cells_types = types.clone();
     let cells = move || match layout.get() {
-        Some(mf) => message_first_cells(&cells_row, &cells_cols, &mf),
-        None => compact_cells(&cells_row, &severity_cols),
+        Some(mf) => message_first_cells(&cells_row, &cells_cols, &cells_types, &mf),
+        None => compact_cells(&cells_row, &cells_types, &severity_cols),
     };
 
     let columns_for_detail = columns.clone();
+    let types_for_detail = types;
     let row_for_detail = row.clone();
     // `zip` semantics: a short row renders the cells it has, no more.
     let detail_fields = partition_detail_fields(&row[..row.len().min(columns.len())]);
@@ -794,6 +811,7 @@ fn RowFragment(
                         <div class="dg" id=detail_grid_id.clone()>
                             {
                             let columns_for_detail = columns_for_detail.clone();
+                            let types_for_detail = types_for_detail.clone();
                             let row_for_detail = row_for_detail.clone();
                             let detail_fields = detail_fields.clone();
                             let executed_query = executed_query.clone();
@@ -801,9 +819,11 @@ fn RowFragment(
                             move || detail_fields.visible(show_nulls.get()).into_iter().map(|i| {
                                 let (name, v) = (&columns_for_detail[i], &row_for_detail[i]);
                                 let key = name.clone();
-                                let value_text = value_to_string(v);
+                                // The filter keeps the wire text; only the
+                                // reading is shortened.
+                                let value_text = cell_text(types_for_detail.get(i), v);
                                 let field_for_click = name.clone();
-                                let value_for_click = value_text.clone();
+                                let value_for_click = value_to_string(v);
                                 let field_for_label = name.clone();
                                 let value_for_label = value_text.clone();
                                 let allowed = capabilities.detail_filter(name, v);
@@ -918,7 +938,7 @@ fn FindSimilarButton(
 }
 
 /// The compact layout's cells: one per column, in wire order.
-fn compact_cells(row: &[Value], severity_cols: &[usize]) -> Vec<AnyView> {
+fn compact_cells(row: &[Value], types: &[ColumnType], severity_cols: &[usize]) -> Vec<AnyView> {
     row.iter()
         .enumerate()
         .map(|(ci, v)| {
@@ -929,7 +949,7 @@ fn compact_cells(row: &[Value], severity_cols: &[usize]) -> Vec<AnyView> {
                 let cls = severity_class(v);
                 view! { <td><span class=cls>{s}</span></td> }.into_any()
             } else {
-                view! { <td>{value_to_string(v)}</td> }.into_any()
+                view! { <td>{cell_text(types.get(ci), v)}</td> }.into_any()
             }
         })
         .collect()
@@ -941,10 +961,18 @@ fn compact_cells(row: &[Value], severity_cols: &[usize]) -> Vec<AnyView> {
 /// Every column this drops is still reachable in the inline detail or
 /// the docked inspector — the mode trades the columns for one readable
 /// message, it does not hide data.
-fn message_first_cells(row: &[Value], columns: &[String], mf: &MessageFirst) -> Vec<AnyView> {
+fn message_first_cells(
+    row: &[Value],
+    columns: &[String],
+    types: &[ColumnType],
+    mf: &MessageFirst,
+) -> Vec<AnyView> {
     let mut out: Vec<AnyView> = Vec::with_capacity(3);
     if let Some(i) = mf.time {
-        let text = row.get(i).map(value_to_string).unwrap_or_default();
+        let text = row
+            .get(i)
+            .map(|v| cell_text(types.get(i), v))
+            .unwrap_or_default();
         out.push(view! { <td class="mono mf-time">{text}</td> }.into_any());
     }
     if let Some(i) = mf.severity
@@ -954,13 +982,16 @@ fn message_first_cells(row: &[Value], columns: &[String], mf: &MessageFirst) -> 
         let cls = severity_class(v);
         out.push(view! { <td><span class=cls>{s}</span></td> }.into_any());
     }
-    let message = row.get(mf.message).map(value_to_string).unwrap_or_default();
+    let message = row
+        .get(mf.message)
+        .map(|v| cell_text(types.get(mf.message), v))
+        .unwrap_or_default();
     let meta = mf
         .meta
         .iter()
         .filter_map(|&i| {
             let name = columns.get(i)?;
-            let value = value_to_string(row.get(i)?);
+            let value = cell_text(types.get(i), row.get(i)?);
             Some(view! { <span>{format!("{name} {value}")}</span> })
         })
         .collect::<Vec<_>>();
