@@ -16,7 +16,9 @@
 //! [`capture`] applies `/query`'s guards in `/query`'s order and calls the
 //! same functions, with two capture steps before the query is tracked:
 //!
-//! 1. The trawl `query` permission, else 403.
+//! 1. The trawl `query` permission, else 403. Then request-shape
+//!    validation: a `query` holding U+0000 is a 400, since the store's TEXT
+//!    columns refuse it. It opens no timing account.
 //! 2. One deadline for the whole capture: `[capture] deadline_secs`,
 //!    capped by the server's query timeout.
 //! 3. The query id and the timing account of kind `capture`, opened
@@ -229,6 +231,15 @@ pub async fn capture(
     req: CaptureRequest,
 ) -> Result<CaptureResponse, ServerError> {
     require_query(verified)?;
+    // Request-shape validation, like the JSON extractor's: before the
+    // timing account opens. The store's TEXT columns refuse U+0000 and a
+    // capture's text is stored and shown back, so the insert would fail
+    // as a 503 for an input the caller controls.
+    if req.query.contains('\0') {
+        return Err(ServerError::BadRequest(
+            "the query text contains a NUL character".into(),
+        ));
+    }
     let results = Arc::clone(&state.results);
     let limits = &results.capture;
     let pool = &state.query.pool;

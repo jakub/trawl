@@ -364,6 +364,61 @@ async fn refused_bounds_take_nothing() {
     );
 }
 
+/// The store's TEXT columns refuse U+0000, and a capture's text is stored
+/// and shown back (ADR-0057), so a request whose `query` carries one is a
+/// 400 at the boundary, not a 503 from the insert. Nothing is held, no row
+/// is kept and no file is left. A NUL in a `window` string already fails
+/// as an unparseable timestamp.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_nul_in_the_query_text_is_refused_at_the_boundary() {
+    let server = boot().await;
+    server.results_clock.set(at("2024-01-16T10:30:00Z"));
+    let service = captured::SERVICE;
+    let names = captured::root_names(&server);
+    let cases = [
+        (
+            "a NUL in a quoted value",
+            json!({ "query": format!("service={service} \"a\u{0}b\"") }),
+            "the query text contains a NUL character",
+        ),
+        (
+            "a NUL in a bare term",
+            json!({ "query": format!("service={service} message=a\u{0}b") }),
+            "the query text contains a NUL character",
+        ),
+        (
+            "a NUL beside a window",
+            json!({ "query": format!("service={service} \u{0}"), "window": { "last": "1h" } }),
+            "the query text contains a NUL character",
+        ),
+        (
+            "a NUL in a window string",
+            json!({ "query": corpus_query(), "window": { "earliest": "2024-01-16T10:00:00\u{0}Z" } }),
+            "is not an RFC 3339 instant",
+        ),
+    ];
+    for (what, body, message) in cases {
+        let before = permits(&server);
+        let (status, _, answer) = captured::capture(&server, &server.analyst_token, &body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {answer}");
+        assert_eq!(code(&answer), "bad_request", "{what}: {answer}");
+        assert!(
+            answer["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(message)),
+            "{what}: {answer}"
+        );
+        captured::assert_nothing_held(&server, before, what).await;
+        assert_eq!(captured::root_names(&server), names, "{what}: no file");
+    }
+    assert!(
+        captured::listed(&server, &server.analyst_token)
+            .await
+            .is_empty(),
+        "no row"
+    );
+}
+
 /// The saved query whose recorded run the `from saved` capture reads.
 const REPORT: &str = "capture_report";
 
