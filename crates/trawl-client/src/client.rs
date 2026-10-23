@@ -1116,6 +1116,8 @@ impl HttpClient {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent, ClientError>> + Send>>, ClientError>
     {
         let resp = self.stream(query).await?;
+        let request_id = request_id_of(&resp);
+        let url = resp.url().clone();
         let byte_stream = resp.bytes_stream();
 
         let event_stream = async_stream::try_stream! {
@@ -1123,7 +1125,8 @@ impl HttpClient {
             let mut buffer = String::new();
 
             while let Some(chunk) = futures::StreamExt::next(&mut byte_stream).await {
-                let chunk = chunk.map_err(sanitize_reqwest_error)?;
+                let chunk = chunk
+                    .map_err(|e| body_chunk_error(e.with_url(url.clone()), request_id.clone()))?;
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
 
                 while let Some(pos) = buffer.find("\n\n") {
@@ -1144,7 +1147,7 @@ impl HttpClient {
                     match event_type.as_deref() {
                         Some("data") => {
                             let event: trawl_api::value::QueryResult =
-                                decode_frame("event", event_data.as_deref())?;
+                                decode_frame("event", event_data.as_deref(), request_id.as_deref())?;
                             yield StreamEvent::Event(event);
                         }
                         Some("error") => {
@@ -1154,7 +1157,7 @@ impl HttpClient {
                         }
                         Some("snapshot") => {
                             let frame: trawl_api::stream::SnapshotFrame =
-                                decode_frame("snapshot", event_data.as_deref())?;
+                                decode_frame("snapshot", event_data.as_deref(), request_id.as_deref())?;
                             yield StreamEvent::Snapshot {
                                 result: frame.result,
                                 capped: frame.capped,
@@ -1166,7 +1169,7 @@ impl HttpClient {
                                 missed: u64,
                             }
                             let frame: LaggedFrame =
-                                decode_frame("lag notice", event_data.as_deref())?;
+                                decode_frame("lag notice", event_data.as_deref(), request_id.as_deref())?;
                             yield StreamEvent::Lagged(frame.missed);
                         }
                         _ => {} // ignore keep-alive, etc.
@@ -1297,17 +1300,20 @@ impl ErrorHeaders {
     }
 }
 
-/// Classify a failure reading or decoding a response body.
-///
 /// Decode one SSE frame's `data` payload, naming the frame `what` when it
-/// is missing or does not decode.
+/// is missing or does not decode. A failure carries the stream response's
+/// `request_id`.
 fn decode_frame<T: serde::de::DeserializeOwned>(
     what: &str,
     data: Option<&str>,
+    request_id: Option<&str>,
 ) -> Result<T, ClientError> {
-    let data = data.ok_or_else(|| ClientError::parse(format!("stream {what} has no data")))?;
-    serde_json::from_str(data)
-        .map_err(|e| ClientError::parse(format!("invalid stream {what}: {e}")))
+    let data = data.ok_or_else(|| {
+        ClientError::parse(format!("stream {what} has no data")).answered_by(request_id)
+    })?;
+    serde_json::from_str(data).map_err(|e| {
+        ClientError::parse(format!("invalid stream {what}: {e}")).answered_by(request_id)
+    })
 }
 
 /// reqwest reports every failure collecting a body as a decode error, a

@@ -458,3 +458,80 @@ async fn a_body_timeout_after_the_headers_carries_the_request_id() {
         );
     }
 }
+
+/// Open `/stream` and read it until it fails. A stream that ends cleanly
+/// is a test failure, so the caller always has an error to inspect.
+async fn stream_error(client: &HttpClient) -> Result<(), ClientError> {
+    use futures::StreamExt as _;
+    let mut events = client.stream_events("_service=nginx").await?;
+    while let Some(event) = events.next().await {
+        event?;
+    }
+    panic!("the stream ended without an error");
+}
+
+/// A `/stream` 200 carrying the id, whose body is `body`.
+fn stream_response(body: &[u8]) -> Vec<u8> {
+    response(
+        "200 OK",
+        &[
+            ("x-request-id", REQUEST_ID),
+            ("content-type", "text/event-stream"),
+        ],
+        body,
+    )
+}
+
+/// A stream frame that does not decode ends the stream with a parse
+/// error, and that error names the response's id.
+#[tokio::test]
+async fn a_malformed_stream_frame_carries_the_request_id() {
+    for body in [
+        &b"event: data\ndata: {}\n\n"[..],
+        &b"event: snapshot\n\n"[..],
+        &b"event: lagged\ndata: {}\n\n"[..],
+    ] {
+        let (client, served) = serve_one(Answer::Respond(stream_response(body))).await;
+        let error = exchange(stream_error(&client), served)
+            .await
+            .expect_err("a malformed frame is an error");
+        assert!(matches!(&error, ClientError::Parse { .. }), "{error:?}");
+        assert_eq!(error.request_id(), Some(REQUEST_ID), "{error:?}");
+    }
+}
+
+/// A `/stream` body that closes before its declared length is a body-read
+/// network error, and names the response's id.
+#[tokio::test]
+async fn a_stream_cut_short_after_the_headers_carries_the_request_id() {
+    let (client, served) = serve_one(Answer::Respond(cut_short_response())).await;
+    let error = exchange(stream_error(&client), served)
+        .await
+        .expect_err("a short stream is an error");
+    assert_eq!(
+        error.network_kind(),
+        Some(NetworkKind::BodyRead),
+        "{error:?}"
+    );
+    assert_eq!(error.request_id(), Some(REQUEST_ID), "{error:?}");
+}
+
+/// A `/stream` body that stalls past the client's deadline after the
+/// headers is a body timeout, and names the response's id.
+#[tokio::test]
+async fn a_stream_timeout_after_the_headers_carries_the_request_id() {
+    let (client, served) = serve_one_within(
+        Answer::Stall(cut_short_response()),
+        Some(Duration::from_millis(500)),
+    )
+    .await;
+    let error = exchange(stream_error(&client), served)
+        .await
+        .expect_err("a stalled stream is an error");
+    assert_eq!(
+        error.network_kind(),
+        Some(NetworkKind::BodyTimeout),
+        "{error:?}"
+    );
+    assert_eq!(error.request_id(), Some(REQUEST_ID), "{error:?}");
+}
