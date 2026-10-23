@@ -48,3 +48,7 @@ Building #307 settled ten points the decision left open. The decision stands; th
 - **`X-Request-Id` reaches the caller on every error that got a response.** trawl-client exposes it on each such error, and the CLI prints it after the message.
 
 The structured window spells `earliest` and `latest` as RFC 3339 instants with their offset applied, unlike the DSL's literals, whose offset `/query` drops. A missing file of a `from saved` run counts as zero bytes against the source budget; the vanished-run check then names it.
+
+## Amendment: known limit of the apartness proof, 2026-10-23
+
+Known limit: the apartness proof (ADR-0056's `hold_apart_from`) follows directory parents as the kernel names them and does not see bind-mount aliases; a results root bind-mounted from inside the data root is accepted. The query scratch root inherits the limit. A mount-aware proof (mountinfo or `STATX_MNT_ID`) over every held root is follow-up work. Until then the operator keeps the results and scratch roots on paths that are not aliases of a protected root's interior.

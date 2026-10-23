@@ -22,8 +22,10 @@
 //! process. It makes the directory 0700 if it is missing, holds its final
 //! component no-follow as ADR-0052 holds a storage root, and refuses the
 //! held directory if, by device and inode, it is one of trawld's storage
-//! roots or sits inside or above one. It then takes an exclusive `flock` on
-//! that handle. The query scratch directory and the results root
+//! roots or sits inside or above one. The proof compares the parents as the
+//! kernel names them from the held directory, so a bind mount whose source
+//! lies inside a protected root is not detected (see [`hold_apart_from`]).
+//! It then takes an exclusive `flock` on that handle. The query scratch directory and the results root
 //! (ADR-0057) are both held this way; a [`RootRole`] says which one a
 //! refusal names.
 //!
@@ -626,6 +628,15 @@ impl HeldRoot {
 /// relative path in either path all resolve to the same pairs. Judging the
 /// handle makes the answer hold for the directory that is locked, whatever
 /// its path names by then.
+///
+/// What the proof cannot see: it compares the parents as the kernel names
+/// them from the held directory. At a bind-mount root, `..` is the mount
+/// point's parent, not the source directory's, so a bind mount whose source
+/// lies inside a protected root is reported by its mount point's parents
+/// and that alias is not detected. A directory that is itself a root, or
+/// that reaches one through a symlink, is still refused. The operator must
+/// not alias a protected root's interior. A proof that sees mounts, by
+/// mountinfo or `STATX_MNT_ID`, is follow-up work.
 pub fn hold_apart_from(
     path: &Path,
     roots: &[OwnedRoot],
@@ -876,6 +887,8 @@ mod lock {
 
     /// A directory's device and inode. Every spelling of a directory, a
     /// symlink, a `..`, a relative path or a bind mount, leads to one pair.
+    /// The pair says nothing about which parents a spelling reaches: see
+    /// [`lineage`].
     type Identity = (u64, u64);
 
     /// Flags for an open that only finds a directory, following links. On
@@ -896,6 +909,13 @@ mod lock {
     /// The identities of the directory `fd` holds and of each directory
     /// above it, nearest first, up to the process's root. Each step opens
     /// `..` from the step before, so the kernel names every parent.
+    ///
+    /// The parents are the ones the kernel names from `fd`, not the ones of
+    /// the directory's source. At a bind-mount root, `..` is the mount
+    /// point's parent, so the lineage of a bind mount whose source lies
+    /// inside a protected root leaves out that root and its ancestors, and
+    /// the comparison against the root never sees them. That alias is not
+    /// detected; the operator must not alias a protected root's interior.
     fn lineage(fd: BorrowedFd<'_>) -> io::Result<Vec<Identity>> {
         let mut lineage = vec![identity(fd)?];
         let mut dir = rustix::fs::openat(fd, c"..", LOOKUP_FLAGS, Mode::empty())?;

@@ -514,7 +514,7 @@ The spill cap counts the bytes DuckDB accounts. On disk, DuckDB can hold a littl
 
 A query-only node with a read-only data root must set `query_scratch_dir` to a writable directory. With the default on a read-only mount, startup refuses, and the message names `[server] query_scratch_dir`.
 
-**The lock and boot cleanup.** trawld makes the directory 0700, opens its final component without following a symlink, and takes an exclusive `flock` on it for the life of the process. Before it takes the lock, it compares the opened directory, and each directory above it, with the data root, the WAL directory, and the repin staging roots by device and inode. An overlap refuses the start however the path spells it, through a symlink or a bind mount included. A second trawld that finds the lock held refuses to start with `the query scratch directory ... is locked by another trawld`. Give each trawld on one host its own directory. Distinct `[data] path` values already give distinct defaults.
+**The lock and boot cleanup.** trawld makes the directory 0700, opens its final component without following a symlink, and takes an exclusive `flock` on it for the life of the process. Before it takes the lock, it compares the opened directory, and each directory above it, with the data root, the WAL directory, and the repin staging roots by device and inode. An overlap refuses the start however the path spells it, through a symlink included. The check follows the directory's parents as the kernel names them, so a bind mount that places the directory inside the data root, the WAL directory, or a repin staging root is not detected. Do not alias those roots' interiors. A second trawld that finds the lock held refuses to start with `the query scratch directory ... is locked by another trawld`. Give each trawld on one host its own directory. Distinct `[data] path` values already give distinct defaults.
 
 Under the lock, boot reads the whole directory and then removes what an earlier trawld left behind, such as after a SIGKILL or an eviction:
 
@@ -557,7 +557,7 @@ A capture must survive a restart until it expires, so the results root is not qu
 | Refused at startup | Checked |
 |--------------------|---------|
 | An empty path. An explicit path that is relative or has a `..` component. A path with a glob metacharacter | As written, by `trawld --check-config` too |
-| A path equal to, inside, or above the data root, the WAL directory, a repin staging root, or the query scratch directory | As written, and again at startup by device and inode, so a symlink or a bind mount cannot hide an overlap |
+| A path equal to, inside, or above the data root, the WAL directory, a repin staging root, or the query scratch directory | As written, and again at startup by device and inode, so a symlink cannot hide an overlap. The check follows the directory's parents, so a bind mount that places the directory inside the data root, the WAL directory, or the scratch root is not detected; do not alias those roots' interiors |
 | A final path component that is a symlink, or a directory that another user owns | At startup |
 | A directory that another trawld holds | At startup, with `the results root ... is locked by another trawld` |
 
