@@ -12,6 +12,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { sha256, readRunBuild, verifyRunIdentity } from './identity.mjs';
+import { integerCell } from './workload.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const { values } = parseArgs({ options: { run: { type: 'string' } } });
@@ -234,7 +235,10 @@ try {
     assert.equal(receipt.result.rows.length, net.count);
     const seq = receipt.result.columns.findIndex(c => c.name === 'experiment_seq');
     assert.ok(seq >= 0);
-    assert.deepEqual(receipt.result.rows.map(row => row[seq]), corpus.slice(0, net.count).map(e => e.experiment_seq));
+    // A run result is the typed result wire: an integer cell is a decimal
+    // string under its `integer` column, read the way verifyRows reads one.
+    const seqColumn = receipt.result.columns[seq];
+    assert.deepEqual(receipt.result.rows.map(row => integerCell(seqColumn, row[seq])), corpus.slice(0, net.count).map(e => BigInt(e.experiment_seq)));
     report.receipts.push(safeReceipt({ ...receipt, net_id: net.id, net_name: net.name }));
   }
   assert.equal(new Set(report.receipts.map(r => r.id)).size, 21);

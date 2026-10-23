@@ -27,7 +27,7 @@ export function corpus(seed, count, run) {
 // wire carries integers as canonical decimal strings under their column's
 // type (ADR-0035, amended 2026-10-22); a JSON number there is a wire fault,
 // and `BigInt` keeps every digit a `Number` would round past 2^53.
-function integerCell(column, value) {
+export function integerCell(column, value) {
   assert.equal(column.type, 'integer', `column ${column.name} is ${column.type}, not integer`);
   assert.ok(typeof value === 'string' && /^-?(0|[1-9][0-9]*)$/.test(value),
     `column ${column.name}: ${JSON.stringify(value)} is not a decimal integer cell`);
