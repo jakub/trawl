@@ -1213,24 +1213,48 @@ impl HttpClient {
     }
 
     /// [`Self::send_authenticated`], reading at most `cap` body bytes
-    /// through [`read_json_capped`].
+    /// whatever the status.
+    ///
+    /// A success body is decoded through [`read_json_capped`]: past the cap
+    /// it is [`ClientError::TooLarge`]. A failure body is read under the
+    /// same cap through [`read_bounded`], and one that cannot be judged
+    /// (over the cap, or cut off) falls back to the `unknown error`
+    /// envelope as [`check_status`] does for an unreadable one. It is never
+    /// `TooLarge`: that would hide the status, request id and `Retry-After`
+    /// the headers already gave. Unlike [`check_status`], which buffers a
+    /// failure body whole, no more than `cap` bytes are ever read.
     async fn send_capped<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
         cap: usize,
         what: &str,
     ) -> Result<T, ClientError> {
-        let resp = self.execute_authenticated(req).await?;
-        read_json_capped(resp, cap, what).await
+        let resp = self.execute_unchecked(req).await?;
+        if resp.status().is_success() {
+            return read_json_capped(resp, cap, what).await;
+        }
+        let status = resp.status().as_u16();
+        let headers = ErrorHeaders::of(&resp);
+        let body = read_bounded(resp, cap).await.unwrap_or_default();
+        Err(server_error(status, headers, &body))
     }
 
     /// Send an authenticated request and hand back a success response,
     /// its body unread; a failure status is a [`ClientError::Server`].
+    async fn execute_authenticated(
+        &self,
+        req: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, ClientError> {
+        check_status(self.execute_unchecked(req).await?).await
+    }
+
+    /// Send an authenticated request and hand back the response whatever
+    /// its status, its body unread.
     ///
     /// The request is built before it is sent so its body decides how a
     /// send failure reads: only a request that uploads something can have
     /// its upload cut off (see [`sanitize_upload_error`]).
-    async fn execute_authenticated(
+    async fn execute_unchecked(
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<reqwest::Response, ClientError> {
@@ -1243,8 +1267,7 @@ impl HttpClient {
         } else {
             sanitize_reqwest_error
         };
-        let resp = self.client.execute(request).await.map_err(sanitize)?;
-        check_status(resp).await
+        self.client.execute(request).await.map_err(sanitize)
     }
 }
 
