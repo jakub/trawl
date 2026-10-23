@@ -50,6 +50,33 @@ data:
     {{- else if not (hasPrefix (printf "%s/" $mount) (clean (toString .Values.config.data.path))) }}
     {{- fail (printf "config.data.path %q is not below %s, so trawld's default scratch directory <data.path>.query-scratch would sit off the data volume: set config.server.queryScratchDir to a directory below %s" (toString .Values.config.data.path) $mount $mount) }}
     {{- end }}
+    {{- /* The results root (ADR-0057) follows the same rules as scratch: it
+         must land on the data volume, apart from the effective scratch
+         directory and the crash-dump mount. trawld's default is the sibling
+         <data.path>.results, which is on the volume exactly when data.path
+         is below its mount. Compare the effective paths trawld resolves. */}}
+    {{- $results := toString .Values.config.server.resultsDir }}
+    {{- $effectiveScratch := ternary (clean $scratch) (printf "%s.query-scratch" (clean (toString .Values.config.data.path))) (ne $scratch "") }}
+    {{- $effectiveResults := ternary (clean $results) (printf "%s.results" (clean (toString .Values.config.data.path))) (ne $results "") }}
+    {{- if $results }}
+    {{- if not (hasPrefix (printf "%s/" $mount) (clean $results)) }}
+    {{- fail (printf "config.server.resultsDir must be an absolute path below %s so captured results land on the data volume; got %q" $mount $results) }}
+    {{- end }}
+    {{- else if not (hasPrefix (printf "%s/" $mount) (clean (toString .Values.config.data.path))) }}
+    {{- fail (printf "config.data.path %q is not below %s, so trawld's default results directory <data.path>.results would sit off the data volume: set config.server.resultsDir to a directory below %s" (toString .Values.config.data.path) $mount $mount) }}
+    {{- end }}
+    {{- if or (eq $effectiveResults $effectiveScratch) (hasPrefix (printf "%s/" $effectiveScratch) $effectiveResults) (hasPrefix (printf "%s/" $effectiveResults) $effectiveScratch) }}
+    {{- fail (printf "config.server.resultsDir %q (effective; config.server.resultsDir, or <config.data.path>.results when it is empty) must not be at, under, or above the query scratch directory %q (config.server.queryScratchDir, or <config.data.path>.query-scratch when it is empty): trawld refuses to start when the two overlap; move one of them" $effectiveResults $effectiveScratch) }}
+    {{- end }}
+    {{- if .Values.crashDump.enabled }}
+    {{- $cores := clean (toString .Values.crashDump.mountPath) }}
+    {{- if or (eq $effectiveResults $cores) (hasPrefix (printf "%s/" $cores) $effectiveResults) (hasPrefix (printf "%s/" $effectiveResults) $cores) }}
+    {{- fail (printf "crashDump.mountPath %q must not be at, under, or above the results directory %q (config.server.resultsDir, or <config.data.path>.results when it is empty): the crash-dump volume would shadow captured results and fill the volume that holds the cores; move one of them" $cores $effectiveResults) }}
+    {{- end }}
+    {{- end }}
+    {{- if $results }}
+    results_dir = {{ clean $results | quote }}
+    {{- end }}
     query_spill_max_bytes = {{ .Values.config.server.querySpillMaxBytes | quote }}
     query_memory_limit = {{ .Values.config.server.queryMemoryLimit | quote }}
     query_threads = {{ .Values.config.server.queryThreads | int }}
@@ -75,6 +102,18 @@ data:
 
     [data]
     path = {{ .Values.config.data.path | quote }}
+
+    {{- /* [capture] (ADR-0057) renders only when config.capture is set. Every
+         key is emitted verbatim, strings quoted: trawld's boot-time
+         validation is the one validator, and a chart that cherry-picked
+         known keys would silently drop a typo'd one. */}}
+    {{- if .Values.config.capture }}
+
+    [capture]
+    {{- range $key, $value := .Values.config.capture }}
+    {{ $key }} = {{ if kindIs "string" $value }}{{ $value | quote }}{{ else }}{{ $value | toJson }}{{ end }}
+    {{- end }}
+    {{- end }}
 
     [auth]
     # database_url deliberately absent: the fleet keystore DSN is injected
