@@ -12,7 +12,10 @@ use trawl_api::{ErrorCode, ErrorDetail, ErrorEnvelope};
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     /// HTTP transport failure.
-    #[error("network error: {0}")]
+    #[error(
+        "network error: {0}{suffix}",
+        suffix = RequestSuffix(.0.request_id.as_deref())
+    )]
     Network(NetworkError),
 
     /// Server returned a non-success status with structured error info.
@@ -36,7 +39,10 @@ pub enum ClientError {
     },
 
     /// Failed to parse the server's response.
-    #[error("response parse error: {message}")]
+    #[error(
+        "response parse error: {message}{}",
+        RequestSuffix(request_id.as_deref())
+    )]
     Parse {
         /// What did not parse. Never quotes the body.
         message: String,
@@ -54,7 +60,10 @@ pub enum ClientError {
 
     /// A response body larger than the endpoint's cap. Only the first
     /// `cap` bytes were read; the rest never was.
-    #[error("response too large: more than {cap} bytes")]
+    #[error(
+        "response too large: more than {cap} bytes{}",
+        RequestSuffix(request_id.as_deref())
+    )]
     TooLarge {
         /// The most bytes the endpoint's body may hold.
         cap: usize,
@@ -139,8 +148,8 @@ impl fmt::Display for NetworkError {
     }
 }
 
-/// Renders ` (request <id>)` after a server error's message when the
-/// response named a request id, so a CLI user can quote it.
+/// Renders ` (request <id>)` after an error's message when the response it
+/// came from named a request id, so a CLI user can quote it.
 struct RequestSuffix<'a>(Option<&'a str>);
 
 impl fmt::Display for RequestSuffix<'_> {
@@ -225,5 +234,75 @@ impl ClientError {
             Self::Server { error, .. } => Some(&error.code),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "01JBQ7ZK3M8X2V5N9R4T6W0YCD";
+
+    /// Builds one variant, with or without a request id.
+    type Build = fn(Option<&str>) -> ClientError;
+
+    /// Every variant that carries a request id renders it once, as the
+    /// ` (request <id>)` suffix, and renders none without one.
+    #[test]
+    fn display_ends_with_the_request_id_when_there_is_one() {
+        let server = |request_id: Option<&str>| ClientError::Server {
+            status: 500,
+            error: ErrorEnvelope::simple(ErrorCode::ResultCorrupt, "broken"),
+            request_id: request_id.map(str::to_owned),
+            retry_after_secs: None,
+        };
+        let parse = |request_id: Option<&str>| ClientError::Parse {
+            message: "bad json".to_owned(),
+            request_id: request_id.map(str::to_owned),
+        };
+        let too_large = |request_id: Option<&str>| ClientError::TooLarge {
+            cap: 10,
+            request_id: request_id.map(str::to_owned),
+        };
+        let network = |request_id: Option<&str>| {
+            ClientError::Network(
+                NetworkError::new(NetworkKind::BodyRead, "response body broken")
+                    .answered_by(request_id.map(str::to_owned)),
+            )
+        };
+        let cases: [(Build, &str); 4] = [
+            (server, "server error (HTTP 500): broken"),
+            (parse, "response parse error: bad json"),
+            (too_large, "response too large: more than 10 bytes"),
+            (network, "network error: response body broken"),
+        ];
+        for (build, text) in cases {
+            assert_eq!(build(None).to_string(), text);
+            assert_eq!(
+                build(Some(ID)).to_string(),
+                format!("{text} (request {ID})")
+            );
+        }
+    }
+
+    /// The variants with no response behind them render no suffix.
+    #[test]
+    fn display_of_a_response_less_error_has_no_suffix() {
+        assert_eq!(
+            ClientError::Network(NetworkError::new(NetworkKind::Connect, "refused")).to_string(),
+            "network error: refused"
+        );
+        assert_eq!(
+            ClientError::parse("no response").to_string(),
+            "response parse error: no response"
+        );
+        assert_eq!(
+            ClientError::InvalidCa("empty".to_owned()).to_string(),
+            "invalid CA certificate: empty"
+        );
+        assert_eq!(
+            ClientError::InvalidUrl("userinfo".to_owned()).to_string(),
+            "invalid URL: userinfo"
+        );
     }
 }
