@@ -54,10 +54,21 @@ fn telemetry() -> &'static Capture {
     })
 }
 
+/// A capture deadline no loaded machine reaches, for a test where the
+/// deadline must decide nothing.
+const UNHURRIED_SECS: u64 = 300;
+
 /// A fixture over the capture corpus with `capture`, its clock at
 /// [`CAPTURED_AT`], and a recorded report for the analyst and the admin.
 async fn boot(capture: CaptureConfig) -> Arc<TestServer> {
-    let (server, data) = captured::boot_with_data(RateLimitConfig::default(), capture).await;
+    boot_with_timeout(capture, common::DEFAULT_TEST_TIMEOUT_SECS).await
+}
+
+/// [`boot`], with queries that time out after `timeout_secs`, which also
+/// caps every capture's deadline.
+async fn boot_with_timeout(capture: CaptureConfig, timeout_secs: u64) -> Arc<TestServer> {
+    let (server, data) =
+        captured::boot_with_data_timeout(RateLimitConfig::default(), capture, timeout_secs).await;
     server.results_clock.set(at(CAPTURED_AT));
     record_report(&server, &data, &server.analyst_token, "analyst_report").await;
     record_report(&server, &data, &server.admin_token, "admin_report").await;
@@ -140,13 +151,14 @@ fn spawn_capture(
     tokio::spawn(async move { captured::capture(&server, &token, &body).await })
 }
 
-/// Wait up to ten seconds for `done`, failing by `what`.
+/// Wait up to a minute for `done`, failing by `what`. A loaded machine has
+/// run these fixtures twenty times slower than an idle one.
 async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let give_up = std::time::Instant::now() + Duration::from_secs(10);
+    let give_up = std::time::Instant::now() + Duration::from_mins(1);
     while !done() {
         assert!(
             std::time::Instant::now() < give_up,
-            "waited 10 s for {what}"
+            "waited a minute for {what}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -188,9 +200,22 @@ async fn timing_of(request_id: &str) -> Captured {
 /// With the key's one running capture held, four more of its captures
 /// wait and the fifth is refused at once with `capture_busy`, taking no
 /// permit and no guard. Released, the five all finish.
+///
+/// The queued captures take their turns one after another, each inside
+/// its own deadline, and a queued capture whose deadline passes is refused
+/// as busy too. A loaded machine has taken longer than the fixture's ten
+/// seconds over the five, so every capture here gets [`UNHURRIED_SECS`]
+/// and only the queue decides the answers.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_key_queue_refuses_the_next_capture() {
-    let server = boot(CaptureConfig::default()).await;
+    let server = boot_with_timeout(
+        CaptureConfig {
+            deadline_secs: UNHURRIED_SECS,
+            ..CaptureConfig::default()
+        },
+        UNHURRIED_SECS,
+    )
+    .await;
     let key = captured::key_id(&server, &server.analyst_token).await;
     let gate = &server.state.results.gate;
     let seams = server.state.query.pool.seams();

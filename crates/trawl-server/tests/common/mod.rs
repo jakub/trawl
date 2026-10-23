@@ -2600,10 +2600,27 @@ pub mod captured {
         rate_limit: super::RateLimitConfig,
         capture: trawl_config::CaptureConfig,
     ) -> (TestServer, String) {
+        boot_with_data_timeout(rate_limit, capture, super::DEFAULT_TEST_TIMEOUT_SECS).await
+    }
+
+    /// [`boot_with_data`] whose queries time out after `timeout_secs`, which
+    /// also caps every capture's deadline.
+    pub async fn boot_with_data_timeout(
+        rate_limit: super::RateLimitConfig,
+        capture: trawl_config::CaptureConfig,
+        timeout_secs: u64,
+    ) -> (TestServer, String) {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
         let data = super::seed_data_root(tmp.path());
         seed_hour(&data, SERVICE, &corpus());
-        let server = super::setup_with_capture(tmp.path(), data.clone(), rate_limit, capture).await;
+        let server = super::setup_with_capture_timeout(
+            tmp.path(),
+            data.clone(),
+            rate_limit,
+            capture,
+            timeout_secs,
+        )
+        .await;
         std::mem::forget(tmp);
         (server, data)
     }
