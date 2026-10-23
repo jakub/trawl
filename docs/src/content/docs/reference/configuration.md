@@ -72,7 +72,7 @@ A check runs only when its prerequisite completed. Otherwise the check is
 | `server.app.connect` | A connection to the app-state database authenticates. | `server.config` |
 | `server.app.schema` | trawld's boot admits the app-state migration ledger. | `server.app.connect` |
 | `server.app.writer` | Reports whether a session holds trawld's writer lock. A held lock does not prove that trawld runs on this host. | `server.app.connect` |
-| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node, the same holds for the WAL directory, even when `[ingest] wal_dir` names a path inside the data root: the running user can read and write it, or create it in the nearest directory above it that exists. The access check covers the directories trawld writes and the directory where it creates them. It does not cover every parent directory that boot opens to sync. The check also predicts how boot closes the storage roots to their owner: the data root, a WAL directory the data root does not hold, and the repin siblings when they exist. A WAL directory under the data root is held only when it is a real directory reached without a symlink or a mount on the way, and the kernel reports mount IDs; otherwise it is a root of its own. A root with group or other permissions is `complete` with the reason `will_tighten`. A root that is a symlink, a WAL directory or repin sibling that is not a directory, a root that another user owns, and a root that needs closing on a read-only filesystem fail. | `server.config` |
+| `server.data.root` | The data root exists and is a directory, or boot creates it, and the running user can use it. On an ingest node, the same holds for the WAL directory, even when `[ingest] wal_dir` names a path inside the data root: the running user can read and write it, or create it in the nearest directory above it that exists. The access check covers the directories trawld writes and the directory where it creates them. It does not cover every parent directory that boot opens to sync. The check also predicts how boot closes the storage roots to their owner: the data root, a WAL directory the data root does not hold, and the repin siblings and the results root when they exist. A WAL directory under the data root is held only when it is a real directory reached without a symlink or a mount on the way, and the kernel reports mount IDs; otherwise it is a root of its own. A root with group or other permissions is `complete` with the reason `will_tighten`. A root that is a symlink, a WAL directory, repin sibling, or results root that is not a directory, a root that another user owns, and a root that needs closing on a read-only filesystem fail. | `server.config` |
 | `server.data.epoch` | The data root's `EPOCH` is current, or boot initializes it. | `server.data.root` |
 | `server.data.identity` | The data root belongs to the catalog in the app-state database. | `server.data.epoch`, `server.app.schema` |
 | `server.data.conformance` | Conformance is recorded for this catalog and data root, or boot runs the pass. A query-only node reports `not_configured`. | `server.data.identity` |
@@ -129,8 +129,8 @@ blocks the change. The check fails for each root that the start refuses:
 
 - The root itself is a symlink. A symlink in a directory above the root is
   followed.
-- A WAL directory or repin sibling is not a directory. A data root that is
-  not a directory fails the structural check instead.
+- A WAL directory, repin sibling, or results root is not a directory. A data
+  root that is not a directory fails the structural check instead.
 - Another user owns the root, even when trawld runs as root.
 - The root needs closing and is on a read-only filesystem.
 

@@ -2499,9 +2499,29 @@ mod tests {
         ingest: bool,
         ask_access: bool,
     ) -> (Outcome, Option<&'static str>) {
+        let results_dir = absent_results(data_root);
+        unchanged_with_results(tmp, data_root, wal_dir, &results_dir, ingest, ask_access).await
+    }
+
+    /// [`unchanged`], with the results root at `results_dir`.
+    #[cfg(unix)]
+    async fn unchanged_with_results(
+        tmp: &tempfile::TempDir,
+        data_root: &Path,
+        wal_dir: &Path,
+        results_dir: &Path,
+        ingest: bool,
+        ask_access: bool,
+    ) -> (Outcome, Option<&'static str>) {
         let before = modes(tmp.path());
-        let row =
-            root_and_wal_check(data_root.to_owned(), wal_dir.to_owned(), ingest, ask_access).await;
+        let row = check_root(
+            data_root.to_owned(),
+            wal_dir.to_owned(),
+            results_dir.to_owned(),
+            ingest,
+            ask_access,
+        )
+        .await;
         assert_eq!(
             modes(tmp.path()),
             before,
@@ -2516,6 +2536,8 @@ mod tests {
                             storage root";
     const ASIDE_LINK: &str = "the repin aside root is a symlink, and trawld does not follow one \
                               at a storage root";
+    const RESULTS_LINK: &str = "the results root is a symlink, and trawld does not follow one at \
+                                a storage root";
 
     /// An owner-only root is `complete` with no reason. One with a group or
     /// other bit is `complete`, `will_tighten`, on both node types: boot
@@ -2644,6 +2666,90 @@ mod tests {
         }
     }
 
+    /// The results root is predicted as the repin roots are (ADR-0057):
+    /// absent before the first boot is no fault, an owner-only one is
+    /// `complete`, and one with a group or other bit is `complete`,
+    /// `will_tighten`, on both node types, named by kind. A symlink, dangling
+    /// or not, and a file refuse at boot whoever runs trawld, so those rows
+    /// fail in a root run too. No mode changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_results_root_is_predicted_as_the_other_roots_are() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        write(&data.join("EPOCH"), b"3\n");
+        owner_only_mode(&data);
+        let wal = data.join("wal");
+        let results = data.with_extension("results");
+        let look = |ingest, ask_access| {
+            unchanged_with_results(&tmp, &data, &wal, &results, ingest, ask_access)
+        };
+        for ingest in [false, true] {
+            assert_eq!(
+                look(ingest, true).await,
+                (Outcome::Complete, None),
+                "absent, ingest {ingest}"
+            );
+        }
+
+        std::fs::create_dir(&results).unwrap();
+        for (mode, expected) in [
+            (0o700, None),
+            (0o755, Some(reason::WILL_TIGHTEN)),
+            (0o701, Some(reason::WILL_TIGHTEN)),
+        ] {
+            set_mode(&results, mode);
+            for ingest in [false, true] {
+                assert_eq!(
+                    look(ingest, true).await,
+                    (Outcome::Complete, expected),
+                    "mode {mode:o}, ingest {ingest}"
+                );
+                assert_eq!(
+                    look(ingest, false).await,
+                    (Outcome::NotSampled, Some(reason::RAN_AS_ROOT)),
+                    "mode {mode:o}, ingest {ingest}"
+                );
+            }
+        }
+        set_mode(&results, 0o755);
+        let row = check_root(data.clone(), wal.clone(), results.clone(), true, true).await;
+        assert_eq!(
+            row.into_check().detail.as_deref(),
+            Some(
+                "group or other permissions on the results root: trawld removes them at its \
+                 next start, and nothing beneath changes"
+            )
+        );
+        std::fs::remove_dir(&results).unwrap();
+
+        let real = tmp.path().join("elsewhere");
+        std::fs::create_dir(&real).unwrap();
+        owner_only_mode(&real);
+        for target in [real.clone(), tmp.path().join("nowhere")] {
+            std::os::unix::fs::symlink(&target, &results).unwrap();
+            for ask_access in [false, true] {
+                assert_eq!(
+                    look(true, ask_access).await,
+                    (Outcome::Failed, Some(RESULTS_LINK)),
+                    "{target:?}, ask_access {ask_access}"
+                );
+            }
+            assert!(std::fs::symlink_metadata(&results).unwrap().is_symlink());
+            std::fs::remove_file(&results).unwrap();
+        }
+
+        std::fs::write(&results, b"not a directory").unwrap();
+        for ask_access in [false, true] {
+            assert_eq!(
+                look(false, ask_access).await,
+                (Outcome::Failed, Some("the results root is not a directory")),
+                "ask_access {ask_access}"
+            );
+        }
+        assert_eq!(std::fs::read(&results).unwrap(), b"not a directory");
+    }
+
     /// A repin sibling that is not a directory refuses at boot whoever runs
     /// trawld, so the row fails in a root run too, and the file is left as
     /// it was. A data root that is not a directory stays the structural
@@ -2768,6 +2874,7 @@ mod tests {
             RootKind::WalDir,
             RootKind::RepinShadow,
             RootKind::RepinAside,
+            RootKind::ResultsRoot,
         ];
         let causes = [
             Unclosable::Symlink,
