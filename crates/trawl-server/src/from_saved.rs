@@ -394,9 +394,7 @@ mod tests {
     pub(super) fn cols(names: &[&str]) -> Vec<trawl_api::value::Column> {
         names
             .iter()
-            .map(|n| trawl_api::value::Column {
-                name: (*n).to_string(),
-            })
+            .map(|n| trawl_api::value::Column::new(*n, trawl_api::value::ColumnType::String))
             .collect()
     }
 
@@ -971,7 +969,10 @@ mod pg_tests {
             sid,
             saved_id,
             &trawl_api::value::QueryResult {
-                columns: super::tests::cols(&["n"]),
+                columns: vec![trawl_api::value::Column::new(
+                    "n",
+                    trawl_api::value::ColumnType::Integer,
+                )],
                 rows: vec![vec![trawl_api::value::Value::Integer(7)]],
             },
         )
@@ -1150,7 +1151,10 @@ mod pg_tests {
             sid,
             saved_id,
             &trawl_api::value::QueryResult {
-                columns: super::tests::cols(&["n"]),
+                columns: vec![trawl_api::value::Column::new(
+                    "n",
+                    trawl_api::value::ColumnType::Integer,
+                )],
                 rows: vec![vec![trawl_api::value::Value::Integer(7)]],
             },
         )

@@ -302,12 +302,10 @@ fn scale_is_taken_from_the_fetched_result() {
     use trawl_api::value::Column;
 
     let query = "* | stats count() by status";
-    let columns: Vec<Column> = ["status", "count"]
-        .iter()
-        .map(|n| Column {
-            name: (*n).to_string(),
-        })
-        .collect();
+    let columns = vec![
+        Column::new("status", trawl_api::value::ColumnType::String),
+        Column::new("count", trawl_api::value::ColumnType::Integer),
+    ];
     // 60 groups, the largest on row 55 — past the first page, which is
     // exactly the row a page-scoped scale would never see.
     let rows: Vec<Vec<Value>> = (0..60)
@@ -367,16 +365,26 @@ mod tests {
         group_columns(query, columns).is_empty()
     }
 
+    /// Each column typed by the cells it holds, as a server would.
     fn result(names: &[&str], rows: Vec<Vec<Value>>) -> QueryResult {
-        QueryResult {
-            columns: names
-                .iter()
-                .map(|n| Column {
-                    name: (*n).to_string(),
-                })
-                .collect(),
-            rows,
-        }
+        let columns = names
+            .iter()
+            .enumerate()
+            .map(|(idx, n)| {
+                let mut fold = trawl_api::value::TypeFold::new();
+                for row in &rows {
+                    if let Some(cell) = row.get(idx) {
+                        fold.observe_value(cell);
+                    }
+                }
+                Column::new(
+                    *n,
+                    fold.finish()
+                        .unwrap_or(trawl_api::value::ColumnType::String),
+                )
+            })
+            .collect();
+        QueryResult { columns, rows }
     }
 
     fn int_rows() -> Vec<Vec<Value>> {

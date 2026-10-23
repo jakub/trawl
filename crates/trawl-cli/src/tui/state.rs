@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use ratatui::layout::Rect;
 use trawl_client::{PaginationMeta, QueryResponse};
-use trawl_engine::value::{Column, QueryResult, Value};
+use trawl_engine::value::{Column, ColumnType, QueryResult, TypeFold, Value, land_u64};
 
 /// Cached layout areas from the last render frame, used for mouse hit-testing.
 ///
@@ -1808,6 +1808,28 @@ impl SimpleEditor {
     }
 }
 
+/// One live-tail JSON cell as a [`Value`].
+///
+/// The live lane still sends plain JSON maps, whose integers are JSON
+/// numbers, so this lands them by the wire's rule: `i64` first, then
+/// [`land_u64`] for the unsigned range above it, a float only for a
+/// number that is one. An object has no cell type and keeps its JSON text.
+fn live_cell(json: &serde_json::Value) -> Value {
+    match json {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Boolean(*b),
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .map(Value::Integer)
+            .or_else(|| n.as_u64().map(land_u64))
+            .or_else(|| n.as_f64().map(Value::Float))
+            .unwrap_or(Value::Null),
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Array(items) => Value::Array(items.iter().map(live_cell).collect()),
+        serde_json::Value::Object(_) => Value::String(json.to_string()),
+    }
+}
+
 /// Rolling buffer for live-streamed log events.
 ///
 /// Tracks columns via union of all seen field names and maintains
@@ -1877,7 +1899,7 @@ impl LiveBuffer {
         let mut row = vec![Value::Null; self.column_names.len()];
         for (key, json_val) in event {
             if let Some(&idx) = self.column_index.get(key) {
-                row[idx] = serde_json::from_value(json_val.clone()).unwrap_or(Value::Null);
+                row[idx] = live_cell(json_val);
             }
         }
 
@@ -1891,13 +1913,21 @@ impl LiveBuffer {
 
     /// Snapshot the current buffer state as a `QueryResponse` for rendering.
     pub fn to_query_response(&self) -> QueryResponse {
+        let rows: Vec<Vec<Value>> = self.rows.iter().cloned().collect();
+        // Each column is typed by the cells it buffers; one with no
+        // non-null cell has no evidence and is `string`.
         let columns: Vec<Column> = self
             .column_names
             .iter()
-            .map(|name| Column { name: name.clone() })
+            .enumerate()
+            .map(|(idx, name)| {
+                let mut fold = TypeFold::new();
+                for row in &rows {
+                    fold.observe_value(&row[idx]);
+                }
+                Column::new(name.clone(), fold.finish().unwrap_or(ColumnType::String))
+            })
             .collect();
-
-        let rows: Vec<Vec<Value>> = self.rows.iter().cloned().collect();
         let returned = rows.len();
 
         QueryResponse {
@@ -1939,7 +1969,7 @@ impl LiveBuffer {
             let mut row = vec![Value::Null; self.column_names.len()];
             for (key, json_val) in row_map {
                 if let Some(&idx) = self.column_index.get(key) {
-                    row[idx] = serde_json::from_value(json_val.clone()).unwrap_or(Value::Null);
+                    row[idx] = live_cell(json_val);
                 }
             }
             self.rows.push_back(row);

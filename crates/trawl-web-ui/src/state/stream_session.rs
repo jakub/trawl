@@ -22,7 +22,7 @@ use std::rc::Rc;
 use leptos::prelude::*;
 use serde::Deserialize;
 use trawl_api::stream::SnapshotCap;
-use trawl_api::value::{Column, QueryResult, Value};
+use trawl_api::value::{Column, ColumnType, QueryResult, TypeFold, Value};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{EventSource, MessageEvent};
@@ -315,14 +315,21 @@ fn snapshot_listener(signals: LiveSignals) -> Closure<dyn FnMut(MessageEvent)> {
                     .collect()
             })
             .collect();
-        let result = QueryResult {
-            columns: wire
-                .columns
-                .into_iter()
-                .map(|name| Column { name })
-                .collect(),
-            rows,
-        };
+        // Each column is typed by the cells it holds; one with no non-null
+        // cell has no evidence and is `string`.
+        let columns = wire
+            .columns
+            .into_iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                let mut fold = TypeFold::new();
+                for row in &rows {
+                    fold.observe_value(&row[idx]);
+                }
+                Column::new(name, fold.finish().unwrap_or(ColumnType::String))
+            })
+            .collect();
+        let result = QueryResult { columns, rows };
         snapshot.set(Some(result));
     })
 }

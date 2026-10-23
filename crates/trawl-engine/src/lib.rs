@@ -9,6 +9,7 @@
 //! emitter and executes them against `DuckDB`.
 
 pub mod cancel;
+pub mod column_type;
 pub mod error;
 pub mod executor;
 pub mod parquet_stats;

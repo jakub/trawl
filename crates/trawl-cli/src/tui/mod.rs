@@ -1065,10 +1065,20 @@ mod tests {
 
     /// Build a successful `QueryResponse` with the given columns and rows.
     fn make_query_response(columns: Vec<&str>, rows: Vec<Vec<Value>>) -> QueryResponse {
+        // Each column typed by the cells it holds, as a server would.
         let cols = columns
             .into_iter()
-            .map(|name| Column {
-                name: name.to_owned(),
+            .enumerate()
+            .map(|(idx, name)| {
+                let mut fold = trawl_engine::value::TypeFold::new();
+                for row in &rows {
+                    fold.observe_value(&row[idx]);
+                }
+                Column::new(
+                    name,
+                    fold.finish()
+                        .unwrap_or(trawl_engine::value::ColumnType::String),
+                )
             })
             .collect();
         let returned = rows.len();

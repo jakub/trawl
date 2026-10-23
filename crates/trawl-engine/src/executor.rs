@@ -23,10 +23,13 @@ use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
 use crate::cancel::CancelLatch;
+use crate::column_type::column_type;
 use crate::error::{DuckDbDiagnostic, EngineError, missing_column};
 use crate::scratch::ScratchLock;
 use crate::timing::{Fallback, PhaseClock, QueryPhase};
-use crate::value::{Column, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64};
+use crate::value::{
+    Column, ColumnType, QueryResult, SchemaColumn, SchemaResult, Value, land_i128, land_u64,
+};
 
 /// Names of the result columns `DuckDB` returned as TIMESTAMP.
 type TimestampColumns = Vec<String>;
@@ -988,18 +991,10 @@ impl Executor {
                 .ok_or(EngineError::Database(duckdb::Error::InvalidColumnName(
                     "statement unavailable after query execution".into(),
                 )))?;
-        let col_count = stmt_ref.column_count();
-        let columns: Vec<Column> = stmt_ref
-            .column_names()
-            .into_iter()
-            .map(|name| Column { name })
-            .collect();
-
-        // A column is TIMESTAMP the first time a non-NULL cell of it comes
-        // back as one — cheaper than asking for the declared type, and an
-        // all-NULL column has nothing to shift anyway. The extra
-        // `get_ref_unwrap` costs one lookup per column until it is flagged.
-        let mut is_timestamp = vec![false; col_count];
+        // Typed before the first row is read, so a zero-row or all-NULL
+        // column is typed from execution too.
+        let columns = typed_columns(stmt_ref);
+        let col_count = columns.len();
 
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
@@ -1013,20 +1008,16 @@ impl Executor {
                 _ => {}
             }
             let mut cells = Vec::with_capacity(col_count);
-            for (i, seen) in is_timestamp.iter_mut().enumerate() {
-                if !*seen && matches!(row.get_ref_unwrap(i), ValueRef::Timestamp(..)) {
-                    *seen = true;
-                }
-                cells.push(extract_value(row, i, utc_offset_secs));
+            for (i, column) in columns.iter().enumerate() {
+                cells.push(extract_value(row, i, &column.name, utc_offset_secs)?);
             }
             rows.push(cells);
         }
 
         let timestamp_columns: TimestampColumns = columns
             .iter()
-            .zip(&is_timestamp)
-            .filter(|&(_, &ts)| ts)
-            .map(|(col, _)| col.name.clone())
+            .filter(|col| col.ty == ColumnType::Timestamp)
+            .map(|col| col.name.clone())
             .collect();
 
         Ok((QueryResult { columns, rows }, timestamp_columns))
@@ -1530,7 +1521,7 @@ impl Executor {
             for row in &result.rows {
                 let mut map = serde_json::Map::with_capacity(result.columns.len());
                 for (col, val) in result.columns.iter().zip(row.iter()) {
-                    map.insert(col.name.clone(), value_to_json(val));
+                    map.insert(col.name.clone(), val.to_plain_json());
                 }
                 serde_json::to_writer(&mut file, &map).map_err(|e| {
                     EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
@@ -1594,18 +1585,13 @@ impl Executor {
                 .ok_or(EngineError::Database(duckdb::Error::InvalidColumnName(
                     "statement unavailable after query execution".into(),
                 )))?;
-        let col_count = stmt_ref.column_count();
-        let columns: Vec<Column> = stmt_ref
-            .column_names()
-            .into_iter()
-            .map(|name| Column { name })
-            .collect();
+        let columns = typed_columns(stmt_ref);
 
         let mut rows = Vec::new();
         while let Some(row) = result_rows.next()? {
-            let mut cells = Vec::with_capacity(col_count);
-            for i in 0..col_count {
-                cells.push(extract_value(row, i, 0));
+            let mut cells = Vec::with_capacity(columns.len());
+            for (i, column) in columns.iter().enumerate() {
+                cells.push(extract_value(row, i, &column.name, 0)?);
             }
             rows.push(cells);
         }
@@ -1634,6 +1620,7 @@ fn finish_result(
             ast.search.time_filter.as_ref().map(|tf| tf.node.duration),
         )?;
         let tracked = tail_timestamp_scope(timestamp_columns, &emitted.rust_stages);
+        retype_tracked_timestamps(&mut result, &tracked);
         shift_timestamp_columns(&mut result, &tracked, utc_offset_secs);
     }
     cap.trim(&mut result);
@@ -1641,21 +1628,6 @@ fn finish_result(
         result.reorder_log_columns();
     }
     Ok(result)
-}
-
-/// Convert a [`Value`] to a [`serde_json::Value`] for ndjson serialization.
-fn value_to_json(v: &Value) -> serde_json::Value {
-    match v {
-        Value::Null => serde_json::Value::Null,
-        Value::Boolean(b) => serde_json::Value::Bool(*b),
-        Value::Integer(n) => serde_json::json!(n),
-        // A JSON number, like every other integer: ndjson export must
-        // spell an oversized unsigned the way the wire does.
-        Value::UInt(u) => serde_json::json!(u),
-        Value::Float(f) => serde_json::json!(f),
-        Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
-    }
 }
 
 /// `DuckDB`'s "no matching files" message, carried by a
@@ -2353,6 +2325,17 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
         .collect()
 }
 
+/// A statement's result columns, each typed from its `DuckDB` logical
+/// type ([`column_type`]). Read once the statement has run and before its
+/// first row, so a zero-row result is typed too.
+fn typed_columns(stmt: &duckdb::Statement<'_>) -> Vec<Column> {
+    stmt.column_names()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, name)| Column::new(name, column_type(&stmt.column_logical_type(idx))))
+        .collect()
+}
+
 /// Extract a `Value` from a duckdb row at the given column index.
 ///
 /// Uses `ValueRef` for type-safe dispatch. Temporal values render through
@@ -2362,8 +2345,18 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
 ///
 /// `utc_offset_secs` is applied to timestamp values before civil time
 /// formatting. Pass `0` for UTC.
-fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Value {
-    match row.get_ref_unwrap(idx) {
+///
+/// The cell has to agree with the type [`crate::column_type::column_type`]
+/// gives its column, or the wire encoder refuses it; a `HUGEINT` or
+/// `UHUGEINT` outside `i64` ∪ `u64` has no `integer` cell at all and is
+/// refused here, by `column`'s name ([`EngineError::IntegerOutOfRange`]).
+fn extract_value(
+    row: &duckdb::Row<'_>,
+    idx: usize,
+    column: &str,
+    utc_offset_secs: i32,
+) -> Result<Value, EngineError> {
+    Ok(match row.get_ref_unwrap(idx) {
         ValueRef::Null => Value::Null,
         ValueRef::Boolean(b) => Value::Boolean(b),
         ValueRef::TinyInt(i) => Value::Integer(i64::from(i)),
@@ -2372,8 +2365,9 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Val
         ValueRef::BigInt(i) => Value::Integer(i),
         // Past `i64::MAX` the magnitude lands in `Value::UInt` —
         // `trawl_api::value` owns that rule for every decoder, this one
-        // included.
-        ValueRef::HugeInt(i) => land_i128(i),
+        // included — and past `u64::MAX` it has no variant.
+        ValueRef::HugeInt(i) => land_huge(i, column)?,
+        ValueRef::UHugeInt(u) => land_uhuge(u, column)?,
         ValueRef::UTinyInt(i) => Value::Integer(i64::from(i)),
         ValueRef::USmallInt(i) => Value::Integer(i64::from(i)),
         ValueRef::UInt(i) => Value::Integer(i64::from(i)),
@@ -2388,44 +2382,81 @@ fn extract_value(row: &duckdb::Row<'_>, idx: usize, utc_offset_secs: i32) -> Val
         ValueRef::Date32(days) => Value::String(format_date(days)),
         ValueRef::Time64(unit, val) => Value::String(format_time(unit, val)),
         // list values from aggregations like LIST(DISTINCT col)
-        ValueRef::List(..) => row
-            .get::<_, duckdb::types::Value>(idx)
-            .map_or(Value::Null, convert_duckdb_value),
+        ValueRef::List(..) | ValueRef::Array(..) => match row.get::<_, duckdb::types::Value>(idx) {
+            Ok(value) => convert_duckdb_value(value, column, utc_offset_secs)?,
+            Err(_) => Value::Null,
+        },
         // everything else: try string extraction, fall back to null
         _ => row.get::<_, String>(idx).map_or(Value::Null, Value::String),
-    }
+    })
 }
 
 /// Recursively convert a `duckdb::types::Value` to our `Value`.
 ///
 /// This is the nested twin of [`extract_value`] — a `list()` aggregate
 /// arrives here element by element — so it lands the same integer widths
-/// the same way. Without the unsigned arms a `UBIGINT` inside a list fell
-/// through to the debug-text fallback below and reached the reader as
-/// `UBigInt(18446744073709551615)`.
-fn convert_duckdb_value(v: duckdb::types::Value) -> Value {
-    match v {
+/// and renders the same temporal text the same way, refusing a huge
+/// integer by the same column name. Without the unsigned arms a `UBIGINT`
+/// inside a list fell through to the debug-text fallback below and reached
+/// the reader as `UBigInt(18446744073709551615)`.
+fn convert_duckdb_value(
+    v: duckdb::types::Value,
+    column: &str,
+    utc_offset_secs: i32,
+) -> Result<Value, EngineError> {
+    Ok(match v {
         duckdb::types::Value::Null => Value::Null,
         duckdb::types::Value::Boolean(b) => Value::Boolean(b),
         duckdb::types::Value::TinyInt(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::SmallInt(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::Int(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::BigInt(i) => Value::Integer(i),
-        duckdb::types::Value::HugeInt(i) => land_i128(i),
+        duckdb::types::Value::HugeInt(i) => land_huge(i, column)?,
+        duckdb::types::Value::UHugeInt(u) => land_uhuge(u, column)?,
         duckdb::types::Value::UTinyInt(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::USmallInt(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::UInt(i) => Value::Integer(i64::from(i)),
         duckdb::types::Value::UBigInt(i) => land_u64(i),
         duckdb::types::Value::Float(f) => Value::Float(f64::from(f)),
         duckdb::types::Value::Double(f) => Value::Float(f),
-        duckdb::types::Value::Text(s) => Value::String(s),
-        duckdb::types::Value::List(elements) => {
-            Value::Array(elements.into_iter().map(convert_duckdb_value).collect())
+        duckdb::types::Value::Text(s) | duckdb::types::Value::Enum(s) => Value::String(s),
+        duckdb::types::Value::Blob(bytes) => Value::String(format!("<blob {} bytes>", bytes.len())),
+        // A `list(_time)` element is the same instant a `_time` cell is,
+        // so it renders the same way: the column is `list<timestamp>`,
+        // and a debug spelling would not be a timestamp at all.
+        duckdb::types::Value::Timestamp(unit, val) => {
+            Value::String(format_timestamp(unit, val, utc_offset_secs))
+        }
+        duckdb::types::Value::Date32(days) => Value::String(format_date(days)),
+        duckdb::types::Value::Time64(unit, val) => Value::String(format_time(unit, val)),
+        duckdb::types::Value::List(elements) | duckdb::types::Value::Array(elements) => {
+            Value::Array(
+                elements
+                    .into_iter()
+                    .map(|element| convert_duckdb_value(element, column, utc_offset_secs))
+                    .collect::<Result<_, _>>()?,
+            )
         }
         other => Value::String(format!("{other:?}")),
-    }
+    })
 }
 
+/// A `HUGEINT` cell, narrowed by checked conversion or refused by its
+/// column's name.
+fn land_huge(v: i128, column: &str) -> Result<Value, EngineError> {
+    land_i128(v).ok_or_else(|| EngineError::IntegerOutOfRange {
+        column: column.to_owned(),
+    })
+}
+
+/// A `UHUGEINT` cell, the unsigned twin of [`land_huge`].
+fn land_uhuge(v: u128, column: &str) -> Result<Value, EngineError> {
+    u64::try_from(v)
+        .map(land_u64)
+        .map_err(|_| EngineError::IntegerOutOfRange {
+            column: column.to_owned(),
+        })
+}
 /// A `UBIGINT` inside a `list()` reaches the reader as a number,
 /// including the ones past `i64::MAX` that only `Value::UInt` holds.
 ///
@@ -2445,7 +2476,7 @@ fn list_ubigint_renders_digits() {
         .expect("prepare");
     let mut rows = stmt.query([]).expect("query");
     let row = rows.next().expect("step").expect("one row");
-    let cell = extract_value(row, 0, 0);
+    let cell = extract_value(row, 0, "ids", 0).expect("every element fits an integer cell");
 
     assert_eq!(
         cell,
@@ -2463,6 +2494,153 @@ fn list_ubigint_renders_digits() {
     );
 }
 
+/// `test_all_types()`'s columns as [`column_type`] maps them, in order.
+#[cfg(test)]
+const ALL_TYPES_MAPPED: [&str; 55] = [
+    "bool boolean",
+    "tinyint integer",
+    "smallint integer",
+    "int integer",
+    "bigint integer",
+    "hugeint integer",
+    "uhugeint integer",
+    "utinyint integer",
+    "usmallint integer",
+    "uint integer",
+    "ubigint integer",
+    "bignum string",
+    "date date",
+    "time time",
+    "timestamp timestamp",
+    "timestamp_s timestamp",
+    "timestamp_ms timestamp",
+    "timestamp_ns timestamp",
+    "time_tz time",
+    "timestamp_tz timestamp",
+    "float float",
+    "double float",
+    "dec_4_1 string",
+    "dec_9_4 string",
+    "dec_18_6 string",
+    "dec38_10 string",
+    "uuid string",
+    "interval string",
+    "varchar string",
+    "blob string",
+    "bit string",
+    "small_enum string",
+    "medium_enum string",
+    "large_enum string",
+    "int_array list<integer>",
+    "double_array list<float>",
+    "date_array list<date>",
+    "timestamp_array list<timestamp>",
+    "timestamptz_array list<timestamp>",
+    "varchar_array list<string>",
+    "nested_int_array list<list<integer>>",
+    "struct string",
+    "struct_of_arrays string",
+    "array_of_structs list<string>",
+    "map string",
+    "union string",
+    "fixed_int_array list<integer>",
+    "fixed_varchar_array list<string>",
+    "fixed_nested_int_array list<list<integer>>",
+    "fixed_nested_varchar_array list<list<string>>",
+    "fixed_struct_array list<string>",
+    "struct_of_fixed_array string",
+    "fixed_array_of_int_list list<list<integer>>",
+    "list_of_fixed_int_array list<list<integer>>",
+    "geometry string",
+];
+
+/// Every `DuckDB` type's column type agrees with the cells
+/// [`extract_value`] lands for it, row by row over `test_all_types()`:
+/// the wire encoder takes each cell under its column's mapped type, and the
+/// decoder lands it back unchanged. A disagreement here would be a real
+/// query refused at the wire, so this is the guard on [`column_type`].
+///
+/// The only refusals are by design, and they name their column: the
+/// `HUGEINT` extremes and the `UHUGEINT` maximum lie outside `i64` ∪ `u64`.
+/// `time_ns` is left out because the bundled duckdb-rs cannot read a
+/// `TIME_NS` cell at all (`get_ref_unwrap` panics), whatever its type.
+#[cfg(test)]
+#[test]
+fn every_duckdb_type_agrees_with_its_cells() {
+    let conn = Connection::open_in_memory().expect("in-memory duckdb");
+    let mut stmt = conn
+        .prepare("SELECT * EXCLUDE (time_ns) FROM test_all_types()")
+        .expect("prepare");
+    let mut rows = stmt.query([]).expect("query");
+    let columns = typed_columns(rows.as_ref().expect("statement after query"));
+
+    let mapped: Vec<String> = columns
+        .iter()
+        .map(|column| format!("{} {}", column.name, column.ty))
+        .collect();
+    assert_eq!(mapped, ALL_TYPES_MAPPED);
+
+    let mut refused = Vec::new();
+    let mut landed = 0;
+    while let Some(row) = rows.next().expect("step") {
+        for (i, column) in columns.iter().enumerate() {
+            let cell = match extract_value(row, i, &column.name, 0) {
+                Ok(cell) => cell,
+                Err(EngineError::IntegerOutOfRange { column }) => {
+                    refused.push(column);
+                    continue;
+                }
+                Err(other) => panic!("{}: {other}", column.name),
+            };
+            let one = QueryResult {
+                columns: vec![column.clone()],
+                rows: vec![vec![cell.clone()]],
+            };
+            let wire = serde_json::to_string(&one).unwrap_or_else(|e| {
+                panic!(
+                    "{} ({}): {cell:?} does not encode: {e}",
+                    column.name, column.ty
+                )
+            });
+            let back: QueryResult = serde_json::from_str(&wire)
+                .unwrap_or_else(|e| panic!("{}: {wire} does not decode: {e}", column.name));
+            // Through `Debug`, so a NaN element compares equal to itself.
+            assert_eq!(
+                format!("{:?}", back.rows[0][0]),
+                format!("{cell:?}"),
+                "{}",
+                column.name
+            );
+            landed += 1;
+        }
+    }
+    assert_eq!(refused, ["hugeint", "hugeint", "uhugeint"]);
+    assert_eq!(landed, columns.len() * 3 - refused.len());
+}
+
+/// A zero-row statement is typed from its logical types all the same, and
+/// a bare `NULL` column is typed as `DuckDB` resolves it (INTEGER), never
+/// left untyped.
+#[cfg(test)]
+#[test]
+fn zero_row_statements_are_typed() {
+    let conn = Connection::open_in_memory().expect("in-memory duckdb");
+    let mut stmt = conn
+        .prepare("SELECT NULL AS nothing, 1::UBIGINT AS n, [1.5::DOUBLE] AS l WHERE false")
+        .expect("prepare");
+    let mut rows = stmt.query([]).expect("query");
+    let columns = typed_columns(rows.as_ref().expect("statement after query"));
+    assert!(rows.next().expect("step").is_none());
+    assert_eq!(
+        columns,
+        [
+            Column::new("nothing", ColumnType::Integer),
+            Column::new("n", ColumnType::Integer),
+            Column::new("l", ColumnType::list(ColumnType::Float)),
+        ]
+    );
+}
+
 /// Convert a temporal value to microseconds based on its `TimeUnit`.
 ///
 /// `DuckDB` stores temporal values as integer offsets from the Unix epoch;
@@ -2476,12 +2654,24 @@ const fn to_micros(unit: TimeUnit, val: i64) -> i64 {
     }
 }
 
+/// `DuckDB`'s infinite timestamps: the two extremes of its count, in every
+/// unit. They are not instants, so they spell `DuckDB`'s own words, the ones
+/// `trawl_core::compare::Instant::cast_text` uses too, rather than a civil
+/// time no calendar holds (the count would also overflow the shift below).
+const TIMESTAMP_INFINITY: i64 = i64::MAX;
+const TIMESTAMP_NEG_INFINITY: i64 = -i64::MAX;
+
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_lossless
 )]
 fn format_timestamp(unit: TimeUnit, val: i64, utc_offset_secs: i32) -> String {
+    match val {
+        TIMESTAMP_INFINITY => return "infinity".to_owned(),
+        TIMESTAMP_NEG_INFINITY => return "-infinity".to_owned(),
+        _ => {}
+    }
     let micros = to_micros(unit, val) + i64::from(utc_offset_secs) * 1_000_000;
 
     let (total_secs, sub_secs) = if micros >= 0 {
@@ -2558,6 +2748,22 @@ fn tail_timestamp_scope(timestamp_columns: &[String], stages: &[Spanned<PipeStag
         scope.advance(&stage.node);
     }
     scope
+}
+
+/// Type the columns the Rust tail's lineage ([`tail_timestamp_scope`])
+/// still calls a stored TIMESTAMP as `timestamp`.
+///
+/// The tail runs over pipeline cells, where a stored TIMESTAMP arrives as
+/// text, so [`crate::post_process::rows_to_result`] types a pass-through
+/// timestamp column `string`. The lineage knows better: the column is the
+/// SQL result's timestamp, renamed or aliased at most, so it keeps that
+/// type. A column the lineage cannot vouch for is typed by its own cells.
+fn retype_tracked_timestamps(result: &mut QueryResult, tracked: &PinScope) {
+    for column in &mut result.columns {
+        if column.ty == ColumnType::String && tracked.pin_for(&column.name).is_some() {
+            column.ty = ColumnType::Timestamp;
+        }
+    }
 }
 
 /// Re-apply the display offset to the TIMESTAMP columns that survived the

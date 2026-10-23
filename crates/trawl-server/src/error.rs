@@ -601,6 +601,7 @@ impl ServerError {
             Self::Engine(EngineError::Parse(_)) => "parse",
             Self::Engine(EngineError::Emit(_)) => "emit",
             Self::Engine(EngineError::Refused { .. }) => "refused",
+            Self::Engine(EngineError::IntegerOutOfRange { .. }) => "integer_out_of_range",
             // A budget refusal ends the query database's open at startup,
             // so no request carries it; it reads as the engine it came from.
             Self::Engine(EngineError::Database(_) | EngineError::BudgetNotApplied { .. }) => {
@@ -855,6 +856,15 @@ impl IntoResponse for ServerError {
             Self::Engine(EngineError::Refused { message }) => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::ValidationError, message.clone()),
+            ),
+            // A result cell no wire integer holds (ADR-0035, amended
+            // 2026-10-22). The query ran; its answer has no exact spelling,
+            // and only the caller can choose a cast, so it is the caller's
+            // to fix: a 400 under the execution code, with the
+            // trawl-authored sentence naming the column and the casts.
+            Self::Engine(err @ EngineError::IntegerOutOfRange { .. }) => (
+                StatusCode::BAD_REQUEST,
+                ErrorEnvelope::simple(ErrorCode::ExecutionError, err.to_string()),
             ),
             Self::Engine(EngineError::ResultTooLarge(n)) => (
                 StatusCode::BAD_REQUEST,

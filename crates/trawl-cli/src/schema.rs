@@ -747,12 +747,14 @@ mod tests {
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let result = trawl_engine::value::QueryResult {
             columns: vec![
-                trawl_engine::value::Column {
-                    name: "service".into(),
-                },
-                trawl_engine::value::Column {
-                    name: "duration".into(),
-                },
+                trawl_engine::value::Column::new(
+                    "service",
+                    trawl_engine::value::ColumnType::String,
+                ),
+                trawl_engine::value::Column::new(
+                    "duration",
+                    trawl_engine::value::ColumnType::Integer,
+                ),
             ],
             rows: vec![vec![
                 trawl_engine::value::Value::String("nginx".into()),

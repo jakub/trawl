@@ -425,12 +425,9 @@ fn render_ndjson(result: &QueryResult, out: &mut impl Write) -> io::Result<()> {
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
-            // `Value`'s Serialize impl emits plain JSON, never a struct or
-            // a map, so this conversion has no failure mode.
-            map.insert(
-                col.name.clone(),
-                serde_json::to_value(val).expect("Value serialization is infallible"),
-            );
+            // An export file, not the wire: integers stay JSON numbers
+            // (ADR-0035, amended 2026-10-22).
+            map.insert(col.name.clone(), val.to_plain_json());
         }
         serde_json::to_writer(&mut *out, &map).map_err(io::Error::other)?;
         writeln!(out)?;
@@ -464,10 +461,7 @@ fn csv_escape_value(val: &Value) -> String {
         // full precision for data fidelity (TUI display uses 2dp for readability)
         Value::Float(f) => f.to_string(),
         Value::String(s) => csv_escape_string(s),
-        Value::Array(arr) => {
-            let json = serde_json::to_string(arr).unwrap_or_default();
-            csv_escape_string(&json)
-        }
+        Value::Array(_) => csv_escape_string(&val.to_plain_json().to_string()),
     }
 }
 
@@ -738,9 +732,10 @@ mod tests {
         trawl_client::QueryResponse {
             execution: None,
             result: QueryResult {
-                columns: vec![trawl_engine::value::Column {
-                    name: "host".to_owned(),
-                }],
+                columns: vec![trawl_engine::value::Column::new(
+                    "host",
+                    trawl_engine::value::ColumnType::String,
+                )],
                 rows: vec![vec![Value::String("db1".to_owned())]],
             },
             pagination: trawl_client::PaginationMeta {
@@ -814,9 +809,10 @@ mod tests {
         assert_eq!(severity_cell_text(&Value::Integer(99)), "99");
 
         let result = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: trawl_core::schema::SEVERITY.to_owned(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                trawl_core::schema::SEVERITY,
+                trawl_engine::value::ColumnType::Integer,
+            )],
             rows: vec![vec![Value::Integer(17)]],
         };
         let render = |f: fn(&QueryResult, &mut Vec<u8>) -> io::Result<()>| {
@@ -842,12 +838,8 @@ mod tests {
     fn a_declared_severity_column_displays_its_token_in_the_table_only() {
         let result = QueryResult {
             columns: vec![
-                trawl_engine::value::Column {
-                    name: "s".to_owned(),
-                },
-                trawl_engine::value::Column {
-                    name: "n".to_owned(),
-                },
+                trawl_engine::value::Column::new("s", trawl_engine::value::ColumnType::Integer),
+                trawl_engine::value::Column::new("n", trawl_engine::value::ColumnType::Integer),
             ],
             rows: vec![vec![Value::Integer(18), Value::Integer(18)]],
         };
@@ -872,9 +864,10 @@ mod tests {
         // result column keeps the spelling the user typed, so the match
         // folds too — `DuckDB` identifiers are case-insensitive.
         let mixed = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: "S".to_owned(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                "S",
+                trawl_engine::value::ColumnType::Integer,
+            )],
             rows: vec![vec![Value::Integer(18)]],
         };
         let mut buf = Vec::new();
@@ -978,9 +971,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let source = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: "message".into(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                "message",
+                trawl_engine::value::ColumnType::String,
+            )],
             rows: vec![vec![Value::String("local row".into())]],
         };
         for name in ["one.parquet", "two.parquet", "excluded.other"] {
@@ -1008,9 +1002,10 @@ mod tests {
         let output = dir.path().join("output.parquet");
         let executor = trawl_engine::executor::Executor::new().unwrap();
         let source = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: "message".to_owned(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                "message",
+                trawl_engine::value::ColumnType::String,
+            )],
             rows: vec![
                 vec![Value::String("first".to_owned())],
                 vec![Value::String("second".to_owned())],

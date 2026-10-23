@@ -214,9 +214,7 @@ fn uint_values_are_faceted() {
     use crate::result_actions::Capabilities;
     use trawl_api::value::Column;
 
-    let col = |name: &str| Column {
-        name: name.to_owned(),
-    };
+    let col = |name: &str| Column::new(name, trawl_api::value::ColumnType::Integer);
 
     // A column mixing the two integer widths facets both of them.
     let mixed = QueryResult {
@@ -258,10 +256,10 @@ mod tests {
     use super::*;
     use trawl_api::value::Column;
 
+    /// Facets classify by cell variant, never by column type, so the type
+    /// here is not under test.
     fn col(name: &str) -> Column {
-        Column {
-            name: name.to_owned(),
-        }
+        Column::new(name, trawl_api::value::ColumnType::String)
     }
 
     #[test]

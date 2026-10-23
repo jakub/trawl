@@ -3504,7 +3504,7 @@ fn build_result_debug(result: Option<&QueryResult>) -> ResultDebug {
             columns
                 .iter()
                 .zip(row.iter())
-                .map(|(col, val)| (col.clone(), value_to_json(val)))
+                .map(|(col, val)| (col.clone(), val.to_plain_json()))
                 .collect()
         })
         .collect();
@@ -3514,19 +3514,6 @@ fn build_result_debug(result: Option<&QueryResult>) -> ResultDebug {
         columns,
         row_count: qr.row_count(),
         sample,
-    }
-}
-
-/// Convert a trawl `Value` to a `serde_json::Value` for debug log output.
-fn value_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::Null => serde_json::Value::Null,
-        Value::Boolean(b) => serde_json::Value::Bool(*b),
-        Value::Integer(i) => serde_json::json!(i),
-        Value::UInt(u) => serde_json::json!(u),
-        Value::Float(f) => serde_json::json!(f),
-        Value::String(s) => serde_json::Value::String(s.clone()),
-        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
     }
 }
 
@@ -3569,17 +3556,15 @@ fn generate_csv(result: &QueryResult) -> String {
 /// Generate newline-delimited JSON from query results.
 ///
 /// Each row is serialized as a JSON object with column names as keys.
-/// Values use the custom `Serialize` impl on `Value` which maps directly
-/// to JSON primitives.
+/// An export file is not the wire (ADR-0035, amended 2026-10-22): every
+/// cell goes through [`Value::to_plain_json`], so integers stay JSON
+/// numbers that jq and Vector read natively.
 fn generate_ndjson(result: &QueryResult) -> String {
     let mut buf = String::new();
     for row in &result.rows {
         let mut map = serde_json::Map::with_capacity(result.columns.len());
         for (col, val) in result.columns.iter().zip(row.iter()) {
-            map.insert(
-                col.name.clone(),
-                serde_json::to_value(val).expect("Value serialization is infallible"),
-            );
+            map.insert(col.name.clone(), val.to_plain_json());
         }
         // serde_json::to_string on a Map is infallible for our Value types.
         buf.push_str(&serde_json::to_string(&map).expect("Map serialization is infallible"));
@@ -4214,12 +4199,8 @@ mod tests {
     fn ndjson_generation_produces_valid_output() {
         let result = QueryResult {
             columns: vec![
-                trawl_engine::value::Column {
-                    name: "host".to_owned(),
-                },
-                trawl_engine::value::Column {
-                    name: "count".to_owned(),
-                },
+                trawl_engine::value::Column::new("host", trawl_engine::value::ColumnType::String),
+                trawl_engine::value::Column::new("count", trawl_engine::value::ColumnType::Mixed),
             ],
             rows: vec![
                 vec![Value::String("web-01".to_owned()), Value::Integer(42)],
@@ -4242,9 +4223,10 @@ mod tests {
     #[test]
     fn csv_generation_sanitizes_string_values() {
         let result = QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: "cmd".to_owned(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                "cmd",
+                trawl_engine::value::ColumnType::String,
+            )],
             rows: vec![
                 vec![Value::String("=evil()".to_owned())],
                 vec![Value::String("safe".to_owned())],
@@ -4501,9 +4483,10 @@ mod tests {
             severity_columns: vec![],
         };
         let one_column = || QueryResult {
-            columns: vec![trawl_engine::value::Column {
-                name: "host".to_owned(),
-            }],
+            columns: vec![trawl_engine::value::Column::new(
+                "host",
+                trawl_engine::value::ColumnType::String,
+            )],
             rows: vec![vec![Value::String("web-01".to_owned())]],
         };
         let expected = crate::from_saved::unavailable_run_message(7);

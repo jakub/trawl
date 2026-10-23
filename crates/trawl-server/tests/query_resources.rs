@@ -821,7 +821,7 @@ async fn spill_budget_child(work: &Path) {
     let small = post_query(&server, SMALL).await;
     assert_eq!(small.status, 200, "{}", small.body);
     let body: serde_json::Value = serde_json::from_str(&small.body).unwrap();
-    assert_eq!(body["rows"], serde_json::json!([[CORPUS_ROWS]]));
+    assert_eq!(body["rows"], serde_json::json!([[CORPUS_ROWS.to_string()]]));
     assert_nothing_leaked(work, &before, &[&answer.request_id, &small.request_id]);
 }
 

@@ -219,12 +219,14 @@ pub fn extract_series(result: &QueryResult) -> (Vec<(String, Vec<u64>)>, usize) 
 #[cfg(test)]
 #[test]
 fn series_ranking_survives_unsigned_totals() {
-    let mut columns = vec![crate::value::Column {
-        name: "_time".to_owned(),
-    }];
-    columns.extend((0..7).map(|i| crate::value::Column {
-        name: format!("m{i}"),
-    }));
+    let mut columns = vec![crate::value::Column::new(
+        "_time",
+        crate::value::ColumnType::Timestamp,
+    )];
+    columns
+        .extend((0..7).map(|i| {
+            crate::value::Column::new(format!("m{i}"), crate::value::ColumnType::Integer)
+        }));
 
     // Six small metrics and one enormous one, twice over.
     let row = |t: &str| {
@@ -264,15 +266,9 @@ fn series_ranking_survives_unsigned_totals() {
 fn uint_metric_is_not_a_group() {
     let result = QueryResult {
         columns: vec![
-            crate::value::Column {
-                name: "_time".to_owned(),
-            },
-            crate::value::Column {
-                name: "first_request_id".to_owned(),
-            },
-            crate::value::Column {
-                name: "count".to_owned(),
-            },
+            crate::value::Column::new("_time", crate::value::ColumnType::Timestamp),
+            crate::value::Column::new("first_request_id", crate::value::ColumnType::Integer),
+            crate::value::Column::new("count", crate::value::ColumnType::Integer),
         ],
         rows: vec![vec![
             Value::String("2026-01-01 00:00:00".to_owned()),
@@ -300,15 +296,9 @@ fn digit_string_label_stays_a_group() {
     let grouped_by = |label: &str| {
         let result = QueryResult {
             columns: vec![
-                crate::value::Column {
-                    name: "_time".to_owned(),
-                },
-                crate::value::Column {
-                    name: "status".to_owned(),
-                },
-                crate::value::Column {
-                    name: "count".to_owned(),
-                },
+                crate::value::Column::new("_time", crate::value::ColumnType::Timestamp),
+                crate::value::Column::new("status", crate::value::ColumnType::String),
+                crate::value::Column::new("count", crate::value::ColumnType::Integer),
             ],
             rows: vec![
                 vec![
@@ -345,9 +335,7 @@ mod tests {
     use crate::value::Column;
 
     fn col(name: &str) -> Column {
-        Column {
-            name: name.to_owned(),
-        }
+        Column::new(name, crate::value::ColumnType::String)
     }
 
     #[test]

@@ -21,7 +21,7 @@ use trawl_core::row::{self, Row};
 use trawl_core::stream::{self, CompiledStage, StageResult, StreamPlan};
 
 use crate::error::EngineError;
-use crate::value::{Column, QueryResult, land_u64};
+use crate::value::{Column, ColumnType, QueryResult, TypeFold, land_u64};
 
 /// Apply Rust pipeline stages to a SQL result set.
 ///
@@ -94,7 +94,7 @@ pub fn apply_rust_stages(
     // Apply deferred sort stages.
     let sorted = apply_sorts(processed, &sort_stages);
 
-    Ok(events_to_result(&sorted))
+    Ok(rows_to_result(&sorted, &result.columns))
 }
 
 /// Convert a columnar `QueryResult` into a vec of typed pipeline rows.
@@ -135,14 +135,16 @@ fn cell_to_eval(cell: &crate::value::Value) -> EvalValue {
 
 /// A pipeline cell as a result cell.
 ///
-/// A non-finite double survives as `Value::Float`; the one place it becomes
-/// `null` is `trawl_api::value`'s serializer, at the wire, which is where
-/// the all-SQL path nulls it too. Nulling it here as well would make the kv
-/// tail disagree with the same query without the split.
+/// A non-finite double survives as `Value::Float`, and the wire spells it
+/// as `NaN`, `Infinity` or `-Infinity` under its `float` column, the same
+/// as the all-SQL path. Nulling it here would make the kv tail disagree
+/// with the same query without the split.
 ///
 /// A `Timestamp` becomes the string `executor::extract_value` renders,
 /// deliberately: the display-offset shift runs after the tail and re-parses
-/// that text, so a cell retyped here would silently stop shifting.
+/// that text, so a cell retyped here would silently stop shifting. Its
+/// column is still typed `timestamp` ([`rows_to_result`] folds the
+/// pipeline cell, not this one).
 fn eval_to_cell(cell: &EvalValue) -> crate::value::Value {
     match cell {
         EvalValue::Null => crate::value::Value::Null,
@@ -176,37 +178,83 @@ fn unsigned_arm() {
     );
 }
 
-/// Convert pipeline rows back to a columnar `QueryResult`.
+/// Add one pipeline cell's type to a column's evidence.
 ///
-/// Discovers the column set across all events (preserving insertion order)
+/// The pipeline cell, not the result cell it becomes: an
+/// [`EvalValue::Timestamp`] is text in the result, but its column is a
+/// `timestamp` column.
+fn observe_cell(fold: &mut TypeFold, cell: &EvalValue) {
+    let ty = match cell {
+        EvalValue::Null => return,
+        EvalValue::Bool(_) => ColumnType::Boolean,
+        EvalValue::Int(_) | EvalValue::UInt(_) => ColumnType::Integer,
+        EvalValue::Float(_) => ColumnType::Float,
+        EvalValue::Str(_) => ColumnType::String,
+        EvalValue::Timestamp(_) => ColumnType::Timestamp,
+        EvalValue::Array(elements) => {
+            let mut items = TypeFold::new();
+            for element in elements {
+                observe_cell(&mut items, element);
+            }
+            fold.observe_list(items);
+            return;
+        }
+    };
+    fold.observe(&ty);
+}
+
+/// Convert pipeline rows to a typed, columnar [`QueryResult`].
+///
+/// The one builder for every result a Rust-side stage produces: the batch
+/// tail behind `extract kv`, and the live lane's frames and snapshots.
+/// Discovers the column set across all rows (preserving insertion order)
 /// and fills missing keys with NULL.
-fn events_to_result(events: &[Row]) -> QueryResult {
-    // Discover columns across all events, preserving insertion order.
+///
+/// Each column is typed from the cells it holds (ADR-0035, amended
+/// 2026-10-22): one type of cell gives that type, several give `mixed`,
+/// and list items fold the same way. A column with no non-null cell has
+/// no evidence of its own and takes the type of the same-named column in
+/// `inherited` (the input the stages ran over), else `string`.
+pub fn rows_to_result(rows: &[Row], inherited: &[Column]) -> QueryResult {
+    // Discover columns across all rows, preserving insertion order.
     let mut col_set = IndexSet::new();
-    for event in events {
-        for key in event.keys() {
+    for row in rows {
+        for key in row.keys() {
             col_set.insert(key.clone());
         }
     }
 
     let columns: Vec<Column> = col_set
         .iter()
-        .map(|name| Column { name: name.clone() })
+        .map(|name| {
+            let mut fold = TypeFold::new();
+            for row in rows {
+                if let Some(cell) = row.get(name) {
+                    observe_cell(&mut fold, cell);
+                }
+            }
+            let ty = fold.finish().unwrap_or_else(|| {
+                inherited
+                    .iter()
+                    .find(|column| &column.name == name)
+                    .map_or(ColumnType::String, |column| column.ty.clone())
+            });
+            Column::new(name.clone(), ty)
+        })
         .collect();
 
-    let rows: Vec<Vec<crate::value::Value>> = events
+    let rows: Vec<Vec<crate::value::Value>> = rows
         .iter()
-        .map(|event| {
+        .map(|row| {
             col_set
                 .iter()
-                .map(|col| eval_to_cell(event.get(col).unwrap_or(&EvalValue::Null)))
+                .map(|col| eval_to_cell(row.get(col).unwrap_or(&EvalValue::Null)))
                 .collect()
         })
         .collect();
 
     QueryResult { columns, rows }
 }
-
 /// Run pass-through stages on each event.
 fn apply_pass_through(
     stages: &mut [CompiledStage],
@@ -427,9 +475,7 @@ fn rust_tail_sort_orders_large_unsigned_exactly() {
         .expect("dsl parses")
         .pipeline;
     let result = QueryResult {
-        columns: vec![Column {
-            name: "bytes".to_string(),
-        }],
+        columns: vec![Column::new("bytes", ColumnType::Mixed)],
         rows: vec![
             vec![Value::UInt(u64::MAX)],
             vec![Value::UInt(u64::MAX - 1)],
@@ -475,9 +521,7 @@ fn timechart_on_refused_in_batch_tail() {
         .expect("dsl parses")
         .pipeline;
     let result = QueryResult {
-        columns: vec![Column {
-            name: "_raw".to_string(),
-        }],
+        columns: vec![Column::new("_raw", ColumnType::String)],
         rows: Vec::new(),
     };
     let anchor = EvalContext::at(
@@ -519,12 +563,8 @@ fn tail_timechart_span_follows_the_query_window() {
     let last = query.search.time_filter.as_ref().map(|tf| tf.node.duration);
     let rows = || QueryResult {
         columns: vec![
-            Column {
-                name: "_time".to_string(),
-            },
-            Column {
-                name: "message".to_string(),
-            },
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("message", ColumnType::String),
         ],
         rows: vec![
             vec![
@@ -576,9 +616,7 @@ mod tests {
         QueryResult {
             columns: columns
                 .iter()
-                .map(|n| Column {
-                    name: n.to_string(),
-                })
+                .map(|n| Column::new(*n, ColumnType::String))
                 .collect(),
             rows,
         }

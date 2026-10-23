@@ -701,16 +701,26 @@ mod align_series_tests {
     /// 2026-09-01T00:00:00Z.
     const T0: i64 = 1_788_220_800;
 
+    /// Each column typed by the cells it holds, as a server would.
     fn result(names: &[&str], rows: Vec<Vec<Value>>) -> QueryResult {
-        QueryResult {
-            columns: names
-                .iter()
-                .map(|n| Column {
-                    name: (*n).to_string(),
-                })
-                .collect(),
-            rows,
-        }
+        let columns = names
+            .iter()
+            .enumerate()
+            .map(|(idx, n)| {
+                let mut fold = trawl_api::value::TypeFold::new();
+                for row in &rows {
+                    if let Some(cell) = row.get(idx) {
+                        fold.observe_value(cell);
+                    }
+                }
+                Column::new(
+                    *n,
+                    fold.finish()
+                        .unwrap_or(trawl_api::value::ColumnType::String),
+                )
+            })
+            .collect();
+        QueryResult { columns, rows }
     }
 
     /// The snapshot lane, which most tests exercise.

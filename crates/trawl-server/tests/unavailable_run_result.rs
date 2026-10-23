@@ -321,9 +321,10 @@ mod unavailable_run_result {
         // Move the rows into the blob, exactly as a failed parquet write
         // would have left them, and drop the path.
         let result = trawl_api::value::QueryResult {
-            columns: vec![trawl_api::value::Column {
-                name: "service".to_owned(),
-            }],
+            columns: vec![trawl_api::value::Column::new(
+                "service",
+                trawl_api::value::ColumnType::String,
+            )],
             rows: vec![vec![trawl_api::value::Value::String("nginx".to_owned())]],
         };
         let blob = zstd::encode_all(serde_json::to_vec(&result).unwrap().as_slice(), 3).unwrap();

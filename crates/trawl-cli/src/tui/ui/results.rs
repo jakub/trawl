@@ -1531,13 +1531,14 @@ fn severity_cell_text(value: &trawl_engine::value::Value) -> String {
 fn timechart_sparklines_survive_unsigned_magnitudes() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use trawl_engine::value::{Column, QueryResult};
+    use trawl_engine::value::{Column, ColumnType, QueryResult};
 
-    let col = |name: &str| Column {
-        name: name.to_owned(),
-    };
     let result = QueryResult {
-        columns: vec![col("_time"), col("m0"), col("m1")],
+        columns: vec![
+            Column::new("_time", ColumnType::Timestamp),
+            Column::new("m0", ColumnType::Integer),
+            Column::new("m1", ColumnType::Integer),
+        ],
         rows: vec![
             vec![
                 Value::String("2026-01-01 00:00:00".to_owned()),
@@ -1605,12 +1606,8 @@ fn bar_chart_renders_uint_metric() {
 
     let result = QueryResult {
         columns: vec![
-            Column {
-                name: "service".to_owned(),
-            },
-            Column {
-                name: "first_request_id".to_owned(),
-            },
+            Column::new("service", trawl_engine::value::ColumnType::String),
+            Column::new("first_request_id", trawl_engine::value::ColumnType::Integer),
         ],
         rows: vec![vec![
             Value::String("nginx".to_owned()),

@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 
-use trawl_api::value::{Column, QueryResult, Value, land_u64};
+use trawl_api::value::{Column, ColumnType, QueryResult, TypeFold, Value, land_u64};
 
 /// Max raw events retained in the ring — older events roll off.
 pub const LIVE_RING_CAPACITY: usize = 5000;
@@ -99,10 +99,23 @@ pub fn ring_to_result(ring: &RingBuffer) -> QueryResult {
         })
         .collect();
 
-    QueryResult {
-        columns: col_order.into_iter().map(|name| Column { name }).collect(),
-        rows,
-    }
+    // Each column is typed by the cells it holds; one with no non-null
+    // cell has no evidence and is `string`.
+    let columns = col_order
+        .into_iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let mut fold = TypeFold::new();
+            for row in &rows {
+                if let Some(cell) = row.get(idx) {
+                    fold.observe_value(cell);
+                }
+            }
+            Column::new(name, fold.finish().unwrap_or(ColumnType::String))
+        })
+        .collect();
+
+    QueryResult { columns, rows }
 }
 
 /// A live event's oversized unsigned reaches the results table intact.

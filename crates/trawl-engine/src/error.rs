@@ -83,6 +83,22 @@ pub enum EngineError {
     #[error("{message}")]
     Refused { message: String },
 
+    /// A `HUGEINT` or `UHUGEINT` result cell outside `i64` ∪ `u64`
+    /// (ADR-0035, amended 2026-10-22), for example a `sum` past
+    /// `u64::MAX`. The result wire's `integer` type has no wider variant,
+    /// and a float or digits as text would be a different answer, so the
+    /// query is refused by the column's name with the casts that make it
+    /// answerable.
+    ///
+    /// The message is trawl-authored and names only the result column, a
+    /// name the caller's own query produced, so it crosses the trust
+    /// boundary intact.
+    #[error(
+        "column {column:?} holds an integer outside the 64-bit range; \
+         cast it explicitly with tonumber() or tostring()"
+    )]
+    IntegerOutOfRange { column: String },
+
     /// The query database refused a budget, or a clone read one back other
     /// than configured (ADR-0056). The structured-error setting
     /// (`errors_as_json`) is read back the same way, since without it no

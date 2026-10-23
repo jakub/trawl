@@ -1004,8 +1004,10 @@ async fn fresh_boot_restart_and_interrupted_current_cutover() {
         .await
         .unwrap();
     assert_eq!(
-        serde_json::to_value(&result.result.rows).unwrap(),
-        serde_json::json!([["new-generation"]])
+        result.result.rows,
+        vec![vec![trawl_engine::value::Value::String(
+            "new-generation".to_owned()
+        )]]
     );
     let pin: String =
         sqlx::query_scalar("SELECT duckdb_type FROM field_types WHERE field='status'")
