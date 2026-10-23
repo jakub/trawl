@@ -36,15 +36,17 @@
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
 use dashmap::DashMap;
 use fleet_auth::VerifiedKey;
+use governor::NotUntil;
 use governor::Quota;
 use governor::RateLimiter;
-use governor::clock::DefaultClock;
+use governor::clock::{Clock as _, DefaultClock};
 use governor::state::keyed::DashMapStateStore;
 
 use crate::config::RateLimitConfig;
@@ -53,6 +55,22 @@ use crate::policy::{Permission, TrawlAuthz as _};
 
 /// A keyed rate limiter: one bucket per API key id.
 type KeyedLimiter = RateLimiter<i64, DashMapStateStore<i64>, DefaultClock>;
+
+/// Seconds a refused caller should wait, as `Retry-After` carries them:
+/// governor's wait rounded up to a whole second, and never 0, since a
+/// header of 0 invites the immediate retry the refusal just turned away.
+fn retry_after_secs(wait: Duration) -> u64 {
+    (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1)
+}
+
+/// The `Retry-After` of a refusal governor made, measured from `now` on the
+/// limiter's own clock.
+fn refusal_retry_after_secs(
+    not_until: &NotUntil<<DefaultClock as governor::clock::Clock>::Instant>,
+    now: <DefaultClock as governor::clock::Clock>::Instant,
+) -> u64 {
+    retry_after_secs(not_until.wait_time_from(now))
+}
 
 /// One route class's limiters: the config default plus a lazily-populated
 /// map of keyed limiters indexed by effective RPM.
@@ -193,16 +211,18 @@ pub async fn rate_limit_middleware(request: Request, next: Next) -> Result<Respo
     if let Some(limiter) = rate_state.limiter_for(
         verified.has_permission(Permission::Ingest),
         verified.rate_rpm(),
-    ) && limiter.check_key(&verified.id).is_err()
+    ) && let Err(not_until) = limiter.check_key(&verified.id)
     {
+        let retry_after_secs = refusal_retry_after_secs(&not_until, limiter.clock().now());
         tracing::warn!(
             event_type = "rate_limit_exceeded",
             user = %verified.name,
             key_id = verified.id,
             prefix = %verified.prefix,
+            retry_after_secs,
             "rate limit exceeded"
         );
-        return Err(ServerError::RateLimited);
+        return Err(ServerError::RateLimited { retry_after_secs });
     }
 
     // Metered: the limiter passed this verified key, a disabled limit
@@ -228,6 +248,40 @@ mod tests {
         (0..attempts)
             .filter(|_| limiter.check_key(&key_id).is_ok())
             .count()
+    }
+
+    #[test]
+    fn retry_after_rounds_up_and_is_never_zero() {
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_secs(Duration::from_secs(1)), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1001)), 2);
+        assert_eq!(retry_after_secs(Duration::from_secs(12)), 12);
+    }
+
+    /// After a key spends its quota, the refusal's `Retry-After` is the
+    /// ceiling of governor's own wait, measured on governor's clock, and at
+    /// least 1 even when the wait is under a second.
+    #[test]
+    fn refusal_carries_the_ceiling_of_governors_wait() {
+        for rpm in [5, 60, 6000] {
+            let state = RateLimitState::interactive(&config_with_rpm(rpm));
+            let limiter = state.limiter_for(false, None).unwrap();
+            let key_id = 11;
+            assert_eq!(spend(&limiter, key_id, rpm as usize), rpm as usize);
+
+            let not_until = limiter.check_key(&key_id).unwrap_err();
+            let now = limiter.clock().now();
+            let wait = not_until.wait_time_from(now);
+            let got = refusal_retry_after_secs(&not_until, now);
+
+            assert!(got >= 1, "rpm {rpm}: {got}");
+            assert_eq!(
+                got,
+                u64::try_from(wait.as_nanos().div_ceil(1_000_000_000).max(1)).unwrap(),
+                "rpm {rpm}: wait {wait:?}"
+            );
+        }
     }
 
     #[test]

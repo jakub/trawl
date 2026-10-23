@@ -185,9 +185,11 @@ pub enum ServerError {
         limit: usize,
     },
 
-    /// Rate limit exceeded (429).
+    /// Rate limit exceeded (429). `retry_after_secs` is the wait the limiter
+    /// computed, rounded up to whole seconds and at least 1; it becomes the
+    /// `Retry-After` header.
     #[error("rate limit exceeded")]
-    RateLimited,
+    RateLimited { retry_after_secs: u64 },
 
     /// Too many concurrent SSE streams (429).
     #[error("too many concurrent streams")]
@@ -568,7 +570,7 @@ impl ServerError {
             Self::BadRequest(_) => "bad request".to_owned(),
             Self::NotFound(_) => "not found".to_owned(),
             Self::Forbidden(_) => "forbidden".to_owned(),
-            Self::RateLimited => "rate limit exceeded".to_owned(),
+            Self::RateLimited { .. } => "rate limit exceeded".to_owned(),
             Self::TooManyStreams => "too many concurrent streams".to_owned(),
             // [`CAPACITY_NOT_STARTED`] is a fixed server-capacity sentence
             // with nothing to redact, and it is the whole answer a
@@ -627,7 +629,7 @@ impl ServerError {
             Self::WindowMaterialize(_) => "window_materialize",
             Self::Timeout => "timeout",
             Self::Ingest(_) | Self::IngestBodyTooLarge { .. } => "ingest",
-            Self::RateLimited => "rate_limited",
+            Self::RateLimited { .. } => "rate_limited",
             Self::TooManyStreams => "too_many_streams",
             // An auth backend outage is the same 503 it was before the
             // driver's kind rode along; `cause_kind` tells it apart.
@@ -693,7 +695,7 @@ impl ServerError {
             | Self::Timeout
             | Self::Ingest(_)
             | Self::IngestBodyTooLarge { .. }
-            | Self::RateLimited
+            | Self::RateLimited { .. }
             | Self::TooManyStreams
             | Self::IngestBatchTooLarge { .. }
             | Self::PreviewTooLarge { .. }
@@ -1050,7 +1052,7 @@ impl IntoResponse for ServerError {
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorEnvelope::simple(ErrorCode::Timeout, "query timed out"),
             ),
-            Self::RateLimited => (
+            Self::RateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorEnvelope::simple(ErrorCode::RateLimited, "rate limit exceeded"),
             ),
@@ -1147,7 +1149,7 @@ impl IntoResponse for ServerError {
         let body = trawl_api::ErrorResponse { error: envelope };
         let mut response = (status, axum::Json(body)).into_response();
         match self {
-            Self::HotBufferFull { retry_after_secs } => {
+            Self::HotBufferFull { retry_after_secs } | Self::RateLimited { retry_after_secs } => {
                 response.headers_mut().insert(
                     axum::http::header::RETRY_AFTER,
                     axum::http::HeaderValue::from(retry_after_secs),
