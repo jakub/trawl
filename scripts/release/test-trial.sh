@@ -627,6 +627,40 @@ ok documented t -p trial query "$DOCUMENTED_QUERY" -f json
 [[ "$(jq -cS . "$WORK/documented.out")" == "$DOCUMENTED_ROW" ]] || fail "the documented query did not return $DOCUMENTED_ROW"
 note "exact row: $DOCUMENTED_ROW"
 
+step "trial A: a capture writes the results root and its file owner-only, and the page decodes"
+# The trial leaves [server] results_dir at its default, beside the data root
+# on the trawld volume (ADR-0057). The documented query has rows and columns,
+# so the capture always writes a file.
+RESULTS_ROOT=/var/lib/trawl/data.results
+printf 'Authorization: Bearer %s\n' "$(<"$STATE_DIR/operator.token")" >"$WORK/operator.header"
+results_call() { # results_call NAME PATH [CURL-ARG...]: HTTP 200, body in $WORK/NAME.json
+  local name=$1 path=$2 status
+  shift 2
+  status=$(curl --silent --show-error --max-time 60 --cacert "$STATE_DIR/ca.pem" \
+    -H @"$WORK/operator.header" -o "$WORK/$name.json" -w '%{http_code}' "$@" \
+    "https://127.0.0.1:15514$path") || fail "curl could not reach $path"
+  [[ "$status" == 200 ]] || fail "$path answered HTTP $status, expected 200"
+}
+results_call capture /api/v1/results -H 'Content-Type: application/json' \
+  --data "$(jq -cn --arg query "$DOCUMENTED_QUERY" '{query: $query}')"
+read -r result_id file_bytes captured_rows < <(jq -r '.result | "\(.id) \(.file_bytes) \(.captured_rows)"' "$WORK/capture.json") ||
+  fail "the capture response has no result id, file_bytes and captured_rows"
+[[ "$result_id" =~ ^[0-9a-f]{32}$ ]] || fail "the capture returned a malformed result id"
+[[ "$file_bytes" =~ ^[0-9]+$ && "$file_bytes" -gt 0 ]] || fail "the capture of the documented query wrote no file (file_bytes=$file_bytes)"
+note "captured $result_id: $captured_rows row(s), $file_bytes file bytes"
+check_file trawld "$RESULTS_ROOT" 700 trawl
+check_file trawld "$RESULTS_ROOT/$result_id.parquet" 600 trawl
+results_call page "/api/v1/results/$result_id"
+jq -e --arg id "$result_id" '
+  .result.id == $id
+  and (.page.columns | length) >= 1
+  and (.page.rows | length) == (.result.captured_rows | tonumber)
+  and (.page.rows | length) >= 1
+  and (.positions | length) == (.page.columns | length)' "$WORK/page.json" >/dev/null ||
+  fail "GET /api/v1/results/$result_id did not decode as the captured page"
+note "the page decodes: $(jq -r '"\(.page.columns | length) column(s), \(.page.rows | length) row(s)"' "$WORK/page.json")"
+rm -f "$WORK/operator.header"
+
 step "trial A: each quick-start example returns rows under last=15m"
 for query in "${QUICK_START_QUERIES[@]}"; do
   t -p trial query "last=15m $query" -f json </dev/null >"$WORK/quick-start.out" || fail "'last=15m $query' failed"
